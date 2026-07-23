@@ -8,6 +8,7 @@ const PUBLIC_UNAUTHENTICATED_PATHS = new Set([
   "/login",
   "/watch",
   "/m/watch",
+  "/m/watch/demo",
   "/api/login",
   "/api/pair-login",
   "/api/pair-keys",
@@ -19,7 +20,10 @@ export function isPublicUnauthenticatedPath(pathname: string): boolean {
 }
 
 export function isViewerSnapshotPath(pathname: string): boolean {
-  return /^\/api\/live-sessions\/[^/]+\/snapshot$/u.test(pathname);
+  // Viewer-token-authenticated GET surfaces: each route verifies the signed
+  // viewer grant itself. status/summary/transcript stay readable after the
+  // session ends so participants can open the meeting minutes.
+  return /^\/api\/live-sessions\/[^/]+\/(?:snapshot|status|summary|transcript)$/u.test(pathname);
 }
 
 export function canonicalRequestOrigin(value: string): string | null {

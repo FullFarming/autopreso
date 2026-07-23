@@ -452,6 +452,28 @@ input:focus-visible {
 .live-speaking-waves i:nth-child(2) { height: 13px; animation-delay: -.35s; }
 .live-speaking-waves i:nth-child(3) { height: 9px; animation-delay: -.6s; }
 
+/* Meeting minutes (회의록) — shown when the host ends the session */
+.live-minutes { display: flex; flex: 1; min-height: 0; flex-direction: column; gap: 16px; overflow-y: auto; padding: 22px 18px calc(24px + env(safe-area-inset-bottom)); border: 1px solid rgba(255,255,255,.1); border-radius: 24px; background: #0c0a09; color: #fff; }
+.live-minutes-header { display: grid; justify-items: center; gap: 4px; padding: 10px 0 4px; text-align: center; }
+.live-minutes-ended-dot { width: 8px; height: 8px; border-radius: 9999px; background: #8E8E93; }
+.live-minutes-header strong { font-size: 16px; }
+.live-minutes-header p { margin: 0; color: rgba(255,255,255,.55); font-size: 12px; }
+.live-minutes .live-summary-card { border-color: rgba(255,255,255,.12); background: rgba(255,255,255,.05); color: #fff; }
+.live-minutes .live-summary-card header time,
+.live-minutes .live-summary-section h3 { color: rgba(255,255,255,.5); }
+.live-minutes .live-summary-section ol li p,
+.live-minutes .live-summary-speakers li span,
+.live-minutes .live-summary-overview { color: rgba(255,255,255,.82); }
+.live-minutes-pending { display: grid; gap: 10px; justify-items: start; border: 1px solid rgba(255,255,255,.12); border-radius: 18px; background: rgba(255,255,255,.05); padding: 16px; }
+.live-minutes-pending p { margin: 0; color: rgba(255,255,255,.6); font-size: 12px; line-height: 1.6; }
+.live-minutes-pending button { min-height: 38px; border: 1px solid rgba(255,255,255,.25); border-radius: 9999px; background: transparent; color: #fff; padding: 0 16px; font: 600 12px/1 var(--font-sans); }
+.live-minutes-record { display: grid; gap: 16px; }
+.live-minutes-record h3 { margin: 6px 0 0; color: rgba(255,255,255,.5); font-size: 11px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; }
+.live-minutes-record article { border-bottom: 1px solid rgba(255,255,255,.07); padding-bottom: 14px; }
+.live-minutes-record article header { display: flex; align-items: baseline; gap: 8px; margin-bottom: 6px; color: rgba(255,255,255,.6); font-size: 11px; font-weight: 600; }
+.live-minutes-record article header time { color: rgba(255,255,255,.35); font-size: 10px; font-variant-numeric: tabular-nums; }
+.live-minutes-record article p { margin: 0; color: #fff; font-size: 14.5px; line-height: 1.65; word-break: keep-all; overflow-wrap: anywhere; }
+
 /* Meeting summary */
 .live-summary-panel { display: flex; flex-direction: column; gap: 14px; padding: 22px; }
 .live-summary-hint { margin: 0; color: var(--muted); font-size: 12px; line-height: 1.6; }
@@ -479,6 +501,39 @@ input:focus-visible {
 .live-language-switch button.is-selected { background: var(--primary); color: var(--on-primary); }
 .live-pip-body { margin: 0; padding: 8px; background: #0c0a09; }
 .live-pip-body .live-viewer-stage { min-height: calc(100vh - 16px); border-radius: 14px; }
+
+/* Pure-black mobile viewer (어닝콜 영상 레퍼런스): the screen IS the feed.
+   No cards, no borders — white text over #000, gray speaker meta, sticky
+   translucent toolbar, dark live sheet. */
+.live-viewer-shell.is-compact { width: 100%; height: 100dvh; margin: 0; padding: 0; gap: 0; overflow: hidden; background: #000; }
+.live-viewer-shell.is-compact .live-meeting-feed,
+.live-viewer-shell.is-compact .live-minutes { min-height: 0; }
+.live-viewer-shell.is-compact .live-viewer-toolbar { position: sticky; top: 0; z-index: 4; margin: 0; border: none; border-radius: 0; background: rgba(0,0,0,.86); backdrop-filter: blur(14px); box-shadow: none; padding: calc(6px + env(safe-area-inset-top)) 14px 8px; }
+.live-viewer-shell.is-compact .live-viewer-toolbar > strong { color: #fff; }
+.live-viewer-shell.is-compact .live-viewer-delivery-method { color: rgba(255,255,255,.45); }
+.live-viewer-shell.is-compact .live-viewer-toolbar button { border-color: rgba(255,255,255,.2); background: transparent; color: #fff; }
+.live-viewer-shell.is-compact .live-viewer-toolbar button.is-selected { background: rgba(255,255,255,.16); }
+.live-viewer-shell.is-compact .live-language-switch { border-color: rgba(255,255,255,.16); background: rgba(255,255,255,.07); }
+.live-viewer-shell.is-compact .live-language-switch button { color: rgba(255,255,255,.55); }
+.live-viewer-shell.is-compact .live-language-switch button.is-selected { background: #fff; color: #000; }
+.live-viewer-shell.is-compact .live-viewer-stage { flex: 1; border: none; border-radius: 0; background: #000; box-shadow: none; padding: 12px 18px 0; }
+.live-viewer-shell.is-compact .live-viewer-stage-header { margin-bottom: 10px; }
+.live-viewer-shell.is-compact .live-viewer-stage .live-eyebrow,
+.live-viewer-shell.is-compact .live-viewer-stage .live-connection-state { color: rgba(255,255,255,.4); font-size: 10px; }
+.live-viewer-shell.is-compact .live-turn-card { border-bottom: none; padding: 0 0 4px; }
+.live-viewer-shell.is-compact .live-turn-card header { color: #8E8E93; }
+.live-viewer-shell.is-compact .live-turn-card p { font-size: 17px; line-height: 1.68; color: #fff; }
+.live-viewer-shell.is-compact .live-now-sheet { margin: 8px 0 10px; border-color: rgba(255,255,255,.06); background: #1c1c1e; }
+.live-viewer-shell.is-compact .live-speak-bar { margin: 0 12px; border-color: rgba(255,255,255,.14); background: #111; }
+.live-viewer-shell.is-compact .live-floor-indicator { color: #fff; }
+.live-viewer-shell.is-compact .live-floor-indicator.is-idle { color: rgba(255,255,255,.45); }
+.live-viewer-shell.is-compact .live-speak-button { background: #fff; color: #000; }
+.live-viewer-shell.is-compact .live-speak-button.is-speaking { background: #c62828; color: #fff; }
+.live-viewer-shell.is-compact .live-viewer-footer { padding: 10px 16px calc(12px + env(safe-area-inset-bottom)); color: rgba(255,255,255,.35); }
+.live-viewer-shell.is-compact .live-error { margin: 8px 12px 0; }
+.live-viewer-shell.is-compact .live-minutes { border: none; border-radius: 0; background: #000; }
+.live-viewer-shell.is-compact .live-jump-latest { bottom: 132px; }
+.live-viewer-shell.is-compact .live-viewer-legend { display: none; }
 
 @media (max-width: 760px) {
   .live-host-shell,
