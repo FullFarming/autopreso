@@ -680,7 +680,16 @@ test("live security and gateway metrics sources do not log private media or use 
 test("viewer sockets cannot inject caption or audio payloads and cap JSON message size", () => {
   const source = readFileSync(new URL("../../../media-gateway/src/gateway-server.js", import.meta.url), "utf8");
   assert.match(source, /new WebSocketServer\(\{ noServer: true, maxPayload: 64 \* 1_024 \}\)/u);
-  assert.match(source, /if \(isBinary\) throw new Error\("VIEWER_BINARY_INPUT_FORBIDDEN"\)/u);
+  // 발언권(floor) 보유자만 오디오 프레임을 올릴 수 있고, 비보유자 프레임은
+  // 파이프라인에 닿기 전에 폐기됩니다. 보유자 프레임도 호스트와 같은
+  // 크기 검증과 세션 오디오 예산을 통과해야 합니다.
+  const viewerBinaryBranch = source.match(
+    /const holder = floorHolders\.get\(claims\.sessionId\);[\s\S]*?metrics\.increment\("floor_audio_frames_total"\);/u,
+  );
+  assert.ok(viewerBinaryBranch, "viewer binary handling must be floor-gated");
+  assert.match(viewerBinaryBranch[0], /if \(!holder \|\| holder\.webSocket !== webSocket\)/u);
+  assert.match(viewerBinaryBranch[0], /data\.byteLength !== INPUT_FRAME_BYTES/u);
+  assert.match(viewerBinaryBranch[0], /consumeAudioBudget\(claims\.sessionId, data\.byteLength\)/u);
   assert.match(source, /if \(message\.type !== "subscribe"[\s\S]*?throw new Error\("INVALID_SUBSCRIPTION"\)/u);
   assert.match(source, /message\.sessionId !== claims\.sessionId/u);
   assert.match(source, /LANGUAGE_CODE_PATTERN\.test\(message\.language\)/u);

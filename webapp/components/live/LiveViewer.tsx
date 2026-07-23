@@ -17,6 +17,8 @@ import type {
   SpeakerAssignment,
 } from "@/lib/live-contract";
 import { getReconnectDelayMilliseconds, getReconnectStatus } from "./connection-resilience";
+import type { MeetingSummary } from "@/lib/live/summary";
+import MeetingSummaryCard from "./MeetingSummaryCard";
 import MeetingTurnFeed from "./MeetingTurnFeed";
 import { startSpeakCapture, type SpeakSession } from "./speak-client";
 import SpeakerCaption, { resolveSpeakerColor } from "./SpeakerCaption";
@@ -525,6 +527,9 @@ export default function LiveViewer({ compact = false }: { compact?: boolean }) {
   const [speakers, setSpeakers] = useState<SpeakerAssignment[]>([]);
   const [status, setStatus] = useState("연결 전");
   const [floorHolder, setFloorHolder] = useState<string | null>(null);
+  const [isSessionEnded, setIsSessionEnded] = useState(false);
+  const [summaryRecord, setSummaryRecord] = useState<{ summary: MeetingSummary; createdAt: string } | null>(null);
+  const [summaryStatus, setSummaryStatus] = useState<"idle" | "loading" | "missing">("idle");
   const [speakState, setSpeakState] = useState<"idle" | "starting" | "speaking">("idle");
   const speakStateRef = useRef<"idle" | "starting" | "speaking">("idle");
   const speakSessionRef = useRef<SpeakSession | null>(null);
@@ -643,6 +648,25 @@ export default function LiveViewer({ compact = false }: { compact?: boolean }) {
       }
     }, 5_000);
   }, [endSpeaking]);
+
+  const fetchSummary = useCallback(async () => {
+    if (!viewer || !languageRef.current) return;
+    setSummaryStatus("loading");
+    try {
+      const record = await readApi<{ summary: MeetingSummary; createdAt: string }>(await fetch(
+        `/api/live-sessions/${viewer.session.id}/summary?language=${encodeURIComponent(languageRef.current)}`,
+        { headers: { authorization: `Bearer ${viewer.viewerToken}` } },
+      ));
+      setSummaryRecord(record);
+      setSummaryStatus("idle");
+    } catch (summaryError) {
+      setSummaryRecord(null);
+      setSummaryStatus("missing");
+      if (summaryError instanceof ApiRequestError && summaryError.code !== "SUMMARY_NOT_READY") {
+        setError(summaryError.message);
+      }
+    }
+  }, [viewer]);
 
   const sessionType = viewer?.session.sessionType ?? "presentation";
   const outputMode = viewer?.session.outputMode ?? "captions";
@@ -843,7 +867,14 @@ export default function LiveViewer({ compact = false }: { compact?: boolean }) {
     }
     if (event.type === "speaker-legend") setSpeakers(event.speakers);
     if (event.type === "floor") setFloorHolder(event.holder?.displayName ?? null);
-    if (event.type === "session-status") setStatus(captionConnectionLabel(event.status));
+    if (event.type === "session-status") {
+      setStatus(captionConnectionLabel(event.status));
+      if (event.status === "stopped") {
+        setIsSessionEnded(true);
+        setFloorHolder(null);
+        void endSpeaking(false);
+      }
+    }
     if (event.type === "language-status" && event.language === languageRef.current) setStatus(captionConnectionLabel(event.status));
     if (event.type === "language-removed" && event.language === languageRef.current) setError("호스트가 이 언어를 종료했습니다. 다른 언어를 선택하세요.");
     if (event.type === "audio-control" && event.language === languageRef.current) {
@@ -853,7 +884,7 @@ export default function LiveViewer({ compact = false }: { compact?: boolean }) {
       if (event.action === "restart") setStatus("통역 음성 자동 복구 · 계속 수신 중");
     }
     if (event.type === "error") setError(event.message);
-  }, [restartInterpretationAudio]);
+  }, [endSpeaking, restartInterpretationAudio]);
   handleEventRef.current = handleEvent;
 
   const subscribe = useCallback(async (nextLanguage: string, currentViewer: ViewerState) => {
@@ -1146,8 +1177,23 @@ export default function LiveViewer({ compact = false }: { compact?: boolean }) {
         <button type="button" onClick={() => void openPip()} aria-label="Picture in Picture로 열기">PiP</button>
       </header>
       {error && <div className="live-error" role="alert">{error}</div>}
+      {isSessionEnded && (
+        <div className="live-summary-panel">
+          {summaryRecord
+            ? <MeetingSummaryCard summary={summaryRecord.summary} createdAt={summaryRecord.createdAt} />
+            : (
+              <div className="live-summary-empty">
+                <strong>미팅이 종료되었습니다.</strong>
+                <p>{summaryStatus === "missing" ? "아직 요약이 준비되지 않았습니다. 잠시 후 다시 확인하세요." : "호스트가 생성한 AI 요약을 확인할 수 있습니다."}</p>
+                <button type="button" className="accent-btn" disabled={summaryStatus === "loading"} onClick={() => void fetchSummary()}>
+                  {summaryStatus === "loading" ? "요약 불러오는 중…" : "미팅 요약 보기"}
+                </button>
+              </div>
+            )}
+        </div>
+      )}
       {stage}
-      {sessionType === "meeting" && (
+      {sessionType === "meeting" && !isSessionEnded && (
         <div className="live-speak-bar">
           {floorHolder && speakState !== "speaking"
             ? <span className="live-floor-indicator"><span className="live-speaking-waves" aria-hidden="true"><i /><i /><i /></span>{floorHolder} 발언 중</span>

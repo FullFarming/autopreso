@@ -13,11 +13,13 @@ import type {
   SpeakerAssignment,
 } from "@/lib/live-contract";
 import { LANGUAGE_CODES, LANGUAGE_LABELS, toOpenAITranslationLanguageCode } from "@/lib/languageDetect";
+import type { MeetingSummary } from "@/lib/live/summary";
 import {
   startLiveAudioClient,
   type LiveAudioClient,
   type LiveInputSource,
 } from "./live-audio-client";
+import MeetingSummaryCard from "./MeetingSummaryCard";
 import { resolveSpeakerColor } from "./SpeakerCaption";
 
 const LANGUAGE_OPTIONS = LANGUAGE_CODES.map((code) => ({ code, label: LANGUAGE_LABELS[code] }));
@@ -176,6 +178,10 @@ export default function LiveHostDashboard() {
   const [languages, setLanguages] = useState<string[]>(["en"]);
   const [session, setSession] = useState<LiveSession | null>(null);
   const [speakers, setSpeakers] = useState<SpeakerAssignment[]>([]);
+  const [endedSession, setEndedSession] = useState<{ id: string; languages: string[] } | null>(null);
+  const [hostSummary, setHostSummary] = useState<{ summary: MeetingSummary; createdAt: string } | null>(null);
+  const [isSummaryBusy, setIsSummaryBusy] = useState(false);
+  const [summaryMessage, setSummaryMessage] = useState("");
   const [admission, setAdmission] = useState<AdmissionState | null>(null);
   const [invite, setInvite] = useState<InviteState | null>(null);
   const [inviteFeedback, setInviteFeedback] = useState("");
@@ -461,6 +467,9 @@ export default function LiveHostDashboard() {
     try {
       await stopBroadcast();
       await readResponse<unknown>(await fetch(`/api/live-sessions/${session.id}`, { method: "DELETE" }));
+      setEndedSession({ id: session.id, languages: [...session.languages] });
+      setHostSummary(null);
+      setSummaryMessage("");
       setSession(null);
       setAdmission(null);
       setInvite(null);
@@ -471,6 +480,37 @@ export default function LiveHostDashboard() {
       setIsBusy(false);
     }
   }, [session, stopBroadcast]);
+
+  const generateSummaries = useCallback(async () => {
+    if (!endedSession) return;
+    setIsSummaryBusy(true);
+    setSummaryMessage("");
+    setError("");
+    try {
+      let firstSummary: MeetingSummary | null = null;
+      let savedCount = 0;
+      for (const language of endedSession.languages) {
+        try {
+          const result = await readResponse<{ summary: MeetingSummary }>(await fetch(
+            `/api/live-sessions/${endedSession.id}/summary`,
+            { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ language }) },
+          ));
+          savedCount += 1;
+          if (!firstSummary) firstSummary = result.summary;
+        } catch (languageError) {
+          // 한 언어의 실패(예: 발언 기록 없음)가 다른 언어 요약을 막지 않습니다.
+          if (endedSession.languages.length === 1) throw languageError;
+        }
+      }
+      if (savedCount === 0) throw new Error("요약할 발언 기록이 없습니다.");
+      if (firstSummary) setHostSummary({ summary: firstSummary, createdAt: new Date().toISOString() });
+      setSummaryMessage(`${savedCount}개 언어의 요약을 저장했습니다. 참가자도 각자 언어로 볼 수 있습니다.`);
+    } catch (summaryError) {
+      setError(summaryError instanceof Error ? summaryError.message : "요약을 생성할 수 없습니다.");
+    } finally {
+      setIsSummaryBusy(false);
+    }
+  }, [endedSession]);
 
   useEffect(() => {
     if (!sessionId) {
@@ -537,6 +577,26 @@ export default function LiveHostDashboard() {
       </header>
 
       {error && <div className="live-error" role="alert">{error}</div>}
+
+      {endedSession && !session && (
+        <section className="glass live-summary-panel" aria-labelledby="summary-heading">
+          <div className="live-section-heading">
+            <div><span>RECAP</span><h2 id="summary-heading">미팅 요약</h2></div>
+            {summaryMessage ? <small role="status">{summaryMessage}</small> : null}
+          </div>
+          {hostSummary
+            ? <MeetingSummaryCard summary={hostSummary.summary} createdAt={hostSummary.createdAt} />
+            : <p className="live-summary-hint">방금 종료한 미팅의 발언 기록으로 AI 요약을 만들 수 있습니다. 요약은 참가자에게도 각자 언어로 제공됩니다.</p>}
+          <div className="live-summary-actions">
+            <button type="button" className="accent-btn" disabled={isSummaryBusy} onClick={() => void generateSummaries()}>
+              {isSummaryBusy ? "요약 생성 중…" : hostSummary ? "요약 다시 생성" : "AI 요약 생성"}
+            </button>
+            <button type="button" onClick={() => { setEndedSession(null); setHostSummary(null); setSummaryMessage(""); }}>
+              닫기
+            </button>
+          </div>
+        </section>
+      )}
 
       {isConfiguring && (
         <section className="glass live-wizard" aria-labelledby="wizard-heading">
