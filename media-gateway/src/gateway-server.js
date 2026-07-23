@@ -534,7 +534,12 @@ export function createGatewayServer({
         }
         if (isBinary) {
           const holder = floorHolders.get(claims.sessionId);
-          if (!holder || holder.webSocket !== webSocket) throw new Error("VIEWER_BINARY_INPUT_FORBIDDEN");
+          if (!holder || holder.webSocket !== webSocket) {
+            // Frames race speak-ended after a preemption; dropping them keeps
+            // the viewer connection (and their captions) alive.
+            metrics.increment("dropped_audio_frames_total");
+            return;
+          }
           const state = hostSessions.get(claims.sessionId);
           if (!state) throw new Error("SESSION_NOT_STARTED");
           if (data.byteLength !== INPUT_FRAME_BYTES) throw new Error("INVALID_AUDIO_FRAME");

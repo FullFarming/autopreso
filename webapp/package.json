@@ -1,0 +1,35 @@
+{
+  "name": "realtime-noel-web",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "typecheck": "tsc --noEmit",
+    "test:live": "node --experimental-strip-types --experimental-loader ./lib/security/test-typescript-loader.mjs --test components/live/live-audio-client.test.ts lib/live/live-service.test.ts lib/security/live-admission-store.test.ts lib/security/live-security.test.ts"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.108.1",
+    "next": "^15.3.3",
+    "qrcode": "1.5.4",
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.0",
+    "@types/qrcode": "1.5.6",
+    "@types/react": "^19.1.0",
+    "@types/react-dom": "^19.1.0",
+    "autoprefixer": "^10.4.20",
+    "postcss": "^8.5.3",
+    "tailwindcss": "^3.4.17",
+    "typescript": "^5.8.3"
+  },
+  "overrides": {
+    "next": {
+      "postcss": "8.5.20"
+    }
+  }
+}

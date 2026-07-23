@@ -181,11 +181,11 @@ test("a second speaker preempts the current one and non-holders may not send aud
   await waitForJson(speakerB, (message) => message.type === "speak-started");
   assert.equal((await preempted).reason, "preempted");
 
-  // speakerA lost the floor: binary input is forbidden again.
-  const closed = once(speakerA, "close");
+  // speakerA lost the floor: stray frames are dropped without killing the
+  // connection (they race the speak-ended notification).
   speakerA.send(Buffer.alloc(INPUT_FRAME_BYTES));
-  const [code] = await closed;
-  assert.equal(code, 4400);
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  assert.equal(speakerA.readyState, WebSocket.OPEN);
 });
 
 test("disconnecting floor holder releases the floor and a denied take does not disturb viewing", async (context) => {
