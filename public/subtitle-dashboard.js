@@ -1101,7 +1101,24 @@ function sessionDetailElements() {
     summary: document.getElementById("session-detail-summary"),
     generate: document.getElementById("session-detail-generate-summary"),
     audio: document.getElementById("session-detail-audio"),
+    exportButton: document.getElementById("session-detail-export"),
+    tabs: [...document.querySelectorAll("[data-transcript-lang]")],
   };
+}
+
+// Held so a language tab re-renders from what is already loaded instead of
+// refetching the whole transcript.
+const openSessionDetail = { id: "", lines: [], language: "en" };
+
+function renderOpenSessionTranscript() {
+  const els = sessionDetailElements();
+  if (!els.transcript) return;
+  renderSessionTranscript(els.transcript, openSessionDetail.lines, openSessionDetail.language);
+  for (const tab of els.tabs) {
+    const isSelected = tab.dataset.transcriptLang === openSessionDetail.language;
+    tab.classList.toggle("is-selected", isSelected);
+    tab.setAttribute("aria-selected", String(isSelected));
+  }
 }
 
 async function openSessionRecordDetail(session) {
@@ -1111,10 +1128,21 @@ async function openSessionRecordDetail(session) {
     const body = await fetch(`/api/subtitles/sessions/${encodeURIComponent(session.id)}`).then((res) => res.json());
     if (!body.ok) throw new Error(body.error || t("records.loadFailed"));
     const detail = body.data;
-    els.title.textContent = session.title || formatSessionRecordTime(session.startedAt) || session.id;
-    const period = [formatSessionRecordTime(session.startedAt), formatSessionRecordTime(session.endedAt)].filter(Boolean).join(" ~ ");
-    els.meta.textContent = `${period} · ${t("records.lineCount", { count: session.lineCount })}`;
-    renderSessionTranscript(els.transcript, detail.lines ?? []);
+    // Prefer the record's own meta: a calendar chip only carries id and title,
+    // so reading audioSources/lineCount off it lost the audio players entirely.
+    const meta = detail.meta ?? {};
+    const startedAt = meta.startedAt || session.startedAt;
+    const endedAt = meta.endedAt || meta.effectiveEnd || session.endedAt;
+    els.title.textContent = meta.title || session.title || formatSessionRecordTime(startedAt) || session.id;
+    const period = [formatSessionRecordTime(startedAt), formatSessionRecordTime(endedAt)].filter(Boolean).join(" ~ ");
+    els.meta.textContent = `${period} · ${t("records.lineCount", { count: meta.lineCount ?? session.lineCount ?? 0 })}`;
+    openSessionDetail.id = session.id;
+    openSessionDetail.lines = detail.lines ?? [];
+    // Open on whichever language the record actually has, so a KO-only session
+    // does not land on an empty EN tab.
+    const hasEnglish = openSessionDetail.lines.some((line) => transcriptTextForLanguage(line, "en"));
+    openSessionDetail.language = hasEnglish ? "en" : "ko";
+    renderOpenSessionTranscript();
     els.summary.replaceChildren();
     if (detail.summary) {
       renderSessionSummary(els.summary, detail.summary);
@@ -1127,7 +1155,9 @@ async function openSessionRecordDetail(session) {
       els.generate.onclick = () => { void generateSessionDetailSummary(session); };
     }
     els.audio.replaceChildren();
-    for (const source of Array.isArray(session.audioSources) ? session.audioSources : []) {
+    const audioSources = Array.isArray(meta.audioSources) ? meta.audioSources
+      : (Array.isArray(session.audioSources) ? session.audioSources : []);
+    for (const source of audioSources) {
       const label = document.createElement("span");
       label.textContent = source === "system" ? t("records.systemAudio") : t("records.micAudio");
       const player = document.createElement("audio");
@@ -1135,6 +1165,10 @@ async function openSessionRecordDetail(session) {
       player.preload = "none";
       player.src = `/api/subtitles/sessions/${encodeURIComponent(session.id)}/audio/${encodeURIComponent(source)}`;
       els.audio.append(label, player);
+    }
+    if (els.exportButton) {
+      els.exportButton.hidden = openSessionDetail.lines.length === 0;
+      els.exportButton.onclick = () => exportSessionTranscript(session);
     }
     els.page?.classList.add("is-detail-view");
     els.panel.hidden = false;
@@ -1172,9 +1206,29 @@ async function generateSessionDetailSummary(session) {
 
 document.getElementById("session-detail-back")?.addEventListener("click", closeSessionRecordDetail);
 
-function renderSessionTranscript(container, lines) {
+// The requested language may be either side of a turn: a Korean speaker's line
+// has Korean in sourceText and English in translatedText, and an English
+// speaker's line is the reverse. Returns "" when the line has nothing in that
+// language, so the caller can skip it instead of printing the wrong language.
+function transcriptTextForLanguage(line, language) {
+  const source = String(line.sourceText ?? "").trim();
+  const translated = String(line.translatedText ?? "").trim();
+  const sourceLanguage = String(line.sourceLanguage ?? "").slice(0, 2).toLowerCase();
+  const targetLanguage = String(line.targetLanguage ?? "").slice(0, 2).toLowerCase();
+  if (targetLanguage === language && translated) return translated;
+  if (sourceLanguage === language && source) return source;
+  // Language unlabelled (older records, or a record-only 원문 relay): fall back
+  // to whichever side exists so the turn is never silently dropped.
+  if (!sourceLanguage && !targetLanguage) return source || translated;
+  return "";
+}
+
+function renderSessionTranscript(container, lines, language = "en") {
   container.replaceChildren();
-  if (!lines.length) {
+  const inLanguage = lines
+    .map((line) => ({ line, text: transcriptTextForLanguage(line, language) }))
+    .filter((entry) => entry.text);
+  if (!inLanguage.length) {
     const empty = document.createElement("p");
     empty.textContent = t("records.noLines");
     container.append(empty);
@@ -1182,7 +1236,7 @@ function renderSessionTranscript(container, lines) {
   }
   const list = document.createElement("ol");
   list.className = "session-transcript-lines";
-  for (const line of lines) {
+  for (const { line, text: lineText } of inLanguage) {
     const item = document.createElement("li");
     const stamp = document.createElement("time");
     const totalSeconds = Math.floor((line.elapsedMs ?? 0) / 1000);
@@ -1195,9 +1249,7 @@ function renderSessionTranscript(container, lines) {
       item.append(speaker);
     }
     const text = document.createElement("span");
-    text.textContent = line.sourceText && line.translatedText && line.sourceText !== line.translatedText
-      ? `${line.sourceText} — ${line.translatedText}`
-      : (line.sourceText || line.translatedText || "");
+    text.textContent = lineText;
     item.append(text);
     list.append(item);
   }
@@ -3057,4 +3109,40 @@ if (window.realtimeNoelDesktop?.onLiveCallCaption) {
       translatedText: text,
     }));
   });
+}
+
+// ── Session detail: language tabs + per-session export ───────────────────────
+for (const tab of document.querySelectorAll("[data-transcript-lang]")) {
+  tab.addEventListener("click", () => {
+    openSessionDetail.language = tab.dataset.transcriptLang === "ko" ? "ko" : "en";
+    renderOpenSessionTranscript();
+  });
+}
+
+function exportSessionTranscript(session) {
+  const rows = [["elapsed", "speaker", "source", "translation", "sourceLanguage", "targetLanguage"]];
+  for (const line of openSessionDetail.lines) {
+    const totalSeconds = Math.floor((line.elapsedMs ?? 0) / 1000);
+    rows.push([
+      `${String(Math.floor(totalSeconds / 60)).padStart(2, "0")}:${String(totalSeconds % 60).padStart(2, "0")}`,
+      line.speaker ?? "",
+      line.sourceText ?? "",
+      line.translatedText ?? "",
+      line.sourceLanguage ?? "",
+      line.targetLanguage ?? "",
+    ]);
+  }
+  // Excel opens UTF-8 CSV correctly only with a BOM; without it Korean arrives
+  // as mojibake.
+  const csv = "\ufeff" + rows
+    .map((row) => row.map((cell) => `"${String(cell).replace(/"/gu, '""')}"`).join(","))
+    .join("\r\n");
+  const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  const stamp = (session.startedAt ?? "").slice(0, 16).replace(/[:T]/gu, "-");
+  link.download = `${(session.title || session.id).slice(0, 60)}-${stamp}.csv`;
+  link.click();
+  URL.revokeObjectURL(url);
 }

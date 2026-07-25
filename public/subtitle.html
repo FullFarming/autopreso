@@ -241,6 +241,31 @@
                 </div>
               </section>
             </section>
+
+            <!-- These follow the RUNNING session, not a record: topics are grouped
+                 as the talk progresses and lines land here as they are confirmed.
+                 They sat under Records, where they described nothing the page was
+                 about -- a record's own lines are its transcript and its topics
+                 are its summary chapters. -->
+            <section class="history-panel workspace-panel">
+              <div class="panel-heading">
+                <span data-i18n="history.topics">주제</span>
+                <span class="panel-heading-actions">
+                  <button id="export-history" type="button" class="secondary compact" data-i18n="history.export">Excel</button>
+                  <button id="clear-history" type="button" class="secondary compact" data-i18n="history.clear">기록 지우기</button>
+                </span>
+              </div>
+              <div id="recorder-status" class="field-status" role="status" data-i18n="history.recorderPreparing">기록 준비 중</div>
+              <div id="topic-list" class="topic-list" aria-live="polite"></div>
+            </section>
+
+            <section id="translation-log-panel" class="translation-log-panel workspace-panel">
+              <div class="panel-heading">
+                <span data-i18n="history.committed">확정된 자막</span>
+                <strong id="translation-count">0</strong>
+              </div>
+              <div id="translation-log" class="translation-log" data-i18n-aria="history.committedLabel" aria-label="날짜별 확정 자막 기록" aria-live="polite"></div>
+            </section>
           </div>
         </div>
 
@@ -367,12 +392,16 @@
               <button id="session-detail-back" type="button" class="secondary compact" data-i18n="records.back">← 목록으로</button>
               <span id="session-detail-title"></span>
               <span id="session-detail-meta" class="session-detail-meta"></span>
+              <button id="session-detail-export" type="button" class="secondary compact" data-i18n="records.export">Excel</button>
             </div>
             <div id="session-detail-audio" class="session-record-audio"></div>
             <div class="session-detail-columns">
               <section class="session-detail-column" data-i18n-aria="records.transcriptLabel" aria-label="원문 기록">
-                <h3 data-i18n="records.transcript">원문</h3>
-                <div id="session-detail-transcript" class="session-record-detail"></div>
+                <div class="session-detail-tabs" role="tablist" data-i18n-aria="records.transcriptLangLabel" aria-label="원문 언어">
+                  <button type="button" role="tab" data-transcript-lang="en" class="is-selected" aria-selected="true">EN</button>
+                  <button type="button" role="tab" data-transcript-lang="ko" aria-selected="false">KO</button>
+                </div>
+                <div id="session-detail-transcript" class="session-record-detail" role="tabpanel"></div>
               </section>
               <section class="session-detail-column" data-i18n-aria="records.summaryLabel" aria-label="AI 요약">
                 <h3 data-i18n="records.summary">AI 요약</h3>
@@ -382,25 +411,6 @@
             </div>
           </section>
 
-          <section class="history-panel workspace-panel">
-            <div class="panel-heading">
-              <span data-i18n="history.topics">주제</span>
-              <span class="panel-heading-actions">
-                <button id="export-history" type="button" class="secondary compact" data-i18n="history.export">Excel</button>
-                <button id="clear-history" type="button" class="secondary compact" data-i18n="history.clear">기록 지우기</button>
-              </span>
-            </div>
-            <div id="recorder-status" class="field-status" role="status" data-i18n="history.recorderPreparing">기록 준비 중</div>
-            <div id="topic-list" class="topic-list" aria-live="polite"></div>
-          </section>
-
-          <section id="translation-log-panel" class="translation-log-panel workspace-panel">
-            <div class="panel-heading">
-              <span data-i18n="history.committed">확정된 자막</span>
-              <strong id="translation-count">0</strong>
-            </div>
-            <div id="translation-log" class="translation-log" data-i18n-aria="history.committedLabel" aria-label="날짜별 확정 자막 기록" aria-live="polite"></div>
-          </section>
         </div>
 
         <!-- ══════════════ PAGE · SETTINGS ══════════════ -->

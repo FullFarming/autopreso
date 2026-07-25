@@ -4490,9 +4490,7 @@ body.theme-light .subtitle-app-shell video {
 }
 
 /* Detail subview: hide the list/topic/log panels, show 원문 + 요약 columns. */
-#records-page.is-detail-view #session-records-panel,
-#records-page.is-detail-view .history-panel,
-#records-page.is-detail-view #translation-log-panel { display: none; }
+#records-page.is-detail-view #session-records-panel { display: none; }
 
 .session-record-detail-page {
   display: grid;

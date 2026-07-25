@@ -666,3 +666,52 @@ test("a participant's mirrored caption is recorded on the host with attribution"
     await new Promise((resolve) => httpServer.close(resolve));
   }
 });
+
+test("the record detail keeps 원문 per language and pulls audio from the record's own meta", async () => {
+  const [html, dashboard] = await Promise.all([
+    fs.readFile(path.join(import.meta.dirname, "..", "public/subtitle.html"), "utf8"),
+    fs.readFile(path.join(import.meta.dirname, "..", "public/subtitle-dashboard.js"), "utf8"),
+  ]);
+  // Left side: one tab per language. Right side: the AI summary.
+  assert.match(html, /data-transcript-lang="en"/u);
+  assert.match(html, /data-transcript-lang="ko"/u);
+  assert.match(html, /id="session-detail-summary"/u);
+  assert.match(html, /id="session-detail-export"/u);
+  assert.match(dashboard, /function transcriptTextForLanguage/u);
+
+  // A calendar chip carries only id and title, so the detail must read
+  // audioSources and lineCount off the fetched record or the audio players
+  // silently vanish -- which is exactly what happened.
+  assert.match(dashboard, /Array\.isArray\(meta\.audioSources\)/u);
+
+  // The live topic/committed panels follow the RUNNING session; under Records
+  // they described nothing the page was about.
+  const recordsPage = html.slice(html.indexOf('data-workspace-page="records"'), html.indexOf('data-workspace-page="settings"'));
+  assert.doesNotMatch(recordsPage, /history-panel|translation-log-panel/u);
+  const captionsPage = html.slice(html.indexOf('data-workspace-page="captions"'), html.indexOf('data-workspace-page="livecall"'));
+  assert.match(captionsPage, /history-panel/u);
+  assert.match(captionsPage, /translation-log-panel/u);
+});
+
+test("a language tab shows whichever side of a turn is in that language", async () => {
+  const dashboard = await fs.readFile(path.join(import.meta.dirname, "..", "public/subtitle-dashboard.js"), "utf8");
+  const body = dashboard.slice(
+    dashboard.indexOf("function transcriptTextForLanguage"),
+    dashboard.indexOf("function renderSessionTranscript"),
+  );
+  const transcriptTextForLanguage = new Function(`${body}; return transcriptTextForLanguage;`)();
+
+  // Korean speaker: Korean is the SOURCE, English the translation.
+  const koTurn = { sourceText: "회복되었습니다", translatedText: "It recovered.", sourceLanguage: "ko", targetLanguage: "en" };
+  assert.equal(transcriptTextForLanguage(koTurn, "en"), "It recovered.");
+  assert.equal(transcriptTextForLanguage(koTurn, "ko"), "회복되었습니다");
+  // English speaker: the same line, reversed. A naive "translatedText for EN"
+  // rule would print Korean on the English tab.
+  const enTurn = { sourceText: "What drove it?", translatedText: "무엇이 이끌었나요?", sourceLanguage: "en", targetLanguage: "ko" };
+  assert.equal(transcriptTextForLanguage(enTurn, "en"), "What drove it?");
+  assert.equal(transcriptTextForLanguage(enTurn, "ko"), "무엇이 이끌었나요?");
+  // Unlabelled (older records, record-only 원문 relay): never drop the turn.
+  assert.equal(transcriptTextForLanguage({ sourceText: "원문만", translatedText: "" }, "en"), "원문만");
+  // A line with nothing in that language is skipped, not mislabelled.
+  assert.equal(transcriptTextForLanguage({ sourceText: "只有中文", sourceLanguage: "zh", targetLanguage: "zh" }, "en"), "");
+});
