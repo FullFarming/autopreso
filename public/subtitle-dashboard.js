@@ -3,6 +3,7 @@ import {
   createTranslatedAudioGuard,
   shouldGateTranslatedAudioInput,
 } from "./subtitle-audio-player.js";
+import { buildMonthGrid, buildTimeGrid } from "./records-calendar.js";
 
 const SAMPLE_RATE = 24000;
 const LIVE_AUDIO_CHUNK_DURATION_MS = 100;
@@ -820,13 +821,207 @@ function setSessionRecordsStatus(message, isError = false) {
 }
 
 async function loadSessionRecords() {
-  if (!getSessionRecordsList()) return;
+  if (!getSessionRecordsList() && !document.getElementById("records-cal-grid")) return;
   try {
     const body = await fetch("/api/subtitles/sessions").then((res) => res.json());
-    if (body.ok) renderSessionRecords(body.data ?? []);
+    if (!body.ok) return;
+    const sessions = body.data ?? [];
+    // Only Live Call meetings have a meeting time worth placing on a calendar;
+    // caption-only sessions go to the plain list below it.
+    renderRecordsCalendar(sessions.filter((session) => session.kind === "live-call"));
+    renderSessionRecords(sessions.filter((session) => session.kind !== "live-call"));
   } catch {
     // Server unavailable — keep whatever is on screen.
   }
+}
+
+// ── Records calendar: Outlook-style month / week / day over Live Call meetings,
+// anchored on today. Placement maths lives in records-calendar.js so it can be
+// tested without a DOM; this only renders. ───────────────────────────────────
+
+const recordsCalendar = { view: "month", anchor: new Date(), meetings: [] };
+const RECORDS_WEEKDAYS = ["일", "월", "화", "수", "목", "금", "토"];
+const RECORDS_DAY_START_HOUR = 7;
+const RECORDS_HOUR_HEIGHT = 44;
+
+function formatRecordsClock(minutes) {
+  const hour = String(Math.floor(minutes / 60)).padStart(2, "0");
+  const minute = String(Math.round(minutes % 60)).padStart(2, "0");
+  return `${hour}:${minute}`;
+}
+
+function renderRecordsCalendar(meetings) {
+  if (Array.isArray(meetings)) recordsCalendar.meetings = meetings;
+  const grid = document.getElementById("records-cal-grid");
+  if (!grid) return;
+  const period = document.getElementById("records-cal-period");
+  const { anchor, view } = recordsCalendar;
+
+  if (period) {
+    if (view === "month") {
+      period.textContent = `${anchor.getFullYear()}년 ${anchor.getMonth() + 1}월`;
+    } else if (view === "day") {
+      period.textContent = `${anchor.getMonth() + 1}월 ${anchor.getDate()}일 ${RECORDS_WEEKDAYS[anchor.getDay()]}`;
+    } else {
+      const week = buildTimeGrid({ anchor, days: 7, meetings: [] });
+      const first = week.days[0].date;
+      const last = week.days[6].date;
+      period.textContent = `${first.getMonth() + 1}월 ${first.getDate()}일 – ${last.getMonth() + 1}월 ${last.getDate()}일`;
+    }
+  }
+
+  grid.replaceChildren();
+  grid.dataset.view = view;
+  if (view === "month") grid.append(buildRecordsMonth());
+  else grid.append(buildRecordsTimeGrid(view === "week" ? 7 : 1));
+
+  const count = recordsCalendar.meetings.length;
+  setSessionRecordsStatus(count ? `미팅 ${count}건` : "");
+}
+
+function buildRecordsMonth() {
+  const wrap = document.createElement("div");
+  wrap.className = "records-month";
+
+  const head = document.createElement("div");
+  head.className = "records-month-head";
+  for (const label of RECORDS_WEEKDAYS) {
+    const cell = document.createElement("span");
+    cell.textContent = label;
+    head.append(cell);
+  }
+  wrap.append(head);
+
+  const { weeks } = buildMonthGrid({ anchor: recordsCalendar.anchor, meetings: recordsCalendar.meetings });
+  const body = document.createElement("div");
+  body.className = "records-month-body";
+  body.style.setProperty("--records-week-count", String(weeks.length));
+  for (const week of weeks) {
+    for (const cell of week) {
+      const dayCell = document.createElement("div");
+      dayCell.className = "records-month-cell";
+      dayCell.classList.toggle("is-outside", !cell.isCurrentMonth);
+      dayCell.classList.toggle("is-today", cell.isToday);
+
+      const number = document.createElement("span");
+      number.className = "records-month-date";
+      number.textContent = String(cell.date.getDate());
+      dayCell.append(number);
+
+      for (const segment of cell.meetings) {
+        dayCell.append(buildRecordsChip(segment));
+      }
+      body.append(dayCell);
+    }
+  }
+  wrap.append(body);
+  return wrap;
+}
+
+function buildRecordsChip(segment) {
+  const chip = document.createElement("button");
+  chip.type = "button";
+  chip.className = "records-chip";
+  chip.classList.toggle("is-unterminated", Boolean(segment.isUnterminated));
+  const time = document.createElement("b");
+  time.textContent = segment.isContinuation ? "계속" : formatRecordsClock(segment.startMinute);
+  const label = document.createElement("span");
+  label.textContent = segment.title || "제목 없음";
+  chip.append(time, label);
+  chip.addEventListener("click", () => { void openSessionRecordDetail({ id: segment.id, title: segment.title }); });
+  return chip;
+}
+
+function buildRecordsTimeGrid(days) {
+  const wrap = document.createElement("div");
+  wrap.className = "records-time";
+  wrap.style.setProperty("--records-hour-height", `${RECORDS_HOUR_HEIGHT}px`);
+  wrap.style.setProperty("--records-day-count", String(days));
+
+  const grid = buildTimeGrid({ anchor: recordsCalendar.anchor, days, meetings: recordsCalendar.meetings });
+  // The gutter normally opens at 07:00, but a meeting earlier than that must be
+  // drawn where it happened -- clamping it to the first row would show a 00:30
+  // call sitting at 07:00.
+  const earliest = grid.days.reduce(
+    (min, day) => day.segments.reduce((inner, segment) => Math.min(inner, segment.startMinute), min),
+    RECORDS_DAY_START_HOUR * 60,
+  );
+  const startHour = Math.max(0, Math.min(RECORDS_DAY_START_HOUR, Math.floor(earliest / 60)));
+
+  const head = document.createElement("div");
+  head.className = "records-time-head";
+  head.append(document.createElement("span"));
+  for (const day of grid.days) {
+    const label = document.createElement("span");
+    label.className = "records-time-day";
+    label.classList.toggle("is-today", day.isToday);
+    label.textContent = days === 1
+      ? `${day.date.getMonth() + 1}.${day.date.getDate()} ${RECORDS_WEEKDAYS[day.date.getDay()]}`
+      : `${RECORDS_WEEKDAYS[day.date.getDay()]} ${day.date.getDate()}`;
+    head.append(label);
+  }
+  wrap.append(head);
+
+  const body = document.createElement("div");
+  body.className = "records-time-body";
+
+  const gutter = document.createElement("div");
+  gutter.className = "records-time-gutter";
+  for (let hour = startHour; hour < 24; hour += 1) {
+    const mark = document.createElement("span");
+    mark.textContent = `${String(hour).padStart(2, "0")}시`;
+    gutter.append(mark);
+  }
+  body.append(gutter);
+
+  for (const day of grid.days) {
+    const column = document.createElement("div");
+    column.className = "records-time-column";
+    for (let hour = startHour; hour < 24; hour += 1) {
+      const slot = document.createElement("div");
+      slot.className = "records-time-slot";
+      column.append(slot);
+    }
+    for (const segment of day.segments) {
+      column.append(buildRecordsBlock(segment, segment.clusterLaneCount ?? day.laneCount, startHour));
+    }
+    body.append(column);
+  }
+  wrap.append(body);
+  return wrap;
+}
+
+function buildRecordsBlock(segment, laneCount, startHour) {
+  const block = document.createElement("button");
+  block.type = "button";
+  block.className = "records-block";
+  block.classList.toggle("is-unterminated", Boolean(segment.isUnterminated));
+  // Offsets are minutes from the gutter's first hour, which the caller widened
+  // if any meeting starts earlier than the default open time.
+  const topMinutes = Math.max(0, segment.startMinute - startHour * 60);
+  const heightMinutes = Math.max(12, segment.endMinute - Math.max(segment.startMinute, startHour * 60));
+  block.style.top = `calc(${topMinutes} / 60 * var(--records-hour-height))`;
+  block.style.height = `calc(${heightMinutes} / 60 * var(--records-hour-height))`;
+  const width = 100 / Math.max(1, laneCount);
+  block.style.left = `${segment.lane * width}%`;
+  block.style.width = `calc(${width}% - 3px)`;
+
+  const time = document.createElement("b");
+  time.textContent = `${formatRecordsClock(segment.startMinute)}–${formatRecordsClock(segment.endMinute)}`;
+  const label = document.createElement("span");
+  label.textContent = segment.title || "제목 없음";
+  block.append(time, label);
+  block.addEventListener("click", () => { void openSessionRecordDetail({ id: segment.id, title: segment.title }); });
+  return block;
+}
+
+function stepRecordsCalendar(direction) {
+  const next = new Date(recordsCalendar.anchor.getTime());
+  if (recordsCalendar.view === "month") next.setMonth(next.getMonth() + direction);
+  else if (recordsCalendar.view === "week") next.setDate(next.getDate() + 7 * direction);
+  else next.setDate(next.getDate() + direction);
+  recordsCalendar.anchor = next;
+  renderRecordsCalendar();
 }
 
 function formatSessionRecordTime(iso) {
@@ -842,63 +1037,40 @@ function renderSessionRecords(sessions) {
   const list = getSessionRecordsList();
   if (!list) return;
   list.replaceChildren();
-  if (!sessions.length) {
-    setSessionRecordsStatus("아직 기록된 세션이 없습니다. 세션을 시작하면 시간순 원문이 자동으로 기록됩니다.");
-    return;
-  }
-  setSessionRecordsStatus(`${sessions.length}개 세션이 기록되어 있습니다.`);
+  const details = document.getElementById("records-local-sessions");
+  // Nothing to reach means nothing to show: the disclosure hides entirely rather
+  // than explaining its own emptiness.
+  if (details) details.hidden = sessions.length === 0;
   for (const session of sessions) {
     list.append(buildSessionRecordCard(session));
   }
 }
 
-// Spotify-shelf card: album-art style cover (deterministic gradient from the
-// title) + title/meta below. The whole card opens the session detail view
-// (원문 + AI 요약 side by side).
-const SESSION_COVER_GRADIENTS = [
-  "linear-gradient(135deg, #3b4b8f, #16182b)",
-  "linear-gradient(135deg, #7a3b5e, #221019)",
-  "linear-gradient(135deg, #2f6f5e, #0f1f1a)",
-  "linear-gradient(135deg, #8f6a2f, #241a0c)",
-  "linear-gradient(135deg, #4f3b8f, #150f2b)",
-  "linear-gradient(135deg, #3b7a8f, #0c1d22)",
-];
-
-function sessionCoverStyle(seedText) {
-  let hash = 0;
-  const seed = String(seedText ?? "");
-  for (let i = 0; i < seed.length; i += 1) hash = ((hash << 5) - hash + seed.charCodeAt(i)) | 0;
-  return SESSION_COVER_GRADIENTS[Math.abs(hash) % SESSION_COVER_GRADIENTS.length];
-}
-
+// Caption-only sessions: a plain Toss-style list row. They have no meeting time,
+// so they are never placed on the calendar -- the record still has to be
+// reachable, which is what this list is for.
 function buildSessionRecordCard(session) {
-  const card = document.createElement("button");
-  card.type = "button";
-  card.className = "session-record-card";
-
-  const title = session.title || formatSessionRecordTime(session.startedAt) || session.id;
-  const cover = document.createElement("span");
-  cover.className = "session-record-cover";
-  cover.style.background = sessionCoverStyle(title);
-  const coverMark = document.createElement("strong");
-  coverMark.textContent = title.trim().slice(0, 2);
-  const coverBadge = document.createElement("em");
-  coverBadge.textContent = session.hasSummary ? "요약 완료" : "요약 대기";
-  coverBadge.classList.toggle("has-summary", Boolean(session.hasSummary));
-  cover.append(coverMark, coverBadge);
+  const row = document.createElement("button");
+  row.type = "button";
+  row.className = "records-local-row";
 
   const heading = document.createElement("div");
-  heading.className = "session-record-heading";
+  heading.className = "records-local-heading";
   const titleEl = document.createElement("strong");
-  titleEl.textContent = title;
+  titleEl.textContent = session.title || formatSessionRecordTime(session.startedAt) || session.id;
   const meta = document.createElement("span");
-  const period = [formatSessionRecordTime(session.startedAt), formatSessionRecordTime(session.endedAt)].filter(Boolean).join(" ~ ");
+  const period = [formatSessionRecordTime(session.startedAt), formatSessionRecordTime(session.endedAt)]
+    .filter(Boolean).join(" – ");
   meta.textContent = `${period} · ${session.lineCount}줄`;
   heading.append(titleEl, meta);
 
-  card.append(cover, heading);
-  card.addEventListener("click", () => { void openSessionRecordDetail(session); });
-  return card;
+  const right = document.createElement("span");
+  right.className = "records-local-right";
+  right.textContent = session.hasSummary ? "요약" : "";
+
+  row.append(heading, right);
+  row.addEventListener("click", () => { void openSessionRecordDetail(session); });
+  return row;
 }
 
 // ── Session detail subview: hides the record panels and shows the source
@@ -1061,6 +1233,23 @@ function renderSessionSummary(container, summary) {
 }
 
 document.getElementById("refresh-session-records")?.addEventListener("click", () => void loadSessionRecords());
+document.getElementById("records-cal-prev")?.addEventListener("click", () => stepRecordsCalendar(-1));
+document.getElementById("records-cal-next")?.addEventListener("click", () => stepRecordsCalendar(1));
+document.getElementById("records-cal-today")?.addEventListener("click", () => {
+  recordsCalendar.anchor = new Date();
+  renderRecordsCalendar();
+});
+for (const button of document.querySelectorAll("[data-records-view]")) {
+  button.addEventListener("click", () => {
+    recordsCalendar.view = button.dataset.recordsView ?? "month";
+    for (const sibling of document.querySelectorAll("[data-records-view]")) {
+      const isSelected = sibling === button;
+      sibling.classList.toggle("is-selected", isSelected);
+      sibling.setAttribute("aria-pressed", String(isSelected));
+    }
+    renderRecordsCalendar();
+  });
+}
 
 function connectWebSocket() {
   const proto = location.protocol === "https:" ? "wss" : "ws";

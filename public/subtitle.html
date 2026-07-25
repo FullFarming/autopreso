@@ -328,13 +328,37 @@
 
         <!-- ══════════════ PAGE · RECORDS ══════════════ -->
         <div class="workspace-page" data-workspace-page="records" id="records-page" aria-label="Caption records">
-          <section id="session-records-panel" class="workspace-panel session-records-panel">
-            <div class="panel-heading">
-              <span>세션 기록 · AI 요약</span>
-              <button id="refresh-session-records" type="button" class="secondary compact">새로고침</button>
+          <!-- Records as a calendar: Live Call meetings sit at their real start
+               time, month / week / day, anchored on today. Clicking a meeting
+               opens the existing detail subview (원문 + 요약). Caption-only
+               sessions have no meeting time, so they stay in a separate list. -->
+          <section id="session-records-panel" class="workspace-panel records-cal-panel">
+            <div class="records-cal-toolbar">
+              <div class="records-cal-nav">
+                <button id="records-cal-prev" type="button" class="records-cal-step" aria-label="이전 기간">
+                  <svg viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10 3.5 5.5 8l4.5 4.5"/></svg>
+                </button>
+                <button id="records-cal-today" type="button" class="records-cal-today">오늘</button>
+                <button id="records-cal-next" type="button" class="records-cal-step" aria-label="다음 기간">
+                  <svg viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 3.5 10.5 8 6 12.5"/></svg>
+                </button>
+              </div>
+              <h3 id="records-cal-period" class="records-cal-period" aria-live="polite"></h3>
+              <div class="records-cal-views" role="group" aria-label="보기 단위">
+                <button type="button" data-records-view="month" class="is-selected" aria-pressed="true">월</button>
+                <button type="button" data-records-view="week" aria-pressed="false">주</button>
+                <button type="button" data-records-view="day" aria-pressed="false">일</button>
+              </div>
+              <button id="refresh-session-records" type="button" class="records-cal-step" aria-label="새로고침">
+                <svg viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" aria-hidden="true"><path d="M13.4 6.4A5.6 5.6 0 1 0 13.9 9"/><path d="M13.6 2.6v3.8H9.8" stroke-linejoin="round"/></svg>
+              </button>
             </div>
-            <div id="session-records-status" class="field-status" role="status" aria-live="polite">세션을 시작하면 시간순 원문이 기록되고, 끝나면 AI 요약이 생성됩니다.</div>
-            <div id="session-records-list" class="session-records-list" aria-live="polite"></div>
+            <div id="records-cal-grid" class="records-cal-grid" aria-live="polite"></div>
+            <div id="session-records-status" class="records-cal-status" role="status" aria-live="polite"></div>
+            <details id="records-local-sessions" class="records-local">
+              <summary>자막 세션</summary>
+              <div id="session-records-list" class="records-local-list" aria-live="polite"></div>
+            </details>
           </section>
 
           <!-- Session detail: opened by clicking a record card. Source
