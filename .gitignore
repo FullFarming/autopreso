@@ -26,8 +26,12 @@ pnpm-debug.log*
 # Test and build output
 coverage/
 dist/
-build/
 .nyc_output/
+# build/ holds electron-builder signing config, not build output. Exclude its
+# contents rather than the directory itself -- git cannot re-include a file
+# whose parent directory is excluded, so `build/` + `!build/...` would not work.
+build/*
+!build/entitlements.mac.plist
 
 # Python cache and virtual environments
 __pycache__/
