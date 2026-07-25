@@ -205,7 +205,7 @@ function makeCtx() {
     events,
     source: "mic",
     targetLanguage: "ko",
-    outputMode: "captions_audio",
+    outputMode: "audio",
     getSourceText: () => sourceText,
     setSourceText: (value) => { sourceText = value; },
     getTranslatedText: () => translatedText,

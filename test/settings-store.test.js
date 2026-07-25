@@ -55,14 +55,14 @@ test("createSettingsStore persists and validates interpreted audio settings", as
   await store.save({
     subtitle: {
       translationLanguages: ["en", "ko", "ja"],
-      outputMode: "captions_audio",
+      outputMode: "audio",
       audioLanguage: "ja",
       audioVolume: 0.35,
     },
   });
 
   const saved = await store.load();
-  assert.equal(saved.subtitle.outputMode, "captions_audio");
+  assert.equal(saved.subtitle.outputMode, "audio");
   assert.equal(saved.subtitle.audioLanguage, "ja");
   assert.equal(saved.subtitle.audioVolume, 0.35);
 
@@ -636,4 +636,42 @@ test("validateApiKeys accepts an absent section and every known slot", () => {
   assert.doesNotThrow(() => validateApiKeys(undefined));
   assert.doesNotThrow(() => validateApiKeys({}));
   assert.doesNotThrow(() => validateApiKeys({ openai: "", openaiSecondary: "a", gemini: "b", geminiSecondary: "c" }));
+});
+
+
+// Mixed caption+audio output is retired: one output per session. Rejecting it on
+// write is not enough on its own -- an existing settings.json may already hold
+// it, and throwing on load would brick the file (a failure this store has had
+// before), so the read path migrates instead.
+test("the retired captions_audio output mode is rejected on write", () => {
+  assert.throws(
+    () => validateSubtitleSettings({ outputMode: "captions_audio" }),
+    /outputMode must be captions or audio/u,
+  );
+  // The two surviving modes still validate.
+  validateSubtitleSettings({ outputMode: "captions" });
+  validateSubtitleSettings({
+    outputMode: "audio",
+    translationProvider: "gemini",
+    translationLanguages: ["en", "ko"],
+    audioLanguage: "en",
+    audioVolume: 0.5,
+  });
+});
+
+test("an existing captions_audio settings file migrates to captions instead of failing to load", async () => {
+  const filePath = await tempPath();
+  await fs.writeFile(filePath, JSON.stringify({
+    subtitle: { outputMode: "captions_audio", translationLanguages: ["en", "ko"], audioLanguage: "ko" },
+  }));
+
+  const store = createSettingsStore({ filePath, env: {}, readCodexAuth: noCodexAuth });
+  const loaded = await store.load();
+  assert.equal(loaded.subtitle.outputMode, "captions", "the mixed mode degrades to captions, the safe half");
+
+  // And the migration is durable: saving afterwards must not throw on the value
+  // it just read.
+  await store.save({ subtitle: { translationLanguages: ["en", "ko"] } });
+  const reloaded = await store.load();
+  assert.equal(reloaded.subtitle.outputMode, "captions");
 });

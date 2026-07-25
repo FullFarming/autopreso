@@ -1857,7 +1857,9 @@ export function normalizeSubtitleSettings(settings = {}) {
     ? merged
     : { ...merged, translationLanguages: undefined };
   const translationLanguages = normalizeTranslationLanguages(translationLanguageSource);
-  const outputMode = ["captions", "captions_audio", "audio"].includes(merged.outputMode)
+  // captions_audio is retired, so it is not accepted here either -- a stale value
+  // falls back to the default instead of reviving the mixed mode.
+  const outputMode = ["captions", "audio"].includes(merged.outputMode)
     ? merged.outputMode
     : DEFAULT_SUBTITLE_SETTINGS.outputMode;
   const normalizedAudioLanguage = normalizeLanguageCode(merged.audioLanguage);

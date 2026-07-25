@@ -365,7 +365,12 @@ test("sticky consensus has a bounded long-term fallback when its sibling channel
   }
 });
 
-test("Gemini provider codes do not make cumulative source text pin KO to EN to KO switching", async () => {
+// KO -> EN -> KO in one session. Two behaviours used to be asserted together
+// under the mixed caption+audio mode: captions must not pin the source language
+// to the first segment, and the stale interpreted-audio queue must be dropped at
+// the boundary. That mode is retired, so the scenario runs once per surviving
+// mode and each asserts the half that mode can actually produce.
+async function runDirectionSwitchScenario(outputMode) {
   const sockets = [];
   const broadcasts = [];
   const manager = createSubtitleRealtimeManager({
@@ -377,7 +382,7 @@ test("Gemini provider codes do not make cumulative source text pin KO to EN to K
           translationProvider: "gemini",
           inputMode: "mic",
           languagePair: { a: "en", b: "ko" },
-          outputMode: "captions_audio",
+          outputMode,
           audioLanguage: "en",
         },
       }),
@@ -413,6 +418,12 @@ test("Gemini provider codes do not make cumulative source text pin KO to EN to K
     serverContent: { outputTranscription: { text: "We return to Korean to explain the hotel investment strategy." } },
   }));
 
+  await manager.stop();
+  return broadcasts;
+}
+
+test("Gemini provider codes do not make cumulative source text pin KO to EN to KO switching", async () => {
+  const broadcasts = await runDirectionSwitchScenario("captions");
   const englishPartials = broadcasts.filter((message) => message.type === "subtitle:partial" && message.targetLanguage === "en");
   assert.equal(englishPartials.length >= 2, true);
   assert.equal(englishPartials.at(-1).sourceLanguage, "ko");
@@ -422,6 +433,10 @@ test("Gemini provider codes do not make cumulative source text pin KO to EN to K
     false,
     "same-language EN target output must never be emitted during the middle English segment",
   );
+});
+
+test("the stale interpreted-audio queue is cleared at a direction boundary", async () => {
+  const broadcasts = await runDirectionSwitchScenario("audio");
   assert.equal(
     broadcasts.some((message) => message.type === "subtitle:audio-control"
       && message.targetLanguage === "en"
@@ -429,5 +444,4 @@ test("Gemini provider codes do not make cumulative source text pin KO to EN to K
     true,
     "the stale interpreted-audio queue is cleared at the direction boundary",
   );
-  await manager.stop();
 });

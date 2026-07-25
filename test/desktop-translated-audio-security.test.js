@@ -103,7 +103,7 @@ class FakeAudioContext {
 }
 
 test("Gemini streams canonical PCM16 mono 24 kHz audio without waiting for a transcript boundary", () => {
-  for (const outputMode of ["captions_audio", "audio"]) {
+  for (const outputMode of ["audio"]) {
     const result = collectGeminiEvents(modelTurn({
       mimeType: "audio/pcm;rate=24000",
       data: VALID_PCM,
@@ -302,7 +302,11 @@ test("subtitle audio settings reject provider confusion, missing language, and i
     audioVolume: 0.75,
   };
   assert.doesNotThrow(() => validateSubtitleSettings(validAudio));
-  assert.doesNotThrow(() => validateSubtitleSettings({ ...validAudio, outputMode: "captions_audio" }));
+  // Mixed caption+audio output is retired: rejected on write, migrated on read.
+  assert.throws(
+    () => validateSubtitleSettings({ ...validAudio, outputMode: "captions_audio" }),
+    /outputMode must be captions or audio/u,
+  );
   assert.throws(() => validateSubtitleSettings({ outputMode: "captions", translationProvider: "openai" }), /remain gemini/u);
 
   for (const settings of [

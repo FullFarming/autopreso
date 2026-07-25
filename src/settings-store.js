@@ -230,6 +230,13 @@ function migrateSettings(settings) {
     settings.subtitle.fontFamily = DEFAULT_SUBTITLE_SETTINGS.fontFamily;
   }
   settings.subtitle.translationProvider = "gemini";
+  // Mixed caption+audio output is retired. Any settings.json written before that
+  // still holds it, and validateSubtitleSettings now rejects it — so migrate on
+  // the way in rather than letting the file become unloadable. Captions is the
+  // safe half: it degrades what the user hears, never what they read.
+  if (settings.subtitle?.outputMode === "captions_audio") {
+    settings.subtitle.outputMode = "captions";
+  }
   if (settings.subtitle?.tonePolishModel === "gpt-4o-mini") {
     settings.subtitle.tonePolishModel = DEFAULT_SUBTITLE_SETTINGS.tonePolishModel;
   }
@@ -362,10 +369,14 @@ export function validateSubtitleSettings(value) {
   }
   if (value.languagePair !== undefined) validateLanguagePair(value.languagePair);
   if (value.translationLanguages !== undefined) validateTranslationLanguages(value.translationLanguages);
-  if (value.outputMode !== undefined && !["captions", "captions_audio", "audio"].includes(value.outputMode)) {
-    throw new Error("Subtitle outputMode must be captions, captions_audio, or audio.");
+  // Mixed caption+audio output is retired: a session produces captions OR
+  // interpreted audio, not both. A settings file written before this still holds
+  // the old value, so the READ path migrates it (see migrateSettingsFile) rather
+  // than throwing here, which would make the file unloadable.
+  if (value.outputMode !== undefined && !["captions", "audio"].includes(value.outputMode)) {
+    throw new Error("Subtitle outputMode must be captions or audio.");
   }
-  const hasAudioOutput = value.outputMode === "captions_audio" || value.outputMode === "audio";
+  const hasAudioOutput = value.outputMode === "audio";
   if (hasAudioOutput) {
     if (value.translationProvider !== "gemini") throw new Error("Subtitle translationProvider must remain gemini.");
     const voiceProvider = value.voiceProvider ?? "gemini";
