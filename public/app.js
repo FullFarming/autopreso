@@ -19,7 +19,7 @@ const OPENAI_TRANSCRIPTION_MODELS = [
   "whisper-1",
 ];
 const MOONSHINE_MODELS = ["tiny", "small", "medium"];
-const MIC_STORAGE_KEY = "autopreso.mic";
+const MIC_STORAGE_KEY = "realtime-noel.mic";
 
 const STARTER_STAGING_ELEMENTS = [];
 
@@ -239,7 +239,7 @@ function App() {
         }
       }
       if (message.type === "whiteboard:update") {
-        // Recenter when the live canvas resets to a fresh starter (Start preso, Reset session).
+        // Recenter when the live canvas resets to a fresh starter (Start Realtime Noel, Reset session).
         const isFreshStarter =
           Array.isArray(message.elements) &&
           message.elements.length <= STARTER_ELEMENTS.length + 1;
@@ -445,7 +445,7 @@ function App() {
       });
       if (!res.ok) {
         const body = await res.json().catch(() => ({}));
-        throw new Error(body.error || `Start preso failed (${res.status})`);
+        throw new Error(body.error || `Start Realtime Noel failed (${res.status})`);
       }
       // Server broadcasts mode=live and whiteboard:update; the WS handler swaps the canvas.
     } catch (err) {
@@ -692,7 +692,7 @@ function App() {
         React.createElement(
           "div",
           { className: "brand-row" },
-          React.createElement("h1", null, "Auto Preso"),
+          React.createElement("h1", null, "Realtime Noel"),
           React.createElement(
             "div",
             {
@@ -723,10 +723,10 @@ function App() {
                   if (mode !== "live") startPreso();
                 },
                 disabled: presoStarting,
-                title: presoStarting ? "Starting..." : "Preso mode",
+                title: presoStarting ? "Starting..." : "Realtime Noel mode",
                 "aria-pressed": mode === "live",
               },
-              presoStarting && mode === "staging" ? "..." : "Preso",
+              presoStarting && mode === "staging" ? "..." : "Realtime Noel",
             ),
           ),
         ),
@@ -734,7 +734,7 @@ function App() {
           "p",
           null,
           mode === "staging"
-            ? "Drop keywords, diagrams, or images on the canvas. They will be used as reference during the preso."
+            ? "Drop keywords, diagrams, or images on the canvas. They will be used as reference during Realtime Noel."
             : "Just talk through your ideas. Let the agent whiteboard for you.",
         ),
       ),
@@ -749,7 +749,7 @@ function App() {
                 onClick: startPreso,
                 disabled: presoStarting,
               },
-              presoStarting ? "Starting..." : "Start Preso →",
+              presoStarting ? "Starting..." : "Start Realtime Noel →",
             )
           : null,
         isLive
@@ -925,7 +925,7 @@ function App() {
             React.createElement(
               "p",
               { className: "agent-instructions-hint" },
-              "Saved automatically. Takes effect on next Start Preso.",
+              "Saved automatically. Takes effect on next Start Realtime Noel.",
             ),
           )
         : null,

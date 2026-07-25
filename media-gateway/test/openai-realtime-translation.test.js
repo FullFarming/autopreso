@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import test from "node:test";
 
-import { OpenAIRealtimeTranslationAdapter, resamplePcm16Mono } from "../src/openai-realtime-translation.js";
+import { OpenAIRealtimeTranslationAdapter, OpenAITextToSpeechAdapter, resamplePcm16Mono } from "../src/openai-realtime-translation.js";
 
 class FakeSocket extends EventEmitter {
   constructor() {
@@ -140,4 +140,51 @@ test("one rejected audio callback cannot poison later translated audio", async (
   await new Promise((resolve) => setImmediate(resolve));
   assert.deepEqual(received, [[2, 0]]);
   await session.close();
+});
+
+test("OpenAI TTS streams 24kHz PCM with a deterministic voice and 16-bit alignment", async () => {
+  const requests = [];
+  const fetchImpl = async (url, init) => {
+    requests.push({ url, body: JSON.parse(init.body) });
+    return {
+      ok: true,
+      status: 200,
+      body: (async function* () {
+        yield new Uint8Array([1, 2, 3]); // odd split: last byte must carry over
+        yield new Uint8Array([4]);
+      })(),
+    };
+  };
+  const adapter = new OpenAITextToSpeechAdapter({ apiKey: "sk-test", fetchImpl });
+  const chunks = [];
+  for await (const chunk of adapter.synthesizeStream({ language: "en", voiceName: "Achernar", text: "Hello there", sampleRate: 24_000 })) {
+    chunks.push([...chunk]);
+  }
+  assert.equal(requests[0].url, "https://api.openai.com/v1/audio/speech");
+  assert.equal(requests[0].body.response_format, "pcm");
+  assert.equal(requests[0].body.input, "Hello there");
+  assert.equal(typeof requests[0].body.voice, "string");
+  const again = new OpenAITextToSpeechAdapter({ apiKey: "sk-test", fetchImpl });
+  for await (const _ of again.synthesizeStream({ language: "en", voiceName: "Achernar", text: "x", sampleRate: 24_000 })) break;
+  assert.equal(requests[0].body.voice, requests[1].body.voice, "same speaker voiceName maps to the same OpenAI voice");
+  assert.deepEqual(chunks.flat(), [1, 2, 3, 4]);
+  assert.equal(chunks.every((chunk) => chunk.length % 2 === 0), true);
+});
+
+test("OpenAI TTS failure degrades to the fallback voice instead of silencing the meeting", async () => {
+  const fetchImpl = async () => ({ ok: false, status: 500, body: null });
+  const fallbackCalls = [];
+  const fallback = {
+    async *synthesizeStream(input) {
+      fallbackCalls.push(input.text);
+      yield new Uint8Array([9, 9]);
+    },
+  };
+  const adapter = new OpenAITextToSpeechAdapter({ apiKey: "sk-test", fetchImpl, fallback });
+  const chunks = [];
+  for await (const chunk of adapter.synthesizeStream({ language: "ko", voiceName: "A", text: "안녕하세요", sampleRate: 24_000 })) {
+    chunks.push([...chunk]);
+  }
+  assert.deepEqual(fallbackCalls, ["안녕하세요"]);
+  assert.deepEqual(chunks, [[9, 9]]);
 });

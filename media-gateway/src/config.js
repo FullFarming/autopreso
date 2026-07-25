@@ -39,7 +39,7 @@ const LIVE_LANGUAGE_ALIASES = new Map();
 for (const language of LIVE_TRANSLATION_LANGUAGES) LIVE_LANGUAGE_ALIASES.set(language.toLowerCase(), language);
 for (const [alias, language] of LIVE_LANGUAGE_ALIAS_ENTRIES) LIVE_LANGUAGE_ALIASES.set(alias, language);
 
-function normalizeLiveLanguage(value) {
+export function normalizeLiveLanguage(value) {
   return LIVE_LANGUAGE_ALIASES.get(String(value ?? "").trim().toLowerCase()) ?? "";
 }
 
@@ -77,7 +77,22 @@ export function validateLiveSettings(value) {
   if (!Number.isSafeInteger(maxViewers) || maxViewers < 1 || maxViewers > 50) throw new Error("최대 시청자는 1명 이상 50명 이하여야 합니다.");
   const glossaryPack = value.glossaryPack ?? "general_cre";
   if (!GLOSSARY_PACKS.includes(glossaryPack)) throw new Error("지원하지 않는 용어집입니다.");
-  return { sessionType, languages, outputMode, voiceProvider, maxViewers, glossaryPack };
+  // Free-form glossary text mirrored from the desktop subtitle settings so
+  // Live Call translation uses the exact same terminology as local captions.
+  // Optional and never persisted/compared server-side.
+  if (value.glossaryText !== undefined && typeof value.glossaryText !== "string") {
+    throw new Error("용어집 텍스트가 올바르지 않습니다.");
+  }
+  const glossaryText = String(value.glossaryText ?? "").trim().slice(0, 16_000);
+  // Tone + domain mirror the desktop subtitle settings so the second-pass
+  // polish behaves identically for web viewers.
+  const translationTone = value.translationTone ?? "natural";
+  if (!["natural", "business"].includes(translationTone)) throw new Error("지원하지 않는 번역 톤입니다.");
+  if (value.domainText !== undefined && typeof value.domainText !== "string") {
+    throw new Error("도메인 텍스트가 올바르지 않습니다.");
+  }
+  const domainText = String(value.domainText ?? "").trim().slice(0, 2_000);
+  return { sessionType, languages, outputMode, voiceProvider, maxViewers, glossaryPack, glossaryText, translationTone, domainText };
 }
 
 export function readGatewayEnvironment(environment = process.env) {
@@ -133,10 +148,16 @@ export function readGatewayEnvironment(environment = process.env) {
   }
   const sttLanguageCodes = String(environment.STT_LANGUAGE_CODES ?? "ko-KR,en-US,ja-JP").split(",").map((value) => value.trim()).filter(Boolean);
   if (sttLanguageCodes.length < 1 || sttLanguageCodes.length > 3) throw new Error("STT_LANGUAGE_CODES는 1개 이상 3개 이하여야 합니다.");
+  const hostReconnectGraceMilliseconds = Number(environment.LIVE_HOST_RECONNECT_GRACE_MS ?? 45_000);
+  if (!Number.isFinite(hostReconnectGraceMilliseconds) || hostReconnectGraceMilliseconds < 0) {
+    throw new Error("LIVE_HOST_RECONNECT_GRACE_MS가 올바르지 않습니다.");
+  }
   return {
     port: Number(environment.PORT ?? 8080),
     geminiApiKey: environment.GEMINI_API_KEY,
     geminiLiveModel: environment.GEMINI_LIVE_MODEL,
+    geminiTextModel: String(environment.GEMINI_TEXT_MODEL ?? "gemini-3.5-flash").trim() || "gemini-3.5-flash",
+    openaiRealtimeTranslateModel: String(environment.OPENAI_REALTIME_TRANSLATE_MODEL ?? "gpt-realtime-translate").trim() || "gpt-realtime-translate",
     openaiApiKey: environment.OPENAI_API_KEY.trim(),
     projectId: environment.GOOGLE_CLOUD_PROJECT,
     baseUrl: supabaseUrl.origin,
@@ -145,10 +166,37 @@ export function readGatewayEnvironment(environment = process.env) {
     gatewaySecret: environment.LIVE_GATEWAY_TOKEN_SECRET.trim(),
     viewerSecret: environment.LIVE_VIEWER_TOKEN_SECRET.trim(),
     sttLanguageCodes,
+    hostReconnectGraceMilliseconds,
     externalEnvironment: "development",
   };
 }
 
 function hasAudioOutput(outputMode) {
   return outputMode === "captions_audio" || outputMode === "audio";
+}
+
+/** Script-level plausibility check: does this text look like it is written in
+ *  the given language? Used to gate verbatim source-lane passthrough and to
+ *  validate LLM translation output, because per-result STT language detection
+ *  (and an echoing LLM) must never surface raw Korean on a Latin-script lane. */
+export function textPlausiblyInLanguage(text, language) {
+  const base = String(language ?? "").trim().toLowerCase().split("-")[0];
+  if (!base) return false;
+  const letters = String(text ?? "").replace(/[^\p{L}\p{M}]/gu, "");
+  if (!letters) return true; // digits/punctuation are language-neutral
+  const hangul = /[가-힯ᄀ-ᇿ㄰-㆏]/u.test(letters);
+  const kana = /[぀-ヿ]/u.test(letters);
+  const han = /[一-鿿㐀-䶿]/u.test(letters);
+  const cyrillic = /[Ѐ-ӿ]/u.test(letters);
+  const arabic = /[؀-ۿݐ-ݿ]/u.test(letters);
+  const thai = /[฀-๿]/u.test(letters);
+  switch (base) {
+    case "ko": return hangul;
+    case "ja": return kana || (han && !hangul);
+    case "zh": case "cmn": case "yue": return han && !kana && !hangul;
+    case "ru": case "uk": return cyrillic;
+    case "ar": return arabic;
+    case "th": return thai;
+    default: return !hangul && !kana && !han && !cyrillic && !arabic && !thai;
+  }
 }

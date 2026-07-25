@@ -1,9 +1,9 @@
-<h1 align="center">autopreso</h1>
+<h1 align="center">Realtime Noel</h1>
 
 <p align="center">
-  <a href="https://github.com/kunchenguid/autopreso/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/kunchenguid/autopreso/ci.yml?style=flat-square&label=ci" /></a>
-  <a href="https://github.com/kunchenguid/autopreso/actions/workflows/release-please.yml"><img alt="Release" src="https://img.shields.io/github/actions/workflow/status/kunchenguid/autopreso/release-please.yml?style=flat-square&label=release" /></a>
-  <a href="https://www.npmjs.com/package/autopreso"><img alt="npm" src="https://img.shields.io/npm/v/autopreso?style=flat-square" /></a>
+  <a href="https://github.com/kyeongmankim/realtime-noel/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/kyeongmankim/realtime-noel/ci.yml?style=flat-square&label=ci" /></a>
+  <a href="https://github.com/kyeongmankim/realtime-noel/actions/workflows/release-please.yml"><img alt="Release" src="https://img.shields.io/github/actions/workflow/status/kyeongmankim/realtime-noel/release-please.yml?style=flat-square&label=release" /></a>
+  <a href="https://www.npmjs.com/package/realtime-noel"><img alt="npm" src="https://img.shields.io/npm/v/realtime-noel?style=flat-square" /></a>
   <a href="https://img.shields.io/badge/platform-macOS-blue?style=flat-square"><img alt="Platform" src="https://img.shields.io/badge/platform-macOS-blue?style=flat-square" /></a>
   <a href="https://x.com/kunchenguid"><img alt="X" src="https://img.shields.io/badge/X-@kunchenguid-black?style=flat-square" /></a>
   <a href="https://discord.gg/Wsy2NpnZDu"><img alt="Discord" src="https://img.shields.io/discord/1439901831038763092?style=flat-square&label=discord" /></a>
@@ -12,32 +12,32 @@
 <h3 align="center">Let the whiteboard whiteboard itself.</h3>
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/kunchenguid/autopreso/main/assets/autopreso.png" alt="autopreso whiteboard hero screenshot" width="960" />
+  <img src="https://raw.githubusercontent.com/kyeongmankim/realtime-noel/main/assets/realtime-noel.png" alt="Realtime Noel whiteboard hero screenshot" width="960" />
 </p>
 
 > [!WARNING]
-> autopreso is in **alpha** and under active development. Expect rough edges, breaking changes, and the occasional weird drawing. Bug reports welcome.
+> Realtime Noel is in **alpha** and under active development. Expect rough edges, breaking changes, and the occasional weird drawing. Bug reports welcome.
 
 You wanted to give the talk, not build the deck.
 
-autopreso runs a local web app with a live Excalidraw canvas and a listening agent.
+Realtime Noel runs a local web app with a live Excalidraw canvas and a listening agent.
 You speak; transcripts stream to a model; the model draws, labels, and rearranges the whiteboard in real time.
 Stage a few seed elements, hit start, and present.
 
 - **Hands free** - your speech drives an agent that edits an Excalidraw scene as you talk, no clicking required.
-- **Bring your own model** - use your OpenAI API key or Codex subscription. Auto Preso itself is completely free and open source.
+- **Bring your own model** - use your OpenAI API key or Codex subscription. Realtime Noel itself is completely free and open source.
 - **Can run locally** - use Moonshine for transcription and Ollama for the agent and you get a fully local setup.
 
 ## Quick Start
 
 ```sh
-$ npx autopreso              # boots the server, opens the browser
-autopreso listening at http://127.0.0.1:3210
+$ npx realtime-noel          # boots the server, opens the browser
+Realtime Noel listening at http://127.0.0.1:3210
 
 # In the browser:
 # 1. Drop reference materials onto the staging canvas (title, agenda, etc).
 # 2. Pick your microphone, transcription model, agent model, and optional Agent instructions.
-# 3. Click "Start Preso" and start talking.
+# 3. Click "Start Realtime Noel" and start talking.
 ```
 
 ## Install
@@ -45,21 +45,21 @@ autopreso listening at http://127.0.0.1:3210
 **npm (recommended)**
 
 ```sh
-npm install -g autopreso
-autopreso
+npm install -g realtime-noel
+realtime-noel
 ```
 
 **npx (no install)**
 
 ```sh
-npx autopreso
+npx realtime-noel
 ```
 
 **From source**
 
 ```sh
-git clone https://github.com/kunchenguid/autopreso.git
-cd autopreso
+git clone https://github.com/kyeongmankim/realtime-noel.git
+cd realtime-noel
 npm install
 npm start
 ```
@@ -84,15 +84,15 @@ npm start
 
 - **Two modes** - "staging" lets you sketch seed content client-side; "live" hands the canvas over to the agent, biases OpenAI Realtime transcription toward staging text and labels, and starts streaming transcripts.
 - **Local server, local network only** - the Express + WebSocket server binds to 127.0.0.1; nothing is exposed beyond your machine.
-- **Persistent settings** - models, API keys, STT engine choices, and Agent instructions live in `~/.config/autopreso/settings.json` and survive restarts.
+- **Persistent settings** - models, API keys, STT engine choices, and Agent instructions live in `~/.config/realtime-noel/settings.json` and survive restarts.
 - **Warmup loop** - after you hit start the agent primes itself against your staging content and Agent instructions so the first sentence you say doesn't get a cold model.
 
 ## CLI Reference
 
 | Command        | Description                                  |
 | -------------- | -------------------------------------------- |
-| `autopreso`    | Start the local server and open the browser. |
-| `autopreso -h` | Show help.                                   |
+| `realtime-noel`    | Start the local server and open the browser. |
+| `realtime-noel -h` | Show help.                                   |
 
 ### Flags
 
@@ -103,14 +103,14 @@ npm start
 
 ## Configuration
 
-Settings persist at `~/.config/autopreso/settings.json` and are managed from the in-app status panel.
-Agent instructions are saved automatically from staging, can be up to 100,000 characters, and take effect on the next Start Preso.
-The live Session cost card estimates agent token costs and OpenAI Realtime audio costs for the current presentation, resetting on Start Preso or session reset.
+Settings persist at `~/.config/realtime-noel/settings.json` and are managed from the in-app status panel.
+Agent instructions are saved automatically from staging, can be up to 100,000 characters, and take effect on the next Start Realtime Noel.
+The live Session cost card estimates agent token costs and OpenAI Realtime audio costs for the current presentation, resetting on Start Realtime Noel or session reset.
 OpenAI prices use the built-in May 2026 rate table; local providers show `$0.0000`, Codex shows token volume because it routes through your subscription, and unknown models show `n/a`.
 
 ### Defaults on first run
 
-When no settings file exists, autopreso picks providers based on what it finds in your environment:
+When no settings file exists, Realtime Noel picks providers based on what it finds in your environment:
 
 | You have...                                | Agent provider                 | Transcription              |
 | ------------------------------------------ | ------------------------------ | -------------------------- |
@@ -134,8 +134,8 @@ Provider variables only seed `settings.json` on first run. Once the file exists,
 | `OPENAI_BASE_URL`      | Seeds the OpenAI agent API base URL.                  |
 | `CODEX_MODEL`          | Seeds the Codex model.                                |
 | `OLLAMA_MODEL`         | Seeds the Ollama model.                               |
-| `AUTOPRESO_CACHE_LOG`  | Cache usage log path. Default: `~/.config/autopreso/logs/cache.log`. |
-| `AUTOPRESO_DEBUG_LOG`  | Agent debug log path. Default: `~/.config/autopreso/logs/debug.log`. |
+| `REALTIME_NOEL_CACHE_LOG`  | Cache usage log path. Default: `~/.config/realtime-noel/logs/cache.log`. |
+| `REALTIME_NOEL_DEBUG_LOG`  | Agent debug log path. Default: `~/.config/realtime-noel/logs/debug.log`. |
 
 Local Moonshine transcription ships as an optional native sidecar for `darwin-arm64` and `darwin-x64`. On other platforms, choose OpenAI Realtime in the STT panel.
 

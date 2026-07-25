@@ -10,8 +10,8 @@ import {
 } from "../src/moonshine-transcription.js";
 
 test("moonshinePlatformPackageName supports both macOS binary variants", () => {
-  assert.equal(moonshinePlatformPackageName("darwin", "arm64"), "@autopreso/moonshine-darwin-arm64");
-  assert.equal(moonshinePlatformPackageName("darwin", "x64"), "@autopreso/moonshine-darwin-x64");
+  assert.equal(moonshinePlatformPackageName("darwin", "arm64"), "@realtime-noel/moonshine-darwin-arm64");
+  assert.equal(moonshinePlatformPackageName("darwin", "x64"), "@realtime-noel/moonshine-darwin-x64");
 });
 
 test("moonshinePlatformPackageName rejects unsupported platforms", () => {
@@ -25,15 +25,50 @@ test("resolveMoonshineSidecarPath resolves the binary inside the optional packag
   const resolved = resolveMoonshineSidecarPath({
     platform: "darwin",
     arch: "arm64",
-    requireResolve: () => "/workspace/node_modules/@autopreso/moonshine-darwin-arm64/package.json",
+    requireResolve: () => "/workspace/node_modules/@realtime-noel/moonshine-darwin-arm64/package.json",
   });
 
-  assert.equal(resolved, "/workspace/node_modules/@autopreso/moonshine-darwin-arm64/bin/autopreso-moonshine");
+  assert.equal(resolved, "/workspace/node_modules/@realtime-noel/moonshine-darwin-arm64/bin/realtime-noel-moonshine");
+});
+
+test("resolveMoonshineSidecarPath falls back to the legacy sidecar package during rename migration", () => {
+  const resolved = resolveMoonshineSidecarPath({
+    platform: "darwin",
+    arch: "arm64",
+    requireResolve: (specifier) => {
+      if (specifier === "@realtime-noel/moonshine-darwin-arm64/package.json") {
+        const error = new Error("missing");
+        error.code = "MODULE_NOT_FOUND";
+        throw error;
+      }
+      return "/workspace/node_modules/@legacy/moonshine-darwin-arm64/package.json";
+    },
+  });
+
+  assert.equal(
+    resolved,
+    `/workspace/node_modules/@legacy/moonshine-darwin-arm64/bin/${["auto", "preso"].join("")}-moonshine`,
+  );
+});
+
+test("resolveMoonshineSidecarPath reports a clear error when no sidecar package is installed", () => {
+  assert.throws(
+    () => resolveMoonshineSidecarPath({
+      platform: "darwin",
+      arch: "arm64",
+      requireResolve: () => {
+        const error = new Error("missing");
+        error.code = "MODULE_NOT_FOUND";
+        throw error;
+      },
+    }),
+    /Cannot find Moonshine sidecar package for darwin\/arm64/,
+  );
 });
 
 test("resolveMoonshineSidecarPath prefers an explicit binary override", () => {
   const resolved = resolveMoonshineSidecarPath({
-    env: { AUTOPRESO_MOONSHINE_BIN: "/tmp/dev/autopreso-moonshine" },
+    env: { REALTIME_NOEL_MOONSHINE_BIN: "/tmp/dev/realtime-noel-moonshine" },
     platform: "linux",
     arch: "x64",
     requireResolve: () => {
@@ -41,7 +76,7 @@ test("resolveMoonshineSidecarPath prefers an explicit binary override", () => {
     },
   });
 
-  assert.equal(resolved, "/tmp/dev/autopreso-moonshine");
+  assert.equal(resolved, "/tmp/dev/realtime-noel-moonshine");
 });
 
 test("createMoonshineTranscription maps sidecar transcript events and sends audio JSONL", () => {
@@ -64,11 +99,11 @@ test("createMoonshineTranscription maps sidecar transcript events and sends audi
     queueTranscript: (text) => queued.push(text),
     options: { moonshineModel: "medium" },
     spawnProcess: (binary, args) => {
-      assert.equal(binary, "/tmp/autopreso-moonshine");
+      assert.equal(binary, "/tmp/realtime-noel-moonshine");
       assert.deepEqual(args, ["--model", "medium", "--language", "en"]);
       return child;
     },
-    resolveSidecarPath: () => "/tmp/autopreso-moonshine",
+    resolveSidecarPath: () => "/tmp/realtime-noel-moonshine",
   });
 
   transcription.sendAudio("abc123");
@@ -102,7 +137,7 @@ test("createMoonshineTranscription can prewarm the sidecar before audio arrives"
     queueTranscript: () => {},
     options: { moonshineModel: "medium" },
     spawnProcess: () => child,
-    resolveSidecarPath: () => "/tmp/autopreso-moonshine",
+    resolveSidecarPath: () => "/tmp/realtime-noel-moonshine",
   });
 
   let ready = false;
@@ -136,7 +171,7 @@ test("createMoonshineTranscription keeps the warmed process alive when recording
     queueTranscript: () => {},
     options: { moonshineModel: "medium" },
     spawnProcess: () => child,
-    resolveSidecarPath: () => "/tmp/autopreso-moonshine",
+    resolveSidecarPath: () => "/tmp/realtime-noel-moonshine",
   });
 
   transcription.sendAudio("abc123");

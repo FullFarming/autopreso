@@ -8,6 +8,30 @@ const VOICE_PROVIDERS = new Set<LiveVoiceProvider>(["gemini", "openai"]);
 const GLOSSARY_PACKS = new Set<GlossaryPack>(["general_cre", "hotel", "fnb"]);
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
 
+export function parseTitle(value: unknown): string {
+  if (typeof value !== "string") {
+    throw new LiveSessionError("라이브 제목이 필요합니다.", "INVALID_TITLE", 400);
+  }
+  const title = value.normalize("NFC").replace(/\p{Cc}|\p{Cf}/gu, "").replace(/\s+/gu, " ").trim();
+  if (Array.from(title).length < 1 || Array.from(title).length > 120 || /[<>]/u.test(title)) {
+    throw new LiveSessionError("라이브 제목은 1자 이상 120자 이하로 입력하세요.", "INVALID_TITLE", 400);
+  }
+  return title;
+}
+
+export function parseScheduledAt(value: unknown): string | null {
+  if (value === undefined || value === null || value === "") return null;
+  if (typeof value !== "string"
+    || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})$/u.test(value)) {
+    throw new LiveSessionError("라이브 일정이 올바르지 않습니다.", "INVALID_SCHEDULED_AT", 400);
+  }
+  const timestamp = Date.parse(value);
+  if (!Number.isFinite(timestamp)) {
+    throw new LiveSessionError("라이브 일정이 올바르지 않습니다.", "INVALID_SCHEDULED_AT", 400);
+  }
+  return new Date(timestamp).toISOString();
+}
+
 export function parseSessionId(value: unknown): string {
   if (typeof value !== "string" || !UUID_PATTERN.test(value)) {
     throw new LiveSessionError("세션 ID가 올바르지 않습니다.", "INVALID_SESSION_ID", 400);

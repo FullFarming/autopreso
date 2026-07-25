@@ -42,11 +42,25 @@ export const LIVE_VIEWER_TOKEN_SECRET =
 export const LIVE_GATEWAY_TOKEN_SECRET =
   readRequiredProductionSecret("LIVE_GATEWAY_TOKEN_SECRET") ?? "local-live-gateway-token-secret-change-before-production";
 
+export function isProductionRuntime(): boolean {
+  return process.env.NODE_ENV === "production";
+}
+
 // Existing host and pairing modules retain local-only defaults. Importing this
 // module from middleware guarantees those defaults can never reach production.
 readRequiredProductionSecret("SESSION_SECRET");
 readRequiredProductionSecret("PAIR_SECRET");
-readRequiredProductionSecret("ADMIN_PASSWORD");
+
+// ADMIN_PASSWORD is an operator-chosen login password, not an HMAC secret:
+// brute force is bounded by the login rate limiter, so it follows the 5+
+// character policy from host-login-config.ts instead of the 32-char secret
+// minimum above.
+if (process.env.NODE_ENV === "production") {
+  const adminPassword = process.env.ADMIN_PASSWORD?.trim() ?? "";
+  if (adminPassword.length < 5 || isKnownInsecureSecret(adminPassword)) {
+    throw new Error("ADMIN_PASSWORD must be configured with a non-placeholder password of at least 5 characters");
+  }
+}
 
 // 2026-07-19 security: mutating requests are fail-closed in production. Local
 // development keeps explicit loopback origins so Host header spoofing cannot

@@ -15,21 +15,34 @@ export function resolveSpeakerColor(speaker: SpeakerAssignment | null): string {
   return SPEAKER_COLORS[index % SPEAKER_COLORS.length];
 }
 
+/** Contract C5: gray caption meta — name · department · job title when the
+ *  gateway attributes the caption to a participant identity. Everything not
+ *  attributed to a floor participant is the host microphone, so it reads as
+ *  "Host" instead of leaking raw diarization labels (S1, S2…). */
+export function speakerMetaLine(speaker: SpeakerAssignment | null): string {
+  if (!speaker) return "Host";
+  if (!speaker.speakerId.startsWith("participant:")) return "Host";
+  const name = speaker.name?.trim() || speaker.label;
+  return [name, speaker.department?.trim(), speaker.jobTitle?.trim()]
+    .filter((part): part is string => Boolean(part))
+    .join(" · ");
+}
+
 export default function SpeakerCaption({ caption, active = false }: { caption: CaptionEvent; active?: boolean }) {
   const color = resolveSpeakerColor(caption.speaker);
   const speaker = caption.speaker;
-  const label = speaker ? speaker.label : "발표자";
+  const label = speakerMetaLine(speaker);
 
   return (
     <article
       className={`live-caption-card ${active ? "is-active" : ""} ${caption.isFinal ? "" : "is-partial"}`}
-      aria-label={`${label} 자막${caption.isFinal ? "" : ", 작성 중"}`}
+      aria-label={`${label} caption${caption.isFinal ? "" : ", updating"}`}
     >
       <div className="live-caption-speaker">
         <span className="live-speaker-dot" style={{ backgroundColor: color }} aria-hidden="true" />
         <span>{label}</span>
         <span className="live-speaker-line" style={{ backgroundColor: color }} aria-hidden="true" />
-        {!caption.isFinal && <span className="live-caption-state">듣는 중</span>}
+        {!caption.isFinal && <span className="live-caption-state">Listening</span>}
       </div>
       <p>{caption.text}</p>
     </article>

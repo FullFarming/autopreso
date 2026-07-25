@@ -75,6 +75,29 @@ export async function enforceSessionJoinRateLimit(
   }
 }
 
+export async function enforceAdmissionCodeAttemptRateLimit(
+  store: RateLimitStore,
+): Promise<void> {
+  const keyHash = await opaqueIdentifier(
+    LIVE_ADMISSION_PEPPER,
+    "join-admission-global",
+    "six-digit-code-attempt",
+  );
+  const allowed = await store.consumeRateLimit({
+    scope: "join-admission-global",
+    keyHash,
+    limit: 300,
+    windowSeconds: 300,
+  });
+  if (!allowed) {
+    throw new LiveAdmissionError(
+      "인증번호 입장 요청이 너무 많습니다. 잠시 후 다시 시도해 주세요.",
+      "RATE_LIMITED",
+      429,
+    );
+  }
+}
+
 export async function enforceGatewayTokenRateLimit(
   hostId: string,
   sessionId: string,
@@ -95,6 +118,31 @@ export async function enforceGatewayTokenRateLimit(
     throw new LiveAdmissionError(
       "게이트웨이 연결 요청이 너무 많습니다. 잠시 후 다시 시도해 주세요.",
       "GATEWAY_TOKEN_RATE_LIMITED",
+      429,
+    );
+  }
+}
+
+export async function enforceSummaryGenerationRateLimit(
+  hostId: string,
+  sessionId: string,
+  store: RateLimitStore,
+): Promise<void> {
+  const keyHash = await opaqueIdentifier(
+    LIVE_ADMISSION_PEPPER,
+    "summary-host-session",
+    `${hostId}\u0000${sessionId}`,
+  );
+  const allowed = await store.consumeRateLimit({
+    scope: "summary-host-session",
+    keyHash,
+    limit: 10,
+    windowSeconds: 60 * 60,
+  });
+  if (!allowed) {
+    throw new LiveAdmissionError(
+      "요약 생성 요청이 너무 많습니다. 잠시 후 다시 시도해 주세요.",
+      "SUMMARY_RATE_LIMITED",
       429,
     );
   }

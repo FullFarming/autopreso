@@ -6,8 +6,8 @@
   "packages": {
     ".": {
       "release-type": "node",
-      "package-name": "autopreso",
-      "component": "autopreso",
+      "package-name": "realtime-noel",
+      "component": "realtime-noel",
       "exclude-paths": [
         "packages/moonshine-darwin-arm64",
         "packages/moonshine-darwin-x64",
@@ -18,7 +18,7 @@
     },
     "packages/moonshine-darwin-arm64": {
       "release-type": "node",
-      "package-name": "@autopreso/moonshine-darwin-arm64",
+      "package-name": "@realtime-noel/moonshine-darwin-arm64",
       "component": "moonshine-sidecars",
       "include-paths": [
         "packages/moonshine-darwin-arm64",
@@ -36,12 +36,12 @@
         {
           "type": "json",
           "path": "package.json",
-          "jsonpath": "$.optionalDependencies['@autopreso/moonshine-darwin-arm64']"
+          "jsonpath": "$.optionalDependencies['@realtime-noel/moonshine-darwin-arm64']"
         },
         {
           "type": "json",
           "path": "package.json",
-          "jsonpath": "$.optionalDependencies['@autopreso/moonshine-darwin-x64']"
+          "jsonpath": "$.optionalDependencies['@realtime-noel/moonshine-darwin-x64']"
         }
       ]
     }

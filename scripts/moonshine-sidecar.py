@@ -47,7 +47,7 @@ def pcm16le_base64_to_float32(audio_base64):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="AutoPreso Moonshine JSONL sidecar")
+    parser = argparse.ArgumentParser(description="Realtime Noel Moonshine JSONL sidecar")
     parser.add_argument("--model", choices=sorted(MODEL_ARCH_BY_NAME), default="medium")
     parser.add_argument("--language", default="en")
     args = parser.parse_args()

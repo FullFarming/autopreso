@@ -12,7 +12,7 @@ import { setTimeout as sleep } from "node:timers/promises";
 
 import { createOpenAITranscription } from "../src/openai-transcription.js";
 
-const settingsPath = path.join(os.homedir(), ".config", "autopreso", "settings.json");
+const settingsPath = path.join(os.homedir(), ".config", "realtime-noel", "settings.json");
 const settings = JSON.parse(fs.readFileSync(settingsPath, "utf8"));
 const env = { OPENAI_API_KEY: settings.apiKeys.openai };
 const PCM_PATH = process.argv[2] ?? "/tmp/probe.pcm";

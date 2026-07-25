@@ -1,66 +1,109 @@
 {
-  "name": "autopreso",
-  "version": "0.1.6",
-  "description": "Realtime speech to presentation. Let the whiteboard whiteboard itself.",
+  "name": "realtime-noel",
+  "version": "0.2.1",
+  "description": "Realtime bilingual subtitles and visual note taking.",
   "license": "MIT",
   "author": "Kun Chen <kun@kunchenguid.com>",
-  "homepage": "https://github.com/kunchenguid/autopreso#readme",
+  "homepage": "https://github.com/kyeongmankim/realtime-noel#readme",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/kunchenguid/autopreso.git"
+    "url": "git+https://github.com/kyeongmankim/realtime-noel.git"
   },
   "bugs": {
-    "url": "https://github.com/kunchenguid/autopreso/issues"
+    "url": "https://github.com/kyeongmankim/realtime-noel/issues"
   },
-  "keywords": [
-    "excalidraw",
-    "whiteboard",
-    "presentation",
-    "voice",
-    "speech-to-text",
-    "ai-agent",
-    "moonshine",
-    "openai",
-    "transcription",
-    "cli"
-  ],
   "engines": {
     "node": ">=24"
   },
   "type": "module",
+  "main": "electron/main.js",
   "bin": {
-    "autopreso": "src/cli.js"
+    "realtime-noel": "src/cli.js"
   },
   "files": [
     "assets/",
+    "electron/",
     "LICENSE",
     "public/",
     "src/"
   ],
   "scripts": {
     "build:moonshine-sidecars": "node ./scripts/build-moonshine-sidecars.js",
+    "desktop": "node ./scripts/start-desktop.js",
     "dev": "node ./src/cli.js",
+    "dist:mac": "electron-builder --mac dmg --arm64 --publish never",
+    "dist:mac:x64": "electron-builder --mac dmg --x64 --publish never",
+    "dist:win": "electron-builder --win portable --x64 --publish never",
     "prepare:release-packages": "node ./scripts/prepare-release-packages.js",
-    "test": "node --test",
     "start": "node ./src/cli.js",
+    "test": "node --test \"test/**/*.test.js\"",
+    "test:all": "npm test && npm --prefix media-gateway test && npm --prefix webapp test",
     "typecheck": "tsc --noEmit"
+  },
+  "build": {
+    "appId": "com.realtime-noel.app",
+    "productName": "Realtime Noel",
+    "files": [
+      "assets/**",
+      "electron/**",
+      "public/**",
+      "src/**",
+      "package.json"
+    ],
+    "mac": {
+      "category": "public.app-category.productivity",
+      "hardenedRuntime": true,
+      "entitlements": "build/entitlements.mac.plist",
+      "entitlementsInherit": "build/entitlements.mac.plist",
+      "extendInfo": {
+        "NSAudioCaptureUsageDescription": "Realtime Noel needs system audio access to generate live translated subtitles.",
+        "NSMicrophoneUsageDescription": "Realtime Noel needs microphone access to generate live translated subtitles.",
+        "NSScreenCaptureUsageDescription": "Realtime Noel needs screen and system audio recording access to capture presentation audio."
+      },
+      "target": [
+        {
+          "target": "dmg",
+          "arch": [
+            "arm64",
+            "x64"
+          ]
+        }
+      ]
+    },
+    "win": {
+      "requestedExecutionLevel": "asInvoker",
+      "target": [
+        {
+          "target": "portable",
+          "arch": [
+            "x64"
+          ]
+        }
+      ]
+    },
+    "portable": {
+      "artifactName": "${productName}-${version}-win-portable.${ext}"
+    }
   },
   "dependencies": {
     "@ai-sdk/openai": "^3.0.63",
     "ai": "^6.0.176",
     "express": "^5.2.1",
+    "https-proxy-agent": "^9.1.0",
     "open": "^11.0.0",
     "ws": "^8.20.0",
     "zod": "^4.4.3"
   },
   "optionalDependencies": {
-    "@autopreso/moonshine-darwin-arm64": "0.1.1",
-    "@autopreso/moonshine-darwin-x64": "0.1.1"
+    "@realtime-noel/moonshine-darwin-arm64": "0.1.1",
+    "@realtime-noel/moonshine-darwin-x64": "0.1.1"
   },
   "devDependencies": {
     "@types/express": "^5.0.6",
     "@types/node": "^25.6.2",
     "@types/ws": "^8.18.1",
+    "electron": "^42.1.0",
+    "electron-builder": "^26.8.1",
     "typescript": "^6.0.3"
   }
 }

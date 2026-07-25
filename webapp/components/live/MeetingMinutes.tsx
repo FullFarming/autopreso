@@ -36,10 +36,16 @@ function groupTranscript(entries: TranscriptEntry[]): TranscriptTurn[] {
   return turns;
 }
 
-function formatMinuteTime(iso: string): string {
-  const time = new Date(iso);
-  if (Number.isNaN(time.getTime())) return "";
-  return time.toLocaleTimeString("ko-KR", { hour: "2-digit", minute: "2-digit", hour12: false });
+export function formatMinuteTime(iso: string): string {
+  // 2026-07-24 fix: Use the fixed KST session clock. Locale output and host
+  // time zones previously produced different SSR/client text and hydration #418.
+  const normalizedIso = /(?:Z|[+-]\d{2}:\d{2})$/u.test(iso) ? iso : `${iso}Z`;
+  const timestamp = Date.parse(normalizedIso);
+  if (!Number.isFinite(timestamp)) return "";
+  const kstTime = new Date(timestamp + (9 * 60 * 60 * 1_000));
+  const hours = String(kstTime.getUTCHours()).padStart(2, "0");
+  const minutes = String(kstTime.getUTCMinutes()).padStart(2, "0");
+  return `${hours}:${minutes}`;
 }
 
 export default function MeetingMinutes({ summary, summaryCreatedAt, transcript, isLoading, onRetry }: {
@@ -51,23 +57,23 @@ export default function MeetingMinutes({ summary, summaryCreatedAt, transcript, 
 }) {
   const turns = useMemo(() => groupTranscript(transcript), [transcript]);
   return (
-    <div className="live-minutes" aria-label="회의록">
+    <div className="live-minutes" aria-label="Meeting notes">
       <header className="live-minutes-header">
         <span className="live-minutes-ended-dot" aria-hidden="true" />
-        <strong>미팅이 종료되었습니다</strong>
-        <p>호스트가 라이브를 종료했습니다. 아래에서 회의록을 확인하세요.</p>
+        <strong>The meeting has ended</strong>
+        <p>The host ended the live session. Your meeting notes are available below.</p>
       </header>
       {summary
         ? <MeetingSummaryCard summary={summary} createdAt={summaryCreatedAt} />
         : (
           <div className="live-minutes-pending">
-            <p>{isLoading ? "회의록을 불러오는 중…" : "AI 요약이 아직 준비되지 않았습니다. 호스트가 생성하면 여기에 표시됩니다."}</p>
-            <button type="button" disabled={isLoading} onClick={onRetry}>{isLoading ? "불러오는 중…" : "다시 확인"}</button>
+            <p>{isLoading ? "Loading meeting notes…" : "The AI summary is not ready yet. It will appear after the host creates it."}</p>
+            <button type="button" disabled={isLoading} onClick={onRetry}>{isLoading ? "Loading…" : "Check again"}</button>
           </div>
         )}
       {turns.length > 0 && (
         <section className="live-minutes-record">
-          <h3>전체 발언 기록</h3>
+          <h3>Full transcript</h3>
           {turns.map((turn) => (
             <article key={turn.key}>
               <header>

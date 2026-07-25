@@ -2,10 +2,36 @@ import type { GlossaryPack, LiveOutputMode, LiveSession, LiveSessionType, LiveSn
 import { LANGUAGE_CODES, toOpenAITranslationLanguageCode } from "../languageDetect";
 import { LiveSessionError } from "./errors";
 import type { LiveSessionStore } from "./store";
-import { parseGlossaryPack, parseLanguages, parseMaxViewers, parseOutputMode, parseSessionType, parseVersion, parseVoiceProvider } from "./validation";
+import {
+  parseGlossaryPack,
+  parseLanguages,
+  parseMaxViewers,
+  parseOutputMode,
+  parseScheduledAt,
+  parseSessionType,
+  parseTitle,
+  parseVersion,
+  parseVoiceProvider,
+} from "./validation";
 
 const SESSION_TTL_MILLISECONDS = 6 * 60 * 60 * 1_000;
+const MAX_SCHEDULE_AHEAD_MILLISECONDS = 30 * 24 * 60 * 60 * 1_000;
 const OPENAI_REALTIME_TRANSLATION_LANGUAGES = new Set(LANGUAGE_CODES.map(toOpenAITranslationLanguageCode));
+const DUAL_CAPTION_LANGUAGES = ["ko", "en"] as const;
+const MAX_SESSION_LANGUAGES = 3;
+
+/** Contract C6: every Live session always carries both ko and en caption
+ *  lanes, regardless of the host selection. When the union would exceed the
+ *  3-language cap, host-selected extra languages are dropped from the end. */
+export function withDualCaptionLanguages(languages: readonly string[]): [string, ...string[]] {
+  const extras = languages.filter((language) => !DUAL_CAPTION_LANGUAGES.includes(language as typeof DUAL_CAPTION_LANGUAGES[number]));
+  const keptExtras = extras.slice(0, MAX_SESSION_LANGUAGES - DUAL_CAPTION_LANGUAGES.length);
+  const result: string[] = languages.filter((language) => !extras.includes(language) || keptExtras.includes(language));
+  for (const required of DUAL_CAPTION_LANGUAGES) {
+    if (!result.includes(required)) result.push(required);
+  }
+  return result as [string, ...string[]];
+}
 
 export class LiveSessionService {
   private readonly store: LiveSessionStore;
@@ -18,11 +44,19 @@ export class LiveSessionService {
 
   async create(hostId: string, input: CreateServiceInput): Promise<LiveSession> {
     const { sessionType, outputMode, voiceProvider } = normalizeSessionSettings(input);
-    const languages = parseLanguages(input.languages);
+    const languages = withDualCaptionLanguages(parseLanguages(input.languages));
+    const title = parseTitle(input.title ?? "Live Session");
+    const scheduledAt = parseScheduledAt(input.scheduledAt);
+    const scheduledTimestamp = scheduledAt === null ? this.now() : Date.parse(scheduledAt);
+    if (scheduledTimestamp > this.now() + MAX_SCHEDULE_AHEAD_MILLISECONDS) {
+      throw new LiveSessionError("라이브 일정은 30일 이내로 예약하세요.", "SCHEDULE_TOO_FAR", 400);
+    }
     assertOpenAIVoiceLanguages(voiceProvider, languages);
     const session: LiveSession = {
       id: crypto.randomUUID(),
       hostId,
+      title,
+      scheduledAt,
       sessionType,
       outputMode,
       voiceProvider,
@@ -33,9 +67,17 @@ export class LiveSessionService {
       viewerCount: 0,
       version: 1,
       admissionOpenUntil: null,
-      expiresAt: new Date(this.now() + SESSION_TTL_MILLISECONDS).toISOString(),
+      expiresAt: new Date(Math.max(this.now(), scheduledTimestamp) + SESSION_TTL_MILLISECONDS).toISOString(),
+      endedAt: null,
+      hasCoverImage: false,
     };
     return this.store.create(session);
+  }
+
+  /** Contract C10: mark the uploaded cover object on the owned session. */
+  async setCoverImage(hostId: string, sessionId: string, path: string): Promise<void> {
+    const updated = await this.store.setCoverImageOwned(sessionId, hostId, path);
+    if (!updated) throw new LiveSessionError("세션을 찾을 수 없습니다.", "SESSION_NOT_FOUND", 404);
   }
 
   async update(hostId: string, sessionId: string, input: UpdateServiceInput): Promise<LiveSession> {
@@ -43,7 +85,14 @@ export class LiveSessionService {
     const current = await this.store.get(sessionId);
     if (!current || current.hostId !== hostId) throw new LiveSessionError("세션을 찾을 수 없습니다.", "SESSION_NOT_FOUND", 404);
     const { sessionType, outputMode, voiceProvider } = normalizeSessionSettings(input, current);
-    const languages = input.languages === undefined ? current.languages : parseLanguages(input.languages);
+    const title = input.title === undefined ? current.title : parseTitle(input.title);
+    const scheduledAt = input.scheduledAt === undefined ? current.scheduledAt : parseScheduledAt(input.scheduledAt);
+    if (scheduledAt !== null && Date.parse(scheduledAt) > this.now() + MAX_SCHEDULE_AHEAD_MILLISECONDS) {
+      throw new LiveSessionError("라이브 일정은 30일 이내로 예약하세요.", "SCHEDULE_TOO_FAR", 400);
+    }
+    const languages = input.languages === undefined
+      ? withDualCaptionLanguages(current.languages)
+      : withDualCaptionLanguages(parseLanguages(input.languages));
     assertOpenAIVoiceLanguages(voiceProvider, languages);
     const maxViewers = input.maxViewers === undefined ? current.maxViewers : parseMaxViewers(input.maxViewers);
     if (maxViewers < current.viewerCount) {
@@ -54,6 +103,8 @@ export class LiveSessionService {
       sessionType,
       outputMode,
       voiceProvider,
+      title,
+      scheduledAt,
       languages,
       maxViewers,
       glossaryPack,
@@ -62,8 +113,75 @@ export class LiveSessionService {
     return updated;
   }
 
-  async stop(hostId: string, sessionId: string): Promise<void> {
-    if (!await this.store.stopOwned(sessionId, hostId)) throw new LiveSessionError("세션을 찾을 수 없습니다.", "SESSION_NOT_FOUND", 404);
+  /** The only transition that ends a Live Call. Desktop caption pause,
+   *  channel restart, and controller refresh never call this boundary. */
+  async end(hostId: string, sessionId: string): Promise<void> {
+    if (!await this.store.terminateOwned(sessionId, hostId)) {
+      throw new LiveSessionError("세션을 찾을 수 없습니다.", "SESSION_NOT_FOUND", 404);
+    }
+  }
+
+  async start(hostId: string, sessionId: string, expectedVersion: unknown): Promise<LiveSession> {
+    const version = parseVersion(expectedVersion);
+    const started = await this.store.startOwned(sessionId, hostId, version);
+    if (!started) {
+      const current = await this.store.get(sessionId);
+      if (!current || current.hostId !== hostId) {
+        throw new LiveSessionError("세션을 찾을 수 없습니다.", "SESSION_NOT_FOUND", 404);
+      }
+      if (current.status === "live") return current;
+      if (current.status === "stopped" || current.status === "failed") {
+        throw new LiveSessionError("종료된 세션은 시작할 수 없습니다.", "SESSION_NOT_STARTABLE", 409);
+      }
+      if (current.status === "paused") {
+        throw new LiveSessionError("일시정지된 세션은 재개로 다시 시작하세요.", "SESSION_PAUSED", 409);
+      }
+      throw new LiveSessionError("다른 변경이 먼저 저장되었습니다. 새로고침 후 다시 시도하세요.", "VERSION_CONFLICT", 409);
+    }
+    return started;
+  }
+
+  /** Contract C4: live → paused. Idempotent when the session is already paused. */
+  async pause(hostId: string, sessionId: string, expectedVersion: unknown): Promise<LiveSession> {
+    return this.transition(hostId, sessionId, expectedVersion, "pause");
+  }
+
+  /** Contract C4: paused → live. Idempotent when the session is already live. */
+  async resume(hostId: string, sessionId: string, expectedVersion: unknown): Promise<LiveSession> {
+    return this.transition(hostId, sessionId, expectedVersion, "resume");
+  }
+
+  private async transition(
+    hostId: string,
+    sessionId: string,
+    expectedVersion: unknown,
+    action: "pause" | "resume",
+  ): Promise<LiveSession> {
+    const version = parseVersion(expectedVersion);
+    const transitioned = action === "pause"
+      ? await this.store.pauseOwned(sessionId, hostId, version)
+      : await this.store.resumeOwned(sessionId, hostId, version);
+    if (transitioned) return transitioned;
+    const current = await this.store.get(sessionId);
+    if (!current || current.hostId !== hostId) {
+      throw new LiveSessionError("세션을 찾을 수 없습니다.", "SESSION_NOT_FOUND", 404);
+    }
+    const targetStatus = action === "pause" ? "paused" : "live";
+    if (current.status === targetStatus) return current;
+    const requiredStatus = action === "pause" ? "live" : "paused";
+    if (current.status !== requiredStatus) {
+      throw new LiveSessionError(
+        action === "pause" ? "라이브 중인 세션만 일시정지할 수 있습니다." : "일시정지된 세션만 재개할 수 있습니다.",
+        action === "pause" ? "SESSION_NOT_PAUSABLE" : "SESSION_NOT_RESUMABLE",
+        409,
+      );
+    }
+    throw new LiveSessionError("다른 변경이 먼저 저장되었습니다. 새로고침 후 다시 시도하세요.", "VERSION_CONFLICT", 409);
+  }
+
+  /** Host session recovery: active sessions (preparing/live/paused) owned by the host. */
+  async listActive(hostId: string): Promise<LiveSession[]> {
+    return this.store.listOwnedActive(hostId);
   }
 
   async snapshot(sessionId: string, language: string): Promise<LiveSnapshot> {
@@ -94,6 +212,8 @@ interface LegacySessionSettingsInput {
 }
 
 interface CreateServiceInput extends LegacySessionSettingsInput {
+  title?: unknown;
+  scheduledAt?: unknown;
   sessionType?: unknown;
   outputMode?: unknown;
   voiceProvider?: unknown;
@@ -104,6 +224,8 @@ interface CreateServiceInput extends LegacySessionSettingsInput {
 
 interface UpdateServiceInput extends LegacySessionSettingsInput {
   version: unknown;
+  title?: unknown;
+  scheduledAt?: unknown;
   sessionType?: unknown;
   outputMode?: unknown;
   voiceProvider?: unknown;

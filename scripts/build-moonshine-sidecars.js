@@ -23,10 +23,10 @@ function buildTarget(target) {
     throw new Error("Moonshine sidecar release binaries must be built on macOS.");
   }
 
-  const buildRoot = path.join(rootDir, ".autopreso-dev", "release-build", target.name);
+  const buildRoot = path.join(rootDir, ".realtime-noel-dev", "release-build", target.name);
   const venvDir = path.join(buildRoot, "venv");
   const binDir = path.join(rootDir, target.packageDir, "bin");
-  const outputPath = path.join(binDir, "autopreso-moonshine");
+  const outputPath = path.join(binDir, "realtime-noel-moonshine");
   const archPrefix = target.arch === "x64" ? ["arch", "-x86_64"] : [];
   const python = process.env.PYTHON || "python3";
 
@@ -60,7 +60,7 @@ function buildTarget(target) {
     "--clean",
     "--noconfirm",
     "--name",
-    "autopreso-moonshine",
+    "realtime-noel-moonshine",
     "--hidden-import",
     "moonshine_voice.transcriber",
     "--add-binary",

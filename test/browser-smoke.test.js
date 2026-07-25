@@ -11,7 +11,7 @@ import { WebSocket } from "ws";
 import { startServer } from "../src/server.js";
 
 const CHROME_BIN = process.env.CHROME_BIN ?? "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
-const CHROME_DEBUG_PORT = 9333;
+const CHROME_DEBUG_PORT = Number(process.env.CHROME_DEBUG_PORT ?? 9333 + (process.pid % 1000));
 
 test("browser renders the app shell", async (t) => {
   if (!existsSync(CHROME_BIN)) {
@@ -36,7 +36,7 @@ test("browser renders the app shell", async (t) => {
     httpServer.close();
   });
 
-  const userDataDir = await mkdtemp(path.join(tmpdir(), "autopreso-chrome-"));
+  const userDataDir = await mkdtemp(path.join(tmpdir(), "realtime-noel-chrome-"));
   const chrome = spawn(
     CHROME_BIN,
     [
@@ -59,13 +59,13 @@ test("browser renders the app shell", async (t) => {
   });
 
   const tab = await waitForChromeTab(url);
-  const text = await waitForRenderedText(tab.webSocketDebuggerUrl, "Start Preso");
+  const text = await waitForRenderedText(tab.webSocketDebuggerUrl, "Start Realtime Noel", url);
 
-  assert.match(text, /Start Preso/);
+  assert.match(text, /Start Realtime Noel/);
 
   const controls = await evaluateInTab(tab.webSocketDebuggerUrl, `Array.from(document.querySelectorAll(".controls button")).map((button) => button.textContent.trim())`);
-  // Page starts in staging: Start Preso + Reset staging.
-  assert.ok(controls.some((label) => label.includes("Start Preso")), `expected a Start Preso button, got ${JSON.stringify(controls)}`);
+  // Page starts in staging: Start Realtime Noel + Reset staging.
+  assert.ok(controls.some((label) => label.includes("Start Realtime Noel")), `expected a Start Realtime Noel button, got ${JSON.stringify(controls)}`);
   assert.ok(controls.some((label) => label.includes("Reset Staging")), `expected a Reset Staging button, got ${JSON.stringify(controls)}`);
 });
 
@@ -84,7 +84,7 @@ async function waitForChromeTab(url) {
   throw new Error("Timed out waiting for Chrome debug tab.");
 }
 
-function waitForRenderedText(webSocketDebuggerUrl, expectedText) {
+function waitForRenderedText(webSocketDebuggerUrl, expectedText, targetUrl) {
   return new Promise((resolve, reject) => {
     const ws = new WebSocket(webSocketDebuggerUrl);
     let id = 0;
@@ -105,7 +105,9 @@ function waitForRenderedText(webSocketDebuggerUrl, expectedText) {
 
     ws.on("open", async () => {
       try {
+        await request("Page.enable");
         await request("Runtime.enable");
+        await request("Page.navigate", { url: targetUrl });
         const deadline = Date.now() + 15000;
         let lastText = "";
 

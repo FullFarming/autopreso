@@ -4,17 +4,25 @@ import path from "node:path";
 
 const require = createRequire(import.meta.url);
 const SAMPLE_RATE = 24000;
-const SIDECAR_PACKAGE_BY_PLATFORM = new Map([
-  ["darwin:arm64", "@autopreso/moonshine-darwin-arm64"],
-  ["darwin:x64", "@autopreso/moonshine-darwin-x64"],
+const LEGACY_PACKAGE_SCOPE = `@${["auto", "preso"].join("")}`;
+const LEGACY_BINARY_NAME = `${["auto", "preso"].join("")}-moonshine`;
+const SIDECAR_PACKAGES_BY_PLATFORM = new Map([
+  ["darwin:arm64", [
+    { packageName: "@realtime-noel/moonshine-darwin-arm64", binaryName: "realtime-noel-moonshine" },
+    { packageName: `${LEGACY_PACKAGE_SCOPE}/moonshine-darwin-arm64`, binaryName: LEGACY_BINARY_NAME },
+  ]],
+  ["darwin:x64", [
+    { packageName: "@realtime-noel/moonshine-darwin-x64", binaryName: "realtime-noel-moonshine" },
+    { packageName: `${LEGACY_PACKAGE_SCOPE}/moonshine-darwin-x64`, binaryName: LEGACY_BINARY_NAME },
+  ]],
 ]);
 
 export function moonshinePlatformPackageName(platform = process.platform, arch = process.arch) {
-  const packageName = SIDECAR_PACKAGE_BY_PLATFORM.get(`${platform}:${arch}`);
-  if (!packageName) {
+  const packages = SIDECAR_PACKAGES_BY_PLATFORM.get(`${platform}:${arch}`);
+  if (!packages) {
     throw new Error("Moonshine local transcription is currently available for macOS arm64 and x64.");
   }
-  return packageName;
+  return packages[0].packageName;
 }
 
 export function resolveMoonshineSidecarPath({
@@ -23,11 +31,21 @@ export function resolveMoonshineSidecarPath({
   arch = process.arch,
   requireResolve = require.resolve,
 } = {}) {
-  if (env.AUTOPRESO_MOONSHINE_BIN) return env.AUTOPRESO_MOONSHINE_BIN;
+  if (env.REALTIME_NOEL_MOONSHINE_BIN) return env.REALTIME_NOEL_MOONSHINE_BIN;
 
-  const packageName = moonshinePlatformPackageName(platform, arch);
-  const packageJsonPath = requireResolve(`${packageName}/package.json`);
-  return path.join(path.dirname(packageJsonPath), "bin", "autopreso-moonshine");
+  const packages = SIDECAR_PACKAGES_BY_PLATFORM.get(`${platform}:${arch}`);
+  if (!packages) {
+    moonshinePlatformPackageName(platform, arch);
+  }
+  for (const candidate of packages) {
+    try {
+      const packageJsonPath = requireResolve(`${candidate.packageName}/package.json`);
+      return path.join(path.dirname(packageJsonPath), "bin", candidate.binaryName);
+    } catch (error) {
+      if (error.code !== "MODULE_NOT_FOUND") throw error;
+    }
+  }
+  throw new Error(`Cannot find Moonshine sidecar package for ${platform}/${arch}.`);
 }
 
 export function createMoonshineTranscription({

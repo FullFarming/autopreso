@@ -6,6 +6,9 @@ import { getSupabasePublicAccess, getSupabaseServerAccess, supabaseAdminHeaders 
 
 export interface LiveSessionSecurityView {
   id: string;
+  title: string;
+  scheduledAt: string | null;
+  status: "preparing" | "live" | "paused";
   sessionType: "presentation" | "meeting";
   outputMode: "captions" | "captions_audio" | "audio";
   voiceProvider: "gemini" | "openai";
@@ -15,6 +18,8 @@ export interface LiveSessionSecurityView {
   version: number;
   expiresAt: string;
   admissionOpenUntil: string | null;
+  admissionGeneration: number;
+  admissionState: "uninitialized" | "open" | "paused" | "ended";
 }
 
 export interface ViewerGrantRecord {
@@ -22,16 +27,47 @@ export interface ViewerGrantRecord {
   sessionId: string;
   userId: string;
   displayName: string;
+  department: string;
+  jobTitle: string;
+  participantId: string;
   expiresAt: string;
 }
 
-type ViewerLiveSessionSecurityView = Omit<LiveSessionSecurityView, "admissionOpenUntil" | "version">;
+type ViewerLiveSessionSecurityView = Omit<
+  LiveSessionSecurityView,
+  "admissionOpenUntil" | "admissionGeneration" | "admissionState" | "version"
+>;
 const CANONICAL_LANGUAGE_CODES = new Set<string>(LANGUAGE_CODES);
 
 export interface AdmissionRedemption {
   grant: ViewerGrantRecord;
   session: ViewerLiveSessionSecurityView;
   viewerCount: number;
+}
+
+export interface LiveSessionLifecycle {
+  id: string;
+  hostId: string;
+  title: string;
+  scheduledAt: string | null;
+  status: "preparing" | "live" | "paused" | "stopped" | "failed";
+  endedAt: string | null;
+}
+
+export interface LiveParticipantRosterRecord {
+  participantId: string;
+  grantId: string;
+  userId: string;
+  displayName: string;
+  department: string;
+  jobTitle: string;
+  joinedAt: string;
+  lastSeenAt: string;
+  leftAt: string | null;
+  lastSpokeAt: string | null;
+  utteranceCount: number;
+  speakingSeconds: number;
+  retentionExpiresAt: string | null;
 }
 
 export class LiveAdmissionError extends Error {
@@ -67,6 +103,22 @@ function unwrapRpcRow(value: unknown): Record<string, unknown> {
 function requiredString(row: Record<string, unknown>, key: string): string {
   const value = row[key];
   if (typeof value !== "string" || !value) {
+    throw new LiveAdmissionError("라이브 인증 응답이 올바르지 않습니다.", "INVALID_STORE_RESPONSE", 503);
+  }
+  return value;
+}
+
+function requiredTimestamp(row: Record<string, unknown>, key: string): string {
+  const value = requiredString(row, key);
+  if (!Number.isFinite(Date.parse(value))) {
+    throw new LiveAdmissionError("라이브 인증 응답이 올바르지 않습니다.", "INVALID_STORE_RESPONSE", 503);
+  }
+  return value;
+}
+
+function optionalTimestamp(value: unknown): string | null {
+  if (value === null) return null;
+  if (typeof value !== "string" || !Number.isFinite(Date.parse(value))) {
     throw new LiveAdmissionError("라이브 인증 응답이 올바르지 않습니다.", "INVALID_STORE_RESPONSE", 503);
   }
   return value;
@@ -108,7 +160,7 @@ function mapRpcError(status: number, body: RpcErrorBody): LiveAdmissionError {
   if (["ADMISSION_CLOSED", "INVITE_CLOSED", "INVITE_NOT_FOUND", "INVITE_EXPIRED", "INVITE_REVOKED"].some(
     (code) => providerCode === code || providerMessage.includes(code),
   )) {
-    return new LiveAdmissionError("입장 시간이 종료되었거나 인증번호가 올바르지 않습니다.", "ADMISSION_CLOSED", 410);
+    return new LiveAdmissionError("QR 초대가 만료되었거나 종료되었습니다.", "ADMISSION_CLOSED", 410);
   }
   if (providerCode === "VIEWER_LIMIT_REACHED" || providerMessage.includes("VIEWER_LIMIT_REACHED")) {
     return new LiveAdmissionError("호스트가 정한 최대 시청자 수에 도달했습니다.", "VIEWER_LIMIT_REACHED", 409);
@@ -157,16 +209,34 @@ function parseAdmissionRedemption(body: unknown): AdmissionRedemption {
   if (typeof viewerCount !== "number" || !Number.isInteger(viewerCount) || viewerCount < 0 || viewerCount > maxViewers) {
     throw new LiveAdmissionError("시청자 수 응답이 올바르지 않습니다.", "INVALID_STORE_RESPONSE", 503);
   }
+  const status = row.status ?? "live";
+  if (status !== "preparing" && status !== "live" && status !== "paused") {
+    throw new LiveAdmissionError("입장권 세션 상태가 올바르지 않습니다.", "INVALID_STORE_RESPONSE", 503);
+  }
+  const title = row.title ?? "Live Session";
+  if (typeof title !== "string" || Array.from(title).length < 1 || Array.from(title).length > 120) {
+    throw new LiveAdmissionError("입장권 세션 제목이 올바르지 않습니다.", "INVALID_STORE_RESPONSE", 503);
+  }
+  const scheduledAt = row.scheduled_at ?? null;
+  if (scheduledAt !== null && (typeof scheduledAt !== "string" || !Number.isFinite(Date.parse(scheduledAt)))) {
+    throw new LiveAdmissionError("입장권 세션 일정이 올바르지 않습니다.", "INVALID_STORE_RESPONSE", 503);
+  }
   return {
     grant: {
       id: requiredString(row, "grant_id"),
       sessionId: requiredString(row, "session_id"),
       userId: requiredString(row, "user_id"),
       displayName: requiredString(row, "display_name"),
+      department: requiredString(row, "department"),
+      jobTitle: requiredString(row, "job_title"),
+      participantId: requiredString(row, "participant_id"),
       expiresAt: requiredString(row, "grant_expires_at"),
     },
     session: {
       id: requiredString(row, "session_id"),
+      title,
+      scheduledAt,
+      status,
       sessionType,
       outputMode,
       voiceProvider,
@@ -197,16 +267,10 @@ export function resolveLiveAdmissionExpiry(session: Pick<LiveSessionSecurityView
 
 export function resolveLiveInviteExpiry(session: LiveSessionSecurityView, now: number = Date.now()): string {
   const sessionExpiresAt = Date.parse(session.expiresAt);
-  const admissionExpiresAt = session.admissionOpenUntil === null
-    ? Number.NaN
-    : Date.parse(session.admissionOpenUntil);
   if (!Number.isFinite(sessionExpiresAt)) {
     throw new LiveAdmissionError("라이브 세션 만료 정보가 올바르지 않습니다.", "INVALID_STORE_RESPONSE", 503);
   }
-  if (!Number.isFinite(admissionExpiresAt) || admissionExpiresAt <= now) {
-    throw new LiveAdmissionError("입장 시간이 종료되었습니다.", "ADMISSION_CLOSED", 410);
-  }
-  const expiresAt = Math.min(now + 6 * 60 * 60 * 1_000, sessionExpiresAt, admissionExpiresAt);
+  const expiresAt = sessionExpiresAt;
   if (expiresAt <= now) throw new LiveAdmissionError("입장 시간이 종료되었습니다.", "ADMISSION_CLOSED", 410);
   return new Date(expiresAt).toISOString();
 }
@@ -249,7 +313,7 @@ export class SupabaseLiveAdmissionStore {
 
   async assertHostSession(sessionId: string, hostId: string): Promise<LiveSessionSecurityView> {
     const query = new URLSearchParams({
-      select: "id,session_type,output_mode,voice_provider,glossary_pack,languages,max_viewers,version,expires_at,admission_open_until",
+      select: "id,title,scheduled_at,status,session_type,output_mode,voice_provider,glossary_pack,languages,max_viewers,version,expires_at,admission_open_until,admission_generation,admission_state",
       id: `eq.${sessionId}`,
       host_id: `eq.${hostId}`,
       status: "neq.stopped",
@@ -292,8 +356,36 @@ export class SupabaseLiveAdmissionStore {
       && (typeof admissionOpenUntil !== "string" || !Number.isFinite(Date.parse(admissionOpenUntil)))) {
       throw new LiveAdmissionError("입장창 만료 정보가 올바르지 않습니다.", "INVALID_STORE_RESPONSE", 503);
     }
+    const admissionGeneration = row.admission_generation;
+    if (typeof admissionGeneration !== "number"
+      || !Number.isSafeInteger(admissionGeneration)
+      || admissionGeneration < 0) {
+      throw new LiveAdmissionError("인증번호 세대 정보가 올바르지 않습니다.", "INVALID_STORE_RESPONSE", 503);
+    }
+    const admissionState = row.admission_state;
+    if (admissionState !== "uninitialized"
+      && admissionState !== "open"
+      && admissionState !== "paused"
+      && admissionState !== "ended") {
+      throw new LiveAdmissionError("입장 상태가 올바르지 않습니다.", "INVALID_STORE_RESPONSE", 503);
+    }
+    const title = row.title ?? "Live Session";
+    if (typeof title !== "string" || Array.from(title).length < 1 || Array.from(title).length > 120) {
+      throw new LiveAdmissionError("라이브 세션 제목이 올바르지 않습니다.", "INVALID_STORE_RESPONSE", 503);
+    }
+    const scheduledAt = row.scheduled_at ?? null;
+    if (scheduledAt !== null && (typeof scheduledAt !== "string" || !Number.isFinite(Date.parse(scheduledAt)))) {
+      throw new LiveAdmissionError("라이브 세션 일정이 올바르지 않습니다.", "INVALID_STORE_RESPONSE", 503);
+    }
+    const status = row.status ?? "preparing";
+    if (status !== "preparing" && status !== "live" && status !== "paused") {
+      throw new LiveAdmissionError("라이브 세션 상태가 올바르지 않습니다.", "INVALID_STORE_RESPONSE", 503);
+    }
     return {
       id: requiredString(row, "id"),
+      title,
+      scheduledAt,
+      status,
       sessionType,
       outputMode,
       voiceProvider,
@@ -303,7 +395,80 @@ export class SupabaseLiveAdmissionStore {
       version,
       expiresAt,
       admissionOpenUntil,
+      admissionGeneration,
+      admissionState,
     };
+  }
+
+  async readSessionLifecycle(sessionId: string): Promise<LiveSessionLifecycle | null> {
+    const query = new URLSearchParams({
+      select: "id,host_id,title,scheduled_at,status,ended_at",
+      id: `eq.${sessionId}`,
+      limit: "1",
+    });
+    const body = await this.request(`live_sessions?${query}`, { method: "GET" });
+    if (!Array.isArray(body) || body.length === 0) return null;
+    const row = unwrapRpcRow(body);
+    const status = requiredString(row, "status");
+    if (!["preparing", "live", "paused", "stopped", "failed"].includes(status)) {
+      throw new LiveAdmissionError("라이브 세션 상태가 올바르지 않습니다.", "INVALID_STORE_RESPONSE", 503);
+    }
+    const title = row.title ?? "Live Session";
+    const scheduledAt = row.scheduled_at ?? null;
+    const endedAt = row.ended_at ?? null;
+    if (typeof title !== "string"
+      || Array.from(title).length < 1
+      || Array.from(title).length > 120
+      || (scheduledAt !== null && (typeof scheduledAt !== "string" || !Number.isFinite(Date.parse(scheduledAt))))
+      || (endedAt !== null && (typeof endedAt !== "string" || !Number.isFinite(Date.parse(endedAt))))) {
+      throw new LiveAdmissionError("라이브 세션 정보가 올바르지 않습니다.", "INVALID_STORE_RESPONSE", 503);
+    }
+    return {
+      id: requiredString(row, "id"),
+      hostId: requiredString(row, "host_id"),
+      title,
+      scheduledAt,
+      status: status as LiveSessionLifecycle["status"],
+      endedAt,
+    };
+  }
+
+  async assertHostSessionOwnership(sessionId: string, hostId: string): Promise<void> {
+    const session = await this.readSessionLifecycle(sessionId);
+    if (!session || session.hostId !== hostId) {
+      throw new LiveAdmissionError("라이브 세션을 찾을 수 없습니다.", "LIVE_SESSION_NOT_FOUND", 404);
+    }
+  }
+
+  async assertParticipantAccess(input: {
+    sessionId: string;
+    userId: string;
+    grantId?: string;
+    recapOnly?: boolean;
+  }): Promise<"viewer" | "recap"> {
+    if (!input.recapOnly && input.grantId) {
+      const viewerQuery = new URLSearchParams({
+        select: "id",
+        id: `eq.${input.grantId}`,
+        session_id: `eq.${input.sessionId}`,
+        user_id: `eq.${input.userId}`,
+        revoked_at: "is.null",
+        expires_at: `gt.${new Date().toISOString()}`,
+        limit: "1",
+      });
+      const viewerRows = await this.request(`viewer_grants?${viewerQuery}`, { method: "GET" });
+      if (Array.isArray(viewerRows) && viewerRows.length === 1) return "viewer";
+    }
+    const recapQuery = new URLSearchParams({
+      select: "session_id",
+      session_id: `eq.${input.sessionId}`,
+      user_id: `eq.${input.userId}`,
+      expires_at: `gt.${new Date().toISOString()}`,
+      limit: "1",
+    });
+    const recapRows = await this.request(`live_recap_grants?${recapQuery}`, { method: "GET" });
+    if (Array.isArray(recapRows) && recapRows.length === 1) return "recap";
+    throw new LiveAdmissionError("회의록을 볼 권한이 없습니다.", "RECAP_FORBIDDEN", 403);
   }
 
   async openAdmission(input: {
@@ -349,7 +514,6 @@ export class SupabaseLiveAdmissionStore {
     hostId: string;
     tokenHmac: string;
     expiresAt: string;
-    admissionOpenUntil: string;
   }): Promise<void> {
     await this.request("rpc/create_live_invite", {
       method: "POST",
@@ -358,7 +522,6 @@ export class SupabaseLiveAdmissionStore {
         p_host_id: input.hostId,
         p_token_hmac: input.tokenHmac,
         p_expires_at: input.expiresAt,
-        p_admission_open_until: input.admissionOpenUntil,
       }),
     });
   }
@@ -390,15 +553,19 @@ export class SupabaseLiveAdmissionStore {
     userId: string;
     deviceHash: string;
     displayName: string;
+    department: string;
+    jobTitle: string;
     expiresAt: string;
   }): Promise<AdmissionRedemption> {
-    const body = await this.request("rpc/redeem_live_admission", {
+    const body = await this.request("rpc/redeem_live_admission_v3", {
       method: "POST",
       body: JSON.stringify({
         p_code_hmac: input.codeHmac,
         p_user_id: input.userId,
         p_device_hash: input.deviceHash,
         p_display_name: input.displayName,
+        p_department: input.department,
+        p_job_title: input.jobTitle,
         p_grant_expires_at: input.expiresAt,
       }),
     });
@@ -410,19 +577,65 @@ export class SupabaseLiveAdmissionStore {
     userId: string;
     deviceHash: string;
     displayName: string;
+    department: string;
+    jobTitle: string;
     expiresAt: string;
   }): Promise<AdmissionRedemption> {
-    const body = await this.request("rpc/redeem_live_invite", {
+    const body = await this.request("rpc/redeem_live_invite_v3", {
       method: "POST",
       body: JSON.stringify({
         p_token_hmac: input.tokenHmac,
         p_user_id: input.userId,
         p_device_hash: input.deviceHash,
         p_display_name: input.displayName,
+        p_department: input.department,
+        p_job_title: input.jobTitle,
         p_grant_expires_at: input.expiresAt,
       }),
     });
     return parseAdmissionRedemption(body);
+  }
+
+  async readParticipantRoster(sessionId: string, hostId: string): Promise<LiveParticipantRosterRecord[]> {
+    const body = await this.request("rpc/read_live_participant_roster", {
+      method: "POST",
+      body: JSON.stringify({ p_session_id: sessionId, p_host_id: hostId }),
+    });
+    if (!Array.isArray(body)) {
+      throw new LiveAdmissionError("참가자 목록 응답이 올바르지 않습니다.", "INVALID_STORE_RESPONSE", 503);
+    }
+    return body.map((value) => {
+      if (!isRecord(value)) {
+        throw new LiveAdmissionError("참가자 목록 응답이 올바르지 않습니다.", "INVALID_STORE_RESPONSE", 503);
+      }
+      const utteranceCount = value.utterance_count;
+      const speakingSeconds = Number(value.speaking_seconds);
+      const leftAt = optionalTimestamp(value.left_at);
+      const lastSpokeAt = optionalTimestamp(value.last_spoke_at);
+      const retentionExpiresAt = optionalTimestamp(value.retention_expires_at);
+      if (typeof utteranceCount !== "number"
+        || !Number.isSafeInteger(utteranceCount)
+        || utteranceCount < 0
+        || !Number.isFinite(speakingSeconds)
+        || speakingSeconds < 0) {
+        throw new LiveAdmissionError("참가자 목록 응답이 올바르지 않습니다.", "INVALID_STORE_RESPONSE", 503);
+      }
+      return {
+        participantId: requiredString(value, "participant_id"),
+        grantId: requiredString(value, "grant_id"),
+        userId: requiredString(value, "user_id"),
+        displayName: requiredString(value, "display_name"),
+        department: requiredString(value, "department"),
+        jobTitle: requiredString(value, "job_title"),
+        joinedAt: requiredTimestamp(value, "joined_at"),
+        lastSeenAt: requiredTimestamp(value, "last_seen_at"),
+        leftAt,
+        lastSpokeAt,
+        utteranceCount,
+        speakingSeconds,
+        retentionExpiresAt,
+      };
+    });
   }
 
   async consumeRateLimit(input: {
@@ -461,6 +674,21 @@ export class SupabaseLiveAdmissionStore {
     if (body !== true) {
       throw new LiveAdmissionError("시청자 입장권이 만료되었거나 폐기되었습니다.", "VIEWER_GRANT_REVOKED", 401);
     }
+  }
+
+  async leaveViewer(sessionId: string, grantId: string, userId: string): Promise<boolean> {
+    const body = await this.request("rpc/leave_live_session", {
+      method: "POST",
+      body: JSON.stringify({
+        p_session_id: sessionId,
+        p_grant_id: grantId,
+        p_user_id: userId,
+      }),
+    });
+    if (typeof body !== "boolean") {
+      throw new LiveAdmissionError("퇴장 응답이 올바르지 않습니다.", "INVALID_STORE_RESPONSE", 503);
+    }
+    return body;
   }
 }
 

@@ -1,4 +1,21 @@
-export function createTranscriptTurnQueue({ runTurn, debounceMs = 150, isReady = (_text) => true }) {
+// A turn that never settles (a hung LLM/network call with no timeout of its
+// own) must not jam the queue forever: past this, the queue moves on to the
+// buffered chunks. The late turn's result is discarded by the caller's own
+// session guards. Generous by default — real agent turns can take minutes.
+const DEFAULT_TURN_TIMEOUT_MS = 180_000;
+// While a turn runs, overflow chunks are buffered for the next turn. Bound the
+// buffer so a stalled turn can't grow it (and the next turn's prompt) without
+// limit — keep only the most recent chunks.
+const DEFAULT_MAX_BUFFERED_CHUNKS = 200;
+
+export function createTranscriptTurnQueue({
+  runTurn,
+  debounceMs = 150,
+  isReady = (_text) => true,
+  turnTimeoutMs = DEFAULT_TURN_TIMEOUT_MS,
+  maxBufferedChunks = DEFAULT_MAX_BUFFERED_CHUNKS,
+  log = console,
+}) {
   let running = false;
   let buffered = [];
   let current = Promise.resolve();
@@ -22,15 +39,46 @@ export function createTranscriptTurnQueue({ runTurn, debounceMs = 150, isReady =
     pending = [];
     if (running) {
       buffered.push(text);
+      if (buffered.length > maxBufferedChunks) {
+        buffered.splice(0, buffered.length - maxBufferedChunks);
+      }
     } else {
       current = drain(text);
+    }
+  }
+
+  // Bound a single turn's wall-clock so a hung runTurn can never leave the
+  // queue `running` forever (every later chunk would buffer and nothing would
+  // ever fire again — the "queue piles up and everything stops" stall). The
+  // timed-out turn keeps running in the background; its late effects are the
+  // caller's session guards' problem, but the QUEUE recovers.
+  async function runTurnBounded(text) {
+    // runTurn MUST start synchronously (callers capture per-session state at
+    // the moment the turn begins — deferring even a microtask changes which
+    // session a turn observes).
+    const turn = Promise.resolve(runTurn(text));
+    if (!Number.isFinite(turnTimeoutMs) || turnTimeoutMs <= 0) return turn;
+    // A late rejection after the timeout won loses the race and would otherwise
+    // become an unhandled rejection — observe it on a side branch.
+    turn.catch(() => {});
+    let timer = null;
+    const timedOut = new Promise((resolve) => {
+      timer = setTimeout(() => {
+        log.warn?.(`[turn-queue] turn did not settle within ${turnTimeoutMs}ms; continuing with buffered transcript`);
+        resolve();
+      }, turnTimeoutMs);
+    });
+    try {
+      await Promise.race([turn, timedOut]);
+    } finally {
+      clearTimeout(timer);
     }
   }
 
   async function drain(text) {
     running = true;
     try {
-      await runTurn(text);
+      await runTurnBounded(text);
     } finally {
       if (buffered.length > 0) {
         const next = buffered.join("\n");

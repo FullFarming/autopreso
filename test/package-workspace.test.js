@@ -12,17 +12,31 @@ function readJson(relativePath) {
 test("root package keeps platform sidecars as optional published packages, not local workspaces", () => {
   const rootPackage = readJson("package.json");
 
-  assert.deepEqual(rootPackage.files, ["assets/", "LICENSE", "public/", "src/"]);
-  assert.equal(rootPackage.bin["autopreso"], "src/cli.js");
+  assert.deepEqual(rootPackage.files, ["assets/", "electron/", "LICENSE", "public/", "src/"]);
+  assert.equal(rootPackage.bin["realtime-noel"], "src/cli.js");
+  assert.equal(rootPackage.main, "electron/main.js");
   assert.equal(rootPackage.scripts.dev, "node ./src/cli.js");
+  assert.equal(rootPackage.scripts.desktop, "node ./scripts/start-desktop.js");
+  assert.equal(rootPackage.scripts["dist:mac"], "electron-builder --mac dmg --arm64 --publish never");
+  assert.equal(rootPackage.scripts["dist:mac:x64"], "electron-builder --mac dmg --x64 --publish never");
+  assert.equal(rootPackage.scripts["dist:win"], "electron-builder --win portable --x64 --publish never");
+  assert.equal(rootPackage.build.appId, "com.realtime-noel.app");
+  assert.equal(rootPackage.build.productName, "Realtime Noel");
+  assert.equal(rootPackage.build.mac.category, "public.app-category.productivity");
+  assert.match(rootPackage.build.mac.extendInfo.NSAudioCaptureUsageDescription, /Realtime Noel/);
+  assert.match(rootPackage.build.mac.extendInfo.NSMicrophoneUsageDescription, /Realtime Noel/);
+  assert.match(rootPackage.build.mac.extendInfo.NSScreenCaptureUsageDescription, /Realtime Noel/);
+  assert.equal(rootPackage.build.mac.target[0].target, "dmg");
+  assert.equal(rootPackage.build.win.target[0].target, "portable");
+  assert.equal(rootPackage.build.portable.artifactName, "${productName}-${version}-win-portable.${ext}");
   assert.equal(rootPackage.scripts["build:moonshine-sidecars"], "node ./scripts/build-moonshine-sidecars.js");
   assert.equal(rootPackage.scripts["prepare:release-packages"], "node ./scripts/prepare-release-packages.js");
   assert.equal(rootPackage.workspaces, undefined);
-  assert.ok(rootPackage.optionalDependencies["@autopreso/moonshine-darwin-arm64"]);
-  assert.ok(rootPackage.optionalDependencies["@autopreso/moonshine-darwin-x64"]);
+  assert.ok(rootPackage.optionalDependencies["@realtime-noel/moonshine-darwin-arm64"]);
+  assert.ok(rootPackage.optionalDependencies["@realtime-noel/moonshine-darwin-x64"]);
 });
 
-test("Moonshine sidecar packages share one version, decoupled from autopreso", () => {
+test("Moonshine sidecar packages share one version, decoupled from realtime-noel", () => {
   const armPackage = readJson("packages/moonshine-darwin-arm64/package.json");
   const x64Package = readJson("packages/moonshine-darwin-x64/package.json");
   const rootPackage = readJson("package.json");
@@ -35,20 +49,20 @@ test("Moonshine sidecar packages share one version, decoupled from autopreso", (
   // Root optionalDependencies must pin the exact sidecar version that's
   // checked into the sidecar package.jsons, otherwise `npm ci` (and the
   // resolver in src/moonshine-transcription.js) sees a version mismatch.
-  assert.equal(rootPackage.optionalDependencies["@autopreso/moonshine-darwin-arm64"], armPackage.version);
-  assert.equal(rootPackage.optionalDependencies["@autopreso/moonshine-darwin-x64"], x64Package.version);
+  assert.equal(rootPackage.optionalDependencies["@realtime-noel/moonshine-darwin-arm64"], armPackage.version);
+  assert.equal(rootPackage.optionalDependencies["@realtime-noel/moonshine-darwin-x64"], x64Package.version);
 });
 
 test("Moonshine sidecar packages expose the resolver binary contract", () => {
   const packages = [
     {
       dir: "packages/moonshine-darwin-arm64",
-      name: "@autopreso/moonshine-darwin-arm64",
+      name: "@realtime-noel/moonshine-darwin-arm64",
       cpu: "arm64",
     },
     {
       dir: "packages/moonshine-darwin-x64",
-      name: "@autopreso/moonshine-darwin-x64",
+      name: "@realtime-noel/moonshine-darwin-x64",
       cpu: "x64",
     },
   ];
@@ -59,8 +73,8 @@ test("Moonshine sidecar packages expose the resolver binary contract", () => {
     assert.equal(packageJson.name, sidecarPackage.name);
     assert.deepEqual(packageJson.os, ["darwin"]);
     assert.deepEqual(packageJson.cpu, [sidecarPackage.cpu]);
-    assert.deepEqual(packageJson.files, ["bin/autopreso-moonshine"]);
-    assert.equal(packageJson.bin["autopreso-moonshine"], "bin/autopreso-moonshine");
+    assert.deepEqual(packageJson.files, ["bin/realtime-noel-moonshine"]);
+    assert.equal(packageJson.bin["realtime-noel-moonshine"], "bin/realtime-noel-moonshine");
   }
 });
 
@@ -76,11 +90,11 @@ test("Moonshine sidecars are built from a pinned release recipe", () => {
   ]);
 
   // release-please runs in monorepo manifest mode with two components: the
-  // root autopreso CLI and the moonshine-sidecars group. The sidecar group
+  // root realtime-noel CLI and the moonshine-sidecars group. The sidecar group
   // owns the moonshine config and build scripts via include-paths so that
   // only commits touching those files trigger sidecar version bumps.
   assert.equal(releasePlease.packages["."]["release-type"], "node");
-  assert.equal(releasePlease.packages["."].component, "autopreso");
+  assert.equal(releasePlease.packages["."].component, "realtime-noel");
   assert.equal(releasePlease.packages["packages/moonshine-darwin-arm64"].component, "moonshine-sidecars");
   assert.ok(releasePlease.packages["packages/moonshine-darwin-arm64"]["include-paths"].includes("moonshine-sidecar.config.json"));
   assert.ok(releasePlease.packages["."]["exclude-paths"].includes("moonshine-sidecar.config.json"));
@@ -90,7 +104,7 @@ test("release workflow uses current actions and npm trusted publishing", () => {
   const releaseWorkflow = readFileSync(path.join(rootDir, ".github/workflows/release-please.yml"), "utf8");
   const ciWorkflow = readFileSync(path.join(rootDir, ".github/workflows/ci.yml"), "utf8");
 
-  assert.equal(releaseWorkflow.includes("autopreso_released: ${{ steps.release.outputs.release_created }}"), true);
+  assert.equal(releaseWorkflow.includes("realtime_noel_released: ${{ steps.release.outputs.release_created }}"), true);
   assert.equal(releaseWorkflow.includes(".--release_created"), false);
   assert.equal(releaseWorkflow.includes("npm install --package-lock-only --ignore-scripts --omit=optional"), true);
   assert.equal(releaseWorkflow.includes("NODE_AUTH_TOKEN"), false);

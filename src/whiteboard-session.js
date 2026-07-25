@@ -44,7 +44,7 @@ export function createWhiteboardSession({ options, wss, runAgent }) {
     // Snapshot of the user's free-form "Agent instructions" textarea taken at
     // /api/preso/start. Frozen for the duration of the preso so the cached
     // system-prompt prefix the warmup loop primes stays stable; mid-preso edits
-    // to the textarea only take effect on the next Start Preso.
+    // to the textarea only take effect on the next Start Realtime Noel.
     agentInstructions: "",
     warmupPromise: Promise.resolve(),
     // Snapshot of the warmup loop state, also broadcast to clients via WS.

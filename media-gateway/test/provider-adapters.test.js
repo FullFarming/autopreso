@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import test from "node:test";
 
-import { ChirpTextToSpeechAdapter, CloudSpeechToTextAdapter, CloudTranslationAdvancedAdapter, GeminiLiveTranslateAdapter } from "../src/google-provider-adapters.js";
+import { ChirpTextToSpeechAdapter, CloudSpeechToTextAdapter, CloudTranslationAdvancedAdapter, GeminiLiveTranslateAdapter, GeminiTextTranslateAdapter } from "../src/google-provider-adapters.js";
 import { SupabaseViewerAuthorizer } from "../src/supabase-adapters.js";
 
 test("Chirp uses v1 bidirectional PCM streaming and yields audio before ending input", async () => {
@@ -177,6 +177,100 @@ function readLastSample(bytes) {
   return new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getInt16(bytes.byteLength - 2, true);
 }
 
+// A throwing caption handler used to be swallowed by `.catch(() => undefined)`
+// on the callback tail: no log, no counter, nothing. If the caption path failed
+// on every message — a snapshot allowlist rejection escalating to
+// SESSION_STOPPED, a Supabase 5xx, a polish adapter throwing — then every
+// caption for the rest of the session vanished while /health stayed ok and the
+// audio frame counter kept climbing. The failure has to be observable.
+test("a throwing caption handler is reported and does not break the callback tail", async () => {
+  const errors = [];
+  const delivered = [];
+  let messageHandler;
+  const adapter = new GeminiLiveTranslateAdapter({
+    model: "gemini-3.5-live-translate-preview",
+    client: {
+      live: {
+        async connect(options) {
+          messageHandler = options.callbacks.onmessage;
+          return { sendRealtimeInput() {}, close() {} };
+        },
+      },
+    },
+  });
+  await adapter.open({
+    language: "ko",
+    async onCaption(value) {
+      delivered.push(value.text);
+      if (value.text.includes("boom")) throw new Error("PUBLISH_FAILED");
+    },
+    async onAudio() {},
+    onCallbackError: (error) => errors.push(error instanceof Error ? error.message : String(error)),
+  });
+
+  messageHandler({ serverContent: { outputTranscription: { text: "boom." }, turnComplete: true } });
+  for (let tick = 0; tick < 4; tick += 1) await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(errors, ["PUBLISH_FAILED"], "the swallowed failure must surface");
+
+  // The tail must survive: the next message still delivers.
+  messageHandler({ serverContent: { outputTranscription: { text: "recovered." }, turnComplete: true } });
+  for (let tick = 0; tick < 4; tick += 1) await new Promise((resolve) => setImmediate(resolve));
+  assert.ok(delivered.includes("recovered."), `tail died after the throw: ${delivered.join(" | ")}`);
+});
+
+// The committed-caption handler runs an LLM polish pass. Interpreted audio is
+// time-critical playout and must never queue behind it: captions must stay
+// ordered relative to captions, and PCM relative to PCM, but the two are
+// independent. Sharing one serialization tail meant a slow polish delayed the
+// listener's audio by the full polish timeout.
+test("a slow committed caption never delays interpreted audio", async () => {
+  const order = [];
+  let releaseCaption;
+  const captionGate = new Promise((resolve) => { releaseCaption = resolve; });
+  let messageHandler;
+  const adapter = new GeminiLiveTranslateAdapter({
+    model: "gemini-3.5-live-translate-preview",
+    client: {
+      live: {
+        async connect(options) {
+          messageHandler = options.callbacks.onmessage;
+          return { sendRealtimeInput() {}, close() {} };
+        },
+      },
+    },
+  });
+  const session = await adapter.open({
+    language: "ko",
+    async onCaption() {
+      order.push("caption:start");
+      await captionGate; // stands in for the polish round-trip
+      order.push("caption:end");
+    },
+    async onAudio() { order.push("audio"); },
+  });
+
+  // One message carrying both a committed transcription and PCM.
+  messageHandler({
+    serverContent: {
+      outputTranscription: { text: "폴리시가 느린 문장입니다." },
+      modelTurn: { parts: [{ inlineData: { mimeType: "audio/pcm;rate=24000", data: Buffer.from([1, 2]).toString("base64") } }] },
+      turnComplete: true,
+    },
+  });
+
+  // Let microtasks settle while the caption handler is still blocked.
+  for (let tick = 0; tick < 5; tick += 1) await new Promise((resolve) => setImmediate(resolve));
+  // The caption handler is still parked in its await, so the polish has NOT
+  // finished — and the audio must already have played anyway.
+  assert.ok(order.includes("caption:start"), "the caption handler should have started");
+  assert.ok(!order.includes("caption:end"), "the polish must still be pending for this test to mean anything");
+  assert.ok(order.includes("audio"), `audio must not wait for the caption: ${order.join(" > ")}`);
+
+  releaseCaption();
+  await new Promise((resolve) => setImmediate(resolve));
+  await session.close();
+});
+
 test("Gemini Live Translate uses the official audio-only translation configuration", async () => {
   const connections = [];
   const audio = [];
@@ -206,6 +300,10 @@ test("Gemini Live Translate uses the official audio-only translation configurati
   });
   assert.deepEqual(connections[0].config.responseModalities, ["AUDIO"]);
   assert.equal("systemInstruction" in connections[0].config, false);
+  // Desktop subtitle parity: the same fast end-of-speech tuning.
+  assert.deepEqual(connections[0].config.realtimeInputConfig, {
+    automaticActivityDetection: { prefixPaddingMs: 100, silenceDurationMs: 450 },
+  });
   connections[0].callbacks.onmessage({
     serverContent: { modelTurn: { parts: [{ inlineData: { mimeType: "audio/pcm;rate=24000", data: Buffer.from([1, 2, 3, 4]).toString("base64") } }] } },
   });
@@ -703,4 +801,193 @@ test("viewer authorization accepts only a live session in the granted language",
     "session-1",
     "ko",
   ), false);
+});
+
+test("Cloud STT surfaces interim transcripts through onPartialTranscript", async () => {
+  const stream = new EventEmitter();
+  stream.write = () => true;
+  stream.end = () => stream.emit("end");
+  const partials = [];
+  const adapter = new CloudSpeechToTextAdapter({ client: { streamingRecognize: () => stream }, projectId: "dev-project", languageCodes: ["ko-KR"] });
+  const session = await adapter.open({
+    async onFinalUtterance() {},
+    onPartialTranscript(partial) { partials.push(partial); },
+  });
+  stream.emit("data", {
+    results: [
+      { isFinal: false, stability: 0.1, languageCode: "ko-kr", alternatives: [{ transcript: "안녕하세요 " }] },
+      { isFinal: false, stability: 0.01, alternatives: [{ transcript: "여러분" }] },
+    ],
+  });
+  stream.emit("data", { results: [{ isFinal: true, alternatives: [{ transcript: "안녕하세요 여러분", words: [] }] }] });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(partials, [{ text: "안녕하세요 여러분", sourceLanguage: "ko-kr" }]);
+  await session.close();
+});
+
+test("Gemini text translation serves BOTH partials and finals; Cloud Translate is failure-only", async () => {
+  const calls = [];
+  const geminiClient = {
+    models: {
+      async generateContent(request) {
+        calls.push(request);
+        if (String(request.contents?.[0]?.parts?.[0]?.text ?? "").includes("실패해줘")) throw new Error("GEMINI_DOWN");
+        return { text: "Hello everyone, let us begin." };
+      },
+    },
+  };
+  const fallbackCalls = [];
+  const fallback = {
+    async translate(input) {
+      fallbackCalls.push(input);
+      return `cloud:${input.text}`;
+    },
+  };
+  const adapter = new GeminiTextTranslateAdapter({ client: geminiClient, model: "gemini-3.5-flash", fallback });
+
+  // Finals go through Gemini for desktop-parity quality.
+  const finalText = await adapter.translate({ text: "안녕하세요 여러분 시작하겠습니다", language: "en", sourceLanguage: "ko-KR", intent: "final" });
+  assert.equal(finalText, "Hello everyone, let us begin.");
+  assert.equal(calls.length, 1);
+  assert.match(String(calls[0].contents[0].parts[0].text), /안녕하세요 여러분 시작하겠습니다/);
+
+  // Partials also go through Gemini — captions are locked to Gemini 3.5.
+  const partialText = await adapter.translate({ text: "안녕하", language: "en", sourceLanguage: "ko-KR", intent: "partial" });
+  assert.equal(partialText, "Hello everyone, let us begin.");
+  assert.equal(calls.length, 2);
+
+  // A Gemini failure falls back to Cloud Translate instead of failing the lane.
+  const recovered = await adapter.translate({ text: "실패해줘", language: "en", sourceLanguage: "ko-KR", intent: "final" });
+  assert.equal(recovered, "cloud:실패해줘");
+});
+
+test("Gemini text translation rejects output in the wrong script and falls back", async () => {
+  const geminiClient = {
+    models: {
+      // Model echoes Korean back instead of translating: must not surface.
+      async generateContent() { return { text: "안녕하세요 여러분" }; },
+    },
+  };
+  const fallback = { async translate(input) { return `cloud:${input.text}`; } };
+  const adapter = new GeminiTextTranslateAdapter({ client: geminiClient, fallback });
+  const result = await adapter.translate({ text: "안녕하세요 여러분", language: "en", sourceLanguage: "ko-KR", intent: "final" });
+  assert.equal(result, "cloud:안녕하세요 여러분");
+});
+
+test("Gemini text translation injects the desktop subtitle glossary into every prompt", async () => {
+  const prompts = [];
+  const geminiClient = {
+    models: {
+      async generateContent(request) {
+        prompts.push(String(request.contents?.[0]?.parts?.[0]?.text ?? ""));
+        return { text: "Hilton Garden Inn conversion is on track." };
+      },
+    },
+  };
+  const adapter = new GeminiTextTranslateAdapter({ client: geminiClient });
+  await adapter.translate({
+    text: "힐튼 가든 인 컨버전은 순항 중입니다",
+    language: "en",
+    sourceLanguage: "ko-KR",
+    glossaryText: "힐튼 가든 인 = Hilton Garden Inn\n컨버전 = conversion",
+    intent: "final",
+  });
+  assert.match(prompts[0], /Glossary — always use these exact term translations:/);
+  assert.match(prompts[0], /힐튼 가든 인 = Hilton Garden Inn/);
+});
+
+test("Gemini Live Translate accumulates transcription deltas like the desktop pipeline", async () => {
+  const captions = [];
+  const inputCaptions = [];
+  let messageHandler;
+  const adapter = new GeminiLiveTranslateAdapter({
+    model: "gemini-3.5-live-translate-preview",
+    client: {
+      live: {
+        async connect(options) {
+          messageHandler = options.callbacks.onmessage;
+          return { sendRealtimeInput() {}, close() {} };
+        },
+      },
+    },
+  });
+  const session = await adapter.open({
+    language: "en",
+    onCaption: (caption) => { captions.push({ ...caption }); },
+    onInputCaption: (caption) => { inputCaptions.push({ ...caption }); },
+    onAudio: async () => {},
+    onInterruption: async () => {},
+  });
+  // Deltas, exactly as the Live API sends them.
+  messageHandler({ serverContent: { outputTranscription: { text: "Hello" } } });
+  messageHandler({ serverContent: { outputTranscription: { text: " every" } } });
+  messageHandler({ serverContent: { outputTranscription: { text: "one" }, inputTranscription: { text: "안녕하세요", languageCode: "ko-KR" } } });
+  messageHandler({ serverContent: { turnComplete: true } });
+  // Next utterance must start from a clean slate.
+  messageHandler({ serverContent: { outputTranscription: { text: "Next topic" }, turnComplete: true } });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(captions, [
+    { text: "Hello", isFinal: false },
+    { text: "Hello every", isFinal: false },
+    { text: "Hello everyone", isFinal: false },
+    { text: "Hello everyone", isFinal: true },
+    { text: "Next topic", isFinal: true },
+  ]);
+  assert.deepEqual(inputCaptions, [
+    { text: "안녕하세요", isFinal: false, languageCode: "ko-KR" },
+    { text: "안녕하세요", isFinal: true, languageCode: "ko-KR" },
+  ]);
+  await session.close();
+});
+
+test("Gemini Live Translate interruption discards the abandoned utterance text", async () => {
+  const captions = [];
+  let messageHandler;
+  const adapter = new GeminiLiveTranslateAdapter({
+    model: "gemini-3.5-live-translate-preview",
+    client: { live: { async connect(options) { messageHandler = options.callbacks.onmessage; return { sendRealtimeInput() {}, close() {} }; } } },
+  });
+  const session = await adapter.open({
+    language: "en",
+    onCaption: (caption) => { captions.push({ ...caption }); },
+    onAudio: async () => {},
+    onInterruption: async () => {},
+  });
+  messageHandler({ serverContent: { outputTranscription: { text: "Abandoned words" } } });
+  messageHandler({ serverContent: { interrupted: true } });
+  messageHandler({ serverContent: { outputTranscription: { text: "Fresh start" }, turnComplete: true } });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(captions.at(-1), { text: "Fresh start", isFinal: true });
+  assert.equal(captions.some((caption) => caption.isFinal && caption.text.includes("Abandoned")), false);
+  await session.close();
+});
+
+test("continuous speech commits sentences as finals without waiting for turnComplete", async () => {
+  const captions = [];
+  let messageHandler;
+  const adapter = new GeminiLiveTranslateAdapter({
+    model: "gemini-3.5-live-translate-preview",
+    finalFlushMilliseconds: 30,
+    client: { live: { async connect(options) { messageHandler = options.callbacks.onmessage; return { sendRealtimeInput() {}, close() {} }; } } },
+  });
+  const session = await adapter.open({
+    language: "en",
+    onCaption: (caption) => { captions.push({ ...caption }); },
+    onAudio: async () => {},
+    onInterruption: async () => {},
+  });
+  // The real model's delta pattern for continuous speech — no turn signal.
+  messageHandler({ serverContent: { outputTranscription: { text: "Hello everyone." } } });
+  messageHandler({ serverContent: { outputTranscription: { text: " Let's start the meeting." } } });
+  messageHandler({ serverContent: { outputTranscription: { text: " This quarter's" } } });
+  await new Promise((resolve) => setImmediate(resolve));
+  const finalsBeforeFlush = captions.filter((caption) => caption.isFinal).map((caption) => caption.text);
+  assert.deepEqual(finalsBeforeFlush, ["Hello everyone.", "Let's start the meeting."]);
+  assert.equal(captions.at(-1).isFinal, false);
+  assert.equal(captions.at(-1).text, "This quarter's");
+  // Silence: the tail flushes as a final on its own.
+  await new Promise((resolve) => setTimeout(resolve, 90));
+  const finals = captions.filter((caption) => caption.isFinal).map((caption) => caption.text);
+  assert.deepEqual(finals, ["Hello everyone.", "Let's start the meeting.", "This quarter's"]);
+  await session.close();
 });

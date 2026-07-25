@@ -39,14 +39,12 @@ export default function LoginPage() {
         window.location.assign("/");
         return;
       }
-      const data: unknown = await response.json().catch(() => null);
-      const message = data && typeof data === "object" && "error" in data
-        && typeof data.error === "string"
-        ? data.error
-        : "로그인에 실패했습니다.";
-      setError(message);
+      await response.json().catch(() => null);
+      setError(response.status === 429
+        ? "Too many sign-in attempts. Please wait and try again."
+        : "Check your user ID and password.");
     } catch {
-      setError("서버에 연결할 수 없습니다.");
+      setError("Unable to connect to the server.");
     } finally {
       setSubmitting(false);
     }
@@ -56,29 +54,29 @@ export default function LoginPage() {
     <main className="flex min-h-[100dvh] flex-col items-center justify-center px-4">
       <div className="glass-strong w-full max-w-sm p-8">
         <h1 className="display mb-1 text-3xl">Realtime Noel</h1>
-        <p className="mb-6 text-sm text-cw-grey75">실시간 번역 자막 — 사내용</p>
+        <p className="mb-6 text-sm text-cw-grey75">Live translated captions for your team</p>
         <form onSubmit={handleSubmit} className="space-y-4">
           <div>
-            <label htmlFor="login-name" className="mb-1 block text-sm font-medium text-cw-grey75">이름 (자막에 표시될 이름)</label>
-            <input id="login-name" value={name} onChange={(event) => setName(event.target.value)} placeholder="예: Noel" required className="glass-input" />
+            <label htmlFor="login-name" className="mb-1 block text-sm font-medium text-cw-grey75">Display name</label>
+            <input id="login-name" value={name} onChange={(event) => setName(event.target.value)} placeholder="e.g. Noel" required className="glass-input" />
           </div>
           <div>
-            <label htmlFor="login-id" className="mb-1 block text-sm font-medium text-cw-grey75">아이디</label>
+            <label htmlFor="login-id" className="mb-1 block text-sm font-medium text-cw-grey75">User ID</label>
             <input id="login-id" type="text" autoComplete="username" value={id} onChange={(event) => setId(event.target.value)} className="glass-input" required />
           </div>
           <div>
-            <label htmlFor="login-password" className="mb-1 block text-sm font-medium text-cw-grey75">비밀번호</label>
+            <label htmlFor="login-password" className="mb-1 block text-sm font-medium text-cw-grey75">Password</label>
             <input id="login-password" type="password" autoComplete="current-password" value={password} onChange={(event) => setPassword(event.target.value)} className="glass-input" required />
           </div>
           {error ? (
             <div className="rounded-2xl border border-cw-darkRed/20 bg-cw-darkRedTint px-4 py-2 text-sm text-cw-darkRed">{error}</div>
           ) : null}
           <button type="submit" disabled={submitting} className="accent-btn w-full px-4 py-3 text-base font-semibold disabled:opacity-60">
-            {submitting ? "확인 중…" : "로그인"}
+            {submitting ? "Signing in…" : "Sign in"}
           </button>
         </form>
       </div>
-      <p className="mt-6 text-xs text-cw-grey50">사내용 — 외부 공유 금지</p>
+      <p className="mt-6 text-xs text-cw-grey50">Internal access only</p>
     </main>
   );
 }

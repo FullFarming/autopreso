@@ -19,8 +19,8 @@ function makeDependencies() {
     synthesized,
     dependencies: {
       liveTranslate: {
-        async open({ language, onCaption, onAudio, onInterruption }) {
-          const session = { language, onCaption, onAudio, onInterruption, sent: [], ended: 0, async sendAudio(frame) { this.sent.push(frame); }, async audioStreamEnd() { this.ended += 1; }, async close() {} };
+        async open({ language, onCaption, onAudio, onInterruption, onInputCaption }) {
+          const session = { language, onCaption, onAudio, onInterruption, onInputCaption, sent: [], ended: 0, async sendAudio(frame) { this.sent.push(frame); }, async audioStreamEnd() { this.ended += 1; }, async close() {} };
           liveSessions.push(session);
           return session;
         },
@@ -111,7 +111,12 @@ test("Presentation coalesces repeated partial snapshots and publishes one ordere
     ["안녕하세요", false],
     ["안녕하세요", true],
   ]);
-  assert.deepEqual(captions.map((event) => event.seq), [1, 2, 3]);
+  // Contract C1: interim captions carry the seq their committed line WILL
+  // take, without consuming it. Two partials and the final that supersedes
+  // them are all the same committed line, so all three report seq 1. The
+  // durable counter only advances on the final.
+  assert.deepEqual(captions.map((event) => event.seq), [1, 1, 1]);
+  assert.deepEqual(captions.filter((event) => event.isFinal).map((event) => event.seq), [1]);
 });
 
 test("Presentation OpenAI voice failure clears audio but leaves Gemini captions running", async () => {
@@ -405,7 +410,7 @@ test("mode hot-swap preserves speaker identity and deterministically adds a Town
     languages: ["ko"],
     dependencies: townhallState.dependencies,
     speakerRegistry: meeting.speakers,
-    initialSequence: meeting.lastSequence,
+    initialSequences: meeting.lastSequences,
   });
   await townhall.start();
   await townhall.acceptFinalUtterance({ speakerLabel: "A", text: "two", sourceEndedAt: "2026-07-19T00:00:01.000Z" });
@@ -415,7 +420,11 @@ test("mode hot-swap preserves speaker identity and deterministically adds a Town
   assert.equal(after.voiceName, "Achernar");
   assert.equal(townhallState.synthesized[0].voiceName, "Achernar");
   const townhallAudio = townhallState.events.find((event) => event.header?.type === "audio-chunk");
-  assert.ok(townhallAudio.header.seq > meeting.lastSequence, "hot-swap sequence must remain monotonic");
+  assert.ok(townhallAudio.header.seq >= 1, "audio chunks keep their own transient counter");
+  // Hot-swap seeds every per-language caption counter so caption seq stays
+  // monotonic across pipelines (audio never consumes caption seq): the
+  // townhall utterance above continues right after the meeting's last seq.
+  assert.equal(townhall.lastSequences.ko, meeting.lastSequences.ko + 1);
 });
 
 test("Townhall keeps streaming when synthesis itself lasts longer than three seconds", async () => {
@@ -605,6 +614,414 @@ test("stale host frames are dropped and pauses close the provider audio turn", a
   assert.equal(state.liveSessions[0].ended, 1);
 });
 
+test("caption seq is per-language monotonic from 1 and audio events never consume it", async () => {
+  const state = makeDependencies();
+  const pipeline = new LiveMediaPipeline({
+    sessionId: "s-per-language-seq",
+    sessionType: "meeting",
+    outputMode: "captions_audio",
+    languages: ["en", "ja"],
+    dependencies: state.dependencies,
+  });
+  await pipeline.start();
+  await pipeline.acceptFinalUtterance({ speakerLabel: "A", text: "one", sourceEndedAt: "2026-07-19T00:00:00.000Z" });
+  await pipeline.acceptFinalUtterance({ speakerLabel: "A", text: "two", sourceEndedAt: "2026-07-19T00:00:01.000Z" });
+
+  const captions = state.events.filter((event) => event.type === "caption");
+  assert.deepEqual(captions.filter((event) => event.language === "en").map((event) => event.seq), [1, 2]);
+  assert.deepEqual(captions.filter((event) => event.language === "ja").map((event) => event.seq), [1, 2]);
+  // Audio chunks were interleaved between captions but the caption lanes above
+  // stayed dense: the audio events run on their own transient counter.
+  assert.ok(state.events.filter((event) => event.header?.type === "audio-chunk").length >= 2);
+  assert.deepEqual(pipeline.lastSequences, { en: 2, ja: 2 });
+});
+
+test("per-language initial sequences seed caption counters independently", async () => {
+  const state = makeDependencies();
+  const pipeline = new LiveMediaPipeline({
+    sessionId: "s-seeded",
+    sessionType: "meeting",
+    outputMode: "captions",
+    languages: ["ko", "en"],
+    dependencies: state.dependencies,
+    initialSequences: { ko: 41, en: 7 },
+  });
+  await pipeline.start();
+  await pipeline.acceptFinalUtterance({ speakerLabel: "A", text: "resume", sourceEndedAt: "2026-07-19T00:00:00.000Z" });
+  const captions = state.events.filter((event) => event.type === "caption");
+  assert.equal(captions.find((event) => event.language === "ko").seq, 42);
+  assert.equal(captions.find((event) => event.language === "en").seq, 8);
+});
+
+test("pause discards audio and finalized utterances; resume restores emission with intact seq", async () => {
+  const state = makeDependencies();
+  const pipeline = new LiveMediaPipeline({
+    sessionId: "s-pause",
+    sessionType: "meeting",
+    outputMode: "captions",
+    languages: ["ko"],
+    dependencies: state.dependencies,
+    now: () => 1_000,
+  });
+  await pipeline.start();
+  await pipeline.acceptFinalUtterance({ speakerLabel: "A", text: "before", sourceEndedAt: "2026-07-19T00:00:00.000Z" });
+
+  pipeline.pause();
+  assert.equal(pipeline.isPaused, true);
+  assert.equal(await pipeline.acceptAudio(new Uint8Array(1_280), 1_000), false);
+  await pipeline.acceptFinalUtterance({ speakerLabel: "A", text: "while paused", sourceEndedAt: "2026-07-19T00:00:01.000Z" });
+  assert.equal(state.events.filter((event) => event.type === "caption").length, 1);
+
+  pipeline.resume();
+  await pipeline.acceptFinalUtterance({ speakerLabel: "A", text: "after", sourceEndedAt: "2026-07-19T00:00:02.000Z" });
+  const captions = state.events.filter((event) => event.type === "caption");
+  assert.deepEqual(captions.map((event) => [event.seq, event.text]), [[1, "ko:before"], [2, "ko:after"]]);
+});
+
+// Contract C6: the source-language lane is decided by the STT provider's
+// detected `sourceLanguage` on the finalized utterance — the most reliable
+// signal the pipeline already has (it reflects what was actually recognized,
+// not what the host configured).
+test("dual-language lanes emit the source language verbatim and translate only the others", async () => {
+  const state = makeDependencies();
+  const pipeline = new LiveMediaPipeline({
+    sessionId: "s-dual",
+    sessionType: "meeting",
+    outputMode: "captions",
+    languages: ["ko", "en"],
+    dependencies: state.dependencies,
+  });
+  await pipeline.start();
+  await pipeline.acceptFinalUtterance({
+    speakerLabel: "A",
+    text: "안녕하세요",
+    sourceLanguage: "ko-KR",
+    sourceEndedAt: "2026-07-23T00:00:00.000Z",
+  });
+  await pipeline.acceptFinalUtterance({
+    speakerLabel: "A",
+    text: "good morning",
+    sourceLanguage: "en-US",
+    sourceEndedAt: "2026-07-23T00:00:02.000Z",
+  });
+
+  const captions = state.events.filter((event) => event.type === "caption");
+  assert.deepEqual(
+    captions.map((event) => [event.language, event.text]).sort(),
+    [
+      ["en", "en:안녕하세요"],
+      ["en", "good morning"],
+      ["ko", "ko:good morning"],
+      ["ko", "안녕하세요"],
+    ].sort(),
+  );
+  // The verbatim lanes never called the translator mock.
+  assert.deepEqual(state.translated.map(([text, language]) => [text, language]).sort(), [
+    ["good morning", "ko"],
+    ["안녕하세요", "en"],
+  ].sort());
+});
+
+// A viewer reads every speaker in one chosen language, so it must still be
+// able to reveal what was actually said. The published caption therefore
+// carries the source text and an explicit translationStatus; the viewer must
+// never have to guess whether `text` is really in the lane language.
+test("finalized captions carry the source text, source language, and translation status", async () => {
+  const state = makeDependencies();
+  const pipeline = new LiveMediaPipeline({
+    sessionId: "s-source-text",
+    sessionType: "meeting",
+    outputMode: "captions",
+    languages: ["ko", "en"],
+    dependencies: state.dependencies,
+  });
+  await pipeline.start();
+  await pipeline.acceptFinalUtterance({
+    speakerLabel: "A",
+    text: "안녕하세요",
+    sourceLanguage: "ko-KR",
+    sourceEndedAt: "2026-07-23T00:00:00.000Z",
+  });
+
+  const captions = state.events.filter((event) => event.type === "caption");
+  const byLanguage = new Map(captions.map((event) => [event.language, event]));
+
+  // The ko lane is the source lane: the text IS the original, so there is no
+  // separate original to disclose.
+  assert.equal(byLanguage.get("ko").text, "안녕하세요");
+  assert.equal(byLanguage.get("ko").sourceText, null);
+  assert.equal(byLanguage.get("ko").sourceLanguage, "ko");
+  assert.equal(byLanguage.get("ko").translationStatus, "verbatim");
+
+  // The en lane is translated, so it must carry the Korean original.
+  assert.equal(byLanguage.get("en").text, "en:안녕하세요");
+  assert.equal(byLanguage.get("en").sourceText, "안녕하세요");
+  assert.equal(byLanguage.get("en").sourceLanguage, "ko");
+  assert.equal(byLanguage.get("en").translationStatus, "translated");
+});
+
+test("a failed translation is published as failed, not disguised as lane-language text", async () => {
+  const state = makeDependencies();
+  state.dependencies.textTranslate.translate = async () => { throw new Error("LANGUAGE_UNAVAILABLE"); };
+  const pipeline = new LiveMediaPipeline({
+    sessionId: "s-translate-fail",
+    sessionType: "meeting",
+    outputMode: "captions",
+    languages: ["ko", "en"],
+    dependencies: state.dependencies,
+  });
+  await pipeline.start();
+  await pipeline.acceptFinalUtterance({
+    speakerLabel: "A",
+    text: "안녕하세요",
+    sourceLanguage: "ko-KR",
+    sourceEndedAt: "2026-07-23T00:00:00.000Z",
+  });
+
+  const englishLane = state.events.find((event) => event.type === "caption" && event.language === "en");
+  // Fail-open still publishes — a verbatim caption beats a dropped one — but
+  // it must be labelled so the viewer can show it as the original instead of
+  // silently presenting Korean as English.
+  assert.equal(englishLane.text, "안녕하세요");
+  assert.equal(englishLane.translationStatus, "failed");
+  assert.equal(englishLane.sourceText, "안녕하세요");
+  assert.equal(englishLane.sourceLanguage, "ko");
+});
+
+test("interim captions carry the same provenance fields as finals", async () => {
+  const state = makeDependencies();
+  const pipeline = new LiveMediaPipeline({
+    sessionId: "s-partial-source",
+    sessionType: "meeting",
+    outputMode: "captions",
+    languages: ["ko", "en"],
+    dependencies: state.dependencies,
+  });
+  await pipeline.start();
+  pipeline.acceptPartialTranscript({ text: "안녕하세요 여러분", sourceLanguage: "ko-KR" });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+
+  const partials = state.events.filter((event) => event.type === "caption" && event.isFinal === false);
+  const englishPartial = partials.find((event) => event.language === "en");
+  const koreanPartial = partials.find((event) => event.language === "ko");
+  assert.equal(englishPartial.sourceText, "안녕하세요 여러분");
+  assert.equal(englishPartial.sourceLanguage, "ko");
+  assert.equal(englishPartial.translationStatus, "translated");
+  assert.equal(koreanPartial.sourceText, null);
+  assert.equal(koreanPartial.translationStatus, "verbatim");
+});
+
+// A polite hand-off is the most common floor transition: A presses Stop, then
+// B presses Speak. It arrives as setFloorSpeaker(null) followed by
+// setFloorSpeaker(B), and the grace record for A must survive it — A's
+// committed caption can land seconds later and must not be credited to B.
+test("a polite floor hand-off keeps the previous holder attributable", async () => {
+  const state = makeDependencies();
+  let clock = 0;
+  const pipeline = new LiveMediaPipeline({
+    sessionId: "s-polite-handoff",
+    sessionType: "meeting",
+    outputMode: "captions",
+    languages: ["ko"],
+    dependencies: state.dependencies,
+    now: () => clock,
+  });
+  await pipeline.start();
+
+  pipeline.setFloorSpeaker({ participantId: "A", displayName: "발표자A" });
+  clock = 10_000;
+  pipeline.setFloorSpeaker(null);                                        // A stops
+  pipeline.setFloorSpeaker({ participantId: "B", displayName: "발표자B" }); // B starts
+
+  // A's audio began before the release, so the fence must return A.
+  const forA = pipeline.resolveFloorForCapture(5_000);
+  assert.equal(forA?.participantId, "A", "A's pre-release speech must stay with A");
+  // B's own speech began after the release and must stay with B.
+  const forB = pipeline.resolveFloorForCapture(10_500);
+  assert.equal(forB?.participantId, "B");
+});
+
+// Contract C1: interim captions must NOT consume the finalized caption seq
+// space. Only finals persist, so fetchLastUtteranceSeqs returns the last FINAL
+// seq — and that value reseeds a fresh pipeline. If partials advance the same
+// counter, the reseed regresses below what viewers already saw, and the
+// viewer's `seq <= lastSeq` guard then drops every subsequent caption for the
+// rest of the meeting.
+test("interim captions never consume the finalized caption seq space", async () => {
+  const state = makeDependencies();
+  const pipeline = new LiveMediaPipeline({
+    sessionId: "s-seq-space",
+    sessionType: "meeting",
+    outputMode: "captions",
+    languages: ["ko"],
+    dependencies: state.dependencies,
+    now: () => 0,
+  });
+  await pipeline.start();
+
+  for (let index = 0; index < 20; index += 1) {
+    await state.liveSessions[0].onCaption({ text: `partial ${index}`, isFinal: false });
+  }
+  await state.liveSessions[0].onCaption({ text: "committed line", isFinal: true });
+  for (let index = 0; index < 30; index += 1) {
+    await state.liveSessions[0].onCaption({ text: `after ${index}`, isFinal: false });
+  }
+
+  const captions = state.events.filter((event) => event.type === "caption");
+  const finals = captions.filter((event) => event.isFinal);
+
+  assert.equal(finals.length, 1);
+  // 20 interim captions preceded the commit, and it still takes seq 1 — that
+  // is the whole fix. Before it, the commit took seq 21 while viewers had
+  // already been shown seq 51, so the reseed regressed by 30.
+  assert.equal(finals.at(-1).seq, 1, "interim captions must not consume commit seq");
+  // The durable invariant: the finals max (what fetchLastUtteranceSeqs
+  // returns) is never below any FINAL seq delivered, so a reseed cannot
+  // regress the committed stream. Interim seq is deliberately excluded — it
+  // is a forward-looking hint and the viewer ignores it for resume.
+  const finalsMax = Math.max(...finals.map((event) => event.seq));
+  assert.ok(finals.every((event) => event.seq <= finalsMax));
+  assert.deepEqual(finals.map((event) => event.seq), [1], "commit seq stays gap-free from 1");
+});
+
+// A speaker genuinely repeating a sentence is not the model re-emitting one.
+// The dedupe memo must therefore be time-gated: identical text only counts as
+// a re-emission when it lands within a second of the previous publish.
+test("an identical sentence said again after a pause publishes again", async () => {
+  const state = makeDependencies();
+  let clock = 0;
+  const pipeline = new LiveMediaPipeline({
+    sessionId: "s-repeat",
+    sessionType: "meeting",
+    outputMode: "captions",
+    languages: ["ko"],
+    dependencies: state.dependencies,
+    now: () => clock,
+  });
+  await pipeline.start();
+
+  await state.liveSessions[0].onCaption({ text: "네, 맞습니다.", isFinal: true });
+  // Same words, three seconds later — a real second utterance.
+  clock = 3_000;
+  await state.liveSessions[0].onCaption({ text: "네, 맞습니다.", isFinal: true });
+
+  const finals = state.events.filter((event) => event.type === "caption" && event.isFinal);
+  assert.equal(finals.length, 2, "a repeated acknowledgement must not be swallowed");
+  assert.deepEqual(finals.map((event) => event.text), ["네, 맞습니다.", "네, 맞습니다."]);
+  assert.ok(finals[1].seq > finals[0].seq, "the repeat takes its own caption seq");
+});
+
+test("a provider re-emitting the same text within a second is still suppressed", async () => {
+  const state = makeDependencies();
+  let clock = 0;
+  const pipeline = new LiveMediaPipeline({
+    sessionId: "s-reemit",
+    sessionType: "meeting",
+    outputMode: "captions",
+    languages: ["ko"],
+    dependencies: state.dependencies,
+    now: () => clock,
+  });
+  await pipeline.start();
+
+  await state.liveSessions[0].onCaption({ text: "동일한 문장", isFinal: true });
+  clock = 200;
+  await state.liveSessions[0].onCaption({ text: "동일한 문장", isFinal: true });
+
+  const finals = state.events.filter((event) => event.type === "caption" && event.isFinal);
+  assert.equal(finals.length, 1, "an immediate duplicate is a provider re-emission");
+});
+
+test("TTS synthesis is skipped for zero-subscriber languages while captions still translate", async () => {
+  const state = makeDependencies();
+  const subscribers = new Map([["ko", 0]]);
+  const pipeline = new LiveMediaPipeline({
+    sessionId: "s-tts-skip",
+    sessionType: "meeting",
+    outputMode: "captions_audio",
+    languages: ["ko"],
+    dependencies: state.dependencies,
+    getSubscriberCount: (language) => subscribers.get(language) ?? 0,
+  });
+  await pipeline.start();
+  await pipeline.acceptFinalUtterance({ speakerLabel: "A", text: "nobody listening", sourceEndedAt: "2026-07-19T00:00:00.000Z" });
+  assert.equal(state.translated.length, 1, "caption translation must still run (contract C6)");
+  assert.equal(state.events.filter((event) => event.type === "caption").length, 1);
+  assert.equal(state.synthesized.length, 0, "no subscriber → no TTS");
+
+  subscribers.set("ko", 1);
+  await pipeline.acceptFinalUtterance({ speakerLabel: "A", text: "listener arrived", sourceEndedAt: "2026-07-19T00:00:01.000Z" });
+  assert.equal(state.synthesized.length, 1, "TTS resumes for subsequent utterances");
+});
+
+test("SESSION_STOPPED from the publisher stops emission without counting toward the language cooldown", async () => {
+  const state = makeDependencies();
+  state.dependencies.publisher.publish = async (_sessionId, _language, event) => {
+    if (event.type === "caption") throw new Error("SESSION_STOPPED");
+    state.events.push(event);
+  };
+  const pipeline = new LiveMediaPipeline({
+    sessionId: "s-stopped",
+    sessionType: "meeting",
+    outputMode: "captions",
+    languages: ["ko"],
+    dependencies: state.dependencies,
+  });
+  await pipeline.start();
+  for (let index = 0; index < 3; index += 1) {
+    await pipeline.acceptFinalUtterance({ speakerLabel: "A", text: `stopped-${index}`, sourceEndedAt: `2026-07-19T00:00:0${index}.000Z` });
+  }
+  assert.equal(state.events.some((event) => event.type === "language-status" && event.code === "LANGUAGE_COOLDOWN"), false);
+  assert.equal(state.events.some((event) => event.type === "language-status" && event.status === "preparing"), false);
+});
+
+test("caption finalize-to-publish latency is observed per published caption", async () => {
+  const state = makeDependencies();
+  const observed = [];
+  let now = 10_000;
+  state.dependencies.publisher.publish = async (_sessionId, _language, event) => {
+    if (event.type === "caption") now += 120;
+    state.events.push(event);
+  };
+  const pipeline = new LiveMediaPipeline({
+    sessionId: "s-latency",
+    sessionType: "meeting",
+    outputMode: "captions",
+    languages: ["ko"],
+    dependencies: state.dependencies,
+    now: () => now,
+    observeLatency: (name, value) => observed.push([name, value]),
+  });
+  await pipeline.start();
+  await pipeline.acceptFinalUtterance({ speakerLabel: "A", text: "measured", sourceEndedAt: "2026-07-19T00:00:00.000Z" });
+  assert.deepEqual(observed, [["caption_publish_latency_ms", 120]]);
+});
+
+test("a seventh named floor participant beyond the six diarization slots keeps correct attribution and joins the legend", async () => {
+  const state = makeDependencies();
+  const pipeline = new LiveMediaPipeline({
+    sessionId: "s-seventh",
+    sessionType: "meeting",
+    outputMode: "captions",
+    languages: ["ko"],
+    dependencies: state.dependencies,
+  });
+  await pipeline.start();
+  for (const label of ["A", "B", "C", "D", "E", "F"]) {
+    await pipeline.acceptFinalUtterance({ speakerLabel: label, text: `from ${label}`, sourceEndedAt: "2026-07-19T00:00:00.000Z" });
+  }
+  assert.equal(pipeline.speakers.list().length, 6);
+
+  pipeline.setFloorSpeaker({ participantId: "participant-7", displayName: "일곱번째 참가자" });
+  await pipeline.acceptFinalUtterance({ speakerLabel: "G", text: "일곱번째 발언", sourceEndedAt: "2026-07-19T00:00:07.000Z" });
+
+  const caption = state.events.filter((event) => event.type === "caption").at(-1);
+  assert.equal(caption.speaker.label, "일곱번째 참가자");
+  const legend = pipeline.speakers.list();
+  assert.equal(legend.length, 7, "named floor participants may exceed the six-slot diarization cap");
+  assert.equal(legend.some((speaker) => speaker.label === "일곱번째 참가자"), true);
+});
+
 function tonePcm(frequency, milliseconds) {
   const sampleCount = Math.round(16_000 * milliseconds / 1_000);
   const bytes = new Uint8Array(sampleCount * 2);
@@ -614,3 +1031,428 @@ function tonePcm(frequency, milliseconds) {
   }
   return bytes;
 }
+
+test("a misdetected source language cannot leak untranslated text into another lane", async () => {
+  const state = makeDependencies();
+  const pipeline = new LiveMediaPipeline({ sessionId: "s-script-gate", mode: "meeting", languages: ["en", "ko"], dependencies: state.dependencies });
+  await pipeline.start();
+  // STT wrongly tags Korean speech as en-US: the en lane must still translate.
+  await pipeline.acceptFinalUtterance({ speakerLabel: "A", text: "안녕하세요 여러분", sourceLanguage: "en-US", sourceEndedAt: "2026-07-19T00:00:00.000Z" });
+  const en = state.events.find((event) => event.type === "caption" && event.language === "en");
+  assert.equal(en.text, "en:안녕하세요 여러분");
+});
+
+test("matching source language and script keeps verbatim passthrough on the source lane", async () => {
+  const state = makeDependencies();
+  const pipeline = new LiveMediaPipeline({ sessionId: "s-script-ok", mode: "meeting", languages: ["en", "ko"], dependencies: state.dependencies });
+  await pipeline.start();
+  await pipeline.acceptFinalUtterance({ speakerLabel: "A", text: "안녕하세요 여러분", sourceLanguage: "ko-KR", sourceEndedAt: "2026-07-19T00:00:00.000Z" });
+  const ko = state.events.find((event) => event.type === "caption" && event.language === "ko");
+  const en = state.events.find((event) => event.type === "caption" && event.language === "en");
+  assert.equal(ko.text, "안녕하세요 여러분");
+  assert.equal(en.text, "en:안녕하세요 여러분");
+});
+
+test("a translate failure publishes the verbatim caption instead of dropping the utterance", async () => {
+  const state = makeDependencies();
+  state.dependencies.textTranslate.translate = async ({ text, language }) => {
+    if (language === "ja") throw new Error("provider unavailable");
+    return `${language}:${text}`;
+  };
+  const pipeline = new LiveMediaPipeline({ sessionId: "s-translate-fallback", mode: "meeting", languages: ["en", "ja"], dependencies: state.dependencies });
+  await pipeline.start();
+  await pipeline.acceptFinalUtterance({ speakerLabel: "A", text: "hello everyone", sourceLanguage: "en-US", sourceEndedAt: "2026-07-19T00:00:00.000Z" });
+  const ja = state.events.find((event) => event.type === "caption" && event.language === "ja");
+  assert.equal(ja.text, "hello everyone");
+  assert.equal(state.events.some((event) => event.type === "language-status" && event.language === "ja" && event.status === "preparing"), true);
+});
+
+test("meeting interim transcripts stream partial captions to every lane", async () => {
+  const state = makeDependencies();
+  const pipeline = new LiveMediaPipeline({ sessionId: "s-partials", mode: "meeting", languages: ["en", "ko"], dependencies: state.dependencies });
+  await pipeline.start();
+  pipeline.acceptPartialTranscript({ text: "안녕하", sourceLanguage: "ko-KR" });
+  await new Promise((resolve) => setImmediate(resolve));
+  pipeline.acceptPartialTranscript({ text: "안녕하세요 여러분", sourceLanguage: "ko-KR" });
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+  const partials = state.events.filter((event) => event.type === "caption" && !event.isFinal);
+  const ko = partials.filter((event) => event.language === "ko").map((event) => event.text);
+  const en = partials.filter((event) => event.language === "en").map((event) => event.text);
+  assert.deepEqual(ko.at(-1), "안녕하세요 여러분");
+  assert.deepEqual(en.at(-1), "en:안녕하세요 여러분");
+  assert.equal(partials.every((event) => event.speaker?.speakerId === "live"), true);
+});
+
+test("meeting partial captions dedupe repeats and skip empty text", async () => {
+  const state = makeDependencies();
+  const pipeline = new LiveMediaPipeline({ sessionId: "s-partials-dedupe", mode: "meeting", languages: ["ko"], dependencies: state.dependencies });
+  await pipeline.start();
+  pipeline.acceptPartialTranscript({ text: "같은 내용", sourceLanguage: "ko-KR" });
+  await new Promise((resolve) => setImmediate(resolve));
+  pipeline.acceptPartialTranscript({ text: "같은 내용", sourceLanguage: "ko-KR" });
+  pipeline.acceptPartialTranscript({ text: "  ", sourceLanguage: "ko-KR" });
+  await new Promise((resolve) => setImmediate(resolve));
+  const partials = state.events.filter((event) => event.type === "caption" && !event.isFinal);
+  assert.equal(partials.length, 1);
+});
+
+test("a finalized utterance invalidates in-flight partial work for its lanes", async () => {
+  const state = makeDependencies();
+  let releaseTranslate = null;
+  const baseTranslate = state.dependencies.textTranslate.translate;
+  state.dependencies.textTranslate.translate = async (input) => {
+    if (!input.text.startsWith("stale")) return baseTranslate(input);
+    await new Promise((resolve) => { releaseTranslate = resolve; });
+    return baseTranslate(input);
+  };
+  const pipeline = new LiveMediaPipeline({ sessionId: "s-partials-fence", mode: "meeting", languages: ["en"], dependencies: state.dependencies });
+  await pipeline.start();
+  pipeline.acceptPartialTranscript({ text: "stale partial", sourceLanguage: "ko-KR" });
+  await new Promise((resolve) => setImmediate(resolve));
+  await pipeline.acceptFinalUtterance({ speakerLabel: "A", text: "final words", sourceLanguage: "ko-KR", sourceEndedAt: "2026-07-19T00:00:00.000Z" });
+  releaseTranslate?.();
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+  const captions = state.events.filter((event) => event.type === "caption" && event.language === "en");
+  assert.equal(captions.at(-1)?.isFinal, true);
+  assert.equal(captions.some((event) => !event.isFinal && event.text.includes("stale")), false);
+});
+
+test("captions are mirrored to the host socket for bidirectional desktop display", async () => {
+  const state = makeDependencies();
+  const hostEvents = [];
+  const pipeline = new LiveMediaPipeline({
+    sessionId: "s-host-mirror",
+    mode: "meeting",
+    languages: ["ko"],
+    dependencies: state.dependencies,
+    onHostEvent: (event) => hostEvents.push(event),
+  });
+  await pipeline.start();
+  pipeline.setFloorSpeaker({ participantId: "p1", displayName: "김참가" });
+  await pipeline.acceptFinalUtterance({ speakerLabel: "A", text: "참가자 발언입니다", sourceLanguage: "ko-KR", sourceEndedAt: "2026-07-19T00:00:00.000Z" });
+  const captions = hostEvents.filter((event) => event.type === "caption");
+  assert.equal(captions.length, 1);
+  assert.equal(captions[0].text, "참가자 발언입니다");
+  assert.equal(captions[0].speaker.isParticipant, true);
+  assert.equal(captions[0].speaker.name, "김참가");
+});
+
+test("partial captions carry a full speaker assignment shape the viewer contract accepts", async () => {
+  const state = makeDependencies();
+  const pipeline = new LiveMediaPipeline({ sessionId: "s-partial-shape", mode: "meeting", languages: ["ko"], dependencies: state.dependencies, now: () => 1_753_350_000_000 });
+  await pipeline.start();
+  pipeline.acceptPartialTranscript({ text: "실시간 확인", sourceLanguage: "ko-KR" });
+  await new Promise((resolve) => setImmediate(resolve));
+  const partial = state.events.find((event) => event.type === "caption" && !event.isFinal);
+  // Mirrors webapp isSpeaker(): every field must be present or the viewer
+  // silently drops the caption.
+  assert.equal(partial.speaker.speakerId, "live");
+  assert.equal(typeof partial.speaker.label, "string");
+  assert.equal(typeof partial.speaker.colorToken, "string");
+  assert.equal(partial.speaker.voiceName, null);
+  assert.equal(partial.speaker.voiceStatus, "disabled");
+  assert.equal(typeof partial.speaker.lastSeenAt, "string");
+});
+
+// ── Continuity contract: captions must keep reaching viewers ──────────────
+
+/** Mirror of webapp LiveViewer isCaptionEvent/isSpeaker validators: any
+ *  caption the gateway publishes MUST pass this or the viewer silently drops
+ *  it (the exact bug that hid all partials on 2026-07-24). */
+/** Mirrors LiveViewer's resume guard: committed captions run the per-language
+ *  strict-greater check and advance lastSeq; interim captions bypass both.
+ *  Kept beside viewerAcceptsCaption so a gateway seq change that would blank a
+ *  real viewer's feed fails here first. */
+function viewerAcceptsSeq(state, event, { committedOnly = true } = {}) {
+  const last = state[event.language] ?? 0;
+  if (committedOnly && !event.isFinal) return true;
+  if (event.seq <= last) return false;
+  state[event.language] = event.seq;
+  return true;
+}
+
+test("a realistic interim/commit stream loses no committed caption at the viewer", async () => {
+  const state = makeDependencies();
+  const pipeline = new LiveMediaPipeline({
+    sessionId: "s-viewer-guard",
+    sessionType: "meeting",
+    outputMode: "captions",
+    languages: ["ko"],
+    dependencies: state.dependencies,
+    now: () => 0,
+  });
+  await pipeline.start();
+
+  // Three utterances, each streamed as partials then committed.
+  for (let utterance = 0; utterance < 3; utterance += 1) {
+    for (let step = 0; step < 5; step += 1) {
+      await state.liveSessions[0].onCaption({ text: `u${utterance} step ${step}`, isFinal: false });
+    }
+    await state.liveSessions[0].onCaption({ text: `utterance ${utterance} committed.`, isFinal: true });
+  }
+
+  const captions = state.events.filter((event) => event.type === "caption");
+  const finals = captions.filter((event) => event.isFinal);
+  assert.equal(finals.length, 3);
+  assert.deepEqual(finals.map((event) => event.seq), [1, 2, 3]);
+
+  // With the corrected guard every commit reaches the feed.
+  const live = {};
+  const accepted = captions.filter((event) => viewerAcceptsSeq(live, event));
+  assert.equal(accepted.filter((event) => event.isFinal).length, 3, "no commit may be dropped");
+
+  // And the guard is load-bearing: applying it to interim captions too — the
+  // pre-fix behaviour — silently eats commits, which is the blank-feed bug.
+  const naive = {};
+  const naiveAccepted = captions.filter((event) => viewerAcceptsSeq(naive, event, { committedOnly: false }));
+  assert.ok(
+    naiveAccepted.filter((event) => event.isFinal).length < 3,
+    "guarding interim captions must be demonstrably wrong, or this test proves nothing",
+  );
+});
+
+function viewerAcceptsCaption(value) {
+  const isSpeakerShape = (speaker) => speaker !== null && typeof speaker === "object"
+    && typeof speaker.speakerId === "string"
+    && typeof speaker.label === "string"
+    && typeof speaker.colorToken === "string"
+    && (typeof speaker.voiceName === "string" || speaker.voiceName === null)
+    && typeof speaker.lastSeenAt === "string"
+    && (speaker.voiceStatus === undefined || ["disabled", "analyzing", "ready", "unavailable"].includes(speaker.voiceStatus));
+  return value.type === "caption"
+    && Number.isSafeInteger(value.seq) && value.seq >= 0
+    && typeof value.sessionId === "string"
+    && typeof value.language === "string"
+    && (value.speaker === null || isSpeakerShape(value.speaker))
+    && typeof value.text === "string"
+    && typeof value.isFinal === "boolean"
+    && typeof value.sourceEndedAt === "string"
+    && typeof value.emittedAt === "string";
+}
+
+test("every published caption (partial, diarized final, floor final) passes the viewer contract", async () => {
+  const state = makeDependencies();
+  const pipeline = new LiveMediaPipeline({ sessionId: "s-viewer-contract", mode: "meeting", languages: ["ko", "en"], dependencies: state.dependencies });
+  await pipeline.start();
+  pipeline.acceptPartialTranscript({ text: "부분 자막", sourceLanguage: "ko-KR" });
+  await new Promise((resolve) => setImmediate(resolve));
+  await pipeline.acceptFinalUtterance({ speakerLabel: "A", text: "호스트 발화", sourceLanguage: "ko-KR", sourceEndedAt: "2026-07-19T00:00:00.000Z" });
+  pipeline.setFloorSpeaker({ participantId: "p1", displayName: "김참가" });
+  await pipeline.acceptFinalUtterance({ speakerLabel: "B", text: "참가자 발화", sourceLanguage: "ko-KR", sourceStartOffsetMs: 5_000, sourceEndOffsetMs: 6_000, sourceEndedAt: "2026-07-19T00:00:06.000Z" });
+  const captions = state.events.filter((event) => event.type === "caption");
+  assert.ok(captions.length >= 5);
+  for (const caption of captions) {
+    assert.equal(viewerAcceptsCaption(caption), true, `viewer would drop: ${JSON.stringify(caption)}`);
+  }
+});
+
+test("captions keep flowing through a full translate outage and recover afterwards", async () => {
+  const state = makeDependencies();
+  let outage = true;
+  state.dependencies.textTranslate.translate = async ({ text, language }) => {
+    if (outage) throw new Error("PROVIDER_DOWN");
+    return `${language}:${text}`;
+  };
+  let now = 1_000;
+  const pipeline = new LiveMediaPipeline({ sessionId: "s-outage", mode: "meeting", languages: ["en"], dependencies: state.dependencies, now: () => now });
+  await pipeline.start();
+  for (let index = 0; index < 5; index += 1) {
+    await pipeline.acceptFinalUtterance({ speakerLabel: "A", text: `발화 ${index}`, sourceLanguage: "ko-KR", sourceStartOffsetMs: index * 1_000, sourceEndOffsetMs: index * 1_000 + 500, sourceEndedAt: `2026-07-19T00:00:0${index}.500Z` });
+  }
+  const duringOutage = state.events.filter((event) => event.type === "caption" && event.isFinal);
+  assert.equal(duringOutage.length, 5, "an outage must never drop a caption");
+  assert.equal(duringOutage.every((event) => event.text.startsWith("발화")), true, "outage captions fall back to verbatim");
+  outage = false;
+  // Repeated failures arm a 30s cooldown (captions stay verbatim, never
+  // dropped); once it lapses translation must resume on its own.
+  now += 31_000;
+  await pipeline.acceptFinalUtterance({ speakerLabel: "A", text: "복구 발화", sourceLanguage: "ko-KR", sourceStartOffsetMs: 9_000, sourceEndOffsetMs: 9_500, sourceEndedAt: "2026-07-19T00:00:09.500Z" });
+  const afterRecovery = state.events.filter((event) => event.type === "caption" && event.isFinal).at(-1);
+  assert.equal(afterRecovery.text, "en:복구 발화", "translation resumes after the provider recovers");
+});
+
+// ── 2026-07-24 provider split: meeting captions on Gemini Live Translate ──
+
+test("meeting opens live-translate sessions per language and never Cloud STT", async () => {
+  const state = makeDependencies();
+  const pipeline = new LiveMediaPipeline({ sessionId: "s-live-meeting", mode: "meeting", languages: ["ko", "en"], dependencies: state.dependencies });
+  await pipeline.start();
+  assert.equal(state.liveSessions.length, 2);
+  assert.equal(state.speechSessions.length, 0);
+  await pipeline.acceptAudio(new Uint8Array(1_280), Date.now());
+  assert.deepEqual(state.liveSessions.map((session) => session.sent.length), [1, 1]);
+});
+
+test("meeting live-translate captions carry floor attribution while a participant speaks", async () => {
+  const state = makeDependencies();
+  const pipeline = new LiveMediaPipeline({ sessionId: "s-live-floor", mode: "meeting", languages: ["ko", "en"], dependencies: state.dependencies });
+  await pipeline.start();
+  const enSession = state.liveSessions.find((session) => session.language === "en");
+  await enSession.onCaption({ text: "Hello from the floor", isFinal: false });
+  pipeline.setFloorSpeaker({ participantId: "p1", displayName: "김참가" });
+  await enSession.onCaption({ text: "Hello from the floor, everyone", isFinal: true });
+  const captions = state.events.filter((event) => event.type === "caption" && event.language === "en");
+  assert.equal(captions[0].speaker, null);
+  assert.equal(captions.at(-1).speaker?.name, "김참가");
+  assert.equal(captions.at(-1).speaker?.isParticipant, true);
+});
+
+test("the meeting input transcript feeds the source-language lane like the desktop hub", async () => {
+  const state = makeDependencies();
+  const pipeline = new LiveMediaPipeline({ sessionId: "s-live-input", mode: "meeting", languages: ["ko", "en"], dependencies: state.dependencies });
+  await pipeline.start();
+  const firstSession = state.liveSessions[0];
+  assert.equal(typeof firstSession.onInputCaption, "function", "only the first session surfaces input transcripts");
+  assert.equal(state.liveSessions[1].onInputCaption, undefined);
+  await firstSession.onInputCaption({ text: "안녕하세요 여러분", isFinal: false, languageCode: "ko-KR" });
+  await firstSession.onInputCaption({ text: "안녕하세요 여러분 반갑습니다", isFinal: true, languageCode: "ko-KR" });
+  const koCaptions = state.events.filter((event) => event.type === "caption" && event.language === "ko");
+  assert.deepEqual(koCaptions.map((event) => [event.text, event.isFinal]), [
+    ["안녕하세요 여러분", false],
+    ["안녕하세요 여러분 반갑습니다", true],
+  ]);
+  // English speech routes to the en lane by script when the hint is absent.
+  await firstSession.onInputCaption({ text: "Let us move on to the next item", isFinal: true });
+  const enCaptions = state.events.filter((event) => event.type === "caption" && event.language === "en");
+  assert.equal(enCaptions.at(-1).text, "Let us move on to the next item");
+});
+
+test("meeting finals run the desktop deterministic glossary pass", async () => {
+  const state = makeDependencies();
+  const pipeline = new LiveMediaPipeline({
+    sessionId: "s-live-glossary",
+    mode: "meeting",
+    languages: ["en"],
+    glossaryText: "힐튼 가든 인 = Hilton Garden Inn\n르메르디앙 = Le Méridien",
+    dependencies: state.dependencies,
+  });
+  await pipeline.start();
+  await state.liveSessions[0].onCaption({ text: "We toured 힐튼 가든 인 yesterday", isFinal: false });
+  await state.liveSessions[0].onCaption({ text: "We toured 힐튼 가든 인 yesterday", isFinal: true });
+  const captions = state.events.filter((event) => event.type === "caption");
+  assert.equal(captions[0].text, "We toured 힐튼 가든 인 yesterday", "partials stay verbatim for latency");
+  assert.equal(captions.at(-1).text, "We toured Hilton Garden Inn yesterday", "finals enforce the glossary");
+});
+
+test("meeting audio output opens OpenAI voice sessions, never Gemini voice", async () => {
+  const state = makeDependencies();
+  const pipeline = new LiveMediaPipeline({
+    sessionId: "s-live-voice",
+    sessionType: "meeting",
+    outputMode: "captions_audio",
+    languages: ["ko"],
+    dependencies: state.dependencies,
+  });
+  await pipeline.start();
+  assert.equal(state.openaiVoiceSessions.length, 1);
+  // Gemini live sessions still caption but their audio callback is inert.
+  await state.liveSessions[0].onAudio({ sampleRate: 24_000, pcm: new Uint8Array([1, 0]) });
+  assert.equal(state.events.filter((event) => event.header?.type === "audio-chunk").length, 0);
+  await state.openaiVoiceSessions[0].onAudio({ sampleRate: 24_000, pcm: new Uint8Array([2, 0]) });
+  assert.equal(state.events.filter((event) => event.header?.type === "audio-chunk").length, 1);
+});
+
+test("meeting live-translate captions mirror to the host socket", async () => {
+  const state = makeDependencies();
+  const hostEvents = [];
+  const pipeline = new LiveMediaPipeline({
+    sessionId: "s-live-host-mirror",
+    mode: "meeting",
+    languages: ["ko"],
+    dependencies: state.dependencies,
+    onHostEvent: (event) => hostEvents.push(event),
+  });
+  await pipeline.start();
+  await state.liveSessions[0].onCaption({ text: "미러링 확인", isFinal: true });
+  assert.equal(hostEvents.filter((event) => event.type === "caption").length, 1);
+});
+
+test("floor captions carry participant:<id> speakerId so records attribute to the participant", async () => {
+  const state = makeDependencies();
+  const pipeline = new LiveMediaPipeline({ sessionId: "s-participant-id", mode: "meeting", languages: ["en"], dependencies: state.dependencies });
+  await pipeline.start();
+  pipeline.setFloorSpeaker({ participantId: "p-77", displayName: "김참가", department: "재무팀", jobTitle: "매니저" });
+  await state.liveSessions[0].onCaption({ text: "Participant speech.", isFinal: true });
+  const caption = state.events.filter((event) => event.type === "caption").at(-1);
+  assert.equal(caption.speaker.speakerId, "participant:p-77");
+  assert.equal(caption.speaker.name, "김참가");
+  assert.equal(caption.speaker.department, "재무팀");
+  assert.equal(caption.speaker.jobTitle, "매니저");
+});
+
+test("input-transcript captions are marked origin source; translated lanes are not", async () => {
+  const state = makeDependencies();
+  const pipeline = new LiveMediaPipeline({ sessionId: "s-origin", mode: "meeting", languages: ["ko", "en"], dependencies: state.dependencies });
+  await pipeline.start();
+  await state.liveSessions[0].onInputCaption({ text: "안녕하세요 여러분.", isFinal: true, languageCode: "ko-KR" });
+  const enSession = state.liveSessions.find((session) => session.language === "en");
+  await enSession.onCaption({ text: "Hello everyone.", isFinal: true });
+  const koCaption = state.events.find((event) => event.type === "caption" && event.language === "ko");
+  const enCaption = state.events.find((event) => event.type === "caption" && event.language === "en");
+  assert.equal(koCaption.origin, "source");
+  assert.equal("origin" in enCaption, false);
+});
+
+test("meeting finals run the desktop second-pass polish before the deterministic glossary", async () => {
+  const state = makeDependencies();
+  const polishCalls = [];
+  state.dependencies.captionPolish = {
+    async polish(input) {
+      polishCalls.push(input);
+      return "We toured 힐튼 가든 인 yesterday, and results exceeded expectations.";
+    },
+  };
+  const pipeline = new LiveMediaPipeline({
+    sessionId: "s-polish",
+    mode: "meeting",
+    languages: ["en"],
+    glossaryText: "힐튼 가든 인 = Hilton Garden Inn",
+    translationTone: "business",
+    domainText: "호텔 미팅",
+    dependencies: state.dependencies,
+  });
+  await pipeline.start();
+  await state.liveSessions[0].onCaption({ text: "we toured hilton garden inn yesterday and results were good", isFinal: true });
+  assert.equal(polishCalls.length, 1);
+  assert.equal(polishCalls[0].tone, "business");
+  assert.equal(polishCalls[0].domain, "호텔 미팅");
+  const final = state.events.filter((event) => event.type === "caption").at(-1);
+  // Polish output, then the deterministic glossary net fixes the Korean term.
+  assert.equal(final.text, "We toured Hilton Garden Inn yesterday, and results exceeded expectations.");
+});
+
+// The p95 committed-caption target is unmeasurable without this: latency was
+// only ever observed on #processFinalUtterance, which no session type reaches.
+test("the live caption path reports publish and polish latency", async () => {
+  const state = makeDependencies();
+  const observed = [];
+  let clock = 0;
+  state.dependencies.captionPolish = {
+    async polish({ translatedText }) { clock += 400; return translatedText; },
+  };
+  const pipeline = new LiveMediaPipeline({
+    sessionId: "s-latency",
+    sessionType: "meeting",
+    outputMode: "captions",
+    languages: ["ko"],
+    dependencies: state.dependencies,
+    now: () => clock,
+    observeLatency: (name, value) => observed.push([name, value]),
+  });
+  await pipeline.start();
+
+  await state.liveSessions[0].onCaption({ text: "확정된 문장입니다.", isFinal: false });
+  assert.equal(observed.length, 0, "interim captions carry no committed-latency target");
+
+  await state.liveSessions[0].onCaption({ text: "확정된 문장입니다.", isFinal: true });
+  const names = observed.map(([name]) => name);
+  assert.ok(names.includes("caption_publish_latency_ms"), `missing publish latency: ${names.join(",")}`);
+  assert.ok(names.includes("caption_polish_latency_ms"), `missing polish latency: ${names.join(",")}`);
+  // Polish is separable from total, so a slow second pass is distinguishable
+  // from a slow provider.
+  const polish = observed.find(([name]) => name === "caption_polish_latency_ms")[1];
+  assert.equal(polish, 400);
+  assert.ok(observed.every(([, value]) => Number.isFinite(value) && value >= 0));
+});

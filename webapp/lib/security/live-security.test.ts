@@ -3,7 +3,14 @@ import { Buffer } from "node:buffer";
 import { readFileSync } from "node:fs";
 import test from "node:test";
 
-import { createGatewayToken, createViewerGrantToken, verifyGatewayToken, verifyViewerGrantToken } from "../auth/live-auth";
+import {
+  createGatewayToken,
+  createRecapGrantToken,
+  createViewerGrantToken,
+  verifyGatewayToken,
+  verifyRecapGrantToken,
+  verifyViewerGrantToken,
+} from "../auth/live-auth";
 import { LANGUAGE_CODES } from "../languageDetect";
 import {
   assertStrictOrigin,
@@ -31,7 +38,9 @@ import {
 } from "./live-input-validation";
 import { createLiveInviteToken, SupabaseLiveAdmissionStore } from "./live-admission-store";
 import {
+  enforceAdmissionCodeAttemptRateLimit,
   enforceGatewayTokenRateLimit,
+  enforceSummaryGenerationRateLimit,
   enforceJoinPreflightRateLimits,
   enforceHostLoginRateLimit,
   enforceSessionJoinRateLimit,
@@ -73,6 +82,7 @@ test("viewer routes are public only by exact path while mutating requests still 
     assert.equal(isPublicUnauthenticatedPath(pathname), false);
   }
   assert.equal(isViewerSnapshotPath(`/api/live-sessions/${crypto.randomUUID()}/snapshot`), true);
+  assert.equal(isViewerSnapshotPath(`/api/live-sessions/${crypto.randomUUID()}/leave`), true);
   assert.equal(isViewerSnapshotPath("/api/live-sessions/not/a/snapshot"), false);
   process.env.ALLOWED_ORIGINS = "https://portal.example.com";
   assert.throws(() => assertStrictOrigin(requestHeaders({ origin: "https://portal.example.com.evil.test" })), CsrfError);
@@ -102,6 +112,15 @@ test("viewer token rejects tampering and expiry", async () => {
   assert.equal((await verifyViewerGrantToken(signed.token, now + 1)).sessionId, "session-1");
   await assert.rejects(() => verifyViewerGrantToken(`${signed.token.slice(0, -1)}0`, now + 1));
   await assert.rejects(() => verifyViewerGrantToken(signed.token, now + 6 * 60 * 60 * 1000));
+});
+
+test("recap credential is session-bound for thirty days and cannot act as a viewer grant", async () => {
+  const now = Date.UTC(2026, 6, 23);
+  const signed = await createRecapGrantToken({ sessionId: "session-1", userId: "user-1" }, now);
+  const claims = await verifyRecapGrantToken(signed.token, now + 29 * 24 * 60 * 60 * 1000);
+  assert.equal(claims.sessionId, "session-1");
+  await assert.rejects(() => verifyViewerGrantToken(signed.token, now + 1));
+  await assert.rejects(() => verifyRecapGrantToken(signed.token, now + 30 * 24 * 60 * 60 * 1000));
 });
 
 test("gateway token is session-bound and expires after fifteen minutes", async () => {
@@ -134,6 +153,25 @@ test("gateway token issuance consumes one opaque host-session bucket", async () 
   assert.ok(routeSource.indexOf("enforceGatewayTokenRateLimit(hostId, sessionId, store)") < routeSource.indexOf("createGatewayToken(sessionId, hostId)"));
 });
 
+test("summary generation is rate limited by opaque host and session identity", async () => {
+  const calls: Array<{ scope: string; keyHash: string; limit: number; windowSeconds: number }> = [];
+  const store: RateLimitStore = {
+    async consumeRateLimit(input) {
+      calls.push(input);
+      return true;
+    },
+  };
+  await enforceSummaryGenerationRateLimit("host-1", "session-1", store);
+  assert.deepEqual(calls.map(({ scope, limit, windowSeconds }) => ({ scope, limit, windowSeconds })), [{
+    scope: "summary-host-session",
+    limit: 10,
+    windowSeconds: 3600,
+  }]);
+  assert.match(calls[0].keyHash, /^[0-9a-f]{64}$/u);
+  assert.equal(calls[0].keyHash.includes("host-1"), false);
+  assert.equal(calls[0].keyHash.includes("session-1"), false);
+});
+
 test("admission HMAC is deterministic and never stores the six digit code", async () => {
   const digest = await hmacHex("a-secure-test-pepper", "admission\u0000123456");
   assert.equal(digest.length, 64);
@@ -160,13 +198,14 @@ test("opaque invite tokens contain 32 random bytes and only their scoped HMAC re
       const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
       calls.push({ path, body });
       if (path.endsWith("resolve_live_invite_rate_key")) return Response.json("b".repeat(64));
-      if (path.endsWith("redeem_live_invite")) {
+      if (path.endsWith("redeem_live_invite_v3")) {
         return Response.json({
           grant_id: "grant-1", session_id: "session-1", user_id: "user-1",
           grant_expires_at: "2026-07-20T06:00:00.000Z", session_expires_at: "2026-07-20T06:00:00.000Z",
           session_type: "meeting", output_mode: "captions", glossary_pack: "general_cre",
           voice_provider: "gemini",
           languages: ["ko"], viewer_count: 1, max_viewers: 50, display_name: "Viewer 1",
+          department: "Strategy", job_title: "Director", participant_id: "participant-1",
         });
       }
       return Response.json(true);
@@ -175,7 +214,6 @@ test("opaque invite tokens contain 32 random bytes and only their scoped HMAC re
   await store.createInvite({
     sessionId: "session-1", hostId: "host-1", tokenHmac,
     expiresAt: "2026-07-20T00:05:00.000Z",
-    admissionOpenUntil: "2026-07-20T00:05:00.000Z",
   });
   assert.equal(await store.resolveInviteRateKey(tokenHmac), "b".repeat(64));
   const redemption = await store.redeemInvite({
@@ -183,6 +221,8 @@ test("opaque invite tokens contain 32 random bytes and only their scoped HMAC re
     userId: "user-1",
     deviceHash: "c".repeat(64),
     displayName: "Viewer 1",
+    department: "Strategy",
+    jobTitle: "Director",
     expiresAt: "2026-07-20T06:00:00.000Z",
   });
   assert.equal(redemption.grant.id, "grant-1");
@@ -190,7 +230,7 @@ test("opaque invite tokens contain 32 random bytes and only their scoped HMAC re
   assert.deepEqual(calls.map((call) => call.path), [
     "/rest/v1/rpc/create_live_invite",
     "/rest/v1/rpc/resolve_live_invite_rate_key",
-    "/rest/v1/rpc/redeem_live_invite",
+    "/rest/v1/rpc/redeem_live_invite_v3",
   ]);
   assert.equal(calls.some((call) => JSON.stringify(call.body).includes(inviteToken)), false);
   assert.equal(calls.every((call) => JSON.stringify(call.body).includes(tokenHmac)), true);
@@ -229,6 +269,22 @@ test("a resolved session uses one fixed 64-hex session bucket", async () => {
   await enforceSessionJoinRateLimit(sessionRateKey, store);
   assert.deepEqual(calls, [{ scope: "join-session", keyHash: sessionRateKey, limit: 60, windowSeconds: 300 }]);
   await assert.rejects(() => enforceSessionJoinRateLimit("guessed-code-hmac", store), /요청 제한 키/);
+});
+
+test("six-digit attempts share a persistent global brute-force bucket", async () => {
+  const calls: Array<{ scope: string; keyHash: string; limit: number; windowSeconds: number }> = [];
+  const store: RateLimitStore = {
+    async consumeRateLimit(input) {
+      calls.push(input);
+      return true;
+    },
+  };
+  await enforceAdmissionCodeAttemptRateLimit(store);
+  assert.deepEqual(
+    { scope: calls[0].scope, limit: calls[0].limit, windowSeconds: calls[0].windowSeconds },
+    { scope: "join-admission-global", limit: 300, windowSeconds: 300 },
+  );
+  assert.match(calls[0].keyHash, /^[0-9a-f]{64}$/u);
 });
 
 test("production host login consumes a persistent hashed IP bucket", async () => {
@@ -362,17 +418,23 @@ test("web ingress normalization matches every alias accepted by the database mig
 test("viewer display names are NFC normalized and stripped of controls and HTML", () => {
   assert.equal(sanitizeViewerDisplayName("  Ga\u0301<script>alert(1)</script>\nGuest  "), "Gá alert(1) Guest");
   const valid = joinLiveSessionInputSchema.parse({
-    code: "123456",
+    inviteToken: "a".repeat(43),
     displayName: "  가 <b>Guest</b>\u0000 ",
+    department: "  Stra\u0301tegy ",
+    jobTitle: " Director ",
     deviceId: "device-identifier-12345",
     accessToken: "a".repeat(20),
   });
   assert.equal(valid.displayName, "가 Guest");
+  assert.equal(valid.department, "Strátegy");
+  assert.equal(valid.jobTitle, "Director");
   assert.equal(Array.from(valid.displayName).length <= 40, true);
   for (const displayName of ["<script></script>", "\u0000\u0001", "a".repeat(41)]) {
     assert.equal(joinLiveSessionInputSchema.safeParse({
-      code: "123456",
+      inviteToken: "a".repeat(43),
       displayName,
+      department: "Strategy",
+      jobTitle: "Director",
       deviceId: "device-identifier-12345",
       accessToken: "a".repeat(20),
     }).success, false);
@@ -387,45 +449,67 @@ test("admission and join schemas fail closed on malformed or surplus external in
   assert.equal(createLiveInviteInputSchema.safeParse({ action: "open" }).success, false);
   assert.equal(createLiveInviteInputSchema.safeParse({ action: "create", origin: "https://untrusted.example" }).success, false);
   assert.equal(joinLiveSessionInputSchema.safeParse({
-    code: "123456",
+    admissionCode: "123456",
     displayName: "Viewer 1",
+    department: "Strategy",
+    jobTitle: "Director",
     deviceId: "device-identifier-12345",
     accessToken: "a".repeat(20),
   }).success, true);
   assert.equal(joinLiveSessionInputSchema.safeParse({
-    code: "123456 OR 1=1",
+    admissionCode: "123456 OR 1=1",
     displayName: "Viewer 1",
+    department: "Strategy",
+    jobTitle: "Director",
     deviceId: "device-identifier-12345",
     accessToken: "a".repeat(20),
   }).success, false);
   assert.equal(joinLiveSessionInputSchema.safeParse({
     inviteToken: "a".repeat(43),
     displayName: "Viewer 1",
+    department: "Strategy",
+    jobTitle: "Director",
     deviceId: "device-identifier-12345",
     accessToken: "a".repeat(20),
   }).success, true);
   assert.equal(joinLiveSessionInputSchema.safeParse({
-    code: "123456",
+    admissionCode: "123456",
     inviteToken: "a".repeat(43),
     displayName: "Viewer 1",
+    department: "Strategy",
+    jobTitle: "Director",
     deviceId: "device-identifier-12345",
     accessToken: "a".repeat(20),
   }).success, false);
   assert.equal(joinLiveSessionInputSchema.safeParse({
     displayName: "Viewer 1",
+    department: "Strategy",
+    jobTitle: "Director",
     deviceId: "device-identifier-12345",
     accessToken: "a".repeat(20),
   }).success, false);
   assert.equal(joinLiveSessionInputSchema.safeParse({
     inviteToken: "a".repeat(44),
     displayName: "Viewer 1",
+    department: "Strategy",
+    jobTitle: "Director",
     deviceId: "device-identifier-12345",
     accessToken: "a".repeat(20),
   }).success, false);
   assert.equal(joinLiveSessionInputSchema.safeParse({
-    code: "123456",
+    inviteToken: "a".repeat(43),
     displayName: "Viewer 1",
+    department: "Strategy",
+    jobTitle: "Director",
     password: "viewer-password-is-not-accepted",
+    deviceId: "device-identifier-12345",
+    accessToken: "a".repeat(20),
+  }).success, false);
+  assert.equal(joinLiveSessionInputSchema.safeParse({
+    inviteToken: "a".repeat(43),
+    displayName: "Viewer 1",
+    department: "",
+    jobTitle: "Director",
     deviceId: "device-identifier-12345",
     accessToken: "a".repeat(20),
   }).success, false);
@@ -453,8 +537,15 @@ test("host login is env-only and weak credentials require an explicit non-produc
   assert.throws(() => readHostLoginConfig({
     NODE_ENV: "production",
     ADMIN_USER_IDS: "host",
-    ADMIN_PASSWORD: "short",
+    ADMIN_PASSWORD: "tiny",
   }), /강한 호스트 로그인/u);
+  // Operator-chosen passwords of five or more characters are accepted so the
+  // Vercel-configured ADMIN_PASSWORD does not silently 500 the login route.
+  assert.equal(readHostLoginConfig({
+    NODE_ENV: "production",
+    ADMIN_USER_IDS: "host",
+    ADMIN_PASSWORD: "n0el!",
+  }).isEnabled, true);
   assert.equal(readHostLoginConfig({
     NODE_ENV: "production",
     ADMIN_USER_IDS: "host-a,host-b",
@@ -501,6 +592,16 @@ test("production rejects known example placeholders regardless of their length",
   ]) {
     assert.equal(isKnownInsecureSecret(example[name] ?? ""), true, `${name} must remain an intentionally invalid example`);
   }
+});
+
+test("ADMIN_PASSWORD follows the 5+ char operator policy, not the 32-char HMAC secret gate", () => {
+  const source = readFileSync(new URL("./config.ts", import.meta.url), "utf8");
+  assert.doesNotMatch(source, /readRequiredProductionSecret\("ADMIN_PASSWORD"\)/u);
+  assert.match(source, /adminPassword\.length < 5/u);
+  assert.match(source, /isKnownInsecureSecret\(adminPassword\)/u);
+  // The HMAC-grade secrets keep the strong 32-char gate.
+  assert.match(source, /readRequiredProductionSecret\("SESSION_SECRET"\)/u);
+  assert.match(source, /readRequiredProductionSecret\("PAIR_SECRET"\)/u);
 });
 
 test("development Supabase connections require an exact allowlisted project ref", () => {
@@ -624,6 +725,11 @@ test("login route applies the limiter without logging credentials", () => {
   assert.doesNotMatch(source, /createHash|rnw_link|linkHash/u);
   assert.doesNotMatch(source, /cw1234|\^admin/u);
   assert.doesNotMatch(source, /password === HOST_LOGIN_CONFIG\.password/u);
+  // The env-backed config is read per request: a module-scope constant would
+  // freeze a stale (or throwing) value for the lambda's lifetime, so a fixed
+  // Vercel env var could never take effect without an opaque 500.
+  assert.doesNotMatch(source, /^const HOST_LOGIN_CONFIG = readHostLoginConfig\(\)/mu);
+  assert.match(source, /HOST_LOGIN_CONFIG_INVALID/u);
 });
 
 test("viewer admission routes never log names, codes, tokens, or captions", () => {
@@ -635,6 +741,44 @@ test("viewer admission routes never log names, codes, tokens, or captions", () =
   for (const source of sources) {
     assert.doesNotMatch(source, /console\.(?:log|info|warn|error)/u);
   }
+});
+
+test("meeting record routes bind host ownership and participant recap access before service-role reads", () => {
+  const summary = readFileSync(new URL("../../app/api/live-sessions/[id]/summary/route.ts", import.meta.url), "utf8");
+  const transcript = readFileSync(new URL("../../app/api/live-sessions/[id]/transcript/route.ts", import.meta.url), "utf8");
+  const status = readFileSync(new URL("../../app/api/live-sessions/[id]/status/route.ts", import.meta.url), "utf8");
+  assert.ok(summary.indexOf("assertHostSessionOwnership") < summary.indexOf("fetchUtterances(sessionId"));
+  assert.ok(summary.indexOf("enforceSummaryGenerationRateLimit(hostId") < summary.indexOf("generateMeetingSummary(attributedUtterances"));
+  assert.ok(transcript.indexOf("assertHostSessionOwnership") < transcript.indexOf("fetchUtterances(sessionId"));
+  assert.match(summary, /authorizeParticipantRecordRequest\(request, sessionId, store\)/u);
+  assert.match(transcript, /authorizeParticipantRecordRequest\(request, sessionId, store\)/u);
+  assert.match(status, /assertHostSessionOwnership\(sessionId, hostId\)/u);
+  assert.match(status, /authorizeParticipantRecordRequest\(request, sessionId, store\)/u);
+  assert.match(status, /httpOnly: true[\s\S]*secure: isProductionRuntime\(\)[\s\S]*sameSite: "lax"/u);
+  assert.match(status, /path: `\/api\/live-sessions\/\$\{sessionId\}`/u);
+  // All three must fall through to participant access when a valid host cookie
+  // simply is not THIS session's owner. Catching only AuthenticationError meant
+  // assertHostSessionOwnership's LiveAdmissionError(404) propagated, so a
+  // participant browsing with a host cookie in the same browser got 404s on
+  // status polling, minutes, and transcript recovery despite a valid grant.
+  for (const source of [summary, transcript, status]) {
+    assert.match(source, /if \(!isHostOwnershipMiss\(error\)\) throw error;/u);
+    assert.doesNotMatch(source, /if \(!\(error instanceof AuthenticationError\)\) throw error;/u);
+  }
+  // The predicate must not grant access by itself — the participant check still runs.
+  const authorization = readFileSync(new URL("./live-viewer-authorization.ts", import.meta.url), "utf8");
+  assert.match(authorization, /export function isHostOwnershipMiss/u);
+  assert.match(authorization, /=== "LIVE_SESSION_NOT_FOUND"/u);
+});
+
+test("host create, start, update, and end routes require a signed host session and owned store mutations", () => {
+  const createRoute = readFileSync(new URL("../../app/api/live-sessions/route.ts", import.meta.url), "utf8");
+  const sessionRoute = readFileSync(new URL("../../app/api/live-sessions/[id]/route.ts", import.meta.url), "utf8");
+  const startRoute = readFileSync(new URL("../../app/api/live-sessions/[id]/start/route.ts", import.meta.url), "utf8");
+  assert.ok(createRoute.indexOf("requireHost(request)") < createRoute.indexOf(".create(hostId"));
+  assert.ok(startRoute.indexOf("requireHost(request)") < startRoute.indexOf(".start("));
+  assert.ok(sessionRoute.indexOf("requireHost(request)") < sessionRoute.indexOf(".update(hostId"));
+  assert.ok(sessionRoute.indexOf("requireHost(request)") < sessionRoute.indexOf(".end(hostId"));
 });
 
 test("snapshot reconnect validates canonical language before one atomic viewer topic authorization", () => {
@@ -692,7 +836,16 @@ test("viewer sockets cannot inject caption or audio payloads and cap JSON messag
   assert.match(viewerBinaryBranch[0], /consumeAudioBudget\(claims\.sessionId, data\.byteLength\)/u);
   assert.match(source, /if \(message\.type !== "subscribe"[\s\S]*?throw new Error\("INVALID_SUBSCRIPTION"\)/u);
   assert.match(source, /message\.sessionId !== claims\.sessionId/u);
-  assert.match(source, /LANGUAGE_CODE_PATTERN\.test\(message\.language\)/u);
+  // 구독 언어는 형태 정규식이 아니라 레지스트리로 검증합니다. 정규식은
+  // 호스트 UI가 제공하는 zh-Hans/zh-Hant를 거부하거나, 반대로 ko-KR 같은
+  // 지역 코드를 통과시켜 파이프라인이 발행하지 않는 토픽을 열어 버립니다.
+  assert.match(source, /const language = normalizeLiveLanguage\(message\.language\)/u);
+  assert.match(source, /\|\| !language\b/u);
+  // 토픽·인가·리플레이는 모두 정규화된 값을 쓰며, 원본 클라이언트 문자열이
+  // 토픽 키에 그대로 들어가지 않아야 합니다.
+  assert.match(source, /topic = `\$\{message\.sessionId\}:\$\{language\}`/u);
+  assert.match(source, /runViewerAuthorization\(message\.sessionId, language\)/u);
+  assert.doesNotMatch(source, /:\$\{message\.language\}`/u);
 });
 
 test("invite links are consumed from a scrubbed URL fragment before join", () => {

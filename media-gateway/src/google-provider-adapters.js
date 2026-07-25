@@ -1,4 +1,4 @@
-import { AUDIO_CONFIG, STT_CONFIG } from "./config.js";
+import { AUDIO_CONFIG, STT_CONFIG, textPlausiblyInLanguage } from "./config.js";
 import { Pcm16StreamConditioner } from "./pcm-conditioning.js";
 import { StableTranscriptSegmenter, StableUtteranceSegmenter } from "./stable-utterance-segmenter.js";
 import { segmentTextForStreamingTts } from "./tts-text-segmentation.js";
@@ -13,15 +13,61 @@ const CHIRP_LOCALES = new Map([
   ["hi", "hi-IN"], ["id", "id-ID"], ["vi", "vi-VN"], ["it", "it-IT"],
 ]);
 
+// 2026-07-23 fix: gemini-3.5-live-translate-preview validates targetLanguageCode
+// lazily on the FIRST audio chunk and rejects regioned codes (ko-KR/en-US)
+// with close 1007 "Request contains an invalid argument". The official list
+// (ai.google.dev/gemini-api/docs/live-api/live-translate) is bare BCP-47 —
+// only Chinese scripts and Portuguese carry a suffix. Chirp TTS locales
+// (CHIRP_LOCALES above) legitimately stay regioned; do not merge the two maps.
 const LIVE_TRANSLATION_LANGUAGE_CODES = new Map([
-  ["en", "en-US"], ["ko", "ko-KR"], ["ja", "ja-JP"],
+  ["en", "en"], ["ko", "ko"], ["ja", "ja"],
   ["zh-CN", "zh-Hans"],
   ["zh", "zh-Hans"],
   ["zh-Hans", "zh-Hans"],
   ["zh-Hant", "zh-Hant"],
-  ["es", "es-ES"], ["pt", "pt-BR"], ["fr", "fr-FR"], ["de", "de-DE"],
-  ["ru", "ru-RU"], ["hi", "hi-IN"], ["id", "id-ID"], ["vi", "vi-VN"], ["it", "it-IT"],
+  ["es", "es"], ["pt", "pt-BR"], ["fr", "fr"], ["de", "de"],
+  ["ru", "ru"], ["hi", "hi"], ["id", "id"], ["vi", "vi"], ["it", "it"],
 ]);
+
+// Delta-accumulation for Live API transcriptions — exact copy of the desktop
+// pipeline's mergeTranscript/boundTranscript (src/gemini-live-translate.js).
+const MAX_LIVE_TRANSCRIPT_CHARS = 16_384;
+
+function boundLiveTranscript(value) {
+  const text = String(value ?? "");
+  return text.length <= MAX_LIVE_TRANSCRIPT_CHARS ? text : text.slice(-MAX_LIVE_TRANSCRIPT_CHARS);
+}
+
+function mergeLiveTranscript(accumulated, incoming) {
+  const prev = String(accumulated ?? "");
+  const text = String(incoming ?? "");
+  if (!text) return boundLiveTranscript(prev);
+  if (!prev) return boundLiveTranscript(text);
+  if (text === prev) return boundLiveTranscript(prev);
+  if (text.startsWith(prev)) return boundLiveTranscript(text);
+  if (prev.startsWith(text)) return boundLiveTranscript(prev);
+  if (prev.endsWith(text)) return boundLiveTranscript(prev);
+  return boundLiveTranscript(`${prev}${text}`);
+}
+
+/** Last committable sentence boundary in `text` (exclusive end index), or 0.
+ *  During continuous speech the live-translate model never sends
+ *  turnComplete, so finals come from append-only sentence commits — the same
+ *  WhisperLiveKit-style pattern the desktop subtitle pipeline uses. CJK stops
+ *  commit immediately; Latin punctuation needs a following space/quote so
+ *  decimals ("3.5") and abbreviations ("U.S.") stay intact. */
+export function lastSentenceBoundaryEnd(text) {
+  const value = String(text ?? "");
+  for (let index = value.length - 1; index >= 0; index -= 1) {
+    const char = value[index];
+    if ("。！？…".includes(char)) return index + 1;
+    if (!".!?".includes(char)) continue;
+    const next = value[index + 1];
+    if (next === undefined) continue; // stream may still be mid-sentence
+    if (/[\s"'”’)\]]/u.test(next)) return index + 1;
+  }
+  return 0;
+}
 
 const TTS_RESPONSE_HIGH_WATER_BYTES = 144_000;
 const TTS_RESPONSE_LOW_WATER_BYTES = 72_000;
@@ -33,13 +79,19 @@ export class GeminiLiveTranslateAdapter {
     client,
     model,
     reconnectDelay = (attempt) => new Promise((resolve) => setTimeout(resolve, Math.min(500 * 2 ** Math.min(attempt - 1, 6), 30_000))),
+    finalFlushMilliseconds = 2_500,
   }) {
     this.client = client;
     this.model = model;
     this.reconnectDelay = reconnectDelay;
+    this.finalFlushMilliseconds = finalFlushMilliseconds;
   }
 
-  async open({ language, onCaption, onAudio, onInterruption }) {
+  /** `onCallbackError` receives any error thrown by a caption/audio handler. It
+   *  exists so a failing caption path is observable instead of silent — see the
+   *  comment on `enqueueCallback`. Defaults to a no-op so existing callers keep
+   *  today's fail-open behaviour, minus the silence. */
+  async open({ language, onCaption, onAudio, onInterruption, onInputCaption = null, onCallbackError = null }) {
     const targetLanguageCode = LIVE_TRANSLATION_LANGUAGE_CODES.get(language) ?? language;
     let session = null;
     let resumptionHandle = null;
@@ -50,6 +102,64 @@ export class GeminiLiveTranslateAdapter {
     let nextConnectionGeneration = 0;
     let activeConnectionGeneration = 0;
     let callbackTail = Promise.resolve();
+    // Live API transcription messages are DELTAS, and during continuous
+    // speech the model never sends turnComplete. Like the desktop pipeline:
+    // accumulate with a prefix-aware merge, commit complete sentences as
+    // finals (append-only), keep the remainder as the live partial, and
+    // flush the tail as final after a short silence.
+    const makeTranscriptLane = () => ({ accumulated: "", committedLength: 0 });
+    let outputLane = makeTranscriptLane();
+    let inputLane = makeTranscriptLane();
+    let inputTranscriptLanguageCode = null;
+    let finalFlushTimer = null;
+    const clearFinalFlushTimer = () => {
+      if (finalFlushTimer !== null) clearTimeout(finalFlushTimer);
+      finalFlushTimer = null;
+    };
+    const resetTranscriptLanes = () => {
+      outputLane = makeTranscriptLane();
+      inputLane = makeTranscriptLane();
+      inputTranscriptLanguageCode = null;
+      clearFinalFlushTimer();
+    };
+    const emitLane = async (lane, emit, { flushAll = false } = {}) => {
+      const uncommitted = lane.accumulated.slice(lane.committedLength);
+      const boundary = flushAll ? uncommitted.length : lastSentenceBoundaryEnd(uncommitted);
+      if (boundary > 0) {
+        const segment = uncommitted.slice(0, boundary).trim();
+        lane.committedLength += boundary;
+        if (segment) await emit({ text: segment, isFinal: true });
+      }
+      if (flushAll) {
+        lane.accumulated = "";
+        lane.committedLength = 0;
+        return;
+      }
+      const tail = lane.accumulated.slice(lane.committedLength).trim();
+      if (tail) await emit({ text: tail, isFinal: false });
+      if (lane.committedLength > 8_192) {
+        lane.accumulated = lane.accumulated.slice(lane.committedLength);
+        lane.committedLength = 0;
+      }
+    };
+    const emitInput = typeof onInputCaption === "function"
+      ? (caption) => onInputCaption({ ...caption, languageCode: inputTranscriptLanguageCode })
+      : null;
+    // Silence flush: the model sends no turn signal during continuous talk,
+    // so a short pause commits whatever remains as the final segment.
+    const armFinalFlushTimer = (generation) => {
+      clearFinalFlushTimer();
+      finalFlushTimer = setTimeout(() => {
+        finalFlushTimer = null;
+        enqueueCallback(async () => {
+          if (generation !== activeConnectionGeneration || isClosed) return;
+          await emitLane(outputLane, onCaption, { flushAll: true });
+          if (generation !== activeConnectionGeneration || isClosed) return;
+          if (emitInput) await emitLane(inputLane, emitInput, { flushAll: true });
+          inputTranscriptLanguageCode = null;
+        });
+      }, this.finalFlushMilliseconds);
+    };
     let inputTail = Buffer.alloc(0);
     let inputQueue = Promise.resolve();
     const clearInputTail = () => { inputTail = Buffer.alloc(0); };
@@ -58,8 +168,24 @@ export class GeminiLiveTranslateAdapter {
       inputQueue = queued.catch(() => undefined);
       return queued;
     };
+    // The tail must survive a throwing handler — one bad caption cannot stop the
+    // stream — but the failure MUST be reported. Swallowing it meant that when
+    // the caption path failed on every message (a snapshot allowlist rejection
+    // escalating to SESSION_STOPPED, a Supabase 5xx, a polish adapter throwing),
+    // every caption for the rest of the session vanished while /health stayed ok
+    // and the audio frame counter kept climbing. There was no log, no metric,
+    // and no way to tell it apart from a quiet room.
     const enqueueCallback = (task) => {
-      callbackTail = callbackTail.then(task, task).catch(() => undefined);
+      callbackTail = callbackTail.then(task, task).catch((error) => { onCallbackError?.(error); });
+    };
+    // Audio gets its OWN serialization tail. PCM must stay ordered relative to
+    // PCM and captions relative to captions, but the two are independent — and
+    // the committed-caption handler runs an LLM polish pass. Sharing one tail
+    // meant a slow polish delayed the listener's interpreted audio by the whole
+    // polish timeout, both within a message and across every message behind it.
+    let audioTail = Promise.resolve();
+    const enqueueAudio = (task) => {
+      audioTail = audioTail.then(task, task).catch((error) => { onCallbackError?.(error); });
     };
     const closedSessions = new WeakSet();
     const closeSessionOnce = (providerSession) => {
@@ -80,6 +206,15 @@ export class GeminiLiveTranslateAdapter {
             targetLanguageCode,
             echoTargetLanguage: false,
           },
+          // Desktop subtitle parity + the ultra-low-latency tuning: a short
+          // end-of-speech window finalizes each utterance in ~450ms instead
+          // of the provider default, without clipping mid-word.
+          realtimeInputConfig: {
+            automaticActivityDetection: {
+              prefixPaddingMs: 100,
+              silenceDurationMs: 450,
+            },
+          },
           contextWindowCompression: { slidingWindow: {} },
           sessionResumption: resumptionHandle ? { handle: resumptionHandle } : {},
         },
@@ -89,6 +224,8 @@ export class GeminiLiveTranslateAdapter {
             if (message.sessionResumptionUpdate?.newHandle) resumptionHandle = message.sessionResumptionUpdate.newHandle;
             if (message.goAway) void reconnect();
             const transcription = message.serverContent?.outputTranscription;
+            const inputTranscription = message.serverContent?.inputTranscription;
+            const isTurnComplete = Boolean(message.serverContent?.turnComplete || message.serverContent?.generationComplete);
             const isInterrupted = Boolean(message.serverContent?.interrupted);
             const audioParts = (message.serverContent?.modelTurn?.parts ?? []).flatMap((part) => {
               const inlineData = part.inlineData ?? part.inline_data;
@@ -96,14 +233,57 @@ export class GeminiLiveTranslateAdapter {
               const pcm = Uint8Array.from(Buffer.from(inlineData.data, "base64"));
               return pcm.byteLength > 0 ? [pcm] : [];
             });
+            // Dispatched before the caption work and on a separate tail, so
+            // playout never waits on a caption polish round-trip.
+            if (audioParts.length > 0) {
+              enqueueAudio(async () => {
+                for (const pcm of audioParts) {
+                  if (connectionGeneration !== activeConnectionGeneration || isClosed) return;
+                  await onAudio?.({ pcm, sampleRate: AUDIO_CONFIG.outputSampleRate });
+                }
+              });
+            }
             enqueueCallback(async () => {
               if (connectionGeneration !== activeConnectionGeneration || isClosed) return;
-              if (transcription?.text) await onCaption({ text: transcription.text, isFinal: Boolean(message.serverContent?.turnComplete) });
-              if (connectionGeneration !== activeConnectionGeneration || isClosed) return;
-              if (isInterrupted) await onInterruption?.();
-              for (const pcm of audioParts) {
+              if (isInterrupted) {
+                // A barge-in abandons the current utterance; stale accumulated
+                // text must not leak into the next one.
+                resetTranscriptLanes();
+                // Audio runs on its own tail, so drain it before clearing:
+                // the clear must still be ordered AFTER every PCM chunk queued
+                // before the barge-in, or a clear could be followed by stale
+                // audio. Awaiting the tail keeps that guarantee without putting
+                // caption polish back in front of playout.
+                await audioTail;
+                await onInterruption?.();
                 if (connectionGeneration !== activeConnectionGeneration || isClosed) return;
-                await onAudio?.({ pcm, sampleRate: AUDIO_CONFIG.outputSampleRate });
+              }
+              if (emitInput && inputTranscription?.text) {
+                inputLane.accumulated = mergeLiveTranscript(inputLane.accumulated, inputTranscription.text);
+                if (inputTranscription.languageCode) inputTranscriptLanguageCode = inputTranscription.languageCode;
+                if (!isTurnComplete) {
+                  await emitLane(inputLane, emitInput);
+                  if (connectionGeneration !== activeConnectionGeneration || isClosed) return;
+                }
+              }
+              if (transcription?.text) {
+                outputLane.accumulated = mergeLiveTranscript(outputLane.accumulated, transcription.text);
+                if (!isTurnComplete) {
+                  await emitLane(outputLane, onCaption);
+                  if (connectionGeneration !== activeConnectionGeneration || isClosed) return;
+                }
+              }
+              if (isTurnComplete) {
+                clearFinalFlushTimer();
+                await emitLane(outputLane, onCaption, { flushAll: true });
+                if (connectionGeneration !== activeConnectionGeneration || isClosed) return;
+                if (emitInput) {
+                  await emitLane(inputLane, emitInput, { flushAll: true });
+                  if (connectionGeneration !== activeConnectionGeneration || isClosed) return;
+                }
+                inputTranscriptLanguageCode = null;
+              } else if (transcription?.text || inputTranscription?.text) {
+                armFinalFlushTimer(connectionGeneration);
               }
             });
           },
@@ -125,6 +305,8 @@ export class GeminiLiveTranslateAdapter {
       // A partial PCM frame belongs to exactly one provider connection. Reusing
       // it after resumption can splice unrelated speech across generations.
       clearInputTail();
+      // Ditto for half-accumulated transcripts.
+      resetTranscriptLanes();
       reconnecting = (async () => {
         while (!isClosed) {
           reconnectAttempts += 1;
@@ -191,6 +373,7 @@ export class GeminiLiveTranslateAdapter {
         isClosed = true;
         activeConnectionGeneration = 0;
         clearInputTail();
+        clearFinalFlushTimer();
         await inputQueue;
         closeSessionOnce(session);
       },
@@ -250,7 +433,7 @@ export class CloudSpeechToTextAdapter {
     this.diarization = diarization;
   }
 
-  async open({ onFinalUtterance, onContinuityDiscard = () => {}, diarization = this.diarization }) {
+  async open({ onFinalUtterance, onPartialTranscript = null, onContinuityDiscard = () => {}, diarization = this.diarization }) {
     const finalWordMap = new Map();
     const seenFinalResults = new Map();
     const finalWordWaiters = new Set();
@@ -282,6 +465,16 @@ export class CloudSpeechToTextAdapter {
     });
     stream.on("data", (response) => {
       try {
+        if (typeof onPartialTranscript === "function") {
+          const interimResults = (response.results ?? []).filter((result) => !result.isFinal);
+          const interimText = interimResults
+            .map((result) => String(result.alternatives?.[0]?.transcript ?? ""))
+            .join("")
+            .trim();
+          if (interimText) {
+            onPartialTranscript({ text: interimText, sourceLanguage: interimResults[0]?.languageCode });
+          }
+        }
         for (const result of response.results ?? []) {
           const alternative = result.alternatives?.[0];
           const words = alternative?.words ?? [];
@@ -325,6 +518,7 @@ export class CloudSpeechToTextAdapter {
       }
     });
     stream.on("error", (error) => {
+      console.error("[stt] streaming recognize error:", error instanceof Error ? error.message : error);
       terminalError = safeSpeechProviderError(error);
       for (const waiter of finalWordWaiters) waiter.reject(terminalError);
       finalWordWaiters.clear();
@@ -637,4 +831,77 @@ function onceEvent(emitter, eventName, signal) {
     emitter.once("error", onError);
     signal?.addEventListener("abort", onAbort, { once: true });
   });
+}
+
+const TRANSLATION_LANGUAGE_NAMES = new Map([
+  ["ko", "Korean"], ["en", "English"], ["ja", "Japanese"], ["zh", "Chinese"],
+  ["es", "Spanish"], ["fr", "French"], ["de", "German"], ["pt", "Portuguese"],
+  ["ru", "Russian"], ["vi", "Vietnamese"], ["id", "Indonesian"], ["th", "Thai"], ["ar", "Arabic"],
+]);
+
+function translationLanguageName(language) {
+  const base = String(language ?? "").trim().toLowerCase().split("-")[0];
+  return TRANSLATION_LANGUAGE_NAMES.get(base) ?? String(language ?? "").trim();
+}
+
+/** ALL meeting captions (partials and finals) are translated by Gemini 3.5
+ *  Flash — the same model family and glossary as the desktop subtitle
+ *  pipeline, per the confirmed provider split (captions=Gemini, voice=OpenAI).
+ *  The machine-translation fallback runs ONLY when Gemini fails or times out,
+ *  so captions never stall or drop. */
+export class GeminiTextTranslateAdapter {
+  constructor({ client, model = "gemini-3.5-flash", fallback = null, timeoutMilliseconds = 3_500, partialTimeoutMilliseconds = 2_500 }) {
+    if (!client?.models?.generateContent) throw new Error("GEMINI_TEXT_CLIENT_UNAVAILABLE");
+    this.client = client;
+    this.model = model;
+    this.fallback = fallback;
+    this.timeoutMilliseconds = timeoutMilliseconds;
+    this.partialTimeoutMilliseconds = partialTimeoutMilliseconds;
+  }
+
+  async translate(input) {
+    const { text, language, sourceLanguage, glossaryText, intent } = input;
+    try {
+      const targetName = translationLanguageName(language);
+      const sourceHint = sourceLanguage && textPlausiblyInLanguage(text, sourceLanguage)
+        ? ` The utterance is in ${translationLanguageName(sourceLanguage)}.`
+        : "";
+      const glossarySection = typeof glossaryText === "string" && glossaryText.trim()
+        ? ["", "Glossary — always use these exact term translations:", glossaryText.trim()]
+        : [];
+      const prompt = [
+        `You are a professional simultaneous interpreter for business meetings.${sourceHint}`,
+        `Translate the utterance below into natural, business-appropriate ${targetName}.`,
+        "Keep company names, personal names, and acronyms verbatim.",
+        "Reply with ONLY the translation - no quotes, no notes, no alternatives.",
+        ...glossarySection,
+        "",
+        text,
+      ].join("\n");
+      let timeoutHandle;
+      const timeoutMilliseconds = intent === "partial" ? this.partialTimeoutMilliseconds : this.timeoutMilliseconds;
+      const response = await Promise.race([
+        this.client.models.generateContent({
+          model: this.model,
+          contents: [{ role: "user", parts: [{ text: prompt }] }],
+          config: { temperature: 0.2, maxOutputTokens: 1_024 },
+        }),
+        new Promise((_, reject) => {
+          timeoutHandle = setTimeout(() => reject(new Error("GEMINI_TRANSLATE_TIMEOUT")), timeoutMilliseconds);
+        }),
+      ]).finally(() => clearTimeout(timeoutHandle));
+      const translated = String(response?.text
+        ?? response?.candidates?.[0]?.content?.parts?.map((part) => part?.text ?? "").join("")
+        ?? "").trim();
+      if (!translated) throw new Error("TRANSLATION_EMPTY");
+      // An echoing/refusing model must never surface wrong-script text.
+      if (!textPlausiblyInLanguage(translated, language)) throw new Error("TRANSLATION_WRONG_SCRIPT");
+      return translated;
+    } catch (error) {
+      const code = error instanceof Error ? error.message : "GEMINI_TRANSLATE_FAILED";
+      console.warn(`[translate] gemini failed (${code}); falling back to machine translation`);
+      if (this.fallback) return this.fallback.translate(input);
+      throw error;
+    }
+  }
 }

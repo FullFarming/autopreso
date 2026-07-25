@@ -7,7 +7,7 @@ import { LiveSessionService } from "./service";
 import { getLiveStoreConfig } from "./config";
 import { toLiveFailure } from "./errors";
 import { MemoryLiveSessionStore, SupabaseLiveSessionStore } from "./store";
-import { parseLanguages, parseSessionId } from "./validation";
+import { parseLanguages, parseScheduledAt, parseSessionId, parseTitle } from "./validation";
 
 test("session ids reject malformed external path input", () => {
   assert.equal(parseSessionId("0192d0f4-9f72-7a36-91f5-6a76ef736f41"), "0192d0f4-9f72-7a36-91f5-6a76ef736f41");
@@ -21,6 +21,14 @@ test("service language parsing canonicalizes ingress aliases and rejects canonic
   assert.throws(() => parseLanguages(["en", "ko", "ja", "fr"]), /1개 이상 3개 이하/u);
 });
 
+test("session metadata normalizes safe titles and ISO schedules", () => {
+  assert.equal(parseTitle("  Global   Earnings Call  "), "Global Earnings Call");
+  assert.equal(parseTitle("회의"), "회의");
+  assert.throws(() => parseTitle("<script>"), /120자/u);
+  assert.equal(parseScheduledAt("2026-07-24T09:00:00+09:00"), "2026-07-24T00:00:00.000Z");
+  assert.throws(() => parseScheduledAt("2026-07-24 09:00"), /올바르지/u);
+});
+
 test("session create validates one to three languages and expires after six hours", async () => {
   const now = Date.UTC(2026, 6, 19);
   const service = new LiveSessionService(new MemoryLiveSessionStore(() => now), () => now);
@@ -32,8 +40,35 @@ test("session create validates one to three languages and expires after six hour
   assert.equal(session.maxViewers, 50);
   assert.equal(session.glossaryPack, "general_cre");
   assert.equal(session.viewerCount, 0);
+  assert.equal(session.title, "Live Session");
+  assert.equal(session.scheduledAt, null);
   assert.equal(session.expiresAt, new Date(now + 6 * 60 * 60 * 1_000).toISOString());
   await assert.rejects(() => service.create("host-1", { sessionType: "meeting", languages: [] }), /1개 이상/);
+});
+
+test("scheduled session expires six hours after schedule and rejects more than 30 days ahead", async () => {
+  const now = Date.UTC(2026, 6, 23);
+  const store = new MemoryLiveSessionStore(() => now);
+  const service = new LiveSessionService(store, () => now);
+  const scheduledAt = new Date(now + 7 * 24 * 60 * 60 * 1_000).toISOString();
+  const session = await service.create("host-1", {
+    title: "Investor Briefing",
+    scheduledAt,
+    sessionType: "meeting",
+    languages: ["ko", "en"],
+  });
+  assert.equal(session.title, "Investor Briefing");
+  assert.equal(session.scheduledAt, scheduledAt);
+  assert.equal(session.expiresAt, new Date(Date.parse(scheduledAt) + 6 * 60 * 60 * 1_000).toISOString());
+  await assert.rejects(
+    service.create("host-1", {
+      title: "Too far",
+      scheduledAt: new Date(now + 31 * 24 * 60 * 60 * 1_000).toISOString(),
+      sessionType: "meeting",
+      languages: ["ko"],
+    }),
+    (error: unknown) => error instanceof Error && "code" in error && error.code === "SCHEDULE_TOO_FAR",
+  );
 });
 
 test("OpenAI voice is presentation-only and remains independent from Gemini captions", async () => {
@@ -107,6 +142,124 @@ test("session update uses optimistic versioning and preserves host ownership", a
     return error instanceof Error && "code" in error && error.code === "VERSION_CONFLICT";
   });
   await assert.rejects(() => service.update("other-host", created.id, { version: 2, languages: ["ja"] }), /찾을 수 없습니다/);
+});
+
+test("host start uses one guarded preparing-to-live transition", async () => {
+  const store = new MemoryLiveSessionStore();
+  const service = new LiveSessionService(store);
+  const created = await service.create("host-1", {
+    title: "Live Translation",
+    sessionType: "meeting",
+    languages: ["ko", "en"],
+  });
+  const started = await service.start("host-1", created.id, created.version);
+  assert.equal(started.status, "live");
+  assert.equal(started.version, created.version + 1);
+  assert.deepEqual(await service.start("host-1", created.id, created.version), started);
+  await assert.rejects(
+    service.start("other-host", created.id, started.version),
+    (error: unknown) => error instanceof Error && "code" in error && error.code === "SESSION_NOT_FOUND",
+  );
+});
+
+test("session languages always include both ko and en caption lanes", async () => {
+  const service = new LiveSessionService(new MemoryLiveSessionStore());
+  const koOnly = await service.create("host-1", { sessionType: "meeting", languages: ["ko"] });
+  assert.deepEqual(koOnly.languages, ["ko", "en"]);
+  const jaOnly = await service.create("host-1", { sessionType: "meeting", languages: ["ja"] });
+  assert.deepEqual(jaOnly.languages, ["ja", "ko", "en"]);
+  // The union never exceeds the 3-language cap: extras beyond capacity drop.
+  const crowded = await service.create("host-1", { sessionType: "meeting", languages: ["ja", "fr", "ko"] });
+  assert.deepEqual(crowded.languages, ["ja", "ko", "en"]);
+  const updated = await service.update("host-1", koOnly.id, { version: 1, languages: ["ja"] });
+  assert.deepEqual(updated.languages, ["ja", "ko", "en"]);
+});
+
+test("pause and resume are guarded versioned transitions between live and paused", async () => {
+  const store = new MemoryLiveSessionStore();
+  const service = new LiveSessionService(store);
+  const created = await service.create("host-1", { sessionType: "meeting", languages: ["ko", "en"] });
+
+  await assert.rejects(
+    service.pause("host-1", created.id, created.version),
+    (error: unknown) => error instanceof Error && "code" in error && error.code === "SESSION_NOT_PAUSABLE",
+  );
+
+  const started = await service.start("host-1", created.id, created.version);
+  const paused = await service.pause("host-1", created.id, started.version);
+  assert.equal(paused.status, "paused");
+  assert.equal(paused.version, started.version + 1);
+  // Idempotent retry with the stale version returns the paused session.
+  assert.deepEqual(await service.pause("host-1", created.id, started.version), paused);
+  await assert.rejects(
+    service.pause("other-host", created.id, paused.version),
+    (error: unknown) => error instanceof Error && "code" in error && error.code === "SESSION_NOT_FOUND",
+  );
+  await assert.rejects(
+    service.start("host-1", created.id, paused.version),
+    (error: unknown) => error instanceof Error && "code" in error && error.code === "SESSION_PAUSED",
+  );
+
+  const resumed = await service.resume("host-1", created.id, paused.version);
+  assert.equal(resumed.status, "live");
+  assert.equal(resumed.version, paused.version + 1);
+  assert.deepEqual(await service.resume("host-1", created.id, paused.version), resumed);
+  // Resuming an already-live session stays idempotent instead of failing.
+  assert.deepEqual(await service.resume("host-1", created.id, resumed.version), resumed);
+
+  await service.end("host-1", created.id);
+  await assert.rejects(
+    service.pause("host-1", created.id, resumed.version + 1),
+    (error: unknown) => error instanceof Error && "code" in error && error.code === "SESSION_NOT_PAUSABLE",
+  );
+});
+
+test("host recovery lists only the host's active sessions", async () => {
+  const store = new MemoryLiveSessionStore();
+  const service = new LiveSessionService(store);
+  const preparing = await service.create("host-1", { sessionType: "meeting", languages: ["ko", "en"], title: "Preparing" });
+  const live = await service.create("host-1", { sessionType: "meeting", languages: ["ko", "en"], title: "Live" });
+  await service.start("host-1", live.id, live.version);
+  const pausedSession = await service.create("host-1", { sessionType: "meeting", languages: ["ko", "en"], title: "Paused" });
+  const pausedStarted = await service.start("host-1", pausedSession.id, pausedSession.version);
+  await service.pause("host-1", pausedSession.id, pausedStarted.version);
+  const ended = await service.create("host-1", { sessionType: "meeting", languages: ["ko", "en"], title: "Ended" });
+  await service.end("host-1", ended.id);
+  await service.create("host-2", { sessionType: "meeting", languages: ["ko", "en"], title: "Other host" });
+
+  const mine = await service.listActive("host-1");
+  assert.deepEqual(
+    mine.map((session) => [session.title, session.status]).sort(),
+    [["Live", "live"], ["Paused", "paused"], ["Preparing", "preparing"]],
+  );
+  assert.ok(mine.every((session) => session.hostId === "host-1"));
+  assert.deepEqual([preparing.id, live.id, pausedSession.id].sort(), mine.map((session) => session.id).sort());
+});
+
+test("only explicit host end terminates a live session", async () => {
+  const store = new MemoryLiveSessionStore();
+  const service = new LiveSessionService(store);
+  const created = await service.create("host-1", {
+    title: "Persistent live call",
+    sessionType: "meeting",
+    languages: ["ko", "en"],
+  });
+  const started = await service.start("host-1", created.id, created.version);
+
+  // Desktop caption pause/restart does not cross the LiveSessionService
+  // boundary, so the session, participants, invite credentials, and transcript
+  // remain attached to the same session id.
+  assert.equal((await store.get(started.id))?.status, "live");
+  await assert.rejects(
+    service.end("other-host", started.id),
+    (error: unknown) => error instanceof Error && "code" in error && error.code === "SESSION_NOT_FOUND",
+  );
+  assert.equal((await store.get(started.id))?.status, "live");
+
+  await service.end("host-1", started.id);
+  const ended = await store.get(started.id);
+  assert.equal(ended?.status, "stopped");
+  assert.ok(ended?.endedAt);
 });
 
 test("session type, output, capacity, and glossary update atomically", async () => {
@@ -248,6 +401,8 @@ test("Supabase session writes use atomic canonical RPC contracts", async () => {
   await store.create({
     id: row.id,
     hostId: row.host_id,
+    title: "Investor Call",
+    scheduledAt: null,
     sessionType: "presentation",
     outputMode: "captions_audio",
     status: "preparing",
@@ -261,6 +416,8 @@ test("Supabase session writes use atomic canonical RPC contracts", async () => {
     expiresAt,
   });
   await store.updateOwned(row.id, row.host_id, 1, {
+    title: "Investor Call",
+    scheduledAt: null,
     sessionType: "meeting",
     outputMode: "audio",
     languages: ["ko"],
@@ -272,6 +429,8 @@ test("Supabase session writes use atomic canonical RPC contracts", async () => {
   assert.deepEqual(requests[0]?.body, {
     p_session_id: row.id,
     p_host_id: row.host_id,
+    p_title: "Investor Call",
+    p_scheduled_at: null,
     p_session_type: "presentation",
     p_output_mode: "captions_audio",
     p_languages: ["ko"],
@@ -282,6 +441,8 @@ test("Supabase session writes use atomic canonical RPC contracts", async () => {
   });
   assert.match(requests[1]?.url ?? "", /\/rpc\/update_live_session$/u);
   assert.equal(requests[1]?.body.p_expected_version, 1);
+  assert.equal(requests[1]?.body.p_title, "Investor Call");
+  assert.equal(requests[1]?.body.p_scheduled_at, null);
   assert.equal(requests[1]?.body.p_output_mode, "audio");
   assert.equal(requests[1]?.body.p_max_viewers, 20);
   assert.equal(requests[1]?.body.p_glossary_pack, "fnb");
@@ -312,7 +473,8 @@ test("expired sessions reject host updates even before database cleanup", async 
   const store = new MemoryLiveSessionStore();
   const expiredSessionId = crypto.randomUUID();
   await store.create({
-    id: expiredSessionId, hostId: "host-1", sessionType: "presentation", outputMode: "captions",
+    id: expiredSessionId, hostId: "host-1", title: "Expired", scheduledAt: null,
+    sessionType: "presentation", outputMode: "captions",
     voiceProvider: "gemini", maxViewers: 50, glossaryPack: "general_cre",
     status: "live", languages: ["en"], viewerCount: 0, version: 1,
     admissionOpenUntil: null, expiresAt: new Date(0).toISOString(),
@@ -329,7 +491,7 @@ test("removed language snapshots fail explicitly", async () => {
   const store = new MemoryLiveSessionStore(() => now);
   const service = new LiveSessionService(store, () => now);
   const created = await service.create("host-1", { sessionType: "meeting", languages: ["en"] });
-  await assert.rejects(() => service.snapshot(created.id, "ko"), (error: unknown) => {
+  await assert.rejects(() => service.snapshot(created.id, "ja"), (error: unknown) => {
     return error instanceof Error && "code" in error && error.code === "LANGUAGE_REMOVED";
   });
 });

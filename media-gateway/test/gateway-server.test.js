@@ -136,6 +136,111 @@ test("host can hot-swap a prepared pipeline and explicitly end an audio turn", a
   await once(webSocket, "close");
 });
 
+test("host translation restart rebuilds the pipeline without ending the live call", async (context) => {
+  const pipelines = [];
+  const authorizationOptions = [];
+  const gateway = createGatewayServer({
+    gatewaySecret: "gateway-secret",
+    viewerSecret: "viewer-secret",
+    viewerAuthorizer: { async authorize() { return true; } },
+    hostAuthorizer: {
+      async authorize(_claims, _settings, options) {
+        authorizationOptions.push(options);
+        return options.requireLive === true;
+      },
+    },
+    async pipelineFactory(settings) {
+      const pipeline = {
+        settings,
+        closed: 0,
+        async start() {},
+        async tick() {},
+        async acceptAudio() {},
+        async endAudioStream() {},
+        async close() { this.closed += 1; },
+      };
+      pipelines.push(pipeline);
+      return pipeline;
+    },
+  });
+  await new Promise((resolve) => gateway.server.listen(0, "127.0.0.1", resolve));
+  context.after(async () => gateway.close());
+  const host = await connectHost(`ws://127.0.0.1:${gateway.server.address().port}/live`);
+  context.after(() => host.terminate());
+
+  let received = nextJson(host);
+  host.send(JSON.stringify({
+    type: "start",
+    sessionId: "session-1",
+    sessionType: "meeting",
+    outputMode: "captions",
+    version: 2,
+    languages: ["ko", "en"],
+  }));
+  assert.equal((await received).type, "started");
+
+  received = nextJson(host);
+  host.send(JSON.stringify({
+    type: "restart",
+    sessionId: "session-1",
+    sessionType: "meeting",
+    outputMode: "captions",
+    version: 2,
+    languages: ["ko", "en"],
+  }));
+  const restarted = await received;
+  assert.equal(restarted.type, "restarted");
+  assert.equal(restarted.sessionId, "session-1");
+  assert.equal(pipelines.length, 2);
+  assert.equal(pipelines[0].closed, 1);
+  assert.equal(pipelines[1].closed, 0);
+  assert.ok(authorizationOptions.every((options) => options.requireLive === true));
+});
+
+test("gateway starts translation only after the database session is live", async (context) => {
+  const authorizationOptions = [];
+  const gateway = createGatewayServer({
+    gatewaySecret: "gateway-secret",
+    viewerSecret: "viewer-secret",
+    viewerAuthorizer: { async authorize() { return true; } },
+    hostAuthorizer: {
+      async authorize(_claims, _settings, options) {
+        authorizationOptions.push(options);
+        return options.requireLive === true;
+      },
+    },
+    async pipelineFactory(settings) {
+      return {
+        voiceOutputMode: settings.voiceOutputMode,
+        async start() {},
+        async tick() {},
+        async acceptAudio() {},
+        async endAudioStream() {},
+        async close() {},
+      };
+    },
+  });
+  await new Promise((resolve) => gateway.server.listen(0, "127.0.0.1", resolve));
+  context.after(async () => gateway.close());
+  const host = await connectHost(`ws://127.0.0.1:${gateway.server.address().port}/live`);
+  context.after(() => host.terminate());
+  const received = nextJson(host);
+  host.send(JSON.stringify({
+    type: "start",
+    sessionId: "session-1",
+    version: 2,
+    mode: "presentation",
+    voiceOutputMode: "captions",
+    languages: ["en"],
+  }));
+  assert.equal((await received).type, "started");
+  assert.equal(authorizationOptions.length >= 2, true);
+  assert.equal(authorizationOptions[0].requireLive, true);
+  assert.equal(authorizationOptions[0].compareVersion, true);
+  assert.equal(authorizationOptions[1].requireLive, true);
+  assert.equal(authorizationOptions[1].compareVersion, true);
+});
+
 test("a reconnecting host replaces ownership without closing the old pipeline twice", async (context) => {
   const pipelines = [];
   const gateway = createGatewayServer({
@@ -810,7 +915,7 @@ test("HOST lease closes the pipeline within the five-second audit interval", asy
     gatewaySecret: "gateway-secret",
     viewerSecret: "viewer-secret",
     viewerAuthorizer: { async authorize() { return true; } },
-    hostAuthorizer: { async authorize(_claims, _settings, options) { authorizeCalls += 1; return !options.requireLive; } },
+    hostAuthorizer: { async authorize(_claims, _settings, options) { authorizeCalls += 1; return options.compareVersion; } },
     setHostLeaseIntervalFn(callback, delay) { assert.equal(delay, 2_500); leaseCallback = callback; return { lease: true }; },
     clearHostLeaseIntervalFn() {},
     async pipelineFactory() { return pipeline; },
@@ -849,9 +954,9 @@ test("a hung HOST lease is aborted within the remaining half of the five-second 
     viewerSecret: "viewer-secret",
     viewerAuthorizer: { async authorize() { return true; } },
     hostAuthorizer: {
-      async authorize(_claims, _settings, { requireLive }) {
+      async authorize(_claims, _settings, { compareVersion }) {
         authorizeCalls += 1;
-        return requireLive ? new Promise(() => {}) : true;
+        return compareVersion ? true : new Promise(() => {});
       },
     },
     setTimeoutFn(callback, delay) {
@@ -897,9 +1002,9 @@ test("an aborted old HOST lease cannot close a successfully swapped pipeline", a
     viewerSecret: "viewer-secret",
     viewerAuthorizer: { async authorize() { return true; } },
     hostAuthorizer: {
-      async authorize(_claims, _settings, { signal, requireLive }) {
+      async authorize(_claims, _settings, { signal, compareVersion }) {
         authorizationCalls += 1;
-        if (!requireLive) return true;
+        if (compareVersion) return true;
         return new Promise((resolve, reject) => {
           signal.addEventListener("abort", () => reject(signal.reason), { once: true });
         });

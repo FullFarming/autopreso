@@ -18,7 +18,7 @@ for (const target of config.targets) {
     );
   }
 
-  const binaryPath = path.join(rootDir, target.packageDir, "bin", "autopreso-moonshine");
+  const binaryPath = path.join(rootDir, target.packageDir, "bin", "realtime-noel-moonshine");
   if (!existsSync(binaryPath)) {
     throw new Error(`Missing built sidecar binary: ${path.relative(rootDir, binaryPath)}. Run 'npm run build:moonshine-sidecars' first.`);
   }

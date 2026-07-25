@@ -1,0 +1,22 @@
+{
+  "manifest_version": 3,
+  "name": "Realtime Noel Viewer",
+  "version": "0.1.0",
+  "description": "조직용 다국어 라이브 자막·Meeting 통역 음성 사이드패널",
+  "minimum_chrome_version": "114",
+  "permissions": ["sidePanel", "storage"],
+  "host_permissions": ["https://realtime-noel-web.vercel.app/*"],
+  "background": {
+    "service_worker": "service-worker.js",
+    "type": "module"
+  },
+  "action": {
+    "default_title": "Realtime Noel Viewer 열기"
+  },
+  "side_panel": {
+    "default_path": "sidepanel.html"
+  },
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'none'; frame-src https://realtime-noel-web.vercel.app"
+  }
+}

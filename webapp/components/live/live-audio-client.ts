@@ -80,7 +80,7 @@ function isSpeakerAssignment(value: unknown): value is SpeakerAssignment {
 
 function assertSessionVersion(version: number): void {
   if (!Number.isSafeInteger(version) || version < 1) {
-    throw new Error("라이브 세션 버전이 올바르지 않습니다.");
+    throw new Error("The live session version is invalid.");
   }
 }
 
@@ -90,10 +90,10 @@ function getGatewayCredentialRefreshDelay(
 ): number {
   const expiresAtMilliseconds = Date.parse(credentials.expiresAt);
   if (!Number.isFinite(expiresAtMilliseconds)) {
-    throw new Error("미디어 게이트웨이 자격 증명의 만료시각이 올바르지 않습니다.");
+    throw new Error("The media gateway credential expiry is invalid.");
   }
   if (expiresAtMilliseconds - nowMilliseconds <= 60_000) {
-    throw new Error("미디어 게이트웨이 자격 증명이 만료됐거나 곧 만료됩니다.");
+    throw new Error("The media gateway credentials have expired or will expire shortly.");
   }
   return Math.min(50 * 60 * 1_000, expiresAtMilliseconds - nowMilliseconds - 60_000);
 }
@@ -102,7 +102,7 @@ function waitForMessage(socket: WebSocket, expectedType: string, timeoutMillisec
   return new Promise((resolve, reject) => {
     const timeout = window.setTimeout(() => {
       socket.removeEventListener("message", handleMessage);
-      reject(new Error("미디어 게이트웨이 응답 시간이 초과됐습니다."));
+      reject(new Error("The media gateway timed out."));
     }, timeoutMilliseconds);
     function handleMessage(event: MessageEvent<unknown>) {
       if (typeof event.data !== "string") return;
@@ -133,7 +133,7 @@ async function openSocket(
   try {
     await new Promise<void>((resolve, reject) => {
       socket.addEventListener("open", () => resolve(), { once: true });
-      socket.addEventListener("error", () => reject(new Error("미디어 게이트웨이에 연결할 수 없습니다.")), { once: true });
+      socket.addEventListener("error", () => reject(new Error("Unable to connect to the media gateway.")), { once: true });
     });
     const authenticated = waitForMessage(socket, "authenticated");
     socket.send(JSON.stringify({ type: "authenticate", token: credentials.token }));
@@ -153,7 +153,7 @@ async function openSocket(
       inputSource: options.inputSource,
     }));
     await started;
-    if (socket.readyState !== WebSocket.OPEN) throw new Error("미디어 게이트웨이 연결이 시작 직후 종료됐습니다.");
+    if (socket.readyState !== WebSocket.OPEN) throw new Error("The media gateway connection closed during startup.");
     return { socket, proactiveReconnectDelay: getGatewayCredentialRefreshDelay(credentials) };
   } catch (error) {
     socket.close();
@@ -172,7 +172,7 @@ async function getStreams(inputSource: LiveInputSource): Promise<MediaStream[]> 
     const display = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
     if (display.getAudioTracks().length === 0) {
       for (const track of display.getTracks()) track.stop();
-      throw new Error("공유한 화면에서 시스템 오디오가 선택되지 않았습니다.");
+      throw new Error("System audio was not included with the shared screen.");
     }
     streams.push(display);
   }
@@ -181,6 +181,7 @@ async function getStreams(inputSource: LiveInputSource): Promise<MediaStream[]> 
 
 export interface LiveAudioClient {
   update(settings: LiveAudioSettings): Promise<void>;
+  restart(): Promise<void>;
   stop(): Promise<void>;
 }
 
@@ -234,7 +235,7 @@ export async function startLiveAudioClient(options: AudioClientOptions): Promise
           options.onLanguageStatus(message.language, message.status);
         }
       } catch {
-        options.onError("게이트웨이 상태 메시지를 읽을 수 없습니다.");
+        options.onError("Unable to read a gateway status message.");
       }
     });
     candidate.addEventListener("close", () => {
@@ -281,7 +282,7 @@ export async function startLiveAudioClient(options: AudioClientOptions): Promise
         previous?.close(1000, "connection refreshed");
         reconnectAttempt = 0;
         scheduleProactiveReconnect(opened.proactiveReconnectDelay);
-        options.onStatus("연결됨 · 송출 중");
+        options.onStatus("Connected · broadcasting");
       } finally {
         isReplacing = false;
       }
@@ -290,7 +291,7 @@ export async function startLiveAudioClient(options: AudioClientOptions): Promise
       await reconnectPromise;
       hasReconnected = true;
     } catch (error: unknown) {
-      if (!isStopped) options.onError(error instanceof Error ? error.message : "미디어 게이트웨이에 다시 연결할 수 없습니다.");
+      if (!isStopped) options.onError(error instanceof Error ? error.message : "Unable to reconnect to the media gateway.");
     } finally {
       reconnectPromise = null;
     }
@@ -317,10 +318,10 @@ export async function startLiveAudioClient(options: AudioClientOptions): Promise
       if (Date.now() - event.data.recordedAt > 750 || event.data.pcm.byteLength !== LIVE_PCM_FRAME_BYTES) return;
       socket.send(event.data.pcm);
     };
-    options.onStatus("연결됨 · 송출 중");
+    options.onStatus("Connected · broadcasting");
     return {
       async update(settings) {
-        if (!socket || socket.readyState !== WebSocket.OPEN) throw new Error("미디어 게이트웨이가 연결되어 있지 않습니다.");
+        if (!socket || socket.readyState !== WebSocket.OPEN) throw new Error("The media gateway is not connected.");
         assertSessionVersion(settings.version);
         const updated = waitForMessage(socket, "updated");
         socket.send(JSON.stringify({
@@ -345,6 +346,22 @@ export async function startLiveAudioClient(options: AudioClientOptions): Promise
           maxViewers: settings.maxViewers,
           glossaryPack: settings.glossaryPack,
         };
+      },
+      async restart() {
+        if (!socket || socket.readyState !== WebSocket.OPEN) throw new Error("The media gateway is not connected.");
+        const restarted = waitForMessage(socket, "restarted");
+        socket.send(JSON.stringify({
+          type: "restart",
+          sessionId: options.sessionId,
+          version: currentSettings.version,
+          sessionType: currentSettings.sessionType,
+          languages: currentSettings.languages,
+          outputMode: currentSettings.outputMode,
+          voiceProvider: currentSettings.voiceProvider,
+          maxViewers: currentSettings.maxViewers,
+          glossaryPack: currentSettings.glossaryPack,
+        }));
+        await restarted;
       },
       async stop() {
         isStopped = true;

@@ -46,3 +46,61 @@ test("nondiarized stable transcript discards one conflicting final and continues
     ["Next section starts now."],
   );
 });
+
+// --- diarized segmenter resilience (missing/conflicting speaker labels) ---
+
+import { StableUtteranceSegmenter } from "../src/stable-utterance-segmenter.js";
+
+function diarizedResult(words, { isFinal = false, stability = 0.96, languageCode = "ko-KR" } = {}) {
+  return {
+    isFinal,
+    stability,
+    languageCode,
+    alternatives: [{
+      words: words.map(([word, startMs, endMs, speakerLabel]) => ({
+        word,
+        startOffset: { seconds: Math.floor(startMs / 1_000), nanos: (startMs % 1_000) * 1_000_000 },
+        endOffset: { seconds: Math.floor(endMs / 1_000), nanos: (endMs % 1_000) * 1_000_000 },
+        ...(speakerLabel ? { speakerLabel } : {}),
+      })),
+    }],
+  };
+}
+
+test("diarized final words without speaker labels fall back to the last known label instead of failing", () => {
+  const segmenter = new StableUtteranceSegmenter();
+  const first = segmenter.accept(diarizedResult([["안녕하세요", 0, 400, "1"]], { isFinal: true }));
+  assert.deepEqual(first.map((utterance) => [utterance.speakerLabel, utterance.text]), [["1", "안녕하세요"]]);
+  const second = segmenter.accept(diarizedResult([["회의를", 500, 900, ""], ["시작합니다", 900, 1_400, ""]], { isFinal: true }));
+  assert.deepEqual(second.map((utterance) => [utterance.speakerLabel, utterance.text]), [["1", "회의를 시작합니다"]]);
+});
+
+test("diarized final words without any prior label default to speaker 1", () => {
+  const segmenter = new StableUtteranceSegmenter();
+  const emitted = segmenter.accept(diarizedResult([["hello", 0, 300, ""]], { isFinal: true }));
+  assert.deepEqual(emitted.map((utterance) => [utterance.speakerLabel, utterance.text]), [["1", "hello"]]);
+});
+
+test("diarized relabeling of a pending word adopts the newest label instead of failing", () => {
+  const segmenter = new StableUtteranceSegmenter();
+  segmenter.accept(diarizedResult([["hello", 0, 300, "1"]], { stability: 0.9 }));
+  const emitted = segmenter.accept(diarizedResult([["hello", 0, 300, "2"]], { isFinal: true }));
+  assert.deepEqual(emitted.map((utterance) => [utterance.speakerLabel, utterance.text]), [["2", "hello"]]);
+});
+
+test("SentencePiece word tokens join into clean text instead of space-separated fragments", () => {
+  const segmenter = new StableUtteranceSegmenter();
+  const emitted = segmenter.accept(diarizedResult([
+    ["▁", 0, 50, "1"],
+    ["안녕하세요", 50, 400, "1"],
+    ["▁오늘", 420, 600, "1"],
+    ["▁", 600, 640, "1"],
+    ["회", 640, 700, "1"],
+    ["의", 700, 760, "1"],
+    ["를", 760, 820, "1"],
+    ["▁시작", 840, 1_000, "1"],
+    ["하", 1_000, 1_060, "1"],
+    ["겠습니다", 1_060, 1_400, "1"],
+  ], { isFinal: true }));
+  assert.deepEqual(emitted.map((utterance) => utterance.text), ["안녕하세요 오늘 회의를 시작하겠습니다"]);
+});

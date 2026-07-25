@@ -15,5 +15,5 @@ export function getReconnectStatus(delayMilliseconds: number): string {
   const seconds = delayMilliseconds < 1_000
     ? (delayMilliseconds / 1_000).toFixed(1)
     : Math.round(delayMilliseconds / 1_000).toString();
-  return `재연결 중 · ${seconds}초 후 재시도`;
+  return `Reconnecting · retrying in ${seconds}s`;
 }

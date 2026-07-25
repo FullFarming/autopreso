@@ -95,7 +95,7 @@ test("resolveAgentProviderFromSettings throws when Ollama model is missing", () 
 });
 
 test("resolveAgentProviderFromSettings returns Codex provider using filesystem auth", () => {
-  const codexHome = mkdtempSync(join(tmpdir(), "autopreso-codex-"));
+  const codexHome = mkdtempSync(join(tmpdir(), "realtime-noel-codex-"));
   writeFileSync(join(codexHome, "auth.json"), JSON.stringify({ tokens: { access_token: "codex-token", refresh_token: "refresh" } }));
 
   const settings = settingsBase();
@@ -114,7 +114,7 @@ test("resolveAgentProviderFromSettings returns Codex provider using filesystem a
 });
 
 test("resolveAgentProviderFromSettings defaults Codex provider to fast mode", () => {
-  const codexHome = mkdtempSync(join(tmpdir(), "autopreso-codex-default-"));
+  const codexHome = mkdtempSync(join(tmpdir(), "realtime-noel-codex-default-"));
   writeFileSync(join(codexHome, "auth.json"), JSON.stringify({ tokens: { access_token: "codex-token", refresh_token: "refresh" } }));
 
   const settings = settingsBase();
@@ -133,7 +133,7 @@ test("resolveAgentProviderFromSettings defaults Codex provider to fast mode", ()
 });
 
 test("resolveAgentProviderFromSettings throws when Codex auth is unavailable", () => {
-  const codexHome = mkdtempSync(join(tmpdir(), "autopreso-codex-empty-"));
+  const codexHome = mkdtempSync(join(tmpdir(), "realtime-noel-codex-empty-"));
   const settings = settingsBase();
   settings.agent.provider = "codex";
 

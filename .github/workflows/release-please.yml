@@ -13,7 +13,7 @@ jobs:
   release-please:
     runs-on: ubuntu-latest
     outputs:
-      autopreso_released: ${{ steps.release.outputs.release_created }}
+      realtime_noel_released: ${{ steps.release.outputs.release_created }}
       sidecars_released: ${{ steps.release.outputs['packages/moonshine-darwin-arm64--release_created'] }}
     steps:
       - uses: googleapis/release-please-action@v5
@@ -52,12 +52,12 @@ jobs:
       - run: npm publish --access public --provenance
         working-directory: packages/moonshine-darwin-x64
 
-  publish-autopreso:
+  publish-realtime-noel:
     needs: [release-please, publish-sidecars]
     # publish-sidecars may be skipped (no sidecar release this round); that's fine,
-    # but if it ran and failed we must NOT publish autopreso because its
+    # but if it ran and failed we must NOT publish realtime-noel because its
     # optionalDependencies would pin a sidecar version that isn't on npm yet.
-    if: ${{ always() && needs.release-please.outputs.autopreso_released == 'true' && (needs.publish-sidecars.result == 'success' || needs.publish-sidecars.result == 'skipped') }}
+    if: ${{ always() && needs.release-please.outputs.realtime_noel_released == 'true' && (needs.publish-sidecars.result == 'success' || needs.publish-sidecars.result == 'skipped') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6

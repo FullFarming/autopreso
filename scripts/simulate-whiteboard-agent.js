@@ -86,7 +86,7 @@ export async function runSimulation(options, agentProvider) {
     });
     httpServer = server.httpServer;
 
-    chromeUserDataDir = await mkdtemp(path.join(tmpdir(), "autopreso-sim-chrome-"));
+    chromeUserDataDir = await mkdtemp(path.join(tmpdir(), "realtime-noel-sim-chrome-"));
     const chromeDebugPort = await getAvailablePort();
     chrome = launchChrome(options.chromeBin, chromeDebugPort, chromeUserDataDir, server.url);
     const tab = await waitForChromeTab(chromeDebugPort, server.url);
@@ -322,7 +322,7 @@ function printStructuredError(message, help) {
 
 function printHelp() {
   console.log(`bin: ${__filename.replace(process.env.HOME ?? "", "~")}
-description: Simulate the AutoPreso whiteboard agent with Codex non-fast mode and capture trajectory artifacts.
+description: Simulate the Realtime Noel whiteboard agent with Codex non-fast mode and capture trajectory artifacts.
 usage: node scripts/simulate-whiteboard-agent.js --transcript <path> --out <dir> [options]
 options[6|]{flag,default,description}:
   --transcript||Full transcript text file

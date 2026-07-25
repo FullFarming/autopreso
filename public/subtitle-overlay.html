@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Realtime Noel Subtitle Overlay</title>
+    <link rel="stylesheet" href="/subtitle.css" />
+  </head>
+  <body class="subtitle-overlay-body">
+    <!-- Three fixed position zones overlay the screen. Each target language
+         renders its own subtitle box into the zone matching its configured
+         position; languages sharing a zone stack vertically. -->
+    <main id="subtitle-overlay" class="subtitle-overlay" aria-live="polite">
+      <div class="subtitle-zone position-top-center" data-zone="top-center"></div>
+      <div class="subtitle-zone position-middle-center" data-zone="middle-center"></div>
+      <div class="subtitle-zone position-bottom-center" data-zone="bottom-center"></div>
+    </main>
+    <script type="module" src="/subtitle-overlay.js"></script>
+  </body>
+</html>

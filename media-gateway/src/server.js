@@ -1,5 +1,6 @@
 import { pathToFileURL } from "node:url";
 
+import { createCaptionPolisher } from "./caption-polish.js";
 import { readGatewayEnvironment } from "./config.js";
 import { createGatewayServer } from "./gateway-server.js";
 import {
@@ -7,9 +8,10 @@ import {
   CloudSpeechToTextAdapter,
   CloudTranslationAdvancedAdapter,
   GeminiLiveTranslateAdapter,
+  GeminiTextTranslateAdapter,
 } from "./google-provider-adapters.js";
 import { LiveMediaPipeline } from "./live-media-pipeline.js";
-import { OpenAIRealtimeTranslationAdapter } from "./openai-realtime-translation.js";
+import { OpenAIRealtimeTranslationAdapter, OpenAITextToSpeechAdapter } from "./openai-realtime-translation.js";
 import { SupabaseFloorController, SupabaseHostAuthorizer, SupabaseLivePublisher, SupabaseViewerAuthorizer } from "./supabase-adapters.js";
 
 export function resolveTextToSpeechV1Client(textToSpeechModule) {
@@ -42,13 +44,29 @@ export async function startMediaGateway(config = readGatewayEnvironment()) {
     eventFanout(sessionId, language, event) { return gateway.broadcastEvent(sessionId, language, event); },
     audioFanout(sessionId, language, frame) { return gateway.broadcastAudio(sessionId, language, frame); },
   });
+  const floorController = new SupabaseFloorController(config);
   gateway = createGatewayServer({
     gatewaySecret: config.gatewaySecret,
     viewerSecret: config.viewerSecret,
     hostAuthorizer,
     viewerAuthorizer,
-    floorController: new SupabaseFloorController(config),
+    floorController,
+    hostReconnectGraceMilliseconds: config.hostReconnectGraceMilliseconds,
+    fetchFloorParticipant: (sessionId, participantId) => floorController.getParticipant(sessionId, participantId),
+    replayUtterances: (sessionId, language, afterSeq, limit) => publisher.fetchUtterancesAfter(sessionId, language, afterSeq, limit),
     async pipelineFactory(message, previousPipeline, onHostEvent) {
+      // Per-language caption seq survives host reconnects and process
+      // restarts: seed from persisted max(seq), best-effort, and never go
+      // backwards relative to the previous in-memory pipeline (contract C1).
+      const initialSequences = { ...(previousPipeline?.lastSequences ?? {}) };
+      try {
+        const persisted = await publisher.fetchLastUtteranceSeqs(message.sessionId, message.languages);
+        for (const [language, seq] of Object.entries(persisted)) {
+          initialSequences[language] = Math.max(initialSequences[language] ?? 0, seq);
+        }
+      } catch {
+        // Best-effort: fall back to the previous pipeline counters (or 0).
+      }
       return new LiveMediaPipeline({
         sessionId: message.sessionId,
         sessionType: message.sessionType,
@@ -56,16 +74,41 @@ export async function startMediaGateway(config = readGatewayEnvironment()) {
         voiceProvider: message.voiceProvider,
         maxViewers: message.maxViewers,
         glossaryPack: message.glossaryPack,
+        glossaryText: message.glossaryText,
+        translationTone: message.translationTone,
+        domainText: message.domainText,
         languages: message.languages,
         speakerRegistry: previousPipeline?.speakers,
-        initialSequence: previousPipeline?.lastSequence ?? 0,
+        initialSequences,
+        getSubscriberCount: (language) => gateway.subscriberCount(message.sessionId, language),
+        observeLatency: (name, value) => gateway.metrics.observe(name, value),
         onHostEvent,
         dependencies: {
           liveTranslate: new GeminiLiveTranslateAdapter({ client: geminiClient, model: config.geminiLiveModel }),
-          openaiLiveTranslate: new OpenAIRealtimeTranslationAdapter({ apiKey: config.openaiApiKey }),
+          openaiLiveTranslate: new OpenAIRealtimeTranslationAdapter({ apiKey: config.openaiApiKey, model: config.openaiRealtimeTranslateModel }),
           speechToText: new CloudSpeechToTextAdapter({ client: speechClient, projectId: config.projectId, languageCodes: config.sttLanguageCodes }),
-          textTranslate: new CloudTranslationAdvancedAdapter({ client: translationClient, projectId: config.projectId }),
-          textToSpeech: new ChirpTextToSpeechAdapter({ client: textToSpeechClient }),
+          // Finals through Gemini Flash (desktop-pipeline tone parity); every
+          // partial and any Gemini failure routes to Cloud Translate.
+          textTranslate: new GeminiTextTranslateAdapter({
+            client: geminiClient,
+            model: config.geminiTextModel,
+            fallback: new CloudTranslationAdvancedAdapter({ client: translationClient, projectId: config.projectId }),
+          }),
+          // Confirmed provider split: captions = Gemini 3.5, voice = OpenAI.
+          // Meeting/townhall TTS speaks through OpenAI with Chirp as the
+          // never-silent fallback; presentation voice is unaffected (it uses
+          // the live-translate audio path above).
+          // Desktop-parity second-pass finalizer for committed captions.
+          // 1.5s matches the desktop finalizer's ceiling. The 4s default was
+          // set when polish blocked the provider callback chain, where every
+          // extra second also delayed interpreted AUDIO playout.
+          captionPolish: createCaptionPolisher({ client: geminiClient, model: config.geminiTextModel, timeoutMs: 1_500 }),
+          textToSpeech: message.sessionType === "presentation"
+            ? new ChirpTextToSpeechAdapter({ client: textToSpeechClient })
+            : new OpenAITextToSpeechAdapter({
+              apiKey: config.openaiApiKey,
+              fallback: new ChirpTextToSpeechAdapter({ client: textToSpeechClient }),
+            }),
           publisher,
         },
       });

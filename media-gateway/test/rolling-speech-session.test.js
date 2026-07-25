@@ -150,3 +150,71 @@ function sineFrame(frequency, frameIndex) {
   }
   return bytes;
 }
+
+test("a failed rollover restarts on a fresh stream instead of poisoning the session", async () => {
+  let now = 0;
+  const streams = [];
+  const emitted = [];
+  const session = new RollingSpeechSession({
+    now: () => now,
+    provider: {
+      async open({ onFinalUtterance }) {
+        const index = streams.length;
+        const stream = {
+          closed: 0,
+          async sendAudio() {},
+          async getFinalWords() { return []; },
+          async waitForFinalWords() { throw new Error("STT_ROLLOVER_WORDS_UNAVAILABLE"); },
+          async close() { this.closed += 1; },
+          onFinalUtterance,
+          index,
+        };
+        streams.push(stream);
+        return stream;
+      },
+    },
+    async onFinalUtterance(utterance) { emitted.push(utterance.text); },
+    onRemap() {},
+  });
+  await session.start();
+  await session.sendAudio(new Uint8Array(1_280));
+  now = 270_000;
+  // Rollover fires here: overlap remap fails (nobody spoke), but audio must keep flowing.
+  await session.sendAudio(new Uint8Array(1_280));
+  await session.sendAudio(new Uint8Array(1_280));
+  assert.equal(streams.length >= 3, true); // original + failed rollover attempt + fresh restart
+  const active = streams.at(-1);
+  await active.onFinalUtterance({ speakerLabel: "A", text: "still alive", sourceEndOffsetMs: 400 });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(emitted, ["still alive"]);
+  await session.close();
+});
+
+test("a broken stream is replaced on the next audio frame instead of failing the session", async () => {
+  const streams = [];
+  const session = new RollingSpeechSession({
+    now: () => 0,
+    provider: {
+      async open({ onFinalUtterance }) {
+        const index = streams.length;
+        const stream = {
+          async sendAudio() {
+            if (index === 0) throw new Error("STT_STREAM_FAILED");
+          },
+          async getFinalWords() { return []; },
+          async close() {},
+          onFinalUtterance,
+        };
+        streams.push(stream);
+        return stream;
+      },
+    },
+    async onFinalUtterance() {},
+    onRemap() {},
+  });
+  await session.start();
+  await session.sendAudio(new Uint8Array(1_280)); // first frame hits the broken stream; must not throw
+  await session.sendAudio(new Uint8Array(1_280));
+  assert.equal(streams.length, 2);
+  await session.close();
+});

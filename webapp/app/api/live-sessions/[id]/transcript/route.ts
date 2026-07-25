@@ -1,11 +1,13 @@
 import { NextRequest } from "next/server";
 
-import { AuthenticationError, getBearerToken, requireHost, verifyViewerGrantToken, VIEWER_GRANT_COOKIE } from "@/lib/auth/live-auth";
+import { AuthenticationError, requireHost } from "@/lib/auth/live-auth";
 import { toLiveFailure } from "@/lib/live/errors";
 import { fetchUtterances, SummaryError } from "@/lib/live/summary";
 import { parseSessionId } from "@/lib/live/validation";
 import { apiError, apiSuccess } from "@/lib/security/api-response";
+import { LiveAdmissionError, SupabaseLiveAdmissionStore } from "@/lib/security/live-admission-store";
 import { liveLanguageInputSchema } from "@/lib/security/live-input-validation";
+import { authorizeParticipantRecordRequest, isHostOwnershipMiss, AuthorizationError } from "@/lib/security/live-viewer-authorization";
 
 /** Full speaker-attributed utterance record of a session in one language.
  *  Host or any participant; readable after the session ends so the meeting
@@ -16,20 +18,16 @@ export async function GET(request: NextRequest, context: { params: Promise<{ id:
     const sessionId = parseSessionId(id);
     const parsedLanguage = liveLanguageInputSchema.safeParse(request.nextUrl.searchParams.get("language"));
     if (!parsedLanguage.success) return apiError("언어를 선택하세요.", "LANGUAGE_REQUIRED", 400);
-    let isAuthorized = false;
+    const store = new SupabaseLiveAdmissionStore();
     try {
-      await requireHost(request);
-      isAuthorized = true;
-    } catch {
-      try {
-        const token = getBearerToken(request) ?? request.cookies.get(VIEWER_GRANT_COOKIE)?.value;
-        const claims = await verifyViewerGrantToken(token);
-        isAuthorized = claims.sessionId === sessionId;
-      } catch {
-        isAuthorized = false;
-      }
+      const { hostId } = await requireHost(request);
+      await store.assertHostSessionOwnership(sessionId, hostId);
+    } catch (error: unknown) {
+      // Also falls through when a valid host cookie simply is not THIS
+      // session's owner, not only when there is no host session at all.
+      if (!isHostOwnershipMiss(error)) throw error;
+      await authorizeParticipantRecordRequest(request, sessionId, store);
     }
-    if (!isAuthorized) return apiError("회의록을 볼 권한이 없습니다.", "TRANSCRIPT_FORBIDDEN", 403);
     const utterances = await fetchUtterances(sessionId, parsedLanguage.data);
     return apiSuccess({
       language: parsedLanguage.data,
@@ -41,7 +39,10 @@ export async function GET(request: NextRequest, context: { params: Promise<{ id:
       })),
     });
   } catch (error: unknown) {
-    if (error instanceof AuthenticationError) return apiError("회의록을 볼 권한이 없습니다.", "TRANSCRIPT_FORBIDDEN", 403);
+    if (error instanceof AuthenticationError || error instanceof AuthorizationError) {
+      return apiError("회의록을 볼 권한이 없습니다.", "TRANSCRIPT_FORBIDDEN", 403);
+    }
+    if (error instanceof LiveAdmissionError) return apiError(error.message, error.code, error.status);
     if (error instanceof SummaryError) return apiError(error.message, error.code, error.status);
     const failure = toLiveFailure(error);
     if (failure.body.code === "SECURITY_NOT_CONFIGURED") {

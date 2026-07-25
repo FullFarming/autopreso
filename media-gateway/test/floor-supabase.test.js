@@ -18,7 +18,7 @@ function makeFetch(responses) {
 
 test("floor controller takes and releases the floor through guarded RPCs", async () => {
   const { calls, fetchFn } = makeFetch([
-    () => ({ status: 200, body: JSON.stringify({ ok: true, displayName: "김노엘" }) }),
+    () => ({ status: 200, body: JSON.stringify({ ok: true, displayName: "김노엘", participantId: "participant-1" }) }),
     () => ({ status: 200, body: "true" }),
   ]);
   const controller = new SupabaseFloorController({
@@ -29,7 +29,7 @@ test("floor controller takes and releases the floor through guarded RPCs", async
   });
 
   const taken = await controller.take("session-1", "grant-1");
-  assert.deepEqual(taken, { ok: true, displayName: "김노엘" });
+  assert.deepEqual(taken, { ok: true, displayName: "김노엘", participantId: "participant-1" });
   assert.match(calls[0].url, /\/rest\/v1\/rpc\/take_live_floor$/);
   assert.deepEqual(JSON.parse(calls[0].init.body), { p_session_id: "session-1", p_grant_id: "grant-1" });
 

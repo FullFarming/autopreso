@@ -14,7 +14,7 @@ Prefer the system temp directory.
 Example layout:
 
 ```text
-/tmp/autopreso-whiteboard-experiment-<id>/
+/tmp/realtime-noel-whiteboard-experiment-<id>/
   transcript.txt
   baseline/
     prompt.txt
@@ -79,7 +79,7 @@ Use `$EXP` for the temporary experiment directory path.
 For example:
 
 ```sh
-EXP="$(mktemp -d /tmp/autopreso-whiteboard-experiment-XXXXXX)"
+EXP="$(mktemp -d /tmp/realtime-noel-whiteboard-experiment-XXXXXX)"
 ```
 
 The script writes the artifacts itself.

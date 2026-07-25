@@ -6,6 +6,14 @@
    readability over video; the surrounding product chrome stays flat. */
 
 :root {
+  --brand-indigo: #1D1740;
+  --brand-red: #E4002B;
+  --brand-grey: #545859;
+  --brand-grey-25: #D4D5D6;
+  --brand-grey-12: #EAEBEB;
+  --brand-blue: #0093AD;
+  --brand-dark-red: #8E1000;
+  --brand-white: #FFFFFF;
   --canvas: #f5f5f7;
   --canvas-soft: #fafafa;
   --ink: #0c0a09;
@@ -277,6 +285,10 @@ input:focus-visible {
 .live-wizard-progress button.is-current { background: var(--primary); color: var(--on-primary); }
 .live-wizard-progress button.is-current span { border-color: var(--on-primary); color: var(--on-primary); }
 .live-wizard-body { display: grid; gap: 16px; min-height: 208px; }
+.live-schedule-grid { display: grid; grid-template-columns: 1.6fr minmax(150px, .7fr) minmax(130px, .55fr); gap: 10px; }
+.live-text-field { display: grid; gap: 7px; color: var(--body); font-size: 11px; font-weight: 600; }
+.live-text-field input { width: 100%; min-height: 46px; border: 1px solid var(--hairline-strong); border-radius: 8px; background: var(--surface); color: var(--ink); padding: 0 13px; font: 500 13px/1 var(--font-sans); }
+.live-text-field input:focus-visible { outline: 2px solid #0093AD; outline-offset: 2px; }
 .live-wizard-footer,
 .live-wizard-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 18px; }
 .live-wizard-footer button,
@@ -380,27 +392,175 @@ input:focus-visible {
 .live-speaker-dot { display: inline-block; width: 9px; height: 9px; flex: 0 0 auto; border: 2px solid rgba(255,255,255,.8); border-radius: 9999px; background: #0093AD; box-shadow: 0 0 0 1px currentColor; }
 .live-privacy-note { margin: 14px 4px 0; color: var(--muted); font-size: 10px; text-align: center; }
 
+/* Host live workspace uses the same focused black canvas as the approved
+   guest experience. Configuration stays available without competing with
+   the QR and Start Live sequence. */
+.live-host-shell { position: relative; color: #FFFFFF; }
+.live-host-shell::before { position: fixed; inset: 0; z-index: -1; background: #000000; content: ""; }
+.live-host-shell .glass { border-color: rgba(255,255,255,.12); border-radius: 8px; background: #000000; box-shadow: none; color: #FFFFFF; }
+.live-host-shell .display,
+.live-host-shell .live-section-heading h2,
+.live-host-shell .live-field-group > strong,
+.live-host-shell .live-field-label strong,
+.live-host-shell .live-field-group label { color: #FFFFFF; }
+.live-host-shell .live-host-header { border-right: 0; border-left: 0; padding: 30px 0 26px; }
+.live-host-shell .live-host-header p,
+.live-host-shell .live-host-status,
+.live-host-shell .live-eyebrow,
+.live-host-shell .live-help,
+.live-host-shell .live-field-group small,
+.live-host-shell .live-field-label small,
+.live-host-shell .live-section-heading small,
+.live-host-shell .live-privacy-note { color: rgba(255,255,255,.52); }
+.live-host-shell .live-wizard,
+.live-host-shell .live-panel,
+.live-host-shell .live-summary-panel { padding: 22px 0; border-right: 0; border-left: 0; }
+.live-host-shell .live-wizard-progress,
+.live-host-shell .live-segmented { border-color: rgba(255,255,255,.14); background: rgba(255,255,255,.05); }
+.live-host-shell .live-wizard-progress button,
+.live-host-shell .live-segmented button { color: rgba(255,255,255,.58); }
+.live-host-shell .live-wizard-progress button.is-current,
+.live-host-shell .live-segmented button.is-selected { background: #FFFFFF; color: #000000; box-shadow: none; }
+.live-host-shell .live-wizard-progress button span { border-color: rgba(255,255,255,.24); color: inherit; }
+.live-host-shell .live-text-field { color: rgba(255,255,255,.62); }
+.live-host-shell .live-text-field input { border-color: rgba(255,255,255,.18); background: #000000; color: #FFFFFF; color-scheme: dark; }
+.live-host-shell .live-mode-card,
+.live-host-shell .live-glossary-grid button,
+.live-host-shell .live-language-grid button,
+.live-host-shell .live-review-list div,
+.live-host-shell .live-session-facts div,
+.live-host-shell .live-language-statuses > div,
+.live-host-shell .live-speaker-legend > div,
+.live-host-shell .live-delivery-method-card,
+.live-host-shell .live-consent-note { border-color: rgba(255,255,255,.13); border-radius: 8px; background: rgba(255,255,255,.04); color: #FFFFFF; box-shadow: none; }
+.live-host-shell .live-mode-card:hover { border-color: rgba(255,255,255,.32); }
+.live-host-shell .live-mode-card.is-selected,
+.live-host-shell .live-glossary-grid button.is-selected,
+.live-host-shell .live-language-grid button.is-selected { border-color: #FFFFFF; background: rgba(255,255,255,.1); box-shadow: none; }
+.live-host-shell .live-mode-card span,
+.live-host-shell .live-glossary-grid span,
+.live-host-shell .live-delivery-method-card p,
+.live-host-shell .live-consent-note,
+.live-host-shell .live-summary-hint { color: rgba(255,255,255,.58); }
+.live-host-shell .live-delivery-method-card strong,
+.live-host-shell .live-review-list dd,
+.live-host-shell .live-session-facts dd,
+.live-host-shell .live-language-statuses strong,
+.live-host-shell .live-speaker-legend strong { color: #FFFFFF; }
+.live-host-shell .live-delivery-method-card span,
+.live-host-shell .live-delivery-method-card small,
+.live-host-shell .live-review-list dt,
+.live-host-shell .live-session-facts dt,
+.live-host-shell .live-language-statuses small,
+.live-host-shell .live-speaker-legend small,
+.live-host-shell .live-speaker-legend p { color: rgba(255,255,255,.48); }
+.live-host-shell .live-admission-code { border: 1px solid rgba(255,255,255,.14); border-radius: 8px; background: #000000; }
+.live-host-shell .live-session-panel { display: grid; grid-template-columns: minmax(0, 1fr) minmax(260px, 340px); gap: 16px 24px; align-items: start; }
+.live-host-shell .live-session-panel .live-section-heading { grid-column: 1 / -1; margin-bottom: 0; }
+.live-host-shell .live-session-panel .live-admission-code { grid-column: 2; grid-row: 2 / span 3; margin-top: 0; }
+.live-host-shell .live-session-panel .live-invite-feedback { grid-column: 2; }
+.live-host-shell .live-session-panel .live-action-row { grid-column: 1; }
+.live-host-shell .glass-btn { border-color: rgba(255,255,255,.22); background: transparent; color: #FFFFFF; }
+.live-host-shell .accent-btn { background: #FFFFFF; color: #000000; }
+.live-host-shell .live-danger-button { border-color: #C78880; color: #C78880; }
+.live-host-shell { display: grid; width: 100%; min-height: 100dvh; grid-template-columns: 220px minmax(0, 1fr); margin: 0; padding: 0; }
+.live-host-rail { position: sticky; top: 0; display: flex; height: 100dvh; flex-direction: column; gap: 42px; padding: 38px 14px; border-right: 1px solid rgba(255,255,255,.16); background: #000; }
+.live-host-rail > strong { padding: 0 14px; color: #fff; font-size: 12px; font-weight: 600; letter-spacing: .22em; text-transform: uppercase; white-space: nowrap; }
+.live-host-rail nav { display: grid; gap: 10px; }
+.live-host-rail button { min-height: 58px; border: 0; border-radius: 8px; background: transparent; color: rgba(255,255,255,.55); padding: 0 18px; font: 500 15px/1 var(--font-sans); text-align: left; }
+.live-host-rail button.is-current { background: rgba(255,255,255,.1); color: #fff; }
+.live-host-rail button:disabled { opacity: 1; }
+.live-host-workspace { width: min(1120px, calc(100% - 64px)); margin: 0 auto; padding: 34px 0 36px; }
+.live-host-page-heading { display: flex; min-height: 70px; align-items: flex-start; justify-content: space-between; gap: 28px; margin-bottom: 18px; }
+.live-host-page-heading h1 { margin: 0; color: #fff; font-size: clamp(26px, 3vw, 38px); line-height: 1.15; }
+.live-host-page-heading p { margin: 8px 0 0; color: rgba(255,255,255,.5); font-size: 14px; }
+.live-host-page-heading .live-host-status { margin-top: 8px; }
+.live-host-shell .live-wizard { display: grid; grid-template-columns: minmax(0, 1fr) minmax(310px, .92fr); gap: 14px 42px; margin: 0; padding: 0; border: 0; }
+.live-host-shell .live-wizard > .live-section-heading { grid-column: 1; margin: 0; }
+.live-host-shell .live-wizard-progress { display: none; }
+.live-host-shell .live-wizard-body { grid-column: 1; min-height: 0; }
+.live-host-shell .live-wizard-footer { grid-column: 1; padding-top: 18px; border-top: 1px solid rgba(255,255,255,.15); }
+.live-host-shell .live-wizard-footer button { min-height: 50px; border-radius: 8px; }
+.live-host-shell .live-wizard-footer .accent-btn { flex: 1; }
+.live-setup-mobile-access { grid-column: 2; grid-row: 1 / span 4; display: flex; min-width: 0; flex-direction: column; gap: 14px; padding-left: 42px; border-left: 1px solid rgba(255,255,255,.18); }
+.live-setup-mobile-access h2 { margin: 0; color: #fff; font-size: 16px; }
+.live-setup-mobile-access > strong { color: rgba(255,255,255,.58); font-size: 14px; font-weight: 500; }
+.live-setup-mobile-access > p { margin: -4px 0 0; color: rgba(255,255,255,.46); font-size: 12px; line-height: 1.5; }
+.live-setup-mobile-access .live-invite-qr { width: min(100%, 340px); min-height: 312px; align-self: stretch; border: 1px solid rgba(255,255,255,.2); background: #000; }
+.live-setup-mobile-access .live-invite-qr img { width: min(250px, 80%); height: auto; }
+.live-qr-placeholder { display: grid; width: 100%; min-height: 310px; place-items: center; border: 1px solid rgba(255,255,255,.2); border-radius: 8px; background: #000; }
+.live-qr-placeholder span { display: grid; width: 82px; height: 82px; place-items: center; border: 1px solid rgba(255,255,255,.16); border-radius: 8px; color: rgba(255,255,255,.22); font: 500 34px/1 var(--font-serif); }
+.live-host-shell .live-schedule-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.live-host-shell .live-schedule-grid .live-title-field { grid-column: 1 / -1; }
+.live-host-shell .live-mode-card { min-height: 86px; }
+.live-host-shell .live-field-group { margin-top: 2px; }
+.live-host-shell .live-session-panel { margin-top: 0; }
+.live-access-code { display: grid; justify-items: center; gap: 5px; padding: 12px; border: 1px solid rgba(255,255,255,.17); border-radius: 8px; background: rgba(255,255,255,.04); color: #fff; }
+.live-access-code > span { color: rgba(255,255,255,.5); font-size: 10px; font-weight: 600; letter-spacing: .05em; text-transform: uppercase; }
+.live-access-code > strong { color: #fff; font-size: 28px; font-variant-numeric: tabular-nums; letter-spacing: .24em; }
+.live-access-code > small { color: rgba(255,255,255,.45); font-size: 10px; }
+.live-host-caption-stage,
+.live-participant-panel { margin: 0 0 26px; padding: 22px 0; border-top: 1px solid rgba(255,255,255,.16); border-bottom: 1px solid rgba(255,255,255,.16); }
+.live-host-caption-feed { display: grid; min-height: 230px; max-height: 430px; gap: 0; overflow-y: auto; }
+.live-host-caption-feed > p { margin: auto; color: rgba(255,255,255,.42); font-size: 14px; }
+.live-host-caption-feed article { padding: 16px 4px; border-bottom: 1px solid rgba(255,255,255,.1); }
+.live-host-caption-feed article:last-child { border-bottom: 0; }
+.live-host-caption-feed article header { display: flex; align-items: baseline; gap: 8px; color: rgba(255,255,255,.5); font-size: 11px; }
+.live-host-caption-feed article header strong { color: #fff; font-size: 13px; }
+.live-host-caption-feed article header time { margin-left: auto; font-variant-numeric: tabular-nums; }
+.live-host-caption-feed article p { margin: 9px 0 0; color: #fff; font-size: clamp(18px, 2.1vw, 26px); line-height: 1.55; }
+.live-participant-table-wrap { overflow-x: auto; }
+.live-participant-table { width: 100%; border-collapse: collapse; color: #fff; font-size: 12px; text-align: left; }
+.live-participant-table th { padding: 10px 12px; border-bottom: 1px solid rgba(255,255,255,.22); color: rgba(255,255,255,.48); font-size: 10px; font-weight: 600; letter-spacing: .04em; text-transform: uppercase; white-space: nowrap; }
+.live-participant-table td { padding: 14px 12px; border-bottom: 1px solid rgba(255,255,255,.1); color: rgba(255,255,255,.72); white-space: nowrap; }
+.live-participant-table td:first-child { color: #fff; font-weight: 600; }
+.live-presence { display: inline-flex; align-items: center; gap: 6px; color: rgba(255,255,255,.46); }
+.live-presence::before { width: 6px; height: 6px; border-radius: 50%; background: rgba(255,255,255,.28); content: ""; }
+.live-presence.is-present { color: #fff; }
+.live-presence.is-present::before { background: #fff; }
+
 /* Viewer stays dark because it is used over rooms, slides and video. */
 .live-viewer-shell { display: flex; min-height: 100dvh; flex-direction: column; gap: 12px; }
-.live-join-card { width: min(460px, 100%); margin: auto; padding: 30px; }
+.live-join-card { display: grid; width: min(390px, calc(100% - 40px)); gap: 14px; margin: auto; padding: 0; color: #fff; }
+.live-join-wordmark { margin-bottom: 12px; color: #fff; font-size: 12px; font-weight: 600; letter-spacing: .22em; text-transform: uppercase; }
+.live-join-methods { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 3px; margin-bottom: 8px; padding: 3px; border: 1px solid rgba(255,255,255,.15); border-radius: 8px; background: rgba(255,255,255,.06); }
+.live-join-methods button { min-height: 38px; border: 0; border-radius: 6px; background: transparent; color: rgba(255,255,255,.55); font: 600 12px/1 var(--font-sans); }
+.live-join-methods button:only-child { grid-column: 1 / -1; }
+.live-join-methods button.is-selected { background: #fff; color: #000; }
 .live-join-card h1 { margin: 6px 0 10px; font-size: clamp(2.3rem, 8vw, 3.4rem); }
 .live-join-card > p { margin: 0 0 24px; color: var(--body); font-size: 13px; line-height: 1.6; }
-.live-join-card label { display: block; margin-bottom: 7px; color: var(--body); font-size: 12px; font-weight: 600; }
+.live-join-card label { display: block; margin-bottom: 0; color: rgba(255,255,255,.58); font-size: 12px; font-weight: 600; }
 .live-join-card input { width: 100%; height: 62px; border: 1px solid var(--hairline-strong); border-radius: 16px; background: var(--surface); color: var(--ink); font: 600 28px/1 var(--font-sans); letter-spacing: .24em; text-align: center; }
-.live-join-card .live-name-input { height: 50px; font-size: 15px; letter-spacing: 0; text-align: left; }
+.live-join-card .live-name-input { height: 58px; border-color: rgba(255,255,255,.22); border-radius: 8px; background: #000; color: #fff; padding: 0 16px; font-size: 17px; letter-spacing: 0; text-align: left; }
+.live-join-card .live-name-input::placeholder { color: rgba(255,255,255,.34); }
+.live-join-card .live-name-input:focus-visible { outline: 2px solid #0093AD; outline-offset: 2px; }
+.live-join-card .live-code-input { height: 58px; border-color: rgba(255,255,255,.22); border-radius: 8px; background: #000; color: #fff; font-size: 22px; font-variant-numeric: tabular-nums; letter-spacing: .34em; }
+.live-join-card .live-code-input::placeholder { color: rgba(255,255,255,.22); }
 .live-join-card > small { display: block; margin: 8px 2px 20px; color: var(--muted); font-size: 10px; }
-.live-join-card .live-primary-action { width: 100%; }
+.live-join-card .live-primary-action { width: 100%; min-height: 54px; margin-top: 4px; border: 0; border-radius: 8px; background: #fff; color: #000; font: 700 14px/1 var(--font-sans); }
+.live-join-card .live-primary-action:disabled { opacity: .36; }
+.live-viewer-shell.is-join { box-sizing: border-box; width: 100%; min-height: 100dvh; max-width: none; padding: max(28px, env(safe-area-inset-top)) 0 max(36px, env(safe-area-inset-bottom)); background: var(--dark); color: var(--brand-white); }
+.live-viewer-shell.is-join .live-join-card { color: var(--brand-white); }
+.live-viewer-shell.is-join .live-join-card > .live-join-lede,
+.live-viewer-shell.is-join .live-join-card > .live-join-mic-note,
+.live-viewer-shell.is-join .live-join-card label { color: var(--brand-grey-25); }
+.live-viewer-shell.is-join .live-join-methods button { min-height: 44px; }
+.live-viewer-shell.is-join button:focus-visible { outline: 2px solid var(--brand-blue); outline-offset: 2px; }
+.live-qr-required,
+.live-viewer-closed { display: grid; place-items: center; color: rgba(255,255,255,.5); font-size: 13px; }
 .live-viewer-toolbar { display: flex; align-items: center; gap: 9px; min-height: 48px; padding: 6px 10px 6px 16px; }
 .live-viewer-toolbar > strong { margin-right: auto; font-size: 12px; white-space: nowrap; }
 .live-viewer-toolbar label { color: var(--muted); font-size: 10px; }
 .live-viewer-toolbar select,
 .live-viewer-toolbar button { min-height: 34px; border: 1px solid var(--hairline-strong); border-radius: 9999px; background: var(--surface); color: var(--ink); padding: 0 12px; font: 500 11px/1 var(--font-sans); }
 .live-viewer-toolbar button.is-selected { background: var(--primary); color: var(--on-primary); }
+.live-viewer-toolbar .live-leave-button { border-color: #C78880; color: #8E1000; }
+.live-text-size-button { min-width: 38px; padding: 0 9px !important; font-size: 13px !important; }
 .live-viewer-stage { display: flex; min-height: 0; flex: 1; flex-direction: column; padding: 20px; border: 1px solid rgba(255,255,255,.1); border-radius: 24px; background: rgba(12,10,9,.94); box-shadow: 0 18px 60px rgba(12,10,9,.25); color: var(--on-dark); }
 .live-viewer-stage-header { display: flex; justify-content: space-between; gap: 12px; margin-bottom: 17px; }
 .live-viewer-stage .live-eyebrow { color: var(--on-dark-soft); }
 .live-viewer-stage .live-connection-state { color: var(--on-dark-soft); }
-.live-caption-stack { display: flex; flex: 1; flex-direction: column; justify-content: flex-end; gap: 9px; min-height: 300px; overflow: hidden; }
+.live-caption-stack { display: flex; flex: 1; flex-direction: column; justify-content: flex-start; gap: 9px; min-height: 300px; overflow: hidden; }
 .live-caption-card { padding: 11px 14px; border: 1px solid rgba(255,255,255,.1); border-radius: 12px; background: rgba(255,255,255,.06); opacity: .62; transition: opacity .18s, background .18s, transform .18s; }
 .live-caption-card.is-active { background: rgba(255,255,255,.12); opacity: 1; transform: translateX(3px); }
 .live-caption-card.is-partial { opacity: .78; }
@@ -425,28 +585,87 @@ input:focus-visible {
 
 /* Earnings-call style meeting feed */
 .live-meeting-feed { position: relative; display: flex; flex: 1; min-height: 0; flex-direction: column; }
-.live-turn-scroll { display: flex; flex: 1; min-height: 260px; flex-direction: column; gap: 14px; overflow-y: auto; padding: 2px 2px 12px; scrollbar-width: thin; }
+.live-turn-scroll { display: flex; flex: 1; min-height: 260px; flex-direction: column; overflow-y: auto; padding: 2px 2px 12px; scrollbar-width: thin; }
+/* Inner wrapper lets a ResizeObserver watch content growth (streaming
+   partials, new paragraphs, Aa text-size reflow) and keep the newest line
+   pinned into view. */
+.live-turn-scroll-content { display: flex; flex-direction: column; gap: 14px; }
+/* New paragraphs ease in instead of popping — the moment a new speaker
+   starts, their name · department · title header appears with this motion. */
+.live-turn-card { animation: live-turn-in .28s ease-out; }
+.live-turn-card.is-live header .live-speaking-waves { color: var(--brand-blue); }
+@keyframes live-turn-in { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
 .live-turn-card { border-bottom: 1px solid rgba(255,255,255,.07); padding: 2px 2px 14px; }
 .live-turn-card header { display: flex; align-items: center; gap: 8px; margin-bottom: 7px; color: var(--on-dark-soft); font-size: 11px; font-weight: 600; }
 .live-turn-card header time { margin-left: 2px; color: rgba(255,255,255,.38); font-size: 10px; font-weight: 400; font-variant-numeric: tabular-nums; }
-.live-turn-card p { margin: 0; color: var(--on-dark); font-size: clamp(15px, 2.4vw, 19px); line-height: 1.6; word-break: keep-all; overflow-wrap: anywhere; }
+.live-turn-card p { margin: 0; color: var(--on-dark); font-size: calc(clamp(15px, 2.4vw, 19px) * var(--live-caption-scale, 1)); line-height: 1.6; word-break: keep-all; overflow-wrap: anywhere; }
 .live-speaker-dot { display: inline-block; width: 8px; height: 8px; border-radius: 9999px; flex: none; }
+/* Reference-app reading treatment: past sentences dim to gray; only the two
+   most recently completed sentences render at full strength. */
+.live-turn-card p .live-turn-text { opacity: .42; transition: opacity .5s ease; }
+.live-turn-card p .live-turn-text.is-recent { opacity: 1; }
+/* Foldable speaker paragraphs. A Live Call runs for hours, so one speaker's
+   turn can reach dozens of sentences; folding it keeps the who-spoke-when
+   skeleton readable. The header is the control and stays visible when folded. */
+.live-turn-toggle { display: flex; align-items: center; gap: 8px; width: 100%; margin: -4px -4px 0; padding: 4px; border: 0; border-radius: 8px; background: none; color: inherit; font: inherit; text-align: left; cursor: pointer; }
+.live-turn-toggle:hover { background: rgba(255,255,255,.04); }
+.live-turn-toggle:focus-visible { outline: 2px solid var(--brand-blue); outline-offset: 1px; }
+.live-turn-toggle strong { font-weight: 600; }
+/* Sentence count sits right of the time and gives the fold a reason: it says
+   how much is hidden without a sentence of explanation. */
+.live-turn-count { margin-left: auto; color: rgba(255,255,255,.34); font-size: 10px; font-weight: 400; font-variant-numeric: tabular-nums; }
+.live-turn-chevron { flex: none; width: 7px; height: 7px; border-right: 1.5px solid rgba(255,255,255,.42); border-bottom: 1.5px solid rgba(255,255,255,.42); transform: rotate(45deg) translateY(-1px); transition: transform .17s cubic-bezier(.16,1,.3,1); }
+.live-turn-card.is-collapsed .live-turn-chevron { transform: rotate(-45deg) translateY(1px); }
+/* Clamp instead of unmounting so browser find and copy still reach the text. */
+.live-turn-card.is-collapsed .live-turn-body { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 1; overflow: hidden; }
+.live-turn-card.is-collapsed .live-turn-body .live-turn-text { opacity: .42; }
+/* Reduced motion has to cover the paragraph entry animation too, not just the
+   fold chevron: the entry animation is the one a reader sees on every new
+   sentence for hours. */
+@media (prefers-reduced-motion: reduce) {
+  .live-turn-card { animation: none; }
+  .live-turn-chevron { transition: none; }
+  .live-turn-card p .live-turn-text { transition: none; }
+}
 .live-jump-latest { position: absolute; bottom: 118px; left: 50%; transform: translateX(-50%); z-index: 2; border: 1px solid rgba(255,255,255,.2); border-radius: 9999px; background: rgba(20,18,16,.92); color: var(--on-dark); padding: 8px 16px; font-size: 11px; font-weight: 600; backdrop-filter: blur(8px); }
-.live-now-sheet { margin-top: 10px; border: 1px solid rgba(255,255,255,.12); border-radius: 18px; background: rgba(255,255,255,.07); padding: 14px 16px; backdrop-filter: blur(14px); }
+.live-now-sheet { position: relative; margin-top: 10px; border: 1px solid rgba(255,255,255,.12); border-radius: 18px; background: rgba(255,255,255,.07); padding: 18px 16px 14px; backdrop-filter: blur(14px); }
+/* Grab handle: tap to collapse the sheet to a slim speaker strip (broadcast
+ * waiting-room pattern) so history can be read while the call continues. */
+.live-now-handle { position: absolute; top: -12px; left: 50%; transform: translateX(-50%); display: grid; place-items: center; width: 72px; height: 44px; border: 0; background: transparent; cursor: pointer; }
+.live-now-handle i { width: 36px; height: 4px; border-radius: 9999px; background: rgba(255,255,255,.28); transition: background .15s; }
+.live-now-handle:hover i, .live-now-handle:focus-visible i { background: rgba(255,255,255,.55); }
+.live-now-sheet.is-collapsed { padding-bottom: 10px; }
 .live-now-speaker { display: flex; align-items: center; gap: 8px; color: var(--on-dark-soft); font-size: 11px; }
 .live-now-speaker strong { color: var(--on-dark); font-size: 12px; }
 .live-now-text { margin: 8px 0 0; color: var(--on-dark); font-size: clamp(17px, 3.4vw, 24px); line-height: 1.45; word-break: keep-all; overflow-wrap: anywhere; }
 
 /* Speaking-floor bar */
-.live-speak-bar { display: flex; align-items: center; justify-content: space-between; gap: 12px; border: 1px solid var(--hairline-strong); border-radius: 9999px; background: var(--surface); padding: 8px 8px 8px 18px; }
+/* Copy-free floor control: the bar is one full-width press target. While
+   speaking only the button animates (recording pulse + live waveform); the
+   caption feed behind stays untouched. */
+.live-speak-bar { display: flex; min-height: 64px; align-items: center; justify-content: center; border: 1px solid var(--hairline-strong); border-radius: 9999px; background: var(--surface); padding: 6px; }
+.live-speak-bar .live-speak-button { width: 100%; }
+.live-speak-button.is-speaking { animation: live-speak-recording 1.6s ease-in-out infinite; }
+@keyframes live-speak-recording {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(214, 45, 48, .45); }
+  50% { box-shadow: 0 0 0 8px rgba(214, 45, 48, 0); }
+}
 .live-floor-indicator { display: inline-flex; align-items: center; gap: 8px; color: var(--ink); font-size: 12px; font-weight: 600; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .live-floor-indicator.is-idle { color: var(--muted); font-weight: 400; }
-.live-speak-button { flex: none; min-height: 46px; border: none; border-radius: 9999px; background: var(--primary); color: var(--on-primary); padding: 0 22px; font: 700 13px/1 var(--font-sans); cursor: pointer; transition: background .18s, transform .12s; }
+.live-speak-button { display: grid; width: 56px; min-width: 44px; min-height: 44px; height: 52px; flex: none; place-items: center; border: none; border-radius: 9999px; background: var(--brand-white); color: var(--brand-indigo); padding: 0; cursor: pointer; transition: background .18s, color .18s, transform .12s, width .18s; }
 .live-speak-button:active { transform: scale(.97); }
 .live-speak-button:disabled { opacity: .55; cursor: default; }
-.live-speak-button.is-speaking { background: #c62828; color: #fff; animation: live-speak-pulse 1.6s ease-in-out infinite; }
-@keyframes live-speak-pulse { 0%, 100% { box-shadow: 0 0 0 0 rgba(198,40,40,.45); } 50% { box-shadow: 0 0 0 9px rgba(198,40,40,0); } }
+.live-speak-button:focus-visible { outline: 2px solid var(--brand-blue); outline-offset: 2px; }
+.live-speak-button.is-starting { color: var(--brand-blue); }
+.live-speak-button.is-speaking { background: var(--brand-red); color: var(--brand-white); }
+.live-speak-microphone { width: 24px; height: 24px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+.live-speak-connecting { display: inline-flex; align-items: center; gap: 3px; height: 18px; }
+.live-speak-connecting i { width: 4px; height: 4px; border-radius: 9999px; background: currentColor; animation: live-connect-dot .8s ease-in-out infinite alternate; }
+.live-speak-connecting i:nth-child(2) { animation-delay: -.25s; }
+.live-speak-connecting i:nth-child(3) { animation-delay: -.5s; }
+@keyframes live-connect-dot { from { opacity: .28; transform: translateY(2px); } to { opacity: 1; transform: translateY(-2px); } }
 .live-speaking-waves { display: inline-flex; align-items: flex-end; gap: 3px; height: 14px; }
+.live-speaking-waves { color: var(--brand-blue); }
 .live-speaking-waves i { width: 3px; border-radius: 9999px; background: currentColor; animation: live-audio-bar 1s ease-in-out infinite alternate; }
 .live-speaking-waves i:nth-child(1) { height: 7px; }
 .live-speaking-waves i:nth-child(2) { height: 13px; animation-delay: -.35s; }
@@ -505,50 +724,92 @@ input:focus-visible {
 /* Pure-black mobile viewer (어닝콜 영상 레퍼런스): the screen IS the feed.
    No cards, no borders — white text over #000, gray speaker meta, sticky
    translucent toolbar, dark live sheet. */
-.live-viewer-shell.is-compact { width: 100%; height: 100dvh; margin: 0; padding: 0; gap: 0; overflow: hidden; background: #000; }
+.live-viewer-shell.is-compact { position: fixed; inset: 0; display: grid; width: 100%; height: 100dvh; grid-template-rows: auto auto auto minmax(0, 1fr) auto auto; margin: 0; padding: 0; gap: 0; overflow: hidden; background: var(--dark); }
+.live-viewer-shell.is-compact > .live-join-card { max-height: 100dvh; overflow-y: auto; padding: max(24px, env(safe-area-inset-top)) 0 max(24px, env(safe-area-inset-bottom)); scrollbar-width: none; }
 .live-viewer-shell.is-compact .live-meeting-feed,
 .live-viewer-shell.is-compact .live-minutes { min-height: 0; }
-.live-viewer-shell.is-compact .live-viewer-toolbar { position: sticky; top: 0; z-index: 4; margin: 0; border: none; border-radius: 0; background: rgba(0,0,0,.86); backdrop-filter: blur(14px); box-shadow: none; padding: calc(6px + env(safe-area-inset-top)) 14px 8px; }
-.live-viewer-shell.is-compact .live-viewer-toolbar > strong { color: #fff; }
+.live-viewer-shell.is-compact .live-viewer-toolbar { position: sticky; top: 0; z-index: 4; display: flex; grid-row: 1; flex-wrap: nowrap; gap: 4px 6px; min-height: calc(44px + env(safe-area-inset-top)); margin: 0; border: none; border-radius: 0; background: var(--dark); box-shadow: none; padding: calc(4px + env(safe-area-inset-top)) 12px 4px; }
+.live-viewer-shell.is-compact .live-viewer-toolbar > strong { grid-column: 1 / 4; grid-row: 1; min-width: 0; margin: 0; overflow: hidden; align-self: center; color: #fff; font-size: 11px; letter-spacing: .12em; text-overflow: ellipsis; text-transform: uppercase; }
 .live-viewer-shell.is-compact .live-viewer-delivery-method { color: rgba(255,255,255,.45); }
-.live-viewer-shell.is-compact .live-viewer-toolbar button { border-color: rgba(255,255,255,.2); background: transparent; color: #fff; }
+.live-viewer-shell.is-compact .live-viewer-toolbar button { min-height: 30px; border-color: rgba(255,255,255,.2); background: transparent; color: #fff; padding: 0 8px; font-size: 10px; white-space: nowrap; }
 .live-viewer-shell.is-compact .live-viewer-toolbar button.is-selected { background: rgba(255,255,255,.16); }
-.live-viewer-shell.is-compact .live-language-switch { border-color: rgba(255,255,255,.16); background: rgba(255,255,255,.07); }
-.live-viewer-shell.is-compact .live-language-switch button { color: rgba(255,255,255,.55); }
+.live-viewer-shell.is-compact .live-viewer-toolbar .live-leave-button { position: absolute; top: calc(2px + env(safe-area-inset-top)); right: 8px; width: 44px; min-width: 44px; border-color: transparent; color: var(--brand-grey-25); padding: 0; }
+.live-viewer-shell.is-compact .live-language-switch { flex: none; border-color: rgba(255,255,255,.16); background: rgba(255,255,255,.07); padding: 2px; }
+.live-viewer-shell.is-compact .live-language-switch button { min-height: 26px; color: rgba(255,255,255,.55); padding: 0 8px; }
 .live-viewer-shell.is-compact .live-language-switch button.is-selected { background: #fff; color: #000; }
-.live-viewer-shell.is-compact .live-viewer-stage { flex: 1; border: none; border-radius: 0; background: #000; box-shadow: none; padding: 12px 18px 0; }
+.live-viewer-shell.is-compact .live-viewer-toolbar > button[aria-label^="Turn translated audio"],
+.live-viewer-shell.is-compact .live-viewer-toolbar > button[aria-label="Translated audio is on"],
+.live-viewer-session-context { grid-row: 2; padding: 8px 18px 7px; background: var(--dark); }
+.live-viewer-session-context h1 { margin: 0; color: #fff; font-size: 20px; line-height: 1.25; }
+.live-viewer-session-context p { margin: 5px 0 0; color: rgba(255,255,255,.48); font-size: 12px; }
+.live-viewer-shell.is-compact .live-viewer-stage { grid-row: 4; min-height: 0; border: none; border-radius: 0; background: var(--dark); box-shadow: none; padding: 6px 18px 0; overflow: hidden; }
 .live-viewer-shell.is-compact .live-viewer-stage-header { margin-bottom: 10px; }
 .live-viewer-shell.is-compact .live-viewer-stage .live-eyebrow,
 .live-viewer-shell.is-compact .live-viewer-stage .live-connection-state { color: rgba(255,255,255,.4); font-size: 10px; }
 .live-viewer-shell.is-compact .live-turn-card { border-bottom: none; padding: 0 0 4px; }
-.live-viewer-shell.is-compact .live-turn-card header { color: #8E8E93; }
-.live-viewer-shell.is-compact .live-turn-card p { font-size: 17px; line-height: 1.68; color: #fff; }
-.live-viewer-shell.is-compact .live-now-sheet { margin: 8px 0 10px; border-color: rgba(255,255,255,.06); background: #1c1c1e; }
-.live-viewer-shell.is-compact .live-speak-bar { margin: 0 12px; border-color: rgba(255,255,255,.14); background: #111; }
+.live-viewer-shell.is-compact .live-turn-card header { color: var(--brand-grey-25); }
+.live-viewer-shell.is-compact .live-turn-card p { font-size: calc(17px * var(--live-caption-scale, 1)); line-height: 1.68; color: #fff; }
+/* Replaced by --live-caption-scale, a continuous slider that works on BOTH the
+   compact and desktop routes. The old .is-text-large/.is-text-largest classes
+   had CSS only under .is-compact, so the control did nothing on /watch. */
+.live-viewer-shell .live-now-text,
+.live-viewer-shell .live-caption-card p { font-size: calc(1em * var(--live-caption-scale, 1)); }
+.live-viewer-shell.is-compact .live-turn-scroll { padding-top: 6px; scroll-padding-top: 6px; }
+.live-viewer-shell.is-compact .live-now-sheet { margin: 8px 0 0; border-color: rgba(255,255,255,.1); border-bottom: 0; border-radius: 18px 18px 0 0; background: var(--dark-elev); }
+.live-viewer-shell.is-compact .live-speak-bar { grid-row: 5; margin: 0 12px 6px; border-color: rgba(255,255,255,.14); background: var(--dark-elev); }
 .live-viewer-shell.is-compact .live-floor-indicator { color: #fff; }
 .live-viewer-shell.is-compact .live-floor-indicator.is-idle { color: rgba(255,255,255,.45); }
-.live-viewer-shell.is-compact .live-speak-button { background: #fff; color: #000; }
-.live-viewer-shell.is-compact .live-speak-button.is-speaking { background: #c62828; color: #fff; }
-.live-viewer-shell.is-compact .live-viewer-footer { padding: 10px 16px calc(12px + env(safe-area-inset-bottom)); color: rgba(255,255,255,.35); }
-.live-viewer-shell.is-compact .live-error { margin: 8px 12px 0; }
+.live-viewer-shell.is-compact .live-speak-button { background: var(--brand-white); color: var(--brand-indigo); }
+.live-viewer-shell.is-compact .live-speak-button.is-starting { color: var(--brand-blue); }
+.live-viewer-shell.is-compact .live-speak-button.is-speaking { background: var(--brand-red); color: var(--brand-white); }
+.live-viewer-shell.is-compact .live-viewer-footer { grid-row: 6; min-height: 0; max-height: calc(28px + env(safe-area-inset-bottom)); gap: 10px; overflow: hidden; padding: 5px 16px calc(5px + env(safe-area-inset-bottom)); color: var(--brand-grey-25); white-space: nowrap; }
+.live-viewer-shell.is-compact .live-viewer-footer span { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.live-viewer-shell.is-compact .live-error { position: absolute; top: calc(88px + env(safe-area-inset-top)); right: 12px; left: 12px; z-index: 8; margin: 0; }
 .live-viewer-shell.is-compact .live-minutes { border: none; border-radius: 0; background: #000; }
 .live-viewer-shell.is-compact .live-jump-latest { bottom: 132px; }
 .live-viewer-shell.is-compact .live-viewer-legend { display: none; }
+.live-viewer-shell.is-compact .live-viewer-delivery-method,
+.live-viewer-shell.is-compact .live-pip-button { display: none; }
+.live-viewer-shell.is-compact .live-viewer-stage:has(.live-now-sheet) + .live-speak-bar { margin: 0 18px 6px; border-top: 0; border-radius: 0 0 18px 18px; background: var(--dark-elev); padding: 6px 16px 10px; }
+.live-viewer-shell.is-compact .live-viewer-stage:has(.live-now-sheet) + .live-speak-bar .live-floor-indicator { display: none; }
+.live-viewer-shell.is-compact .live-viewer-stage:has(.live-now-sheet) + .live-speak-bar .live-speak-button { width: 100%; }
 
 @media (max-width: 760px) {
+  .live-host-shell { display: block; width: 100%; }
+  .live-host-rail { position: static; width: 100%; height: auto; flex-direction: row; align-items: center; justify-content: space-between; gap: 12px; padding: 14px; border-right: 0; border-bottom: 1px solid rgba(255,255,255,.16); }
+  .live-host-rail > strong { padding: 0; }
+  .live-host-rail nav { display: flex; gap: 4px; }
+  .live-host-rail button { min-height: 34px; padding: 0 10px; font-size: 11px; }
+  .live-host-workspace { width: min(100% - 28px, 640px); padding-top: 24px; }
+  .live-host-page-heading { min-height: 56px; }
+  .live-host-shell .live-wizard { grid-template-columns: minmax(0, 1fr); }
+  .live-host-shell .live-wizard > .live-section-heading,
+  .live-host-shell .live-wizard-body,
+  .live-host-shell .live-wizard-footer,
+  .live-setup-mobile-access { grid-column: 1; grid-row: auto; }
+  .live-setup-mobile-access { padding: 20px 0 0; border-top: 1px solid rgba(255,255,255,.16); border-left: 0; }
   .live-host-shell,
   .live-viewer-shell { width: min(100% - 20px, 640px); padding-top: 10px; }
+  .live-host-shell { width: 100%; padding-top: 0; }
   .live-host-header { align-items: flex-start; flex-direction: column; gap: 14px; padding: 22px; }
   .live-host-grid,
   .live-monitor-grid,
   .live-audience-settings { grid-template-columns: minmax(0, 1fr); }
+  .live-host-shell .live-session-panel { grid-template-columns: minmax(0, 1fr); }
+  .live-host-shell .live-session-panel .live-section-heading,
+  .live-host-shell .live-session-panel .live-admission-code,
+  .live-host-shell .live-session-panel .live-invite-feedback,
+  .live-host-shell .live-session-panel .live-action-row { grid-column: 1; grid-row: auto; }
   .live-audience-settings .live-field-group:last-child { grid-column: auto; }
   .live-mode-grid { grid-template-columns: minmax(0, 1fr); }
+  .live-schedule-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .live-schedule-grid .live-title-field { grid-column: 1 / -1; }
   .live-mode-card { min-height: 88px; }
   .live-delivery-method-card { grid-template-columns: minmax(0, 1fr); }
   .live-language-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .live-viewer-toolbar { flex-wrap: wrap; }
-  .live-viewer-toolbar > strong { width: 100%; }
+  .live-viewer-shell.is-compact .live-viewer-toolbar { flex-wrap: nowrap; }
+  .live-viewer-toolbar > strong { width: auto; }
   .live-wizard { padding: 18px; }
   .live-wizard-progress button { font-size: 0; gap: 0; }
   .live-wizard-progress button span { font-size: 9px; }
@@ -558,6 +819,11 @@ input:focus-visible {
   .live-caption-stack { min-height: 56dvh; }
   .live-caption-card p { font-size: 18px; }
   .live-turn-scroll { min-height: 46dvh; }
+  .live-viewer-shell.is-compact .live-turn-scroll { min-height: 0; }
+  /* The sticky Speak bar floats over the page scroll — reserve its height at
+     the bottom of the record so the newest paragraph is never hidden behind
+     it, at any Aa text size. */
+  .live-turn-scroll { padding-bottom: calc(84px + env(safe-area-inset-bottom)); }
   .live-speak-bar { position: sticky; bottom: max(10px, env(safe-area-inset-bottom)); z-index: 3; box-shadow: 0 10px 34px rgba(12,10,9,.35); }
   .live-speak-button { min-height: 52px; padding: 0 26px; font-size: 14px; }
 }
@@ -565,9 +831,180 @@ input:focus-visible {
 @media (prefers-reduced-motion: reduce) {
   .live-audio-bars i { animation: none; }
   .live-speaking-waves i { animation: none; }
-  .live-speak-button.is-speaking { animation: none; }
+  .live-speak-button-waves i,
+  .live-speak-connecting i { animation: none; }
   .live-caption-card { transition: none; }
 }
 @media (prefers-reduced-motion: reduce) {
   .audio-ripple { animation: none; opacity: calc(0.18 + var(--ripple, 0) * 0.5); }
 }
+
+/* ---- Live Call: pause / stage / recovery / scrollback (2026-07-24) ---- */
+
+/* Viewer caption scrollback: full history scrolls; auto-scroll pins to the
+   bottom only while the reader is at the live edge. */
+.live-caption-stack { position: relative; }
+.live-caption-history.is-scrollable { display: flex; flex-direction: column; gap: 9px; max-height: 100%; overflow-y: auto; overscroll-behavior: contain; scrollbar-width: thin; }
+.live-caption-stack .live-jump-latest { bottom: 96px; }
+
+/* Speaker-change overlay (contract C5): transient identity card above the
+   captions when the floor holder changes. Gray/white on black. */
+.live-speaker-change-overlay { position: fixed; top: max(96px, calc(72px + env(safe-area-inset-top))); left: 50%; transform: translateX(-50%); z-index: 6; display: grid; gap: 2px; justify-items: center; min-width: 200px; max-width: min(86vw, 460px); border: 1px solid rgba(255,255,255,.16); border-radius: 14px; background: rgba(10,10,10,.94); padding: 12px 22px; text-align: center; backdrop-filter: blur(10px); animation: live-overlay-in .22s ease-out; }
+.live-speaker-change-overlay strong { color: #fff; font-size: 17px; line-height: 1.3; }
+.live-speaker-change-overlay span { color: rgba(255,255,255,.55); font-size: 12px; }
+@keyframes live-overlay-in { from { opacity: 0; transform: translate(-50%, -6px); } to { opacity: 1; transform: translate(-50%, 0); } }
+
+/* Viewer waiting screen (session preparing): pure black holding view. */
+.live-waiting-screen { position: relative; display: flex; flex: 1; flex-direction: column; align-items: center; justify-content: center; gap: 10px; min-height: 50dvh; background: #000; border-radius: 18px; padding: 32px 20px; text-align: center; overflow: hidden; isolation: isolate; }
+.live-waiting-cover { position: absolute; inset: 0; z-index: -2; width: 100%; height: 100%; object-fit: cover; }
+.live-waiting-scrim { position: absolute; inset: 0; z-index: -1; background: linear-gradient(180deg, rgba(0,0,0,.66) 0%, rgba(0,0,0,.52) 45%, rgba(0,0,0,.86) 100%); }
+.live-viewer-shell.is-compact .live-waiting-screen { grid-row: 4; min-height: 0; border-radius: 0; }
+.live-waiting-screen h2 { margin: 0; color: #fff; font-size: 22px; line-height: 1.3; }
+.live-waiting-screen .live-waiting-schedule { margin: 0; color: rgba(255,255,255,.48); font-size: 13px; }
+.live-waiting-screen strong { color: rgba(255,255,255,.85); font-size: 14px; letter-spacing: .08em; text-transform: uppercase; }
+.live-waiting-screen p { margin: 0; max-width: 340px; color: rgba(255,255,255,.45); font-size: 13px; line-height: 1.5; }
+.live-waiting-screen .live-leave-button { min-height: 44px; margin-top: 12px; border: 1px solid rgba(255,255,255,.24); border-radius: 9999px; background: transparent; color: rgba(255,255,255,.75); padding: 0 22px; }
+.live-waiting-pulse { width: 14px; height: 14px; border-radius: 9999px; background: #fff; opacity: .8; animation: live-waiting-pulse 1.6s ease-in-out infinite; }
+@keyframes live-waiting-pulse { 0%, 100% { transform: scale(.7); opacity: .35; } 50% { transform: scale(1); opacity: .85; } }
+/* Contract C11: waiting-room countdown wrapped in an indeterminate loading
+ * ring (YouTube-live style) — pure CSS, no dependencies. */
+.live-waiting-ring { position: relative; display: grid; place-items: center; width: 168px; height: 168px; }
+.live-loading-ring { position: absolute; inset: 0; border: 3px solid rgba(255,255,255,.14); border-top-color: rgba(255,255,255,.82); border-radius: 9999px; animation: live-loading-ring-spin 1.1s linear infinite; }
+@keyframes live-loading-ring-spin { to { transform: rotate(360deg); } }
+.live-waiting-countdown { margin: 0; color: #fff; font-size: 30px; font-variant-numeric: tabular-nums; font-weight: 700; letter-spacing: .04em; }
+@media (prefers-reduced-motion: reduce) { .live-waiting-pulse { animation: none; } .live-speaker-change-overlay { animation: none; } .live-loading-ring { animation: none; opacity: .35; } }
+
+/* Paused banner for viewers (contract C4). */
+.live-paused-banner { display: flex; align-items: center; justify-content: center; gap: 8px; margin: 8px 12px 0; border: 1px solid rgba(255,255,255,.14); border-radius: 12px; background: rgba(255,255,255,.06); color: rgba(255,255,255,.75); padding: 10px 14px; font-size: 12px; }
+.live-viewer-shell.is-compact .live-paused-banner { position: absolute; top: calc(84px + env(safe-area-inset-top)); right: 12px; left: 12px; z-index: 5; margin: 0; }
+
+/* Ended screen for new entrants hitting a finished session. */
+.live-session-ended-screen { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 10px; margin: auto; max-width: 380px; padding: 40px 24px; text-align: center; }
+.live-session-ended-screen strong { color: var(--heading, #fff); font-size: 18px; }
+.live-session-ended-screen p { margin: 0; color: var(--muted, rgba(255,255,255,.5)); font-size: 13px; line-height: 1.5; }
+.live-session-ended-screen button { min-height: 44px; border: 1px solid var(--hairline-strong, rgba(255,255,255,.24)); border-radius: 9999px; background: transparent; color: inherit; padding: 0 22px; cursor: pointer; }
+.live-ended-view { display: flex; min-height: 0; flex-direction: column; overflow: hidden; }
+.live-session-ended-banner { display: flex; align-items: center; gap: 10px; border-bottom: 1px solid rgba(255,255,255,.12); background: var(--dark); color: var(--brand-white); padding: 12px 18px; }
+.live-session-ended-banner > div { display: grid; min-width: 0; gap: 2px; }
+.live-session-ended-banner strong { font-size: 13px; }
+.live-session-ended-banner p { margin: 0; color: var(--brand-grey-25); font-size: 11px; }
+.live-viewer-shell.is-compact .live-ended-view { grid-row: 4 / 7; }
+
+/* Host: separated destructive area for End session. */
+.live-danger-zone { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; margin-top: 18px; border: 1px solid #C78880; border-radius: 14px; background: rgba(142,16,0,.06); padding: 14px 16px; }
+.live-danger-zone > div { display: grid; gap: 2px; }
+.live-danger-zone strong { color: #8E1000; font-size: 13px; }
+.live-host-shell .live-danger-zone strong { color: #E8A79F; }
+.live-danger-zone p { margin: 0; color: var(--muted); font-size: 11px; max-width: 420px; }
+.live-danger-zone button { min-height: 40px; padding: 0 16px; font: 600 11px/1 var(--font-sans); cursor: pointer; }
+.live-danger-confirm { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.live-danger-confirm span { color: var(--body); font-size: 12px; font-weight: 600; }
+
+/* Host: session recovery panel. */
+.live-recovery-list { display: grid; gap: 8px; margin: 12px 0 0; padding: 0; list-style: none; }
+.live-recovery-list li { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px; border: 1px solid var(--hairline-strong); border-radius: 12px; padding: 10px 14px; }
+.live-recovery-list li > div { display: grid; gap: 2px; }
+.live-recovery-list small { color: var(--muted); font-size: 11px; }
+.live-recovery-list button { min-height: 38px; padding: 0 16px; font: 600 11px/1 var(--font-sans); }
+
+/* Action items with owner/due (contract C7). */
+.live-summary-actions-list li { display: grid; gap: 2px; }
+.live-summary-actions-list small { color: var(--muted); font-size: 11px; }
+
+/* Stage / countdown view (contract C8): pure black, host-only window. */
+.live-stage-shell { position: fixed; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 20px; background: #000; color: #fff; padding: 40px 24px; text-align: center; overflow-y: auto; }
+.live-stage-title { margin: 0; max-width: 80vw; font-size: clamp(26px, 4.5vw, 52px); line-height: 1.2; color: #fff; }
+.live-stage-countdown { margin: 0; font-variant-numeric: tabular-nums; font-size: clamp(56px, 14vw, 160px); font-weight: 700; letter-spacing: .04em; color: #fff; }
+.live-stage-state { display: inline-flex; align-items: center; gap: 12px; margin: 0; color: rgba(255,255,255,.72); font-size: clamp(22px, 4vw, 40px); font-weight: 600; letter-spacing: .06em; }
+.live-stage-state.is-live { color: #ff4d4d; text-transform: uppercase; }
+.live-stage-hint { margin: 0; color: rgba(255,255,255,.62); font-size: 14px; }
+.live-stage-error { margin: 0; color: #E8A79F; font-size: 15px; }
+.live-stage-access { display: flex; flex-wrap: wrap; align-items: center; justify-content: center; gap: 28px; margin-top: 8px; }
+.live-stage-access .live-invite-qr { background: #fff; border-radius: 14px; padding: 10px; }
+.live-stage-access .live-invite-qr figcaption { display: none; }
+.live-stage-code { display: grid; gap: 6px; justify-items: center; }
+.live-stage-code span { color: rgba(255,255,255,.62); font-size: 12px; letter-spacing: .1em; text-transform: uppercase; }
+.live-stage-code strong { font-variant-numeric: tabular-nums; color: #fff; font-size: clamp(34px, 6vw, 64px); letter-spacing: .18em; }
+.live-stage-count { margin: 0; color: rgba(255,255,255,.55); font-size: 16px; }
+/* Contract C10: host-side cover upload block. */
+.live-cover-upload { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; border: 1px solid var(--hairline); border-radius: 14px; padding: 12px 14px; }
+.live-cover-upload > div { flex: 1 1 240px; min-width: 0; }
+.live-cover-upload strong { font-size: 13px; }
+.live-cover-upload p { margin: 2px 0 0; color: var(--muted); font-size: 11px; line-height: 1.5; }
+/* Contract C10: cover image + scrim behind the stage content. The scrim is a
+ * radial gradient that keeps the center readable over any photo. */
+.live-stage-cover { position: absolute; inset: 0; z-index: 0; width: 100%; height: 100%; object-fit: cover; opacity: 1; transition: opacity .6s ease; }
+.live-stage-cover.is-dimmed { opacity: .16; }
+.live-stage-scrim { position: absolute; inset: 0; z-index: 1; background: linear-gradient(180deg, rgba(0,0,0,.62) 0%, rgba(0,0,0,.5) 42%, rgba(0,0,0,.84) 100%); }
+.live-stage-content { position: relative; z-index: 2; display: flex; flex-direction: column; align-items: center; gap: 20px; }
+/* Countdown wrapped in the shared indeterminate loading ring. */
+.live-stage-ring { position: relative; display: grid; place-items: center; width: clamp(240px, 34vw, 420px); height: clamp(240px, 34vw, 420px); }
+.live-stage-ring .live-stage-countdown { font-size: clamp(44px, 7vw, 92px); }
+.live-stage-ring .live-stage-state { font-size: clamp(17px, 2.4vw, 26px); }
+/* Pre-live layers fade out (instead of unmounting) when the host starts. */
+.live-stage-access { transition: opacity .6s ease; }
+.live-stage-access.is-faded-out { opacity: 0; pointer-events: none; position: absolute; }
+@media (prefers-reduced-motion: reduce) { .live-stage-cover, .live-stage-access { transition: none; } }
+
+/* Compact-mode touch targets: every tappable control is at least 44px tall. */
+.live-viewer-shell.is-compact .live-viewer-toolbar { min-height: calc(44px + env(safe-area-inset-top)); }
+.live-viewer-shell.is-compact .live-viewer-toolbar button { min-height: 44px; padding: 0 12px; }
+.live-viewer-shell.is-compact .live-language-switch button { min-height: 44px; min-width: 44px; padding: 0 12px; }
+.live-viewer-shell.is-compact .live-viewer-toolbar .live-leave-button { min-height: 44px; }
+.live-viewer-shell.is-compact .live-speak-bar { position: relative; bottom: auto; box-shadow: none; }
+.live-viewer-shell.is-compact .live-speak-button { min-height: 44px; padding: 0; }
+.live-viewer-shell.is-compact .live-jump-latest { min-height: 44px; }
+
+/* Join screen: pure-black broadcast styling matching the live viewer. */
+.live-join-heading { margin: 0; color: #fff; font-size: clamp(2rem, 7vw, 2.8rem); line-height: 1.1; }
+.live-join-lede { margin: 0 0 18px; color: rgba(255,255,255,.52); font-size: 13.5px; line-height: 1.6; }
+.live-join-card .live-primary-action { min-height: 56px; border: 0; border-radius: 9999px; background: #fff; color: #000; font: 700 16px/1 var(--font-sans); transition: transform .12s; }
+.live-join-card .live-primary-action:active { transform: scale(.98); }
+.live-join-card .live-primary-action:disabled { opacity: .45; }
+.live-join-card .live-code-input { border-color: rgba(255,255,255,.28); background: #000; color: #fff; font-variant-numeric: tabular-nums; }
+.live-join-mic-note { margin: 4px 0 0; color: rgba(255,255,255,.38); font-size: 11.5px; line-height: 1.5; text-align: center; }
+
+/* Brand wordmark: uppercase letterspaced everywhere (rail reference design). */
+.live-viewer-toolbar > strong { font-size: 11px; font-weight: 700; letter-spacing: .22em; text-transform: uppercase; }
+
+/* Speak button keeps its prominent pill in every state; while speaking the
+   label is replaced by a live waveform inside the button. */
+.live-speak-button-waves { display: inline-flex; align-items: center; justify-content: center; gap: 5px; height: 24px; }
+.live-speak-button-waves i { width: 4px; border-radius: 9999px; background: currentColor; animation: live-audio-bar 1.1s ease-in-out infinite alternate; }
+.live-speak-button-waves i:nth-child(1) { height: 10px; }
+.live-speak-button-waves i:nth-child(2) { height: 20px; animation-delay: -.35s; }
+.live-speak-button-waves i:nth-child(3) { height: 14px; animation-delay: -.6s; }
+.live-speak-button-waves i:nth-child(4) { height: 22px; animation-delay: -.15s; }
+.live-speak-button-waves i:nth-child(5) { height: 12px; animation-delay: -.5s; }
+.live-speak-button[data-level="0"] .live-speak-button-waves i { animation-play-state: paused; transform: scaleY(.35); }
+.live-speak-button[data-level="1"] .live-speak-button-waves i { transform: scaleY(.5); }
+.live-speak-button[data-level="2"] .live-speak-button-waves i { transform: scaleY(.7); }
+.live-speak-button[data-level="3"] .live-speak-button-waves i { transform: scaleY(.86); }
+.live-speak-button[data-level="4"] .live-speak-button-waves i { transform: scaleY(1); }
+.live-speak-button-waves i { transform-origin: center; transition: transform 80ms linear; }
+
+/* Caption controls sit directly above the caption record: language first, then
+   text size. Live Call is caption-first, so translated-audio controls are not
+   surfaced here at all. */
+.live-caption-controls { display: flex; align-items: center; gap: 8px; padding: 0 2px 8px; }
+.live-viewer-shell.is-compact > .live-viewer-session-context { grid-row: 2; }
+.live-viewer-shell.is-compact > .live-caption-controls { grid-row: 3; }
+.live-caption-controls .live-viewer-delivery-method { margin-left: auto; }
+.live-text-size { position: relative; display: inline-flex; align-items: center; gap: 8px; }
+/* The slider grows the row rather than floating over the captions, so opening it
+   never covers the text it is adjusting. */
+.live-text-size-slider { display: none; align-items: center; flex: 1; min-width: 96px; }
+.live-text-size-slider.is-open { display: inline-flex; }
+.live-text-size-slider input[type="range"] { width: 100%; min-width: 88px; height: 28px; accent-color: var(--brand-blue); background: transparent; cursor: pointer; }
+.live-viewer-shell.is-compact .live-caption-controls { padding: 0 12px 8px; }
+.live-viewer-shell.is-compact .live-text-size-slider input[type="range"] { height: 44px; }
+@media (prefers-reduced-motion: reduce) { .live-text-size-slider { transition: none; } }
+
+/* The text-size button used to inherit its colour from the toolbar. Moved into
+   the caption-controls row it fell back to the default dark ink — rgb(12,10,9),
+   the exact shell background — so it rendered invisible. Style it here rather
+   than by ancestry, and mirror the language pill so the two read as one group. */
+.live-caption-controls .live-text-size-button { min-height: 34px; min-width: 40px; border: 1px solid var(--hairline-strong); border-radius: 9999px; background: var(--surface); color: var(--body); font: 700 13px/1 var(--font-sans); cursor: pointer; }
+.live-caption-controls .live-text-size-button[aria-expanded="true"] { background: var(--primary); color: var(--on-primary); border-color: transparent; }
+.live-viewer-shell.is-compact .live-caption-controls .live-text-size-button { min-height: 44px; min-width: 44px; border-color: rgba(255,255,255,.16); background: rgba(255,255,255,.07); color: #fff; }
+.live-viewer-shell.is-compact .live-caption-controls .live-text-size-button[aria-expanded="true"] { background: #fff; color: #000; }

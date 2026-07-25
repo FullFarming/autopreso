@@ -7,7 +7,7 @@ import { test } from "node:test";
 import { resolveSimulatorAgentProvider } from "../src/simulator-agent-provider.js";
 
 test("resolveSimulatorAgentProvider always uses Codex CLI auth", () => {
-  const codexHome = mkdtempSync(join(tmpdir(), "autopreso-sim-codex-"));
+  const codexHome = mkdtempSync(join(tmpdir(), "realtime-noel-sim-codex-"));
   writeFileSync(join(codexHome, "auth.json"), JSON.stringify({ tokens: { access_token: "codex-token", refresh_token: "refresh" } }));
 
   assert.deepEqual(
@@ -27,7 +27,7 @@ test("resolveSimulatorAgentProvider always uses Codex CLI auth", () => {
 });
 
 test("resolveSimulatorAgentProvider disables Codex fast mode", () => {
-  const codexHome = mkdtempSync(join(tmpdir(), "autopreso-sim-codex-"));
+  const codexHome = mkdtempSync(join(tmpdir(), "realtime-noel-sim-codex-"));
   writeFileSync(join(codexHome, "auth.json"), JSON.stringify({ tokens: { access_token: "codex-token", refresh_token: "refresh" } }));
 
   assert.deepEqual(

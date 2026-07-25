@@ -2,6 +2,8 @@ import { NextRequest } from "next/server";
 
 import { AuthenticationError, requireHost } from "@/lib/auth/live-auth";
 import { LiveSessionError, toLiveFailure } from "@/lib/live/errors";
+import { isLiveCallEnabled } from "@/lib/live/feature-flag";
+import { generateSessionSummariesAfterEnd } from "@/lib/live/post-session-summary";
 import { LiveSessionService } from "@/lib/live/service";
 import { getLiveSessionStore } from "@/lib/live/store";
 import { parseSessionId } from "@/lib/live/validation";
@@ -30,6 +32,7 @@ export async function GET(request: NextRequest, context: RouteContext) {
 
 export async function PATCH(request: NextRequest, context: RouteContext) {
   try {
+    if (!isLiveCallEnabled()) return apiError("Live Call 기능이 비활성화되어 있습니다.", "LIVE_CALL_DISABLED", 403);
     const [{ hostId }, params] = await Promise.all([requireHost(request), context.params]);
     const id = parseSessionId(params.id);
     const parsed = updateLiveSessionInputSchema.safeParse(await request.json());
@@ -37,6 +40,8 @@ export async function PATCH(request: NextRequest, context: RouteContext) {
     const input = parsed.data;
     const session = await new LiveSessionService(getLiveSessionStore()).update(hostId, id, {
       version: input.version,
+      title: input.title,
+      scheduledAt: input.scheduledAt,
       sessionType: input.sessionType,
       languages: input.languages,
       outputMode: input.outputMode,
@@ -55,9 +60,20 @@ export async function PATCH(request: NextRequest, context: RouteContext) {
 
 export async function DELETE(request: NextRequest, context: RouteContext) {
   try {
+    if (!isLiveCallEnabled()) return apiError("Live Call 기능이 비활성화되어 있습니다.", "LIVE_CALL_DISABLED", 403);
     const [{ hostId }, params] = await Promise.all([requireHost(request), context.params]);
     const id = parseSessionId(params.id);
-    await new LiveSessionService(getLiveSessionStore()).stop(hostId, id);
+    const store = getLiveSessionStore();
+    // Capture the active language list before terminate clears session state.
+    const sessionBeforeEnd = await store.get(id);
+    await new LiveSessionService(store).end(hostId, id);
+    // Contract C7: auto-generate meeting summaries per active language.
+    // Fire-and-forget with one retry — never blocks or fails the End response.
+    if (sessionBeforeEnd && sessionBeforeEnd.hostId === hostId) {
+      void generateSessionSummariesAfterEnd(id, hostId, sessionBeforeEnd.languages).catch((summaryError: unknown) => {
+        console.error(`live post-session summary scheduling failed (${id})`, summaryError);
+      });
+    }
     return apiSuccess({ id, status: "stopped" as const });
   } catch (error: unknown) {
     if (error instanceof AuthenticationError) return apiError(error.message, "HOST_AUTH_REQUIRED", 401);

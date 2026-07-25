@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Realtime Noel Subtitle Controller</title>
+    <link rel="stylesheet" href="/subtitle.css" />
+  </head>
+  <body class="subtitle-controller-body">
+    <!-- Mini-player console: one row, packed edge to edge like a music
+         player — brand/drag zone (track info), transport (Restart · Stop ·
+         big Go-Live · Host Speak · End · elapsed), adjust cluster (font,
+         position, opacity, gap), window cluster (Main · Hide · Quit). -->
+    <main class="caption-player-controller caption-controller-window mini-player" aria-label="Live subtitle controls">
+      <div id="controller-drag" class="controller-drag mp-brand" role="button" tabindex="0" aria-label="Move subtitle controller">
+        <strong>Realtime Noel</strong>
+        <span id="controller-live-call-status" class="mp-status" role="status" aria-live="polite" aria-atomic="true">Captions ready</span>
+        <span class="mp-vu" aria-hidden="true"><i id="controller-vu-fill"></i></span>
+      </div>
+      <div class="controller-body">
+        <div class="controller-cluster mp-transport" role="group" aria-label="Caption engine">
+          <button id="controller-restart" type="button" class="mp-icon controller-primary" title="Restart captions — the Live Call session stays connected" aria-label="Restart captions">
+            <svg viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" aria-hidden="true"><path d="M13.4 6.4A5.6 5.6 0 1 0 13.9 9"/><path d="M13.6 2.6v3.8H9.8" stroke-linejoin="round"/></svg>
+          </button>
+          <button id="controller-stop" type="button" class="mp-icon" title="Stop captions only — guests remain in the Live Call" aria-label="Stop captions">
+            <svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor" aria-hidden="true"><rect x="3.5" y="3.5" width="9" height="9" rx="1.6"/></svg>
+          </button>
+          <div id="controller-live-call" class="mp-live-call" aria-label="Live Call" hidden>
+            <button id="controller-go-live" type="button" class="controller-go-live" title="Start the Live Call for every participant">Go-Live</button>
+            <button id="controller-host-speak" type="button" class="mp-icon" title="Reclaim the speaking floor so the host microphone is heard" aria-label="Host Speak" hidden>
+              <svg viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true"><rect x="6" y="1.8" width="4" height="7.4" rx="2" fill="currentColor" stroke="none"/><path d="M3.4 7.4a4.6 4.6 0 0 0 9.2 0M8 12v2.4"/></svg>
+            </button>
+            <button id="controller-end-live-call" type="button" class="controller-button controller-danger mp-end" title="End the Live Call for every participant">End</button>
+            <span id="controller-elapsed" class="controller-readout mp-elapsed" aria-label="Live elapsed time" hidden>00:00</span>
+          </div>
+        </div>
+        <div class="controller-cluster mp-adjust" role="group" aria-label="Subtitle appearance">
+          <div class="controller-group" aria-label="Subtitle font size">
+            <button id="controller-font-down" type="button" class="controller-icon" aria-label="Decrease subtitle font size">A-</button>
+            <span id="controller-font-size" class="controller-readout">38px</span>
+            <button id="controller-font-up" type="button" class="controller-icon" aria-label="Increase subtitle font size">A+</button>
+          </div>
+          <div class="controller-group controller-position" aria-label="Subtitle position">
+            <button type="button" class="controller-chip mp-pos" data-controller-position="top-center" title="Top" aria-label="Subtitles at the top">
+              <svg viewBox="0 0 14 14" width="13" height="13" fill="currentColor" aria-hidden="true"><rect x="1.5" y="2" width="11" height="2.4" rx="1.1"/><rect x="3.5" y="9.6" width="7" height="1.6" rx="0.8" opacity="0.35"/></svg>
+            </button>
+            <button type="button" class="controller-chip mp-pos" data-controller-position="middle-center" title="Middle" aria-label="Subtitles in the middle">
+              <svg viewBox="0 0 14 14" width="13" height="13" fill="currentColor" aria-hidden="true"><rect x="1.5" y="5.8" width="11" height="2.4" rx="1.1"/></svg>
+            </button>
+            <button type="button" class="controller-chip mp-pos" data-controller-position="bottom-center" title="Bottom" aria-label="Subtitles at the bottom">
+              <svg viewBox="0 0 14 14" width="13" height="13" fill="currentColor" aria-hidden="true"><rect x="3.5" y="2.8" width="7" height="1.6" rx="0.8" opacity="0.35"/><rect x="1.5" y="9.6" width="11" height="2.4" rx="1.1"/></svg>
+            </button>
+          </div>
+          <label class="controller-opacity" title="Subtitle background opacity">
+            <svg viewBox="0 0 14 14" width="13" height="13" aria-hidden="true"><circle cx="7" cy="7" r="5.4" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M7 1.6a5.4 5.4 0 0 1 0 10.8Z" fill="currentColor"/></svg>
+            <input id="controller-opacity" type="range" min="0.2" max="1" step="0.01" aria-label="Subtitle background opacity" />
+            <output id="controller-opacity-value">92%</output>
+          </label>
+          <div class="controller-group controller-gap" aria-label="Subtitle edge gap" title="Distance from the screen edge">
+            <svg viewBox="0 0 14 14" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" aria-hidden="true"><path d="M2 1.6h10M2 12.4h10M7 4v6M5.2 5.6 7 3.8l1.8 1.8M5.2 8.4 7 10.2l1.8-1.8"/></svg>
+            <button id="controller-gap-down" type="button" class="controller-icon" aria-label="Move subtitles closer to the edge">−</button>
+            <span id="controller-gap-value" class="controller-readout">48</span>
+            <button id="controller-gap-up" type="button" class="controller-icon" aria-label="Move subtitles away from the edge">+</button>
+          </div>
+        </div>
+        <div id="controller-voice-provider" class="controller-language-set" role="radiogroup" aria-label="통역 음성 엔진" hidden>
+          <span>Voice</span>
+          <button type="button" class="controller-lang-option" data-controller-voice-provider="gemini" role="radio" aria-checked="true">Gemini</button>
+          <button type="button" class="controller-lang-option" data-controller-voice-provider="openai" role="radio" aria-checked="false">OpenAI</button>
+        </div>
+        <div class="controller-cluster mp-window" role="group" aria-label="App controls">
+          <button id="controller-main-window" type="button" class="mp-pill" title="Bring the main window to the front. The Live Call keeps running.">Main</button>
+          <button id="controller-hide" type="button" class="mp-icon" title="Hide the controller. Captions keep running." aria-label="Hide the controller">
+            <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true"><path d="M3.5 6.2 8 10.4l4.5-4.2"/></svg>
+          </button>
+          <button id="controller-quit" type="button" class="mp-icon controller-danger" title="Quit Realtime Noel" aria-label="Quit Realtime Noel">
+            <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" aria-hidden="true"><path d="M8 1.8v6"/><path d="M4.2 4.1a5.4 5.4 0 1 0 7.6 0"/></svg>
+          </button>
+        </div>
+      </div>
+    </main>
+    <script type="module" src="/subtitle-controller.js"></script>
+  </body>
+</html>

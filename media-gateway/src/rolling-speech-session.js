@@ -33,12 +33,45 @@ export class RollingSpeechSession {
     if (this.#terminalError) throw this.#terminalError;
     if (!(frame instanceof Uint8Array) || frame.byteLength !== FRAME_BYTES) throw new Error("INVALID_AUDIO_FRAME");
     if (this.now() - this.#startedAt >= STT_CONFIG.rolloverMilliseconds) await this.#rollover();
-    await this.#stream.sendAudio(frame);
+    try {
+      await this.#stream.sendAudio(frame);
+    } catch (error) {
+      // A broken provider stream must not end the session: swap in a fresh
+      // stream (losing only the in-flight window) and keep audio flowing.
+      console.warn("[stt] stream send failed, restarting stream:", error instanceof Error ? error.message : error);
+      await this.#restart();
+      await this.#stream.sendAudio(frame);
+    }
     this.#pcmRing?.push(frame, this.#streamAudioOffsetMs);
     this.#streamAudioOffsetMs += AUDIO_CONFIG.chunkMilliseconds;
     this.#overlapFrames.push(frame.slice());
     const maxFrames = STT_CONFIG.overlapMilliseconds / AUDIO_CONFIG.chunkMilliseconds;
     if (this.#overlapFrames.length > maxFrames) this.#overlapFrames.shift()?.fill(0);
+  }
+
+  /** Fail-open recovery: open a brand-new stream with no overlap replay and no
+   *  speaker remap. Diarization labels may reset (a new "1" can appear), which
+   *  is an acceptable cost compared to a session that stops captioning. */
+  async #restart() {
+    const previous = this.#stream;
+    this.#stream = null;
+    if (previous) await Promise.allSettled([previous.close()]);
+    const pcmRing = this.capturePcmWindows ? new PcmTimelineRing({ sampleRate: AUDIO_CONFIG.inputSampleRate }) : null;
+    try {
+      const next = await this.provider.open({
+        generation: this.now(),
+        onFinalUtterance: (utterance) => this.#handleFinalUtterance(utterance, pcmRing),
+      });
+      this.#pcmRing?.clear();
+      this.#pcmRing = pcmRing;
+      this.#stream = next;
+      this.#streamAudioOffsetMs = 0;
+      this.#clearOverlapFrames();
+      this.#startedAt = this.now();
+    } catch (error) {
+      this.#terminalError = error instanceof Error ? error : new Error("STT_RESTART_FAILED");
+      throw this.#terminalError;
+    }
   }
 
   async #rollover() {
@@ -76,12 +109,16 @@ export class RollingSpeechSession {
       this.#streamAudioOffsetMs = nextAudioOffsetMs;
       this.#startedAt = this.now();
     } catch (error) {
+      // Rollover remap needs final words inside the overlap window; a silent
+      // room makes that impossible (STT_ROLLOVER_WORDS_UNAVAILABLE). That is a
+      // normal condition, not a fault — restart fresh instead of poisoning
+      // every future frame.
+      console.warn("[stt] rollover failed, restarting stream:", error instanceof Error ? error.message : error);
       await Promise.allSettled([previous.close(), next.close()]);
       previousPcmRing?.clear();
       nextPcmRing?.clear();
       this.#stream = null;
-      this.#terminalError = error instanceof Error ? error : new Error("STT_ROLLOVER_FAILED");
-      throw this.#terminalError;
+      await this.#restart();
     }
   }
 

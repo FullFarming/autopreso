@@ -40,7 +40,7 @@ test("resolveCodexCliCredentials refreshes expiring Codex CLI auth in place", as
 });
 
 function writeCodexAuth({ accessToken, refreshToken }) {
-  const codexHome = mkdtempSync(join(tmpdir(), "autopreso-codex-"));
+  const codexHome = mkdtempSync(join(tmpdir(), "realtime-noel-codex-"));
   writeFileSync(
     join(codexHome, "auth.json"),
     JSON.stringify({ tokens: { access_token: accessToken, refresh_token: refreshToken } }),

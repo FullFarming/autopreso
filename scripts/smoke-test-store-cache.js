@@ -131,7 +131,7 @@ async function runStatelessMode(creds) {
   console.log("\n=== mode: stateless (store:false, full history each turn) ===");
   const rows = [];
   // Build a chat-like input array that grows by one entry per turn, mirroring
-  // how the autopreso server currently sends full agent history.
+  // how the Realtime Noel server currently sends full agent history.
   const history = [];
   for (let i = 1; i <= turns; i += 1) {
     history.push({
@@ -148,7 +148,7 @@ async function runStatelessMode(creds) {
     });
     if (i > 1) {
       // Insert a synthetic prior assistant reply so the cache prefix has
-      // something stable on each turn (mimics how autopreso re-sends history
+      // something stable on each turn (mimics how Realtime Noel re-sends history
       // including the assistant UNDERSTOOD reply from warmup).
       history.splice(history.length - 1, 0, {
         role: "assistant",

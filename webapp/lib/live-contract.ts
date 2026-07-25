@@ -4,11 +4,14 @@ export type LiveVoiceProvider = "gemini" | "openai";
 export type GlossaryPack = "general_cre" | "hotel" | "fnb";
 export type VoiceStatus = "disabled" | "analyzing" | "ready" | "unavailable";
 
-export type LiveSessionStatus = "preparing" | "live" | "stopped" | "failed";
+export type LiveSessionStatus = "preparing" | "live" | "paused" | "stopped" | "failed";
+export type CaptionTranslationStatus = "verbatim" | "translated" | "failed";
 
 export interface LiveSession {
   id: string;
   hostId: string;
+  title: string;
+  scheduledAt: string | null;
   sessionType: LiveSessionType;
   outputMode: LiveOutputMode;
   voiceProvider: LiveVoiceProvider;
@@ -20,6 +23,44 @@ export interface LiveSession {
   version: number;
   admissionOpenUntil: string | null;
   expiresAt: string;
+  endedAt?: string | null;
+  /** Contract C10: true when a stage/waiting-room cover image was uploaded.
+   *  Clients fetch it from GET /api/live-sessions/[id]/cover. */
+  hasCoverImage?: boolean;
+  /** Content-hash version of the cover — clients append it as a cache key
+   *  so replacing the cover refreshes already-open stages and viewers. */
+  coverImageVersion?: string | null;
+}
+
+export interface LiveParticipantIdentity {
+  displayName: string;
+  department: string;
+  jobTitle: string;
+}
+
+export type JoinLiveSessionInput = LiveParticipantIdentity & {
+  accessToken: string;
+  deviceId: string;
+  inviteToken?: string;
+  admissionCode?: string;
+};
+
+export interface LiveParticipantActivity extends LiveParticipantIdentity {
+  participantId: string;
+  joinedAt: string;
+  lastSeenAt: string;
+  isPresent: boolean;
+  utteranceCount: number;
+  speakingSeconds: number;
+  lastSpokeAt: string | null;
+}
+
+export interface LiveSpeechActivity extends LiveParticipantIdentity {
+  seq: number;
+  participantId: string | null;
+  text: string;
+  startedAt: string | null;
+  endedAt: string;
 }
 
 export interface SpeakerAssignment {
@@ -29,6 +70,20 @@ export interface SpeakerAssignment {
   voiceName: string | null;
   voiceStatus: VoiceStatus;
   lastSeenAt: string;
+  /** Contract C5: attributed participant identity, present in meeting mode. */
+  name?: string;
+  department?: string;
+  jobTitle?: string;
+}
+
+/** Contract C5: floor holder identity for the speaker-change overlay.
+ *  `displayName` is kept for events from older gateways. */
+export interface LiveFloorHolder {
+  participantId?: string;
+  name?: string;
+  displayName?: string;
+  department?: string;
+  jobTitle?: string;
 }
 
 export interface CaptionEvent {
@@ -39,8 +94,24 @@ export interface CaptionEvent {
   speaker: SpeakerAssignment | null;
   text: string;
   isFinal: boolean;
+  /** What the speaker actually said, when `text` is a translation of it.
+   *  null on the source lane, where `text` already IS the original. Powers the
+   *  viewer's per-entry 원문보기 disclosure. */
+  sourceText?: string | null;
+  /** Normalized language the utterance was recognized in, or null when the
+   *  STT provider reported none. */
+  sourceLanguage?: string | null;
+  /** "verbatim": `text` is the original. "translated": `text` is a real
+   *  translation of `sourceText`. "failed": translation failed and the
+   *  original was published on this lane, so `text` is NOT in `language` —
+   *  the viewer must present it as the original, not as its chosen language. */
+  translationStatus?: CaptionTranslationStatus;
+  sourceStartedAt?: string | null;
   sourceEndedAt: string;
   emittedAt: string;
+  /** Contract C2: true when the gateway re-sends a missed caption after
+   *  a viewer subscribes with lastSeq. Same dedupe path as live captions. */
+  replay?: boolean;
 }
 
 export interface AudioChunkHeader {
@@ -60,13 +131,24 @@ export interface LiveSnapshot {
   speakers: SpeakerAssignment[];
 }
 
+export interface RecordingStatusEvent {
+  type: "recording-status";
+  sessionId: string;
+  language: string;
+  status: "error";
+  code: "UTTERANCE_PERSIST_FAILED";
+  seq: number;
+  message: string;
+}
+
 export type LiveControlEvent =
   | { type: "session-status"; sessionId: string; status: LiveSessionStatus; code?: string }
-  | { type: "floor"; sessionId: string; holder: { displayName: string } | null }
+  | { type: "floor"; sessionId: string; holder: LiveFloorHolder | null }
   | { type: "language-status"; sessionId: string; language: string; status: "preparing" | "ready" | "unavailable"; code?: string }
   | { type: "audio-control"; seq: number; sessionId: string; language: string; action: "clear" | "restart"; reason: "interrupted" | "queue_restart" }
   | { type: "speaker-legend"; sessionId: string; speakers: SpeakerAssignment[] }
   | { type: "language-removed"; sessionId: string; language: string; code: "LANGUAGE_REMOVED" }
+  | RecordingStatusEvent
   | { type: "error"; sessionId: string; code: string; message: string };
 
 export type LiveBroadcastEvent = CaptionEvent | LiveControlEvent;
@@ -76,6 +158,8 @@ export type ApiFailure = { ok: false; error: string; code: string };
 export type ApiResponse<T> = ApiSuccess<T> | ApiFailure;
 
 export interface CreateLiveSessionInput {
+  title: string;
+  scheduledAt?: string | null;
   sessionType: LiveSessionType;
   languages: string[];
   outputMode?: LiveOutputMode;
@@ -86,6 +170,8 @@ export interface CreateLiveSessionInput {
 
 export interface UpdateLiveSessionInput {
   version: number;
+  title?: string;
+  scheduledAt?: string | null;
   sessionType?: LiveSessionType;
   languages?: string[];
   outputMode?: LiveOutputMode;

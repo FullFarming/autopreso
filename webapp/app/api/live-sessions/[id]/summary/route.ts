@@ -1,6 +1,7 @@
 import { NextRequest } from "next/server";
 
-import { AuthenticationError, getBearerToken, requireHost, verifyViewerGrantToken, VIEWER_GRANT_COOKIE } from "@/lib/auth/live-auth";
+import { AuthenticationError, requireHost } from "@/lib/auth/live-auth";
+import { buildParticipantActivity } from "@/lib/live/activity";
 import { toLiveFailure } from "@/lib/live/errors";
 import {
   fetchUtterances,
@@ -11,7 +12,10 @@ import {
 } from "@/lib/live/summary";
 import { parseSessionId } from "@/lib/live/validation";
 import { apiError, apiSuccess } from "@/lib/security/api-response";
+import { LiveAdmissionError, SupabaseLiveAdmissionStore } from "@/lib/security/live-admission-store";
 import { liveLanguageInputSchema } from "@/lib/security/live-input-validation";
+import { enforceSummaryGenerationRateLimit } from "@/lib/security/live-rate-limit";
+import { authorizeParticipantRecordRequest, isHostOwnershipMiss, AuthorizationError } from "@/lib/security/live-viewer-authorization";
 
 function parseLanguage(value: string | null): string | null {
   const parsed = liveLanguageInputSchema.safeParse(value);
@@ -21,9 +25,12 @@ function parseLanguage(value: string | null): string | null {
 /** Host-only: generate (or regenerate) the meeting summary for one language. */
 export async function POST(request: NextRequest, context: { params: Promise<{ id: string }> }) {
   try {
-    await requireHost(request);
+    const { hostId } = await requireHost(request);
     const { id } = await context.params;
     const sessionId = parseSessionId(id);
+    const store = new SupabaseLiveAdmissionStore();
+    await store.assertHostSessionOwnership(sessionId, hostId);
+    await enforceSummaryGenerationRateLimit(hostId, sessionId, store);
     const body: unknown = await request.json().catch(() => null);
     const language = parseLanguage(
       body && typeof body === "object" && !Array.isArray(body) && typeof (body as { language?: unknown }).language === "string"
@@ -31,15 +38,31 @@ export async function POST(request: NextRequest, context: { params: Promise<{ id
         : null,
     );
     if (!language) return apiError("요약할 언어를 선택하세요.", "LANGUAGE_REQUIRED", 400);
-    const utterances = await fetchUtterances(sessionId, language);
+    const [utterances, activity] = await Promise.all([
+      fetchUtterances(sessionId, language),
+      buildParticipantActivity(sessionId, hostId, language),
+    ]);
     if (utterances.length === 0) {
       return apiError("요약할 발언 기록이 없습니다.", "NO_UTTERANCES", 404);
     }
-    const { summary, model } = await generateMeetingSummary(utterances, language);
+    const participantById = new Map(activity.participants.map((participant) => [participant.participantId, participant]));
+    const attributedUtterances = utterances.map((utterance) => {
+      const participant = utterance.participantId ? participantById.get(utterance.participantId) : undefined;
+      return participant
+        ? {
+            ...utterance,
+            speakerName: participant.displayName,
+            speakerDepartment: participant.department,
+            speakerJobTitle: participant.jobTitle,
+          }
+        : utterance;
+    });
+    const { summary, model } = await generateMeetingSummary(attributedUtterances, language);
     await upsertMeetingSummary(sessionId, language, summary, model);
     return apiSuccess({ summary, model, utteranceCount: utterances.length });
   } catch (error: unknown) {
     if (error instanceof AuthenticationError) return apiError(error.message, "HOST_AUTH_REQUIRED", 401);
+    if (error instanceof LiveAdmissionError) return apiError(error.message, error.code, error.status);
     if (error instanceof SummaryError) return apiError(error.message, error.code, error.status);
     const failure = toLiveFailure(error);
     if (failure.body.code === "SECURITY_NOT_CONFIGURED") {
@@ -56,22 +79,24 @@ export async function GET(request: NextRequest, context: { params: Promise<{ id:
     const sessionId = parseSessionId(id);
     const language = parseLanguage(request.nextUrl.searchParams.get("language"));
     if (!language) return apiError("언어를 선택하세요.", "LANGUAGE_REQUIRED", 400);
-    let isAuthorized = false;
+    const store = new SupabaseLiveAdmissionStore();
     try {
-      await requireHost(request);
-      isAuthorized = true;
-    } catch {
-      const token = getBearerToken(request) ?? request.cookies.get(VIEWER_GRANT_COOKIE)?.value;
-      const claims = await verifyViewerGrantToken(token);
-      // 종료된 미팅의 요약도 봐야 하므로 활성 토픽 검사는 하지 않습니다.
-      isAuthorized = claims.sessionId === sessionId;
+      const { hostId } = await requireHost(request);
+      await store.assertHostSessionOwnership(sessionId, hostId);
+    } catch (error: unknown) {
+      // Also falls through when a valid host cookie simply is not THIS
+      // session's owner, not only when there is no host session at all.
+      if (!isHostOwnershipMiss(error)) throw error;
+      await authorizeParticipantRecordRequest(request, sessionId, store);
     }
-    if (!isAuthorized) return apiError("요약을 볼 권한이 없습니다.", "SUMMARY_FORBIDDEN", 403);
     const record = await readMeetingSummary(sessionId, language);
     if (!record) return apiError("아직 요약이 준비되지 않았습니다.", "SUMMARY_NOT_READY", 404);
     return apiSuccess(record);
   } catch (error: unknown) {
-    if (error instanceof AuthenticationError) return apiError("요약을 볼 권한이 없습니다.", "SUMMARY_FORBIDDEN", 403);
+    if (error instanceof AuthenticationError || error instanceof AuthorizationError) {
+      return apiError("요약을 볼 권한이 없습니다.", "SUMMARY_FORBIDDEN", 403);
+    }
+    if (error instanceof LiveAdmissionError) return apiError(error.message, error.code, error.status);
     if (error instanceof SummaryError) return apiError(error.message, error.code, error.status);
     const failure = toLiveFailure(error);
     if (failure.body.code === "SECURITY_NOT_CONFIGURED") {

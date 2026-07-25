@@ -4,6 +4,7 @@ const DEFAULT_MAX_SEGMENT_MILLISECONDS = 2_400;
 export class StableUtteranceSegmenter {
   #pendingWords = new Map();
   #emittedWords = new Map();
+  #lastSpeakerLabel = "1";
 
   constructor({
     minimumStability = DEFAULT_MINIMUM_STABILITY,
@@ -24,10 +25,21 @@ export class StableUtteranceSegmenter {
     if (!isFinal && Number(result?.stability ?? 0) < this.minimumStability) return [];
     const alternative = result?.alternatives?.[0];
     const words = (alternative?.words ?? []).map(normalizeWord).filter((word) => word.text);
-    if (isFinal && words.some((word) => !word.speakerLabel)) {
-      throw new Error("STT_SPEAKER_CONTINUITY_AMBIGUOUS");
+    if (isFinal) {
+      // Streaming diarization routinely finalizes trailing words before their
+      // speaker tag settles. Dropping the caption is worse than a provisional
+      // label, so unlabeled final words inherit the last known speaker.
+      for (const word of words) {
+        if (word.speakerLabel) this.#lastSpeakerLabel = word.speakerLabel;
+        else word.speakerLabel = this.#lastSpeakerLabel;
+      }
     }
     for (const word of words) this.#acceptWord(word);
+    if (isFinal) {
+      for (const [key, word] of this.#pendingWords) {
+        if (!word.speakerLabel) this.#pendingWords.set(key, { ...word, speakerLabel: this.#lastSpeakerLabel });
+      }
+    }
     return this.#flush({ isFinal, sourceLanguage: result?.languageCode });
   }
 
@@ -38,11 +50,9 @@ export class StableUtteranceSegmenter {
 
   #acceptWord(word) {
     const key = wordKey(word);
-    const previous = this.#pendingWords.get(key) ?? this.#emittedWords.get(key);
-    if (previous?.speakerLabel && word.speakerLabel && previous.speakerLabel !== word.speakerLabel) {
-      throw new Error("STT_SPEAKER_CONTINUITY_AMBIGUOUS");
-    }
     if (this.#emittedWords.has(key)) return;
+    const previous = this.#pendingWords.get(key);
+    // Diarization refines labels across interim results; the newest label wins.
     this.#pendingWords.set(key, {
       ...word,
       speakerLabel: word.speakerLabel || previous?.speakerLabel || "",
@@ -56,8 +66,8 @@ export class StableUtteranceSegmenter {
       if (pending.length === 0) break;
       const first = pending[0];
       if (!first.speakerLabel) {
-        if (isFinal) throw new Error("STT_SPEAKER_CONTINUITY_AMBIGUOUS");
-        break;
+        if (!isFinal) break;
+        first.speakerLabel = this.#lastSpeakerLabel;
       }
       const run = [];
       for (const word of pending) {
@@ -87,7 +97,7 @@ export class StableUtteranceSegmenter {
       }
       utterances.push({
         speakerLabel: first.speakerLabel,
-        text: emitted.map((word) => word.text).join(" ").trim(),
+        text: joinWordTexts(emitted),
         sourceStartOffsetMs: emitted[0].startMs,
         sourceEndOffsetMs: emitted.at(-1).endMs,
         ...(sourceLanguage ? { sourceLanguage } : {}),
@@ -177,6 +187,16 @@ export class StableTranscriptSegmenter {
     this.#previousStableTokens = [];
     this.#lastEmittedEndMs = 0;
   }
+}
+
+/** Diarized CJK responses tokenize words as SentencePiece pieces where "▁"
+ *  marks a word boundary; joining those with spaces produced broken captions
+ *  like "회 의 를". When the marker is present, concatenate and turn markers
+ *  into spaces; otherwise keep the legacy space join for plain words. */
+function joinWordTexts(words) {
+  const hasMarker = words.some((word) => word.text.includes("▁"));
+  if (!hasMarker) return words.map((word) => word.text).join(" ").trim();
+  return words.map((word) => word.text).join("").replaceAll("▁", " ").replace(/\s+/gu, " ").trim();
 }
 
 function normalizeWord(word) {

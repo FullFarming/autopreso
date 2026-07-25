@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { createOpenAI } from "@ai-sdk/openai";
 import { generateText, stepCountIs, streamText, tool } from "ai";
 import express from "express";
 import { WebSocket, WebSocketServer } from "ws";
@@ -18,7 +19,15 @@ import {
 import { createMoonshineTranscription as createDefaultMoonshineTranscription } from "./moonshine-transcription.js";
 import { createOpenAITranscription as createDefaultOpenAITranscription } from "./openai-transcription.js";
 import { audioSecondsFromBase64Pcm16 } from "./session-cost.js";
-import { validateAgentInstructions } from "./settings-store.js";
+import { DEFAULT_SUBTITLE_SETTINGS, validateAgentInstructions, validateSubtitleSettings } from "./settings-store.js";
+import { generateGeminiText } from "./gemini-text-generation.js";
+import { GLOSSARY_PRESETS } from "./glossary-presets.js";
+import { createSessionTranscripts } from "./session-transcripts.js";
+import { createSubtitleChannelHub } from "./subtitle-channels.js";
+import { createSubtitleHistory, historyToCsv } from "./subtitle-history.js";
+import { SUBTITLE_LANGUAGES, isSupportedSubtitleLanguage } from "./subtitle-languages.js";
+import { createSubtitlePolisher } from "./subtitle-polish.js";
+import { createSubtitleRealtimeManager } from "./subtitle-realtime.js";
 import { broadcast, createWhiteboardSession } from "./whiteboard-session.js";
 import { detectMalformedLayoutWarnings, normalizeWhiteboardElements } from "./whiteboard-elements.js";
 import { extractWhiteboardKeywords } from "./whiteboard-keywords.js";
@@ -26,15 +35,53 @@ import { applyWhiteboardEditOperations, formatLineNumberedWhiteboard } from "./w
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = path.join(__dirname, "..", "public");
+const SUBTITLE_NO_STORE_ASSETS = new Set([
+  "subtitle.html",
+  "subtitle-dashboard.js",
+  "subtitle-workspace.js",
+  "subtitle-audio-player.js",
+  "subtitle.css",
+  "subtitle-overlay.html",
+  "subtitle-overlay.js",
+  "subtitle-controller.html",
+  "subtitle-controller.js",
+]);
 export const DEFAULT_AGENT_TIMEOUT_MS = 90_000;
+const OPENAI_REALTIME_TRANSLATION_VALIDATE_URL = "wss://api.openai.com/v1/realtime/translations?model=gpt-realtime-translate";
 
 export async function startServer(options) {
   const app = express();
+  app.use((req, res, next) => {
+    if (!isMutatingMethod(req.method) || isAllowedLocalOrigin(req.headers.origin, req.headers.host)) {
+      next();
+      return;
+    }
+    res.status(403).json({ ok: false, error: "허용되지 않은 요청 출처입니다.", code: "INVALID_ORIGIN" });
+  });
   app.use(express.json({ limit: "1mb" }));
-  app.use(express.static(PUBLIC_DIR));
+  app.use(express.static(PUBLIC_DIR, {
+    setHeaders(res, filePath) {
+      const relativePath = path.relative(PUBLIC_DIR, filePath).split(path.sep).join("/");
+      if (!SUBTITLE_NO_STORE_ASSETS.has(relativePath)) return;
+      res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
+      res.setHeader("Pragma", "no-cache");
+      res.setHeader("Expires", "0");
+      res.setHeader("Surrogate-Control", "no-store");
+    },
+  }));
 
   const httpServer = createHttpServer(app);
-  const wss = new WebSocketServer({ server: httpServer, path: "/ws" });
+  const wss = new WebSocketServer({ noServer: true, maxPayload: 1_000_000 });
+  httpServer.on("upgrade", (request, socket, head) => {
+    if (request.url !== "/ws" || !isAllowedLocalOrigin(request.headers.origin, request.headers.host)) {
+      socket.write("HTTP/1.1 403 Forbidden\r\n\r\n");
+      socket.destroy();
+      return;
+    }
+    wss.handleUpgrade(request, socket, head, (client) => {
+      wss.emit("connection", client, request);
+    });
+  });
   const state = createWhiteboardSession({
     options,
     wss,
@@ -55,6 +102,72 @@ export async function startServer(options) {
     queueTranscript: (transcript) => state.queueTranscript(transcript),
     state,
   });
+  const subtitleHistory = createSubtitleHistory({
+    settingsStore: options.settingsStore,
+    fetchImpl: options.fetchImpl ?? globalThis.fetch,
+    log: options.log ?? console,
+  });
+  await subtitleHistory.hydrate();
+  // Per-session recording: unlike the rolling translation-only history above,
+  // this keeps the ORIGINAL source text with per-line timestamps so a session
+  // can be replayed and AI-summarized after it ends.
+  const sessionTranscripts = options.transcriptsDir
+    ? createSessionTranscripts({ storageDir: options.transcriptsDir, log: options.log ?? console })
+    : null;
+  // Per-viewer subtitle channels: every lane message gets a seq stamp and is
+  // fanned out through the hub so a client subscribed to specific languages
+  // (subtitle:subscribe) only receives its own lanes. Clients that never
+  // subscribe receive everything, exactly as before.
+  const subtitleHub = createSubtitleChannelHub();
+  const broadcastSubtitleMessage = (message) => {
+    const stamped = subtitleHub.ingest(message);
+    const serialized = JSON.stringify(stamped);
+    for (const wsClient of wss.clients) {
+      if (wsClient.readyState === WebSocket.OPEN && subtitleHub.shouldSend(wsClient, stamped)) {
+        wsClient.send(serialized);
+      }
+    }
+    if (message.type !== "subtitle:committed") return;
+    void sessionTranscripts?.recordLine(message);
+    void subtitleHistory.record(message)
+      .then((snapshot) => broadcast(wss, { type: "subtitle:history", ...snapshot }))
+      .catch((error) => broadcast(wss, {
+        type: "subtitle:history",
+        ...subtitleHistory.getSnapshot(),
+        recorderStatus: { ...subtitleHistory.getSnapshot().recorderStatus, lastError: error.message },
+      }));
+  };
+  // Second-pass subtitle polish. Gemini is the primary translation path:
+  // key 1 stays on gemini-3.5-live-translate-preview for low-latency Live
+  // Translate, while key 2 (when configured) runs the committed-line glossary
+  // finalizer on Gemini Flash so terminology work cannot slow the live socket.
+  const subtitlePolish = async (args) => {
+    const saved = options.settingsStore ? await options.settingsStore.load() : {};
+    const env = options.env ?? process.env;
+    const polishOptions = selectSubtitlePolishOptions({ args, saved, env });
+    if (!polishOptions) return args?.translatedText;
+    const polisher = polishOptions.provider === "gemini"
+      ? createSubtitlePolisher({
+        generateText: options.subtitleGeminiPolishGenerateText ?? ((request) => generateGeminiText({
+          ...request,
+          apiKey: polishOptions.apiKey,
+          fetchImpl: options.fetchImpl ?? globalThis.fetch,
+        })),
+        model: polishOptions.modelId,
+      })
+      : createSubtitlePolisher({
+        generateText: options.subtitlePolishGenerateText ?? generateText,
+        model: createOpenAI({ apiKey: polishOptions.apiKey })(polishOptions.modelId),
+      });
+    return polisher.polish(args);
+  };
+  const subtitles = createSubtitleRealtimeManager({
+    broadcast: broadcastSubtitleMessage,
+    settingsStore: options.settingsStore,
+    env: options.env ?? process.env,
+    createWebSocket: options.createSubtitleWebSocket,
+    polish: options.subtitlePolish ?? subtitlePolish,
+  });
 
   app.get("/api/config", async (_req, res) => {
     const sanitized = options.settingsStore ? await options.settingsStore.getSanitized() : null;
@@ -67,6 +180,188 @@ export async function startServer(options) {
   app.get("/api/settings", async (_req, res) => {
     if (!options.settingsStore) return res.status(404).json({ error: "Settings store not available." });
     res.json(await options.settingsStore.getSanitized());
+  });
+
+  app.get("/api/subtitles/history", (_req, res) => {
+    res.json({ ok: true, data: subtitleHistory.getSnapshot() });
+  });
+
+  // Language registry for the dashboard/overlay UI — the single source of
+  // truth lives in src/subtitle-languages.js; the frontend fetches it here so
+  // the pill list never drifts from what the server accepts.
+  app.get("/api/subtitle-languages", (_req, res) => {
+    res.json({
+      ok: true,
+      languages: SUBTITLE_LANGUAGES.map(({ code, label, nativeLabel }) => ({ code, label, nativeLabel })),
+    });
+  });
+
+  // Portable settings transfer remains subtitle-only so a downloaded file can
+  // never become a second plaintext store for long-lived provider credentials.
+  app.get("/api/glossary-presets", (_req, res) => {
+    res.json(GLOSSARY_PRESETS);
+  });
+
+  app.get("/api/settings/export", async (_req, res) => {
+    if (!options.settingsStore) return res.status(404).json({ error: "Settings store not available." });
+    const settings = await options.settingsStore.load();
+    const payload = createSafeSettingsExport(settings);
+    res.setHeader("content-type", "application/json; charset=utf-8");
+    res.setHeader("content-disposition", 'attachment; filename="realtime-noel-settings.json"');
+    res.send(JSON.stringify(payload, null, 2));
+  });
+
+  app.get("/api/subtitles/history/export.csv", (_req, res) => {
+    const csv = historyToCsv(subtitleHistory.getSnapshot());
+    res.setHeader("content-type", "text/csv; charset=utf-8");
+    res.setHeader("content-disposition", 'attachment; filename="realtime-noel-subtitles.csv"');
+    // UTF-8 BOM so Excel decodes Korean correctly on double-click.
+    res.send(String.fromCharCode(0xfeff) + csv);
+  });
+
+  app.post("/api/subtitles/history/clear", async (_req, res) => {
+    const snapshot = await subtitleHistory.clear();
+    broadcast(wss, { type: "subtitle:history", ...snapshot });
+    res.json({ ok: true, data: snapshot });
+  });
+
+  // Session transcripts: full timestamped source-text record per caption
+  // session, plus on-demand (and post-stop automatic) AI summaries.
+  const selectTranscriptSummaryGenerator = async () => {
+    if (options.subtitleSummaryGenerateText) return options.subtitleSummaryGenerateText;
+    const saved = options.settingsStore ? await options.settingsStore.load() : {};
+    const env = options.env ?? process.env;
+    const geminiKey = saved.apiKeys?.gemini || env.GEMINI_API_KEY || "";
+    if (geminiKey) {
+      const model = saved.subtitle?.geminiPolishModel || DEFAULT_SUBTITLE_SETTINGS.geminiPolishModel;
+      return (request) => generateGeminiText({
+        ...request,
+        apiKey: geminiKey,
+        model,
+        fetchImpl: options.fetchImpl ?? globalThis.fetch,
+      });
+    }
+    const openaiKey = saved.apiKeys?.openai || env.OPENAI_API_KEY || "";
+    if (openaiKey) {
+      return async ({ system, prompt }) => {
+        const { text } = await generateText({
+          model: createOpenAI({ apiKey: openaiKey })(env.OPENAI_SUMMARY_MODEL || "gpt-5.5-mini"),
+          system,
+          prompt,
+        });
+        return { text };
+      };
+    }
+    return null;
+  };
+
+  const summarizeSessionTranscript = async (sessionId) => {
+    if (!sessionTranscripts) throw new Error("세션 기록 저장소가 설정되지 않았습니다.");
+    const generator = await selectTranscriptSummaryGenerator();
+    if (!generator) throw new Error("AI 요약에는 Gemini 또는 OpenAI API 키가 필요합니다. Settings에서 키를 저장하세요.");
+    const summary = await sessionTranscripts.summarize(sessionId, generator);
+    broadcast(wss, { type: "subtitle:session-summary", sessionId, summary });
+    return summary;
+  };
+
+  app.get("/api/subtitles/sessions", async (_req, res) => {
+    if (!sessionTranscripts) return res.json({ ok: true, data: [] });
+    res.json({ ok: true, data: await sessionTranscripts.list() });
+  });
+
+  app.get("/api/subtitles/sessions/:id", async (req, res) => {
+    if (!sessionTranscripts) return res.status(404).json({ ok: false, error: "세션 기록 저장소가 설정되지 않았습니다." });
+    const session = await sessionTranscripts.get(req.params.id);
+    if (!session) return res.status(404).json({ ok: false, error: "세션 기록을 찾을 수 없습니다." });
+    res.json({ ok: true, data: session });
+  });
+
+  app.post("/api/subtitles/sessions/:id/summary", async (req, res) => {
+    try {
+      res.json({ ok: true, data: await summarizeSessionTranscript(req.params.id) });
+    } catch (error) {
+      res.status(422).json({ ok: false, error: error.message });
+    }
+  });
+
+  // Live Call archives arrive from the Electron main process after the host
+  // ends a call: full speaker-attributed transcript (+ meeting summary when
+  // the workspace already generated one). Transcripts can exceed the global
+  // 1mb JSON cap, so this route parses its own body.
+  app.post("/api/subtitles/sessions/import", express.json({ limit: "25mb" }), async (req, res) => {
+    if (!sessionTranscripts) return res.status(404).json({ ok: false, error: "세션 기록 저장소가 설정되지 않았습니다." });
+    const meta = await sessionTranscripts.importSession(req.body ?? {});
+    if (!meta) return res.status(400).json({ ok: false, error: "세션 기록 형식이 올바르지 않습니다." });
+    broadcast(wss, { type: "subtitle:sessions", sessions: await sessionTranscripts.list() });
+    // No stored summary yet → generate one locally from the imported lines.
+    if (!meta.hasSummary && meta.lineCount > 0) {
+      summarizeSessionTranscript(meta.id).catch((error) => {
+        (options.log ?? console).warn?.(`[session-transcripts] import summary skipped: ${error?.message ?? error}`);
+      });
+    }
+    res.json({ ok: true, data: meta });
+  });
+
+  app.get("/api/subtitles/sessions/:id/audio/:source", async (req, res) => {
+    const audioPath = await sessionTranscripts?.getAudioFile(req.params.id, req.params.source);
+    if (!audioPath) return res.status(404).json({ ok: false, error: "세션 음성 파일이 없습니다." });
+    res.setHeader("content-type", "audio/wav");
+    res.sendFile(audioPath);
+  });
+
+  app.post("/api/subtitles/openai/validate", async (req, res) => {
+    const providedApiKey = typeof req.body?.apiKey === "string" ? req.body.apiKey.trim() : "";
+    const saved = options.settingsStore ? await options.settingsStore.load() : {};
+    const env = options.env ?? process.env;
+    const apiKey = providedApiKey || saved.apiKeys?.openai || env.OPENAI_API_KEY || "";
+    if (!apiKey.trim()) {
+      return res.status(400).json({
+        ok: false,
+        error: "OpenAI API key를 입력하세요.",
+        code: "OPENAI_KEY_REQUIRED",
+      });
+    }
+    try {
+      await validateOpenAIRealtimeTranslationKey({
+        apiKey,
+        createWebSocket: options.createSubtitleWebSocket ?? ((url, protocols, init) => new WebSocket(url, protocols, init)),
+      });
+      res.json({ ok: true, data: { status: "valid" } });
+    } catch {
+      res.status(400).json({
+        ok: false,
+        error: "OpenAI Realtime 연결 확인에 실패했습니다. API key, 네트워크, 사용량 한도를 확인하세요.",
+        code: "OPENAI_REALTIME_VALIDATE_FAILED",
+      });
+    }
+  });
+
+  app.post("/api/subtitles/gemini/validate", async (req, res) => {
+    const providedApiKey = typeof req.body?.apiKey === "string" ? req.body.apiKey.trim() : "";
+    const saved = options.settingsStore ? await options.settingsStore.load() : {};
+    const env = options.env ?? process.env;
+    const apiKey = providedApiKey || saved.apiKeys?.gemini || env.GEMINI_API_KEY || "";
+    if (!apiKey.trim()) {
+      return res.status(400).json({
+        ok: false,
+        error: "Gemini API key를 입력하세요.",
+        code: "GEMINI_KEY_REQUIRED",
+      });
+    }
+    try {
+      await validateGeminiTextGenerationKey({
+        apiKey,
+        model: saved.subtitle?.geminiPolishModel || "gemini-3.5-flash",
+        fetchImpl: options.fetchImpl ?? globalThis.fetch,
+      });
+      res.json({ ok: true, data: { status: "valid" } });
+    } catch {
+      res.status(400).json({
+        ok: false,
+        error: "Gemini 연결 확인에 실패했습니다. API key, 프로젝트 권한, 사용량 한도를 확인하세요.",
+        code: "GEMINI_VALIDATE_FAILED",
+      });
+    }
   });
 
   app.post("/api/session/reset", (_req, res) => {
@@ -84,8 +379,8 @@ export async function startServer(options) {
     }
     // Snapshot the user's free-form Agent instructions at start so the cached
     // system-prompt prefix stays stable for the whole preso. Edits made to
-    // the textarea after Start Preso land on disk but only take effect on the
-    // next Start Preso.
+    // the textarea after Start Realtime Noel land on disk but only take effect
+    // on the next Start Realtime Noel.
     let settings;
     try {
       settings = options.settingsStore ? await options.settingsStore.load() : null;
@@ -96,7 +391,7 @@ export async function startServer(options) {
     const agentInstructions = typeof settings?.agentInstructions === "string" ? settings.agentInstructions : "";
     const primerMessage = buildStagingPrimerMessage({ stagingElements, stagingScreenshot });
     const keywords = extractWhiteboardKeywords(stagingElements);
-    console.log(`[autopreso] preso/start: ${keywords.length} staging keyword(s) for transcription bias`);
+    console.log(`[realtime-noel] realtime/start: ${keywords.length} staging keyword(s) for transcription bias`);
     transcription.setSessionContext({ keywords });
     state.startPreso({ primerMessage, agentInstructions });
     state.startWarmupLoop({
@@ -152,7 +447,10 @@ export async function startServer(options) {
     }
   });
 
-  httpServer.on("close", () => transcription.close());
+  httpServer.on("close", () => {
+    transcription.close();
+    subtitles.close();
+  });
 
   wss.on("connection", async (client) => {
     let activeAudioSessionId = null;
@@ -165,6 +463,11 @@ export async function startServer(options) {
     client.send(JSON.stringify({ type: "mode", mode: state.mode }));
     client.send(JSON.stringify({ type: "warmup", ...state.warmupState }));
     client.send(JSON.stringify({ type: "cost", ...state.cost.getSummary() }));
+    client.send(JSON.stringify({ type: "subtitle:history", ...subtitleHistory.getSnapshot() }));
+    // Late-join sync: paint the current live subtitle lanes immediately
+    // instead of waiting for the next partial.
+    client.send(JSON.stringify(subtitleHub.snapshotFor(client)));
+    client.on("close", () => subtitleHub.removeClient(client));
     if (state.mode === "live") {
       client.send(JSON.stringify({ type: "whiteboard:update", elements: state.elements }));
     }
@@ -225,10 +528,150 @@ export async function startServer(options) {
           client.send(JSON.stringify({ type: "error", message: `Failed to apply settings: ${error.message}` }));
         }
       }
+
+      if (message.type === "subtitle:live-call-caption") {
+        // Live Call participant (Speak) captions: the media gateway mirrors
+        // them to the desktop host socket, the Electron main process forwards
+        // them over IPC, and the dashboard relays them here. Rebroadcast as
+        // native subtitle lines so the overlay, preview, history, and session
+        // records treat participant speech exactly like local captions.
+        // Identity travels as structured fields — the overlay renders a
+        // name·department·title badge instead of a "Name:" text prefix, and
+        // the session record keeps attribution via the speaker field.
+        const translatedText = String(message.translatedText ?? "").trim();
+        if (translatedText && message.recordOnly === true) {
+          // 원문 보관: the untranslated source line goes into the session
+          // record (Records shows the original alongside the translation)
+          // but NEVER onto the overlay — screen captions stay
+          // translation-direction only, exactly like the subtitle policy.
+          void sessionTranscripts?.recordLine({
+            speaker: String(message.speaker ?? "").trim().slice(0, 80),
+            sourceText: translatedText,
+            translatedText: "",
+          });
+          return;
+        }
+        if (translatedText) {
+          const speakerName = String(message.speaker ?? "").trim().slice(0, 80);
+          broadcastSubtitleMessage({
+            type: message.partial ? "subtitle:partial" : "subtitle:committed",
+            source: "live-call",
+            targetLanguage: String(message.targetLanguage ?? ""),
+            sourceText: String(message.sourceText ?? ""),
+            translatedText,
+            ...(speakerName ? {
+              speaker: speakerName,
+              liveCallSpeaker: {
+                name: speakerName,
+                department: String(message.speakerDepartment ?? "").trim().slice(0, 80),
+                jobTitle: String(message.speakerJobTitle ?? "").trim().slice(0, 100),
+              },
+            } : {}),
+          });
+        }
+      }
+
+      if (message.type === "subtitle:mirror") {
+        // Phone-link mirror: the dashboard renderer receives lines from the
+        // paired web session (Supabase, Chromium network stack → passes
+        // corporate proxies) and relays them here; rebroadcast as real
+        // subtitle events so the overlay/preview/history treat them natively.
+        const translatedText = String(message.translatedText ?? "").trim();
+        if (translatedText) {
+          const line = {
+            type: message.partial ? "subtitle:partial" : "subtitle:committed",
+            source: "mirror",
+            targetLanguage: String(message.targetLanguage ?? ""),
+            sourceText: String(message.sourceText ?? ""),
+            translatedText: message.speaker ? `${message.speaker}: ${translatedText}` : translatedText,
+          };
+          broadcastSubtitleMessage(line);
+        }
+      }
+
+      if (message.type === "subtitle:start") {
+        try {
+          validateSubtitleSettings(message.settings);
+          await subtitles.start({ sessionId: message.sessionId, settings: message.settings });
+          await sessionTranscripts?.begin({ sessionId: message.sessionId });
+        } catch (error) {
+          client.send(JSON.stringify({ type: "subtitle:error", message: error.message, code: "SUBTITLE_START_FAILED" }));
+        }
+      }
+
+      if (message.type === "subtitle:audio") {
+        subtitles.sendAudio({
+          sessionId: message.sessionId,
+          source: message.source,
+          audio: message.audio,
+        });
+        // Archive the raw session audio (24 kHz PCM16) alongside the
+        // transcript so Records can replay what was actually said.
+        void sessionTranscripts?.appendAudioChunk(message.source, message.audio);
+      }
+
+      if (message.type === "subtitle:subscribe") {
+        // languages: array of codes to receive, or null/[] for everything.
+        // Responds with a snapshot of the currently visible lanes so the
+        // subscribing viewer paints the live line immediately.
+        const snapshot = subtitleHub.subscribe(client, message.languages ?? null);
+        client.send(JSON.stringify(snapshot));
+      }
+
+      if (message.type === "subtitle:input-status") {
+        // Feed the stall watchdog: speech signal present → subtitles expected.
+        if (message.status === "signal") subtitles.noteInputSignal({ sessionId: message.sessionId });
+        broadcast(wss, {
+          type: "subtitle:input-status",
+          source: message.source === "mic" ? "mic" : "system",
+          status: ["signal", "waiting", "silent"].includes(message.status) ? message.status : "waiting",
+          level: Number.isFinite(Number(message.level)) ? Math.max(0, Math.min(1, Number(message.level))) : 0,
+        });
+      }
+
+      if (message.type === "subtitle:control") {
+        const command = typeof message.command === "string" ? message.command : "";
+        if (!["stop", "restart", "font", "offset", "position", "languages", "opacity"].includes(command)) return;
+        // Server-side recovery: rebuild the translation channels directly so a
+        // restart works even when no dashboard page is open to run a full
+        // stop/start (overlay double-click, headless viewers). A connected
+        // dashboard still performs its full restart on the broadcast below —
+        // its new session simply replaces the rebuilt channels.
+        if (command === "restart") void subtitles.restartChannels({ reason: "control_restart" });
+        broadcast(wss, {
+          type: "subtitle:control",
+          command,
+          delta: Number.isFinite(Number(message.delta)) ? Number(message.delta) : undefined,
+          position: typeof message.position === "string" ? message.position : undefined,
+          languages: Array.isArray(message.languages) ? message.languages.filter((language) => isSupportedSubtitleLanguage(language)) : undefined,
+          opacity: Number.isFinite(Number(message.opacity)) ? Math.max(0.2, Math.min(1, Number(message.opacity))) : undefined,
+        });
+      }
+
+      if (message.type === "subtitle:stop") {
+        if (typeof message.sessionId !== "string" || message.sessionId.length === 0) return;
+        await subtitles.stop(message.sessionId);
+        // Close the transcript session and, when a provider key exists,
+        // generate the AI summary automatically. Best-effort: a summary
+        // failure never blocks or breaks the stop.
+        const ended = await sessionTranscripts?.end();
+        broadcast(wss, { type: "subtitle:sessions", sessions: await (sessionTranscripts?.list() ?? []) });
+        if (ended && ended.lineCount > 0) {
+          summarizeSessionTranscript(ended.id).catch((error) => {
+            (options.log ?? console).warn?.(`[session-transcripts] auto summary skipped: ${error?.message ?? error}`);
+          });
+        }
+      }
     });
   });
 
-  await new Promise((resolve) => httpServer.listen(options.port, options.host, () => resolve(undefined)));
+  await new Promise((resolve, reject) => {
+    httpServer.once("error", reject);
+    httpServer.listen(options.port, options.host, () => {
+      httpServer.off("error", reject);
+      resolve(undefined);
+    });
+  });
   const address = httpServer.address();
   const port = typeof address === "object" && address ? address.port : options.port;
   return {
@@ -237,6 +680,135 @@ export async function startServer(options) {
     state,
     url: `http://${options.host}:${port}`,
   };
+}
+
+export function createSafeSettingsExport(settings) {
+  const source = settings?.subtitle && typeof settings.subtitle === "object"
+    ? settings.subtitle
+    : {};
+  const subtitle = {};
+  for (const key of Object.keys(DEFAULT_SUBTITLE_SETTINGS)) {
+    if (!Object.prototype.hasOwnProperty.call(source, key)) continue;
+    subtitle[key] = structuredClone(source[key]);
+  }
+  return { subtitle };
+}
+
+function isMutatingMethod(method) {
+  return ["POST", "PUT", "PATCH", "DELETE"].includes(method);
+}
+
+function isAllowedLocalOrigin(origin, host) {
+  if (!origin) return true;
+  try {
+    const originUrl = new URL(origin);
+    return originUrl.origin === `http://${host}` || originUrl.origin === `https://${host}`;
+  } catch {
+    return false;
+  }
+}
+
+function validateOpenAIRealtimeTranslationKey({ apiKey, createWebSocket }) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const settle = (error, socket) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      socket?.close?.();
+      if (error) reject(error);
+      else resolve();
+    };
+    const timer = setTimeout(() => settle(new Error("OpenAI Realtime validation timed out."), socket), 8000);
+    let socket;
+    try {
+      socket = createWebSocket(OPENAI_REALTIME_TRANSLATION_VALIDATE_URL, undefined, {
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          "OpenAI-Safety-Identifier": "realtime-noel-key-validation",
+        },
+      });
+    } catch (error) {
+      clearTimeout(timer);
+      reject(error);
+      return;
+    }
+    socket.on("open", () => {
+      socket.send(JSON.stringify({
+        type: "session.update",
+        session: {
+          audio: {
+            input: {
+              transcription: { model: "gpt-realtime-whisper" },
+              noise_reduction: { type: "near_field" },
+            },
+            output: { language: "ko" },
+          },
+        },
+      }));
+    });
+    socket.on("message", (raw) => {
+      let message;
+      try {
+        message = JSON.parse(raw.toString("utf8"));
+      } catch {
+        settle(new Error("Invalid OpenAI Realtime validation response."), socket);
+        return;
+      }
+      if (message.type === "session.updated" || message.type === "session.created") {
+        settle(null, socket);
+      }
+      if (message.type === "error") {
+        settle(new Error(message.error?.message ?? "OpenAI Realtime validation failed."), socket);
+      }
+    });
+    socket.on("error", (error) => settle(error, socket));
+    socket.on("close", () => {
+      if (!settled) settle(new Error("OpenAI Realtime validation closed before confirmation."), socket);
+    });
+  });
+}
+
+async function validateGeminiTextGenerationKey({ apiKey, model, fetchImpl }) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 8000);
+  try {
+    await generateGeminiText({
+      apiKey,
+      model,
+      prompt: "Return the word ok.",
+      abortSignal: controller.signal,
+      fetchImpl,
+    });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** @param {any} options */
+export function selectSubtitlePolishOptions({ args = {}, saved = {}, env = process.env } = {}) {
+  const hasGlossaryOrDomain = Boolean(String(args.glossary ?? "").trim() || String(args.domain ?? "").trim());
+  const shouldRecoverPlaceholder = isEllipsisPlaceholder(args.translatedText)
+    && String(args.sourceText ?? "").trim().length >= 2;
+  if (args.tone !== "business" && !hasGlossaryOrDomain && !shouldRecoverPlaceholder) return null;
+  const provider = args.polishProvider === "gemini" || saved.subtitle?.translationProvider === "gemini" ? "gemini" : "openai";
+
+  const secondaryKey = provider === "gemini"
+    ? (saved.apiKeys?.geminiSecondary || env.GEMINI_SECONDARY_API_KEY || saved.apiKeys?.gemini || env.GEMINI_API_KEY || "").trim()
+    : (saved.apiKeys?.openaiSecondary || env.OPENAI_SECONDARY_API_KEY || "").trim();
+  if (!secondaryKey) return null;
+
+  return {
+    provider,
+    apiKey: secondaryKey,
+    modelId: provider === "gemini"
+      ? (saved.subtitle?.geminiPolishModel || "gemini-3.5-flash")
+      : (saved.subtitle?.tonePolishModel || "gpt-5.5"),
+  };
+}
+
+function isEllipsisPlaceholder(value) {
+  return /^\s*(?:\.{2,}|…+)\s*$/.test(String(value ?? ""));
 }
 
 async function createTranscriptionManager({ options, wss, queueTranscript, state }) {
@@ -292,15 +864,32 @@ async function createTranscriptionManager({ options, wss, queueTranscript, state
     const factory = pickFactory(settings);
     label = newLabel;
     options.onStatus?.(`Preparing ${label} transcription model...`);
-    current = factory({
-      sendTranscript,
-      queueTranscript,
-      options: factoryOptions,
-      env: factoryOptions.env,
-    });
-    if (hasSessionContext) current.setSessionContext?.(sessionContext);
-    await current.ready();
-    options.onStatus?.(`${label} transcription model ready.`);
+    try {
+      current = factory({
+        sendTranscript,
+        queueTranscript,
+        options: factoryOptions,
+        env: factoryOptions.env,
+      });
+      if (hasSessionContext) current.setSessionContext?.(sessionContext);
+      await current.ready();
+      options.onStatus?.(`${label} transcription model ready.`);
+    } catch (error) {
+      // The whiteboard transcription model is OPTIONAL for the subtitle feature
+      // (Gemini/OpenAI Realtime translate audio directly). A missing local
+      // Moonshine sidecar must NOT crash server boot — degrade gracefully so the
+      // subtitle overlay still runs; surface the cause for the whiteboard path.
+      try { current?.close?.(); } catch {}
+      current = null;
+      label = "";
+      const detail = error?.message ?? String(error);
+      options.onStatus?.(`Transcription model unavailable (${newLabel}): ${detail}. Subtitle translation still works; live whiteboard transcription is disabled until this is resolved.`);
+      broadcast(wss, {
+        type: "transcription:error",
+        message: `Transcription model unavailable (${newLabel}): ${detail}`,
+        code: "TRANSCRIPTION_MODEL_UNAVAILABLE",
+      });
+    }
   }
 
   await applyCurrent();
@@ -673,9 +1262,9 @@ function summarizeAgentResult(result) {
   );
 }
 
-const DEFAULT_LOG_DIR = path.join(os.homedir(), ".config", "autopreso", "logs");
-const CACHE_USAGE_LOG_PATH = process.env.AUTOPRESO_CACHE_LOG ?? path.join(DEFAULT_LOG_DIR, "cache.log");
-const DEBUG_LOG_PATH = process.env.AUTOPRESO_DEBUG_LOG ?? path.join(DEFAULT_LOG_DIR, "debug.log");
+const DEFAULT_LOG_DIR = path.join(os.homedir(), ".config", "realtime-noel", "logs");
+const CACHE_USAGE_LOG_PATH = process.env.REALTIME_NOEL_CACHE_LOG ?? path.join(DEFAULT_LOG_DIR, "cache.log");
+const DEBUG_LOG_PATH = process.env.REALTIME_NOEL_DEBUG_LOG ?? path.join(DEFAULT_LOG_DIR, "debug.log");
 
 let logDirsEnsured = false;
 function ensureLogDirs() {
@@ -956,7 +1545,7 @@ function formatCurrentCanvasTask(elements, latestScreenshot) {
 }
 
 export function whiteboardSystemPrompt() {
-  return `You are AutoPreso, a real-time visual note-taking agent.
+  return `You are Realtime Noel, a real-time visual note-taking agent.
 
 You listen to transcript chunks and maintain a visual presentation that complements the speaker.
 The transcript may contain slight inaccuracies, especially for names, product terms, and short phrases.

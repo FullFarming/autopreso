@@ -4,7 +4,7 @@
 // pure-black feed can be reviewed without a running session. No auth, no
 // network — static mock captions only.
 
-import { ViewerStage } from "@/components/live/LiveViewer";
+import { SpeakControlIcon, ViewerSessionContext, ViewerStage } from "@/components/live/LiveViewer";
 import type { CaptionEvent, SpeakerAssignment } from "@/lib/live-contract";
 
 function speaker(id: number, label: string): SpeakerAssignment {
@@ -20,23 +20,21 @@ function speaker(id: number, label: string): SpeakerAssignment {
 
 function caption(seq: number, who: SpeakerAssignment | null, text: string, isFinal = true): CaptionEvent {
   return {
-    type: "caption", seq, sessionId: "demo", language: "ko", speaker: who, text, isFinal,
+    type: "caption", seq, sessionId: "demo", language: "en", speaker: who, text, isFinal,
     sourceEndedAt: new Date(1_784_000_000_000 + seq * 45_000).toISOString(),
     emittedAt: new Date(1_784_000_000_000 + seq * 45_000).toISOString(),
   };
 }
 
-const noel = speaker(0, "김노엘");
+const noel = speaker(0, "Noel Kim");
 const james = speaker(1, "James");
-const host = speaker(2, "운영자");
+const host = speaker(2, "Host");
 
 const MOCK_CAPTIONS: CaptionEvent[] = [
-  caption(1, host, "안녕하세요, 여러분. 오늘 2분기 실적 발표 컨퍼런스 콜에 오신 것을 환영합니다."),
-  caption(2, host, "먼저 안전 항구 조항에 대해 간단히 말씀드리겠습니다. 오늘 전달하는 내용 중 일부는 미래 예측 진술일 수 있습니다."),
-  caption(3, james, "감사합니다. 이번 분기 매출은 AI 수요와 클라우드 성장에 힘입어 전년 대비 24% 증가했습니다."),
-  caption(4, james, "특히 보안 플랫폼이 분석하는 AI 워크로드 수는 분기별로 45% 이상 증가하는 성장세를 보이고 있습니다."),
-  caption(5, noel, "질문 기회를 주셔서 감사합니다. 두 가지 여쭙고 싶은데요, 하나는 생성형 AI 투자수익률 기회에 관한 것입니다."),
-  caption(6, noel, "2027년 용량 제약 해소를 위한 자본적지출 예산 원칙은 어떻게 바뀌는지 궁금합니다.", false),
+  caption(1, host, "Good afternoon. Welcome to our second-quarter earnings call."),
+  caption(2, james, "Revenue increased 24 percent year over year, led by AI demand and continued cloud growth."),
+  caption(3, noel, "Thank you. I would like to understand the return profile of your generative AI investments."),
+  caption(4, noel, "How are your capital allocation principles changing through 2027?", false),
 ];
 
 export default function MobileWatchDemoPage() {
@@ -44,18 +42,37 @@ export default function MobileWatchDemoPage() {
     <main className="live-viewer-shell is-compact">
       <header className="glass-pill live-viewer-toolbar">
         <strong>Realtime Noel</strong>
-        <div className="live-language-switch" role="group" aria-label="자막 언어 선택">
-          <button type="button" className="is-selected" aria-pressed>한국어</button>
-          <button type="button">EN</button>
-        </div>
+        <button type="button" className="live-leave-button" aria-label="Leave meeting">Leave</button>
       </header>
-      <ViewerStage sessionType="meeting" outputMode="captions" captions={MOCK_CAPTIONS}
-        speakers={[host, james, noel]} status="실시간 연결" isAudioEnabled={false} floorHolder="김노엘" />
-      <div className="live-speak-bar">
-        <span className="live-floor-indicator"><span className="live-speaking-waves" aria-hidden="true"><i /><i /><i /></span>김노엘 발언 중</span>
-        <button type="button" className="live-speak-button">🎙 발언하기</button>
+      <ViewerSessionContext title="Q2 2026 Earnings Call" scheduledAt="2026-07-23T14:00:00+09:00" />
+      {/* Mirrors LiveViewer: reading controls sit below the title, directly above
+          the caption record, and no translated-audio control is surfaced. */}
+      <div className="live-caption-controls">
+        <div className="live-language-switch" role="group" aria-label="Caption language">
+          <button type="button" className="is-selected" aria-pressed>EN</button>
+          <button type="button">KO</button>
+        </div>
+        <div className="live-text-size">
+          <button type="button" className="live-text-size-button" aria-expanded="false"
+            aria-controls="live-caption-scale" aria-label="Caption text size">Aa</button>
+          <label className="live-text-size-slider" hidden>
+            <span className="sr-only">Caption text size</span>
+            <input id="live-caption-scale" type="range" min={1} max={2} step={0.1} defaultValue={1} />
+          </label>
+        </div>
       </div>
-      <footer className="live-viewer-footer"><span>김노엘 · 12/50명 접속</span><span>만료 19:30</span></footer>
+      <ViewerStage sessionType="meeting" outputMode="captions" captions={MOCK_CAPTIONS}
+        speakers={[host, james, noel]} status="Connected · live captions" sessionStatus="live"
+        isAudioEnabled={false} floorHolder="Noel Kim" />
+      <div className="live-speak-bar is-speaking">
+        <span className="live-floor-indicator is-idle">Your turn is live until someone else takes over.</span>
+        <button type="button" className="live-speak-button is-speaking" aria-pressed="true" aria-disabled="true"
+          aria-label="Speaking. Your turn stays active until another participant or the host takes over."
+          data-level="4">
+          <SpeakControlIcon state="speaking" />
+        </button>
+      </div>
+      <footer className="live-viewer-footer"><span>Noel Kim · 12/50 joined</span><span>Valid until the host ends this session</span></footer>
     </main>
   );
 }

@@ -44,13 +44,18 @@ export class SpeakerRegistry {
       return existing;
     }
     const index = this.list().length;
-    if (index >= 6) throw new Error("SPEAKER_LIMIT_EXCEEDED");
+    // Named floor participants (participant:<id>) may exceed the six
+    // diarization slots: they carry their own display identity, so the
+    // legend grows instead of mis-attributing their captions.
+    const isFloorParticipant = providerLabel.startsWith("participant:");
+    if (index >= 6 && !isFloorParticipant) throw new Error("SPEAKER_LIMIT_EXCEEDED");
+    const paletteIndex = index % COLOR_TOKENS.length;
     const lastSeenAt = new Date(this.now()).toISOString();
     const assignment = {
       speakerId: `speaker-${index + 1}`,
       label: `Speaker ${index + 1}`,
-      colorToken: COLOR_TOKENS[index],
-      voiceName: hasAudioOutput(this.outputMode) ? CHIRP_VOICES[index] : null,
+      colorToken: COLOR_TOKENS[paletteIndex],
+      voiceName: hasAudioOutput(this.outputMode) ? CHIRP_VOICES[paletteIndex] : null,
       voiceStatus: hasAudioOutput(this.outputMode) ? "ready" : "disabled",
       lastSeenAt,
     };

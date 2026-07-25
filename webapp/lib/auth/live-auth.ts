@@ -5,7 +5,9 @@ import { LIVE_GATEWAY_TOKEN_SECRET, LIVE_VIEWER_TOKEN_SECRET } from "../security
 import { hmacHex, timingSafeEqual } from "../security/hmac";
 
 export const VIEWER_GRANT_COOKIE = "rnw_viewer_grant";
+export const RECAP_GRANT_COOKIE = "rnw_recap_grant";
 const VIEWER_GRANT_TTL_MS = 6 * 60 * 60 * 1000;
+const RECAP_GRANT_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const GATEWAY_TOKEN_TTL_MS = 15 * 60 * 1000;
 
 export interface ViewerGrantClaims {
@@ -24,6 +26,14 @@ export interface GatewayClaims {
   aud: "media-gateway";
   iat: number;
   exp: number;
+}
+
+export interface RecapGrantClaims {
+  role: "RECAP";
+  sessionId: string;
+  userId: string;
+  issuedAt: number;
+  expiresAt: number;
 }
 
 export class AuthenticationError extends Error {}
@@ -88,6 +98,16 @@ function isGatewayClaims(value: unknown): value is GatewayClaims {
     && typeof claims.exp === "number";
 }
 
+function isRecapGrantClaims(value: unknown): value is RecapGrantClaims {
+  if (!value || typeof value !== "object") return false;
+  const claims = value as Record<string, unknown>;
+  return claims.role === "RECAP"
+    && typeof claims.sessionId === "string"
+    && typeof claims.userId === "string"
+    && typeof claims.issuedAt === "number"
+    && typeof claims.expiresAt === "number";
+}
+
 export function getBearerToken(request: Pick<NextRequest, "headers">): string | null {
   const authorization = request.headers.get("authorization");
   if (!authorization) return null;
@@ -117,6 +137,34 @@ export async function verifyViewerGrantToken(
   if (!isViewerGrantClaims(value)) throw new AuthenticationError("시청자 인증 정보가 올바르지 않습니다.");
   if (value.issuedAt > now + 30_000 || value.expiresAt <= now || value.expiresAt - value.issuedAt > VIEWER_GRANT_TTL_MS) {
     throw new AuthenticationError("시청자 인증이 만료되었습니다.");
+  }
+  return value;
+}
+
+export async function createRecapGrantToken(
+  input: Pick<RecapGrantClaims, "sessionId" | "userId">,
+  now: number = Date.now(),
+): Promise<{ token: string; claims: RecapGrantClaims }> {
+  const claims: RecapGrantClaims = {
+    role: "RECAP",
+    ...input,
+    issuedAt: now,
+    expiresAt: now + RECAP_GRANT_TTL_MS,
+  };
+  return { token: await signClaims(LIVE_VIEWER_TOKEN_SECRET, claims), claims };
+}
+
+export async function verifyRecapGrantToken(
+  token: string | null | undefined,
+  now: number = Date.now(),
+): Promise<RecapGrantClaims> {
+  if (!token) throw new AuthenticationError("회의록 인증이 필요합니다.");
+  const value = await verifySignedClaims(LIVE_VIEWER_TOKEN_SECRET, token);
+  if (!isRecapGrantClaims(value)) throw new AuthenticationError("회의록 인증 정보가 올바르지 않습니다.");
+  if (value.issuedAt > now + 30_000
+    || value.expiresAt <= now
+    || value.expiresAt - value.issuedAt > RECAP_GRANT_TTL_MS) {
+    throw new AuthenticationError("회의록 인증이 만료되었습니다.");
   }
   return value;
 }

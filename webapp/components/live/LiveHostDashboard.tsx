@@ -13,6 +13,7 @@ import type {
   SpeakerAssignment,
 } from "@/lib/live-contract";
 import { LANGUAGE_CODES, LANGUAGE_LABELS, toOpenAITranslationLanguageCode } from "@/lib/languageDetect";
+import { LIVE_CALL_ENABLED } from "@/lib/live/feature-flag";
 import type { MeetingSummary } from "@/lib/live/summary";
 import {
   startLiveAudioClient,
@@ -25,14 +26,14 @@ import { resolveSpeakerColor } from "./SpeakerCaption";
 const LANGUAGE_OPTIONS = LANGUAGE_CODES.map((code) => ({ code, label: LANGUAGE_LABELS[code] }));
 
 const SESSION_TYPE_OPTIONS: Array<{ value: LiveSessionType; title: string; description: string }> = [
-  { value: "presentation", title: "Presentation", description: "한 발표자의 음성을 선택한 언어로 빠르게 전달합니다." },
-  { value: "meeting", title: "Meeting", description: "여러 화자를 구분하고 자막 또는 통역 음성을 함께 전달합니다." },
+  { value: "presentation", title: "Presentation", description: "Deliver one presenter in each guest's selected language." },
+  { value: "meeting", title: "Meeting", description: "Identify multiple speakers and deliver captions or translated audio." },
 ];
 
 const OUTPUT_OPTIONS: Array<{ value: LiveOutputMode; title: string; description: string }> = [
-  { value: "captions", title: "자막", description: "기본값 · 번역 자막만 표시하고 음성은 재생하지 않습니다." },
-  { value: "captions_audio", title: "자막 + 통역 음성", description: "자막을 보면서 사용자 동의 후 AI 합성 통역 음성을 듣습니다." },
-  { value: "audio", title: "통역 음성만", description: "Meeting의 오디오 프리셋 · 사용자 동의 후 합성 통역 음성만 재생합니다." },
+  { value: "captions", title: "Captions", description: "Default · show translated captions without playing audio." },
+  { value: "captions_audio", title: "Captions + audio", description: "Show captions and let each guest opt in to translated audio." },
+  { value: "audio", title: "Audio only", description: "Meeting audio preset · play translated audio after guest consent." },
 ];
 
 const OPENAI_REALTIME_TRANSLATION_LANGUAGES = new Set([
@@ -47,25 +48,25 @@ function isOpenAIVoiceTarget(language: string): boolean {
 function getDeliveryMethod(sessionType: LiveSessionType, outputMode: LiveOutputMode, voiceProvider: LiveVoiceProvider): { title: string; status: string; description: string } {
   if (sessionType === "presentation") {
     return outputMode === "captions"
-      ? { title: "빠른 실시간 자막", status: "단일 발표자 최적화", description: "말하는 동안 선택한 언어의 자막을 빠르게 표시합니다." }
+      ? { title: "Fast live captions", status: "Optimized for one presenter", description: "Display captions in each selected language while the presenter speaks." }
       : voiceProvider === "openai"
-        ? { title: "OpenAI Realtime 통역 음성", status: "연속 음성 최적화", description: "Gemini 자막은 유지하면서 OpenAI의 낮은 지연 통역 음성을 출력합니다." }
-        : { title: "Gemini 통역 음성", status: "단일 발표자 최적화", description: "Gemini 자막과 통역 음성을 함께 출력합니다." };
+        ? { title: "OpenAI Realtime audio", status: "Optimized for continuous speech", description: "Keep Gemini captions while OpenAI provides low-latency translated audio." }
+        : { title: "Gemini translated audio", status: "Optimized for one presenter", description: "Deliver Gemini captions and translated audio together." };
   }
   return outputMode === "captions"
-    ? { title: "화자 구분 자막", status: "발화 종료 후 표시", description: "발화가 끝나면 화자를 구분해 번역 자막을 표시합니다." }
-    : { title: "화자 구분 · 발화 종료 후 출력", status: "화자별 AI 음성", description: "발화가 끝난 뒤 통역 음성을 재생합니다. 장문 무정지 발화에서는 지연될 수 있습니다." };
+    ? { title: "Speaker-aware captions", status: "Shown after each turn", description: "Identify each speaker and display translated captions after the turn." }
+    : { title: "Speaker-aware translated audio", status: "One AI voice per speaker", description: "Play translated audio after each turn. Long uninterrupted speech may add delay." };
 }
 
 const SESSION_LANGUAGE_HELP: Record<LiveSessionType, string> = {
-  presentation: "Presentation의 기본 번역 언어는 English입니다. 언어를 바꾸면 준비가 끝난 뒤 교체됩니다.",
-  meeting: "Meeting은 선택한 언어별 화자 구분 번역 자막을 제공합니다. 언어를 바꾸면 준비가 끝난 뒤 교체됩니다.",
+  presentation: "English is the default translation language. A new language becomes available after preparation.",
+  meeting: "Meeting provides speaker-aware captions for each selected language. Changes apply after preparation.",
 };
 
 const GLOSSARY_PACK_OPTIONS: Array<{ value: GlossaryPack; title: string; description: string }> = [
-  { value: "general_cre", title: "CRE", description: "상업용 부동산 기본 용어" },
-  { value: "hotel", title: "Hotel", description: "호텔 투자·운영 용어" },
-  { value: "fnb", title: "F&B", description: "리테일 임대차·외식 용어" },
+  { value: "general_cre", title: "CRE", description: "Commercial real estate terminology" },
+  { value: "hotel", title: "Hotel", description: "Hotel investment and operations" },
+  { value: "fnb", title: "F&B", description: "Retail leasing and food service" },
 ];
 
 interface AdmissionState {
@@ -75,7 +76,44 @@ interface AdmissionState {
 
 interface InviteState {
   url: string;
+  admissionCode: string;
   expiresAt: string;
+}
+
+interface InviteResult {
+  inviteToken: string;
+  admissionCode: string;
+  expiresAt: string;
+  version: number;
+}
+
+interface LiveParticipant {
+  participantId: string;
+  displayName: string;
+  department: string;
+  jobTitle: string;
+  joinedAt: string;
+  lastSeenAt: string;
+  isPresent: boolean;
+  utteranceCount: number;
+  speakingSeconds: number;
+  lastSpokeAt: string | null;
+}
+
+interface RecentSpeech {
+  seq: number;
+  participantId: string;
+  displayName: string;
+  department: string;
+  jobTitle: string;
+  text: string;
+  startedAt: string;
+  endedAt: string;
+}
+
+interface ParticipantActivity {
+  participants: LiveParticipant[];
+  recentSpeeches: RecentSpeech[];
 }
 
 interface GatewayCredentials {
@@ -84,12 +122,21 @@ interface GatewayCredentials {
   expiresAt: string;
 }
 
+interface RecoverableSession {
+  id: string;
+  title: string;
+  status: LiveSession["status"];
+  scheduledAt: string | null;
+  viewerCount: number;
+  version: number;
+}
+
 type LanguageStatus = "preparing" | "ready" | "unavailable";
 
 const LANGUAGE_STATUS_LABELS: Record<LanguageStatus, string> = {
-  preparing: "준비 중",
-  ready: "준비됨",
-  unavailable: "사용 불가",
+  preparing: "Preparing",
+  ready: "Ready",
+  unavailable: "Unavailable",
 };
 
 function languageStatusMap(languages: string[], status: LanguageStatus): Record<string, LanguageStatus> {
@@ -97,15 +144,15 @@ function languageStatusMap(languages: string[], status: LanguageStatus): Record<
 }
 
 function getSpeakerVoiceStatus(speaker: SpeakerAssignment, outputMode: LiveOutputMode): string {
-  if (outputMode === "captions") return "자막 전용";
+  if (outputMode === "captions") return "Captions only";
   if ("voiceStatus" in speaker) {
-    if (speaker.voiceStatus === "analyzing") return "자동 분석 중";
-    if (speaker.voiceStatus === "ready") return `음색 배정 완료${speaker.voiceName ? ` · ${speaker.voiceName}` : ""}`;
-    if (speaker.voiceStatus === "unavailable") return "사용 불가";
-    if (speaker.voiceStatus === "disabled") return "자막 전용";
+    if (speaker.voiceStatus === "analyzing") return "Analyzing voice";
+    if (speaker.voiceStatus === "ready") return `Voice ready${speaker.voiceName ? ` · ${speaker.voiceName}` : ""}`;
+    if (speaker.voiceStatus === "unavailable") return "Unavailable";
+    if (speaker.voiceStatus === "disabled") return "Captions only";
   }
-  if (speaker.voiceName) return `음색 배정 완료 · ${speaker.voiceName}`;
-  return "음색 배정 대기";
+  if (speaker.voiceName) return `Voice ready · ${speaker.voiceName}`;
+  return "Waiting for voice";
 }
 
 async function readResponse<T>(response: Response): Promise<T> {
@@ -115,18 +162,19 @@ async function readResponse<T>(response: Response): Promise<T> {
 }
 
 function formatTime(value: string | null): string {
-  if (!value) return "닫힘";
-  return new Intl.DateTimeFormat("ko-KR", { hour: "2-digit", minute: "2-digit", second: "2-digit" }).format(new Date(value));
+  if (!value) return "Closed";
+  return new Intl.DateTimeFormat("en", { hour: "2-digit", minute: "2-digit", second: "2-digit" }).format(new Date(value));
 }
 
 function formatSessionStatus(status: LiveSession["status"]): string {
-  if (status === "live") return "송출 중";
-  if (status === "preparing") return "준비 중";
-  if (status === "stopped") return "종료됨";
-  return "오류";
+  if (status === "live") return "Live";
+  if (status === "preparing") return "Preparing";
+  if (status === "paused") return "Paused";
+  if (status === "stopped") return "Ended";
+  return "Failed";
 }
 
-function InviteQrCode({ value }: { value: string }) {
+export function InviteQrCode({ value }: { value: string }) {
   const [dataUrl, setDataUrl] = useState("");
   const [qrError, setQrError] = useState("");
 
@@ -142,17 +190,17 @@ function InviteQrCode({ value }: { value: string }) {
     }).then((nextDataUrl) => {
       if (!isDisposed) setDataUrl(nextDataUrl);
     }).catch(() => {
-      if (!isDisposed) setQrError("QR 코드를 만들 수 없습니다. 링크 복사를 사용하세요.");
+      if (!isDisposed) setQrError("The QR code could not be created. Copy the invite link instead.");
     });
     return () => { isDisposed = true; };
   }, [value]);
 
   return (
     <figure className="live-invite-qr" data-qr-value={value}>
-      {dataUrl ? <img src={dataUrl} alt="Realtime Noel 시청자 초대 QR 코드" width={176} height={176} />
+      {dataUrl ? <img src={dataUrl} alt="Realtime Noel guest invite QR code" width={176} height={176} />
         : qrError ? <span role="alert">{qrError}</span>
-          : <span role="status">QR 코드 만드는 중…</span>}
-      <figcaption>휴대전화 카메라로 스캔해 참여</figcaption>
+          : <span role="status">Creating QR code…</span>}
+      <figcaption>Scan or share this link · every guest enters their own profile</figcaption>
     </figure>
   );
 }
@@ -162,11 +210,14 @@ async function requestGatewayCredentials(sessionId: string): Promise<GatewayCred
     await fetch(`/api/live-sessions/${sessionId}/gateway-token`, { method: "POST" }),
   );
   const gatewayUrl = process.env.NEXT_PUBLIC_LIVE_GATEWAY_URL ?? "";
-  if (!gatewayUrl) throw new Error("미디어 게이트웨이 주소가 설정되지 않았습니다.");
+  if (!gatewayUrl) throw new Error("The media gateway address is not configured.");
   return { ...token, gatewayUrl };
 }
 
 export default function LiveHostDashboard() {
+  const [title, setTitle] = useState("");
+  const [sessionDate, setSessionDate] = useState(() => new Date().toISOString().slice(0, 10));
+  const [startTime, setStartTime] = useState("09:00");
   const [sessionType, setSessionType] = useState<LiveSessionType>("presentation");
   const [outputMode, setOutputMode] = useState<LiveOutputMode>("captions");
   const [voiceProvider, setVoiceProvider] = useState<LiveVoiceProvider>("gemini");
@@ -185,17 +236,27 @@ export default function LiveHostDashboard() {
   const [admission, setAdmission] = useState<AdmissionState | null>(null);
   const [invite, setInvite] = useState<InviteState | null>(null);
   const [inviteFeedback, setInviteFeedback] = useState("");
+  const [participants, setParticipants] = useState<LiveParticipant[]>([]);
+  const [recentSpeeches, setRecentSpeeches] = useState<RecentSpeech[]>([]);
   const [isBusy, setIsBusy] = useState(false);
   const [isBroadcasting, setIsBroadcasting] = useState(false);
-  const [gatewayStatus, setGatewayStatus] = useState("준비됨");
-  const [sessionSyncStatus, setSessionSyncStatus] = useState("상태 동기화 대기");
+  const [gatewayStatus, setGatewayStatus] = useState("Ready");
+  const [sessionSyncStatus, setSessionSyncStatus] = useState("Waiting to sync");
   const [languageStatuses, setLanguageStatuses] = useState<Record<string, LanguageStatus>>({});
   const [error, setError] = useState("");
+  const [recoverableSessions, setRecoverableSessions] = useState<RecoverableSession[]>([]);
+  const [isRecoveryDismissed, setIsRecoveryDismissed] = useState(false);
+  const [isEndConfirmVisible, setIsEndConfirmVisible] = useState(false);
   const audioClientRef = useRef<LiveAudioClient | null>(null);
   const sessionId = session?.id ?? null;
 
   const languageLabel = useMemo<Map<string, string>>(() => new Map(LANGUAGE_OPTIONS.map((item) => [item.code, item.label])), []);
   const isOpenAIVoiceLanguageSupported = useMemo(() => languages.every(isOpenAIVoiceTarget), [languages]);
+  const scheduledAt = useMemo(() => {
+    if (!sessionDate || !startTime) return "";
+    const date = new Date(`${sessionDate}T${startTime}:00`);
+    return Number.isNaN(date.valueOf()) ? "" : date.toISOString();
+  }, [sessionDate, startTime]);
 
   useEffect(() => {
     if (voiceProvider === "openai" && (sessionType === "meeting" || !isOpenAIVoiceLanguageSupported)) {
@@ -218,9 +279,8 @@ export default function LiveHostDashboard() {
       const next = await readResponse<LiveSession>(await fetch("/api/live-sessions", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ sessionType, languages, outputMode, voiceProvider, maxViewers, glossaryPack }),
+        body: JSON.stringify({ title, scheduledAt, sessionType, languages, outputMode, voiceProvider, maxViewers, glossaryPack }),
       }));
-      setSession(next);
       setSessionType(next.sessionType);
       setOutputMode(next.outputMode);
       setVoiceProvider(next.voiceProvider);
@@ -231,20 +291,53 @@ export default function LiveHostDashboard() {
       setInvite(null);
       setSpeakers([]);
       setLanguageStatuses(languageStatusMap(next.languages, "preparing"));
+      setSession(next);
+      const inviteResult = await readResponse<InviteResult>(
+        await fetch(`/api/live-sessions/${next.id}/invites`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ action: "create" }),
+        }),
+      );
+      setInvite({
+        url: `${window.location.origin}/m/watch#invite=${encodeURIComponent(inviteResult.inviteToken)}`,
+        admissionCode: inviteResult.admissionCode,
+        expiresAt: inviteResult.expiresAt,
+      });
+      setAdmission({ code: inviteResult.admissionCode, openUntil: inviteResult.expiresAt });
+      setSession((current) => current?.id === next.id
+        ? { ...current, version: inviteResult.version, admissionOpenUntil: inviteResult.expiresAt }
+        : current);
     } catch (requestError) {
-      setError(requestError instanceof Error ? requestError.message : "라이브 세션을 시작할 수 없습니다.");
+      setError(requestError instanceof Error ? requestError.message : "The live session could not be created.");
     } finally {
       setIsBusy(false);
     }
-  }, [glossaryPack, languages, maxViewers, outputMode, sessionType, voiceProvider]);
+  }, [glossaryPack, languages, maxViewers, outputMode, scheduledAt, sessionType, title, voiceProvider]);
 
   const stopBroadcast = useCallback(async () => {
     const client = audioClientRef.current;
     audioClientRef.current = null;
     if (client) await client.stop();
     setIsBroadcasting(false);
-    setGatewayStatus("준비됨");
+    setGatewayStatus("Ready");
   }, []);
+
+  const restartBroadcast = useCallback(async () => {
+    if (!audioClientRef.current || !isBroadcasting) return;
+    setIsBusy(true);
+    setError("");
+    setGatewayStatus("Refreshing caption engine");
+    try {
+      await audioClientRef.current.restart();
+      setGatewayStatus("Connected · broadcasting");
+    } catch (restartError) {
+      setGatewayStatus("Refresh failed · session still connected");
+      setError(restartError instanceof Error ? restartError.message : "Unable to refresh the caption engine.");
+    } finally {
+      setIsBusy(false);
+    }
+  }, [isBroadcasting]);
 
   const applySession = useCallback(async () => {
     if (!session) return;
@@ -304,9 +397,9 @@ export default function LiveHostDashboard() {
             setGlossaryPack(previousSession.glossaryPack);
             setLanguages([...previousSession.languages]);
             setLanguageStatuses(previousStatuses);
-            throw new Error(`새 설정을 준비하지 못해 이전 설정으로 복구했습니다. ${gatewayError instanceof Error ? gatewayError.message : ""}`.trim());
+            throw new Error(`The new settings could not be prepared, so the previous settings were restored. ${gatewayError instanceof Error ? gatewayError.message : ""}`.trim());
           } catch (compensationError) {
-            if (compensationError instanceof Error && compensationError.message.startsWith("새 설정을 준비하지 못해")) throw compensationError;
+            if (compensationError instanceof Error && compensationError.message.startsWith("The new settings could not be prepared")) throw compensationError;
             await stopBroadcast();
             didFailClosed = true;
             const failedSession = restoredSession ?? next;
@@ -318,7 +411,7 @@ export default function LiveHostDashboard() {
             setGlossaryPack(failedSession.glossaryPack);
             setLanguages([...failedSession.languages]);
             setLanguageStatuses(languageStatusMap(failedSession.languages, "unavailable"));
-            throw new Error("설정 복구에 실패해 송출을 중단했습니다. 세션 상태를 확인한 뒤 다시 시작하세요.");
+            throw new Error("Settings could not be restored, so broadcasting stopped. Check the session and start again.");
           }
         }
       }
@@ -332,7 +425,7 @@ export default function LiveHostDashboard() {
       if (!isBroadcasting) setLanguageStatuses(languageStatusMap(next.languages, "preparing"));
     } catch (requestError) {
       if (!didFailClosed) setLanguageStatuses(previousStatuses);
-      setError(requestError instanceof Error ? requestError.message : "설정을 변경할 수 없습니다.");
+      setError(requestError instanceof Error ? requestError.message : "Unable to update settings.");
     } finally {
       setIsBusy(false);
     }
@@ -358,7 +451,7 @@ export default function LiveHostDashboard() {
       setInvite(null);
       setInviteFeedback("");
       try {
-        const inviteResult = await readResponse<{ inviteToken: string; expiresAt: string }>(
+        const inviteResult = await readResponse<InviteResult>(
           await fetch(`/api/live-sessions/${session.id}/invites`, {
             method: "POST",
             headers: { "content-type": "application/json" },
@@ -366,15 +459,19 @@ export default function LiveHostDashboard() {
           }),
         );
         setInvite({
-          url: `${window.location.origin}/watch#invite=${encodeURIComponent(inviteResult.inviteToken)}`,
+          url: `${window.location.origin}/m/watch#invite=${encodeURIComponent(inviteResult.inviteToken)}`,
+          admissionCode: inviteResult.admissionCode,
           expiresAt: inviteResult.expiresAt,
         });
+        setSession((current) => current?.id === session.id
+          ? { ...current, version: inviteResult.version, admissionOpenUntil: inviteResult.expiresAt }
+          : current);
       } catch (inviteError) {
         setInvite(null);
-        setError("입장번호는 열렸지만 초대 링크를 만들지 못했습니다. 번호로 입장할 수 있습니다.");
+        setError("The guest window opened, but its QR invite could not be created.");
       }
     } catch (requestError) {
-      setError(requestError instanceof Error ? requestError.message : "입장번호를 열 수 없습니다.");
+      setError(requestError instanceof Error ? requestError.message : "Unable to open guest entry.");
     } finally {
       setIsBusy(false);
     }
@@ -397,9 +494,9 @@ export default function LiveHostDashboard() {
       setSession((current) => current?.id === session.id
         ? { ...current, admissionOpenUntil: null, version: result.version }
         : current);
-      setInviteFeedback("입장창을 닫았습니다. 현재 송출 세션은 계속 유지됩니다.");
+      setInviteFeedback("Guest entry is closed. The live session is still running.");
     } catch (requestError) {
-      setError(requestError instanceof Error ? requestError.message : "입장창을 닫을 수 없습니다.");
+      setError(requestError instanceof Error ? requestError.message : "Unable to close guest entry.");
     } finally {
       setIsBusy(false);
     }
@@ -409,56 +506,225 @@ export default function LiveHostDashboard() {
     if (!invite) return;
     setInviteFeedback("");
     try {
-      if (!navigator.clipboard) throw new Error("이 브라우저는 안전한 링크 복사를 지원하지 않습니다.");
+      if (!navigator.clipboard) throw new Error("This browser does not support secure link copying.");
       await navigator.clipboard.writeText(invite.url);
-      setInviteFeedback("초대 링크를 복사했습니다.");
+      setInviteFeedback("Invite link copied.");
     } catch (copyError) {
-      setError(copyError instanceof Error ? copyError.message : "초대 링크를 복사할 수 없습니다.");
+      setError(copyError instanceof Error ? copyError.message : "Unable to copy the invite link.");
     }
   }, [invite]);
 
+  const retryInvite = useCallback(async () => {
+    if (!session) return;
+    setIsBusy(true);
+    setError("");
+    try {
+      const inviteResult = await readResponse<InviteResult>(
+        await fetch(`/api/live-sessions/${session.id}/invites`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ action: "create" }),
+        }),
+      );
+      setInvite({
+        url: `${window.location.origin}/m/watch#invite=${encodeURIComponent(inviteResult.inviteToken)}`,
+        admissionCode: inviteResult.admissionCode,
+        expiresAt: inviteResult.expiresAt,
+      });
+      setAdmission({ code: inviteResult.admissionCode, openUntil: inviteResult.expiresAt });
+      setSession((current) => current?.id === session.id
+        ? { ...current, version: inviteResult.version, admissionOpenUntil: inviteResult.expiresAt }
+        : current);
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : "Unable to create the guest QR.");
+    } finally {
+      setIsBusy(false);
+    }
+  }, [session]);
+
   const inviteMailto = useMemo(() => {
     if (!invite) return "";
-    const subject = encodeURIComponent("Realtime Noel Live 초대");
-    const body = encodeURIComponent(`아래 링크로 Live에 참여하세요.\n\n${invite.url}\n\n초대 만료: ${formatTime(invite.expiresAt)}`);
+    const subject = encodeURIComponent("Realtime Noel Live invitation");
+    const body = encodeURIComponent(`Join the Live session with this link:\n\n${invite.url}\n\nInvite expires: ${formatTime(invite.expiresAt)}`);
     return `mailto:?subject=${subject}&body=${body}`;
   }, [invite]);
+
+  /** Attaches the host audio client to the gateway for an already-live session. */
+  const connectBroadcast = useCallback(async (activeSession: LiveSession) => {
+    const credentials = await requestGatewayCredentials(activeSession.id);
+    setLanguageStatuses(languageStatusMap(languages, "preparing"));
+    const client = await startLiveAudioClient({
+      sessionId: activeSession.id,
+      version: activeSession.version,
+      sessionType,
+      languages,
+      outputMode,
+      voiceProvider,
+      maxViewers,
+      glossaryPack,
+      inputSource,
+      credentials,
+      refreshCredentials: () => requestGatewayCredentials(activeSession.id),
+      onStatus: setGatewayStatus,
+      onError: setError,
+      onSpeakers: setSpeakers,
+      onLanguageStatus: (language, status) => {
+        setLanguageStatuses((current) => ({ ...current, [language]: status }));
+      },
+    });
+    audioClientRef.current = client;
+    setIsBroadcasting(true);
+  }, [glossaryPack, inputSource, languages, maxViewers, outputMode, sessionType, voiceProvider]);
 
   const startBroadcast = useCallback(async () => {
     if (!session || isBroadcasting) return;
     setIsBusy(true);
     setError("");
     try {
-      const credentials = await requestGatewayCredentials(session.id);
-      setLanguageStatuses(languageStatusMap(languages, "preparing"));
-      const client = await startLiveAudioClient({
-        sessionId: session.id,
-        version: session.version,
-        sessionType,
-        languages,
-        outputMode,
-        voiceProvider,
-        maxViewers,
-        glossaryPack,
-        inputSource,
-        credentials,
-        refreshCredentials: () => requestGatewayCredentials(session.id),
-        onStatus: setGatewayStatus,
-        onError: setError,
-        onSpeakers: setSpeakers,
-        onLanguageStatus: (language, status) => {
-          setLanguageStatuses((current) => ({ ...current, [language]: status }));
-        },
-      });
-      audioClientRef.current = client;
-      setIsBroadcasting(true);
-      setSession((current) => current ? { ...current, status: "live" } : current);
+      const startedSession = session.status === "live"
+        ? session
+        : await readResponse<LiveSession>(await fetch(`/api/live-sessions/${session.id}/start`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ version: session.version }),
+        }));
+      setSession(startedSession);
+      await connectBroadcast(startedSession);
     } catch (requestError) {
-      setError(requestError instanceof Error ? requestError.message : "음성 송출을 시작할 수 없습니다.");
+      setError(requestError instanceof Error ? requestError.message : "Unable to start the live broadcast.");
     } finally {
       setIsBusy(false);
     }
-  }, [glossaryPack, inputSource, isBroadcasting, languages, maxViewers, outputMode, session, sessionType, voiceProvider]);
+  }, [connectBroadcast, isBroadcasting, session]);
+
+  /** Stage fast path: the dashboard is where Start/Pause/End happen, so it
+   *  pushes every status change to the same-origin stage window over a
+   *  BroadcastChannel. The stage keeps its 5s REST poll as the fallback. */
+  useEffect(() => {
+    if (!session || typeof BroadcastChannel === "undefined") return;
+    const channel = new BroadcastChannel("realtime-noel-stage");
+    channel.postMessage({ type: "session-status", sessionId: session.id, status: session.status, coverImageVersion: session.coverImageVersion ?? null });
+    return () => channel.close();
+  }, [session]);
+
+  /** Contract C10: optional stage/waiting-room cover image. A failed upload
+   *  never blocks the session — the stage simply stays plain black. */
+  const coverInputRef = useRef<HTMLInputElement | null>(null);
+  const [coverFeedback, setCoverFeedback] = useState("");
+  const uploadCoverImage = useCallback(async (file: File) => {
+    if (!session) return;
+    setCoverFeedback("Uploading cover…");
+    try {
+      const result = await readResponse<{ hasCoverImage: boolean; coverImageVersion: string }>(await fetch(`/api/live-sessions/${session.id}/cover`, {
+        method: "POST",
+        headers: { "content-type": file.type || "application/octet-stream" },
+        body: file,
+      }));
+      if (result.hasCoverImage) {
+        setSession((current) => current ? { ...current, hasCoverImage: true, coverImageVersion: result.coverImageVersion } : current);
+      }
+      setCoverFeedback("Cover image is live on the stage and waiting room.");
+    } catch (requestError) {
+      setCoverFeedback(requestError instanceof Error ? requestError.message : "Unable to upload the cover image.");
+    }
+  }, [session]);
+
+  /** Contract C4: pause is a real session state — the server transitions
+   *  live → paused and viewers see it; the local audio client also stops. */
+  const pauseSession = useCallback(async () => {
+    if (!session) return;
+    setIsBusy(true);
+    setError("");
+    try {
+      await stopBroadcast();
+      const paused = await readResponse<LiveSession>(await fetch(`/api/live-sessions/${session.id}/pause`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ version: session.version }),
+      }));
+      setSession(paused);
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : "Unable to pause the live session.");
+    } finally {
+      setIsBusy(false);
+    }
+  }, [session, stopBroadcast]);
+
+  const resumeSession = useCallback(async () => {
+    if (!session) return;
+    setIsBusy(true);
+    setError("");
+    try {
+      const resumed = await readResponse<LiveSession>(await fetch(`/api/live-sessions/${session.id}/resume`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ version: session.version }),
+      }));
+      setSession(resumed);
+      await connectBroadcast(resumed);
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : "Unable to resume the live session.");
+    } finally {
+      setIsBusy(false);
+    }
+  }, [connectBroadcast, session]);
+
+  /** Host session recovery: rehydrate the dashboard from an existing active
+   *  session instead of forcing a new one. */
+  const recoverSession = useCallback(async (recoverableId: string) => {
+    setIsBusy(true);
+    setError("");
+    try {
+      const existing = await readResponse<LiveSession>(await fetch(`/api/live-sessions/${recoverableId}`, {
+        method: "GET",
+        cache: "no-store",
+      }));
+      setSession(existing);
+      setTitle(existing.title);
+      setSessionType(existing.sessionType);
+      setOutputMode(existing.outputMode);
+      setVoiceProvider(existing.voiceProvider);
+      setMaxViewers(existing.maxViewers);
+      setGlossaryPack(existing.glossaryPack);
+      setLanguages([...existing.languages]);
+      setIsEditingSession(false);
+      setLanguageStatuses(languageStatusMap(existing.languages, "preparing"));
+      setRecoverableSessions([]);
+      setIsRecoveryDismissed(true);
+      // Recreate the invite/QR: the admission code is deterministic per
+      // session, so the 6-digit code shown to guests does not change.
+      const inviteResult = await readResponse<InviteResult>(
+        await fetch(`/api/live-sessions/${existing.id}/invites`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ action: "create" }),
+        }),
+      );
+      setInvite({
+        url: `${window.location.origin}/m/watch#invite=${encodeURIComponent(inviteResult.inviteToken)}`,
+        admissionCode: inviteResult.admissionCode,
+        expiresAt: inviteResult.expiresAt,
+      });
+      setAdmission({ code: inviteResult.admissionCode, openUntil: inviteResult.expiresAt });
+      setSession((current) => current?.id === existing.id
+        ? { ...current, version: inviteResult.version, admissionOpenUntil: inviteResult.expiresAt }
+        : current);
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : "Unable to resume the session.");
+    } finally {
+      setIsBusy(false);
+    }
+  }, []);
+
+  /** Contract C8: opens the stage/countdown view in its own named window so
+   *  Electron can intercept it and send it to the external display. */
+  const openStageWindow = useCallback(() => {
+    if (!session) return;
+    const hash = invite
+      ? `#invite=${encodeURIComponent(invite.url)}&code=${encodeURIComponent(invite.admissionCode)}`
+      : "";
+    window.open(`/stage/${session.id}${hash}`, "realtime-noel-stage");
+  }, [invite, session]);
 
   const stopSession = useCallback(async () => {
     if (!session) return;
@@ -467,6 +733,7 @@ export default function LiveHostDashboard() {
     try {
       await stopBroadcast();
       await readResponse<unknown>(await fetch(`/api/live-sessions/${session.id}`, { method: "DELETE" }));
+      setIsEndConfirmVisible(false);
       setEndedSession({ id: session.id, languages: [...session.languages] });
       setHostSummary(null);
       setSummaryMessage("");
@@ -474,8 +741,10 @@ export default function LiveHostDashboard() {
       setAdmission(null);
       setInvite(null);
       setSpeakers([]);
+      setParticipants([]);
+      setRecentSpeeches([]);
     } catch (requestError) {
-      setError(requestError instanceof Error ? requestError.message : "라이브 세션을 종료할 수 없습니다.");
+      setError(requestError instanceof Error ? requestError.message : "Unable to end the live session.");
     } finally {
       setIsBusy(false);
     }
@@ -502,19 +771,37 @@ export default function LiveHostDashboard() {
           if (endedSession.languages.length === 1) throw languageError;
         }
       }
-      if (savedCount === 0) throw new Error("요약할 발언 기록이 없습니다.");
+      if (savedCount === 0) throw new Error("There is no transcript to summarize.");
       if (firstSummary) setHostSummary({ summary: firstSummary, createdAt: new Date().toISOString() });
-      setSummaryMessage(`${savedCount}개 언어의 요약을 저장했습니다. 참가자도 각자 언어로 볼 수 있습니다.`);
+      setSummaryMessage(`Saved summaries in ${savedCount} language${savedCount === 1 ? "" : "s"}. Guests can view their selected language.`);
     } catch (summaryError) {
-      setError(summaryError instanceof Error ? summaryError.message : "요약을 생성할 수 없습니다.");
+      setError(summaryError instanceof Error ? summaryError.message : "Unable to create the summary.");
     } finally {
       setIsSummaryBusy(false);
     }
   }, [endedSession]);
 
+  // Host session recovery: on mount, look for active sessions this host
+  // still owns (e.g. after a page refresh) and offer to resume them.
+  useEffect(() => {
+    if (!LIVE_CALL_ENABLED) return;
+    let isDisposed = false;
+    void (async () => {
+      try {
+        const result = await readResponse<{ sessions: RecoverableSession[] }>(
+          await fetch("/api/live-sessions?scope=mine", { method: "GET", cache: "no-store" }),
+        );
+        if (!isDisposed && result.sessions.length > 0) setRecoverableSessions(result.sessions);
+      } catch {
+        // Recovery is a convenience — failures never block creating a session.
+      }
+    })();
+    return () => { isDisposed = true; };
+  }, []);
+
   useEffect(() => {
     if (!sessionId) {
-      setSessionSyncStatus("상태 동기화 대기");
+      setSessionSyncStatus("Waiting to sync");
       return;
     }
     let isDisposed = false;
@@ -527,19 +814,28 @@ export default function LiveHostDashboard() {
       const controller = new AbortController();
       requestController = controller;
       try {
-        const latest = await readResponse<LiveSession>(await fetch(`/api/live-sessions/${sessionId}`, {
-          method: "GET",
-          cache: "no-store",
-          signal: controller.signal,
-        }));
+        const [latest, activity] = await Promise.all([
+          readResponse<LiveSession>(await fetch(`/api/live-sessions/${sessionId}`, {
+            method: "GET",
+            cache: "no-store",
+            signal: controller.signal,
+          })),
+          readResponse<ParticipantActivity>(await fetch(`/api/live-sessions/${sessionId}/participants`, {
+            method: "GET",
+            cache: "no-store",
+            signal: controller.signal,
+          })),
+        ]);
         if (isDisposed) return;
         setSession((current) => current?.id === sessionId
           ? { ...current, viewerCount: latest.viewerCount, status: latest.status }
           : current);
-        setSessionSyncStatus("상태 자동 동기화");
+        setParticipants(activity.participants);
+        setRecentSpeeches(activity.recentSpeeches);
+        setSessionSyncStatus("Synced automatically");
       } catch (requestError) {
         if (!isDisposed && (!(requestError instanceof DOMException) || requestError.name !== "AbortError")) {
-          setSessionSyncStatus("상태 동기화 지연");
+          setSessionSyncStatus("Sync delayed");
         }
       } finally {
         isRequestPending = false;
@@ -562,50 +858,98 @@ export default function LiveHostDashboard() {
   const deliveryMethod = getDeliveryMethod(sessionType, outputMode, voiceProvider);
   const selectedGlossaryLabel = GLOSSARY_PACK_OPTIONS.find((option) => option.value === glossaryPack)?.title ?? glossaryPack;
 
+  if (!LIVE_CALL_ENABLED) {
+    return (
+      <main className="live-host-shell">
+        <div className="live-host-workspace">
+          <section className="glass live-panel" aria-label="Live Call disabled">
+            <h1>Live Call is disabled</h1>
+            <p>The Live Call feature is turned off for this deployment. Base caption functionality is unaffected.</p>
+          </section>
+        </div>
+      </main>
+    );
+  }
+
   return (
     <main className="live-host-shell">
-      <header className="live-host-header glass">
-        <div>
-          <span className="live-eyebrow">Realtime Noel · Live</span>
-          <h1 className="display">한 번의 음성, 각자의 언어.</h1>
-          <p>호스트가 최대 3개 언어를 준비하면 최대 50명이 웹·모바일·Chrome에서 같은 결과를 공유합니다.</p>
-        </div>
-        <div className="live-host-status" aria-live="polite">
-          <span className={`live-status-dot ${session ? "is-live" : ""}`} aria-hidden="true" />
-          <span>{session ? `${session.viewerCount}명 접속 · ${formatSessionStatus(session.status)}` : "시작 전"}</span>
-        </div>
-      </header>
+      <aside className="live-host-rail">
+        <strong>Realtime Noel</strong>
+        <nav aria-label="Host workspace">
+          <button type="button" className="is-current" aria-current="page">Live</button>
+          <button type="button" disabled>Transcripts</button>
+          <button type="button" disabled>Settings</button>
+        </nav>
+      </aside>
+      <div className="live-host-workspace">
+        <header className="live-host-page-heading">
+          <div>
+            <h1>{session ? session.title : "Create Live Session"}</h1>
+            {session?.scheduledAt && <p>{new Date(session.scheduledAt).toLocaleString("en-US", {
+              month: "short", day: "numeric", year: "numeric", hour: "numeric", minute: "2-digit",
+            })}</p>}
+          </div>
+          <div className="live-host-status" aria-live="polite">
+            <span className={`live-status-dot ${isBroadcasting ? "is-live" : ""}`} aria-hidden="true" />
+            <span>{session ? `${session.viewerCount} joined · ${formatSessionStatus(session.status)}` : "Not started"}</span>
+          </div>
+        </header>
 
       {error && <div className="live-error" role="alert">{error}</div>}
+
+      {!session && !isRecoveryDismissed && recoverableSessions.length > 0 && (
+        <section className="glass live-panel live-recovery-panel" aria-labelledby="recovery-heading">
+          <div className="live-section-heading">
+            <div><span>RESUME</span><h2 id="recovery-heading">Active session found</h2></div>
+            <button type="button" className="glass-btn" onClick={() => setIsRecoveryDismissed(true)}>Dismiss</button>
+          </div>
+          <p className="live-help">You still have an active live session. Resume it to keep the same invite code and participants.</p>
+          <ul className="live-recovery-list">
+            {recoverableSessions.map((recoverable) => (
+              <li key={recoverable.id}>
+                <div>
+                  <strong>{recoverable.title}</strong>
+                  <small>{formatSessionStatus(recoverable.status)} · {recoverable.viewerCount} joined
+                    {recoverable.scheduledAt ? ` · ${new Date(recoverable.scheduledAt).toLocaleString("en")}` : ""}</small>
+                </div>
+                <button type="button" className="accent-btn" disabled={isBusy}
+                  onClick={() => void recoverSession(recoverable.id)}>
+                  Resume session
+                </button>
+              </li>
+            ))}
+          </ul>
+        </section>
+      )}
 
       {endedSession && !session && (
         <section className="glass live-summary-panel" aria-labelledby="summary-heading">
           <div className="live-section-heading">
-            <div><span>RECAP</span><h2 id="summary-heading">미팅 요약</h2></div>
+            <div><span>RECAP</span><h2 id="summary-heading">Meeting summary</h2></div>
             {summaryMessage ? <small role="status">{summaryMessage}</small> : null}
           </div>
           {hostSummary
             ? <MeetingSummaryCard summary={hostSummary.summary} createdAt={hostSummary.createdAt} />
-            : <p className="live-summary-hint">방금 종료한 미팅의 발언 기록으로 AI 요약을 만들 수 있습니다. 요약은 참가자에게도 각자 언어로 제공됩니다.</p>}
+            : <p className="live-summary-hint">Create an AI summary from the completed meeting transcript. Guests receive it in their selected language.</p>}
           <div className="live-summary-actions">
             <button type="button" className="accent-btn" disabled={isSummaryBusy} onClick={() => void generateSummaries()}>
-              {isSummaryBusy ? "요약 생성 중…" : hostSummary ? "요약 다시 생성" : "AI 요약 생성"}
+              {isSummaryBusy ? "Creating summary…" : hostSummary ? "Create summary again" : "Create AI summary"}
             </button>
             <button type="button" onClick={() => { setEndedSession(null); setHostSummary(null); setSummaryMessage(""); }}>
-              닫기
+              Close
             </button>
           </div>
         </section>
       )}
 
       {isConfiguring && (
-        <section className="glass live-wizard" aria-labelledby="wizard-heading">
+        <section className={`glass live-wizard ${wizardStep > 1 ? "is-advanced" : ""}`} aria-labelledby="wizard-heading">
           <div className="live-section-heading">
-            <div><span>SETUP</span><h2 id="wizard-heading">호스트 설정</h2></div>
-            <small>{wizardStep}/4</small>
+            <div><h2 id="wizard-heading">{wizardStep === 1 ? "Session details" : "Advanced settings"}</h2></div>
+            {wizardStep > 1 && <small>{wizardStep}/4</small>}
           </div>
-          <nav className="live-wizard-progress" aria-label="라이브 설정 단계">
-            {(["형식", "출력", "참여자", "확인"] as const).map((label, index) => {
+          <nav className="live-wizard-progress" aria-label="Live setup steps">
+            {(["Details", "Output", "Audience", "Review"] as const).map((label, index) => {
               const step = (index + 1) as 1 | 2 | 3 | 4;
               return <button key={label} type="button" className={wizardStep === step ? "is-current" : ""}
                 aria-current={wizardStep === step ? "step" : undefined} onClick={() => setWizardStep(step)}>
@@ -613,10 +957,39 @@ export default function LiveHostDashboard() {
               </button>;
             })}
           </nav>
+          <aside className="live-setup-mobile-access" aria-label="Mobile access preview">
+            <h2>Mobile access</h2>
+            {invite ? <InviteQrCode value={invite.url} /> : <div className="live-qr-placeholder" aria-hidden="true"><span>N</span></div>}
+            <strong>{invite ? "QR ready for guests" : "QR appears after the session is created"}</strong>
+            {invite && (
+              <div className="live-access-code">
+                <span>6-digit access code</span>
+                <strong>{invite.admissionCode}</strong>
+              </div>
+            )}
+            <p>Guests enter their name, department, and job title. The access code remains unchanged until this session ends.</p>
+          </aside>
 
           {wizardStep === 1 && (
             <div className="live-wizard-body">
-              <div className="live-mode-grid live-mode-grid-two" role="radiogroup" aria-label="세션 형식">
+              <div className="live-schedule-grid">
+                <label className="live-text-field live-title-field">
+                  <span>Session title</span>
+                  <input type="text" maxLength={100} value={title} onChange={(event) => setTitle(event.target.value)}
+                    placeholder="Q3 earnings call" autoComplete="off" required />
+                </label>
+                <label className="live-text-field">
+                  <span>Date</span>
+                  <input type="text" inputMode="numeric" pattern="\d{4}-\d{2}-\d{2}" placeholder="YYYY-MM-DD"
+                    value={sessionDate} onChange={(event) => setSessionDate(event.target.value)} required />
+                </label>
+                <label className="live-text-field">
+                  <span>Start time</span>
+                  <input type="text" inputMode="numeric" pattern="(?:[01]\d|2[0-3]):[0-5]\d" placeholder="HH:MM"
+                    value={startTime} onChange={(event) => setStartTime(event.target.value)} required />
+                </label>
+              </div>
+              <div className="live-mode-grid live-mode-grid-two" role="radiogroup" aria-label="Session format">
                 {SESSION_TYPE_OPTIONS.map((option) => (
                   <button key={option.value} type="button" role="radio" aria-checked={sessionType === option.value}
                     className={`live-mode-card ${sessionType === option.value ? "is-selected" : ""}`}
@@ -626,23 +999,23 @@ export default function LiveHostDashboard() {
                 ))}
               </div>
               <div className="live-field-group">
-                <strong>입력 음성</strong>
-                <div className="live-segmented" role="radiogroup" aria-label="입력 음성">
-                  {([['mic', '마이크'], ['system', '시스템'], ['both', '둘 다']] as Array<[LiveInputSource, string]>).map(([value, label]) => (
+                <strong>Audio source</strong>
+                <div className="live-segmented" role="radiogroup" aria-label="Audio source">
+                  {([['mic', 'Microphone'], ['system', 'System audio'], ['both', 'Both']] as Array<[LiveInputSource, string]>).map(([value, label]) => (
                     <button key={value} type="button" role="radio" aria-checked={inputSource === value}
                       className={inputSource === value ? "is-selected" : ""} onClick={() => setInputSource(value)} disabled={Boolean(session)}>
                       {label}
                     </button>
                   ))}
                 </div>
-                <p className="live-help">마이크는 소음 억제·에코 제거를 적용하고, 시스템 음성은 원본을 유지합니다.</p>
+                <p className="live-help">Microphone audio uses noise and echo control. System audio stays unmodified.</p>
               </div>
             </div>
           )}
 
           {wizardStep === 2 && (
             <div className="live-wizard-body">
-              <div className="live-mode-grid" role="radiogroup" aria-label="시청자 출력 방식">
+              <div className="live-mode-grid" role="radiogroup" aria-label="Guest output">
                 {OUTPUT_OPTIONS.map((option) => (
                   <button key={option.value} type="button" role="radio" aria-checked={outputMode === option.value}
                     className={`live-mode-card ${outputMode === option.value ? "is-selected" : ""}`}
@@ -653,7 +1026,7 @@ export default function LiveHostDashboard() {
               </div>
               <section className="live-delivery-method-card" aria-labelledby="live-delivery-method-title" aria-describedby="live-delivery-method-description">
                 <div>
-                  <span>현재 전달 방식</span>
+                  <span>Current delivery</span>
                   <strong id="live-delivery-method-title">{deliveryMethod.title}</strong>
                   <small>{deliveryMethod.status}</small>
                 </div>
@@ -661,37 +1034,37 @@ export default function LiveHostDashboard() {
               </section>
               <section className="live-delivery-method-card" aria-labelledby="live-caption-provider-title">
                 <div>
-                  <span>자막 엔진</span>
-                  <strong id="live-caption-provider-title">Gemini 고정</strong>
-                  <small>모든 출력 모드</small>
+                  <span>Caption engine</span>
+                  <strong id="live-caption-provider-title">Gemini fixed</strong>
+                  <small>All output modes</small>
                 </div>
-                <p>음성 엔진을 바꿔도 실시간 번역 자막은 Gemini가 계속 생성합니다.</p>
+                <p>Gemini continues to create live translated captions when the audio engine changes.</p>
               </section>
               {outputMode !== "captions" && (
                 <div className="live-field-group">
-                  <div className="live-field-label"><strong>통역 음성 엔진</strong><small>음성 출력에만 적용</small></div>
-                  <div className="live-mode-grid live-mode-grid-two" role="radiogroup" aria-label="통역 음성 엔진" aria-describedby="live-voice-provider-help">
+                  <div className="live-field-label"><strong>Translated audio engine</strong><small>Audio output only</small></div>
+                  <div className="live-mode-grid live-mode-grid-two" role="radiogroup" aria-label="Translated audio engine" aria-describedby="live-voice-provider-help">
                     <button type="button" role="radio" aria-checked={voiceProvider === "gemini"}
                       className={`live-mode-card ${voiceProvider === "gemini" ? "is-selected" : ""}`}
                       onClick={() => setVoiceProvider("gemini")}>
-                      <strong>Gemini 음성</strong><span>현재 방식 · Gemini 자막과 함께 통역 음성을 출력합니다.</span>
+                      <strong>Gemini audio</strong><span>Current method · deliver translated audio with Gemini captions.</span>
                     </button>
                     <button type="button" role="radio" aria-checked={voiceProvider === "openai"}
                       aria-describedby="live-voice-provider-help" disabled={sessionType === "meeting" || !isOpenAIVoiceLanguageSupported}
                       className={`live-mode-card ${voiceProvider === "openai" ? "is-selected" : ""}`}
                       onClick={() => setVoiceProvider("openai")}>
-                      <strong>OpenAI Realtime</strong><span>Presentation에서 낮은 지연의 연속 통역 음성을 출력합니다.</span>
+                      <strong>OpenAI Realtime</strong><span>Low-latency continuous translated audio for presentations.</span>
                     </button>
                   </div>
                   <p id="live-voice-provider-help" className="live-help">{sessionType === "meeting"
-                    ? "Meeting은 화자별 고정 음색을 위해 Gemini 음성을 사용합니다."
+                    ? "Meeting uses Gemini audio to keep one stable voice for each speaker."
                     : !isOpenAIVoiceLanguageSupported
-                      ? "선택한 언어 중 OpenAI Realtime 통역 음성이 지원하지 않는 언어가 있어 Gemini 음성을 사용합니다."
-                      : "OpenAI Realtime은 지원되는 13개 대상 언어에서 사용할 수 있습니다. 자막은 Gemini로 유지됩니다."}</p>
+                      ? "One or more selected languages are not supported by OpenAI Realtime audio, so Gemini audio will be used."
+                      : "OpenAI Realtime is available for 13 supported target languages. Captions remain on Gemini."}</p>
                 </div>
               )}
               {outputMode !== "captions" &&
-                <p className="live-consent-note" role="note"><strong>통역 음성</strong>은 시청자가 직접 재생을 누른 뒤에만 시작됩니다.</p>
+                <p className="live-consent-note" role="note"><strong>Translated audio</strong> starts only after each guest chooses to play it.</p>
               }
             </div>
           )}
@@ -699,13 +1072,13 @@ export default function LiveHostDashboard() {
           {wizardStep === 3 && (
             <div className="live-wizard-body live-audience-settings">
               <div className="live-field-group">
-                <label htmlFor="live-capacity">최대 참여자 <output htmlFor="live-capacity">{maxViewers}명</output></label>
+                <label htmlFor="live-capacity">Maximum guests <output htmlFor="live-capacity">{maxViewers}</output></label>
                 <input id="live-capacity" type="range" min={1} max={50} step={1} value={maxViewers}
                   onChange={(event) => setMaxViewers(Number(event.target.value))} />
-                <small>1명부터 최대 50명까지 입장을 제한합니다.</small>
+                <small>Limit entry from 1 to 50 guests.</small>
               </div>
               <div className="live-field-group">
-                <div className="live-field-label"><strong>시청 언어</strong><small>{languages.length}/3</small></div>
+                <div className="live-field-label"><strong>Guest languages</strong><small>{languages.length}/3</small></div>
                 <div className="live-language-grid">
                   {LANGUAGE_OPTIONS.map((language) => {
                     const isSelected = languages.includes(language.code);
@@ -718,18 +1091,18 @@ export default function LiveHostDashboard() {
               </div>
               <div className="live-field-group">
                 <div className="live-field-label">
-                  <strong>산업 용어팩</strong>
-                  <small>{sessionType === "meeting" ? "기본 관용구 + 선택 팩 적용" : "Meeting에서 적용"}</small>
+                  <strong>Industry glossary</strong>
+                  <small>{sessionType === "meeting" ? "Base phrases + selected pack" : "Available for Meeting"}</small>
                 </div>
-                <div className="live-glossary-grid" role="radiogroup" aria-label="산업 용어팩" aria-describedby="live-glossary-help">
+                <div className="live-glossary-grid" role="radiogroup" aria-label="Industry glossary" aria-describedby="live-glossary-help">
                   {GLOSSARY_PACK_OPTIONS.map((option) => <button key={option.value} type="button" role="radio"
                     aria-checked={glossaryPack === option.value} className={glossaryPack === option.value ? "is-selected" : ""}
                     disabled={sessionType === "presentation"}
                     onClick={() => setGlossaryPack(option.value)}><strong>{option.title}</strong><span>{option.description}</span></button>)}
                 </div>
                 <p id="live-glossary-help" className="live-help">{sessionType === "meeting"
-                  ? "Meeting의 화자별 텍스트 번역에 기본 관용구와 선택한 산업 용어팩을 적용합니다."
-                  : "Presentation의 실시간 음성 번역 모델은 용어집 지시를 지원하지 않습니다. Meeting을 선택하면 사용할 수 있습니다."}</p>
+                  ? "Apply base phrases and the selected industry glossary to speaker-aware meeting translations."
+                  : "The presentation streaming model does not support glossary instructions. Choose Meeting to enable them."}</p>
               </div>
             </div>
           )}
@@ -737,30 +1110,68 @@ export default function LiveHostDashboard() {
           {wizardStep === 4 && (
             <div className="live-wizard-body">
               <dl className="live-review-list">
-                <div><dt>세션</dt><dd>{sessionType === "presentation" ? "Presentation" : "Meeting"}</dd></div>
-                <div><dt>출력</dt><dd>{selectedOutputLabel}</dd></div>
-                <div><dt>자막 엔진</dt><dd>Gemini 고정</dd></div>
-                {outputMode !== "captions" && <div><dt>음성 엔진</dt><dd>{voiceProvider === "openai" ? "OpenAI Realtime" : "Gemini"}</dd></div>}
-                <div><dt>정원</dt><dd>{maxViewers}명</dd></div>
-                <div><dt>언어</dt><dd>{languages.map((language) => languageLabel.get(language) ?? language).join(" · ")}</dd></div>
-                <div><dt>용어</dt><dd>{sessionType === "meeting" ? `기본 관용구 + ${selectedGlossaryLabel}` : "적용 안 됨 · Meeting 전용"}</dd></div>
+                <div><dt>Title</dt><dd>{title.trim()}</dd></div>
+                <div><dt>Schedule</dt><dd>{sessionDate} · {startTime}</dd></div>
+                <div><dt>Session</dt><dd>{sessionType === "presentation" ? "Presentation" : "Meeting"}</dd></div>
+                <div><dt>Output</dt><dd>{selectedOutputLabel}</dd></div>
+                <div><dt>Caption engine</dt><dd>Gemini fixed</dd></div>
+                {outputMode !== "captions" && <div><dt>Audio engine</dt><dd>{voiceProvider === "openai" ? "OpenAI Realtime" : "Gemini"}</dd></div>}
+                <div><dt>Capacity</dt><dd>{maxViewers}</dd></div>
+                <div><dt>Languages</dt><dd>{languages.map((language) => languageLabel.get(language) ?? language).join(" · ")}</dd></div>
+                <div><dt>Glossary</dt><dd>{sessionType === "meeting" ? `Base phrases + ${selectedGlossaryLabel}` : "Not applied · Meeting only"}</dd></div>
               </dl>
               <div className="live-wizard-actions">
                 {session && <button type="button" className="glass-btn" onClick={() => {
                   setSessionType(session.sessionType); setOutputMode(session.outputMode); setVoiceProvider(session.voiceProvider); setMaxViewers(session.maxViewers);
                   setGlossaryPack(session.glossaryPack); setLanguages([...session.languages]); setIsEditingSession(false);
-                }}>취소</button>}
-                <button type="button" className="accent-btn live-primary-action" disabled={isBusy}
+                }}>Cancel</button>}
+                <button type="button" className="accent-btn live-primary-action" disabled={isBusy || !title.trim() || !scheduledAt}
                   onClick={() => void (session ? applySession() : createSession())}>
-                  {isBusy ? "저장 중…" : session ? "변경 적용" : "세션 준비"}
+                  {isBusy ? "Creating…" : session ? "Apply changes" : "Create Live"}
                 </button>
               </div>
             </div>
           )}
 
           <div className="live-wizard-footer">
-            <button type="button" className="glass-btn" disabled={wizardStep === 1} onClick={() => setWizardStep((wizardStep - 1) as 1 | 2 | 3 | 4)}>이전</button>
-            {wizardStep < 4 && <button type="button" className="accent-btn" onClick={() => setWizardStep((wizardStep + 1) as 1 | 2 | 3 | 4)}>다음</button>}
+            {wizardStep === 1 ? (
+              <>
+                <button type="button" className="glass-btn" onClick={() => setWizardStep(2)}>Advanced settings</button>
+                <button type="button" className="accent-btn" disabled={isBusy || !title.trim() || !scheduledAt}
+                  onClick={() => void (session ? applySession() : createSession())}>
+                  {isBusy ? "Creating…" : session ? "Apply changes" : "Create Session"}
+                </button>
+              </>
+            ) : (
+              <>
+                <button type="button" className="glass-btn" onClick={() => setWizardStep((wizardStep - 1) as 1 | 2 | 3 | 4)}>Back</button>
+                {wizardStep < 4 && <button type="button" className="accent-btn"
+                  onClick={() => setWizardStep((wizardStep + 1) as 1 | 2 | 3 | 4)}>Continue</button>}
+              </>
+            )}
+          </div>
+        </section>
+      )}
+
+      {session && (
+        <section className="live-host-caption-stage" aria-labelledby="host-caption-heading">
+          <div className="live-section-heading">
+            <div><span>CAPTIONS</span><h2 id="host-caption-heading">Live captions</h2></div>
+            <small>{isBroadcasting ? "Caption engine running" : "Caption input paused · Live Call remains connected"}</small>
+          </div>
+          <div className="live-host-caption-feed" aria-live="polite">
+            {recentSpeeches.length === 0 ? (
+              <p>Captions will appear here as speech is recognized.</p>
+            ) : recentSpeeches.slice(-5).map((speech) => (
+              <article key={`${speech.participantId}-${speech.seq}`}>
+                <header>
+                  <strong>{speech.displayName}</strong>
+                  <span>{speech.department} · {speech.jobTitle}</span>
+                  <time dateTime={speech.endedAt}>{formatTime(speech.endedAt)}</time>
+                </header>
+                <p>{speech.text}</p>
+              </article>
+            ))}
           </div>
         </section>
       )}
@@ -768,82 +1179,167 @@ export default function LiveHostDashboard() {
       {session && (
         <section className="glass live-panel live-session-panel" aria-labelledby="session-heading">
           <div className="live-section-heading">
-            <div><span>LIVE</span><h2 id="session-heading">호스트 세션</h2></div>
+            <div><span>LIVE</span><h2 id="session-heading">{title || "Host session"}</h2></div>
             <small aria-live="polite">{sessionSyncStatus}</small>
           </div>
           <>
               <dl className="live-session-facts">
-                <div><dt>접속자</dt><dd>{session.viewerCount} / {session.maxViewers}</dd></div>
-                <div><dt>세션 상태</dt><dd>{formatSessionStatus(session.status)}</dd></div>
-                <div><dt>형식</dt><dd>{session.sessionType === "presentation" ? "Presentation" : "Meeting"}</dd></div>
-                <div><dt>출력</dt><dd>{OUTPUT_OPTIONS.find((option) => option.value === session.outputMode)?.title}</dd></div>
-                <div><dt>언어</dt><dd>{session.languages.map((language) => languageLabel.get(language) ?? language).join(" · ")}</dd></div>
-                <div><dt>입장 만료</dt><dd>{formatTime(admission?.openUntil ?? session.admissionOpenUntil)}</dd></div>
-                <div><dt>세션 만료</dt><dd>{formatTime(session.expiresAt)}</dd></div>
+                <div><dt>Scheduled</dt><dd>{session.scheduledAt ? new Date(session.scheduledAt).toLocaleString("en") : "Starts now"}</dd></div>
+                <div><dt>Guests</dt><dd>{session.viewerCount} / {session.maxViewers}</dd></div>
+                <div><dt>Status</dt><dd>{formatSessionStatus(session.status)}</dd></div>
+                <div><dt>Format</dt><dd>{session.sessionType === "presentation" ? "Presentation" : "Meeting"}</dd></div>
+                <div><dt>Output</dt><dd>{OUTPUT_OPTIONS.find((option) => option.value === session.outputMode)?.title}</dd></div>
+                <div><dt>Languages</dt><dd>{session.languages.map((language) => languageLabel.get(language) ?? language).join(" · ")}</dd></div>
+                <div><dt>Guest access</dt><dd>Open until the session ends</dd></div>
+                <div><dt>Session expires</dt><dd>{formatTime(session.expiresAt)}</dd></div>
               </dl>
-              {admission && (
+              {invite && (
                 <div className="live-admission-code" aria-live="polite">
-                  <span>공유 인증번호</span><strong>{admission.code}</strong>
-                  <small>입장 만료 {formatTime(admission.openUntil)} · 링크가 안 되면 이 번호를 사용하세요.</small>
-                  {invite && (
-                    <>
-                      <small>초대 링크 만료 {formatTime(invite.expiresAt)}</small>
-                      <div className="live-invite-share">
-                        <InviteQrCode value={invite.url} />
-                        <div className="live-invite-actions">
-                          <button type="button" className="live-invite-copy" onClick={() => void copyInviteLink()}
-                            aria-label="시청자 초대 링크 복사">링크 복사</button>
-                          <a className="live-invite-mail" href={inviteMailto} aria-label="기본 메일 앱에서 Live 초대 작성">메일로 초대</a>
-                        </div>
-                      </div>
-                    </>
-                  )}
+                  <span>Guest QR</span>
+                  <div className="live-invite-share">
+                    <InviteQrCode value={invite.url} />
+                    <div className="live-access-code">
+                      <span>6-digit access code</span>
+                      <strong>{invite.admissionCode}</strong>
+                      <small>Valid until the host ends this session</small>
+                    </div>
+                    <div className="live-invite-actions">
+                      <button type="button" className="live-invite-copy" onClick={() => void copyInviteLink()}
+                        aria-label="Copy guest invite link">Copy link</button>
+                      <a className="live-invite-mail" href={inviteMailto} aria-label="Write a Live invitation email">Invite by email</a>
+                    </div>
+                  </div>
                 </div>
               )}
               <span className="live-invite-feedback" aria-live="polite">{inviteFeedback}</span>
+              <div className="live-cover-upload">
+                <div>
+                  <strong>Stage cover image</strong>
+                  <p>{session.hasCoverImage
+                    ? "Shown behind the stage countdown and the guest waiting room."
+                    : "Optional backdrop for the stage countdown and the guest waiting room. JPEG, PNG, or WebP up to 5MB."}</p>
+                </div>
+                <input ref={coverInputRef} type="file" accept="image/jpeg,image/png,image/webp" hidden
+                  onChange={(event) => {
+                    const file = event.target.files?.[0];
+                    event.target.value = "";
+                    if (file) void uploadCoverImage(file);
+                  }} />
+                <button type="button" className="glass-btn" disabled={isBusy}
+                  onClick={() => coverInputRef.current?.click()}>
+                  {session.hasCoverImage ? "Replace cover" : "Upload cover"}
+                </button>
+                <span className="live-invite-feedback" aria-live="polite">{coverFeedback}</span>
+              </div>
               <div className="live-action-row">
-                <button type="button" className={isBroadcasting ? "live-danger-button" : "accent-btn"} disabled={isBusy}
-                  onClick={() => void (isBroadcasting ? stopBroadcast() : startBroadcast())}>
-                  {isBroadcasting ? "송출 멈춤" : "음성 송출"}
+                {!invite && <button type="button" className="accent-btn" disabled={isBusy} onClick={() => void retryInvite()}>Retry guest QR</button>}
+                {isBroadcasting && <button type="button" className="glass-btn" disabled={isBusy}
+                  title="Refresh the translation pipeline without ending the session"
+                  onClick={() => void restartBroadcast()}>Restart caption engine</button>}
+                {session.status === "paused" ? (
+                  <button type="button" className="accent-btn" disabled={isBusy} onClick={() => void resumeSession()}>
+                    Resume captions
+                  </button>
+                ) : session.status === "live" && isBroadcasting ? (
+                  <button type="button" className="glass-btn" disabled={isBusy} onClick={() => void pauseSession()}>
+                    Pause captions
+                  </button>
+                ) : (
+                  <button type="button" className="accent-btn" disabled={isBusy} onClick={() => void startBroadcast()}>
+                    {session.status === "live" ? "Reconnect captions" : "Start Live"}
+                  </button>
+                )}
+                <button type="button" className="glass-btn" onClick={openStageWindow}
+                  title="Open the stage/countdown view in a separate window">
+                  Open stage view
                 </button>
-                <button type="button" className={admission ? "glass-btn" : "accent-btn"} disabled={isBusy}
-                  aria-label={admission ? "새 시청자 입장창 닫기" : "새 시청자 입장창 열기"}
-                  onClick={() => void (admission ? closeAdmission() : openAdmission())}>
-                  {admission ? "입장창 닫기" : "입장창 열기"}
-                </button>
-                <button type="button" className="glass-btn" disabled={isBusy || isEditingSession} onClick={() => { setWizardStep(1); setIsEditingSession(true); }}>설정 변경</button>
-                <button type="button" className="live-danger-button" disabled={isBusy} onClick={stopSession}>종료</button>
+                <button type="button" className="glass-btn" disabled={isBusy || isEditingSession} onClick={() => { setWizardStep(1); setIsEditingSession(true); }}>Edit setup</button>
+              </div>
+              <div className="live-danger-zone" aria-label="Destructive session controls">
+                <div>
+                  <strong>End session</strong>
+                  <p>Ends the live call for every participant and starts meeting-minutes generation. This cannot be undone.</p>
+                </div>
+                {!isEndConfirmVisible ? (
+                  <button type="button" className="live-danger-button" disabled={isBusy}
+                    onClick={() => setIsEndConfirmVisible(true)}>
+                    End session…
+                  </button>
+                ) : (
+                  <div className="live-danger-confirm" role="group" aria-label="Confirm ending the session">
+                    <span>End this session for all participants?</span>
+                    <button type="button" className="glass-btn" disabled={isBusy}
+                      onClick={() => setIsEndConfirmVisible(false)}>
+                      Cancel
+                    </button>
+                    <button type="button" className="live-danger-button" disabled={isBusy}
+                      onClick={() => void stopSession()}>
+                      Yes, end session
+                    </button>
+                  </div>
+                )}
               </div>
             </>
         </section>
       )}
 
+      {session && (
+        <section className="live-participant-panel" aria-labelledby="participants-heading">
+          <div className="live-section-heading">
+            <div><span>ATTENDANCE</span><h2 id="participants-heading">Participants and speaking activity</h2></div>
+            <small>{participants.filter((participant) => participant.isPresent).length} present · {participants.length} total</small>
+          </div>
+          <div className="live-participant-table-wrap">
+            <table className="live-participant-table">
+              <thead>
+                <tr><th>Name</th><th>Department</th><th>Job title</th><th>Joined</th><th>Speaking activity</th><th>Status</th></tr>
+              </thead>
+              <tbody>
+                {participants.length === 0 ? (
+                  <tr><td colSpan={6}>Waiting for guests to join.</td></tr>
+                ) : participants.map((participant) => (
+                  <tr key={participant.participantId}>
+                    <td>{participant.displayName}</td>
+                    <td>{participant.department}</td>
+                    <td>{participant.jobTitle}</td>
+                    <td>{formatTime(participant.joinedAt)}</td>
+                    <td>{participant.utteranceCount} turns · {Math.round(participant.speakingSeconds)} sec</td>
+                    <td><span className={`live-presence ${participant.isPresent ? "is-present" : ""}`}>{participant.isPresent ? "Present" : "Left"}</span></td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </section>
+      )}
+
       <section className="glass live-panel live-monitor-panel" aria-labelledby="monitor-heading">
         <div className="live-section-heading">
-          <div><span>05</span><h2 id="monitor-heading">언어 상태와 화자 범례</h2></div>
-          <small aria-live="polite">{isBroadcasting ? gatewayStatus : session ? "송출 준비" : "세션 시작 후 표시"}</small>
+          <div><span>MONITOR</span><h2 id="monitor-heading">Languages and speakers</h2></div>
+          <small aria-live="polite">{isBroadcasting ? gatewayStatus : session ? "Ready to broadcast" : "Available after setup"}</small>
         </div>
         <div className="live-monitor-grid">
           <div className="live-language-statuses">
             {(session?.languages ?? languages).map((language) => (
               <div key={language}><span className={`live-status-dot ${isBroadcasting && languageStatuses[language] === "ready" ? "is-live" : ""}`} aria-hidden="true" />
                 <strong>{languageLabel.get(language) ?? language}</strong><small>
-                  {isBroadcasting ? LANGUAGE_STATUS_LABELS[languageStatuses[language] ?? "preparing"] : "대기"}
+                  {isBroadcasting ? LANGUAGE_STATUS_LABELS[languageStatuses[language] ?? "preparing"] : "Waiting"}
                 </small></div>
             ))}
           </div>
           <div className="live-speaker-legend">
-            {speakers.length === 0 ? <p>Meeting에서 화자가 인식되면 세션 고정 라벨이 표시됩니다.</p> : speakers.map((speaker) => (
+            {speakers.length === 0 ? <p>Stable speaker labels appear after Meeting identifies a speaker.</p> : speakers.map((speaker) => (
               <div key={speaker.speakerId}><span className="live-speaker-dot" style={{ backgroundColor: resolveSpeakerColor(speaker) }} aria-hidden="true" />
                 <strong>{speaker.label}</strong>
                 <span className="live-speaker-line" style={{ backgroundColor: resolveSpeakerColor(speaker) }} aria-hidden="true" />
-                <small>음성 · {getSpeakerVoiceStatus(speaker, outputMode)}</small>
+                <small>Audio · {getSpeakerVoiceStatus(speaker, outputMode)}</small>
               </div>
             ))}
           </div>
         </div>
       </section>
-      <p className="live-privacy-note">원본 음성·음성 특징은 저장하지 않으며, 마지막 확정 자막 스냅샷만 재연결을 위해 임시 보관합니다.</p>
+      <p className="live-privacy-note">Original audio and voice characteristics are not stored. Only the latest final caption snapshot is retained temporarily for reconnection.</p>
+      </div>
     </main>
   );
 }

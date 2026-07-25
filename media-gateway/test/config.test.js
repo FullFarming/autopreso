@@ -40,6 +40,9 @@ test("live settings accept one to three unique languages", () => {
     voiceProvider: "gemini",
     maxViewers: 50,
     glossaryPack: "general_cre",
+    glossaryText: "",
+    translationTone: "natural",
+    domainText: "",
   });
   const legacyTownhall = validateLiveSettings({ mode: "townhall", languages: ["ko"], voiceOutputMode: "auto_voice" });
   assert.equal(legacyTownhall.sessionType, "meeting");
@@ -100,6 +103,18 @@ test("gateway prefers the new Supabase secret and temporarily accepts the legacy
   assert.throws(() => readGatewayEnvironment(missing), /SUPABASE_SECRET_KEY/u);
 });
 
+test("host reconnect grace window defaults to 45 seconds and honors the env override", () => {
+  assert.equal(readGatewayEnvironment(gatewayEnvironment()).hostReconnectGraceMilliseconds, 45_000);
+  assert.equal(
+    readGatewayEnvironment({ ...gatewayEnvironment(), LIVE_HOST_RECONNECT_GRACE_MS: "10000" }).hostReconnectGraceMilliseconds,
+    10_000,
+  );
+  assert.throws(
+    () => readGatewayEnvironment({ ...gatewayEnvironment(), LIVE_HOST_RECONNECT_GRACE_MS: "not-a-number" }),
+    /LIVE_HOST_RECONNECT_GRACE_MS/u,
+  );
+});
+
 test("gateway keeps the OpenAI key in internal server config", () => {
   const config = readGatewayEnvironment({ ...gatewayEnvironment(), OPENAI_API_KEY: "sk-server-only" });
   assert.equal(config.openaiApiKey, "sk-server-only");
@@ -109,4 +124,12 @@ test("gateway fails fast when the server-only OpenAI key is missing", () => {
   const environment = gatewayEnvironment();
   delete environment.OPENAI_API_KEY;
   assert.throws(() => readGatewayEnvironment(environment), /OPENAI_API_KEY/u);
+});
+
+test("live settings accept an optional desktop glossary text and cap its size", () => {
+  const base = { sessionType: "meeting", languages: ["ko", "en"], outputMode: "captions" };
+  assert.equal(validateLiveSettings(base).glossaryText, "");
+  assert.equal(validateLiveSettings({ ...base, glossaryText: "  힐튼 = Hilton  " }).glossaryText, "힐튼 = Hilton");
+  assert.equal(validateLiveSettings({ ...base, glossaryText: "가".repeat(20_000) }).glossaryText.length, 16_000);
+  assert.throws(() => validateLiveSettings({ ...base, glossaryText: 123 }), /용어집 텍스트/);
 });

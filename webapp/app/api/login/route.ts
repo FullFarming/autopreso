@@ -9,9 +9,17 @@ import { hostLoginInputSchema } from "@/lib/security/live-input-validation";
 import { enforceHostLoginRateLimit } from "@/lib/security/live-rate-limit";
 import { loginRateLimiter } from "@/lib/security/login-rate-limit";
 
-const HOST_LOGIN_CONFIG = readHostLoginConfig();
-
 export async function POST(request: NextRequest) {
+  // Read the env-backed config per request: a module-scope constant would
+  // freeze a stale value for the lambda's lifetime, and a misconfigured env
+  // would throw at import time and surface as an opaque 500 on every route.
+  let hostLoginConfig;
+  try {
+    hostLoginConfig = readHostLoginConfig();
+  } catch {
+    return apiError("호스트 로그인 환경변수 설정이 올바르지 않습니다.", "HOST_LOGIN_CONFIG_INVALID", 503);
+  }
+
   const parsed = hostLoginInputSchema.safeParse(await request.json().catch(() => null));
   if (!parsed.success) return apiError("로그인 정보가 올바르지 않습니다.", "INVALID_LOGIN_REQUEST", 400);
   const { id, password, name } = parsed.data;
@@ -39,10 +47,10 @@ export async function POST(request: NextRequest) {
 
   const hasValidPassword = timingSafeEqual(
     password.padEnd(256, "\0"),
-    HOST_LOGIN_CONFIG.password.padEnd(256, "\0"),
+    hostLoginConfig.password.padEnd(256, "\0"),
   );
-  const hasValidCredentials = HOST_LOGIN_CONFIG.isEnabled
-    && HOST_LOGIN_CONFIG.userIds.has(id)
+  const hasValidCredentials = hostLoginConfig.isEnabled
+    && hostLoginConfig.userIds.has(id)
     && hasValidPassword;
   if (!hasValidCredentials) {
     const nextLimit = loginRateLimiter.recordFailure(request.headers);

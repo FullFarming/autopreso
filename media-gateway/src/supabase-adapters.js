@@ -10,16 +10,29 @@ export class SupabaseLivePublisher {
   }
 
   async publish(sessionId, language, event) {
+    let recordingError = null;
     if (event.type === "caption" && event.isFinal) {
-      await this.#guardedRpc("persist_live_snapshot_if_active", {
-        p_session_id: sessionId,
-        p_language: language,
-        p_event: event,
-      });
+      // Snapshot persistence is best-effort: a transient failure must not drop
+      // the caption. A genuine "session stopped" RPC decline (false) still
+      // stops emission.
+      let snapshotResult;
+      try {
+        snapshotResult = await this.#request("/rest/v1/rpc/persist_live_snapshot_if_active", {
+          method: "POST",
+          body: JSON.stringify({
+            p_session_id: sessionId,
+            p_language: language,
+            p_event: event,
+          }),
+        });
+      } catch {
+        snapshotResult = undefined; // transient — intentionally swallowed
+      }
+      if (snapshotResult === false) throw new Error("SESSION_STOPPED");
       // Meeting-record persistence is best-effort: a declined or failing RPC
       // (row cap, transient network) must not interrupt the live broadcast.
       try {
-        await this.#request("/rest/v1/rpc/persist_live_utterance_if_active", {
+        const utteranceResult = await this.#request("/rest/v1/rpc/persist_live_utterance_if_active", {
           method: "POST",
           body: JSON.stringify({
             p_session_id: sessionId,
@@ -28,12 +41,19 @@ export class SupabaseLivePublisher {
             p_text: event.text,
             p_speaker_label: event.speaker?.speakerId ?? null,
             p_speaker_name: event.speaker?.label ?? null,
+            p_source_started_at: event.sourceStartedAt ?? null,
             p_source_ended_at: event.sourceEndedAt,
             p_emitted_at: event.emittedAt,
+            p_participant_id: participantIdFromSpeaker(event.speaker),
+            // Provenance for the viewer's original/translation disclosure.
+            // Null on the source lane, where p_text already IS the original.
+            p_source_text: event.sourceText ?? null,
+            p_source_language: event.sourceLanguage ?? null,
           }),
         });
+        if (utteranceResult !== true) recordingError = createRecordingError(sessionId, language, event.seq);
       } catch {
-        // Intentionally swallowed; see comment above.
+        recordingError = createRecordingError(sessionId, language, event.seq);
       }
     }
     if (event.type === "speaker-legend") {
@@ -44,6 +64,7 @@ export class SupabaseLivePublisher {
       });
     }
     await this.eventFanout(sessionId, language, event);
+    if (recordingError) await this.eventFanout(sessionId, language, recordingError);
   }
 
   async #guardedRpc(name, payload) {
@@ -56,6 +77,70 @@ export class SupabaseLivePublisher {
 
   async publishAudio(sessionId, language, header, pcm) {
     await this.audioFanout(sessionId, language, encodeAudioFrame(header, pcm));
+  }
+
+  /** Max persisted caption seq per language, used to seed pipeline counters
+   *  so seq survives host reconnects and process restarts (contract C1). */
+  async fetchLastUtteranceSeqs(sessionId, languages) {
+    const entries = await Promise.all(languages.map(async (language) => {
+      const query = new URLSearchParams({
+        session_id: `eq.${sessionId}`,
+        language: `eq.${language}`,
+        select: "seq",
+        order: "seq.desc",
+        limit: "1",
+      });
+      const rows = await this.#request(`/rest/v1/live_utterances?${query}`, { method: "GET" });
+      const seq = Array.isArray(rows) && rows.length === 1 ? Number(rows[0].seq) : 0;
+      return [language, Number.isSafeInteger(seq) && seq > 0 ? seq : 0];
+    }));
+    return Object.fromEntries(entries);
+  }
+
+  /** Persisted utterances with seq > afterSeq for viewer replay (contract C2). */
+  async fetchUtterancesAfter(sessionId, language, afterSeq, limit = 200) {
+    const query = new URLSearchParams({
+      session_id: `eq.${sessionId}`,
+      language: `eq.${language}`,
+      seq: `gt.${afterSeq}`,
+      select: "seq,speaker_label,speaker_name,text,source_text,source_language,source_ended_at,emitted_at",
+      order: "seq.asc",
+      limit: String(limit),
+    });
+    const rows = await this.#request(`/rest/v1/live_utterances?${query}`, { method: "GET" });
+    if (!Array.isArray(rows)) return [];
+    return rows.map((row) => ({
+      type: "caption",
+      seq: Number(row.seq),
+      sessionId,
+      language,
+      // Must be a COMPLETE SpeakerAssignment: the viewer contract validates
+      // every field and silently drops replayed captions whose speaker shape
+      // is partial — which would make missed history unrecoverable after a
+      // reconnect.
+      speaker: row.speaker_label || row.speaker_name
+        ? {
+          speakerId: String(row.speaker_label ?? row.speaker_name),
+          label: row.speaker_name ?? row.speaker_label ?? "",
+          name: row.speaker_name ?? "",
+          colorToken: "speaker-teal",
+          voiceName: null,
+          voiceStatus: "disabled",
+          lastSeenAt: row.emitted_at,
+        }
+        : null,
+      text: row.text,
+      isFinal: true,
+      // Replayed history must support the same 원문보기 disclosure as live
+      // captions, otherwise reconnecting silently loses the originals. A row
+      // predating the provenance columns replays with null and the viewer
+      // simply offers no disclosure for it.
+      sourceText: row.source_text ?? null,
+      sourceLanguage: row.source_language ?? null,
+      translationStatus: row.source_text ? "translated" : "verbatim",
+      sourceEndedAt: row.source_ended_at,
+      emittedAt: row.emitted_at,
+    }));
   }
 
   async markLive(sessionId) {
@@ -78,6 +163,24 @@ export class SupabaseLivePublisher {
     const text = await response.text();
     return text.length > 0 ? JSON.parse(text) : undefined;
   }
+}
+
+function createRecordingError(sessionId, language, seq) {
+  return {
+    type: "recording-status",
+    sessionId,
+    language,
+    status: "error",
+    code: "UTTERANCE_PERSIST_FAILED",
+    seq,
+    message: "자막은 계속 표시되지만 기록 저장에 실패했습니다.",
+  };
+}
+
+function participantIdFromSpeaker(speaker) {
+  const speakerId = speaker?.speakerId;
+  if (typeof speakerId !== "string" || !speakerId.startsWith("participant:")) return null;
+  return speakerId.slice("participant:".length) || null;
 }
 
 export class SupabaseViewerAuthorizer {
@@ -128,7 +231,10 @@ export class SupabaseHostAuthorizer {
       || typeof claims.sub !== "string"
       || claims.sessionId !== settings.sessionId
       || !Number.isSafeInteger(settings.version)
-      || !Array.isArray(settings.languages)) return false;
+      || !Array.isArray(settings.languages)) {
+      console.warn(`[host-authorize] rejected: malformed claims/settings session=${settings.sessionId} version=${settings.version}`);
+      return false;
+    }
     const query = new URLSearchParams({
       id: `eq.${settings.sessionId}`,
       expires_at: `gt.${new Date().toISOString()}`,
@@ -140,9 +246,15 @@ export class SupabaseHostAuthorizer {
       signal,
       headers: createSupabaseHeaders(this.supabaseCredential),
     });
-    if (!response.ok) return false;
+    if (!response.ok) {
+      console.warn(`[host-authorize] rejected: live_sessions REST HTTP ${response.status} session=${settings.sessionId}`);
+      return false;
+    }
     const rows = await response.json();
-    if (!Array.isArray(rows) || rows.length !== 1) return false;
+    if (!Array.isArray(rows) || rows.length !== 1) {
+      console.warn(`[host-authorize] rejected: no active session row (id/expiry filter) session=${settings.sessionId} rows=${Array.isArray(rows) ? rows.length : "invalid"}`);
+      return false;
+    }
     const row = rows[0];
     const rowSessionType = row.session_type ?? (row.mode === "presentation" ? "presentation" : "meeting");
     const rowOutputMode = row.output_mode
@@ -150,8 +262,12 @@ export class SupabaseHostAuthorizer {
     const rowVoiceProvider = rowSessionType === "presentation" && ["captions_audio", "audio"].includes(rowOutputMode)
       ? row.voice_provider ?? "gemini"
       : "gemini";
-    const isActiveStatus = requireLive ? row.status === "live" : ["preparing", "live"].includes(row.status);
-    return row.host_id === claims.sub
+    // Paused sessions keep a valid host lease (contract C4): pause must not
+    // close the host socket.
+    const isActiveStatus = requireLive
+      ? ["live", "paused"].includes(row.status)
+      : ["preparing", "live", "paused"].includes(row.status);
+    const isAuthorized = row.host_id === claims.sub
       && isActiveStatus
       && (!compareVersion || row.version === settings.version)
       && rowSessionType === settingsSessionType
@@ -162,6 +278,17 @@ export class SupabaseHostAuthorizer {
       && Array.isArray(row.languages)
       && row.languages.length === settings.languages.length
       && row.languages.every((language, index) => language === settings.languages[index]);
+    if (!isAuthorized) {
+      // Session config only — never tokens or transcript content. This names
+      // the exact mismatched field so host-start rejections stop being blind.
+      console.warn(`[host-authorize] rejected session=${settings.sessionId} `
+        + `status=${row.status} requireLive=${requireLive} `
+        + `version=${row.version}/${settings.version} type=${rowSessionType}/${settingsSessionType} `
+        + `output=${rowOutputMode}/${settingsOutputMode} voice=${rowVoiceProvider}/${settingsVoiceProvider} `
+        + `viewers=${row.max_viewers ?? 50}/${settingsMaxViewers} glossary=${row.glossary_pack ?? "general_cre"}/${settingsGlossaryPack} `
+        + `languages=${JSON.stringify(row.languages)}/${JSON.stringify(settings.languages)} host=${row.host_id === claims.sub}`);
+    }
+    return isAuthorized;
   }
 }
 
@@ -176,7 +303,11 @@ export class SupabaseFloorController {
     try {
       const value = await this.#rpc("take_live_floor", { p_session_id: sessionId, p_grant_id: grantId });
       if (value && typeof value === "object" && value.ok === true) {
-        return { ok: true, displayName: typeof value.displayName === "string" ? value.displayName : "참가자" };
+        return {
+          ok: true,
+          displayName: typeof value.displayName === "string" ? value.displayName : "참가자",
+          participantId: typeof value.participantId === "string" ? value.participantId : grantId,
+        };
       }
       const code = value && typeof value === "object" && typeof value.code === "string" ? value.code : "FLOOR_DENIED";
       return { ok: false, code };
@@ -190,6 +321,32 @@ export class SupabaseFloorController {
       return await this.#rpc("release_live_floor", { p_session_id: sessionId, p_grant_id: grantId ?? null }) === true;
     } catch {
       return false;
+    }
+  }
+
+  /** Holder identity for floor broadcasts (contract C5). Best-effort: null on failure. */
+  async getParticipant(sessionId, participantId) {
+    try {
+      const query = new URLSearchParams({
+        session_id: `eq.${sessionId}`,
+        id: `eq.${participantId}`,
+        select: "display_name,department,job_title",
+        limit: "1",
+      });
+      const response = await this.fetchFn(`${this.baseUrl}/rest/v1/live_participants?${query}`, {
+        cache: "no-store",
+        headers: createSupabaseHeaders(this.supabaseCredential),
+      });
+      if (!response.ok) return null;
+      const rows = await response.json();
+      if (!Array.isArray(rows) || rows.length !== 1) return null;
+      return {
+        name: typeof rows[0].display_name === "string" ? rows[0].display_name : "",
+        department: typeof rows[0].department === "string" ? rows[0].department : "",
+        jobTitle: typeof rows[0].job_title === "string" ? rows[0].job_title : "",
+      };
+    } catch {
+      return null;
     }
   }
 
@@ -212,7 +369,12 @@ function resolveSupabaseCredential({ supabaseApiKey, supabaseKeyType, serviceRol
     if (!["secret", "legacy-service-role"].includes(supabaseKeyType)) {
       throw new Error("SUPABASE_SERVER_CREDENTIAL_TYPE_INVALID");
     }
-    return { apiKey: configuredApiKey, keyType: supabaseKeyType };
+    // The key SHAPE wins over the configured slot: a legacy service_role JWT
+    // (eyJ…) placed in the SUPABASE_SECRET_KEY slot must still be sent with
+    // Bearer authorization — apikey-only downgrades it to anon and RLS
+    // silently empties every read.
+    const keyType = configuredApiKey.startsWith("eyJ") ? "legacy-service-role" : supabaseKeyType;
+    return { apiKey: configuredApiKey, keyType };
   }
   const legacyKey = typeof serviceRoleKey === "string" ? serviceRoleKey.trim() : "";
   if (legacyKey) return { apiKey: legacyKey, keyType: "legacy-service-role" };

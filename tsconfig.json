@@ -14,5 +14,5 @@
     "types": ["node"]
   },
   "include": ["src/**/*.js", "scripts/**/*.js", "test/**/*.js"],
-  "exclude": ["node_modules", "public/app.js", ".autopreso-dev"]
+  "exclude": ["node_modules", "public/app.js", ".realtime-noel-dev"]
 }

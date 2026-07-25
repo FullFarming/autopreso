@@ -1,16 +1,16 @@
 {
-  "name": "@autopreso/moonshine-darwin-x64",
+  "name": "@realtime-noel/moonshine-darwin-x64",
   "version": "0.1.1",
-  "description": "Moonshine transcription sidecar for AutoPreso on macOS x64.",
+  "description": "Moonshine transcription sidecar for Realtime Noel on macOS x64.",
   "license": "MIT",
-  "homepage": "https://github.com/kunchenguid/autopreso#readme",
+  "homepage": "https://github.com/kyeongmankim/realtime-noel#readme",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/kunchenguid/autopreso.git",
+    "url": "git+https://github.com/kyeongmankim/realtime-noel.git",
     "directory": "packages/moonshine-darwin-x64"
   },
   "bugs": {
-    "url": "https://github.com/kunchenguid/autopreso/issues"
+    "url": "https://github.com/kyeongmankim/realtime-noel/issues"
   },
   "os": [
     "darwin"
@@ -19,10 +19,10 @@
     "x64"
   ],
   "files": [
-    "bin/autopreso-moonshine"
+    "bin/realtime-noel-moonshine"
   ],
   "bin": {
-    "autopreso-moonshine": "bin/autopreso-moonshine"
+    "realtime-noel-moonshine": "bin/realtime-noel-moonshine"
   },
   "publishConfig": {
     "access": "public"

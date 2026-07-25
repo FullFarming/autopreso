@@ -6,11 +6,11 @@ import { applyWhiteboardEditOperations, formatLineNumberedWhiteboard } from "../
 test("formatLineNumberedWhiteboard prefixes each element with padded line numbers", () => {
   assert.equal(
     formatLineNumberedWhiteboard([
-      { type: "text", id: "title", x: 72, y: 68, text: "AutoPreso" },
+      { type: "text", id: "title", x: 72, y: 68, text: "Realtime Noel" },
       { type: "rectangle", id: "voice", x: 80, y: 140, width: 220, height: 80 },
     ]),
     [
-      '001: {"type":"text","id":"title","x":72,"y":68,"text":"AutoPreso"}',
+      '001: {"type":"text","id":"title","x":72,"y":68,"text":"Realtime Noel"}',
       '002: {"type":"rectangle","id":"voice","x":80,"y":140,"width":220,"height":80}',
     ].join("\n"),
   );
@@ -18,7 +18,7 @@ test("formatLineNumberedWhiteboard prefixes each element with padded line number
 
 test("applyWhiteboardEditOperations edits whiteboard elements by line number", () => {
   const elements = [
-    { type: "text", id: "title", x: 72, y: 68, text: "AutoPreso" },
+    { type: "text", id: "title", x: 72, y: 68, text: "Realtime Noel" },
     { type: "rectangle", id: "voice", x: 80, y: 140, width: 220, height: 80 },
   ];
 
@@ -38,9 +38,9 @@ test("applyWhiteboardEditOperations edits whiteboard elements by line number", (
 test("applyWhiteboardEditOperations can insert into an empty whiteboard", () => {
   assert.deepEqual(
     applyWhiteboardEditOperations([], [
-      { type: "insert_after", line: 0, element: { type: "text", id: "title", x: 72, y: 68, text: "AutoPreso" } },
+      { type: "insert_after", line: 0, element: { type: "text", id: "title", x: 72, y: 68, text: "Realtime Noel" } },
     ]),
-    [{ type: "text", id: "title", x: 72, y: 68, text: "AutoPreso" }],
+    [{ type: "text", id: "title", x: 72, y: 68, text: "Realtime Noel" }],
   );
 });
 

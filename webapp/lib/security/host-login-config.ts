@@ -1,6 +1,8 @@
 import { isKnownInsecureSecret } from "./config";
 
-const MINIMUM_STRONG_PASSWORD_LENGTH = 32;
+// Operator-chosen minimum: brute force is bounded by the login rate limiter,
+// not by password entropy alone, so short-but-deliberate passwords are allowed.
+const MINIMUM_PASSWORD_LENGTH = 5;
 const HOST_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._@-]{0,127}$/u;
 
 export interface HostLoginConfig {
@@ -42,7 +44,7 @@ export function readHostLoginConfig(
   const userIds = parseUserIds(environment.ADMIN_USER_IDS);
   const password = environment.ADMIN_PASSWORD?.trim() ?? "";
   if (userIds.size === 0
-    || password.length < MINIMUM_STRONG_PASSWORD_LENGTH
+    || password.length < MINIMUM_PASSWORD_LENGTH
     || password.length > 256
     || isKnownInsecureSecret(password)) {
     if (isProduction) throw new Error("강한 호스트 로그인 환경변수 설정이 필요합니다.");

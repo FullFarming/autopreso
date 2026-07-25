@@ -2,6 +2,7 @@ import type { CaptionEvent, LiveSession, LiveSnapshot, SpeakerAssignment } from 
 import { LANGUAGE_CODES } from "../languageDetect";
 import { supabaseAdminHeaders, type SupabaseAdminCredential } from "../security/supabase-server-access";
 import { getLiveStoreConfig } from "./config";
+import { coverImageVersionFromPath } from "./cover-image";
 import { LiveSessionError } from "./errors";
 
 const CANONICAL_LANGUAGE_CODES = new Set<string>(LANGUAGE_CODES);
@@ -13,11 +14,19 @@ export interface LiveSessionStore {
     sessionId: string,
     hostId: string,
     expectedVersion: number,
-    patch: Pick<LiveSession, "sessionType" | "outputMode" | "voiceProvider" | "languages" | "maxViewers" | "glossaryPack">,
+    patch: Pick<LiveSession, "title" | "scheduledAt" | "sessionType" | "outputMode" | "voiceProvider" | "languages" | "maxViewers" | "glossaryPack">,
   ): Promise<LiveSession | null>;
-  stopOwned(sessionId: string, hostId: string): Promise<boolean>;
+  startOwned(sessionId: string, hostId: string, expectedVersion: number): Promise<LiveSession | null>;
+  pauseOwned(sessionId: string, hostId: string, expectedVersion: number): Promise<LiveSession | null>;
+  resumeOwned(sessionId: string, hostId: string, expectedVersion: number): Promise<LiveSession | null>;
+  terminateOwned(sessionId: string, hostId: string): Promise<boolean>;
+  /** Contract C10: record that a cover image object exists for the session. */
+  setCoverImageOwned(sessionId: string, hostId: string, path: string): Promise<boolean>;
+  listOwnedActive(hostId: string): Promise<LiveSession[]>;
   getSnapshot(sessionId: string, language: string): Promise<LiveSnapshot | null>;
 }
+
+const ACTIVE_SESSION_STATUSES: ReadonlyArray<LiveSession["status"]> = ["preparing", "live", "paused"];
 
 export class MemoryLiveSessionStore implements LiveSessionStore {
   private readonly sessions = new Map<string, LiveSession>();
@@ -39,7 +48,7 @@ export class MemoryLiveSessionStore implements LiveSessionStore {
     return structuredClone(session);
   }
 
-  async updateOwned(sessionId: string, hostId: string, expectedVersion: number, patch: Pick<LiveSession, "sessionType" | "outputMode" | "voiceProvider" | "languages" | "maxViewers" | "glossaryPack">): Promise<LiveSession | null> {
+  async updateOwned(sessionId: string, hostId: string, expectedVersion: number, patch: Pick<LiveSession, "title" | "scheduledAt" | "sessionType" | "outputMode" | "voiceProvider" | "languages" | "maxViewers" | "glossaryPack">): Promise<LiveSession | null> {
     const current = this.sessions.get(sessionId);
     if (!current
       || current.hostId !== hostId
@@ -51,10 +60,74 @@ export class MemoryLiveSessionStore implements LiveSessionStore {
     return structuredClone(updated);
   }
 
-  async stopOwned(sessionId: string, hostId: string): Promise<boolean> {
+  async startOwned(sessionId: string, hostId: string, expectedVersion: number): Promise<LiveSession | null> {
+    const current = this.sessions.get(sessionId);
+    if (!current
+      || current.hostId !== hostId
+      || current.version !== expectedVersion
+      || current.status !== "preparing"
+      || Date.parse(current.expiresAt) <= this.now()) return null;
+    const started: LiveSession = { ...current, status: "live", version: current.version + 1 };
+    this.sessions.set(sessionId, started);
+    return structuredClone(started);
+  }
+
+  async pauseOwned(sessionId: string, hostId: string, expectedVersion: number): Promise<LiveSession | null> {
+    return this.transitionOwned(sessionId, hostId, expectedVersion, "live", "paused");
+  }
+
+  async resumeOwned(sessionId: string, hostId: string, expectedVersion: number): Promise<LiveSession | null> {
+    return this.transitionOwned(sessionId, hostId, expectedVersion, "paused", "live");
+  }
+
+  private transitionOwned(
+    sessionId: string,
+    hostId: string,
+    expectedVersion: number,
+    fromStatus: LiveSession["status"],
+    toStatus: LiveSession["status"],
+  ): LiveSession | null {
+    const current = this.sessions.get(sessionId);
+    if (!current
+      || current.hostId !== hostId
+      || current.version !== expectedVersion
+      || current.status !== fromStatus
+      || Date.parse(current.expiresAt) <= this.now()) return null;
+    const next: LiveSession = { ...current, status: toStatus, version: current.version + 1 };
+    this.sessions.set(sessionId, next);
+    return structuredClone(next);
+  }
+
+  async listOwnedActive(hostId: string): Promise<LiveSession[]> {
+    return [...this.sessions.values()]
+      .filter((session) => session.hostId === hostId
+        && ACTIVE_SESSION_STATUSES.includes(session.status)
+        && Date.parse(session.expiresAt) > this.now())
+      .map((session) => structuredClone(session));
+  }
+
+  async setCoverImageOwned(sessionId: string, hostId: string, path: string): Promise<boolean> {
+    const current = this.sessions.get(sessionId);
+    if (!current
+      || current.hostId !== hostId
+      || current.status === "stopped"
+      || Date.parse(current.expiresAt) <= this.now()
+      || !path) return false;
+    this.sessions.set(sessionId, { ...current, hasCoverImage: true, coverImageVersion: coverImageVersionFromPath(path) });
+    return true;
+  }
+
+  async terminateOwned(sessionId: string, hostId: string): Promise<boolean> {
     const current = this.sessions.get(sessionId);
     if (!current || current.hostId !== hostId) return false;
-    this.sessions.set(sessionId, { ...current, status: "stopped", version: current.version + 1, viewerCount: 0, admissionOpenUntil: null });
+    this.sessions.set(sessionId, {
+      ...current,
+      status: "stopped",
+      version: current.version + 1,
+      viewerCount: 0,
+      admissionOpenUntil: null,
+      endedAt: current.endedAt ?? new Date(this.now()).toISOString(),
+    });
     for (const key of this.snapshots.keys()) if (key.startsWith(`${sessionId}:`)) this.snapshots.delete(key);
     return true;
   }
@@ -70,6 +143,8 @@ export class MemoryLiveSessionStore implements LiveSessionStore {
 interface SupabaseSessionRow {
   id: string;
   host_id: string;
+  title: string | null;
+  scheduled_at: string | null;
   session_type?: LiveSession["sessionType"];
   output_mode?: LiveSession["outputMode"];
   voice_provider: LiveSession["voiceProvider"];
@@ -83,6 +158,8 @@ interface SupabaseSessionRow {
   version: number;
   admission_open_until: string | null;
   expires_at: string;
+  ended_at?: string | null;
+  cover_image_path?: string | null;
 }
 
 export class SupabaseLiveSessionStore implements LiveSessionStore {
@@ -106,6 +183,8 @@ export class SupabaseLiveSessionStore implements LiveSessionStore {
       body: JSON.stringify({
         p_session_id: session.id,
         p_host_id: session.hostId,
+        p_title: session.title,
+        p_scheduled_at: session.scheduledAt,
         p_session_type: session.sessionType,
         p_output_mode: session.outputMode,
         p_voice_provider: session.voiceProvider,
@@ -129,13 +208,15 @@ export class SupabaseLiveSessionStore implements LiveSessionStore {
     return rows[0] ? fromRow(rows[0]) : null;
   }
 
-  async updateOwned(sessionId: string, hostId: string, expectedVersion: number, patch: Pick<LiveSession, "sessionType" | "outputMode" | "voiceProvider" | "languages" | "maxViewers" | "glossaryPack">): Promise<LiveSession | null> {
+  async updateOwned(sessionId: string, hostId: string, expectedVersion: number, patch: Pick<LiveSession, "title" | "scheduledAt" | "sessionType" | "outputMode" | "voiceProvider" | "languages" | "maxViewers" | "glossaryPack">): Promise<LiveSession | null> {
     const rows = await this.request<SupabaseSessionRow[]>("/rest/v1/rpc/update_live_session", {
       method: "POST",
       body: JSON.stringify({
         p_session_id: sessionId,
         p_host_id: hostId,
         p_expected_version: expectedVersion,
+        p_title: patch.title,
+        p_scheduled_at: patch.scheduledAt,
         p_session_type: patch.sessionType,
         p_output_mode: patch.outputMode,
         p_voice_provider: patch.voiceProvider,
@@ -147,7 +228,92 @@ export class SupabaseLiveSessionStore implements LiveSessionStore {
     return rows[0] ? fromRow(rows[0]) : null;
   }
 
-  async stopOwned(sessionId: string, hostId: string): Promise<boolean> {
+  async startOwned(sessionId: string, hostId: string, expectedVersion: number): Promise<LiveSession | null> {
+    let nextVersion: unknown;
+    try {
+      nextVersion = await this.request<unknown>("/rest/v1/rpc/start_live_session", {
+        method: "POST",
+        body: JSON.stringify({
+          p_session_id: sessionId,
+          p_host_id: hostId,
+          p_expected_version: expectedVersion,
+        }),
+      });
+    } catch (error: unknown) {
+      // 2026-07-23 fix: Re-read an owned row after a guarded start conflict.
+      // This distinguishes an idempotent concurrent retry from an unavailable store.
+      const current = await this.get(sessionId);
+      if (current?.hostId === hostId) return null;
+      throw error;
+    }
+    if (!Number.isSafeInteger(nextVersion) || Number(nextVersion) <= expectedVersion) return null;
+    return this.get(sessionId);
+  }
+
+  async pauseOwned(sessionId: string, hostId: string, expectedVersion: number): Promise<LiveSession | null> {
+    return this.transitionOwned("pause_live_session", sessionId, hostId, expectedVersion);
+  }
+
+  async resumeOwned(sessionId: string, hostId: string, expectedVersion: number): Promise<LiveSession | null> {
+    return this.transitionOwned("resume_live_session", sessionId, hostId, expectedVersion);
+  }
+
+  private async transitionOwned(
+    rpcName: "pause_live_session" | "resume_live_session",
+    sessionId: string,
+    hostId: string,
+    expectedVersion: number,
+  ): Promise<LiveSession | null> {
+    let nextVersion: unknown;
+    try {
+      nextVersion = await this.request<unknown>(`/rest/v1/rpc/${rpcName}`, {
+        method: "POST",
+        body: JSON.stringify({
+          p_session_id: sessionId,
+          p_host_id: hostId,
+          p_expected_version: expectedVersion,
+        }),
+      });
+    } catch (error: unknown) {
+      // Mirror startOwned: re-read an owned row after a guarded conflict so a
+      // concurrent retry surfaces as a version conflict, not a 503.
+      const current = await this.get(sessionId);
+      if (current?.hostId === hostId) return null;
+      throw error;
+    }
+    if (!Number.isSafeInteger(nextVersion) || Number(nextVersion) <= expectedVersion) return null;
+    return this.get(sessionId);
+  }
+
+  async listOwnedActive(hostId: string): Promise<LiveSession[]> {
+    const query = new URLSearchParams({
+      host_id: `eq.${hostId}`,
+      status: `in.(${ACTIVE_SESSION_STATUSES.join(",")})`,
+      expires_at: `gt.${new Date().toISOString()}`,
+      order: "created_at.desc",
+      limit: "20",
+    });
+    const rows = await this.request<SupabaseSessionRow[]>(`/rest/v1/live_sessions?${query}`, { method: "GET" });
+    return rows.map(fromRow);
+  }
+
+  async setCoverImageOwned(sessionId: string, hostId: string, path: string): Promise<boolean> {
+    if (!path) return false;
+    const query = new URLSearchParams({
+      id: `eq.${sessionId}`,
+      host_id: `eq.${hostId}`,
+      status: "neq.stopped",
+      expires_at: `gt.${new Date().toISOString()}`,
+    });
+    const rows = await this.request<SupabaseSessionRow[]>(`/rest/v1/live_sessions?${query}`, {
+      method: "PATCH",
+      headers: { Prefer: "return=representation" },
+      body: JSON.stringify({ cover_image_path: path }),
+    });
+    return rows.length > 0;
+  }
+
+  async terminateOwned(sessionId: string, hostId: string): Promise<boolean> {
     const result = await this.request<unknown>("/rest/v1/rpc/terminate_live_session", {
       method: "POST",
       body: JSON.stringify({ p_session_id: sessionId, p_host_id: hostId }),
@@ -200,6 +366,18 @@ function fromRow(row: SupabaseSessionRow): LiveSession {
   if (row.voice_provider !== "gemini" && row.voice_provider !== "openai") {
     throw new LiveSessionError("저장된 음성 출력 제공자가 올바르지 않습니다.", "INVALID_STORED_SESSION", 500);
   }
+  const title = row.title ?? "Live Session";
+  if (typeof title !== "string"
+    || Array.from(title).length < 1
+    || Array.from(title).length > 120
+    || /[<>]|\p{Cc}|\p{Cf}/u.test(title)) {
+    throw new LiveSessionError("저장된 세션 제목이 올바르지 않습니다.", "INVALID_STORED_SESSION", 500);
+  }
+  const scheduledAt = row.scheduled_at ?? null;
+  if (scheduledAt !== null
+    && (typeof scheduledAt !== "string" || !Number.isFinite(Date.parse(scheduledAt)))) {
+    throw new LiveSessionError("저장된 세션 일정이 올바르지 않습니다.", "INVALID_STORED_SESSION", 500);
+  }
   const sessionType = row.session_type ?? normalizeLegacySessionType(row.mode);
   const outputMode = row.output_mode ?? normalizeLegacyOutputMode(row.mode, row.voice_output_mode);
   const voiceProvider = row.voice_provider;
@@ -209,6 +387,8 @@ function fromRow(row: SupabaseSessionRow): LiveSession {
   return {
     id: row.id,
     hostId: row.host_id,
+    title,
+    scheduledAt,
     sessionType,
     outputMode,
     voiceProvider,
@@ -220,6 +400,9 @@ function fromRow(row: SupabaseSessionRow): LiveSession {
     version: row.version,
     admissionOpenUntil: row.admission_open_until,
     expiresAt: row.expires_at,
+    endedAt: row.ended_at ?? null,
+    hasCoverImage: Boolean(row.cover_image_path),
+    coverImageVersion: coverImageVersionFromPath(row.cover_image_path),
   };
 }
 

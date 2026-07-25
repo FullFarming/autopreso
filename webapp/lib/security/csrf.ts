@@ -22,8 +22,9 @@ export function isPublicUnauthenticatedPath(pathname: string): boolean {
 export function isViewerSnapshotPath(pathname: string): boolean {
   // Viewer-token-authenticated GET surfaces: each route verifies the signed
   // viewer grant itself. status/summary/transcript stay readable after the
-  // session ends so participants can open the meeting minutes.
-  return /^\/api\/live-sessions\/[^/]+\/(?:snapshot|status|summary|transcript)$/u.test(pathname);
+  // session ends so participants can open the meeting minutes. cover is the
+  // stage/waiting-room image (contract C10), served to anonymous viewers.
+  return /^\/api\/live-sessions\/[^/]+\/(?:snapshot|status|summary|transcript|leave|cover)$/u.test(pathname);
 }
 
 export function canonicalRequestOrigin(value: string): string | null {
