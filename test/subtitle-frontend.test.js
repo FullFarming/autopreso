@@ -503,13 +503,15 @@ test("subtitle dashboard captures audio before opening realtime subtitle session
   assert.match(js, /state\.streams = captures\.map/);
 });
 
-test("the interpreted-audio output mode survives settings persistence, and the retired mixed mode is gone", async () => {
+test("the captions output mode survives settings persistence, and audio playback is hidden", async () => {
   const html = readFileSync(path.join(rootDir, "public", "subtitle.html"), "utf8");
   const js = readFileSync(path.join(rootDir, "public", "subtitle-dashboard.js"), "utf8");
   // Two output modes remain: captions, or interpreted audio. The mixed mode is
   // retired -- rejected by validateSubtitleSettings and migrated on read.
   assert.match(html, /<input name="outputMode" type="radio" value="captions"/);
-  assert.match(html, /<input name="outputMode" type="radio" value="audio"/);
+  // Interpreted-audio playback is hidden for now, so the card carries a single
+  // captions radio and is itself hidden rather than showing a one-option control.
+  assert.doesNotMatch(html, /<input name="outputMode" type="radio" value="audio"/);
   assert.doesNotMatch(html, /value="captions_audio"/);
 
   const selectedOutputMode = new Function(
@@ -517,7 +519,7 @@ test("the interpreted-audio output mode survives settings persistence, and the r
     extractFunctionBody(js, "function selectedOutputMode()"),
   );
   const form = {
-    querySelector: () => ({ value: "audio" }),
+    querySelector: () => ({ value: "captions" }),
     elements: {
       inputMode: { value: "system_mic" },
       micDeviceId: { value: "" },
@@ -541,7 +543,7 @@ test("the interpreted-audio output mode survives settings persistence, and the r
       verticalOffset: { value: "24" },
     },
   };
-  assert.equal(selectedOutputMode(form), "audio");
+  assert.equal(selectedOutputMode(form), "captions");
 
   const readSettingsFromForm = new Function(
     "form",
@@ -577,7 +579,7 @@ test("the interpreted-audio output mode survives settings persistence, and the r
     () => selectedOutputMode(form),
     () => "gemini",
   );
-  assert.equal(settings.outputMode, "audio");
+  assert.equal(settings.outputMode, "captions");
 
   /** @type {{ url: string, options: { method: string, body: string } } | null} */
   let request = null;
@@ -611,7 +613,7 @@ test("the interpreted-audio output mode survives settings persistence, and the r
   assert.ok(request, "saving settings must issue an HTTP request");
   assert.equal(request.url, "/api/settings");
   assert.equal(request.options.method, "PUT");
-  assert.equal(JSON.parse(request.options.body).subtitle.outputMode, "audio");
+  assert.equal(JSON.parse(request.options.body).subtitle.outputMode, "captions");
 
   const previewPanel = { hidden: false };
   const runtimeState = { running: true, settings: { outputMode: "audio" } };

@@ -80,7 +80,7 @@
 
               <section class="cfg-section" aria-labelledby="cfg-languages-title">
                 <div class="cfg-heading">
-                  <h2 id="cfg-languages-title"><i>1</i><span data-i18n="cfg.languages">자막 언어</span></h2>
+                  <h2 id="cfg-languages-title"><i data-cfg-ordinal></i><span data-i18n="cfg.languages">자막 언어</span></h2>
                 </div>
                 <div class="language-targets" role="group" aria-labelledby="language-targets-label">
                   <span class="language-targets-label sr-only" id="language-targets-label" data-i18n="cfg.languagesLabel">자막 언어</span>
@@ -103,9 +103,13 @@
                 </div>
               </section>
 
-              <section class="cfg-section" aria-labelledby="pt-output-title">
+              <!-- Hidden for now: at this stage only translated captions are
+                   produced, so the only remaining choice is captions and a
+                   one-option control is noise. The radio stays in the DOM so the
+                   form keeps reporting the mode; nothing here was deleted. -->
+              <section class="cfg-section" aria-labelledby="pt-output-title" hidden>
                 <div class="cfg-heading">
-                  <h2><i>2</i><span data-i18n="cfg.outputMode">출력 방식</span></h2>
+                  <h2><i data-cfg-ordinal></i><span data-i18n="cfg.outputMode">출력 방식</span></h2>
                 </div>
                 <section class="pt-output-group" aria-labelledby="pt-output-title">
                   <div class="pt-output-heading">
@@ -119,10 +123,6 @@
                     <label class="seg-option">
                       <input name="outputMode" type="radio" value="captions" checked />
                       <span data-i18n="output.captions">자막</span>
-                    </label>
-                    <label class="seg-option">
-                      <input name="outputMode" type="radio" value="audio" />
-                      <span data-i18n="output.audio">통역 음성만</span>
                     </label>
                   </div>
                   <div id="pt-playback-options" class="pt-playback-options" hidden>
@@ -161,7 +161,7 @@
 
               <section class="cfg-section" aria-labelledby="cfg-glossary-title">
                 <div class="cfg-heading">
-                  <h2 id="cfg-glossary-title"><i>3</i><span data-i18n="cfg.glossary">용어집</span></h2>
+                  <h2 id="cfg-glossary-title"><i data-cfg-ordinal></i><span data-i18n="cfg.glossary">용어집</span></h2>
                 </div>
                 <label class="control-field">
                   <span data-i18n="glossary.preset">용어집 프리셋</span>
@@ -174,7 +174,7 @@
 
               <section class="cfg-section" aria-labelledby="cfg-appearance-title">
                 <div class="cfg-heading">
-                  <h2 id="cfg-appearance-title"><i>4</i><span data-i18n="cfg.appearance">표시 설정</span></h2>
+                  <h2 id="cfg-appearance-title"><i data-cfg-ordinal></i><span data-i18n="cfg.appearance">표시 설정</span></h2>
                 </div>
                 <label class="placement-offset">
                   <span data-i18n="appearance.opacity">배경 투명도</span>
@@ -196,7 +196,7 @@
 
               <section id="subtitle-placement" class="subtitle-placement cfg-section" data-i18n-aria="position.groupLabel" aria-label="언어별 자막 위치">
                 <div class="cfg-heading placement-head">
-                  <h2 class="placement-title"><i>5</i><span data-i18n="cfg.position">자막 위치</span></h2>
+                  <h2 class="placement-title"><i data-cfg-ordinal></i><span data-i18n="cfg.position">자막 위치</span></h2>
                 </div>
                 <div class="placement-rows">
                   <div class="placement-row" data-lang="en" hidden>

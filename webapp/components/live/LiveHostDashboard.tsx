@@ -30,10 +30,14 @@ const SESSION_TYPE_OPTIONS: Array<{ value: LiveSessionType; title: string; descr
   { value: "meeting", title: "Meeting", description: "Identify multiple speakers and deliver captions or translated audio." },
 ];
 
+// Translated-audio delivery is HIDDEN for now, not removed. At this stage only
+// translated captions cross to participants, get recorded on the host, and flow
+// in real time -- so a host can no longer select an audio-bearing mode. The
+// contract, the pipeline and the live_sessions CHECK still accept
+// captions_audio/audio, which keeps the seq contract (audio events never consume
+// a caption seq) and the TTS paths intact and testable for when audio returns.
 const OUTPUT_OPTIONS: Array<{ value: LiveOutputMode; title: string; description: string }> = [
-  { value: "captions", title: "Captions", description: "Default · show translated captions without playing audio." },
-  { value: "captions_audio", title: "Captions + audio", description: "Show captions and let each guest opt in to translated audio." },
-  { value: "audio", title: "Audio only", description: "Meeting audio preset · play translated audio after guest consent." },
+  { value: "captions", title: "Captions", description: "Show translated captions." },
 ];
 
 const OPENAI_REALTIME_TRANSLATION_LANGUAGES = new Set([
@@ -1188,7 +1192,7 @@ export default function LiveHostDashboard() {
                 <div><dt>Guests</dt><dd>{session.viewerCount} / {session.maxViewers}</dd></div>
                 <div><dt>Status</dt><dd>{formatSessionStatus(session.status)}</dd></div>
                 <div><dt>Format</dt><dd>{session.sessionType === "presentation" ? "Presentation" : "Meeting"}</dd></div>
-                <div><dt>Output</dt><dd>{OUTPUT_OPTIONS.find((option) => option.value === session.outputMode)?.title}</dd></div>
+                <div><dt>Output</dt><dd>{OUTPUT_OPTIONS.find((option) => option.value === session.outputMode)?.title ?? session.outputMode}</dd></div>
                 <div><dt>Languages</dt><dd>{session.languages.map((language) => languageLabel.get(language) ?? language).join(" · ")}</dd></div>
                 <div><dt>Guest access</dt><dd>Open until the session ends</dd></div>
                 <div><dt>Session expires</dt><dd>{formatTime(session.expiresAt)}</dd></div>

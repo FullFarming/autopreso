@@ -39,8 +39,12 @@ test("host wizard offers canonical output modes and Meeting audio consent", asyn
   assert.match(dashboard, /presentation: "English is the default translation language/);
   assert.match(dashboard, /meeting: "Meeting provides speaker-aware captions/);
   assert.match(dashboard, /value: "captions"/);
-  assert.match(dashboard, /value: "captions_audio"/);
-  assert.match(dashboard, /value: "audio"/);
+  // Translated-audio delivery is hidden at this stage: only captions cross to
+  // participants, get recorded on the host, and flow in real time. The contract
+  // and pipeline still accept the audio modes -- this is a hidden option, not a
+  // removed capability.
+  assert.doesNotMatch(dashboard, /value: "captions_audio"/);
+  assert.doesNotMatch(dashboard, /value: "audio"/);
   assert.match(dashboard, /useState<LiveOutputMode>\("captions"\)/);
   assert.match(dashboard, /Speaker-aware translated audio/);
 });
@@ -871,7 +875,8 @@ test("desktop local PT output separates fixed Gemini captions from conditional a
 
   assert.match(html, /class="pt-output-group"/);
   assert.match(html, /name="outputMode"[^>]+value="captions"[^>]+checked/);
-  assert.match(html, /name="outputMode"[^>]+value="audio"/);
+  assert.doesNotMatch(html, /name="outputMode"[^>]+value="audio"/);
+  assert.match(html, /aria-labelledby="pt-output-title" hidden/);
   // The desktop PT output is captions OR interpreted audio; the mixed mode is
   // retired. (The Live Call session mode in webapp/ still has its own values,
   // constrained by an applied Supabase CHECK -- a separate change.)
