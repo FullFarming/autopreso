@@ -77,7 +77,7 @@ export function usePipOverlay(options: PipOverlayOptions) {
 
   const buildRenderer = useCallback((win: Window) => {
     const doc = win.document;
-    doc.title = "Realtime Noel 자막";
+    doc.title = "NOVA 자막";
     doc.body.innerHTML = "";
     // Cinema subtitles: near-black translucent window (black @ 35%), NO
     // box/card — just white text with a strong shadow, centered and

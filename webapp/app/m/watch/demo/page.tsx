@@ -41,7 +41,7 @@ export default function MobileWatchDemoPage() {
   return (
     <main className="live-viewer-shell is-compact">
       <header className="glass-pill live-viewer-toolbar">
-        <strong>Realtime Noel</strong>
+        <strong>NOVA</strong>
         <button type="button" className="live-leave-button" aria-label="Leave meeting">Leave</button>
       </header>
       <ViewerSessionContext title="Q2 2026 Earnings Call" scheduledAt="2026-07-23T14:00:00+09:00" />

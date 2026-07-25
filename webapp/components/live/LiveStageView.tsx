@@ -136,7 +136,7 @@ export default function LiveStageView({ sessionId }: { sessionId: string }) {
         {error === "auth" ? (
           <>
             <p className="live-stage-error" role="alert">Host authorization is required for this Stage overlay.</p>
-            <p className="live-stage-hint">Return to Realtime Noel Settings, save Host Authorization, then start Live Call again.</p>
+            <p className="live-stage-hint">Return to NOVA Settings, save Host Authorization, then start Live Call again.</p>
           </>
         ) : (
           <>

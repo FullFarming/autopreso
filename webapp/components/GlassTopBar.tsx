@@ -39,7 +39,7 @@ export default function GlassTopBar({
   return (
     <div className="pt-safe px-safe sticky top-0 z-40 flex justify-center px-3 pt-3">
       <div className="glass-pill flex w-full max-w-[640px] items-center gap-2 px-4 py-2">
-        <span className="nowrap text-xs font-semibold tracking-wide text-cw-ink">Realtime Noel</span>
+        <span className="nowrap text-xs font-semibold tracking-wide text-cw-ink">NOVA</span>
         <span className="nowrap ml-1 inline-flex items-center gap-1.5 text-[11px] text-cw-grey75">
           <span
             className={`h-2 w-2 rounded-full ${

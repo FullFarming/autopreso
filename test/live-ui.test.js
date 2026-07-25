@@ -474,7 +474,7 @@ test("host renders an offline QR invitation with accessible fallback", async () 
   assert.match(dashboard, /import QRCode from "qrcode"/);
   assert.match(dashboard, /QRCode\.toDataURL\(value/);
   assert.match(dashboard, /errorCorrectionLevel: "M"/);
-  assert.match(dashboard, /alt="Realtime Noel guest invite QR code"/);
+  assert.match(dashboard, /alt="NOVA guest invite QR code"/);
   assert.match(dashboard, /The QR code could not be created\. Copy the invite link instead\./);
   assert.match(dashboard, /<InviteQrCode value=\{invite\.url\} \/>/);
 });
@@ -985,7 +985,7 @@ test("Stage authorization failure returns the host to Electron Settings", async 
 
   assert.match(stage, /opened directly by Electron[\s\S]{0,80}as a full-screen Stage overlay/);
   assert.match(stage, /Host authorization is required for this Stage overlay\./);
-  assert.match(stage, /Return to Realtime Noel Settings, save Host Authorization, then start Live Call again\./);
+  assert.match(stage, /Return to NOVA Settings, save Host Authorization, then start Live Call again\./);
   assert.doesNotMatch(stage, /Sign in as the host on this browser|separate named window|host dashboard/);
 });
 

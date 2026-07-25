@@ -201,7 +201,7 @@ export function InviteQrCode({ value }: { value: string }) {
 
   return (
     <figure className="live-invite-qr" data-qr-value={value}>
-      {dataUrl ? <img src={dataUrl} alt="Realtime Noel guest invite QR code" width={176} height={176} />
+      {dataUrl ? <img src={dataUrl} alt="NOVA guest invite QR code" width={176} height={176} />
         : qrError ? <span role="alert">{qrError}</span>
           : <span role="status">Creating QR code…</span>}
       <figcaption>Scan or share this link · every guest enters their own profile</figcaption>
@@ -548,7 +548,7 @@ export default function LiveHostDashboard() {
 
   const inviteMailto = useMemo(() => {
     if (!invite) return "";
-    const subject = encodeURIComponent("Realtime Noel Live invitation");
+    const subject = encodeURIComponent("NOVA Live invitation");
     const body = encodeURIComponent(`Join the Live session with this link:\n\n${invite.url}\n\nInvite expires: ${formatTime(invite.expiresAt)}`);
     return `mailto:?subject=${subject}&body=${body}`;
   }, [invite]);
@@ -878,7 +878,7 @@ export default function LiveHostDashboard() {
   return (
     <main className="live-host-shell">
       <aside className="live-host-rail">
-        <strong>Realtime Noel</strong>
+        <strong>NOVA</strong>
         <nav aria-label="Host workspace">
           <button type="button" className="is-current" aria-current="page">Live</button>
           <button type="button" disabled>Transcripts</button>

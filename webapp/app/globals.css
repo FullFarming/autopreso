@@ -242,7 +242,7 @@ select.glass-input option { background: #ffffff; color: #0c0a09; }
   will-change: transform, opacity;
 }
 
-/* Realtime Noel Live -------------------------------------------------------- */
+/* NOVA Live -------------------------------------------------------- */
 button:focus-visible,
 a:focus-visible,
 select:focus-visible,
@@ -522,7 +522,7 @@ input:focus-visible {
 /* Viewer stays dark because it is used over rooms, slides and video. */
 .live-viewer-shell { display: flex; min-height: 100dvh; flex-direction: column; gap: 12px; }
 .live-join-card { display: grid; width: min(390px, calc(100% - 40px)); gap: 14px; margin: auto; padding: 0; color: #fff; }
-.live-join-wordmark { margin-bottom: 12px; color: #fff; font-size: 12px; font-weight: 600; letter-spacing: .22em; text-transform: uppercase; }
+.live-join-wordmark { margin: 0; color: #fff; font-size: 12px; font-weight: 600; letter-spacing: .22em; text-transform: uppercase; }
 .live-join-methods { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 3px; margin-bottom: 8px; padding: 3px; border: 1px solid rgba(255,255,255,.15); border-radius: 8px; background: rgba(255,255,255,.06); }
 .live-join-methods button { min-height: 38px; border: 0; border-radius: 6px; background: transparent; color: rgba(255,255,255,.55); font: 600 12px/1 var(--font-sans); }
 .live-join-methods button:only-child { grid-column: 1 / -1; }
@@ -539,7 +539,9 @@ input:focus-visible {
 .live-join-card > small { display: block; margin: 8px 2px 20px; color: var(--muted); font-size: 10px; }
 .live-join-card .live-primary-action { width: 100%; min-height: 54px; margin-top: 4px; border: 0; border-radius: 8px; background: #fff; color: #000; font: 700 14px/1 var(--font-sans); }
 .live-join-card .live-primary-action:disabled { opacity: .36; }
-.live-viewer-shell.is-join { box-sizing: border-box; width: 100%; min-height: 100dvh; max-width: none; padding: max(28px, env(safe-area-inset-top)) 0 max(36px, env(safe-area-inset-bottom)); background: var(--dark); color: var(--brand-white); }
+.live-viewer-shell.is-join { box-sizing: border-box; display: grid; grid-template-rows: auto 1fr auto; width: 100%; min-height: 100dvh; max-width: none; padding: max(28px, env(safe-area-inset-top)) 0 max(36px, env(safe-area-inset-bottom)); background: var(--dark); color: var(--brand-white); }
+.live-join-brand { padding: 0 20px; }
+.live-join-credit { padding: 0 20px; color: rgba(255, 255, 255, 0.34); font-size: 11px; letter-spacing: .04em; text-align: left; }
 .live-viewer-shell.is-join .live-join-card { color: var(--brand-white); }
 .live-viewer-shell.is-join .live-join-card > .live-join-lede,
 .live-viewer-shell.is-join .live-join-card > .live-join-mic-note,
@@ -1008,3 +1010,124 @@ input:focus-visible {
 .live-caption-controls .live-text-size-button[aria-expanded="true"] { background: var(--primary); color: var(--on-primary); border-color: transparent; }
 .live-viewer-shell.is-compact .live-caption-controls .live-text-size-button { min-height: 44px; min-width: 44px; border-color: rgba(255,255,255,.16); background: rgba(255,255,255,.07); color: #fff; }
 .live-viewer-shell.is-compact .live-caption-controls .live-text-size-button[aria-expanded="true"] { background: #fff; color: #000; }
+
+/* ── NOVA component layer (Toss / TDS) ───────────────────────────────────────
+   Values from docs/TOSS_DESIGN_REFERENCE.md, which is derived from Toss's real
+   shipped npm packages. This is a component pass only: the dark viewer surface,
+   the page composition and the information hierarchy are unchanged. Depth is
+   progressive lightening, never shadow; radius is anchored to component size;
+   blue is rationed to one primary action per screen; only opacity/transform and
+   colour animate, and a press releases slower than it depresses.
+   Kept dark-only on purpose -- on the web the subtitle is the product. */
+:root {
+  --nova-surface: #14141a;
+  --nova-surface-raised: #1c1c24;
+  --nova-hairline: #26262f;
+  --nova-hairline-strong: #3c3c47;
+  --nova-text: #ffffff;
+  --nova-text-body: #c3c3c6;
+  --nova-text-muted: #9e9ea4;
+  --nova-text-subtle: #7e7e87;
+  --nova-blue: #3485fa;
+  --nova-blue-strong: #449bff;
+  --nova-overlay-100: rgba(255, 255, 255, 0.07);
+  --nova-overlay-200: rgba(255, 255, 255, 0.11);
+  --nova-r-sm: 8px;
+  --nova-r-row: 12px;
+  --nova-r-md: 14px;
+  --nova-r-pill: 999px;
+  --nova-lh-list: 1.35;
+  --nova-ease-out: cubic-bezier(0.25, 0.1, 0.25, 1);
+  --nova-dur-press-in: 200ms;
+  --nova-dur-press-out: 350ms;
+  --nova-dur-color: 300ms;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root { --nova-dur-press-in: 1ms; --nova-dur-press-out: 1ms; --nova-dur-color: 1ms; }
+}
+
+/* Primary action: TDS Button large -- radius 14, one per screen, and the only
+   blue on it. The press scale releases slower than it depresses. */
+.live-viewer-shell .live-join-card .live-primary-action,
+.live-viewer-shell .live-primary-action {
+  border-radius: var(--nova-r-md);
+  background: var(--nova-blue);
+  color: #ffffff;
+  font-weight: 600;
+  transition: background var(--nova-dur-color) var(--nova-ease-out),
+    transform var(--nova-dur-press-out) var(--nova-ease-out);
+}
+.live-viewer-shell .live-primary-action:hover:not(:disabled) { background: var(--nova-blue-strong); }
+.live-viewer-shell .live-primary-action:active:not(:disabled) {
+  transform: scale(0.98);
+  transition-duration: var(--nova-dur-press-in);
+}
+.live-viewer-shell .live-primary-action:disabled { background: var(--nova-overlay-200); color: var(--nova-text-subtle); opacity: 1; }
+
+/* Segmented control: TDS group radius 15, item radius 12, and the selected item
+   is a RAISED SURFACE rather than a pure-white slab. */
+.live-viewer-shell .live-join-methods {
+  border: 0;
+  border-radius: 15px;
+  background: var(--nova-overlay-100);
+  gap: 2px;
+  padding: 2px;
+}
+.live-viewer-shell .live-join-methods button {
+  border-radius: var(--nova-r-row);
+  color: var(--nova-text-muted);
+  font-weight: 600;
+  transition: background var(--nova-dur-color) var(--nova-ease-out), color var(--nova-dur-color) var(--nova-ease-out);
+}
+.live-viewer-shell .live-join-methods button.is-selected {
+  background: var(--nova-surface-raised);
+  color: var(--nova-text);
+}
+
+/* TextField: TDS box radius 14 on a layered surface, with a real focus ring. */
+.live-viewer-shell .live-join-card input,
+.live-viewer-shell .live-join-card .live-name-input,
+.live-viewer-shell .live-join-card .live-code-input {
+  border: 1px solid var(--nova-hairline-strong);
+  border-radius: var(--nova-r-md);
+  background: var(--nova-surface);
+  color: var(--nova-text);
+  transition: border-color var(--nova-dur-color) var(--nova-ease-out);
+}
+.live-viewer-shell .live-join-card input:focus-visible {
+  border-color: var(--nova-blue);
+  outline: 2px solid color-mix(in srgb, var(--nova-blue) 45%, transparent);
+  outline-offset: 1px;
+}
+.live-viewer-shell .live-join-card label { color: var(--nova-text-muted); }
+
+/* Toolbar controls: pill chips on the overlay ramp, no shadow, colour-only hover. */
+.live-viewer-toolbar select,
+.live-viewer-toolbar button {
+  border: 0;
+  border-radius: var(--nova-r-pill);
+  background: var(--nova-overlay-100);
+  color: var(--nova-text-body);
+  transition: background var(--nova-dur-color) var(--nova-ease-out), color var(--nova-dur-color) var(--nova-ease-out);
+}
+.live-viewer-toolbar button:hover { background: var(--nova-overlay-200); color: var(--nova-text); }
+.live-viewer-toolbar button.is-selected { background: var(--nova-surface-float, #2c2c35); color: var(--nova-text); }
+
+/* Meeting feed turns read as TDS list rows: the tighter list line-height, and a
+   hover underlay INSET inside the row so it never touches the divider. */
+.live-turn-card {
+  border-radius: var(--nova-r-row);
+  line-height: var(--nova-lh-list);
+  position: relative;
+}
+.live-turn-card::after {
+  background: transparent;
+  border-radius: var(--nova-r-row);
+  content: "";
+  inset: 4px 6px;
+  pointer-events: none;
+  position: absolute;
+  transition: background var(--nova-dur-press-in) var(--nova-ease-out);
+}
+.live-turn-card:hover::after { background: var(--nova-overlay-100); }

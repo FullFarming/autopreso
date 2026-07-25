@@ -3,7 +3,7 @@ import type { Metadata, Viewport } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "Realtime Noel",
+  title: "NOVA",
   description: "실시간 양방향 음성 번역 자막 (사내용)",
 };
 

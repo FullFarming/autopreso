@@ -1626,8 +1626,10 @@ export default function LiveViewer({ compact = false }: { compact?: boolean }) {
       : admissionCode.replace(/\D/gu, "").length === 6);
     return (
       <main className={`live-viewer-shell is-join ${compact ? "is-compact" : ""}`}>
+        {/* The wordmark belongs to the SCREEN, not the card: the card is centred,
+            so a wordmark inside it reads as centred too. One mark, top-left. */}
+        <header className="live-join-brand"><span className="live-join-wordmark">NOVA</span></header>
         <section className="live-join-card">
-            <span className="live-join-wordmark">Realtime Noel</span>
             <h1 className="live-join-heading">Live Call</h1>
             <p className="live-join-lede">
               {joinMethod === "invite"
@@ -1681,6 +1683,8 @@ export default function LiveViewer({ compact = false }: { compact?: boolean }) {
             <p className="live-join-mic-note">Microphone access is requested only when you choose Speak.</p>
             {error && <div className="live-error" role="alert">{error}</div>}
           </section>
+        {/* Credit line, matching the desktop app's rail footer. */}
+        <footer className="live-join-credit">Realtime by Noel</footer>
       </main>
     );
   }
@@ -1692,7 +1696,7 @@ export default function LiveViewer({ compact = false }: { compact?: boolean }) {
           down to sit directly above the caption record — that is where they are
           used, and it keeps the title as the first thing read. */}
       <header className="glass-pill live-viewer-toolbar">
-        <strong>Realtime Noel</strong>
+        <strong>NOVA</strong>
         {/* Translated audio is surfaced ONLY for audio-only sessions, where it is
             the entire product. A caption session is caption-first, so the toggle
             would be noise — but hiding it unconditionally would make an

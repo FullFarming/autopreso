@@ -53,7 +53,7 @@ export default function LoginPage() {
   return (
     <main className="flex min-h-[100dvh] flex-col items-center justify-center px-4">
       <div className="glass-strong w-full max-w-sm p-8">
-        <h1 className="display mb-1 text-3xl">Realtime Noel</h1>
+        <h1 className="display mb-1 text-3xl">NOVA</h1>
         <p className="mb-6 text-sm text-cw-grey75">Live translated captions for your team</p>
         <form onSubmit={handleSubmit} className="space-y-4">
           <div>
