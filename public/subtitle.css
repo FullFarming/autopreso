@@ -65,6 +65,10 @@
   /* Spacing. TDS ships no scale; these are the values its components actually
      use. 24 is the universal horizontal inset -- the most repeated number in the
      whole library. */
+  /* One cap for the whole content column so the hero, the cards and the footer
+     bar are always the same width -- a wider footer than its cards reads as a
+     stray empty strip. Generous so it only bites on very large monitors. */
+  --nova-content-max: 1320px;
   --nova-inset: 24px;
   --nova-inset-narrow: 20px;
   --nova-gap-16: 16px;
@@ -2233,14 +2237,41 @@ textarea:focus {
   }
 }
 
-/* Electron host dashboard --------------------------------------------------
-   The DMG loads public/subtitle.html directly. This final layer gives that
-   actual window the same black editorial hierarchy as the approved host
-   references while preserving every existing control and DOM contract. */
+/* ── Electron host dashboard, on the NOVA tokens ──────────────────────────────
+   The DMG loads public/subtitle.html directly. Everything from here to the
+   Records calendar styles that window: rail, hero, numbered section cards, form
+   controls, footer transport, records panels. Same design system as the
+   calendar below — surface ladder for depth (never shadow), TDS list geometry
+   and type scale, blue rationed to one primary action.
+
+   LEGACY ALIAS LAYER. The base stylesheet at the top of this file was authored
+   for a light editorial theme and still owns dozens of rules that the dark
+   layers never restated. Re-pointing the legacy --cw-* names at NOVA tokens
+   fixes all of them at once, including three that resolved to near-black ink on
+   a near-black shell and were literally invisible: the EN/KO placement chips,
+   the edge-offset readout, and the System/Microphone labels in Settings.
+
+   Scoped to .subtitle-dashboard-body deliberately: the subtitle overlay and the
+   caption controller are separate documents that still need --cw-indigo to be
+   the near-black caption plate and --cw-white to be the caption ink. */
 .subtitle-dashboard-body {
+  --cw-indigo: var(--nova-text);
+  --cw-grey: var(--nova-text-muted);
+  --cw-grey-75: var(--nova-text-subtle);
+  --cw-grey-25: var(--nova-hairline-strong);
+  --cw-hairline: var(--nova-hairline);
+  --cw-grey-12: var(--nova-surface-raised);
+  --cw-white: var(--nova-surface-raised);
+  --cw-canvas-soft: var(--nova-surface-raised);
+  --cw-glass: var(--nova-surface);
+  --cw-blue: var(--nova-blue);
+  --cw-blue-12: color-mix(in srgb, var(--nova-blue) 22%, var(--nova-surface));
+  --cw-dark-red: var(--nova-red);
+  --cw-dark-red-12: color-mix(in srgb, var(--nova-red) 20%, var(--nova-surface));
+
   min-height: 100vh;
-  background: #000000;
-  color: rgba(255, 255, 255, 0.62);
+  background: var(--nova-bg);
+  color: var(--nova-text-body);
 }
 
 .subtitle-app-shell {
@@ -2248,50 +2279,52 @@ textarea:focus {
   min-height: 100vh;
   min-width: 0;
   grid-template-columns: 220px minmax(0, 1fr);
-  background: #000000;
+  background: var(--nova-bg);
 }
 
+/* ── Left rail ── */
 .subtitle-app-rail {
   position: sticky;
   top: 0;
   display: flex;
   height: 100vh;
   flex-direction: column;
-  gap: 42px;
-  padding: 38px 14px 24px;
-  border-right: 1px solid rgba(255, 255, 255, 0.16);
-  background: #000000;
+  gap: 32px;
+  padding: 32px 12px 20px;
+  border-right: 1px solid var(--nova-hairline);
+  background: var(--nova-bg);
 }
 
 .subtitle-app-rail > strong {
-  padding: 0 14px;
-  color: #ffffff;
-  font-size: 12px;
-  font-weight: 600;
-  letter-spacing: 0.22em;
-  text-transform: uppercase;
-  white-space: nowrap;
+  padding: 0 12px;
 }
 
 .subtitle-app-rail nav {
   display: grid;
-  gap: 10px;
+  gap: var(--nova-gap-4);
 }
 
+/* TDS list-row geometry: 44 min-height, radius-12 underlay, t6 label at the
+   list line-height (×1.35, not the ×1.5 of prose). */
 .subtitle-app-rail nav a,
 .subtitle-app-rail nav button {
   display: flex;
-  min-height: 52px;
+  min-height: 44px;
   align-items: center;
-  gap: 12px;
+  gap: var(--nova-gap-12);
   border: 0;
-  border-radius: 8px;
+  border-radius: var(--nova-r-row);
   background: transparent;
-  color: rgba(255, 255, 255, 0.52);
-  padding: 0 18px;
-  font: 500 14px/1 var(--ui-font-family);
+  color: var(--nova-text-muted);
+  padding: 0 12px;
+  font-family: var(--ui-font-family);
+  font-size: var(--nova-t6);
+  font-weight: 500;
+  line-height: var(--nova-lh-list);
   text-align: left;
   text-decoration: none;
+  transition: background var(--nova-dur-rapid) var(--nova-spring-rapid),
+    color var(--nova-dur-color) var(--nova-ease-out);
 }
 
 .subtitle-app-rail nav img {
@@ -2300,19 +2333,20 @@ textarea:focus {
   flex: 0 0 20px;
   filter: invert(1);
   opacity: 0.52;
+  transition: opacity var(--nova-dur-color) var(--nova-ease-out);
 }
 
 .subtitle-app-rail nav a:hover,
 .subtitle-app-rail nav button:hover,
 .subtitle-app-rail nav a:focus-visible,
 .subtitle-app-rail nav button:focus-visible {
-  background: rgba(255, 255, 255, 0.07);
-  color: #ffffff;
+  background: var(--nova-overlay-100);
+  color: var(--nova-text);
 }
 
 .subtitle-app-rail nav .is-current {
-  background: rgba(255, 255, 255, 0.1);
-  color: #ffffff;
+  background: var(--nova-overlay-200);
+  color: var(--nova-text);
 }
 
 .subtitle-app-rail nav a:hover img,
@@ -2324,95 +2358,173 @@ textarea:focus {
 }
 
 .subtitle-app-rail > p {
-  margin: auto 14px 0;
-  color: rgba(255, 255, 255, 0.34);
-  font-size: 10px;
-  line-height: 1.55;
+  margin: auto 12px 0;
+  color: var(--nova-text-disabled);
+  font-size: var(--nova-t8);
+  line-height: var(--nova-t8-lh);
 }
 
+/* ── Page hero ── */
 .subtitle-dashboard {
-  width: min(1320px, calc(100vw - 268px));
+  width: min(var(--nova-content-max), calc(100vw - 268px));
   min-width: 0;
   margin: 0 auto;
-  padding: 32px 0 48px;
+  padding: 28px 0 40px;
 }
 
 .subtitle-hero {
-  min-height: 88px;
+  min-height: 0;
   align-items: flex-start;
-  margin: 0 0 20px;
-  padding: 0 0 22px;
+  gap: var(--nova-inset);
+  margin: 0 0 var(--nova-inset-narrow);
+  padding: 0 0 var(--nova-gap-16);
   border: 0;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.16);
+  border-bottom: 1px solid var(--nova-hairline);
   border-radius: 0;
-  background: #000000;
+  background: transparent;
 }
 
 .subtitle-hero-kicker {
-  margin-bottom: 8px;
-  color: rgba(255, 255, 255, 0.46);
-  letter-spacing: 0.16em;
+  margin-bottom: var(--nova-gap-8);
 }
 
+/* t1 (30/40) is the largest published TDS tier; the old clamp ran to 40px,
+   which is off-scale. */
 .subtitle-hero h1 {
   margin: 0;
-  color: #ffffff;
+  color: var(--nova-text);
   font-family: var(--ui-font-family);
-  font-size: clamp(28px, 3vw, 40px);
-  font-weight: 650;
-  letter-spacing: -0.04em;
+  font-size: var(--nova-t1);
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  line-height: var(--nova-t1-lh);
 }
 
 .subtitle-hero p {
-  margin: 8px 0 0;
-  color: rgba(255, 255, 255, 0.46);
-  font-size: 13px;
-  line-height: 1.5;
+  margin: var(--nova-gap-4) 0 0;
+  color: var(--nova-text-muted);
+  font-size: var(--nova-t7);
+  line-height: var(--nova-t7-lh);
+}
+
+.workspace-hero-tools {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: var(--nova-gap-8);
 }
 
 .status-pill {
-  border-color: rgba(255, 255, 255, 0.18);
-  background: transparent;
-  color: rgba(255, 255, 255, 0.62);
+  border: 0;
+  border-radius: var(--nova-r-pill);
+  background: var(--nova-overlay-100);
+  color: var(--nova-text-body);
+  font-size: var(--nova-t7);
+  font-weight: 600;
+  line-height: var(--nova-lh-list);
+  padding: 6px 12px;
+  white-space: nowrap;
 }
 
 .status-pill.active {
-  border-color: rgba(255, 255, 255, 0.42);
-  background: rgba(255, 255, 255, 0.1);
-  color: #ffffff;
+  background: var(--nova-overlay-200);
+  color: var(--nova-text);
 }
 
+.status-pill.error {
+  background: color-mix(in srgb, var(--nova-red) 24%, var(--nova-surface));
+  color: var(--nova-text);
+}
+
+/* Theme switch: TDS segmented control, small. `flex: none` because the global
+   `button` rule sets `flex: 1` and would stretch both halves across the rail. */
+.theme-switch {
+  display: inline-flex;
+  flex: none;
+  gap: 2px;
+  padding: 3px;
+  border: 0;
+  border-radius: var(--nova-r-pill);
+  background: var(--nova-overlay-100);
+}
+
+.theme-switch button {
+  align-items: center;
+  display: inline-flex;
+  flex: none;
+  justify-content: center;
+  min-height: 26px;
+  min-width: 34px;
+  padding: 0;
+  white-space: nowrap;
+  border: 0;
+  border-radius: var(--nova-r-pill);
+  background: transparent;
+  color: var(--nova-text-subtle);
+  cursor: pointer;
+  transition: background var(--nova-dur-color) var(--nova-ease-out),
+    color var(--nova-dur-color) var(--nova-ease-out);
+}
+
+.theme-switch button svg {
+  display: block;
+}
+
+.theme-switch button.is-active {
+  background: var(--nova-surface-float);
+  color: var(--nova-text);
+}
+
+/* Brand wordmark: one style in the rail and in the hero kicker. */
+.subtitle-hero-kicker,
+.subtitle-app-rail > strong {
+  display: block;
+  color: var(--nova-text-subtle);
+  font-size: var(--nova-t8);
+  font-weight: 700;
+  letter-spacing: 0.22em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.subtitle-app-rail > strong {
+  color: var(--nova-text);
+}
+
+/* ── Panels ───────────────────────────────────────────────────────────────── */
 .dashboard-shell {
   display: grid;
   min-width: 0;
-  grid-template-columns: minmax(0, 1fr) minmax(400px, 430px);
-  gap: 18px 32px;
-  align-items: start;
+  gap: var(--nova-gap-16);
 }
 
-.dashboard-grid {
-  display: grid;
-  min-width: 0;
-  grid-column: 1;
-  grid-row: 1;
-  grid-template-columns: minmax(0, 1fr);
-  gap: 18px;
-}
-
-.command-panel {
-  min-width: 0;
-  grid-column: 2;
-  grid-row: 1;
-}
-
-.translation-log-panel {
-  grid-column: 1;
-  grid-row: 2;
-}
-
+.command-panel,
+.history-panel,
+.preview-panel,
+.translation-log-panel,
+.settings-panel,
 .settings-drawer {
-  grid-column: 2;
-  grid-row: 2;
+  border: 1px solid var(--nova-hairline);
+  border-radius: var(--nova-r-panel);
+  background: var(--nova-surface);
+  /* Depth is progressive lightening in this system; shadow is never used. */
+  box-shadow: none;
+  color: var(--nova-text-body);
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+}
+
+/* Inside a workspace page the command panel is only a stack — each numbered
+   .cfg-section is the card, so the wrapper must not draw a second frame around
+   them. This also cancels the 4px ink border-top the light theme put on it. */
+.workspace-page .command-panel {
+  display: grid;
+  gap: 0;
+  min-width: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  padding: 0;
 }
 
 .command-panel > *,
@@ -2432,49 +2544,12 @@ textarea:focus {
   position: absolute;
 }
 
-.command-panel,
-.history-panel,
-.preview-panel,
-.translation-log-panel,
-.settings-panel,
-.settings-drawer {
-  border: 1px solid rgba(255, 255, 255, 0.14);
-  border-radius: 8px;
-  background: #000000;
-  box-shadow: none;
-  color: rgba(255, 255, 255, 0.62);
-  -webkit-backdrop-filter: none;
-  backdrop-filter: none;
-}
-
-.command-panel {
-  gap: 16px;
-  padding: 18px;
-}
-
 .preview-panel {
   display: grid;
   min-height: 470px;
   grid-template-rows: auto minmax(0, 1fr);
   overflow: hidden;
-  padding: 20px;
-}
-
-.preview-label,
-.panel-heading,
-.language-targets-label,
-.placement-title {
-  color: rgba(255, 255, 255, 0.48);
-  font-size: 11px;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-}
-
-.panel-heading strong,
-.placement-title,
-.topic-item strong,
-.settings-drawer summary {
-  color: #ffffff;
+  padding: var(--nova-inset-narrow);
 }
 
 .subtitle-preview {
@@ -2483,41 +2558,514 @@ textarea:focus {
   align-items: flex-end;
   border: 0;
   border-radius: 0;
-  background: #000000;
+  background: var(--nova-bg-recessed);
+  color: var(--nova-text);
   padding: 52px 28px;
 }
 
 .subtitle-preview .translation-line {
   width: 100%;
-  color: #ffffff;
+  color: var(--nova-text);
   font-size: clamp(30px, 3.4vw, 52px);
   line-height: 1.26;
   text-align: left;
   text-shadow: none;
 }
 
-.service-strip,
-.audio-inspector,
-.subtitle-placement,
-.topic-item,
-.translation-day,
-.translation-record,
-.overlay-toggle,
-.pt-output-group {
-  border-color: rgba(255, 255, 255, 0.13);
-  border-radius: 8px;
-  background: rgba(255, 255, 255, 0.035);
+/* Panel overlines stay uppercase micro-type; field labels do not (below). */
+.preview-label,
+.panel-heading {
+  color: var(--nova-text-subtle);
+  font-size: var(--nova-t8);
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  line-height: var(--nova-t8-lh);
+  text-transform: uppercase;
 }
 
-.service-strip span {
-  border-color: rgba(255, 255, 255, 0.13);
+.panel-heading strong,
+.topic-item strong,
+.settings-drawer summary {
+  color: var(--nova-text);
+}
+
+.panel-heading strong {
+  font-size: var(--nova-t7);
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+.panel-heading-actions {
+  display: flex;
+  flex: none;
+  gap: var(--nova-gap-8);
+}
+
+/* ── Numbered section cards ───────────────────────────────────────────────── */
+.cfg-section {
+  display: grid;
+  gap: var(--nova-gap-16);
+  border: 0;
+  padding: 0;
+}
+
+.workspace-page .cfg-section {
+  border: 1px solid var(--nova-hairline);
+  border-radius: var(--nova-r-lg);
+  background: var(--nova-surface);
+  padding: var(--nova-inset-narrow) var(--nova-inset) var(--nova-inset);
+  margin-bottom: var(--nova-gap-12);
+}
+
+.workspace-page .cfg-section:last-of-type {
+  border-bottom: 1px solid var(--nova-hairline);
+  margin-bottom: 0;
+}
+
+/* A button that is a direct child of the grid would otherwise stretch to the
+   full card width: grid items justify-self: stretch by default, which is the
+   grid twin of the global `button { flex: 1 }`. */
+.workspace-page .cfg-section > button {
+  justify-self: start;
+}
+
+/* The light-theme layer parked these fields at fixed tracks of a 12-column
+   grid that no longer exists. Inside a one-column section card that pushes the
+   field into a phantom column 5 and leaves a hole beside the heading. */
+.cfg-section > .language-targets,
+.cfg-section > .input-mode-field,
+.cfg-section > .topic-field,
+.cfg-section > .tone-field {
+  grid-column: auto;
+}
+
+.cfg-heading {
+  display: grid;
+  gap: var(--nova-gap-4);
+}
+
+.cfg-heading h2 {
+  display: flex;
+  align-items: center;
+  gap: var(--nova-gap-8);
+  margin: 0;
+  color: var(--nova-text);
+  font-family: var(--ui-font-family);
+  font-size: var(--nova-t5);
+  font-weight: 700;
+  letter-spacing: 0;
+  line-height: var(--nova-t5-lh);
+  text-transform: none;
+}
+
+.cfg-heading h2 i {
+  display: inline-grid;
+  place-items: center;
+  flex: none;
+  width: 22px;
+  height: 22px;
+  border: 0;
+  border-radius: var(--nova-r-pill);
+  background: var(--nova-overlay-200);
+  color: var(--nova-text-muted);
+  font-family: var(--ui-font-family);
+  font-size: var(--nova-t8);
+  font-style: normal;
+  font-weight: 600;
+  line-height: 1;
+}
+
+.cfg-heading p {
+  margin: 0 0 0 30px;
+  color: var(--nova-text-muted);
+  font-size: var(--nova-t7);
+  line-height: var(--nova-t7-lh);
+}
+
+/* ── Labels, helper text, readouts ────────────────────────────────────────── */
+/* TDS TextField label is t7 and never shout-case. Dropping the old uppercase
+   +letterspacing is the single biggest readability change on these forms. */
+label,
+.language-targets-label,
+.language-targets-hint,
+.placement-hint,
+.placement-title,
+.field-status,
+output,
+.pt-output-help,
+.pt-output-routing-help,
+.workspace-page label {
+  color: var(--nova-text-muted);
+  font-size: var(--nova-t7);
+  font-weight: 500;
+  letter-spacing: 0;
+  line-height: var(--nova-t7-lh);
+  text-transform: none;
+}
+
+label {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+output {
+  color: var(--nova-text);
+  font-weight: 600;
+  min-width: 42px;
+  text-align: right;
+}
+
+.field-status,
+.language-targets-hint,
+.placement-hint {
+  color: var(--nova-text-subtle);
+}
+
+.field-status.registered {
+  color: var(--nova-green);
+}
+
+.language-targets.invalid .language-targets-hint,
+.pt-output-help.is-unavailable {
+  color: var(--nova-red);
+}
+
+/* Placement section title is an h2 with a step number, so it follows the card
+   heading above; only its colour needs restating here. */
+.placement-title {
+  color: var(--nova-text);
+}
+
+/* ── Inputs ───────────────────────────────────────────────────────────────── */
+/* TDS TextField "Box": 1px border, radius 14, 14/16 padding, value on the
+   t5/t6 scale. Excluding range/checkbox/radio/file keeps min-height off the
+   controls that are sized by their own geometry. */
+input:not([type="range"]):not([type="checkbox"]):not([type="radio"]):not([type="file"]),
+select,
+textarea,
+.workspace-page select,
+.workspace-page input[type="text"],
+.workspace-page input[type="url"],
+.workspace-page input[type="number"],
+.workspace-page input[type="date"],
+.workspace-page input[type="time"],
+.workspace-page input[type="password"],
+.workspace-page input[type="search"],
+.workspace-page textarea {
+  width: 100%;
+  min-height: 44px;
+  border: 1px solid var(--nova-hairline-strong);
+  border-radius: var(--nova-r-md);
+  background: var(--nova-surface-raised);
+  color: var(--nova-text);
+  font-family: var(--ui-font-family);
+  font-size: var(--nova-t6);
+  font-weight: 500;
+  letter-spacing: 0;
+  line-height: var(--nova-t6-lh);
+  padding: 0 16px;
+  text-transform: none;
+  color-scheme: dark;
+  transition: border-color var(--nova-dur-color) var(--nova-ease-out);
+}
+
+textarea,
+.workspace-page textarea {
+  min-height: 0;
+  padding: 12px 16px;
+  line-height: var(--nova-lh-body);
+  resize: vertical;
+}
+
+.workspace-page input::placeholder,
+.workspace-page textarea::placeholder {
+  color: var(--nova-text-disabled);
+}
+
+input[type="range"] {
+  min-height: 0;
+  border: 0;
   background: transparent;
-  color: rgba(255, 255, 255, 0.52);
+  padding: 0;
 }
 
-.quick-grid {
+.subtitle-app-shell input[type="checkbox"],
+.subtitle-app-shell input[type="radio"] {
+  accent-color: var(--nova-blue);
+}
+
+/* Sliders are drawn by hand rather than left to accent-color: the default fill
+   would put a third and fourth blue on a screen that is allowed exactly one.
+   Track height 5 with radius = height, like TDS ProgressBar. */
+.subtitle-app-shell input[type="range"] {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 100%;
+  height: 16px;
+  background: transparent;
+  cursor: pointer;
+}
+
+.subtitle-app-shell input[type="range"]::-webkit-slider-runnable-track {
+  height: 5px;
+  border-radius: var(--nova-r-pill);
+  background: var(--nova-overlay-200);
+}
+
+.subtitle-app-shell input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 16px;
+  height: 16px;
+  margin-top: -5.5px;
+  border: 0;
+  border-radius: var(--nova-r-pill);
+  background: var(--nova-text);
+}
+
+.subtitle-app-shell input[type="range"]:disabled {
+  cursor: not-allowed;
+  opacity: 0.3;
+}
+
+.subtitle-app-shell :focus-visible {
+  outline: 2px solid var(--nova-blue-strong);
+  outline-offset: 2px;
+}
+
+input:focus,
+select:focus,
+textarea:focus,
+button:focus-visible,
+a:focus-visible,
+summary:focus-visible {
+  outline: 2px solid var(--nova-blue-strong);
+  outline-offset: 2px;
+  border-color: var(--nova-blue);
+  box-shadow: none;
+}
+
+.workspace-page select:focus-visible,
+.workspace-page input:focus-visible,
+.workspace-page textarea:focus-visible {
+  outline: 2px solid var(--nova-blue-strong);
+  outline-offset: 2px;
+}
+
+.key-row {
+  align-items: center;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: var(--nova-gap-8);
+}
+
+/* Some key-rows are two buttons rather than field + button; the 1fr track would
+   stretch the first one to the full width and push the second to the far edge. */
+.key-row:has(> button:first-child) {
+  grid-template-columns: auto auto;
+  justify-content: start;
+}
+
+.two-column {
+  display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 12px;
+  gap: var(--nova-gap-12);
+}
+
+.font-size-grid {
+  display: grid;
+  gap: var(--nova-gap-12);
+}
+
+.control-stack {
+  gap: var(--nova-gap-8);
+}
+
+.range-number {
+  align-items: center;
+  display: grid;
+  grid-template-columns: 88px minmax(0, 1fr);
+  gap: var(--nova-gap-12);
+}
+
+.glossary-field textarea {
+  font-size: var(--nova-t7);
+  line-height: var(--nova-lh-body);
+}
+
+.password-field {
+  position: relative;
+  display: block;
+}
+
+.password-field input {
+  width: 100%;
+  padding-right: 72px;
+}
+
+/* ── Buttons ──────────────────────────────────────────────────────────────── */
+/* TDS Button, medium: 38 min-height, radius 10, t6 semibold, 2/16 padding.
+   `border: 1px solid transparent` (not `border: 0`) on purpose — the caption
+   controller's own rules set only border-color, so removing the border box here
+   would shift that window's packed row by 2px.
+
+   Blue is rationed to exactly one primary per screen: the footer transport
+   Start. Everything else is the neutral weak variant, the outlined secondary,
+   or the light fill (.accent). */
+button {
+  align-items: center;
+  border: 1px solid transparent;
+  border-radius: 10px;
+  background: var(--nova-overlay-200);
+  color: var(--nova-text);
+  cursor: pointer;
+  display: inline-flex;
+  justify-content: center;
+  min-height: 38px;
+  padding: 2px 16px;
+  font-family: var(--ui-font-family);
+  font-size: var(--nova-t6);
+  font-weight: 600;
+  letter-spacing: 0;
+  line-height: var(--nova-lh-list);
+  transition: background var(--nova-dur-rapid) var(--nova-spring-rapid),
+    color var(--nova-dur-color) var(--nova-ease-out);
+}
+
+button:hover:not(:disabled) {
+  background: var(--nova-overlay-300);
+  border-color: transparent;
+  transform: none;
+}
+
+button.secondary {
+  background: transparent;
+  border: 1px solid var(--nova-hairline-strong);
+  color: var(--nova-text-body);
+}
+
+button.secondary:hover:not(:disabled) {
+  background: var(--nova-overlay-100);
+  border-color: var(--nova-hairline-strong);
+  color: var(--nova-text);
+}
+
+/* TDS Button, small: 32 min-height, radius 8, t7. */
+button.compact {
+  flex: none;
+  min-height: 32px;
+  border-radius: var(--nova-r-sm);
+  padding: 2px 12px;
+  font-size: var(--nova-t7);
+}
+
+button:disabled {
+  cursor: not-allowed;
+  opacity: 0.3;
+}
+
+/* TDS `light` fill variant: near-white plate, dark label. Used for the Live
+   Call CTA so the page keeps its emphasis without spending the blue. */
+button.accent {
+  min-height: 48px;
+  border: 0;
+  border-radius: var(--nova-r-md);
+  background: var(--nova-text);
+  color: var(--nova-bg);
+  font-size: var(--nova-t5);
+  font-weight: 600;
+}
+
+button.accent:hover:not(:disabled) {
+  background: var(--nova-text-strong);
+}
+
+button[aria-busy="true"] {
+  opacity: 0.6;
+  cursor: progress;
+}
+
+.password-reveal {
+  position: absolute;
+  top: 50%;
+  right: 8px;
+  transform: translateY(-50%);
+  min-height: 28px;
+  flex: none;
+  padding: 0 10px;
+  border: 0;
+  border-radius: var(--nova-r-sm);
+  background: var(--nova-overlay-200);
+  color: var(--nova-text-body);
+  font-size: var(--nova-t8);
+  font-weight: 600;
+}
+
+/* The Records calendar authors its own control heights (30 / 26 / chip) but
+   never restated min-height, so the global button min-height was inflating the
+   whole toolbar to 42px and would have overflowed a month cell's chips. */
+.records-cal-step,
+.records-cal-today,
+.records-cal-views button,
+.records-chip,
+.records-block,
+.records-local-row {
+  min-height: 0;
+}
+
+.records-local-row {
+  /* min-height is restated by the row itself; a list row has no radius of its
+     own (the inset underlay carries it) and reads left, not centred. */
+  min-height: 44px;
+  border-radius: 0;
+  justify-content: flex-start;
+}
+
+/* ── Status chips and service strip ───────────────────────────────────────── */
+.service-strip,
+.workspace-page .service-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--nova-gap-8);
+  margin: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  padding: 0;
+}
+
+.service-strip span,
+.workspace-page .service-strip span,
+.workspace-page .service-strip .status-pill {
+  display: inline-flex;
+  align-items: center;
+  border: 0;
+  border-radius: var(--nova-r-pill);
+  background: var(--nova-overlay-100);
+  color: var(--nova-text-muted);
+  font-size: var(--nova-t7);
+  font-weight: 500;
+  line-height: var(--nova-lh-list);
+  padding: 5px 12px;
+}
+
+.service-strip span.active {
+  background: var(--nova-overlay-200);
+  color: var(--nova-text);
+}
+
+.service-strip span.error {
+  background: color-mix(in srgb, var(--nova-red) 24%, var(--nova-surface));
+  color: var(--nova-text);
+}
+
+/* ── Language selection ───────────────────────────────────────────────────── */
+.quick-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--nova-gap-12);
+  align-items: end;
 }
 
 .quick-grid .input-mode-field,
@@ -2530,178 +3078,1019 @@ textarea:focus {
   grid-column: 1 / -1;
 }
 
-label,
-.language-targets-hint,
-.placement-hint,
-.field-status,
-output,
-.pt-output-help,
-.pt-output-routing-help {
-  color: rgba(255, 255, 255, 0.48);
-}
-
-input,
-select,
-textarea,
 .lang-pill,
 .seg-toggle,
 .seg-option span {
-  border-color: rgba(255, 255, 255, 0.17);
-  border-radius: 8px;
-  background: #000000;
-  color: #ffffff;
-}
-
-input:focus,
-select:focus,
-textarea:focus,
-button:focus-visible,
-a:focus-visible,
-summary:focus-visible {
-  outline: 2px solid #0071e3;
-  outline-offset: 2px;
-  border-color: #0071e3;
-  box-shadow: none;
-}
-
-input[type="range"] {
-  accent-color: #ffffff;
-}
-
-.lang-pill:has(input:checked),
-.seg-option input:checked + span {
-  border-color: #ffffff;
-  background: #ffffff;
-  color: #000000;
-}
-
-button {
-  min-height: 42px;
-  border-color: #ffffff;
-  border-radius: 8px;
-  background: #ffffff;
-  color: #000000;
-}
-
-button:hover:not(:disabled) {
-  border-color: #ffffff;
-  background: rgba(255, 255, 255, 0.88);
-}
-
-button.secondary {
-  border-color: rgba(255, 255, 255, 0.2);
+  border-color: var(--nova-hairline-strong);
   background: transparent;
-  color: #ffffff;
+  color: var(--nova-text);
 }
 
-button.secondary:hover:not(:disabled) {
-  border-color: rgba(255, 255, 255, 0.48);
-  background: rgba(255, 255, 255, 0.07);
+.lang-pill {
+  border: 0;
+  border-radius: var(--nova-r-pill);
+  background: var(--nova-overlay-100);
+  color: var(--nova-text-muted);
+  padding: 8px 12px;
+  transition: background var(--nova-dur-rapid) var(--nova-spring-rapid),
+    color var(--nova-dur-color) var(--nova-ease-out);
 }
 
+.lang-pill:hover {
+  background: var(--nova-overlay-200);
+  border-color: transparent;
+}
+
+.lang-pill span {
+  font-size: var(--nova-t7);
+  font-weight: 600;
+  line-height: var(--nova-lh-list);
+}
+
+.lang-pill:has(input:checked) {
+  border-color: transparent;
+  background: var(--nova-surface-float);
+  color: var(--nova-text);
+}
+
+.lang-pill:has(input:focus-visible) {
+  outline: 2px solid var(--nova-blue-strong);
+  outline-offset: 2px;
+}
+
+/* Search-and-tag picker (the live Captions control). */
+.language-tag-picker {
+  display: flex;
+  flex-direction: column;
+  gap: var(--nova-gap-8);
+}
+
+.language-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--nova-gap-8);
+  min-height: 0;
+}
+
+.language-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--nova-gap-4);
+  border: 0;
+  border-radius: var(--nova-r-pill);
+  background: var(--nova-surface-float);
+  color: var(--nova-text);
+  padding: 5px 6px 5px 14px;
+  font-size: var(--nova-t7);
+  font-weight: 600;
+  line-height: var(--nova-lh-list);
+}
+
+/* min-height: 0 or the global button rule inflates the whole chip to 42px. */
+.language-chip-remove {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  width: 20px;
+  height: 20px;
+  min-height: 0;
+  border: 0;
+  border-radius: var(--nova-r-pill);
+  background: transparent;
+  color: var(--nova-text-muted);
+  font-size: var(--nova-t6);
+  line-height: 1;
+  padding: 0;
+}
+
+.language-chip-remove:hover {
+  background: var(--nova-overlay-200);
+  color: var(--nova-text);
+}
+
+.language-chip.at-minimum .language-chip-remove {
+  opacity: 0.3;
+}
+
+.language-search {
+  position: relative;
+}
+
+.language-search input[type="search"] {
+  width: 100%;
+}
+
+/* TDS Dropdown panel: radius 16, no shadow — it reads as floating because it is
+   one step lighter than the card beneath it. */
+.language-suggestions {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  right: 0;
+  margin: 0;
+  padding: var(--nova-gap-4);
+  list-style: none;
+  border: 1px solid var(--nova-hairline);
+  border-radius: var(--nova-r-lg);
+  background: var(--nova-surface-float);
+  box-shadow: none;
+  max-height: 240px;
+  overflow-y: auto;
+  z-index: 30;
+}
+
+.language-suggestion {
+  display: block;
+  width: 100%;
+  min-height: 0;
+  border: 0;
+  border-radius: var(--nova-r-row);
+  background: transparent;
+  color: var(--nova-text-body);
+  /* Left-read, not centred: the global button rule justifies content to the
+     centre and text-align alone will not undo that on a flex button. */
+  justify-content: flex-start;
+  text-align: left;
+  padding: 10px 12px;
+  font-size: var(--nova-t6);
+  font-weight: 500;
+  line-height: var(--nova-lh-list);
+  cursor: pointer;
+}
+
+.language-suggestion:hover,
+.language-suggestion:focus {
+  background: var(--nova-overlay-100);
+  color: var(--nova-text);
+}
+
+.language-suggestion-empty {
+  padding: 10px 12px;
+  color: var(--nova-text-subtle);
+  font-size: var(--nova-t7);
+}
+
+/* ── Segmented controls ───────────────────────────────────────────────────── */
+/* TDS segmented control, medium: group padding 4/5 and radius 15, item radius
+   12. 15 has no token because it is the only place TDS uses it. */
+.seg-toggle {
+  display: grid;
+  grid-template-columns: none;
+  grid-auto-flow: column;
+  grid-auto-columns: minmax(0, 1fr);
+  gap: 2px;
+  border: 0;
+  border-radius: 15px;
+  background: var(--nova-overlay-100);
+  padding: 4px 5px;
+}
+
+.seg-option span {
+  display: block;
+  border-radius: var(--nova-r-row);
+  background: transparent;
+  color: var(--nova-text-muted);
+  cursor: pointer;
+  font-size: var(--nova-t6);
+  font-weight: 600;
+  letter-spacing: 0;
+  line-height: var(--nova-t6-lh);
+  padding: 5px 14px;
+  text-align: center;
+  text-transform: none;
+  transition: background var(--nova-dur-rapid) var(--nova-spring-rapid),
+    color var(--nova-dur-color) var(--nova-ease-out);
+}
+
+.seg-option input:checked + span,
+.lang-pill:has(input:checked) {
+  border-color: transparent;
+}
+
+.seg-option input:checked + span {
+  background: var(--nova-surface-float);
+  color: var(--nova-text);
+}
+
+.seg-option input:focus-visible + span {
+  outline: 2px solid var(--nova-blue-strong);
+  outline-offset: 2px;
+}
+
+.pt-output-options {
+  grid-template-columns: none;
+}
+
+/* ── Output mode block ────────────────────────────────────────────────────── */
+.pt-output-group {
+  display: grid;
+  gap: var(--nova-gap-12);
+  border: 1px solid var(--nova-hairline);
+  border-radius: var(--nova-r-md);
+  background: var(--nova-surface-raised);
+  padding: var(--nova-gap-16);
+}
+
+.pt-output-kicker,
+.pt-output-heading > span {
+  color: var(--nova-text-subtle);
+  font-size: var(--nova-t8);
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  line-height: var(--nova-t8-lh);
+}
+
+.workspace-page .pt-output-heading h2 {
+  color: var(--nova-text);
+  font-size: var(--nova-t4);
+  font-weight: 700;
+  letter-spacing: -0.01em;
+  line-height: var(--nova-t4-lh);
+}
+
+.pt-playback-options {
+  display: grid;
+  grid-template-columns: minmax(180px, 0.7fr) minmax(240px, 1.3fr);
+  gap: var(--nova-gap-12);
+  padding-top: var(--nova-gap-12);
+  border-top: 1px solid var(--nova-hairline);
+}
+
+.pt-voice-method-heading h3 {
+  margin: 0;
+  color: var(--nova-text);
+  font-size: var(--nova-t6);
+  font-weight: 600;
+  line-height: var(--nova-t6-lh);
+}
+
+.pt-voice-method-heading span {
+  color: var(--nova-text-subtle);
+  font-size: var(--nova-t7);
+  font-weight: 400;
+  line-height: var(--nova-t7-lh);
+}
+
+.pt-volume-field > span {
+  color: var(--nova-text-muted);
+}
+
+/* ── Per-language subtitle placement ──────────────────────────────────────── */
+.subtitle-placement,
+.workspace-page .subtitle-placement {
+  margin-top: 0;
+}
+
+.placement-head {
+  display: grid;
+  gap: var(--nova-gap-4);
+}
+
+.placement-rows {
+  display: grid;
+  gap: var(--nova-gap-8);
+}
+
+.placement-row {
+  align-items: center;
+  display: grid;
+  grid-template-columns: 44px minmax(0, 1fr);
+  gap: var(--nova-gap-12);
+}
+
+/* This chip rendered in the ink colour of the light theme — invisible on the
+   dark shell until the alias layer above repointed --cw-indigo. Stated here so
+   it does not depend on that alias. */
+.lang-chip {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: var(--nova-r-sm);
+  background: var(--nova-overlay-100);
+  color: var(--nova-text-body);
+  font-size: var(--nova-t8);
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  line-height: 22px;
+  text-align: center;
+}
+
+.placement-offset {
+  align-items: center;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  gap: var(--nova-gap-12);
+  padding-top: var(--nova-gap-12);
+  border-top: 1px solid var(--nova-hairline);
+  color: var(--nova-text-muted);
+}
+
+/* A divider immediately under the card heading reads as a stray rule; the one
+   below the placement rows is doing real separating work. */
+.cfg-heading + .placement-offset {
+  padding-top: 0;
+  border-top: 0;
+}
+
+#vertical-offset-value {
+  min-width: 48px;
+  color: var(--nova-text);
+  text-align: right;
+}
+
+/* ── Audio inspector ─────────────────────────────────────────────────────── */
+.audio-inspector {
+  border: 1px solid var(--nova-hairline);
+  border-radius: var(--nova-r-md);
+  background: var(--nova-surface-raised);
+  display: grid;
+  gap: 0;
+  padding: 0;
+}
+
+.audio-inspector-heading {
+  align-items: center;
+  display: flex;
+  justify-content: space-between;
+  gap: var(--nova-gap-12);
+  border-bottom: 1px solid var(--nova-hairline);
+  color: var(--nova-text-subtle);
+  font-size: var(--nova-t8);
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  padding: 10px var(--nova-gap-16);
+  text-transform: uppercase;
+}
+
+.audio-meter-row {
+  align-items: center;
+  display: grid;
+  grid-template-columns: minmax(140px, 0.8fr) minmax(120px, 1fr) 64px;
+  gap: var(--nova-gap-12);
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  min-height: 44px;
+  padding: var(--nova-gap-8) var(--nova-gap-16);
+}
+
+.audio-meter-row + .audio-meter-row {
+  border-top: 1px solid var(--nova-hairline);
+}
+
+.audio-meter-row strong {
+  color: var(--nova-text);
+  font-size: var(--nova-t6);
+  font-weight: 600;
+  line-height: var(--nova-lh-list);
+}
+
+.audio-meter-row span {
+  color: var(--nova-text-muted);
+  font-size: var(--nova-t7);
+  line-height: var(--nova-lh-list);
+}
+
+.audio-meter-row em {
+  color: var(--nova-text-subtle);
+  font-size: var(--nova-t7);
+  font-style: normal;
+  font-weight: 600;
+  text-align: right;
+}
+
+/* TDS ProgressBar: radius equals height. */
 .audio-meter {
-  background: rgba(255, 255, 255, 0.1);
+  height: 5px;
+  border: 0;
+  border-radius: var(--nova-r-pill);
+  background: var(--nova-overlay-200);
+  overflow: hidden;
 }
 
 .audio-meter-fill {
-  background: #ffffff;
+  background: var(--nova-green);
 }
 
-.dashboard-actions {
-  position: sticky;
-  bottom: 12px;
-  z-index: 4;
-  padding: 8px;
-  border: 1px solid rgba(255, 255, 255, 0.13);
-  border-radius: 8px;
-  background: rgba(0, 0, 0, 0.94);
-}
-
-.dashboard-actions button {
-  min-height: 48px;
-}
-
-.command-panel > .live-handoff {
+/* ── Live Call: handoff, cover, draft blocks ──────────────────────────────── */
+.command-panel > .live-handoff,
+.live-handoff {
+  display: grid;
   grid-template-columns: minmax(0, 1fr);
-  gap: 12px;
-  padding: 16px;
-  border-color: rgba(255, 255, 255, 0.16);
-  background: rgba(255, 255, 255, 0.035);
+  align-items: start;
+  gap: var(--nova-gap-16);
+  border: 1px solid var(--nova-hairline);
+  border-radius: var(--nova-r-lg);
+  background: var(--nova-surface);
+  box-shadow: none;
+  padding: var(--nova-inset-narrow) var(--nova-inset) var(--nova-inset);
 }
 
 .command-panel > .live-handoff .live-handoff-kicker,
+.live-handoff-kicker,
 .live-handoff-flow {
-  color: rgba(255, 255, 255, 0.44);
+  display: block;
+  color: var(--nova-text-subtle);
+  font-size: var(--nova-t8);
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  line-height: var(--nova-t8-lh);
+}
+
+.live-handoff-flow {
+  margin-top: var(--nova-gap-8);
+  letter-spacing: 0;
 }
 
 .live-handoff h2 {
-  color: #ffffff;
+  margin: var(--nova-gap-4) 0 0;
+  color: var(--nova-text);
   font-family: var(--ui-font-family);
-  font-size: 18px;
-  font-weight: 600;
+  font-size: var(--nova-t4);
+  font-weight: 700;
+  letter-spacing: -0.01em;
+  line-height: var(--nova-t4-lh);
 }
 
 .live-handoff-copy p,
 .live-handoff-action span {
-  color: rgba(255, 255, 255, 0.48);
+  margin: var(--nova-gap-4) 0 0;
+  color: var(--nova-text-muted);
+  font-size: var(--nova-t7);
+  line-height: var(--nova-t7-lh);
 }
 
-.live-handoff-modes {
-  grid-template-columns: minmax(0, 1fr);
+.live-handoff-action {
+  display: grid;
+  gap: var(--nova-gap-8);
 }
 
-.live-handoff-modes li {
-  border-color: rgba(255, 255, 255, 0.12);
-  border-radius: 8px;
-  background: #000000;
+.live-handoff-action span.is-error {
+  color: var(--nova-red);
 }
 
-.live-handoff-modes strong {
-  color: #ffffff;
+.live-web-fallback {
+  display: inline-block;
+  justify-self: start;
+  margin-top: var(--nova-gap-4);
+  color: var(--nova-text-subtle);
+  font-size: var(--nova-t8);
+  line-height: var(--nova-t8-lh);
+  text-decoration: underline;
 }
 
-.live-handoff-modes span {
-  color: rgba(255, 255, 255, 0.46);
+.live-draft-cover {
+  display: grid;
+  gap: var(--nova-gap-8);
+}
+
+.live-draft-cover > span {
+  color: var(--nova-text-muted);
+  font-size: var(--nova-t7);
+  line-height: var(--nova-t7-lh);
+}
+
+.live-draft-cover-row {
+  display: flex;
+  align-items: center;
+  gap: var(--nova-gap-12);
+}
+
+.live-draft-cover-status {
+  min-height: 18px;
+  color: var(--nova-text-subtle);
+  font-size: var(--nova-t7);
+  line-height: var(--nova-t7-lh);
+}
+
+.live-draft-cover-status.is-error,
+#live-host-login-status.is-error {
+  color: var(--nova-red);
+  font-weight: 600;
+}
+
+#live-draft-cover-preview {
+  width: 72px;
+  height: 72px;
+  border: 1px solid var(--nova-hairline);
+  border-radius: var(--nova-r-row);
+  object-fit: cover;
+}
+
+.live-draft-access-note {
+  display: grid;
+  gap: var(--nova-gap-4);
+  margin: 0;
+  border: 0;
+  border-radius: var(--nova-r-md);
+  background: var(--nova-overlay-100);
+  padding: var(--nova-gap-12) var(--nova-gap-16);
+}
+
+.live-draft-access-note strong {
+  color: var(--nova-text);
+  font-size: var(--nova-t6);
+  font-weight: 600;
+  line-height: var(--nova-lh-list);
+}
+
+.live-draft-access-note span {
+  color: var(--nova-text-muted);
+  font-size: var(--nova-t7);
+  line-height: var(--nova-t7-lh);
+}
+
+.live-draft-languages {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--nova-gap-8);
+}
+
+.live-draft-language-chip {
+  display: inline-flex;
+  align-items: center;
+  border: 0;
+  border-radius: var(--nova-r-pill);
+  background: var(--nova-overlay-100);
+  padding: 6px 14px;
+  color: var(--nova-text-body);
+  font-size: var(--nova-t7);
+  font-weight: 500;
+  line-height: var(--nova-lh-list);
+}
+
+.live-schedule-row {
+  display: flex;
+  align-items: center;
+  gap: var(--nova-gap-12);
+}
+
+.live-schedule-row strong {
+  color: var(--nova-text);
+  font-size: var(--nova-t6);
+  font-weight: 600;
+}
+
+/* TDS Dialog: radius 24, float surface, 22/22/16 padding, dark dimmer 0.56. */
+.live-schedule-modal {
+  min-width: 340px;
+  border: 0;
+  border-radius: var(--nova-r-panel);
+  background: var(--nova-surface-float);
+  color: var(--nova-text-body);
+  padding: 22px 22px 16px;
+}
+
+.live-schedule-modal::backdrop {
+  background: var(--nova-scrim);
+}
+
+.live-schedule-modal h3 {
+  margin: 0 0 var(--nova-gap-12);
+  color: var(--nova-text);
+  font-family: var(--ui-font-family);
+  font-size: var(--nova-t4);
+  font-weight: 700;
+  line-height: var(--nova-t4-lh);
+}
+
+.live-schedule-modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--nova-gap-8);
+  margin-top: var(--nova-gap-16);
+}
+
+#manage-glossaries {
+  justify-self: start;
+}
+
+/* ── Settings drawer ─────────────────────────────────────────────────────── */
+.settings-drawer {
+  overflow: hidden;
+  border-radius: var(--nova-r-lg);
+  background: var(--nova-surface-raised);
+}
+
+.settings-drawer summary {
+  color: var(--nova-text);
+  cursor: pointer;
+  font-size: var(--nova-t5);
+  font-weight: 600;
+  line-height: var(--nova-t5-lh);
+  list-style: none;
+  padding: var(--nova-gap-12) var(--nova-inset);
+}
+
+.settings-drawer .settings-panel {
+  display: grid;
+  gap: var(--nova-gap-16);
+  border: 0;
+  border-top: 1px solid var(--nova-hairline);
+  border-radius: 0;
+  background: transparent;
+  padding: var(--nova-inset-narrow) var(--nova-inset) var(--nova-inset);
+}
+
+/* ── Notices ─────────────────────────────────────────────────────────────── */
+.file-protocol-warning,
+.subtitle-error.notice {
+  border: 0;
+  border-radius: var(--nova-r-md);
+  background: var(--nova-overlay-100);
+  color: var(--nova-text);
+  font-size: var(--nova-t7);
+  font-weight: 500;
+  line-height: var(--nova-t7-lh);
+  padding: var(--nova-gap-12) var(--nova-gap-16);
+}
+
+.subtitle-error {
+  margin-top: var(--nova-gap-12);
+  border: 0;
+  border-radius: var(--nova-r-md);
+  background: color-mix(in srgb, var(--nova-red) 20%, var(--nova-surface));
+  color: var(--nova-text);
+  font-size: var(--nova-t7);
+  line-height: var(--nova-t7-lh);
+  padding: var(--nova-gap-12) var(--nova-gap-16);
+}
+
+/* Pipeline badge: only visible while reconnecting or degraded. */
+.subtitle-status-indicator {
+  background: var(--nova-surface-float);
+  border-radius: var(--nova-r-pill);
+  color: var(--nova-yellow);
+  font-size: var(--nova-t7);
+  font-weight: 600;
+  padding: 6px 14px;
+}
+
+.subtitle-status-indicator::before {
+  background: var(--nova-yellow);
+}
+
+/* ── Records page panels (the calendar itself owns its own styling below) ─── */
+/* The calendar grid is already a bordered card, so its wrapper must not draw a
+   second frame around it; the topic and translation-log panels still need one. */
+[data-workspace-page="records"] .workspace-panel {
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  padding: 0;
+  margin-bottom: var(--nova-inset);
+}
+
+[data-workspace-page="records"] .history-panel,
+[data-workspace-page="records"] .translation-log-panel,
+[data-workspace-page="records"] .session-record-detail-page {
+  border: 1px solid var(--nova-hairline);
+  border-radius: var(--nova-r-panel);
+  background: var(--nova-surface);
+  padding: var(--nova-inset-narrow) var(--nova-inset) var(--nova-inset);
 }
 
 .history-panel,
 .translation-log-panel {
-  padding: 20px;
+  display: grid;
+  gap: var(--nova-gap-12);
+  align-content: start;
 }
 
 .translation-log-panel {
-  min-height: 260px;
+  min-height: 0;
 }
 
-.translation-day summary,
-.translation-record-list li {
-  color: rgba(255, 255, 255, 0.72);
+/* Topic rows: TDS list rows, not boxed cards. The negative horizontal margin is
+   how TDS cancels a container inset (`horizontalPadding: 0` is implemented as
+   `marginHorizontal: -24`), so the row's own 24px inset lines up with the panel
+   heading instead of stacking on top of the panel padding — and the divider
+   bleeds to the card's right edge. */
+.topic-list {
+  display: grid;
+  gap: 0;
+  margin: 0 calc(-1 * var(--nova-inset));
 }
 
-.translation-day-count,
+.topic-item {
+  position: relative;
+  display: grid;
+  gap: 2px;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  padding: var(--nova-gap-12) var(--nova-inset);
+}
+
+.topic-item::before {
+  content: "";
+  position: absolute;
+  bottom: 0;
+  left: var(--nova-inset);
+  width: calc(100% - var(--nova-inset));
+  height: 1px;
+  background: var(--nova-hairline);
+}
+
+.topic-item:last-child::before {
+  display: none;
+}
+
+.topic-item strong {
+  position: relative;
+  color: var(--nova-text);
+  font-size: var(--nova-t5);
+  font-weight: 600;
+  line-height: var(--nova-lh-list);
+}
+
 .topic-item span {
-  color: #ffffff;
+  position: relative;
+  color: var(--nova-text-subtle);
+  font-size: var(--nova-t7);
+  font-weight: 500;
+  line-height: var(--nova-lh-list);
 }
 
-.settings-drawer {
-  overflow: hidden;
+.topic-item p {
+  position: relative;
+  margin: 0;
+  color: var(--nova-text-muted);
+  font-size: var(--nova-t7);
+  line-height: var(--nova-lh-list);
 }
 
-.settings-drawer summary {
-  padding: 16px 18px;
+.translation-log {
+  display: grid;
+  gap: 0;
+  margin: 0;
+  padding: 0;
 }
 
-.settings-drawer .settings-panel {
-  border-top-color: rgba(255, 255, 255, 0.14);
+.translation-day {
+  border: 0;
+  border-top: 1px solid var(--nova-hairline);
+  color: var(--nova-text-body);
+  display: block;
+  font-size: var(--nova-t7);
+  line-height: var(--nova-lh-list);
+  padding: var(--nova-gap-12) 0;
 }
 
-.file-protocol-warning,
-.subtitle-error.notice {
-  border-color: rgba(255, 255, 255, 0.24);
-  background: rgba(255, 255, 255, 0.06);
-  color: #ffffff;
+.translation-day:first-child {
+  border-top: 0;
+  padding-top: 0;
 }
 
+.translation-day summary {
+  color: var(--nova-text);
+  font-size: var(--nova-t6);
+  font-weight: 600;
+  line-height: var(--nova-lh-list);
+}
+
+.translation-day-count {
+  color: var(--nova-text-subtle);
+  font-size: var(--nova-t7);
+  font-weight: 600;
+}
+
+.translation-record-list li {
+  color: var(--nova-text-muted);
+  font-size: var(--nova-t7);
+  line-height: var(--nova-lh-list);
+}
+
+/* TDS `Result`: a title, a description, and nothing else — no dashed box. */
+.empty-state,
+.workspace-page .empty-state {
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: var(--nova-text-subtle);
+  font-size: var(--nova-t6);
+  font-weight: 500;
+  line-height: var(--nova-t6-lh);
+  padding: 32px var(--nova-gap-16);
+  text-align: center;
+}
+
+/* ── Footer transport (player bar) ───────────────────────────────────────── */
+.workspace-footer {
+  position: sticky;
+  bottom: 0;
+  z-index: 4;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--nova-gap-12);
+  margin-top: var(--nova-gap-16);
+  border-top: 1px solid var(--nova-hairline);
+  background: var(--nova-bg);
+  padding: var(--nova-gap-12) 0 calc(var(--nova-gap-12) + env(safe-area-inset-bottom, 0px));
+}
+
+.workspace-footer.player-bar {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+  align-items: center;
+  gap: var(--nova-gap-12);
+  background: var(--nova-bg);
+  border-top: 1px solid var(--nova-hairline);
+  padding: var(--nova-gap-12) 0 calc(var(--nova-gap-12) + env(safe-area-inset-bottom, 0px));
+}
+
+.workspace-footer-status,
+.player-bar-left {
+  display: flex;
+  align-items: center;
+  gap: var(--nova-gap-12);
+  justify-self: start;
+}
+
+.workspace-footer-label {
+  color: var(--nova-text-subtle);
+  font-size: var(--nova-t7);
+  line-height: var(--nova-lh-list);
+}
+
+.status-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--nova-gap-4);
+  border: 0;
+  border-radius: var(--nova-r-pill);
+  background: var(--nova-overlay-100);
+  padding: 5px 12px;
+  color: var(--nova-text-muted);
+  font-size: var(--nova-t7);
+  font-weight: 500;
+  line-height: var(--nova-lh-list);
+}
+
+.status-chip::before {
+  content: "";
+  width: 6px;
+  height: 6px;
+  border-radius: var(--nova-r-pill);
+  background: var(--nova-text-disabled);
+}
+
+.status-chip.is-active {
+  color: var(--nova-text);
+}
+
+.status-chip.is-active::before {
+  background: var(--nova-green);
+}
+
+/* The transport group is not itself a surface — the bar is. */
+.dashboard-actions,
+.workspace-footer .dashboard-actions {
+  display: flex;
+  gap: var(--nova-gap-8);
+  margin: 0;
+  position: static;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  padding: 0;
+}
+
+.player-bar .dashboard-actions.player-bar-center {
+  justify-self: center;
+  display: flex;
+  align-items: center;
+  gap: var(--nova-gap-8);
+}
+
+.player-bar-right {
+  justify-self: end;
+  display: inline-flex;
+  align-items: center;
+  gap: var(--nova-gap-8);
+}
+
+/* The one blue on the screen. TDS large button: 48 tall, radius 14 — pill here
+   because the transport reads as a play control. */
+.workspace-footer #start-subtitles {
+  flex: none;
+  min-height: 46px;
+  border: 0;
+  border-radius: var(--nova-r-pill);
+  background: var(--nova-blue);
+  color: var(--nova-text);
+  padding: 0 28px;
+  font-size: var(--nova-t5);
+  font-weight: 600;
+}
+
+.workspace-footer #start-subtitles:hover:not(:disabled) {
+  background: var(--nova-blue-strong);
+}
+
+.workspace-footer #start-subtitles:disabled {
+  opacity: 0.3;
+}
+
+.workspace-footer #stop-subtitles,
+.workspace-footer #restart-subtitles {
+  flex: none;
+  min-height: 46px;
+  border: 1px solid var(--nova-hairline-strong);
+  border-radius: var(--nova-r-pill);
+  background: transparent;
+  color: var(--nova-text-body);
+  padding: 0 20px;
+  font-size: var(--nova-t6);
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.overlay-toggle,
+.workspace-footer .overlay-toggle {
+  display: inline-flex;
+  flex-direction: row;
+  align-items: center;
+  flex-wrap: nowrap;
+  white-space: nowrap;
+  gap: var(--nova-gap-8);
+  border: 0;
+  border-radius: var(--nova-r-pill);
+  background: var(--nova-overlay-100);
+  min-height: 0;
+  padding: 8px 16px;
+  color: var(--nova-text-body);
+}
+
+.overlay-toggle input {
+  height: 16px;
+  width: 16px;
+  min-height: 0;
+}
+
+.overlay-toggle span,
+.workspace-footer .overlay-toggle span {
+  color: var(--nova-text-body);
+  font-size: var(--nova-t7);
+  font-weight: 500;
+  letter-spacing: 0;
+  line-height: var(--nova-lh-list);
+  text-transform: none;
+}
+
+/* ── Workspace page container ────────────────────────────────────────────── */
+.workspace-shell {
+  display: block;
+}
+
+.workspace-panel {
+  min-width: 0;
+}
+
+.workspace-single {
+  display: block;
+  /* No cap of its own: the content column below owns the width, so the cards are
+     always flush with the hero and the footer bar. */
+  max-width: none;
+}
+
+.workspace-page {
+  display: none;
+}
+
+/* Only opacity and transform are animated; nothing in this system animates
+   height or width. */
+.workspace-page.is-active {
+  display: block;
+  animation: workspace-page-in var(--nova-dur-quick) var(--nova-ease-expo);
+}
+
+@keyframes workspace-page-in {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: none; }
+}
+
+/* The inline caption preview is redundant — captions render on the overlay and
+   on every participant screen. Kept in the DOM for the caption engine. */
+.workspace-page .preview-panel {
+  display: none !important;
+}
+
+/* ── Light theme: monochrome invert of the workspace shell. Media (cover
+   previews, QR imagery) is counter-inverted so photos stay true. ── */
+body.theme-light .subtitle-app-shell {
+  filter: invert(1) hue-rotate(180deg);
+}
+
+body.theme-light .subtitle-app-shell img,
+body.theme-light .subtitle-app-shell video {
+  filter: invert(1) hue-rotate(180deg);
+}
+
+/* ── Responsive: this is a resizable desktop window ─────────────────────── */
 @media (max-width: 1120px) {
   .subtitle-app-shell {
     grid-template-columns: 176px minmax(0, 1fr);
@@ -2711,20 +4100,26 @@ button.secondary:hover:not(:disabled) {
     width: min(100% - 32px, 980px);
   }
 
-  .dashboard-shell {
+  .pt-playback-options {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+@media (max-width: 900px) {
+  .quick-grid,
+  .two-column {
     grid-template-columns: minmax(0, 1fr);
   }
 
-  .dashboard-grid,
-  .command-panel,
-  .translation-log-panel,
-  .settings-drawer {
-    grid-column: 1;
-    grid-row: auto;
+  .workspace-footer.player-bar {
+    grid-template-columns: minmax(0, 1fr);
+    justify-items: start;
+    row-gap: var(--nova-gap-8);
   }
 
-  .dashboard-grid {
-    order: -1;
+  .player-bar .dashboard-actions.player-bar-center,
+  .player-bar-right {
+    justify-self: start;
   }
 }
 
@@ -2739,16 +4134,16 @@ button.secondary:hover:not(:disabled) {
     height: auto;
     flex-direction: row;
     align-items: center;
-    gap: 16px;
+    gap: var(--nova-gap-16);
     overflow-x: auto;
-    padding: 14px;
+    padding: var(--nova-gap-12);
     border-right: 0;
-    border-bottom: 1px solid rgba(255, 255, 255, 0.16);
+    border-bottom: 1px solid var(--nova-hairline);
   }
 
   .subtitle-app-rail nav {
     display: flex;
-    gap: 4px;
+    gap: var(--nova-gap-4);
   }
 
   .subtitle-app-rail nav a,
@@ -2764,542 +4159,40 @@ button.secondary:hover:not(:disabled) {
 
   .subtitle-dashboard {
     width: min(100% - 24px, 680px);
-    padding-top: 22px;
+    padding-top: var(--nova-inset-narrow);
   }
 
   .subtitle-hero {
     align-items: flex-start;
     flex-direction: column;
-    gap: 12px;
+    gap: var(--nova-gap-12);
   }
 
-  .quick-grid {
-    grid-template-columns: minmax(0, 1fr);
+  .workspace-page .cfg-section {
+    padding: var(--nova-gap-16);
   }
 
-  .quick-grid .language-targets,
-  .quick-grid .input-mode-field,
-  .quick-grid .topic-field,
-  .quick-grid .tone-field {
-    grid-column: 1;
-  }
-
-  .preview-panel {
-    min-height: 360px;
-  }
-
-  .subtitle-preview {
-    min-height: 280px;
-    padding: 32px 10px;
+  /* Only stack the segmented controls once the labels genuinely stop fitting. */
+  .seg-toggle {
+    grid-auto-flow: row;
+    grid-auto-columns: auto;
   }
 }
 
-/* Pipeline status badge: visible only while reconnecting/recovering/degraded. */
-.subtitle-status-indicator {
-  position: fixed;
-  left: 24px;
-  bottom: 20px;
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  background: rgba(15, 18, 36, 0.8);
-  color: #ffd479;
-  padding: 6px 14px;
-  border-radius: 999px;
-  font-size: 13px;
-  font-weight: 600;
-  pointer-events: none;
-  z-index: 9999;
-}
-
-.subtitle-status-indicator::before {
-  content: "";
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  background: #ffb020;
-  animation: subtitle-status-pulse 1.2s ease-in-out infinite;
-}
-
-@keyframes subtitle-status-pulse {
-  0%, 100% { opacity: 1; }
-  50% { opacity: 0.35; }
-}
-
-/* Search-and-tag language picker: selected languages are removable chips; new
-   ones are added via type-ahead search instead of a full pill list. */
-.language-tag-picker {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
-
-.language-chips {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-  min-height: 30px;
-}
-
-.language-chip {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  background: var(--cw-blue-12, rgba(38, 76, 214, 0.12));
-  border: 1px solid var(--cw-blue, #264cd6);
-  color: var(--cw-blue, #264cd6);
-  border-radius: 999px;
-  padding: 4px 6px 4px 12px;
-  font-size: 13px;
-  font-weight: 650;
-}
-
-.language-chip.at-minimum .language-chip-remove {
-  opacity: 0.35;
-}
-
-.language-chip-remove {
-  border: none;
-  background: transparent;
-  color: inherit;
-  font-size: 15px;
-  line-height: 1;
-  width: 18px;
-  height: 18px;
-  border-radius: 50%;
-  cursor: pointer;
-  padding: 0;
-}
-
-.language-chip-remove:hover {
-  background: rgba(38, 76, 214, 0.18);
-}
-
-.language-search {
-  position: relative;
-}
-
-.language-search input[type="search"] {
-  width: 100%;
-  box-sizing: border-box;
-  padding: 8px 12px;
-  border-radius: 8px;
-  border: 1px solid var(--cw-border, #d8dbe6);
-  font-size: 13px;
-}
-
-.language-suggestions {
-  position: absolute;
-  top: calc(100% + 4px);
-  left: 0;
-  right: 0;
-  margin: 0;
-  padding: 4px;
-  list-style: none;
-  background: var(--cw-white, #fff);
-  border: 1px solid var(--cw-border, #d8dbe6);
-  border-radius: 8px;
-  box-shadow: 0 8px 24px rgba(15, 18, 36, 0.12);
-  max-height: 220px;
-  overflow-y: auto;
-  z-index: 30;
-}
-
-.language-suggestion {
-  display: block;
-  width: 100%;
-  text-align: left;
-  border: none;
-  background: transparent;
-  /* The dashboard's base button style is white-on-blue — restate the ink
-     color or the suggestion text disappears on the white dropdown. */
-  color: var(--cw-ink, #1c2333);
-  padding: 8px 10px;
-  border-radius: 6px;
-  font-size: 13px;
-  cursor: pointer;
-}
-
-.language-suggestion:hover,
-.language-suggestion:focus {
-  background: var(--cw-blue-12, rgba(38, 76, 214, 0.12));
-}
-
-.language-suggestion-empty {
-  padding: 8px 10px;
-  font-size: 12px;
-  color: var(--cw-grey, #6b7280);
-}
-
-/* ── Workspace pages (Captions / Live Call / Records / Settings) ────────── */
-
-.workspace-shell { display: block; }
-
-.workspace-page { display: none; }
-.workspace-page.is-active { display: block; animation: workspace-page-in 0.18s ease; }
-@keyframes workspace-page-in { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
-
-.workspace-columns {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) 280px;
-  align-items: start;
-  gap: 18px;
-}
-@media (max-width: 1080px) { .workspace-columns { grid-template-columns: minmax(0, 1fr); } }
-
-.workspace-panel { min-width: 0; }
-
-.cfg-section {
-  display: grid;
-  gap: 14px;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.1);
-  padding: 20px 0 24px;
-}
-.cfg-section:last-of-type { border-bottom: 0; }
-
-.cfg-heading { display: grid; gap: 4px; }
-.cfg-heading h2 {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  margin: 0;
-  color: #ffffff;
-  font: 600 15px/1.3 var(--ui-font-family);
-}
-.cfg-heading h2 i {
-  display: inline-grid;
-  place-items: center;
-  width: 22px;
-  height: 22px;
-  border: 1px solid rgba(255, 255, 255, 0.28);
-  border-radius: 9999px;
-  font: 600 11px/1 var(--ui-font-family);
-  font-style: normal;
-  color: rgba(255, 255, 255, 0.72);
-}
-.cfg-heading p { margin: 0 0 0 32px; color: rgba(255, 255, 255, 0.45); font-size: 12px; }
-
-.workspace-summary {
-  position: sticky;
-  top: 18px;
-  display: grid;
-  gap: 12px;
-  border: 1px solid rgba(255, 255, 255, 0.12);
-  border-radius: 12px;
-  background: rgba(255, 255, 255, 0.03);
-  padding: 18px 16px;
-}
-.workspace-summary h2 {
-  margin: 0;
-  color: #ffffff;
-  font: 600 13px/1.3 var(--ui-font-family);
-  letter-spacing: 0.02em;
-}
-.workspace-summary dl { display: grid; gap: 10px; margin: 0; }
-.workspace-summary dt {
-  color: rgba(255, 255, 255, 0.42);
-  font-size: 11px;
-  letter-spacing: 0.04em;
-}
-.workspace-summary dd {
-  margin: 2px 0 0;
-  padding-bottom: 10px;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
-  color: rgba(255, 255, 255, 0.88);
-  font-size: 12.5px;
-  line-height: 1.45;
-  word-break: break-word;
-}
-.workspace-summary dd:last-of-type { border-bottom: 0; padding-bottom: 0; }
-.workspace-summary-note { margin: 0; color: rgba(255, 255, 255, 0.38); font-size: 11px; line-height: 1.5; }
-
-.workspace-footer {
-  position: sticky;
-  bottom: 0;
-  z-index: 4;
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  justify-content: space-between;
-  gap: 14px;
-  margin-top: 18px;
-  border-top: 1px solid rgba(255, 255, 255, 0.14);
-  background: #000000;
-  padding: 14px 4px calc(14px + env(safe-area-inset-bottom, 0px));
-}
-.workspace-footer-status { display: flex; align-items: center; gap: 12px; }
-.workspace-footer-label { color: rgba(255, 255, 255, 0.45); font-size: 12px; }
-.status-chip {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  border: 1px solid rgba(255, 255, 255, 0.2);
-  border-radius: 9999px;
-  padding: 6px 14px;
-  color: rgba(255, 255, 255, 0.6);
-  font-size: 12px;
-}
-.status-chip::before { content: ""; width: 7px; height: 7px; border-radius: 9999px; background: rgba(255, 255, 255, 0.35); }
-.status-chip.is-active { color: #ffffff; border-color: rgba(52, 199, 89, 0.6); }
-.status-chip.is-active::before { background: #34c759; }
-
-.workspace-footer .dashboard-actions { display: flex; gap: 10px; margin: 0; }
-
-.live-draft-cover { display: grid; gap: 8px; }
-.live-draft-cover > span { color: rgba(255, 255, 255, 0.45); font-size: 12px; }
-.live-draft-cover-row { display: flex; align-items: center; gap: 12px; }
-.live-draft-cover-status { min-height: 18px; color: rgba(255, 255, 255, 0.48); font-size: 12px; line-height: 1.5; }
-.live-draft-cover-status.is-error,
-#live-host-login-status.is-error { color: #ffffff; font-weight: 600; }
-#live-draft-cover-preview {
-  width: 72px;
-  height: 72px;
-  border: 1px solid rgba(255, 255, 255, 0.16);
-  border-radius: 10px;
-  object-fit: cover;
-}
-.live-draft-access-note {
-  display: grid;
-  gap: 4px;
-  margin: 0;
-  border: 1px solid rgba(255, 255, 255, 0.14);
-  border-radius: 10px;
-  background: rgba(255, 255, 255, 0.035);
-  padding: 14px 16px;
-}
-.live-draft-access-note strong { color: rgba(255, 255, 255, 0.88); font-size: 12.5px; }
-.live-draft-access-note span { color: rgba(255, 255, 255, 0.48); font-size: 12px; line-height: 1.5; }
-
-#manage-glossaries { justify-self: start; }
-
-/* Summary panels removed: pages are a single ordered column of sections. */
-.workspace-single { display: block; max-width: 880px; }
-.workspace-footer .overlay-toggle { display: inline-flex; flex-direction: row; align-items: center; flex-wrap: nowrap; white-space: nowrap; gap: 8px; border: 1px solid rgba(255, 255, 255, 0.16); border-radius: 10px; min-height: 0; padding: 9px 14px; color: rgba(255, 255, 255, 0.78); font-size: 12.5px; }
-.workspace-footer .overlay-toggle span { color: rgba(255, 255, 255, 0.78); }
-.live-schedule-row { display: flex; align-items: center; gap: 14px; }
-.live-schedule-row strong { color: rgba(255, 255, 255, 0.85); font-size: 13.5px; }
-.live-schedule-modal { min-width: 340px; border: 1px solid rgba(255, 255, 255, 0.18); border-radius: 14px; background: #111111; color: rgba(255, 255, 255, 0.85); padding: 22px; }
-.live-schedule-modal::backdrop { background: rgba(0, 0, 0, 0.6); }
-.live-schedule-modal h3 { margin: 0 0 14px; color: #ffffff; font: 600 14px/1.3 var(--ui-font-family); }
-.live-schedule-modal-actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 16px; }
-.live-draft-languages { display: flex; flex-wrap: wrap; gap: 8px; }
-.live-draft-language-chip { display: inline-flex; align-items: center; border: 1px solid rgba(255, 255, 255, 0.22); border-radius: 9999px; padding: 8px 16px; color: rgba(255, 255, 255, 0.85); font-size: 12.5px; }
-
-/* ── Workspace polish pass (2026-07-23): card sections, accent CTA, records ── */
-
-/* Each numbered section reads as a card, like the reference mockups. */
-.workspace-page .cfg-section {
-  border: 1px solid rgba(255, 255, 255, 0.1);
-  border-radius: 14px;
-  background: rgba(255, 255, 255, 0.028);
-  padding: 20px 18px 22px;
-  margin-bottom: 14px;
-}
-.workspace-page .cfg-section:last-of-type { border-bottom: 1px solid rgba(255, 255, 255, 0.1); }
-
-/* Consistent dark form controls inside workspace pages. */
-.workspace-page select,
-.workspace-page input[type="text"],
-.workspace-page input[type="url"],
-.workspace-page input[type="number"],
-.workspace-page input[type="date"],
-.workspace-page input[type="time"],
-.workspace-page input[type="password"],
-.workspace-page textarea {
-  border: 1px solid rgba(255, 255, 255, 0.18);
-  border-radius: 10px;
-  background: rgba(255, 255, 255, 0.04);
-  color: rgba(255, 255, 255, 0.9);
-  min-height: 44px;
-  padding: 0 14px;
-  font: 500 13.5px/1.2 var(--ui-font-family);
-  color-scheme: dark;
-}
-.workspace-page textarea { padding: 12px 14px; min-height: 0; }
-.workspace-page select:focus-visible,
-.workspace-page input:focus-visible,
-.workspace-page textarea:focus-visible { outline: 2px solid rgba(255, 255, 255, 0.6); outline-offset: 2px; }
-.workspace-page label { color: rgba(255, 255, 255, 0.6); font-size: 12px; }
-
-/* ── Player bar: the workspace footer is a Spotify-style now-playing bar.
-   3 zones — status left, transport center, overlay toggle right. ── */
-.workspace-footer.player-bar {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
-  align-items: center;
-  gap: 14px;
-  background: #0a0a0a;
-  border-top: 1px solid rgba(255, 255, 255, 0.12);
-  padding: 12px 16px calc(12px + env(safe-area-inset-bottom, 0px));
-}
-
-.player-bar-left { justify-self: start; }
-
-.player-bar .dashboard-actions.player-bar-center {
-  justify-self: center;
-  display: flex;
-  align-items: center;
-  gap: 10px;
-}
-
-.player-bar-right {
-  justify-self: end;
-  display: inline-flex;
-  align-items: center;
-  gap: 10px;
-}
-
-/* Session transport: the footer echoes the mini-player controller — fully
-   rounded pill actions, Start as the big "play" control. */
-.workspace-footer #start-subtitles {
-  min-height: 46px;
+/* Visually hidden but still announced: used where a heading already carries the
+   words a group needs for its accessible name, so printing them twice would be
+   duplicate copy on screen. */
+.sr-only {
   border: 0;
-  border-radius: 999px;
-  background: #0a84ff;
-  color: #ffffff;
-  padding: 0 26px;
-  font: 700 13.5px/1 var(--ui-font-family);
-}
-.workspace-footer #start-subtitles:disabled { opacity: .45; }
-.workspace-footer #stop-subtitles,
-.workspace-footer #restart-subtitles {
-  min-height: 46px;
-  border: 1px solid rgba(255, 255, 255, 0.22);
-  border-radius: 999px;
-  background: transparent;
-  color: rgba(255, 255, 255, 0.85);
-  padding: 0 20px;
-  font: 600 13px/1 var(--ui-font-family);
-}
-
-/* Records page: panels as cards with clear headers. */
-[data-workspace-page="records"] .workspace-panel {
-  border: 1px solid rgba(255, 255, 255, 0.1);
-  border-radius: 14px;
-  background: rgba(255, 255, 255, 0.028);
-  padding: 18px;
-  margin-bottom: 14px;
-}
-[data-workspace-page="records"] .panel-heading > span { color: #ffffff; font-size: 14px; font-weight: 600; }
-
-/* Model status chips row. */
-.workspace-page .service-strip { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 6px; }
-.workspace-page .service-strip span {
-  display: inline-flex;
-  align-items: center;
-  border: 1px solid rgba(255, 255, 255, 0.18);
-  border-radius: 9999px;
-  padding: 7px 14px;
-  color: rgba(255, 255, 255, 0.72);
-  font-size: 11.5px;
-}
-
-/* ── Monochrome pass (2026-07-23): the workspace is strictly black & white.
- * Blue accents are remapped to white-on-black chips; red stays reserved for
- * errors/record only. ── */
-:root {
-  --cw-blue: #111111;
-  --cw-blue-12: #ffffff;
-}
-.subtitle-app-shell :focus-visible { outline: 2px solid rgba(255, 255, 255, 0.75); outline-offset: 2px; }
-.subtitle-app-shell input[type="range"],
-.subtitle-app-shell input[type="checkbox"],
-.subtitle-app-shell input[type="radio"] { accent-color: #ffffff; }
-.workspace-footer #start-subtitles { background: #ffffff; color: #000000; }
-
-/* The inline caption preview is redundant — captions render on the overlay
- * and on every participant screen. Kept in the DOM for the caption engine. */
-.workspace-page .preview-panel { display: none !important; }
-
-/* Readability bumps for dim helper text. */
-.cfg-heading p { color: rgba(255, 255, 255, 0.62); }
-.language-targets-hint, .placement-hint { color: rgba(255, 255, 255, 0.58); }
-/* The Output Mode card heading was authored with the light-mode ink token
- * (--cw-indigo, near-black), which is invisible on the dark workspace shell.
- * Match the other card headings (#fff) so "PT 출력" is legible. */
-.workspace-page .pt-output-heading h2 { color: #ffffff; }
-
-/* Brand wordmark: one style everywhere (rail reference design). */
-.subtitle-hero-kicker,
-.subtitle-app-rail > strong {
-  color: #ffffff;
-  font-size: 12px;
-  font-weight: 700;
-  letter-spacing: 0.24em;
-  text-transform: uppercase;
-}
-
-/* ── Light theme: monochrome invert of the workspace shell. Media (cover
- * previews, QR imagery) is counter-inverted so photos stay true. ── */
-.workspace-hero-tools {
-  display: flex;
-  flex: 0 0 auto;
-  align-items: center;
-  gap: 12px;
-}
-
-.theme-switch {
-  display: inline-flex;
-  padding: 3px;
-  border: 1px solid rgba(255, 255, 255, 0.24);
-  border-radius: 9999px;
-  background: rgba(255, 255, 255, 0.04);
-}
-
-.theme-switch button {
-  align-items: center;
-  display: inline-flex;
-  justify-content: center;
-  min-height: 28px;
-  min-width: 36px;
+  clip-path: inset(50%);
+  height: 1px;
+  margin: -1px;
+  overflow: hidden;
   padding: 0;
+  position: absolute;
   white-space: nowrap;
-  border: none;
-  border-radius: 9999px;
-  background: transparent;
-  color: rgba(255, 255, 255, 0.62);
-  font: 600 12px/1 var(--ui-font-family);
-  cursor: pointer;
+  width: 1px;
 }
-
-.theme-switch button svg { display: block; }
-
-.theme-switch button.is-active {
-  background: #ffffff;
-  color: #000000;
-}
-body.theme-light .subtitle-app-shell { filter: invert(1) hue-rotate(180deg); }
-body.theme-light .subtitle-app-shell img,
-body.theme-light .subtitle-app-shell video { filter: invert(1) hue-rotate(180deg); }
-/* Fixes after light-theme review: keep status chips outlined (no filled pill
- * whose text vanishes), and pin the toggle's size in the flex rail. */
-.workspace-page .service-strip span,
-.workspace-page .service-strip .status-pill { background: transparent !important; border-color: rgba(255,255,255,.2) !important; color: rgba(255,255,255,.75) !important; }
-
-/* ── Audit fixes (2026-07-23): primary CTA emphasis, WCAG small-text
- * contrast, placeholder color, password reveal, pending states. ── */
-
-button.accent {
-  min-height: 46px;
-  border-color: #ffffff;
-  background: #ffffff;
-  color: #000000;
-  font-weight: 700;
-}
-
-button[aria-busy="true"] { opacity: 0.6; cursor: progress; }
-
-.workspace-page input::placeholder { color: rgba(255, 255, 255, 0.55); }
-
-.live-draft-cover > span { color: rgba(255, 255, 255, 0.62); }
-.command-panel > .live-handoff .live-handoff-kicker,
-.live-handoff-flow { color: rgba(255, 255, 255, 0.62); }
-.live-handoff-copy p,
-.live-handoff-action span,
-.live-draft-cover-status,
-.field-status { color: rgba(255, 255, 255, 0.62); }
-.live-handoff-action span.is-error { color: #ff6b5e; }
-button.secondary { border-color: rgba(255, 255, 255, 0.42); }
 
 /* ── Records calendar ────────────────────────────────────────────────────────
    Outlook-style month/week/day over Live Call meetings, built on the NOVA
@@ -3598,102 +4491,189 @@ button.secondary { border-color: rgba(255, 255, 255, 0.42); }
 #records-page.is-detail-view #session-records-panel,
 #records-page.is-detail-view .history-panel,
 #records-page.is-detail-view #translation-log-panel { display: none; }
-.session-detail-heading { display: flex; align-items: center; gap: 12px; }
-.session-detail-heading > span { color: #ffffff; font-size: 14px; font-weight: 600; }
-.session-detail-heading .session-detail-meta { color: rgba(255, 255, 255, 0.62); font-size: 12px; font-weight: 400; margin-left: auto; }
+
+.session-record-detail-page {
+  display: grid;
+  gap: var(--nova-gap-16);
+}
+
+.session-detail-heading {
+  display: flex;
+  align-items: center;
+  gap: var(--nova-gap-12);
+}
+
+.session-detail-heading > span {
+  color: var(--nova-text);
+  font-size: var(--nova-t5);
+  font-weight: 700;
+  letter-spacing: 0;
+  line-height: var(--nova-t5-lh);
+  text-transform: none;
+}
+
+.session-detail-heading .session-detail-meta {
+  color: var(--nova-text-subtle);
+  font-size: var(--nova-t7);
+  font-weight: 400;
+  letter-spacing: 0;
+  margin-left: auto;
+  text-transform: none;
+}
+
 .session-detail-columns {
   display: grid;
   grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
-  gap: 16px;
-  margin-top: 12px;
+  gap: var(--nova-gap-16);
+  margin-top: 0;
 }
-.session-detail-column { display: grid; gap: 8px; align-content: start; min-width: 0; }
-.session-detail-column h3 { margin: 0; color: #ffffff; font-size: 13px; }
-.session-detail-column .session-record-detail { max-height: min(58vh, 560px); border-top: 0; padding-top: 0; }
+
+.session-detail-column {
+  display: grid;
+  gap: var(--nova-gap-8);
+  align-content: start;
+  min-width: 0;
+}
+
+.session-detail-column h3 {
+  margin: 0;
+  color: var(--nova-text);
+  font-size: var(--nova-t6);
+  font-weight: 600;
+  line-height: var(--nova-t6-lh);
+}
+
+.session-detail-column .session-record-detail {
+  max-height: min(58vh, 560px);
+  border-top: 0;
+  padding-top: 0;
+}
+
 @media (max-width: 900px) {
-  .session-detail-columns { grid-template-columns: 1fr; }
-}
-.session-record-detail { display: grid; gap: 8px; max-height: 320px; padding-top: 10px; border-top: 1px solid rgba(255, 255, 255, 0.12); overflow-y: auto; color: rgba(255, 255, 255, 0.78); font-size: 12.5px; }
-.session-record-detail h3 { margin: 0; color: #ffffff; font-size: 14px; }
-.session-record-detail p, .session-record-detail ul { margin: 0; }
-.session-transcript-lines { display: grid; gap: 6px; margin: 0; padding: 0; list-style: none; }
-.session-transcript-lines li { display: flex; gap: 10px; }
-.session-transcript-lines time { flex: 0 0 auto; color: rgba(255, 255, 255, 0.62); font-variant-numeric: tabular-nums; }
-.session-transcript-speaker { flex: 0 0 auto; color: #ffffff; font-size: 12px; }
-.session-record-audio { display: grid; gap: 6px; }
-.session-record-audio span { color: rgba(255, 255, 255, 0.62); font-size: 11px; }
-.session-record-audio audio { width: 100%; height: 32px; }
-
-.live-web-fallback {
-  display: inline-block;
-  margin-top: 4px;
-  color: rgba(255, 255, 255, 0.62);
-  font-size: 11px;
-  text-decoration: underline;
+  .session-detail-columns { grid-template-columns: minmax(0, 1fr); }
 }
 
-.password-field { position: relative; display: block; }
-.password-field input { width: 100%; padding-right: 64px; }
-.password-reveal {
-  position: absolute;
-  top: 50%;
-  right: 8px;
-  transform: translateY(-50%);
-  min-height: 28px;
-  padding: 0 10px;
-  border: 1px solid rgba(255, 255, 255, 0.42);
-  border-radius: 6px;
-  background: transparent;
-  color: rgba(255, 255, 255, 0.75);
-  font: 600 11px/1 var(--ui-font-family);
-  cursor: pointer;
+.session-record-detail {
+  display: grid;
+  gap: var(--nova-gap-8);
+  max-height: 320px;
+  padding-top: var(--nova-gap-8);
+  border-top: 1px solid var(--nova-hairline);
+  overflow-y: auto;
+  color: var(--nova-text-body);
+  font-size: var(--nova-t7);
+  line-height: var(--nova-lh-body);
 }
+
+.session-record-detail h3 {
+  margin: 0;
+  color: var(--nova-text);
+  font-size: var(--nova-t6);
+}
+
+.session-record-detail p,
+.session-record-detail ul { margin: 0; }
+
+.session-transcript-lines {
+  display: grid;
+  gap: var(--nova-gap-4);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.session-transcript-lines li {
+  display: flex;
+  gap: var(--nova-gap-8);
+  line-height: var(--nova-lh-list);
+}
+
+.session-transcript-lines time {
+  flex: 0 0 auto;
+  color: var(--nova-text-subtle);
+  font-variant-numeric: tabular-nums;
+}
+
+.session-transcript-speaker {
+  flex: 0 0 auto;
+  color: var(--nova-text);
+  font-size: var(--nova-t7);
+  font-weight: 600;
+}
+
+/* Another grid-stretch case: a lone button in a one-column grid fills the
+   column unless it is told to hug its label. */
+.session-detail-column > button {
+  justify-self: start;
+}
+
+.session-record-audio { display: grid; gap: var(--nova-gap-4); }
+.session-record-audio span { color: var(--nova-text-subtle); font-size: var(--nova-t8); }
+
+/* The UA audio widget renders light-on-light without this. */
+.session-record-audio audio {
+  width: 100%;
+  height: 32px;
+  color-scheme: dark;
+}
+
 .controller-go-live { border: 1px solid rgba(255, 255, 255, 0.4) !important; background: #ffffff !important; color: #000000 !important; font-weight: 700 !important; }
 .controller-go-live.is-live { background: transparent !important; color: #ff453a !important; border-color: rgba(255, 69, 58, 0.6) !important; }
 
 /* ── Live Call registered sessions (register now, start later) ───────────── */
-/* Registered sessions: a Spotify-style shelf of upcoming "albums" — cards in a
-   sideways-scrolling row instead of a stacked list. */
+/* A sideways-scrolling shelf of upcoming sessions. Hover changes colour only:
+   the lift this used to have is not motion this system does. */
 .live-registered-list {
   display: flex;
-  gap: 12px;
+  gap: var(--nova-gap-12);
   overflow-x: auto;
-  padding: 4px 2px 8px;
+  padding: 2px 0 var(--nova-gap-8);
   scroll-snap-type: x proximity;
 }
+
 .live-registered-list > p { flex: 1 1 100%; }
+
 .live-registered-item {
   display: grid;
-  gap: 10px;
+  gap: var(--nova-gap-12);
   flex: 0 0 200px;
-  border: 0;
-  border-radius: 12px;
-  background: rgba(255, 255, 255, 0.035);
-  padding: 12px;
+  border: 1px solid var(--nova-hairline);
+  border-radius: var(--nova-r-md);
+  background: var(--nova-surface-raised);
+  padding: var(--nova-gap-16);
   scroll-snap-align: start;
-  transition: background 0.2s ease, transform 0.2s ease;
+  transition: background var(--nova-dur-color) var(--nova-ease-out);
 }
-.live-registered-item:hover { background: rgba(255, 255, 255, 0.08); transform: translateY(-2px); }
+
+.live-registered-item:hover { background: var(--nova-surface-float); }
+
 .live-registered-meta { display: grid; gap: 2px; min-width: 0; }
-.live-registered-meta strong { overflow: hidden; font-size: 13px; text-overflow: ellipsis; white-space: nowrap; }
-.live-registered-meta span { color: rgba(255, 255, 255, 0.55); font-size: 11px; }
+
+.live-registered-meta strong {
+  overflow: hidden;
+  color: var(--nova-text);
+  font-size: var(--nova-t6);
+  font-weight: 600;
+  line-height: var(--nova-lh-list);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.live-registered-meta span {
+  color: var(--nova-text-subtle);
+  font-size: var(--nova-t7);
+  line-height: var(--nova-lh-list);
+}
+
 .live-registered-item button { flex: none; justify-self: start; }
 
-/* Warm empty states: dashed and quiet, not an error-looking box. */
-.workspace-page .empty-state {
-  border: 1px dashed rgba(255, 255, 255, 0.22);
-  border-radius: 12px;
-  background: transparent;
-  color: rgba(255, 255, 255, 0.55);
-  padding: 22px 16px;
-  text-align: center;
-}
-
-/* Shelf headers: section titles read like Spotify row titles. */
+/* Shelf headers: TDS ListHeader medium — t5 bold, no letterspacing hack. */
 [data-workspace-page="records"] .panel-heading > span,
 [data-workspace-page="livecall"] .panel-heading > span {
-  color: #ffffff;
-  font-size: 16px;
+  color: var(--nova-text);
+  font-size: var(--nova-t5);
   font-weight: 700;
-  letter-spacing: -0.2px;
+  letter-spacing: 0;
+  line-height: var(--nova-t5-lh);
+  text-transform: none;
 }
