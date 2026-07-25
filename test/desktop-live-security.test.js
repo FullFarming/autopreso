@@ -287,5 +287,5 @@ test("a malformed settings file is quarantined and boot never rejects silently",
   assert.match(mainSource, /title: "Settings were reset"/u);
   // Last-resort: every other boot failure gets a dialog instead of dying.
   assert.match(mainSource, /app\.whenReady\(\)\.then\(createApp\)\.catch\(/u);
-  assert.match(mainSource, /dialog\.showErrorBox\(\s*\n?\s*"Realtime Noel could not start"/u);
+  assert.match(mainSource, /dialog\.showErrorBox\(\s*\n?\s*"NOVA could not start"/u);
 });

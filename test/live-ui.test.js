@@ -299,7 +299,7 @@ test("host, viewer, and Chrome expose the same approved language set with three-
   assert.match(extensionCss, /font-family: "Pretendard"/);
 });
 
-test("all owned user-visible surfaces use the Realtime Noel product name", async () => {
+test("owned user-visible surfaces carry the current product name", async () => {
   const paths = [
     "public/index.html", "public/app.js", "public/starter-elements.js",
     "public/subtitle.html", "public/subtitle-controller.html", "public/subtitle-overlay.html",
@@ -307,8 +307,12 @@ test("all owned user-visible surfaces use the Realtime Noel product name", async
     "chrome-extension/manifest.json", "chrome-extension/sidepanel.html",
   ];
   const sources = await Promise.all(paths.map(read));
-  assert.match(sources.join("\n"), /Realtime Noel/);
-  assert.doesNotMatch(sources.join("\n"), /Realtime_Noel|AutoPreso|Auto Preso/);
+  const joined = sources.join("\n");
+  // The desktop subtitle product is NOVA. The whiteboard pages (index.html /
+  // app.js) are a separate product and keep their own name, and the webapp is a
+  // separately deployed guest surface -- neither is renamed here.
+  assert.match(joined, /NOVA/);
+  assert.doesNotMatch(joined, /Realtime_Noel|AutoPreso|Auto Preso/);
 });
 
 test("web chrome uses a restrained flat canvas and Pretendard without decorative orb gradients", async () => {
@@ -867,8 +871,11 @@ test("desktop local PT output separates fixed Gemini captions from conditional a
 
   assert.match(html, /class="pt-output-group"/);
   assert.match(html, /name="outputMode"[^>]+value="captions"[^>]+checked/);
-  assert.match(html, /name="outputMode"[^>]+value="captions_audio"/);
   assert.match(html, /name="outputMode"[^>]+value="audio"/);
+  // The desktop PT output is captions OR interpreted audio; the mixed mode is
+  // retired. (The Live Call session mode in webapp/ still has its own values,
+  // constrained by an applied Supabase CHECK -- a separate change.)
+  assert.doesNotMatch(html, /value="captions_audio"/);
   assert.match(html, /name="audioLanguage"/);
   assert.match(html, /name="audioVolume"[^>]+type="range"/);
   assert.match(html, /name="voiceProvider"[^>]+value="gemini"[^>]+checked/);

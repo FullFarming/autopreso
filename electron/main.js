@@ -153,7 +153,7 @@ async function createApp() {
       void dialog.showMessageBox({
         type: "warning",
         title: "Settings were reset",
-        message: "Realtime Noel could not read your settings file, so it started with default settings.",
+        message: "NOVA could not read your settings file, so it started with default settings.",
         detail: `The unreadable file was kept at:\n${quarantinedPath}\n\nRe-enter your API keys and glossary in Settings.`,
         buttons: ["OK"],
         noLink: true,
@@ -248,7 +248,7 @@ async function createDashboardWindow(url) {
     height: 900,
     minWidth: 960,
     minHeight: 680,
-    title: "Realtime Noel Subtitles",
+    title: "NOVA Subtitles",
     webPreferences: {
       contextIsolation: true,
       nodeIntegration: false,
@@ -292,8 +292,8 @@ async function createDashboardWindow(url) {
         // renderer never fires "closed", so nothing else would ever say so.
         try {
           dialog.showErrorBox(
-            "Realtime Noel stopped responding",
-            `The main window could not be restarted (${reason}). Quit and reopen Realtime Noel.`,
+            "NOVA stopped responding",
+            `The main window could not be restarted (${reason}). Quit and reopen NOVA.`,
           );
         } catch { /* dialogs are unavailable in headless test runs */ }
         return;
@@ -307,7 +307,7 @@ async function createDashboardWindow(url) {
       });
       notifyLiveBridgeFailure(
         "Host audio stopped",
-        "The window that captures your microphone stopped responding and could not be restarted, so participants are no longer hearing you. End the Live Call and restart Realtime Noel.",
+        "The window that captures your microphone stopped responding and could not be restarted, so participants are no longer hearing you. End the Live Call and restart NOVA.",
       );
     },
   });
@@ -646,7 +646,7 @@ async function openLiveStageOverlay(baseUrl, sessionId, invite) {
     frame: false,
     autoHideMenuBar: true,
     backgroundColor: "#000000",
-    title: "Realtime Noel Stage",
+    title: "NOVA Stage",
     webPreferences: {
       contextIsolation: true,
       nodeIntegration: false,
@@ -833,7 +833,7 @@ function createControllerWindow(url) {
     alwaysOnTop: true,
     backgroundColor: "#00000000",
     show: false,
-    title: "Realtime Noel Subtitle Controller",
+    title: "NOVA Subtitle Controller",
     webPreferences: {
       contextIsolation: true,
       nodeIntegration: false,
@@ -865,7 +865,7 @@ function createOverlayWindowForDisplay(display) {
     alwaysOnTop: true,
     backgroundColor: "#00000000",
     show: false,
-    title: "Realtime Noel Subtitle Overlay",
+    title: "NOVA Subtitle Overlay",
     webPreferences: {
       contextIsolation: true,
       nodeIntegration: false,
@@ -1046,7 +1046,7 @@ function scheduleLiveGatewayReconnect(armedSession) {
     });
     notifyLiveBridgeFailure(
       "Live Call audio disconnected",
-      `Realtime Noel could not reconnect to the Live Call gateway after ${liveBridgeReconnectAttempts} attempts. Participants are not receiving your audio or captions. End the Live Call and start it again.`,
+      `NOVA could not reconnect to the Live Call gateway after ${liveBridgeReconnectAttempts} attempts. Participants are not receiving your audio or captions. End the Live Call and start it again.`,
     );
     return;
   }
@@ -1868,7 +1868,7 @@ async function ensureMicrophoneAccess() {
     if (status === "denied" || status === "restricted") {
       console.warn(
         `[overlay] microphone access is "${status}". ` +
-        "Enable Realtime Noel under System Settings > Privacy & Security > Microphone, then restart the app.",
+        "Enable NOVA under System Settings > Privacy & Security > Microphone, then restart the app.",
       );
     }
   } catch (error) {
@@ -1900,7 +1900,7 @@ function configureSystemAudioCapture(allowedMediaOrigins) {
       // stream. Log the real cause so the failure is diagnosable, then bail.
       console.warn(
         `[overlay] system audio capture blocked: screen recording permission is "${access}". ` +
-        "Grant Realtime Noel under System Settings > Privacy & Security > Screen & System Audio Recording, then restart.",
+        "Grant NOVA under System Settings > Privacy & Security > Screen & System Audio Recording, then restart.",
       );
       callback({});
       return;
@@ -1978,7 +1978,7 @@ if (singleInstanceLock) {
     console.error(`[boot] startup failed: ${error?.stack ?? error}`);
     try {
       dialog.showErrorBox(
-        "Realtime Noel could not start",
+        "NOVA could not start",
         `${error?.message ?? error}\n\nIf this keeps happening, move ~/.config/${APP_CONFIG_DIR}/settings.json aside and try again.`,
       );
     } catch { /* dialogs are unavailable in headless test runs */ }

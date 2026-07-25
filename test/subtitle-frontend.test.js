@@ -383,8 +383,8 @@ test("subtitle dashboard exposes main controls, Gemma recording, and settings dr
   assert.match(MESSAGES.en["error.micDenied"], /Privacy & Security > Microphone/);
   // The bundle name macOS shows in Privacy & Security must stay literal in
   // both languages, so the instruction matches what the user sees.
-  assert.match(MESSAGES.en["error.micDenied"], /Realtime Noel/);
-  assert.match(MESSAGES.ko["error.micDenied"], /Realtime Noel/);
+  assert.match(MESSAGES.en["error.micDenied"], /NOVA/);
+  assert.match(MESSAGES.ko["error.micDenied"], /NOVA/);
   assert.match(js, /CAPTURE_TIMEOUT_MS = 8000/);
   assert.match(js, /Promise\.allSettled\(tasks\)/);
   assert.match(js, /withMediaCaptureTimeout/);
@@ -404,7 +404,7 @@ test("subtitle dashboard exposes main controls, Gemma recording, and settings dr
   assert.match(js, /formatCaptureFailure/);
   assert.match(js, /t\("error\.systemAudioDenied"\)/);
   assert.match(js, /t\("error\.systemAudioFailed", \{ reason \}\)/);
-  assert.match(MESSAGES.ko["error.systemAudioDenied"], /Realtime Noel의 Screen & System Audio Recording 권한/);
+  assert.match(MESSAGES.ko["error.systemAudioDenied"], /NOVA의 Screen & System Audio Recording 권한/);
   assert.match(MESSAGES.ko["error.systemAudioFailed"], /개발 실행 중이면 Electron 항목도 같은 권한이 필요합니다/);
   assert.match(MESSAGES.en["error.systemAudioFailed"], /Screen & System Audio Recording/);
   assert.match(js, /t\("notice\.partialInputs", \{ failures/);
@@ -503,17 +503,21 @@ test("subtitle dashboard captures audio before opening realtime subtitle session
   assert.match(js, /state\.streams = captures\.map/);
 });
 
-test("captions plus audio remains selected through settings persistence and restores the live preview", async () => {
+test("the interpreted-audio output mode survives settings persistence, and the retired mixed mode is gone", async () => {
   const html = readFileSync(path.join(rootDir, "public", "subtitle.html"), "utf8");
   const js = readFileSync(path.join(rootDir, "public", "subtitle-dashboard.js"), "utf8");
-  assert.match(html, /<input name="outputMode" type="radio" value="captions_audio"/);
+  // Two output modes remain: captions, or interpreted audio. The mixed mode is
+  // retired -- rejected by validateSubtitleSettings and migrated on read.
+  assert.match(html, /<input name="outputMode" type="radio" value="captions"/);
+  assert.match(html, /<input name="outputMode" type="radio" value="audio"/);
+  assert.doesNotMatch(html, /value="captions_audio"/);
 
   const selectedOutputMode = new Function(
     "form",
     extractFunctionBody(js, "function selectedOutputMode()"),
   );
   const form = {
-    querySelector: () => ({ value: "captions_audio" }),
+    querySelector: () => ({ value: "audio" }),
     elements: {
       inputMode: { value: "system_mic" },
       micDeviceId: { value: "" },
@@ -537,7 +541,7 @@ test("captions plus audio remains selected through settings persistence and rest
       verticalOffset: { value: "24" },
     },
   };
-  assert.equal(selectedOutputMode(form), "captions_audio");
+  assert.equal(selectedOutputMode(form), "audio");
 
   const readSettingsFromForm = new Function(
     "form",
@@ -573,7 +577,7 @@ test("captions plus audio remains selected through settings persistence and rest
     () => selectedOutputMode(form),
     () => "gemini",
   );
-  assert.equal(settings.outputMode, "captions_audio");
+  assert.equal(settings.outputMode, "audio");
 
   /** @type {{ url: string, options: { method: string, body: string } } | null} */
   let request = null;
@@ -607,7 +611,7 @@ test("captions plus audio remains selected through settings persistence and rest
   assert.ok(request, "saving settings must issue an HTTP request");
   assert.equal(request.url, "/api/settings");
   assert.equal(request.options.method, "PUT");
-  assert.equal(JSON.parse(request.options.body).subtitle.outputMode, "captions_audio");
+  assert.equal(JSON.parse(request.options.body).subtitle.outputMode, "audio");
 
   const previewPanel = { hidden: false };
   const runtimeState = { running: true, settings: { outputMode: "audio" } };
@@ -620,9 +624,12 @@ test("captions plus audio remains selected through settings persistence and rest
   );
   syncRuntimeOutputVisibility(runtimeState, previewPanel, () => {}, async () => {});
   assert.equal(previewPanel.hidden, true, "audio-only mode hides the subtitle preview");
-  runtimeState.settings.outputMode = "captions_audio";
+  // Switching back to captions restores it. This pair used to be
+  // audio -> captions_audio, which only made sense while one mode emitted both;
+  // captions is now the only mode that produces something to preview.
+  runtimeState.settings.outputMode = "captions";
   syncRuntimeOutputVisibility(runtimeState, previewPanel, () => {}, async () => {});
-  assert.equal(previewPanel.hidden, false, "captions_audio restores the subtitle preview while running");
+  assert.equal(previewPanel.hidden, false, "captions mode shows the subtitle preview while running");
 });
 
 test("subtitle dashboard cannot hang forever while checking audio inputs", () => {
@@ -812,7 +819,7 @@ test("subtitle overlay defaults to the observed two-line rolling-caption layout"
   const css = readFileSync(path.join(rootDir, "public", "subtitle.css"), "utf8");
   const js = readFileSync(path.join(rootDir, "public", "subtitle-overlay.js"), "utf8");
 
-  assert.match(html, /<title>Realtime Noel Subtitle Overlay<\/title>/);
+  assert.match(html, /<title>NOVA Subtitle Overlay<\/title>/);
   // Per-language lanes: three position zones; each language renders its own box.
   assert.match(html, /data-zone="top-center"/);
   assert.match(html, /data-zone="middle-center"/);
@@ -1043,9 +1050,9 @@ test("electron main creates always-on-top click-through overlay", () => {
   assert.match(source, /requestSingleInstanceLock/);
   assert.match(source, /second-instance/);
   assert.match(source, /PREFERRED_PORT = 3210/);
-  assert.match(source, /title: "Realtime Noel Subtitles"/);
-  assert.match(source, /title: "Realtime Noel Subtitle Overlay"/);
-  assert.match(source, /title: "Realtime Noel Subtitle Controller"/);
+  assert.match(source, /title: "NOVA Subtitles"/);
+  assert.match(source, /title: "NOVA Subtitle Overlay"/);
+  assert.match(source, /title: "NOVA Subtitle Controller"/);
   assert.match(source, /createControllerWindow/);
   assert.match(source, /subtitle-controller\.html/);
   assert.match(source, /subtitle-controller:set-visible/);

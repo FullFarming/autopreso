@@ -21,11 +21,11 @@ test("root package keeps platform sidecars as optional published packages, not l
   assert.equal(rootPackage.scripts["dist:mac:x64"], "electron-builder --mac dmg --x64 --publish never");
   assert.equal(rootPackage.scripts["dist:win"], "electron-builder --win portable --x64 --publish never");
   assert.equal(rootPackage.build.appId, "com.realtime-noel.app");
-  assert.equal(rootPackage.build.productName, "Realtime Noel");
+  assert.equal(rootPackage.build.productName, "NOVA");
   assert.equal(rootPackage.build.mac.category, "public.app-category.productivity");
-  assert.match(rootPackage.build.mac.extendInfo.NSAudioCaptureUsageDescription, /Realtime Noel/);
-  assert.match(rootPackage.build.mac.extendInfo.NSMicrophoneUsageDescription, /Realtime Noel/);
-  assert.match(rootPackage.build.mac.extendInfo.NSScreenCaptureUsageDescription, /Realtime Noel/);
+  assert.match(rootPackage.build.mac.extendInfo.NSAudioCaptureUsageDescription, /NOVA/);
+  assert.match(rootPackage.build.mac.extendInfo.NSMicrophoneUsageDescription, /NOVA/);
+  assert.match(rootPackage.build.mac.extendInfo.NSScreenCaptureUsageDescription, /NOVA/);
   assert.equal(rootPackage.build.mac.target[0].target, "dmg");
   assert.equal(rootPackage.build.win.target[0].target, "portable");
   assert.equal(rootPackage.build.portable.artifactName, "${productName}-${version}-win-portable.${ext}");

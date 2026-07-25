@@ -40,7 +40,7 @@ async function readFileOrDirectory(absolutePath) {
   }
 }
 
-test("all current product surfaces use the Realtime Noel display name", async () => {
+test("no product surface carries a retired display name", async () => {
   const files = (await Promise.all(SCANNED_PATHS.map(collectTextFiles))).flat();
   const violations = [];
   for (const file of files) {
@@ -52,11 +52,13 @@ test("all current product surfaces use the Realtime Noel display name", async ()
 
 test("packaging changes the display name without changing compatibility identifiers", async () => {
   const packageJson = JSON.parse(await readFile(path.join(ROOT, "package.json"), "utf8"));
-  assert.equal(packageJson.build.productName, "Realtime Noel");
+  assert.equal(packageJson.build.productName, "NOVA");
   assert.equal(packageJson.name, "realtime-noel");
   assert.equal(packageJson.build.appId, "com.realtime-noel.app");
   for (const message of Object.values(packageJson.build.mac.extendInfo)) {
-    assert.match(message, /Realtime Noel/u);
+    // The OS shows productName in Privacy & Security, so the usage strings
+    // must name the same app or they point at an entry the user cannot find.
+    assert.match(message, /NOVA/u);
     assert.doesNotMatch(message, /Realtime_Noel/u);
   }
 });

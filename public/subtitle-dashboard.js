@@ -731,7 +731,8 @@ function syncDesktopOverlayVisibility(enabled) {
 
 function selectedOutputMode() {
   const value = form.querySelector('input[name="outputMode"]:checked')?.value;
-  return value === "captions_audio" || value === "audio" ? value : "captions";
+  // captions_audio is retired; anything unrecognised falls back to captions.
+  return value === "audio" ? value : "captions";
 }
 
 function enforcePtOutputAvailability() {
@@ -786,7 +787,7 @@ function updatePtOutputControls() {
   if (audioVolumeValue) audioVolumeValue.textContent = `${Math.round(readNumber(form.elements.audioVolume?.value, DEFAULT_SUBTITLE.audioVolume) * 100)}%`;
   startButton.dataset.i18n = outputMode === "audio"
     ? "start.audio"
-    : outputMode === "captions_audio" ? "start.captionsAudio" : "start.captions";
+    : "start.captions";
   startButton.textContent = t(startButton.dataset.i18n);
   void voiceProvider;
 }
@@ -2005,7 +2006,7 @@ function writeSettingsToForm(settings) {
     settings.translationLanguages ?? [settings.languagePair?.a ?? "en", settings.languagePair?.b ?? "ko"],
     settings.audioLanguage ?? DEFAULT_SUBTITLE.audioLanguage,
   );
-  const outputMode = ["captions", "captions_audio", "audio"].includes(settings.outputMode) ? settings.outputMode : DEFAULT_SUBTITLE.outputMode;
+  const outputMode = ["captions", "audio"].includes(settings.outputMode) ? settings.outputMode : DEFAULT_SUBTITLE.outputMode;
   const outputModeInput = form.querySelector(`input[name="outputMode"][value="${outputMode}"]`);
   if (outputModeInput) outputModeInput.checked = true;
   const voiceProvider = settings.voiceProvider === "openai" ? "openai" : "gemini";
@@ -2830,8 +2831,9 @@ function updateOpacityValue(value) {
 
 function formatCaptureFailure(source, error) {
   const isDenied = error?.name === "NotAllowedError" || /permission denied|denied|not allowed/i.test(error?.message || "");
-  // These name "Realtime Noel" on purpose: that is the bundle name macOS shows
-  // in Privacy & Security, so the instruction has to match what the user sees.
+  // These name "NOVA" on purpose: build.productName is NOVA, so that is the
+  // bundle name macOS shows in Privacy & Security and the instruction has to
+  // match what the user actually sees in that list.
   const reason = error?.message || error;
   if (source === "system") {
     return isDenied ? t("error.systemAudioDenied") : t("error.systemAudioFailed", { reason });
