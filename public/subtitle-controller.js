@@ -1,3 +1,11 @@
+import {
+  applyDocumentLanguage,
+  applyTranslations,
+  initLanguage,
+  subscribe as subscribeToLanguage,
+  t,
+} from "./subtitle-i18n.js";
+
 const DEFAULT_SUBTITLE = {
   translationLanguages: ["en", "ko"],
   outputMode: "captions",
@@ -20,6 +28,20 @@ const voiceProviderGroup = document.getElementById("controller-voice-provider");
 const voiceProviderButtons = [...document.querySelectorAll("[data-controller-voice-provider]")];
 let settings = { ...DEFAULT_SUBTITLE };
 let ws = null;
+
+// The dashboard owns the language choice; this window reads the same key and
+// repaints its own labels whenever it changes.
+initLanguage();
+applyDocumentLanguage(document);
+applyTranslations(document);
+window.addEventListener("storage", (event) => {
+  if (event?.key === "realtime-noel-ui-language") initLanguage();
+});
+subscribeToLanguage(() => {
+  applyDocumentLanguage(document);
+  applyTranslations(document);
+  renderSettings();
+});
 
 document.getElementById("controller-restart")?.addEventListener("click", () => sendControl({ command: "restart" }));
 document.getElementById("controller-stop")?.addEventListener("click", () => sendControl({ command: "stop" }));
@@ -129,6 +151,21 @@ function updateOpacityReadout(opacity) {
   if (opacityValue) opacityValue.textContent = `${Math.round(opacity * 100)}%`;
 }
 
+// Status writes go through these two helpers so the data-i18n marker stays in
+// step with the text: keyed messages survive a language switch, one-off
+// interpolated ones do not carry a key.
+function setControllerStatus(key) {
+  if (!liveCallStatus) return;
+  liveCallStatus.dataset.i18n = key;
+  liveCallStatus.textContent = t(key);
+}
+
+function setControllerText(text) {
+  if (!liveCallStatus) return;
+  delete liveCallStatus.dataset.i18n;
+  liveCallStatus.textContent = text;
+}
+
 function isSupportedLanguage(language) {
   return ["en", "ko", "ja"].includes(language);
 }
@@ -172,7 +209,8 @@ if (window.realtimeNoelDesktop?.getLiveCallState && liveCallGroup && goLiveButto
       liveCallGroup.hidden = !state?.armed;
       if (state?.armed) {
         goLiveButton.disabled = Boolean(state.live);
-        goLiveButton.textContent = state.live ? "LIVE" : "Go-Live";
+        goLiveButton.dataset.i18n = state.live ? "controller.live" : "controller.goLive";
+        goLiveButton.textContent = t(goLiveButton.dataset.i18n);
         goLiveButton.classList.toggle("is-live", Boolean(state.live));
         // Host Speak only matters once the call is live and a guest may be
         // holding the speaking floor.
@@ -183,7 +221,7 @@ if (window.realtimeNoelDesktop?.getLiveCallState && liveCallGroup && goLiveButto
       } else {
         if (hostSpeakButton) hostSpeakButton.hidden = true;
         stopLiveElapsed();
-        liveCallStatus.textContent = "Captions ready";
+        setControllerStatus("controller.captionsReady");
       }
     } catch {
       liveCallGroup.hidden = true;
@@ -194,14 +232,12 @@ if (window.realtimeNoelDesktop?.getLiveCallState && liveCallGroup && goLiveButto
     if (!window.realtimeNoelDesktop?.hostSpeak) return;
     hostSpeakButton.disabled = true;
     hostSpeakButton.setAttribute("aria-busy", "true");
-    liveCallStatus.textContent = "Reclaiming the floor…";
+    setControllerStatus("controller.reclaiming");
     try {
       const result = await window.realtimeNoelDesktop.hostSpeak();
-      liveCallStatus.textContent = result?.ok
-        ? "Host has the floor — your microphone is live."
-        : "Could not reclaim the floor. Try again.";
+      setControllerStatus(result?.ok ? "controller.hasFloor" : "controller.reclaimFailed");
     } catch {
-      liveCallStatus.textContent = "Could not reclaim the floor. Try again.";
+      setControllerStatus("controller.reclaimFailed");
     } finally {
       hostSpeakButton.disabled = false;
       hostSpeakButton.removeAttribute("aria-busy");
@@ -209,33 +245,32 @@ if (window.realtimeNoelDesktop?.getLiveCallState && liveCallGroup && goLiveButto
   });
   goLiveButton.addEventListener("click", async () => {
     goLiveButton.disabled = true;
-    liveCallStatus.textContent = "Starting the Live Call…";
+    setControllerStatus("controller.startingLive");
     try {
       const result = await window.realtimeNoelDesktop.goLiveCall();
-      liveCallStatus.textContent = result?.ok
-        ? "LIVE — guests now receive captions."
-        : `Go-Live failed (${result?.code ?? "unknown"}). Try again.`;
+      if (result?.ok) setControllerStatus("controller.liveStarted");
+      else setControllerText(t("controller.goLiveFailedCode", { code: result?.code ?? "unknown" }));
     } catch {
-      liveCallStatus.textContent = "Go-Live failed. Try again.";
+      setControllerStatus("controller.goLiveFailed");
     } finally {
       void syncLiveCall();
     }
   });
   endLiveCallButton.addEventListener("click", async () => {
-    if (!window.confirm("End this Live Call for every participant? This cannot be undone.")) return;
+    if (!window.confirm(t("controller.endConfirm"))) return;
     isEndingLiveCall = true;
     endLiveCallButton.disabled = true;
     endLiveCallButton.setAttribute("aria-busy", "true");
-    liveCallStatus.textContent = "Ending Live Call…";
+    setControllerStatus("controller.ending");
     try {
       const result = await window.realtimeNoelDesktop.endLiveCall();
-      if (result?.ok === false) throw new Error("Live Call could not be ended.");
+      if (result?.ok === false) throw new Error(t("controller.endFailed"));
       liveCallGroup.hidden = true;
-      liveCallStatus.textContent = "";
+      setControllerText("");
       await syncLiveCall();
     } catch {
       liveCallGroup.hidden = false;
-      liveCallStatus.textContent = "Live Call could not be ended. Try again.";
+      setControllerStatus("controller.endFailed");
       endLiveCallButton.disabled = false;
     } finally {
       isEndingLiveCall = false;

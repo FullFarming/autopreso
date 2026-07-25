@@ -3,6 +3,8 @@ import fs from "node:fs";
 import test from "node:test";
 import vm from "node:vm";
 
+import { MESSAGES } from "../public/subtitle-i18n.js";
+
 const mainSource = fs.readFileSync(new URL("../electron/main.js", import.meta.url), "utf8");
 const preloadSource = fs.readFileSync(new URL("../electron/preload.js", import.meta.url), "utf8");
 // public/ is the only copy that exists: it is what src/server.js serves out of
@@ -194,7 +196,9 @@ test("macOS dock activation brings the main window back without disturbing a liv
   assert.doesNotMatch(activateSource, /quit\(|liveCallSession|stopLiveGatewayBridge|\.destroy\(/u);
 });
 
-test("the application menu reaches all three surfaces and ends nothing", () => {
+// The menu labels come from the shared i18n dictionary, so the menu follows the
+// language the renderer picked. The test builds the menu once per language.
+function buildApplicationMenu(language) {
   /** @type {{ role?: string, label?: string, submenu?: { label?: string, accelerator?: string, click?: () => void }[] }[] | null} */
   let template = null;
   const calls = [];
@@ -214,12 +218,21 @@ test("the application menu reaches all three surfaces and ends nothing", () => {
     showControllerWindow: () => { calls.push("show-controller"); return true; },
     showSubtitleOverlays: () => { calls.push("show-overlays"); return true; },
     app: { quit: () => calls.push("QUIT") },
+    // Same lookup the main process uses; the menu is not allowed to hard-code copy.
+    translate: (key) => MESSAGES[language][key],
+    normalizeLanguage: () => language,
+    setLanguage: () => language,
   };
   const installApplicationMenu = vm.runInNewContext(
     `${sourceBetween("function installApplicationMenu", "function destroyOverlayWindow")}; installApplicationMenu`,
     context,
   );
   installApplicationMenu("http://127.0.0.1:3210");
+  return { template, calls };
+}
+
+test("the application menu reaches all three surfaces and ends nothing", () => {
+  const { template, calls } = buildApplicationMenu("en");
   assert.ok(template, "an application menu must be built");
 
   const items = template.flatMap((entry) => entry.submenu ?? []).filter((item) => item.label);
@@ -236,6 +249,19 @@ test("the application menu reaches all three surfaces and ends nothing", () => {
   for (const item of byLabel.values()) item.click();
   assert.deepEqual(calls, ["show-dashboard", "show-controller", "hide-controller", "show-overlays"]);
   assert.equal(calls.includes("QUIT"), false, "no menu item may reach the quit path that ends the Live Call");
+});
+
+test("the application menu follows the UI language the renderer reports", () => {
+  const korean = buildApplicationMenu("ko");
+  const koreanLabels = (korean.template ?? []).flatMap((entry) => entry.submenu ?? []).map((item) => item.label);
+  assert.ok(koreanLabels.includes(MESSAGES.ko["menu.showMainWindow"]));
+  assert.ok(koreanLabels.includes(MESSAGES.ko["menu.showSubtitleOverlays"]));
+  assert.notEqual(MESSAGES.ko["menu.showMainWindow"], MESSAGES.en["menu.showMainWindow"]);
+
+  // The renderer's choice arrives over IPC and rebuilds the menu in place.
+  assert.match(mainSource, /ipcMain\.handle\("app:set-ui-language"/u);
+  assert.match(mainSource, /function applyUiLanguage[\s\S]{0,240}installApplicationMenu\(lastServerUrl\)/u);
+  assert.match(preloadSource, /setUiLanguage: \(language\) => ipcRenderer\.invoke\("app:set-ui-language", language\)/u);
 });
 
 test("every main-window restore path goes through the shared show helper", () => {

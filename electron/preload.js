@@ -30,6 +30,9 @@ contextBridge.exposeInMainWorld("realtimeNoelDesktop", {
   setControllerVisible: (visible) => ipcRenderer.invoke("subtitle-controller:set-visible", Boolean(visible)),
   setOverlayInteractive: (interactive) => ipcRenderer.invoke("subtitle-overlay:set-interactive", Boolean(interactive)),
   showMainWindow: () => ipcRenderer.invoke("app:show-main-window"),
+  // The renderer owns the UI language; the main process needs it for the
+  // application menu labels.
+  setUiLanguage: (language) => ipcRenderer.invoke("app:set-ui-language", language),
   quitApp: () => ipcRenderer.invoke("app:quit"),
   openScreenRecordingSettings: () => ipcRenderer.invoke("system:open-screen-recording-settings"),
 });

@@ -4,12 +4,25 @@
 // presentation glue only — all caption/session logic stays in
 // subtitle-dashboard.js, which binds by element id and keeps working
 // regardless of which page a control lives on.
+//
+// It is also the page's i18n owner: it restores the stored UI language, runs
+// the declarative data-i18n pass, and re-runs it whenever the language changes.
 
-const PAGE_COPY = {
-  captions: { title: "Captions Configuration", subtitle: "Configure how captions are generated and delivered." },
-  livecall: { title: "Live Call", subtitle: "Schedule a host-only live session." },
-  records: { title: "Records", subtitle: "Manage and review your caption records." },
-  settings: { title: "Settings", subtitle: "Manage your audio, translation, and application preferences." },
+import {
+  applyDocumentLanguage,
+  applyTranslations,
+  changeLanguage,
+  getLanguage,
+  initLanguage,
+  subscribe,
+  t,
+} from "./subtitle-i18n.js";
+
+const PAGE_TITLE_KEYS = {
+  captions: "page.captions.title",
+  livecall: "page.livecall.title",
+  records: "page.records.title",
+  settings: "page.settings.title",
 };
 
 const LIVE_DRAFT_STORAGE_KEY = "realtime-noel-live-draft";
@@ -19,11 +32,16 @@ const form = document.getElementById("subtitle-settings");
 const navLinks = document.querySelectorAll("[data-workspace-nav]");
 const pages = document.querySelectorAll("[data-workspace-page]");
 const pageTitle = document.getElementById("workspace-page-title");
-const pageSubtitle = document.getElementById("workspace-page-subtitle");
 const footer = document.querySelector(".workspace-footer");
 
+// Restore the stored choice and paint every static string before anything else
+// reads the DOM.
+initLanguage();
+applyDocumentLanguage(document);
+applyTranslations(document);
+
 function activatePage(page) {
-  if (!PAGE_COPY[page] || !main) return;
+  if (!PAGE_TITLE_KEYS[page] || !main) return;
   main.dataset.activePage = page;
   for (const section of pages) {
     section.classList.toggle("is-active", section.dataset.workspacePage === page);
@@ -36,8 +54,10 @@ function activatePage(page) {
       else link.removeAttribute("aria-current");
     }
   }
-  if (pageTitle) pageTitle.textContent = PAGE_COPY[page].title;
-  if (pageSubtitle) pageSubtitle.textContent = PAGE_COPY[page].subtitle;
+  if (pageTitle) {
+    pageTitle.dataset.i18n = PAGE_TITLE_KEYS[page];
+    pageTitle.textContent = t(PAGE_TITLE_KEYS[page]);
+  }
   // The caption session footer only makes sense on the captions page.
   if (footer) footer.hidden = page !== "captions";
   if (page === "settings") {
@@ -70,7 +90,8 @@ const restartButton = document.getElementById("restart-subtitles");
 function syncOverlayChip() {
   if (!overlayChip) return;
   const isOn = Boolean(overlayCheckbox?.checked);
-  overlayChip.textContent = isOn ? "Active" : "Not Active";
+  overlayChip.dataset.i18n = isOn ? "player.overlayActive" : "player.overlayInactive";
+  overlayChip.textContent = t(overlayChip.dataset.i18n);
   overlayChip.classList.toggle("is-active", isOn);
 }
 overlayCheckbox?.addEventListener("change", syncOverlayChip);
@@ -141,6 +162,7 @@ let liveDraftCoverPreviewUrl = "";
 
 function setCoverStatus(message, isError = false) {
   if (!coverStatus) return;
+  delete coverStatus.dataset.i18n;
   coverStatus.textContent = message;
   coverStatus.classList.toggle("is-error", isError);
 }
@@ -168,14 +190,14 @@ function hasValidCoverImageSignature(bytes, contentType) {
 
 async function serializeCoverImage(file) {
   if (!ALLOWED_COVER_IMAGE_TYPES.has(file.type)) {
-    throw new Error("Choose a JPEG, PNG, or WebP image.");
+    throw new Error(t("live.coverInvalidType"));
   }
   if (file.size <= 0 || file.size > MAX_COVER_IMAGE_BYTES) {
-    throw new Error("The cover image must be no larger than 5MB.");
+    throw new Error(t("live.coverTooLarge"));
   }
   const bytes = new Uint8Array(await file.arrayBuffer());
   if (!hasValidCoverImageSignature(bytes, file.type)) {
-    throw new Error("The selected file does not match its image type.");
+    throw new Error(t("live.coverSignatureMismatch"));
   }
   let binary = "";
   for (let offset = 0; offset < bytes.length; offset += 32_768) {
@@ -189,16 +211,20 @@ async function serializeCoverImage(file) {
   };
 }
 
+function coverSizeSummary(cover) {
+  return `${cover.name} · ${(cover.size / 1024 / 1024).toFixed(1)}MB`;
+}
+
 coverButton?.addEventListener("click", () => coverInput?.click());
 coverInput?.addEventListener("change", async () => {
   const file = coverInput.files?.[0];
   liveDraftCoverData = null;
   if (!file) {
-    setCoverStatus("No image selected.");
+    setCoverStatus(t("live.coverNone"));
     if (coverPreview) coverPreview.hidden = true;
     return;
   }
-  setCoverStatus("Preparing image…");
+  setCoverStatus(t("live.coverPreparing"));
   try {
     const serialized = await serializeCoverImage(file);
     if (coverInput.files?.[0] !== file) return;
@@ -207,13 +233,13 @@ coverInput?.addEventListener("change", async () => {
     liveDraftCoverPreviewUrl = URL.createObjectURL(file);
     if (coverPreview) {
       coverPreview.src = liveDraftCoverPreviewUrl;
-      coverPreview.alt = `Selected cover: ${serialized.name}`;
+      coverPreview.alt = t("live.coverSelected", { name: serialized.name });
       coverPreview.hidden = false;
     }
-    setCoverStatus(`${serialized.name} · ${(serialized.size / 1024 / 1024).toFixed(1)}MB`);
+    setCoverStatus(coverSizeSummary(serialized));
   } catch (error) {
     if (coverPreview) coverPreview.hidden = true;
-    setCoverStatus(error instanceof Error ? error.message : "Could not prepare the cover image.", true);
+    setCoverStatus(error instanceof Error ? error.message : t("live.coverFailed"), true);
   }
 });
 
@@ -249,6 +275,12 @@ syncLiveDraftLanguages();
 const startLiveCallButton = document.getElementById("schedule-live-call");
 const liveWorkspaceStatus = document.getElementById("live-workspace-status");
 
+function setLiveStatus(message) {
+  if (!liveWorkspaceStatus) return;
+  delete liveWorkspaceStatus.dataset.i18n;
+  liveWorkspaceStatus.textContent = message;
+}
+
 function liveDraftScheduledAt() {
   const date = fieldValue("liveDraftDate");
   if (!date) return null;
@@ -265,17 +297,17 @@ let pendingLiveCallRetry = false;
 startLiveCallButton?.addEventListener("click", async () => {
   const bridge = window.realtimeNoelDesktop;
   if (!bridge?.startLiveCall) {
-    if (liveWorkspaceStatus) liveWorkspaceStatus.textContent = "Live Call is available in the desktop app only.";
+    setLiveStatus(t("live.desktopOnly"));
     return;
   }
   startLiveCallButton.disabled = true;
   startLiveCallButton.setAttribute("aria-busy", "true");
-  if (liveWorkspaceStatus) liveWorkspaceStatus.textContent = "Creating the live session…";
+  setLiveStatus(t("live.creating"));
   const selectedCover = coverInput?.files?.[0];
   try {
     if (selectedCover && !liveDraftCoverData) {
       liveDraftCoverData = await serializeCoverImage(selectedCover);
-      setCoverStatus(`${liveDraftCoverData.name} · ${(liveDraftCoverData.size / 1024 / 1024).toFixed(1)}MB`);
+      setCoverStatus(coverSizeSummary(liveDraftCoverData));
     }
     const draft = {
       title: fieldValue("liveDraftTitle"),
@@ -287,12 +319,13 @@ startLiveCallButton?.addEventListener("click", async () => {
     const result = await bridge.startLiveCall(draft);
     if (result?.code === "HOST_LOGIN_REQUIRED" || result?.code === "HOST_LOGIN_REJECTED") {
       const authorizationMessage = result.code === "HOST_LOGIN_REJECTED"
-        ? "The workspace rejected the saved host ID/password. Update them in Settings to the host account the workspace accepts."
-        : "Host authorization is required. Open Settings and save the host authorization.";
+        ? t("live.hostLoginRejected")
+        : t("live.hostLoginRequired");
       pendingLiveCallRetry = true;
-      if (liveWorkspaceStatus) liveWorkspaceStatus.textContent = authorizationMessage;
+      setLiveStatus(authorizationMessage);
       if (hostLoginSection) hostLoginSection.hidden = false;
       if (hostLoginStatus) {
+        delete hostLoginStatus.dataset.i18n;
         hostLoginStatus.textContent = authorizationMessage;
         hostLoginStatus.classList.add("is-error");
       }
@@ -302,15 +335,12 @@ startLiveCallButton?.addEventListener("click", async () => {
       return;
     }
     if (result?.ok) pendingLiveCallRetry = false;
-    if (liveWorkspaceStatus) {
-      liveWorkspaceStatus.textContent = result?.ok
-        ? `Stage overlay is up — access code ${result.admissionCode ?? "?"}. Press Go-Live on the controller to begin.`
-        : LIVE_CALL_START_MESSAGES[result?.code]
-          ?? `Could not start Live Call. Please try again. (code: ${result?.code ?? "unknown"})`;
-    }
+    setLiveStatus(result?.ok
+      ? t("live.stageUp", { code: result.admissionCode ?? "?" })
+      : liveCallFailureMessage(result?.code, "live.startFailed"));
   } catch (error) {
-    const message = error instanceof Error ? error.message : "Could not start Live Call.";
-    if (liveWorkspaceStatus) liveWorkspaceStatus.textContent = message;
+    const message = error instanceof Error ? error.message : t("live.startFailedPlain");
+    setLiveStatus(message);
     if (selectedCover) setCoverStatus(message, true);
   } finally {
     startLiveCallButton.disabled = false;
@@ -320,20 +350,25 @@ startLiveCallButton?.addEventListener("click", async () => {
 
 // Human-readable start failures; unknown codes fall back to a generic retry
 // message so raw machine codes never reach the status line.
-const LIVE_CALL_START_MESSAGES = {
-  HTTP_400: "The workspace rejected the session settings — the app and server versions may be out of sync. Update the app and try again.",
-  LIVE_CALL_DISABLED: "Live Call is turned off in this build.",
-  LIVE_CALL_ALREADY_ARMED: "A Live Call stage is already open. End it from the controller first.",
-  LIVE_CALL_START_IN_PROGRESS: "The stage is already being created — one moment.",
-  NETWORK_UNAVAILABLE: "The workspace could not be reached. Check the network and try again.",
-  LOGIN_RATE_LIMITED: "The workspace is rate-limiting sign-ins. Wait a minute and try again.",
-  INVALID_COVER_IMAGE: "The cover image could not be used. Choose a JPEG, PNG, or WebP under 5MB.",
-  COVER_UPLOAD_FAILED: "The cover image upload failed. Try again or start without a cover.",
-  INVITE_CREATE_FAILED: "The invite could not be created. Try again.",
-  STAGE_OPEN_FAILED: "The stage window could not be opened. Try again.",
-  SESSION_NOT_PREPARING: "That registered session has already started or ended. Refresh the list.",
-  INVALID_SESSION_ID: "The registered session could not be identified. Refresh the list.",
-};
+const LIVE_CALL_FAILURE_CODES = new Set([
+  "HTTP_400",
+  "LIVE_CALL_DISABLED",
+  "LIVE_CALL_ALREADY_ARMED",
+  "LIVE_CALL_START_IN_PROGRESS",
+  "NETWORK_UNAVAILABLE",
+  "LOGIN_RATE_LIMITED",
+  "INVALID_COVER_IMAGE",
+  "COVER_UPLOAD_FAILED",
+  "INVITE_CREATE_FAILED",
+  "STAGE_OPEN_FAILED",
+  "SESSION_NOT_PREPARING",
+  "INVALID_SESSION_ID",
+]);
+
+function liveCallFailureMessage(code, fallbackKey) {
+  if (LIVE_CALL_FAILURE_CODES.has(code)) return t(`live.err.${code}`);
+  return t(fallbackKey, { code: code ?? "unknown" });
+}
 
 // ── Pre-registered sessions: register now, start later with the SAME saved
 // title, cover image, and schedule. List renders with replaceChildren (no
@@ -347,7 +382,7 @@ async function collectLiveDraft() {
   const selectedCover = coverInput?.files?.[0];
   if (selectedCover && !liveDraftCoverData) {
     liveDraftCoverData = await serializeCoverImage(selectedCover);
-    setCoverStatus(`${liveDraftCoverData.name} · ${(liveDraftCoverData.size / 1024 / 1024).toFixed(1)}MB`);
+    setCoverStatus(coverSizeSummary(liveDraftCoverData));
   }
   return {
     title: fieldValue("liveDraftTitle"),
@@ -359,15 +394,18 @@ async function collectLiveDraft() {
 }
 
 function formatRegisteredSchedule(scheduledAt) {
-  if (!scheduledAt) return "바로 시작 가능";
+  if (!scheduledAt) return t("live.registeredStartNow");
   const stamp = Date.parse(scheduledAt);
-  if (!Number.isFinite(stamp)) return "바로 시작 가능";
+  if (!Number.isFinite(stamp)) return t("live.registeredStartNow");
   const at = new Date(stamp);
   const pad = (value) => String(value).padStart(2, "0");
   return `${at.getFullYear()}-${pad(at.getMonth() + 1)}-${pad(at.getDate())} ${pad(at.getHours())}:${pad(at.getMinutes())}`;
 }
 
+let registeredSessionsSnapshot = { sessions: [], statusText: "" };
+
 function renderRegisteredSessions(sessions, statusText = "") {
+  registeredSessionsSnapshot = { sessions, statusText };
   if (!registeredSessionList) return;
   const rows = [];
   if (statusText) {
@@ -382,14 +420,14 @@ function renderRegisteredSessions(sessions, statusText = "") {
     const meta = document.createElement("div");
     meta.className = "live-registered-meta";
     const title = document.createElement("strong");
-    title.textContent = session.title || "(제목 없음)";
+    title.textContent = session.title || t("live.registeredNoTitle");
     const schedule = document.createElement("span");
     schedule.textContent = formatRegisteredSchedule(session.scheduledAt);
     meta.append(title, schedule);
     const startButton = document.createElement("button");
     startButton.type = "button";
     startButton.className = "accent compact";
-    startButton.textContent = "불러와서 시작";
+    startButton.textContent = t("live.registeredStart");
     startButton.addEventListener("click", () => { void startRegisteredSession(session.id, startButton); });
     row.append(meta, startButton);
     rows.push(row);
@@ -400,17 +438,17 @@ function renderRegisteredSessions(sessions, statusText = "") {
 async function refreshRegisteredSessions({ quiet = false } = {}) {
   const bridge = window.realtimeNoelDesktop;
   if (!bridge?.listRegisteredLiveCalls || !registeredSessionList) return;
-  if (!quiet) renderRegisteredSessions([], "등록된 세션을 불러오는 중…");
+  if (!quiet) renderRegisteredSessions([], t("live.loadingRegistered"));
   try {
     const result = await bridge.listRegisteredLiveCalls();
     if (!result?.ok) {
-      renderRegisteredSessions([], LIVE_CALL_START_MESSAGES[result?.code] ?? "등록된 세션을 불러오지 못했습니다.");
+      renderRegisteredSessions([], liveCallFailureMessage(result?.code, "live.registeredLoadFailed"));
       return;
     }
     const sessions = Array.isArray(result.sessions) ? result.sessions : [];
-    renderRegisteredSessions(sessions, sessions.length ? "" : "등록된 세션이 없습니다. Register for Later로 세션을 등록해 두세요.");
+    renderRegisteredSessions(sessions, sessions.length ? "" : t("live.registeredEmpty"));
   } catch {
-    renderRegisteredSessions([], "등록된 세션을 불러오지 못했습니다.");
+    renderRegisteredSessions([], t("live.registeredLoadFailed"));
   }
 }
 
@@ -419,15 +457,12 @@ async function startRegisteredSession(sessionId, button) {
   if (!bridge?.startRegisteredLiveCall) return;
   button.disabled = true;
   button.setAttribute("aria-busy", "true");
-  if (liveWorkspaceStatus) liveWorkspaceStatus.textContent = "등록된 세션을 불러오는 중…";
+  setLiveStatus(t("live.loadingRegistered"));
   try {
     const result = await bridge.startRegisteredLiveCall(sessionId);
-    if (liveWorkspaceStatus) {
-      liveWorkspaceStatus.textContent = result?.ok
-        ? `Stage overlay is up — access code ${result.admissionCode ?? "?"}. Press Go-Live on the controller to begin.`
-        : LIVE_CALL_START_MESSAGES[result?.code]
-          ?? `등록된 세션을 시작하지 못했습니다. (code: ${result?.code ?? "unknown"})`;
-    }
+    setLiveStatus(result?.ok
+      ? t("live.stageUp", { code: result.admissionCode ?? "?" })
+      : liveCallFailureMessage(result?.code, "live.registeredStartFailed"));
     if (result?.ok) void refreshRegisteredSessions({ quiet: true });
   } finally {
     button.disabled = false;
@@ -438,24 +473,21 @@ async function startRegisteredSession(sessionId, button) {
 registerLiveCallButton?.addEventListener("click", async () => {
   const bridge = window.realtimeNoelDesktop;
   if (!bridge?.registerLiveCall) {
-    if (liveWorkspaceStatus) liveWorkspaceStatus.textContent = "Live Call is available in the desktop app only.";
+    setLiveStatus(t("live.desktopOnly"));
     return;
   }
   registerLiveCallButton.disabled = true;
   registerLiveCallButton.setAttribute("aria-busy", "true");
-  if (liveWorkspaceStatus) liveWorkspaceStatus.textContent = "세션을 등록하는 중…";
+  setLiveStatus(t("live.registering"));
   try {
     const draft = await collectLiveDraft();
     const result = await bridge.registerLiveCall(draft);
-    if (liveWorkspaceStatus) {
-      liveWorkspaceStatus.textContent = result?.ok
-        ? `세션이 등록되었습니다 — ${result.title || "(제목 없음)"}. 아래 목록에서 언제든 불러와 시작할 수 있습니다.`
-        : LIVE_CALL_START_MESSAGES[result?.code]
-          ?? `세션을 등록하지 못했습니다. (code: ${result?.code ?? "unknown"})`;
-    }
+    setLiveStatus(result?.ok
+      ? t("live.registered.ok", { title: result.title || t("live.registeredNoTitle") })
+      : liveCallFailureMessage(result?.code, "live.registerFailed"));
     if (result?.ok) void refreshRegisteredSessions({ quiet: true });
   } catch (error) {
-    if (liveWorkspaceStatus) liveWorkspaceStatus.textContent = error instanceof Error ? error.message : "세션을 등록하지 못했습니다.";
+    setLiveStatus(error instanceof Error ? error.message : t("live.registerFailedPlain"));
   } finally {
     registerLiveCallButton.disabled = false;
     registerLiveCallButton.removeAttribute("aria-busy");
@@ -472,41 +504,67 @@ if (window.realtimeNoelDesktop?.listRegisteredLiveCalls) void refreshRegisteredS
 const hostLoginSection = document.getElementById("live-host-login-section");
 const hostLoginStatus = document.getElementById("live-host-login-status");
 
+function setHostLoginStatus(message, isError) {
+  if (!hostLoginStatus) return;
+  delete hostLoginStatus.dataset.i18n;
+  hostLoginStatus.textContent = message;
+  hostLoginStatus.classList.toggle("is-error", Boolean(isError));
+}
+
+// Section ordinals are generated, not written into the markup: the host-login
+// section is hidden unless the desktop bridge is present, and hard-coded numbers
+// made Settings read "1, 3" with a hole where section 2 used to be.
+function renumberConfigSections() {
+  for (const page of document.querySelectorAll("[data-workspace-page]")) {
+    let ordinal = 0;
+    for (const marker of page.querySelectorAll("[data-cfg-ordinal]")) {
+      const section = marker.closest("section");
+      if (section?.hidden) {
+        marker.textContent = "";
+        continue;
+      }
+      ordinal += 1;
+      marker.textContent = String(ordinal);
+    }
+  }
+}
+
+renumberConfigSections();
+
 async function refreshHostLoginStatus() {
   const bridge = window.realtimeNoelDesktop;
   if (!bridge?.getLiveHostLoginStatus || !hostLoginSection) return;
   hostLoginSection.hidden = false;
+  // Revealing a section shifts every ordinal after it.
+  renumberConfigSections();
   try {
     const status = await bridge.getLiveHostLoginStatus();
     if (!status?.ok) return;
     if (form?.elements?.liveHostId && !form.elements.liveHostId.value) form.elements.liveHostId.value = status.hostId;
     if (form?.elements?.liveHostName && !form.elements.liveHostName.value) form.elements.liveHostName.value = status.hostName;
-    if (hostLoginStatus) {
-      hostLoginStatus.textContent = status.hasLogin ? "Authorized — Start Live Call can create the stage." : "Authorization required";
-      hostLoginStatus.classList.toggle("is-error", !status.hasLogin);
-    }
+    setHostLoginStatus(status.hasLogin ? t("settings.authorized") : t("settings.authorizationRequired"), !status.hasLogin);
   } catch {
     // Bridge unavailable: leave the section as-is.
   }
 }
 
-const HOST_LOGIN_VERIFICATION_MESSAGES = {
-  HOST_LOGIN_REJECTED: "Saved, but the workspace rejected this ID/password. Enter the host account the workspace accepts, then save again.",
-  NETWORK_UNAVAILABLE: "Saved, but the workspace could not be reached. Check the network, then save again to re-verify.",
-  LOGIN_RATE_LIMITED: "Saved, but the workspace is rate-limiting sign-ins. Wait a minute, then save again to re-verify.",
-  NO_STORED_LOGIN: "Authorization required — enter both the host ID and password.",
+const HOST_LOGIN_VERIFICATION_KEYS = {
+  HOST_LOGIN_REJECTED: "settings.hostRejected",
+  NETWORK_UNAVAILABLE: "settings.hostNetworkUnavailable",
+  LOGIN_RATE_LIMITED: "settings.hostRateLimited",
+  NO_STORED_LOGIN: "settings.hostNoStoredLogin",
 };
 
 function hostLoginSaveResultMessage(result) {
   if (!result?.ok) {
     return result?.code === "HOST_CREDENTIAL_ENCRYPTION_UNAVAILABLE"
-      ? "This device cannot encrypt the password (OS keychain unavailable). Unlock it and try again."
-      : "Could not save the host authorization.";
+      ? t("settings.hostKeychainUnavailable")
+      : t("settings.hostSaveFailed");
   }
-  if (!result.hasLogin) return HOST_LOGIN_VERIFICATION_MESSAGES.NO_STORED_LOGIN;
-  if (result.verified) return "Authorized — the workspace accepted the sign-in. Start Live Call opens the QR stage directly.";
-  return HOST_LOGIN_VERIFICATION_MESSAGES[result.verificationCode]
-    ?? `Saved, but the workspace sign-in failed (${result.verificationCode ?? "unknown"}).`;
+  if (!result.hasLogin) return t(HOST_LOGIN_VERIFICATION_KEYS.NO_STORED_LOGIN);
+  if (result.verified) return t("settings.authorizedVerified");
+  const key = HOST_LOGIN_VERIFICATION_KEYS[result.verificationCode];
+  return key ? t(key) : t("settings.hostVerifyFailed", { code: result.verificationCode ?? "unknown" });
 }
 
 const saveHostLoginButton = document.getElementById("save-live-host-login");
@@ -515,10 +573,7 @@ saveHostLoginButton?.addEventListener("click", async () => {
   if (!bridge?.saveLiveHostLogin) return;
   saveHostLoginButton.disabled = true;
   saveHostLoginButton.setAttribute("aria-busy", "true");
-  if (hostLoginStatus) {
-    hostLoginStatus.textContent = "Saving and verifying host authorization…";
-    hostLoginStatus.classList.remove("is-error");
-  }
+  setHostLoginStatus(t("settings.savingHostAuthorization"), false);
   try {
     const result = await bridge.saveLiveHostLogin({
       hostId: fieldValue("liveHostId"),
@@ -527,23 +582,17 @@ saveHostLoginButton?.addEventListener("click", async () => {
     });
     if (form?.elements?.liveHostPassword) form.elements.liveHostPassword.value = "";
     const isVerified = Boolean(result?.ok && result.hasLogin && result.verified);
-    if (hostLoginStatus) {
-      hostLoginStatus.textContent = hostLoginSaveResultMessage(result);
-      hostLoginStatus.classList.toggle("is-error", !isVerified);
-    }
+    setHostLoginStatus(hostLoginSaveResultMessage(result), !isVerified);
     // The host came here from a failed Start Live Call: finish their errand
     // for them — go back to the Live Call page and retry automatically.
     if (isVerified && pendingLiveCallRetry) {
       pendingLiveCallRetry = false;
       activatePage("livecall");
-      if (liveWorkspaceStatus) liveWorkspaceStatus.textContent = "Host sign-in verified — retrying Start Live Call…";
+      setLiveStatus(t("live.hostVerifiedRetry"));
       startLiveCallButton?.click();
     }
   } catch {
-    if (hostLoginStatus) {
-      hostLoginStatus.textContent = "Could not save the host authorization.";
-      hostLoginStatus.classList.add("is-error");
-    }
+    setHostLoginStatus(t("settings.hostSaveFailed"), true);
   } finally {
     saveHostLoginButton.disabled = false;
     saveHostLoginButton.removeAttribute("aria-busy");
@@ -574,6 +623,50 @@ themeSwitch?.addEventListener("click", (event) => {
 });
 try { applyTheme(localStorage.getItem(THEME_STORAGE_KEY) === "light" ? "light" : "dark"); } catch { applyTheme("dark"); }
 
+// ── App language: same switch component as the theme control, sitting next to
+// it. The renderer owns the setting; the main process is told over IPC so the
+// application menu follows. ────────────────────────────────────────────────
+
+const languageSwitch = document.getElementById("workspace-language-toggle");
+
+function syncLanguageSwitch() {
+  const current = getLanguage();
+  languageSwitch?.querySelectorAll("[data-language-choice]").forEach((button) => {
+    const isActive = button.dataset.languageChoice === current;
+    button.classList.toggle("is-active", isActive);
+    button.setAttribute("aria-pressed", String(isActive));
+  });
+}
+
+function publishLanguageToMainProcess() {
+  const setter = window.realtimeNoelDesktop?.setUiLanguage;
+  if (typeof setter !== "function") return;
+  try {
+    void Promise.resolve(setter(getLanguage())).catch(() => {});
+  } catch {
+    // The bridge is optional (browser preview).
+  }
+}
+
+languageSwitch?.addEventListener("click", (event) => {
+  const choice = event.target?.closest?.("[data-language-choice]")?.dataset?.languageChoice;
+  if (!choice) return;
+  changeLanguage(choice);
+});
+
+subscribe(() => {
+  applyDocumentLanguage(document);
+  applyTranslations(document);
+  syncLanguageSwitch();
+  syncOverlayChip();
+  syncLiveDraftLanguages();
+  renderRegisteredSessions(registeredSessionsSnapshot.sessions, registeredSessionsSnapshot.statusText);
+  activatePage(main?.dataset.activePage ?? "captions");
+  publishLanguageToMainProcess();
+});
+syncLanguageSwitch();
+publishLanguageToMainProcess();
+
 // ── Password reveal: host sign-in password visibility toggle ───────────────
 
 const hostPasswordReveal = document.getElementById("live-host-password-reveal");
@@ -582,9 +675,11 @@ hostPasswordReveal?.addEventListener("click", () => {
   if (!field) return;
   const reveal = field.type === "password";
   field.type = reveal ? "text" : "password";
-  hostPasswordReveal.textContent = reveal ? "숨김" : "표시";
+  hostPasswordReveal.dataset.i18n = reveal ? "settings.hide" : "settings.reveal";
+  hostPasswordReveal.dataset.i18nAria = reveal ? "settings.hideLabel" : "settings.revealLabel";
+  hostPasswordReveal.textContent = t(hostPasswordReveal.dataset.i18n);
   hostPasswordReveal.setAttribute("aria-pressed", String(reveal));
-  hostPasswordReveal.setAttribute("aria-label", reveal ? "비밀번호 숨김" : "비밀번호 표시");
+  hostPasswordReveal.setAttribute("aria-label", t(hostPasswordReveal.dataset.i18nAria));
 });
 
 activatePage("captions");

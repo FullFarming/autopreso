@@ -3,6 +3,18 @@ import { readFileSync } from "node:fs";
 import path from "node:path";
 import { test } from "node:test";
 
+import { MESSAGES } from "../public/subtitle-i18n.js";
+
+// UI copy lives in the i18n dictionary now: surfaces carry the KEY and the copy
+// must resolve in both languages (test/ui-i18n.test.js proves key parity).
+/** @param {string} key @param {{ en?: RegExp, ko?: RegExp }} [patterns] */
+function assertLocalized(key, patterns = {}) {
+  assert.equal(typeof MESSAGES.en[key], "string", `missing en copy for ${key}`);
+  assert.equal(typeof MESSAGES.ko[key], "string", `missing ko copy for ${key}`);
+  if (patterns.en) assert.match(MESSAGES.en[key], patterns.en);
+  if (patterns.ko) assert.match(MESSAGES.ko[key], patterns.ko);
+}
+
 const rootDir = path.join(import.meta.dirname, "..");
 
 function extractFunctionBody(source, signature) {
@@ -33,7 +45,7 @@ test("subtitle dashboard exposes main controls, Gemma recording, and settings dr
   const controllerHtml = readFileSync(path.join(rootDir, "public", "subtitle-controller.html"), "utf8");
   const controllerJs = readFileSync(path.join(rootDir, "public", "subtitle-controller.js"), "utf8");
 
-  assert.match(html, /<title>Realtime Noel Subtitles<\/title>/);
+  assert.match(html, /<title>NOVA<\/title>/);
   assert.match(html, /value="system_mic"/);
   assert.match(html, /name="openaiKey"/);
   assert.match(html, /name="openaiSecondaryKey"/);
@@ -51,7 +63,8 @@ test("subtitle dashboard exposes main controls, Gemma recording, and settings dr
   assert.match(js, /language-search-input/);
   assert.match(js, /language-suggestions/);
   assert.match(js, /language-chip-remove/);
-  assert.match(js, /언어 검색/);
+  assert.match(js, /t\("language\.searchPlaceholder"\)/);
+  assertLocalized("language.searchPlaceholder", { ko: /언어 검색/ });
   // Source ("원문") display was removed — no toggle, always translation-only.
   assert.doesNotMatch(html, /name="showSourceText"/);
   assert.doesNotMatch(html, /원문 같이 표시/);
@@ -67,7 +80,8 @@ test("subtitle dashboard exposes main controls, Gemma recording, and settings dr
   // languagePair is derived from the selected target languages (the model
   // auto-detects the spoken source), not from removed A/B selects.
   assert.match(js, /deriveLanguagePairFromTargets/);
-  assert.match(html, /Gemma local via Ollama/);
+  assert.match(html, /value="ollama" data-i18n="settings\.topicOllama"/);
+  assertLocalized("settings.topicOllama", { en: /Gemma local via Ollama/ });
   assert.match(html, /name="recordProvider"/);
   // Translation tone (register) selector — natural vs business.
   assert.match(html, /name="tone"/);
@@ -99,17 +113,23 @@ test("subtitle dashboard exposes main controls, Gemma recording, and settings dr
   // The desktop creates Live Call directly. It must never expose a web-login
   // launcher, and every session always creates both admission methods.
   assert.doesNotMatch(html, /id="open-meeting-mode"|data-open-live-workspace|name="liveHostWorkspaceUrl"|>Open Live Call</);
-  assert.match(html, /QR and a 6-digit access code are always created together/);
+  // The explanatory QR/code paragraph was deleted with the rest of the
+  // descriptive prose; both admission methods are still always created.
+  assert.doesNotMatch(html, /QR and a 6-digit access code are always created together|live-draft-access-note/);
   assert.doesNotMatch(html, /name="liveDraftAccess"|QR 무코드 \+ 코드 링크|코드 필수/);
   assert.match(workspaceJs, /coverImage: liveDraftCoverData/);
   assert.match(workspaceJs, /contentType: file\.type/);
   assert.match(workspaceJs, /base64: window\.btoa\(binary\)/);
-  assert.match(workspaceJs, /Open Settings and save the host authorization/);
+  assert.match(workspaceJs, /t\("live\.hostLoginRequired"\)/);
+  assertLocalized("live.hostLoginRequired", { en: /Open Settings and save the host authorization/ });
   assert.doesNotMatch(workspaceJs, /Sign in once in the Live workspace window|login page|login screen/i);
   assert.match(html, /id="pt-voice-method-title"/);
-  assert.match(html, /Gemini 음성/);
+  assert.match(html, /data-i18n="output\.geminiVoice"/);
+  assertLocalized("output.geminiVoice", { ko: /Gemini 음성/ });
   assert.match(html, /OpenAI Realtime/);
-  assert.match(html, /자막 엔진은 Gemini 고정/);
+  // The Gemini-fixed explanation sentence was deleted; the fact remains as a
+  // compact label + value note.
+  assert.doesNotMatch(html, /자막 엔진은 Gemini 고정이며|pt-voice-method-help/);
   assert.doesNotMatch(html, /name="voiceEngine"/);
   // Built-in industry glossary presets: one click fills glossary + domain +
   // language pair for a prepared meeting type.
@@ -154,11 +174,12 @@ test("subtitle dashboard exposes main controls, Gemma recording, and settings dr
   assert.match(html, /name="translationProvider"/);
   assert.match(html, /value="gemini"/);
   assert.doesNotMatch(html, /<select name="translationProvider">/);
-  assert.match(html, /자막 엔진/);
-  assert.match(html, /Gemini 고정/);
+  assert.match(html, /data-i18n="output\.engineNote"/);
+  assertLocalized("output.engineNote", { ko: /자막 엔진/ });
+  assertLocalized("output.engineNoteValue", { ko: /Gemini 고정/ });
   assert.match(js, /translationProvider: "gemini"/);
   // Gemini API key entry with its own save button and status badge.
-  assert.match(html, /<details class="settings-drawer">\s*<summary>Settings<\/summary>/);
+  assert.match(html, /<details class="settings-drawer">\s*<summary data-i18n="settings\.drawerAdvanced">/);
   assert.doesNotMatch(html, /<details class="settings-drawer"[^>]*\sopen(?:\s|>)/);
   assert.match(html, /name="geminiKey"/);
   assert.match(html, /id="save-gemini-key"/);
@@ -183,8 +204,9 @@ test("subtitle dashboard exposes main controls, Gemma recording, and settings dr
   assert.match(js, /AUDIO_PROCESSOR_BUFFER_SIZE = 1024/);
   // Key registration must be explicit for BOTH providers: a clear
   // registered/unregistered badge, not a vague placeholder.
-  assert.match(js, /✓ 등록됨/);
-  assert.match(js, /미등록/);
+  assert.match(js, /"key\.registered" : "key\.unregistered"/);
+  assertLocalized("key.registered", { ko: /✓ 등록됨/ });
+  assertLocalized("key.unregistered", { ko: /미등록/ });
   assert.match(html, /name="ollamaModel"/);
   assert.match(html, /name="ollamaBaseURL"/);
   assert.match(html, /name="maxSubtitleLines"/);
@@ -196,12 +218,15 @@ test("subtitle dashboard exposes main controls, Gemma recording, and settings dr
   assert.match(html, /id="audio-inspector"/);
   assert.match(html, /id="overlay-enabled"/);
   assert.match(html, /name="overlayEnabled"/);
-  assert.match(html, /Subtitle overlay/);
+  assert.match(html, /data-i18n="player\.overlayToggle"/);
+  assertLocalized("player.overlayToggle", { en: /Subtitle overlay/ });
   assert.match(html, /id="refresh-audio-devices"/);
   assert.match(html, /id="system-audio-meter"/);
   assert.match(html, /id="mic-audio-meter"/);
   assert.match(html, /실시간 자막 확인 중/);
-  assert.match(html, /<summary>Settings<\/summary>/);
+  // The drawer summary must not repeat the page title two lines above it.
+  assert.match(html, /<summary data-i18n="settings\.drawerAdvanced">/);
+  assertLocalized("settings.drawerAdvanced", { en: /Advanced/, ko: /고급/ });
   assert.match(html, /데스크톱 앱으로 여는 중/);
   assert.doesNotMatch(html, /Run always-on-top live subtitles/);
   assert.doesNotMatch(html, /Only translated subtitles are shown/);
@@ -226,7 +251,8 @@ test("subtitle dashboard exposes main controls, Gemma recording, and settings dr
   assert.match(controllerHtml, /id="controller-font-up"/);
   // Desktop app controls: raise the main window, hide the floating console,
   // quit the app directly.
-  assert.match(controllerHtml, /id="controller-main-window"[^>]*>Main</);
+  assert.match(controllerHtml, /id="controller-main-window"[^>]*data-i18n="controller\.mainWindow"/);
+  assertLocalized("controller.mainWindow", { en: /Main/ });
   assert.match(controllerHtml, /id="controller-hide"/);
   assert.match(controllerHtml, /id="controller-quit"/);
   assert.match(controllerJs, /showMainWindow/);
@@ -234,7 +260,7 @@ test("subtitle dashboard exposes main controls, Gemma recording, and settings dr
   assert.match(controllerJs, /quitApp/);
   // Main sits in the App-controls cluster, before Hide and Quit so the
   // destructive control stays pinned at the far edge.
-  const windowCluster = controllerHtml.slice(controllerHtml.indexOf('aria-label="App controls"'));
+  const windowCluster = controllerHtml.slice(controllerHtml.indexOf('data-i18n-aria="controller.appControls"'));
   assert.ok(
     windowCluster.indexOf('id="controller-main-window"') < windowCluster.indexOf('id="controller-hide"')
       && windowCluster.indexOf('id="controller-hide"') < windowCluster.indexOf('id="controller-quit"'),
@@ -305,13 +331,17 @@ test("subtitle dashboard exposes main controls, Gemma recording, and settings dr
   assert.match(js, /maxSubtitleLines: 2/);
   assert.match(js, /ollamaModel: "gemma3n:e2b"/);
   assert.match(js, /OpenAI Realtime: ready/);
-  assert.match(js, /실시간 자막 연결됨/);
-  assert.match(js, /기록 보조 기능 사용 중/);
+  assert.match(js, /t\("status\.realtimeConnected"\)/);
+  assertLocalized("status.realtimeConnected", { ko: /실시간 자막 연결됨/ });
+  assert.match(js, /t\("history\.recorderFallback"\)/);
+  assertLocalized("history.recorderFallback", { ko: /기록 보조 기능 사용 중/ });
   // 2026-07-25 Spotify-shelf round: bare "기록 없음" empty boxes were replaced
   // with warm guidance copy.
-  assert.match(js, /아직 확정된 자막이 없습니다/);
+  assert.match(js, /t\("history\.empty"\)/);
+  assertLocalized("history.empty", { ko: /아직 확정된 자막이 없습니다/ });
   assert.doesNotMatch(js, /"기록 없음"/);
-  assert.match(js, /날짜 미확인/);
+  assert.match(js, /t\("history\.unknownDate"\)/);
+  assertLocalized("history.unknownDate", { ko: /날짜 미확인/ });
   assert.match(js, /LOCAL_SERVER_DASHBOARD_URL = "http:\/\/127\.0\.0\.1:3210\/subtitle\.html"/);
   assert.match(js, /location\.protocol === "file:"/);
   assert.match(js, /showFileProtocolWarning/);
@@ -320,10 +350,12 @@ test("subtitle dashboard exposes main controls, Gemma recording, and settings dr
   assert.match(js, /saveOpenAIKey/);
   assert.match(js, /validateOpenAIKey/);
   assert.match(js, /\/api\/subtitles\/openai\/validate/);
-  assert.match(js, /Validating OpenAI Realtime/);
+  assert.match(js, /t\("key\.validatingOpenAI"\)/);
+  assertLocalized("key.validatingOpenAI", { en: /Validating OpenAI Realtime/ });
   assert.match(js, /apiKeys: \{ openai: openaiKey \}/);
   assert.match(js, /renderKeyStatus/);
-  assert.match(js, /OpenAI Realtime 연결을 확인했고 API key를 저장했습니다/);
+  assert.match(js, /t\("key\.openaiSaved"\)/);
+  assertLocalized("key.openaiSaved", { ko: /OpenAI Realtime 연결을 확인했고 API key를 저장했습니다/ });
   assert.match(js, /source: capture\.source/);
   assert.match(js, /label: getAudioTrackLabel/);
   assert.match(js, /startAudioLevelMeter/);
@@ -336,7 +368,8 @@ test("subtitle dashboard exposes main controls, Gemma recording, and settings dr
   assert.match(js, /broadcastInputStatus/);
   assert.match(js, /message\.type === "subtitle:partial"[\s\S]{0,180}setPreviewText/);
   assert.match(js, /micDeviceId/);
-  assert.match(js, /replaceChildren\(new Option\("System default", ""\)\)/);
+  assert.match(js, /replaceChildren\(new Option\(t\("settings\.systemDefault"\), ""\)\)/);
+  assertLocalized("settings.systemDefault", { en: /System default/ });
   assert.match(js, /getDisplayMedia/);
   assert.match(js, /getUserMedia/);
   // A persisted mic deviceId can go stale (unplugged/renumbered device). The
@@ -345,7 +378,13 @@ test("subtitle dashboard exposes main controls, Gemma recording, and settings dr
   assert.match(js, /captureMicrophoneAudio[\s\S]*?deviceId: \{ exact: micSelect\.value \}[\s\S]*?catch[\s\S]*?getUserMedia/);
   // Mic failure guidance must point at the actual macOS panel (Microphone),
   // which is separate from Screen & System Audio Recording.
-  assert.match(js, /개인정보 보호 및 보안.*마이크/);
+  assert.match(js, /t\("error\.micDenied"\)/);
+  assert.match(MESSAGES.ko["error.micDenied"], /개인정보 보호 및 보안.*마이크/);
+  assert.match(MESSAGES.en["error.micDenied"], /Privacy & Security > Microphone/);
+  // The bundle name macOS shows in Privacy & Security must stay literal in
+  // both languages, so the instruction matches what the user sees.
+  assert.match(MESSAGES.en["error.micDenied"], /Realtime Noel/);
+  assert.match(MESSAGES.ko["error.micDenied"], /Realtime Noel/);
   assert.match(js, /CAPTURE_TIMEOUT_MS = 8000/);
   assert.match(js, /Promise\.allSettled\(tasks\)/);
   assert.match(js, /withMediaCaptureTimeout/);
@@ -363,20 +402,37 @@ test("subtitle dashboard exposes main controls, Gemma recording, and settings dr
   assert.match(js, /createGain/);
   assert.match(js, /mute\.gain\.value = 0/);
   assert.match(js, /formatCaptureFailure/);
-  assert.match(js, /Realtime Noel의 Screen & System Audio Recording 권한/);
-  assert.match(js, /개발 실행 중이면 Electron 항목도 같은 권한이 필요합니다/);
-  assert.match(js, /가능한 입력만으로 시작했습니다/);
-  assert.match(js, /서비스 연결 중/);
-  assert.match(js, /자막 준비됨/);
-  assert.match(js, /말씀을 듣고 있어요/);
-  assert.match(js, /번역하고 있어요/);
-  assert.match(js, /다시 연결하는 중/);
-  assert.match(js, /실시간 자막 다시 연결 중/);
+  assert.match(js, /t\("error\.systemAudioDenied"\)/);
+  assert.match(js, /t\("error\.systemAudioFailed", \{ reason \}\)/);
+  assert.match(MESSAGES.ko["error.systemAudioDenied"], /Realtime Noel의 Screen & System Audio Recording 권한/);
+  assert.match(MESSAGES.ko["error.systemAudioFailed"], /개발 실행 중이면 Electron 항목도 같은 권한이 필요합니다/);
+  assert.match(MESSAGES.en["error.systemAudioFailed"], /Screen & System Audio Recording/);
+  assert.match(js, /t\("notice\.partialInputs", \{ failures/);
+  assertLocalized("notice.partialInputs", { ko: /가능한 입력만으로 시작했습니다/ });
+  // Every live status line resolves through the dictionary in both languages.
+  /** @type {[string, RegExp][]} */
+  const statusKeys = [
+    ["status.serviceConnecting", /서비스 연결 중/],
+    ["status.captionsReady", /자막 준비됨/],
+    ["status.hearing", /말씀을 듣고 있어요/],
+    ["status.translating", /번역하고 있어요/],
+    ["status.reconnecting", /다시 연결하는 중/],
+    ["status.realtimeReconnecting", /실시간 자막 다시 연결 중/],
+  ];
+  for (const [key, korean] of statusKeys) {
+    assert.match(js, new RegExp(`t\\("${key.replace(".", "\\.")}"\\)`));
+    assertLocalized(key, { ko: korean });
+  }
   assert.match(js, /void stopSubtitles\(\)/);
-  assert.match(js, /설정을 저장했습니다/);
+  assert.match(js, /t\("notice\.settingsSaved"\)/);
+  assertLocalized("notice.settingsSaved", { ko: /설정을 저장했습니다/ });
   assert.match(js, /window\.location\.href = "\/api\/settings\/export"/);
   assert.doesNotMatch(js, /includeKeys/);
-  assert.match(html, /자막 설정만 포함 — API 키는 이 기기에 유지됩니다/);
+  // The "keys stay on this device" blurb was explanatory prose and was deleted;
+  // the behaviour it described is asserted where it lives (settings-store keeps
+  // API keys out of the export payload).
+  assert.doesNotMatch(html, /자막 설정만 포함 — API 키는 이 기기에 유지됩니다/);
+  assert.match(html, /id="export-settings"[\s\S]{0,200}id="import-settings"/);
 });
 
 test("desktop language picker exposes the approved multilingual set and caps simultaneous output at three", () => {
@@ -387,7 +443,8 @@ test("desktop language picker exposes the approved multilingual set and caps sim
   assert.match(js, /subtitleLanguageRegistry = body\.languages/);
   // The static hint text was removed in the 2026-07-25 declutter; the 3-language
   // cap is enforced in JS and surfaced via the validation flash instead.
-  assert.match(js, /최소 2개 언어를 선택해야 합니다/);
+  assert.match(js, /t\("language\.minimum"\)/);
+  assertLocalized("language.minimum", { ko: /최소 2개 언어를 선택해야 합니다/ });
   assert.match(js, /renderPlacementRows/);
   assert.doesNotMatch(html + js, /Realtime_Noel|AutoPreso|Auto Preso/);
 });
@@ -396,7 +453,7 @@ test("desktop settings stay closed until the native summary is activated and non
   const html = readFileSync(path.join(rootDir, "public", "subtitle.html"), "utf8");
   const css = readFileSync(path.join(rootDir, "public", "subtitle.css"), "utf8");
 
-  assert.match(html, /<details class="settings-drawer">\s*<summary>Settings<\/summary>/);
+  assert.match(html, /<details class="settings-drawer">\s*<summary data-i18n="settings\.drawerAdvanced">/);
   assert.doesNotMatch(html, /<details class="settings-drawer"[^>]*\sopen(?:\s|>)/);
   assert.match(css, /--ui-font-family:\s*"Pretendard"/);
   for (const match of css.matchAll(/\.subtitle-hero h1\s*\{([^}]*)\}/gs)) {
@@ -415,16 +472,18 @@ test("desktop dashboard explains the optional Live handoff without a web launche
 
   assert.match(html, /class="live-handoff"/);
   assert.match(html, /<html lang="ko">/);
-  assert.match(html, /OPTIONAL · LIVE CALL/);
+  assert.match(html, /data-i18n="live\.handoffKicker"/);
+  assertLocalized("live.handoffKicker", { en: /OPTIONAL · LIVE CALL/ });
   // 2026-07-25 design review: the static Presentation/Meeting mode list was
   // decorative noise and was removed from the workspace.
   assert.doesNotMatch(html, /live-handoff-modes/);
   assert.doesNotMatch(html, /Optional translated audio/);
   assert.doesNotMatch(html, /Townhall/);
-  assert.match(html, /Create session → share QR or code → start Live Call/);
+  assert.match(html, /data-i18n="live\.handoffFlow"/);
+  assertLocalized("live.handoffFlow", { en: /Create session → share QR or code → start Live Call/ });
   assert.match(html, /id="live-workspace-status"[^>]*role="status"[^>]*aria-live="polite"/);
   assert.match(html, /id="live-draft-cover-status"[^>]*role="status"[^>]*aria-live="polite"/);
-  assert.match(html, /QR and a 6-digit access code are always created together/);
+  assert.doesNotMatch(html, /QR and a 6-digit access code are always created together/);
   assert.doesNotMatch(html, /id="open-meeting-mode"|data-open-live-workspace|>Open Live Call</);
   assert.match(css, /\.live-handoff\s*\{/);
   assert.match(workspaceJs, /await bridge\.startLiveCall\(draft\)/);
@@ -439,7 +498,8 @@ test("subtitle dashboard captures audio before opening realtime subtitle session
 
   assert.ok(captureIndex > 0, "dashboard should capture selected audio before starting subtitles");
   assert.ok(startIndex > captureIndex, "subtitle:start should be sent only after local capture succeeds");
-  assert.match(js, /입력 확인 중/);
+  assert.match(js, /t\("status\.inputCheck"\)/);
+  assertLocalized("status.inputCheck", { ko: /입력 확인 중/ });
   assert.match(js, /state\.streams = captures\.map/);
 });
 
@@ -582,7 +642,8 @@ test("subtitle dashboard cannot hang forever while checking audio inputs", () =>
     1,
     "system_mic must not schedule duplicate microphone capture streams",
   );
-  assert.match(js, /reject\(new Error\(`\$\{sourceName\} 캡처가/);
+  assert.match(js, /reject\(new Error\(t\("error\.captureTimeout", \{ source: sourceName/);
+  assertLocalized("error.captureTimeout", { ko: /\{source\} 캡처가 \{seconds\}초/ });
   assert.match(js, /if \(timedOut \|\| settled\) \{\s*stopMediaStream\(stream\);/);
 });
 
@@ -599,7 +660,8 @@ test("subtitle dashboard actively starts Web Audio and reports blocked tracks", 
   assert.ok(watchIndex > resumeIndex, "streamer should attach track diagnostics");
   assert.ok(processIndex > watchIndex, "diagnostics should be ready before audio processing starts");
   assert.match(js, /context\.state !== "running"/);
-  assert.match(js, /Audio blocked/);
+  assert.match(js, /t\("audio\.blocked"\)/);
+  assertLocalized("audio.blocked", { en: /Audio blocked/ });
   assert.match(js, /track\.addEventListener\?\.\("mute"/);
   assert.match(js, /track\.addEventListener\?\.\("ended"/);
 });
@@ -653,7 +715,8 @@ test("translated playback isolates system loopback without suppressing microphon
     meterSource,
     /shouldGateTranslatedAudioInput\([\s\S]*?state\.settings\.outputMode,[\s\S]*?subtitleAudioPlayer\.isInputSuppressionActive\(\),[\s\S]*?sourceName,[\s\S]*?\);/,
   );
-  assert.match(meterSource, /isFeedbackSuppressed \? "Output isolated" : hasSignal \? "Signal" : "No signal"/);
+  assert.match(meterSource, /isFeedbackSuppressed \? t\("audio\.outputIsolated"\) : hasSignal \? t\("audio\.signal"\) : t\("audio\.noSignal"\)/);
+  assertLocalized("audio.outputIsolated", { en: /Output isolated/ });
   assert.doesNotMatch(
     streamerSource,
     /shouldGateTranslatedAudioInput\(state\.settings\.outputMode, subtitleAudioPlayer\.isInputSuppressionActive\(\)\)\) return;/,
@@ -690,13 +753,17 @@ test("subtitle dashboard exposes source labels and level meter styles", () => {
 
   assert.match(html, /class="subtitle-app-shell"/);
   assert.match(html, /class="subtitle-app-rail"/);
-  assert.match(html, /<img src="icons\/radio\.svg" alt="" aria-hidden="true" \/>Captions/);
-  assert.match(html, /<img src="icons\/file-text\.svg" alt="" aria-hidden="true" \/>Records/);
-  assert.match(html, /<img src="icons\/users\.svg" alt="" aria-hidden="true" \/>Live Call/);
-  assert.match(html, /<img src="icons\/settings\.svg" alt="" aria-hidden="true" \/>Settings/);
+  assert.match(html, /<img src="icons\/radio\.svg" alt="" aria-hidden="true" \/><span data-i18n="nav\.captions">/);
+  assertLocalized("nav.captions", { en: /Captions/ });
+  assert.match(html, /<img src="icons\/file-text\.svg" alt="" aria-hidden="true" \/><span data-i18n="nav\.records">/);
+  assertLocalized("nav.records", { en: /Records/ });
+  assert.match(html, /<img src="icons\/users\.svg" alt="" aria-hidden="true" \/><span data-i18n="nav\.livecall">/);
+  assertLocalized("nav.livecall", { en: /Live Call/ });
+  assert.match(html, /<img src="icons\/settings\.svg" alt="" aria-hidden="true" \/><span data-i18n="nav\.settings">/);
+  assertLocalized("nav.settings", { en: /Settings/ });
   assert.match(html, /id="caption-workspace" class="subtitle-dashboard"/);
   assert.doesNotMatch(html, /data-open-live-workspace|id="open-meeting-mode"|>Open Live Call</);
-  assert.match(html, /QR and a 6-digit access code are always created together/);
+  assert.doesNotMatch(html, /QR and a 6-digit access code are always created together/);
   assert.match(html, /id="start-subtitles"/);
   assert.match(html, /id="stop-subtitles"/);
   assert.match(html, /id="subtitle-preview"/);
@@ -714,7 +781,9 @@ test("subtitle dashboard exposes source labels and level meter styles", () => {
   assert.match(css, /Electron host dashboard/);
   assert.match(css, /\.subtitle-app-shell[\s\S]*?grid-template-columns: 220px minmax\(0, 1fr\)/);
   assert.match(css, /\.subtitle-app-rail nav img[\s\S]*?width: 20px[\s\S]*?filter: invert\(1\)[\s\S]*?opacity: 0\.52/);
-  assert.match(css, /\.dashboard-shell[\s\S]*?grid-template-columns: minmax\(0, 1fr\) minmax\(400px, 430px\)/);
+  // The two-column track this used to pin was dead: .workspace-shell on the same
+  // element sets display:block and wins. Both are gone.
+  assert.doesNotMatch(css, /minmax\(400px, 430px\)/u);
   assert.doesNotMatch(css, /#ff6a2a|#6ee7b7|#151311|#1d1915|#26211c/i);
   for (const iconName of ["radio", "file-text", "users", "settings"]) {
     const icon = readFileSync(path.join(rootDir, "public", "icons", `${iconName}.svg`), "utf8");
@@ -1051,7 +1120,8 @@ test("settings import rejects array and primitive subtitle/apiKeys sections", ()
   assert.match(importer, /!isPlainSettingsSection\(parsed\.apiKeys\)/u);
   assert.match(importer, /if \(isPlainSettingsSection\(parsed\.subtitle\)\) patch\.subtitle = parsed\.subtitle;/u);
   assert.match(importer, /if \(isPlainSettingsSection\(parsed\.apiKeys\)\) patch\.apiKeys = parsed\.apiKeys;/u);
-  const throwIndex = importer.indexOf("항목은 객체여야 합니다");
+  const throwIndex = importer.indexOf('t("error.importSectionShape")');
+  assertLocalized("error.importSectionShape", { ko: /항목은 객체여야 합니다/ });
   const saveIndex = importer.indexOf("await saveSettings(patch)");
   assert.ok(throwIndex >= 0 && throwIndex < saveIndex, "the shape check must run before the save");
 });

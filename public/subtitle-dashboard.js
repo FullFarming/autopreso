@@ -4,6 +4,9 @@ import {
   shouldGateTranslatedAudioInput,
 } from "./subtitle-audio-player.js";
 import { buildMonthGrid, buildTimeGrid } from "./records-calendar.js";
+// Every user-visible string in this file resolves through t(); subtitle-workspace.js
+// owns restoring/persisting the choice and the declarative data-i18n pass.
+import { getLanguage, subscribe as subscribeToLanguage, t } from "./subtitle-i18n.js";
 
 const SAMPLE_RATE = 24000;
 const LIVE_AUDIO_CHUNK_DURATION_MS = 100;
@@ -114,7 +117,6 @@ const realtimeApiStatus = document.getElementById("realtime-api-status");
 const topicModelStatus = document.getElementById("topic-model-status");
 const refreshAudioDevicesButton = document.getElementById("refresh-audio-devices");
 const playbackOptions = document.getElementById("pt-playback-options");
-const outputProviderHelp = document.getElementById("pt-output-provider-help");
 const audioVolumeValue = document.getElementById("audio-volume-value");
 const primaryNavigationLinks = [...document.querySelectorAll(".subtitle-app-rail nav a[href^='#']")];
 const settingsDrawer = document.querySelector("details.settings-drawer");
@@ -135,8 +137,8 @@ const audioStatus = {
 const subtitleAudioPlayer = createSubtitleAudioPlayer({
   maxQueueSeconds: MAX_TRANSLATED_AUDIO_QUEUE_SECONDS,
   onQueueRestart: () => {
-    setPreviewStatus("통역 음성 자동 복구 · 계속 수신 중", 2400);
-    showNotice("밀린 통역 음성을 정리하고 최신 음성부터 계속 재생합니다.");
+    setPreviewStatus(t("audio.recoveryContinuing"), 2400);
+    showNotice(t("notice.audioQueueTrimmed"));
   },
   onFailure: (error) => {
     showError(error);
@@ -153,7 +155,7 @@ function clearTranslatedAudioQueue() {
 function failTranslatedAudio(error) {
   clearTranslatedAudioQueue();
   showError(error);
-  setPreviewStatus("통역 음성 자동 복구 · 다음 음성 대기", 2400);
+  setPreviewStatus(t("audio.recoveryWaiting"), 2400);
 }
 
 if (location.protocol === "file:") {
@@ -168,10 +170,10 @@ if (location.protocol === "file:") {
 
 function showFileProtocolWarning() {
   if (fileProtocolWarning) fileProtocolWarning.hidden = false;
-  setConnectionStatus("데스크톱 앱에서 열어주세요", "error");
+  setConnectionStatus(t("status.openInDesktopApp"), "error");
   startButton.disabled = true;
   stopButton.disabled = true;
-  setPreviewText("로컬 서버에서 다시 여는 중", "", true);
+  setPreviewText(t("status.reopeningLocalServer"), "", true);
   setTimeout(() => {
     location.href = LOCAL_SERVER_DASHBOARD_URL;
   }, 700);
@@ -224,17 +226,17 @@ form.addEventListener("change", (event) => {
       if (state.running && name === "inputMode") {
         // Audio sources changed — a full restart re-captures the right inputs.
         void restartSubtitles();
-        showNotice("입력을 바꿔 세션을 다시 시작했습니다.");
+        showNotice(t("notice.inputRestarted"));
         return;
       }
       if (state.running && CHANNEL_REBUILD_CONTROLS.has(name)) {
         // Rebuild the server-side translation channels in place (audio capture
         // keeps running) so the live output matches the new language/engine.
         reconfigureRunningSession();
-        showNotice("번역 채널을 새 설정으로 다시 구성했습니다.");
+        showNotice(t("notice.channelsRebuilt"));
         return;
       }
-      showNotice("설정을 저장했습니다.");
+      showNotice(t("notice.settingsSaved"));
     })
     .catch(showError);
 });
@@ -351,9 +353,9 @@ async function applyGlossaryPreset(presetId) {
       // A running session keeps translating with the OLD glossary until its
       // channels are rebuilt — reconfigure in place (audio capture untouched).
       reconfigureRunningSession();
-      showNotice(`프리셋 적용 + 번역 채널 재구성: ${preset.label}`);
+      showNotice(t("notice.presetAppliedRebuilt", { label: preset.label }));
     } else {
-      showNotice(`프리셋 적용: ${preset.label}`);
+      showNotice(t("notice.presetApplied", { label: preset.label }));
     }
   } catch (error) {
     showError(error);
@@ -375,11 +377,11 @@ async function importSettingsFromFile(file) {
   try {
     const parsed = JSON.parse(await file.text());
     if (!isPlainSettingsSection(parsed) || (!parsed.subtitle && !parsed.apiKeys)) {
-      throw new Error("설정 파일 형식이 아닙니다. 내보내기로 만든 JSON을 선택하세요.");
+      throw new Error(t("error.importNotSettingsFile"));
     }
     if ((parsed.subtitle !== undefined && !isPlainSettingsSection(parsed.subtitle))
       || (parsed.apiKeys !== undefined && !isPlainSettingsSection(parsed.apiKeys))) {
-      throw new Error("설정 파일의 subtitle/apiKeys 항목은 객체여야 합니다. 배열이나 문자열은 가져올 수 없습니다.");
+      throw new Error(t("error.importSectionShape"));
     }
     const patch = {};
     if (isPlainSettingsSection(parsed.subtitle)) patch.subtitle = parsed.subtitle;
@@ -390,7 +392,7 @@ async function importSettingsFromFile(file) {
       writeSettingsToForm(state.settings);
       applyPreviewSettings(state.settings);
     }
-    showNotice("설정 파일을 가져왔습니다. 용어집·도메인·키가 적용되었습니다.");
+    showNotice(t("notice.settingsImported"));
   } catch (error) {
     showError(error);
   }
@@ -442,8 +444,11 @@ const LANGUAGE_KO_LABELS = {
 };
 
 function languageDisplayName(language) {
-  const koLabel = LANGUAGE_KO_LABELS[language.code];
   const native = language.nativeLabel || language.label || language.code;
+  // The Korean alias is only useful while the UI itself is Korean; the English
+  // UI shows the native name (and the search box still matches Korean input).
+  if (getLanguage() !== "ko") return native;
+  const koLabel = LANGUAGE_KO_LABELS[language.code];
   return koLabel && koLabel !== native ? `${koLabel} · ${native}` : native;
 }
 
@@ -482,9 +487,9 @@ function renderLanguagePills() {
   const searchInput = document.createElement("input");
   searchInput.type = "search";
   searchInput.id = "language-search-input";
-  searchInput.placeholder = "언어 검색 후 추가 (예: 일본어, Japanese, ja)";
+  searchInput.placeholder = t("language.searchPlaceholder");
   searchInput.autocomplete = "off";
-  searchInput.setAttribute("aria-label", "번역 언어 검색");
+  searchInput.setAttribute("aria-label", t("language.searchLabel"));
   const suggestions = document.createElement("ul");
   suggestions.className = "language-suggestions";
   suggestions.hidden = true;
@@ -540,7 +545,7 @@ function renderLanguageSuggestions(query) {
   if (atMax) {
     const li = document.createElement("li");
     li.className = "language-suggestion-empty";
-    li.textContent = `최대 ${MAX_SELECTED_LANGUAGES}개 언어까지 선택할 수 있습니다 — 먼저 하나를 제거하세요`;
+    li.textContent = t("language.maxSelected", { max: MAX_SELECTED_LANGUAGES });
     suggestions.append(li);
     suggestions.hidden = false;
     return;
@@ -548,7 +553,7 @@ function renderLanguageSuggestions(query) {
   if (matches.length === 0) {
     const li = document.createElement("li");
     li.className = "language-suggestion-empty";
-    li.textContent = "일치하는 언어가 없습니다";
+    li.textContent = t("language.noMatch");
     suggestions.append(li);
     suggestions.hidden = false;
     return;
@@ -613,7 +618,7 @@ function renderLanguageChips() {
     const remove = document.createElement("button");
     remove.type = "button";
     remove.className = "language-chip-remove";
-    remove.setAttribute("aria-label", `${languageDisplayName(language)} 제거`);
+    remove.setAttribute("aria-label", t("language.remove", { language: languageDisplayName(language) }));
     remove.textContent = "×";
     remove.addEventListener("click", () => removeLanguageTag(language.code));
     chip.append(text, remove);
@@ -638,8 +643,8 @@ function renderPlacementRows() {
     const controls = document.createElement("div");
     controls.className = "seg-toggle";
     controls.setAttribute("role", "radiogroup");
-    controls.setAttribute("aria-label", `${languageDisplayName(language)} 자막 위치`);
-    for (const [value, label] of [["top-center", "상단"], ["middle-center", "중앙"], ["bottom-center", "하단"]]) {
+    controls.setAttribute("aria-label", t("language.positionLabel", { language: languageDisplayName(language) }));
+    for (const [value, labelKey] of [["top-center", "position.top"], ["middle-center", "position.middle"], ["bottom-center", "position.bottom"]]) {
       const option = document.createElement("label");
       option.className = "seg-option";
       const input = document.createElement("input");
@@ -648,7 +653,8 @@ function renderPlacementRows() {
       input.value = value;
       input.checked = (existing[language.code] ?? DEFAULT_SUBTITLE.subtitlePositions[language.code] ?? DEFAULT_SUBTITLE.position) === value;
       const text = document.createElement("span");
-      text.textContent = label;
+      text.dataset.i18n = labelKey;
+      text.textContent = t(labelKey);
       option.append(input, text);
       controls.append(option);
     }
@@ -767,24 +773,22 @@ function updatePtOutputControls() {
   const outputMode = selectedOutputMode();
   const voiceProvider = selectedVoiceProvider();
   if (playbackOptions) playbackOptions.hidden = outputMode === "captions";
-  if (outputProviderHelp) {
-    outputProviderHelp.textContent = outputMode === "captions"
-      ? "자막은 Gemini로 고정됩니다. 음성을 켜면 별도의 음성 엔진을 선택할 수 있습니다."
-      : `자막은 Gemini 고정 · 통역 음성은 ${voiceProvider === "openai" ? "OpenAI Realtime" : "Gemini"}로 출력합니다.`;
-    outputProviderHelp.classList.remove("is-unavailable");
-  }
+  // State-only line: it says something ONLY when the chosen voice language has
+  // no OpenAI Realtime voice, so Gemini voice is used instead.
   const openAIHelp = document.getElementById("pt-openai-voice-help");
   if (openAIHelp) {
     const targetLanguage = form.elements.audioLanguage?.value || "en";
     const normalizedLanguage = targetLanguage.toLowerCase() === "zh-cn" ? "zh" : targetLanguage.toLowerCase().split("-")[0];
-    openAIHelp.textContent = OPENAI_REALTIME_TRANSLATION_LANGUAGES.has(normalizedLanguage)
-      ? "OpenAI는 지원 언어에서 낮은 지연의 연속 통역 음성을 출력합니다."
-      : "선택한 언어는 OpenAI Realtime 통역 음성을 지원하지 않아 Gemini 음성을 사용합니다.";
+    const isUnsupported = !OPENAI_REALTIME_TRANSLATION_LANGUAGES.has(normalizedLanguage);
+    openAIHelp.textContent = isUnsupported ? t("output.openaiUnsupported") : "";
+    openAIHelp.hidden = !isUnsupported;
   }
   if (audioVolumeValue) audioVolumeValue.textContent = `${Math.round(readNumber(form.elements.audioVolume?.value, DEFAULT_SUBTITLE.audioVolume) * 100)}%`;
-  startButton.textContent = outputMode === "audio"
-    ? "통역 음성만 시작"
-    : outputMode === "captions_audio" ? "자막 + 통역 음성 시작" : "자막 시작";
+  startButton.dataset.i18n = outputMode === "audio"
+    ? "start.audio"
+    : outputMode === "captions_audio" ? "start.captionsAudio" : "start.captions";
+  startButton.textContent = t(startButton.dataset.i18n);
+  void voiceProvider;
 }
 
 function syncRuntimeOutputVisibility() {
@@ -840,7 +844,9 @@ async function loadSessionRecords() {
 // tested without a DOM; this only renders. ───────────────────────────────────
 
 const recordsCalendar = { view: "month", anchor: new Date(), meetings: [] };
-const RECORDS_WEEKDAYS = ["일", "월", "화", "수", "목", "금", "토"];
+function recordsWeekday(dayIndex) {
+  return t(`records.weekday.${dayIndex}`);
+}
 const RECORDS_DAY_START_HOUR = 7;
 const RECORDS_HOUR_HEIGHT = 44;
 
@@ -859,14 +865,23 @@ function renderRecordsCalendar(meetings) {
 
   if (period) {
     if (view === "month") {
-      period.textContent = `${anchor.getFullYear()}년 ${anchor.getMonth() + 1}월`;
+      period.textContent = t("records.monthPeriod", { year: anchor.getFullYear(), month: anchor.getMonth() + 1 });
     } else if (view === "day") {
-      period.textContent = `${anchor.getMonth() + 1}월 ${anchor.getDate()}일 ${RECORDS_WEEKDAYS[anchor.getDay()]}`;
+      period.textContent = t("records.dayPeriod", {
+        month: anchor.getMonth() + 1,
+        day: anchor.getDate(),
+        weekday: recordsWeekday(anchor.getDay()),
+      });
     } else {
       const week = buildTimeGrid({ anchor, days: 7, meetings: [] });
       const first = week.days[0].date;
       const last = week.days[6].date;
-      period.textContent = `${first.getMonth() + 1}월 ${first.getDate()}일 – ${last.getMonth() + 1}월 ${last.getDate()}일`;
+      period.textContent = t("records.weekPeriod", {
+        fromMonth: first.getMonth() + 1,
+        fromDay: first.getDate(),
+        toMonth: last.getMonth() + 1,
+        toDay: last.getDate(),
+      });
     }
   }
 
@@ -876,7 +891,7 @@ function renderRecordsCalendar(meetings) {
   else grid.append(buildRecordsTimeGrid(view === "week" ? 7 : 1));
 
   const count = recordsCalendar.meetings.length;
-  setSessionRecordsStatus(count ? `미팅 ${count}건` : "");
+  setSessionRecordsStatus(count ? t("records.meetingCount", { count }) : "");
 }
 
 function buildRecordsMonth() {
@@ -885,9 +900,9 @@ function buildRecordsMonth() {
 
   const head = document.createElement("div");
   head.className = "records-month-head";
-  for (const label of RECORDS_WEEKDAYS) {
+  for (let dayIndex = 0; dayIndex < 7; dayIndex += 1) {
     const cell = document.createElement("span");
-    cell.textContent = label;
+    cell.textContent = recordsWeekday(dayIndex);
     head.append(cell);
   }
   wrap.append(head);
@@ -924,9 +939,9 @@ function buildRecordsChip(segment) {
   chip.className = "records-chip";
   chip.classList.toggle("is-unterminated", Boolean(segment.isUnterminated));
   const time = document.createElement("b");
-  time.textContent = segment.isContinuation ? "계속" : formatRecordsClock(segment.startMinute);
+  time.textContent = segment.isContinuation ? t("records.continued") : formatRecordsClock(segment.startMinute);
   const label = document.createElement("span");
-  label.textContent = segment.title || "제목 없음";
+  label.textContent = segment.title || t("records.noTitle");
   chip.append(time, label);
   chip.addEventListener("click", () => { void openSessionRecordDetail({ id: segment.id, title: segment.title }); });
   return chip;
@@ -956,8 +971,8 @@ function buildRecordsTimeGrid(days) {
     label.className = "records-time-day";
     label.classList.toggle("is-today", day.isToday);
     label.textContent = days === 1
-      ? `${day.date.getMonth() + 1}.${day.date.getDate()} ${RECORDS_WEEKDAYS[day.date.getDay()]}`
-      : `${RECORDS_WEEKDAYS[day.date.getDay()]} ${day.date.getDate()}`;
+      ? `${day.date.getMonth() + 1}.${day.date.getDate()} ${recordsWeekday(day.date.getDay())}`
+      : `${recordsWeekday(day.date.getDay())} ${day.date.getDate()}`;
     head.append(label);
   }
   wrap.append(head);
@@ -969,7 +984,7 @@ function buildRecordsTimeGrid(days) {
   gutter.className = "records-time-gutter";
   for (let hour = startHour; hour < 24; hour += 1) {
     const mark = document.createElement("span");
-    mark.textContent = `${String(hour).padStart(2, "0")}시`;
+    mark.textContent = t("records.hourMark", { hour: String(hour).padStart(2, "0") });
     gutter.append(mark);
   }
   body.append(gutter);
@@ -1009,7 +1024,7 @@ function buildRecordsBlock(segment, laneCount, startHour) {
   const time = document.createElement("b");
   time.textContent = `${formatRecordsClock(segment.startMinute)}–${formatRecordsClock(segment.endMinute)}`;
   const label = document.createElement("span");
-  label.textContent = segment.title || "제목 없음";
+  label.textContent = segment.title || t("records.noTitle");
   block.append(time, label);
   block.addEventListener("click", () => { void openSessionRecordDetail({ id: segment.id, title: segment.title }); });
   return block;
@@ -1027,7 +1042,7 @@ function stepRecordsCalendar(direction) {
 function formatSessionRecordTime(iso) {
   const time = Date.parse(iso ?? "");
   if (!Number.isFinite(time)) return "";
-  return new Intl.DateTimeFormat("ko-KR", {
+  return new Intl.DateTimeFormat(getLanguage() === "ko" ? "ko-KR" : "en-US", {
     timeZone: "Asia/Seoul",
     month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit",
   }).format(new Date(time));
@@ -1061,12 +1076,12 @@ function buildSessionRecordCard(session) {
   const meta = document.createElement("span");
   const period = [formatSessionRecordTime(session.startedAt), formatSessionRecordTime(session.endedAt)]
     .filter(Boolean).join(" – ");
-  meta.textContent = `${period} · ${session.lineCount}줄`;
+  meta.textContent = `${period} · ${t("records.lineCount", { count: session.lineCount })}`;
   heading.append(titleEl, meta);
 
   const right = document.createElement("span");
   right.className = "records-local-right";
-  right.textContent = session.hasSummary ? "요약" : "";
+  right.textContent = session.hasSummary ? t("records.summaryBadge") : "";
 
   row.append(heading, right);
   row.addEventListener("click", () => { void openSessionRecordDetail(session); });
@@ -1093,11 +1108,11 @@ async function openSessionRecordDetail(session) {
   if (!els.panel) return;
   try {
     const body = await fetch(`/api/subtitles/sessions/${encodeURIComponent(session.id)}`).then((res) => res.json());
-    if (!body.ok) throw new Error(body.error || "세션을 불러오지 못했습니다.");
+    if (!body.ok) throw new Error(body.error || t("records.loadFailed"));
     const detail = body.data;
     els.title.textContent = session.title || formatSessionRecordTime(session.startedAt) || session.id;
     const period = [formatSessionRecordTime(session.startedAt), formatSessionRecordTime(session.endedAt)].filter(Boolean).join(" ~ ");
-    els.meta.textContent = `${period} · ${session.lineCount}줄`;
+    els.meta.textContent = `${period} · ${t("records.lineCount", { count: session.lineCount })}`;
     renderSessionTranscript(els.transcript, detail.lines ?? []);
     els.summary.replaceChildren();
     if (detail.summary) {
@@ -1105,7 +1120,7 @@ async function openSessionRecordDetail(session) {
       els.generate.hidden = true;
     } else {
       const pending = document.createElement("p");
-      pending.textContent = "아직 요약이 없습니다.";
+      pending.textContent = t("records.noSummary");
       els.summary.append(pending);
       els.generate.hidden = false;
       els.generate.onclick = () => { void generateSessionDetailSummary(session); };
@@ -1113,7 +1128,7 @@ async function openSessionRecordDetail(session) {
     els.audio.replaceChildren();
     for (const source of Array.isArray(session.audioSources) ? session.audioSources : []) {
       const label = document.createElement("span");
-      label.textContent = source === "system" ? "시스템 음성" : "마이크 음성";
+      label.textContent = source === "system" ? t("records.systemAudio") : t("records.micAudio");
       const player = document.createElement("audio");
       player.controls = true;
       player.preload = "none";
@@ -1141,11 +1156,11 @@ async function generateSessionDetailSummary(session) {
   try {
     const body = await fetch(`/api/subtitles/sessions/${encodeURIComponent(session.id)}/summary`, { method: "POST" })
       .then((res) => res.json());
-    if (!body.ok) throw new Error(body.error || "요약을 생성하지 못했습니다.");
+    if (!body.ok) throw new Error(body.error || t("records.summaryFailed"));
     session.hasSummary = true;
     renderSessionSummary(els.summary, body.data);
     els.generate.hidden = true;
-    setSessionRecordsStatus("AI 요약이 준비되었습니다.");
+    setSessionRecordsStatus(t("records.summaryReady"));
   } catch (error) {
     setSessionRecordsStatus(error.message, true);
   } finally {
@@ -1160,7 +1175,7 @@ function renderSessionTranscript(container, lines) {
   container.replaceChildren();
   if (!lines.length) {
     const empty = document.createElement("p");
-    empty.textContent = "이 세션에는 기록된 라인이 없습니다.";
+    empty.textContent = t("records.noLines");
     container.append(empty);
     return;
   }
@@ -1210,7 +1225,7 @@ function renderSessionSummary(container, summary) {
   }
   if (summary.decisions?.length) {
     const label = document.createElement("strong");
-    label.textContent = "결정 사항";
+    label.textContent = t("records.decisions");
     const list = document.createElement("ul");
     for (const decision of summary.decisions) {
       const item = document.createElement("li");
@@ -1221,7 +1236,7 @@ function renderSessionSummary(container, summary) {
   }
   if (summary.actionItems?.length) {
     const label = document.createElement("strong");
-    label.textContent = "액션 아이템";
+    label.textContent = t("records.actionItems");
     const list = document.createElement("ul");
     for (const action of summary.actionItems) {
       const item = document.createElement("li");
@@ -1256,14 +1271,14 @@ function connectWebSocket() {
   const ws = new WebSocket(`${proto}://${location.host}/ws`);
   state.ws = ws;
 
-  ws.addEventListener("open", () => setConnectionStatus("자막 준비됨", "active"));
+  ws.addEventListener("open", () => setConnectionStatus(t("status.captionsReady"), "active"));
   ws.addEventListener("close", () => {
-    setConnectionStatus("연결이 끊겼습니다", "error");
+    setConnectionStatus(t("status.disconnected"), "error");
     clearTranslatedAudioQueue();
     stopLocalStreams();
     void setControllerWindowVisible(false);
   });
-  ws.addEventListener("error", () => setConnectionStatus("연결을 확인해주세요", "error"));
+  ws.addEventListener("error", () => setConnectionStatus(t("status.checkConnection"), "error"));
   ws.addEventListener("message", (event) => {
     const message = JSON.parse(event.data);
     if (message.type === "settings" && message.settings?.subtitle) {
@@ -1285,21 +1300,21 @@ function connectWebSocket() {
       updateAudioInspectorLabels();
     }
     if (message.type === "subtitle:status") {
-      if (message.status === "connecting") setConnectionStatus("서비스 연결 중", "active");
+      if (message.status === "connecting") setConnectionStatus(t("status.serviceConnecting"), "active");
       else if (message.status === "api_ready") {
-        setConnectionStatus("자막 준비됨", "active");
-        setRealtimeApiStatus("실시간 자막 연결됨", "active");
+        setConnectionStatus(t("status.captionsReady"), "active");
+        setRealtimeApiStatus(t("status.realtimeConnected"), "active");
       } else if (message.status === "hearing") {
-        setConnectionStatus("말씀을 듣고 있어요", "active");
-        setPreviewStatus("말씀을 듣고 있어요", 1200);
+        setConnectionStatus(t("status.hearing"), "active");
+        setPreviewStatus(t("status.hearing"), 1200);
       } else if (message.status === "translating") {
-        setConnectionStatus("번역하고 있어요", "active");
-        setPreviewStatus("번역하고 있어요", 1800);
+        setConnectionStatus(t("status.translating"), "active");
+        setPreviewStatus(t("status.translating"), 1800);
       } else if (message.status === "reconnecting") {
-        setConnectionStatus("다시 연결하는 중", "active");
-        setRealtimeApiStatus("실시간 자막 다시 연결 중", "active");
-        setPreviewStatus("다시 연결하는 중", 1800);
-      } else setConnectionStatus(message.status === "listening" ? "자막 수신 중" : "자막 준비됨", message.status === "listening" ? "active" : "");
+        setConnectionStatus(t("status.reconnecting"), "active");
+        setRealtimeApiStatus(t("status.realtimeReconnecting"), "active");
+        setPreviewStatus(t("status.reconnecting"), 1800);
+      } else setConnectionStatus(message.status === "listening" ? t("status.receivingCaptions") : t("status.captionsReady"), message.status === "listening" ? "active" : "");
     }
     if (message.type === "subtitle:partial" && state.settings.outputMode !== "audio") {
       setPreviewText(message.translatedText, message.sourceText, true);
@@ -1314,7 +1329,7 @@ function connectWebSocket() {
         && message.sampleRate === 24_000
         && typeof message.audio === "string";
       if (!isCanonicalAudio) {
-        failTranslatedAudio(new Error("올바르지 않은 통역 음성 프레임을 건너뛰고 계속 수신합니다."));
+        failTranslatedAudio(new Error(t("error.badAudioFrame")));
         return;
       }
       const previousAudioStreamId = translatedAudioGuard.activeStreamId;
@@ -1326,7 +1341,7 @@ function connectWebSocket() {
     if (message.type === "subtitle:audio-control" && (message.action === "clear" || message.action === "restart")) {
       if (!translatedAudioGuard.markControl(message)) return;
       clearTranslatedAudioQueue();
-      if (message.action === "restart") setPreviewStatus("통역 음성 자동 복구 · 계속 수신 중", 2400);
+      if (message.action === "restart") setPreviewStatus(t("audio.recoveryContinuing"), 2400);
     }
     if (message.type === "subtitle:history") {
       renderHistory(message);
@@ -1335,7 +1350,7 @@ function connectWebSocket() {
       renderSessionRecords(message.sessions ?? []);
     }
     if (message.type === "subtitle:session-summary") {
-      setSessionRecordsStatus("AI 요약이 준비되었습니다.");
+      setSessionRecordsStatus(t("records.summaryReady"));
       void loadSessionRecords();
     }
     if (message.type === "subtitle:control") {
@@ -1367,11 +1382,11 @@ async function startSubtitles() {
     if (geminiSecondaryKeyInput?.value.trim()) apiKeysPatch.geminiSecondary = geminiSecondaryKeyInput.value.trim();
     if (Object.keys(apiKeysPatch).length > 0) patch.apiKeys = apiKeysPatch;
     if (!state.hasGeminiKey && !geminiKeyInput?.value.trim()) {
-      throw new Error("Gemini API key is required. Enter a key before starting subtitles.");
+      throw new Error(t("key.geminiRequired"));
     }
     if (state.settings.outputMode !== "captions" && state.settings.voiceProvider === "openai"
       && !state.hasOpenAIKey && !openaiKeyInput.value.trim()) {
-      throw new Error("OpenAI Realtime 음성을 사용하려면 OpenAI API key가 필요합니다.");
+      throw new Error(t("key.openaiVoiceRequired"));
     }
     await saveSettings(patch);
     if (geminiKeyInput?.value.trim()) {
@@ -1399,8 +1414,8 @@ async function startSubtitles() {
       updateServiceStrip();
     }
     await ensureWebSocketOpen();
-    setConnectionStatus("입력 장치 확인 중", "active");
-    setPreviewStatus("입력 확인 중", 1200);
+    setConnectionStatus(t("status.checkingInputs"), "active");
+    setPreviewStatus(t("status.inputCheck"), 1200);
 
     captures = await captureSelectedAudio(state.settings);
     state.streams = captures.map((capture) => capture.stream);
@@ -1416,7 +1431,7 @@ async function startSubtitles() {
       settings: state.settings,
       meeting: await describeActiveMeeting(),
     }));
-    if (state.settings.outputMode !== "audio") setPreviewStatus("자막 대기 중", 1800);
+    if (state.settings.outputMode !== "audio") setPreviewStatus(t("status.waitingForCaptions"), 1800);
 
     for (const capture of captures) {
       const streamer = await createAudioStreamer(capture.stream, capture.source, capture.label, (audio) => {
@@ -1443,9 +1458,9 @@ async function startSubtitles() {
     state.running = true;
     stopButton.disabled = false;
     syncRuntimeOutputVisibility();
-    setConnectionStatus("자막 수신 중", "active");
+    setConnectionStatus(t("status.receivingCaptions"), "active");
     if (state.settings.outputMode !== "captions" && state.settings.inputMode !== "mic") {
-      showNotice("통역 음성이 시스템 오디오 입력으로 다시 들어갈 수 있습니다. 마이크 전용 입력과 이어폰을 권장합니다.");
+      showNotice(t("notice.audioFeedbackWarning"));
     }
   } catch (error) {
     if (state.streams.length === 0) {
@@ -1532,7 +1547,7 @@ function setControllerWindowVisible(visible) {
 async function restartSubtitles() {
   await stopSubtitles();
   await startSubtitles();
-  showNotice("Caption engine restarted. The Live Call session remains connected.");
+  showNotice(t("notice.captionEngineRestarted"));
 }
 
 function stopLocalStreams() {
@@ -1547,7 +1562,7 @@ function stopLocalStreams() {
 async function captureSelectedAudio(settings) {
   const tasks = [];
   if (settings.inputMode === "system" || settings.inputMode === "system_mic") {
-    tasks.push(captureAudioSource("system", "System audio", captureSystemAudio));
+    tasks.push(captureAudioSource("system", t("audio.systemAudio"), captureSystemAudio));
   }
   if (settings.inputMode === "mic" || settings.inputMode === "system_mic") {
     tasks.push(captureAudioSource("mic", selectedMicrophoneLabel(), captureMicrophoneAudio));
@@ -1564,7 +1579,7 @@ async function captureSelectedAudio(settings) {
   if (captures.length === 0) {
     throw new Error(failures.join(" "));
   }
-  if (failures.length > 0) showNotice(`${failures.join(" ")} 가능한 입력만으로 시작했습니다.`);
+  if (failures.length > 0) showNotice(t("notice.partialInputs", { failures: failures.join(" ") }));
   return captures;
 }
 
@@ -1573,7 +1588,7 @@ async function captureAudioSource(source, fallbackLabel, capture) {
     const stream = await withMediaCaptureTimeout(capture(), source);
     return { source, stream, label: getAudioTrackLabel(stream, fallbackLabel) };
   } catch (error) {
-    setAudioSourceStatus(source, "Unavailable", 0);
+    setAudioSourceStatus(source, t("audio.unavailable"), 0);
     throw new Error(formatCaptureFailure(source, error));
   }
 }
@@ -1594,7 +1609,7 @@ async function captureSystemAudio() {
   stream.getVideoTracks().forEach((track) => track.stop());
   if (stream.getAudioTracks().length === 0) {
     stream.getTracks().forEach((track) => track.stop());
-    throw new Error("시스템 오디오 트랙이 없습니다. 화면/오디오 녹화 권한을 확인하세요.");
+    throw new Error(t("error.noSystemAudioTrack"));
   }
   return stream;
 }
@@ -1626,7 +1641,7 @@ function withMediaCaptureTimeout(promise, sourceName) {
       timedOut = true;
       if (settled) return;
       settled = true;
-      reject(new Error(`${sourceName} 캡처가 ${CAPTURE_TIMEOUT_MS / 1000}초 안에 응답하지 않았습니다.`));
+      reject(new Error(t("error.captureTimeout", { source: sourceName, seconds: CAPTURE_TIMEOUT_MS / 1000 })));
     }, CAPTURE_TIMEOUT_MS);
 
     promise.then((stream) => {
@@ -1664,8 +1679,8 @@ async function createAudioStreamer(media, sourceName, label, onChunk) {
   const cleanupTrackDiagnostics = watchAudioTrackState(media, sourceName);
 
   context.addEventListener?.("statechange", () => {
-    if (context.state === "running") setAudioSourceStatus(sourceName, "준비됨", 0);
-    if (context.state === "suspended") setAudioSourceStatus(sourceName, "Audio paused", 0);
+    if (context.state === "running") setAudioSourceStatus(sourceName, t("audio.ready"), 0);
+    if (context.state === "suspended") setAudioSourceStatus(sourceName, t("audio.paused"), 0);
   });
 
   processor.onaudioprocess = (event) => {
@@ -1710,25 +1725,25 @@ async function createAudioStreamer(media, sourceName, label, onChunk) {
 
 async function ensureAudioContextRunning(context, sourceName) {
   if (context.state === "running") return;
-  setAudioSourceStatus(sourceName, "Starting audio", 0);
+  setAudioSourceStatus(sourceName, t("audio.starting"), 0);
   try {
     await context.resume();
   } catch {
-    setAudioSourceStatus(sourceName, "Audio blocked", 0);
-    throw new Error(`${sourceName} 오디오 엔진을 시작할 수 없습니다. Start를 다시 누르거나 마이크/화면 녹화 권한을 확인하세요.`);
+    setAudioSourceStatus(sourceName, t("audio.blocked"), 0);
+    throw new Error(t("error.audioEngineStart", { source: sourceName }));
   }
   if (context.state !== "running") {
-    setAudioSourceStatus(sourceName, "Audio blocked", 0);
-    throw new Error(`${sourceName} 오디오 엔진이 일시정지 상태입니다. Start를 다시 눌러 오디오 사용 권한을 다시 활성화하세요.`);
+    setAudioSourceStatus(sourceName, t("audio.blocked"), 0);
+    throw new Error(t("error.audioEngineSuspended", { source: sourceName }));
   }
 }
 
 function watchAudioTrackState(media, sourceName) {
   const tracks = media.getAudioTracks();
   const cleanups = tracks.map((track) => {
-    const onMute = () => setAudioSourceStatus(sourceName, "음소거됨", 0);
-    const onUnmute = () => setAudioSourceStatus(sourceName, "준비됨", 0);
-    const onEnded = () => setAudioSourceStatus(sourceName, "종료됨", 0);
+    const onMute = () => setAudioSourceStatus(sourceName, t("audio.muted"), 0);
+    const onUnmute = () => setAudioSourceStatus(sourceName, t("audio.ready"), 0);
+    const onEnded = () => setAudioSourceStatus(sourceName, t("audio.ended"), 0);
     track.addEventListener?.("mute", onMute);
     track.addEventListener?.("unmute", onUnmute);
     track.addEventListener?.("ended", onEnded);
@@ -1769,7 +1784,7 @@ function startAudioLevelMeter(sourceName, label, analyser) {
     const hasSignal = !isFeedbackSuppressed && level > INPUT_SIGNAL_THRESHOLD;
     if (hasSignal) silentSince = now;
     const inputStatus = hasSignal ? "signal" : now - silentSince > INPUT_SILENCE_WARNING_MS ? "silent" : "waiting";
-    setAudioSourceStatus(sourceName, isFeedbackSuppressed ? "Output isolated" : hasSignal ? "Signal" : "No signal", isFeedbackSuppressed ? 0 : level);
+    setAudioSourceStatus(sourceName, isFeedbackSuppressed ? t("audio.outputIsolated") : hasSignal ? t("audio.signal") : t("audio.noSignal"), isFeedbackSuppressed ? 0 : level);
     if (inputStatus !== lastBroadcastStatus || now - lastBroadcastAt > INPUT_STATUS_BROADCAST_MS) {
       broadcastInputStatus(sourceName, inputStatus, isFeedbackSuppressed ? 0 : level);
       lastBroadcastStatus = inputStatus;
@@ -1801,16 +1816,16 @@ function broadcastInputStatus(sourceName, status, level) {
 function stopAudioMeters() {
   for (const meter of state.audioMeters.values()) meter.close();
   state.audioMeters.clear();
-  setAudioSourceStatus("system", inputModeUses("system") ? "준비됨" : "꺼짐", 0);
-  setAudioSourceStatus("mic", inputModeUses("mic") ? "준비됨" : "꺼짐", 0);
+  setAudioSourceStatus("system", inputModeUses("system") ? t("audio.ready") : t("audio.off"), 0);
+  setAudioSourceStatus("mic", inputModeUses("mic") ? t("audio.ready") : t("audio.off"), 0);
 }
 
 function updateAudioInspectorLabels() {
-  setAudioSourceLabel("system", "System audio");
+  setAudioSourceLabel("system", t("audio.systemAudio"));
   setAudioSourceLabel("mic", selectedMicrophoneLabel());
   if (state.running) return;
-  setAudioSourceStatus("system", inputModeUses("system") ? "준비됨" : "꺼짐", 0);
-  setAudioSourceStatus("mic", inputModeUses("mic") ? "준비됨" : "꺼짐", 0);
+  setAudioSourceStatus("system", inputModeUses("system") ? t("audio.ready") : t("audio.off"), 0);
+  setAudioSourceStatus("mic", inputModeUses("mic") ? t("audio.ready") : t("audio.off"), 0);
 }
 
 function inputModeUses(sourceName) {
@@ -1821,7 +1836,7 @@ function inputModeUses(sourceName) {
 
 function setAudioSourceLabel(sourceName, label) {
   const target = audioStatus[sourceName]?.label;
-  if (target) target.textContent = label || (sourceName === "system" ? "System audio" : "System default");
+  if (target) target.textContent = label || (sourceName === "system" ? t("audio.systemAudio") : t("settings.systemDefault"));
 }
 
 function setAudioSourceStatus(sourceName, status, level) {
@@ -1832,7 +1847,7 @@ function setAudioSourceStatus(sourceName, status, level) {
 }
 
 function selectedMicrophoneLabel() {
-  return micSelect.selectedOptions[0]?.textContent || "System default";
+  return micSelect.selectedOptions[0]?.textContent || t("settings.systemDefault");
 }
 
 function getAudioTrackLabel(stream, fallback) {
@@ -1884,7 +1899,7 @@ async function hydrateMicrophones() {
   try {
     const selectedDeviceId = state.settings.micDeviceId || micSelect.value;
     const devices = await unlockMicrophoneLabels(await navigator.mediaDevices.enumerateDevices());
-    micSelect.replaceChildren(new Option("System default", ""));
+    micSelect.replaceChildren(new Option(t("settings.systemDefault"), ""));
     for (const device of devices.filter((item) => item.kind === "audioinput")) {
       if (!device.deviceId) continue;
       const option = document.createElement("option");
@@ -1909,7 +1924,7 @@ async function saveSettings(patch) {
     body: JSON.stringify(patch),
   });
   const body = await res.json();
-  if (!res.ok) throw new Error(body.error || "Failed to save settings.");
+  if (!res.ok) throw new Error(body.error || t("error.saveSettingsFailed"));
   if (body.settings) {
     state.hasOpenAIKey = Boolean(body.settings.hasOpenAIKey);
     state.hasOpenAISecondaryKey = Boolean(body.settings.hasOpenAISecondaryKey);
@@ -2097,7 +2112,7 @@ function flashLanguageMinimum() {
   group.classList.add("invalid");
   // The hint is empty + hidden by default (decluttered workspace); it only
   // appears for this validation flash, then hides again.
-  if (hint) { hint.textContent = "최소 2개 언어를 선택해야 합니다"; hint.hidden = false; }
+  if (hint) { hint.textContent = t("language.minimum"); hint.hidden = false; }
   languageMinimumTimer = setTimeout(() => {
     group.classList.remove("invalid");
     if (hint) { hint.textContent = ""; hint.hidden = true; }
@@ -2105,23 +2120,23 @@ function flashLanguageMinimum() {
 }
 
 function updateOpenAIKeyPlaceholder() {
-  openaiKeyInput.placeholder = state.hasOpenAIKey ? "configured (enter to replace)" : "sk-...";
+  openaiKeyInput.placeholder = state.hasOpenAIKey ? t("key.configuredPlaceholder") : "sk-...";
 }
 
 function updateOpenAISecondaryKeyPlaceholder() {
   if (!openaiSecondaryKeyInput) return;
-  openaiSecondaryKeyInput.placeholder = state.hasOpenAISecondaryKey ? "configured (enter to replace)" : "sk-... (separate Project)";
+  openaiSecondaryKeyInput.placeholder = state.hasOpenAISecondaryKey ? t("key.configuredPlaceholder") : "sk-... (separate Project)";
 }
 
 async function saveOpenAIKey() {
   clearError();
   const openaiKey = openaiKeyInput.value.trim();
   if (!openaiKey) {
-    showError(new Error(state.hasOpenAIKey ? "새 키를 입력하면 기존 키를 교체할 수 있습니다." : "OpenAI API key를 입력하세요."));
+    showError(new Error(state.hasOpenAIKey ? t("key.replaceHint") : t("key.enterOpenAI")));
     return;
   }
   try {
-    openaiKeyStatus.textContent = "Validating OpenAI Realtime...";
+    openaiKeyStatus.textContent = t("key.validatingOpenAI");
     await validateOpenAIKey(openaiKey);
     await saveSettings({ apiKeys: { openai: openaiKey } });
     openaiKeyInput.value = "";
@@ -2129,7 +2144,7 @@ async function saveOpenAIKey() {
     updateOpenAIKeyPlaceholder();
     updateOpenAIKeyStatus();
     updateServiceStrip();
-    showNotice("OpenAI Realtime 연결을 확인했고 API key를 저장했습니다.");
+    showNotice(t("key.openaiSaved"));
   } catch (error) {
     updateOpenAIKeyStatus();
     showError(error);
@@ -2140,11 +2155,11 @@ async function saveOpenAISecondaryKey() {
   clearError();
   const openaiSecondaryKey = openaiSecondaryKeyInput?.value.trim() ?? "";
   if (!openaiSecondaryKey) {
-    showError(new Error(state.hasOpenAISecondaryKey ? "새 보조 키를 입력하면 기존 키를 교체할 수 있습니다." : "OpenAI API key 2를 입력하세요."));
+    showError(new Error(state.hasOpenAISecondaryKey ? t("key.replaceHintSecondary") : t("key.enterOpenAISecondary")));
     return;
   }
   try {
-    openaiSecondaryKeyStatus.textContent = "Validating OpenAI Realtime...";
+    openaiSecondaryKeyStatus.textContent = t("key.validatingOpenAI");
     await validateOpenAIKey(openaiSecondaryKey);
     await saveSettings({ apiKeys: { openaiSecondary: openaiSecondaryKey } });
     openaiSecondaryKeyInput.value = "";
@@ -2152,7 +2167,7 @@ async function saveOpenAISecondaryKey() {
     updateOpenAISecondaryKeyPlaceholder();
     updateOpenAISecondaryKeyStatus();
     updateServiceStrip();
-    showNotice("OpenAI Realtime 보조 키를 확인했고 API key 2를 저장했습니다.");
+    showNotice(t("key.openaiSecondarySaved"));
   } catch (error) {
     updateOpenAISecondaryKeyStatus();
     showError(error);
@@ -2166,7 +2181,7 @@ async function validateOpenAIKey(openaiKey) {
     body: JSON.stringify({ apiKey: openaiKey }),
   });
   const body = await res.json();
-  if (!res.ok || !body.ok) throw new Error(body.error || "OpenAI Realtime 연결 확인에 실패했습니다.");
+  if (!res.ok || !body.ok) throw new Error(body.error || t("key.openaiValidateFailed"));
   return body;
 }
 
@@ -2180,14 +2195,15 @@ function updateOpenAISecondaryKeyStatus() {
 
 function updateGeminiKeyStatus() {
   renderKeyStatus(geminiKeyStatus, state.hasGeminiKey);
-  if (geminiKeyInput) geminiKeyInput.placeholder = state.hasGeminiKey ? "configured (enter to replace)" : "AIza...";
+  if (geminiKeyInput) geminiKeyInput.placeholder = state.hasGeminiKey ? t("key.configuredPlaceholder") : "AIza...";
 }
 
 // Explicit registration badge: the key never round-trips to the client, so
 // this badge is the user's only confirmation that a key is stored.
 function renderKeyStatus(element, registered) {
   if (!element) return;
-  element.textContent = registered ? "✓ 등록됨 · 로컬에 저장됨" : "미등록";
+  element.dataset.i18n = registered ? "key.registered" : "key.unregistered";
+  element.textContent = t(element.dataset.i18n);
   element.classList.toggle("registered", Boolean(registered));
 }
 
@@ -2195,19 +2211,19 @@ async function saveGeminiKey() {
   clearError();
   const geminiKey = geminiKeyInput.value.trim();
   if (!geminiKey) {
-    showError(new Error(state.hasGeminiKey ? "새 키를 입력하면 기존 키를 교체할 수 있습니다." : "Gemini API key를 입력하세요."));
+    showError(new Error(state.hasGeminiKey ? t("key.replaceHint") : t("key.enterGemini")));
     return;
   }
   try {
-    geminiKeyStatus.textContent = "Validating Gemini...";
+    geminiKeyStatus.textContent = t("key.validatingGemini");
     await validateGeminiKey(geminiKey);
-    geminiKeyStatus.textContent = "Saving Gemini key...";
+    geminiKeyStatus.textContent = t("key.savingGemini");
     await saveSettings({ apiKeys: { gemini: geminiKey } });
     geminiKeyInput.value = "";
     state.hasGeminiKey = true;
     updateGeminiKeyStatus();
     updateServiceStrip();
-    showNotice("Gemini API key를 확인했고 Live Translate 키로 저장했습니다.");
+    showNotice(t("key.geminiSaved"));
   } catch (error) {
     updateGeminiKeyStatus();
     showError(error);
@@ -2221,15 +2237,18 @@ async function validateGeminiKey(geminiKey) {
     body: JSON.stringify({ apiKey: geminiKey }),
   });
   const body = await res.json();
-  if (!res.ok || !body.ok) throw new Error(body.error || "Gemini API key 확인에 실패했습니다.");
+  if (!res.ok || !body.ok) throw new Error(body.error || t("key.geminiValidateFailed"));
   return body;
 }
 
 function updateGeminiSecondaryKeyStatus() {
   if (!geminiSecondaryKeyStatus) return;
   renderKeyStatus(geminiSecondaryKeyStatus, state.hasGeminiSecondaryKey);
-  if (state.hasGeminiSecondaryKey) geminiSecondaryKeyStatus.textContent = "✓ 등록됨 · 완료문장 언어집 보정 및 병렬 번역";
-  if (geminiSecondaryKeyInput) geminiSecondaryKeyInput.placeholder = state.hasGeminiSecondaryKey ? "configured (enter to replace)" : "AIza... (separate Project)";
+  if (state.hasGeminiSecondaryKey) {
+    geminiSecondaryKeyStatus.dataset.i18n = "key.registeredSecondary";
+    geminiSecondaryKeyStatus.textContent = t("key.registeredSecondary");
+  }
+  if (geminiSecondaryKeyInput) geminiSecondaryKeyInput.placeholder = state.hasGeminiSecondaryKey ? t("key.configuredPlaceholder") : "AIza... (separate Project)";
 }
 
 // Second Gemini key: a separate Gemini project for committed-line glossary
@@ -2240,18 +2259,18 @@ async function saveGeminiSecondaryKey() {
   clearError();
   const geminiSecondaryKey = geminiSecondaryKeyInput?.value.trim() ?? "";
   if (!geminiSecondaryKey) {
-    showError(new Error(state.hasGeminiSecondaryKey ? "새 보조 키를 입력하면 기존 키를 교체할 수 있습니다." : "Gemini API key 2를 입력하세요."));
+    showError(new Error(state.hasGeminiSecondaryKey ? t("key.replaceHintSecondary") : t("key.enterGeminiSecondary")));
     return;
   }
   try {
-    geminiSecondaryKeyStatus.textContent = "Validating Gemini...";
+    geminiSecondaryKeyStatus.textContent = t("key.validatingGemini");
     await validateGeminiKey(geminiSecondaryKey);
-    geminiSecondaryKeyStatus.textContent = "Saving Gemini key 2...";
+    geminiSecondaryKeyStatus.textContent = t("key.savingGemini2");
     await saveSettings({ apiKeys: { geminiSecondary: geminiSecondaryKey } });
     geminiSecondaryKeyInput.value = "";
     state.hasGeminiSecondaryKey = true;
     updateGeminiSecondaryKeyStatus();
-    showNotice("Gemini API key 2를 확인했고 완료문장 언어집 보정용 보조 키로 저장했습니다.");
+    showNotice(t("key.geminiSecondarySaved"));
   } catch (error) {
     updateGeminiSecondaryKeyStatus();
     showError(error);
@@ -2349,7 +2368,7 @@ function historyDayNodes(days) {
   if (days.length === 0) {
     const empty = document.createElement("div");
     empty.className = "empty-state";
-    empty.textContent = "아직 확정된 자막이 없습니다 — 세션을 시작하면 문장이 확정되는 대로 여기에 쌓입니다.";
+    empty.textContent = t("history.empty");
     return [empty];
   }
   return days.map((day, index) => {
@@ -2364,7 +2383,7 @@ function historyDayNodes(days) {
     label.textContent = day.label;
     const count = document.createElement("span");
     count.className = "translation-day-count";
-    count.textContent = `${day.count}문장`;
+    count.textContent = t("history.sentenceCount", { count: day.count });
     summary.append(label, count);
 
     const recordList = document.createElement("ol");
@@ -2414,7 +2433,7 @@ function dateKeyFromRecord(record) {
 }
 
 function labelFromDateKey(dateKey) {
-  return dateKey === "unknown" ? "날짜 미확인" : dateKey;
+  return dateKey === "unknown" ? t("history.unknownDate") : dateKey;
 }
 
 function formatHistoryDateKey(time) {
@@ -2442,7 +2461,7 @@ function topicNodes(topics) {
   if (topics.length === 0) {
     const empty = document.createElement("div");
     empty.className = "empty-state";
-    empty.textContent = "발표가 진행되면 주제가 자동으로 정리됩니다.";
+    empty.textContent = t("history.topicsEmpty");
     return [empty];
   }
   return topics.slice(0, 8).map((topic) => {
@@ -2451,7 +2470,7 @@ function topicNodes(topics) {
     const title = document.createElement("strong");
     title.textContent = topic.topic;
     const count = document.createElement("span");
-    count.textContent = `${topic.count}문장`;
+    count.textContent = t("history.sentenceCount", { count: topic.count });
     const latest = document.createElement("p");
     latest.textContent = topic.items?.[0]?.translatedText ?? "";
     item.append(title, count, latest);
@@ -2460,9 +2479,9 @@ function topicNodes(topics) {
 }
 
 function recorderStatusText(status) {
-  if (state.settings.recordProvider === "none") return "기록 꺼짐";
-  if (status?.lastError) return "기록 보조 기능 사용 중";
-  return "기록 준비됨";
+  if (state.settings.recordProvider === "none") return t("history.recorderOff");
+  if (status?.lastError) return t("history.recorderFallback");
+  return t("history.recorderReady");
 }
 
 async function clearSubtitleHistory() {
@@ -2530,7 +2549,7 @@ function showError(error) {
   errorBox.classList.remove("notice");
   errorBox.textContent = error.message || String(error);
   appendScreenPermissionAction(errorBox.textContent);
-  setConnectionStatus("문제가 발생했습니다", "error");
+  setConnectionStatus(t("status.problem"), "error");
 }
 
 // macOS re-binds the screen-recording grant to each build's code signature, so
@@ -2541,7 +2560,7 @@ function appendScreenPermissionAction(message) {
   const button = document.createElement("button");
   button.type = "button";
   button.className = "secondary compact";
-  button.textContent = "시스템 설정 열기";
+  button.textContent = t("error.openSystemSettings");
   button.addEventListener("click", () => {
     void window.realtimeNoelDesktop.openScreenRecordingSettings();
   });
@@ -2565,7 +2584,7 @@ function ensureWebSocketOpen() {
   if (state.ws?.readyState === WebSocket.OPEN) return Promise.resolve();
   return new Promise((resolve, reject) => {
     state.ws?.addEventListener("open", resolve, { once: true });
-    state.ws?.addEventListener("error", () => reject(new Error("WebSocket is not connected.")), { once: true });
+    state.ws?.addEventListener("error", () => reject(new Error(t("error.websocketClosed"))), { once: true });
   });
 }
 
@@ -2722,7 +2741,7 @@ function adjustControllerFontSize(delta) {
   form.elements.translationFontSize.value = next;
   form.elements.translationFontSizeRange.value = next;
   keepSourceTwoPixelsSmaller();
-  void persistControllerSubtitleSettings("자막 글자 크기를 저장했습니다.");
+  void persistControllerSubtitleSettings(t("notice.fontSizeSaved"));
 }
 
 function adjustControllerVerticalOffset(delta) {
@@ -2731,7 +2750,7 @@ function adjustControllerVerticalOffset(delta) {
   const next = Math.min(600, Math.max(0, Math.round(current + delta)));
   form.elements.verticalOffset.value = next;
   updateVerticalOffsetValue(next);
-  void persistControllerSubtitleSettings("자막 여백을 저장했습니다.");
+  void persistControllerSubtitleSettings(t("notice.edgeOffsetSaved"));
 }
 
 function setControllerSubtitlePosition(position) {
@@ -2740,7 +2759,7 @@ function setControllerSubtitlePosition(position) {
     const radio = form.querySelector(`input[name="pos-${language}"][value="${position}"]`);
     if (radio) radio.checked = true;
   }
-  void persistControllerSubtitleSettings("자막 위치를 저장했습니다.");
+  void persistControllerSubtitleSettings(t("notice.positionSaved"));
 }
 
 function applyControllerLanguagePreset(nextLanguages) {
@@ -2758,10 +2777,10 @@ function applyControllerLanguagePreset(nextLanguages) {
     .then(() => {
       if (state.running) {
         reconfigureRunningSession();
-        showNotice("자막 언어를 바꾸고 번역 채널을 다시 구성했습니다.");
+        showNotice(t("notice.languagesSavedRebuilt"));
         return;
       }
-      showNotice("자막 언어를 저장했습니다.");
+      showNotice(t("notice.languagesSaved"));
     })
     .catch(showError);
 }
@@ -2782,7 +2801,7 @@ function setControllerOpacity(value) {
   const opacity = Math.max(0.2, Math.min(1, readNumber(value, state.settings.opacity ?? DEFAULT_SUBTITLE.opacity)));
   form.elements.opacity.value = opacity;
   if (controllerOpacity) controllerOpacity.value = String(opacity);
-  void persistControllerSubtitleSettings("자막 투명도를 저장했습니다.");
+  void persistControllerSubtitleSettings(t("notice.opacitySaved"));
 }
 
 function syncControllerOpacity() {
@@ -2811,14 +2830,13 @@ function updateOpacityValue(value) {
 
 function formatCaptureFailure(source, error) {
   const isDenied = error?.name === "NotAllowedError" || /permission denied|denied|not allowed/i.test(error?.message || "");
+  // These name "Realtime Noel" on purpose: that is the bundle name macOS shows
+  // in Privacy & Security, so the instruction has to match what the user sees.
+  const reason = error?.message || error;
   if (source === "system") {
-    return isDenied
-      ? "시스템 오디오 권한이 거부되었습니다. macOS Privacy & Security에서 Realtime Noel의 Screen & System Audio Recording 권한을 허용한 뒤 앱을 재시작하세요."
-      : `시스템 오디오를 시작하지 못했습니다: ${error?.message || error} macOS Privacy & Security에서 Realtime Noel의 Screen & System Audio Recording 권한을 허용한 뒤 앱을 재시작하세요. 개발 실행 중이면 Electron 항목도 같은 권한이 필요합니다.`;
+    return isDenied ? t("error.systemAudioDenied") : t("error.systemAudioFailed", { reason });
   }
-  return isDenied
-    ? "마이크 권한이 거부되었습니다. 시스템 설정 > 개인정보 보호 및 보안 > 마이크에서 Realtime Noel을 허용한 뒤 앱을 재시작하세요."
-    : `마이크를 시작하지 못했습니다: ${error?.message || error} 시스템 설정 > 개인정보 보호 및 보안 > 마이크에서 Realtime Noel 권한을 확인하세요.`;
+  return isDenied ? t("error.micDenied") : t("error.micFailed", { reason });
 }
 
 // ── Live Call host audio bridge ────────────────────────────────────────────
@@ -2985,6 +3003,23 @@ if (window.realtimeNoelDesktop?.ensureLiveCallBridge) {
 // is relayed into the server's live-call caption ingest — the overlay,
 // preview, history, and session records then treat it exactly like a native
 // line. Host speech is skipped: the local engine already captions it.
+// ── UI language changes ───────────────────────────────────────────────────
+// subtitle-workspace.js repaints every static data-i18n node; the dynamic
+// panels this file renders have to be rebuilt from their current state.
+subscribeToLanguage(() => {
+  renderLanguagePills();
+  renderPlacementRows();
+  writeSettingsToForm(state.settings);
+  renderLanguageChips();
+  updatePtOutputControls();
+  updateAudioInspectorLabels();
+  updateSessionSummary();
+  updateServiceStrip();
+  renderHistory(state.history);
+  renderRecordsCalendar();
+  void loadSessionRecords();
+});
+
 if (window.realtimeNoelDesktop?.onLiveCallCaption) {
   window.realtimeNoelDesktop.onLiveCallCaption((caption) => {
     if (!caption || caption.speaker?.isParticipant !== true) return;
@@ -3004,7 +3039,7 @@ if (window.realtimeNoelDesktop?.onLiveCallCaption) {
         partial: false,
         targetLanguage: String(caption.language ?? ""),
         sourceText: "",
-        speaker: String(caption.speaker?.name ?? caption.speaker?.label ?? "참가자"),
+        speaker: String(caption.speaker?.name ?? caption.speaker?.label ?? t("live.participant")),
         translatedText: text,
       }));
       return;
@@ -3014,7 +3049,7 @@ if (window.realtimeNoelDesktop?.onLiveCallCaption) {
       partial: caption.isFinal !== true,
       targetLanguage: String(caption.language ?? ""),
       sourceText: "",
-      speaker: String(caption.speaker?.name ?? caption.speaker?.label ?? "참가자"),
+      speaker: String(caption.speaker?.name ?? caption.speaker?.label ?? t("live.participant")),
       speakerDepartment: String(caption.speaker?.department ?? ""),
       speakerJobTitle: String(caption.speaker?.jobTitle ?? ""),
       translatedText: text,

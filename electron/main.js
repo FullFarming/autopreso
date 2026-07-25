@@ -7,6 +7,9 @@ import { WebSocket } from "ws";
 
 import { startServer } from "../src/server.js";
 import { createSettingsStore, migrateSettingsFile } from "../src/settings-store.js";
+// The renderer owns the UI language choice (localStorage); it pushes the value
+// over IPC so the application menu speaks the same language.
+import { normalizeLanguage, setLanguage, t as translate } from "../public/subtitle-i18n.js";
 
 const APP_CONFIG_DIR = "realtime-noel";
 const LEGACY_CONFIG_DIR = ["auto", "preso"].join("");
@@ -1332,28 +1335,28 @@ function installApplicationMenu(serverUrl) {
     ...(process.platform === "darwin" ? [{ role: "appMenu" }] : []),
     { role: "editMenu" },
     {
-      label: "Surfaces",
+      label: translate("menu.surfaces"),
       submenu: [
         {
-          label: "Show Main Window",
+          label: translate("menu.showMainWindow"),
           accelerator: "CommandOrControl+Shift+M",
           click: () => { showDashboardWindow(); },
         },
         { type: "separator" },
         {
-          label: "Show Caption Controller",
+          label: translate("menu.showCaptionController"),
           accelerator: "CommandOrControl+Shift+C",
           click: () => { showControllerWindow(); },
         },
         {
-          label: "Hide Caption Controller",
+          label: translate("menu.hideCaptionController"),
           click: () => {
             if (controllerWindow && !controllerWindow.isDestroyed()) controllerWindow.hide();
           },
         },
         { type: "separator" },
         {
-          label: "Show Subtitle Overlays",
+          label: translate("menu.showSubtitleOverlays"),
           accelerator: "CommandOrControl+Shift+O",
           click: () => { showSubtitleOverlays(); },
         },
@@ -1362,6 +1365,16 @@ function installApplicationMenu(serverUrl) {
     { role: "windowMenu" },
   ];
   Menu.setApplicationMenu(Menu.buildFromTemplate(template));
+}
+
+// The renderer is the source of truth for the UI language; rebuild the menu
+// whenever it reports a change so the labels follow.
+function applyUiLanguage(language) {
+  const next = normalizeLanguage(language);
+  if (!next) return null;
+  setLanguage(next);
+  installApplicationMenu(lastServerUrl);
+  return next;
 }
 
 function destroyOverlayWindow() {
@@ -1788,6 +1801,12 @@ function registerOverlayIpc(settingsStore, { localAppOrigin, liveWorkspaceUrl, l
   // the host microphone source during a Live Call, so this must never reload or
   // recreate it, and it must not touch session state.
   ipcMain.handle("app:show-main-window", () => showDashboardWindow());
+  // UI language: the dashboard renderer persists the choice and reports it here
+  // so the application menu is rebuilt in the same language.
+  ipcMain.handle("app:set-ui-language", (event, language) => {
+    if (!isAllowedOrigin(event.sender.getURL(), new Set([localAppOrigin]))) return null;
+    return applyUiLanguage(language);
+  });
   ipcMain.handle("app:quit", () => {
     isQuitting = true;
     app.quit();

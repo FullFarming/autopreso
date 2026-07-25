@@ -2,7 +2,19 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 
+import { MESSAGES } from "../public/subtitle-i18n.js";
+
 const read = (path) => readFile(new URL(`../${path}`, import.meta.url), "utf8");
+
+// UI copy moved into the i18n dictionary: a surface now carries the KEY, and the
+// text has to resolve in both supported languages.
+/** @param {string} key @param {{ en?: RegExp, ko?: RegExp }} [patterns] */
+function assertLocalized(key, { en, ko } = {}) {
+  assert.equal(typeof MESSAGES.en[key], "string", `missing en copy for ${key}`);
+  assert.equal(typeof MESSAGES.ko[key], "string", `missing ko copy for ${key}`);
+  if (en) assert.match(MESSAGES.en[key], en);
+  if (ko) assert.match(MESSAGES.ko[key], ko);
+}
 
 test("host page exposes Presentation and Meeting without legacy Townhall or PTT UI", async () => {
   const [page, dashboard] = await Promise.all([
@@ -232,7 +244,8 @@ test("desktop subtitle workspace starts Live Call without a web workspace launch
     read("public/subtitle-dashboard.js"),
     read("public/subtitle-workspace.js"),
   ]);
-  assert.match(html, />Start Live Call</);
+  assert.match(html, /id="schedule-live-call"[^>]*data-i18n="live\.start"/);
+  assertLocalized("live.start", { en: /Start Live Call/ });
   assert.doesNotMatch(html, /id="open-meeting-mode"|data-open-live-workspace|>Open Live Call</);
   assert.doesNotMatch(script, /open-meeting-mode|data-open-live-workspace|openLiveWorkspace|realtime-noel-web\.vercel\.app/);
   assert.match(workspace, /await bridge\.startLiveCall\(draft\)/);
@@ -407,10 +420,12 @@ test("desktop Live workspace exposes only the local Start action", async () => {
     read("public/subtitle-workspace.js"),
   ]);
 
-  assert.match(html, />Start Live Call</);
+  assert.match(html, /id="schedule-live-call"[^>]*data-i18n="live\.start"/);
+  assertLocalized("live.start", { en: /Start Live Call/ });
   assert.doesNotMatch(html, /id="open-meeting-mode"|data-open-live-workspace|>Open Live Call</);
   assert.doesNotMatch(script, /openLiveWorkspace|window\.open\("https:\/\/realtime-noel-web\.vercel\.app\//);
-  assert.match(workspace, /QR \+ access code/);
+  assert.match(workspace, /t\("live\.stageUp", \{ code: result\.admissionCode/);
+  assertLocalized("live.stageUp", { en: /access code \{code\}/, ko: /입장 코드 \{code\}/ });
   assert.match(workspace, /result\?\.code === "HOST_LOGIN_REQUIRED"/);
 });
 
@@ -859,10 +874,16 @@ test("desktop local PT output separates fixed Gemini captions from conditional a
   assert.match(html, /name="voiceProvider"[^>]+value="gemini"[^>]+checked/);
   assert.match(html, /name="voiceProvider"[^>]+value="openai"/);
   assert.match(html, /OpenAI Realtime/);
-  // 2026-07-25 declutter: the static provider/routing helper paragraphs were
-  // removed; the Gemini-fixed note lives in the voice-method heading only.
-  assert.match(html, /자막 엔진은 Gemini 고정/);
-  assert.match(html, /시스템 기본 출력/);
+  // 2026-07-25 declutter, extended by the NOVA i18n pass: every explanatory
+  // helper sentence is gone. The Gemini-fixed fact survives as a compact note
+  // (label + value), not as a sentence.
+  assert.doesNotMatch(html, /자막 엔진은 Gemini 고정이며/);
+  assert.doesNotMatch(html, /pt-voice-method-help/);
+  assert.match(html, /data-i18n="output\.engineNote"[\s\S]{0,80}data-i18n="output\.engineNoteValue"/);
+  assertLocalized("output.engineNote", { ko: /자막 엔진/ });
+  assertLocalized("output.engineNoteValue", { ko: /Gemini 고정/ });
+  assert.match(html, /data-i18n="output\.systemDefault"/);
+  assertLocalized("output.systemDefault", { ko: /시스템 기본 출력/ });
   assert.doesNotMatch(html, /pt-output-routing-help/);
   assert.match(css, /\.pt-output-group/);
   assert.match(css, /\.pt-output-options/);
@@ -878,7 +899,8 @@ test("desktop local PT output separates fixed Gemini captions from conditional a
   assert.match(dashboard, /message\.targetLanguage !== state\.settings\.audioLanguage/);
   assert.match(dashboard, /state\.settings\.voiceProvider === "openai"/);
   assert.match(dashboard, /Gemini Live:[\s\S]*OpenAI voice/);
-  assert.match(dashboard, /통역 음성만 시작/);
+  assert.match(dashboard, /"start\.audio"/);
+  assertLocalized("start.audio", { ko: /통역 음성만 시작/ });
 });
 
 test("desktop Live Call draft always issues QR and code, validates local cover data, and keeps authorization inline", async () => {
@@ -890,7 +912,10 @@ test("desktop Live Call draft always issues QR and code, validates local cover d
 
   assert.doesNotMatch(html, /name="liveDraftAccess"/);
   assert.doesNotMatch(html, /QR 무코드 \+ 코드 링크|코드 필수/);
-  assert.match(html, /QR and a 6-digit access code are always created together/);
+  // The explanatory QR/code paragraph was deleted (no descriptive prose); the QR
+  // + code contract is asserted where it is implemented instead.
+  assert.doesNotMatch(html, /QR and a 6-digit access code are always created together|live-draft-access-note/);
+  assert.match(workspace, /t\("live\.stageUp", \{ code: result\.admissionCode/);
   assert.match(html, /id="live-draft-cover-rules"/);
   assert.match(html, /id="live-draft-cover-status"[^>]*role="status"[^>]*aria-live="polite"/);
   assert.match(html, /id="live-host-login-status"[^>]*role="status"[^>]*aria-live="polite"/);
@@ -908,7 +933,8 @@ test("desktop Live Call draft always issues QR and code, validates local cover d
   assert.match(workspace, /base64: window\.btoa\(binary\)/);
   assert.match(workspace, /coverImage: liveDraftCoverData/);
   assert.match(workspace, /result\?\.code === "HOST_LOGIN_REQUIRED"/);
-  assert.match(workspace, /Open Settings and save the host authorization/);
+  assert.match(workspace, /t\("live\.hostLoginRequired"\)/);
+  assertLocalized("live.hostLoginRequired", { en: /Open Settings and save the host authorization/ });
   assert.doesNotMatch(workspace, /Sign in once in the Live workspace window|login page|login screen/i);
 });
 
@@ -918,11 +944,12 @@ test("host authorization save reports the workspace verification outcome instead
   // Start Live Call distinguishes "nothing saved" from "workspace rejected the
   // saved credentials" so re-saving the same values is never prescribed as the fix.
   assert.match(workspace, /HOST_LOGIN_REJECTED/);
-  assert.match(workspace, /rejected the saved host ID\/password/);
+  assert.match(workspace, /t\("live\.hostLoginRejected"\)/);
+  assertLocalized("live.hostLoginRejected", { en: /rejected the saved host ID\/password/ });
 
   // Saving verifies against the workspace and surfaces the real outcome.
   assert.match(workspace, /result\.verified/);
-  assert.match(workspace, /HOST_LOGIN_VERIFICATION_MESSAGES/);
+  assert.match(workspace, /HOST_LOGIN_VERIFICATION_KEYS/);
   assert.match(workspace, /NETWORK_UNAVAILABLE/);
   assert.match(workspace, /LOGIN_RATE_LIMITED/);
   assert.match(workspace, /HOST_CREDENTIAL_ENCRYPTION_UNAVAILABLE/);
@@ -958,10 +985,12 @@ test("armed controller can explicitly end Live Call without coupling caption con
 
   assert.match(controllerHtml, /id="controller-go-live"[\s\S]{0,900}id="controller-end-live-call"/);
   assert.match(controllerHtml, /id="controller-live-call-status"[^>]*role="status"[^>]*aria-live="polite"/);
-  assert.match(controllerJs, /window\.confirm\("End this Live Call for every participant\? This cannot be undone\."\)/);
+  assert.match(controllerJs, /window\.confirm\(t\("controller\.endConfirm"\)\)/);
+  assertLocalized("controller.endConfirm", { en: /End this Live Call for every participant\? This cannot be undone\./ });
   assert.match(controllerJs, /await window\.realtimeNoelDesktop\.endLiveCall\(\)/);
   assert.match(controllerJs, /liveCallGroup\.hidden = true[\s\S]{0,160}await syncLiveCall\(\)/);
-  assert.match(controllerJs, /Live Call could not be ended\. Try again\./);
+  assert.match(controllerJs, /setControllerStatus\("controller\.endFailed"\)/);
+  assertLocalized("controller.endFailed", { en: /Live Call could not be ended\. Try again\./ });
   assert.match(controllerJs, /endLiveCallButton\.disabled = false/);
   assert.match(controllerJs, /controller-restart"\)\?\.addEventListener\("click", \(\) => sendControl\(\{ command: "restart" \}\)\)/);
   assert.match(controllerJs, /controller-stop"\)\?\.addEventListener\("click", \(\) => sendControl\(\{ command: "stop" \}\)\)/);
@@ -979,12 +1008,15 @@ test("controller is a one-row mini-player: brand/drag zone, transport, adjust, w
   assert.match(html, /id="controller-live-call-status"[^>]*class="mp-status"[^>]*role="status"/);
   assert.match(html, /id="controller-vu-fill"/);
   // Transport: Restart/Stop icons + big Go-Live + elapsed timer readout.
-  assert.match(html, /mp-transport"[^>]*aria-label="Caption engine"[\s\S]{0,1200}controller-restart/);
+  assert.match(html, /mp-transport"[^>]*data-i18n-aria="controller\.captionEngine"[\s\S]{0,1200}controller-restart/);
+  assertLocalized("controller.captionEngine", { en: /Caption engine/ });
   assert.match(html, /id="controller-go-live"[^>]*>Go-Live</);
   assert.match(html, /id="controller-elapsed"/);
   // Adjust + window clusters exist; language preset row stays gone.
-  assert.match(html, /mp-adjust"[^>]*aria-label="Subtitle appearance"/);
-  assert.match(html, /mp-window"[^>]*aria-label="App controls"[\s\S]{0,900}controller-quit/);
+  assert.match(html, /mp-adjust"[^>]*data-i18n-aria="controller\.appearance"/);
+  assert.match(html, /mp-window"[^>]*data-i18n-aria="controller\.appControls"[\s\S]{0,900}controller-quit/);
+  assertLocalized("controller.appearance", { en: /Subtitle appearance/ });
+  assertLocalized("controller.appControls", { en: /App controls/ });
   assert.doesNotMatch(html, /data-controller-languages=/);
   assert.match(css, /\.subtitle-controller-body \.controller-cluster \{/);
   assert.match(css, /@keyframes mp-live-pulse/);

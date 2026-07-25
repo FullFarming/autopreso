@@ -3,6 +3,8 @@ import { readFileSync } from "node:fs";
 import path from "node:path";
 import { test } from "node:test";
 
+import { MESSAGES } from "../public/subtitle-i18n.js";
+
 const rootDir = path.join(import.meta.dirname, "..");
 const read = (relative) => readFileSync(path.join(rootDir, relative), "utf8");
 
@@ -187,7 +189,10 @@ test("controller can be moved by pointer drag and recovered from the application
   const main = read("electron/main.js");
   assert.match(main, /ipcMain\.on\("subtitle-controller:move-by"/u);
   assert.match(main, /function installApplicationMenu/u);
-  assert.match(main, /Show Caption Controller/u);
+  // The label is translated; the menu references the key, the copy lives in the
+  // shared dictionary (both languages are covered by test/ui-i18n.test.js).
+  assert.match(main, /translate\("menu\.showCaptionController"\)/u);
+  assert.match(MESSAGES.en["menu.showCaptionController"], /Show Caption Controller/u);
   assert.match(main, /Menu\.setApplicationMenu/u);
 
   const preload = read("electron/preload.js");
@@ -235,7 +240,9 @@ test("desktop go-live refreshes the version and the dashboard bridges host audio
 
   // Go-Live failures surface on the controller instead of failing silently.
   const controllerJs = read("public/subtitle-controller.js");
-  assert.match(controllerJs, /Go-Live failed \(\$\{result\?\.code \?\? "unknown"\}\)/u);
+  assert.match(controllerJs, /t\("controller\.goLiveFailedCode", \{ code: result\?\.code \?\? "unknown" \}\)/u);
+  assert.match(MESSAGES.en["controller.goLiveFailedCode"], /Go-Live failed \(\{code\}\)/u);
+  assert.equal(typeof MESSAGES.ko["controller.goLiveFailedCode"], "string");
 });
 
 test("go-live leaves only the controller and overlays on screen; End brings the dashboard back", () => {

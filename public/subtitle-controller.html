@@ -1,9 +1,18 @@
 <!doctype html>
-<html lang="en">
+<html lang="ko">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Realtime Noel Subtitle Controller</title>
+    <title>NOVA Caption Controller</title>
+    <script>
+      // Anti-flash: adopt the stored UI language before the console renders.
+      try {
+        const stored = localStorage.getItem("realtime-noel-ui-language");
+        const lang = stored === "en" || stored === "ko" ? stored : "ko";
+        document.documentElement.lang = lang;
+        document.documentElement.dataset.uiLang = lang;
+      } catch { /* storage optional */ }
+    </script>
     <link rel="stylesheet" href="/subtitle.css" />
   </head>
   <body class="subtitle-controller-body">
@@ -11,69 +20,69 @@
          player — brand/drag zone (track info), transport (Restart · Stop ·
          big Go-Live · Host Speak · End · elapsed), adjust cluster (font,
          position, opacity, gap), window cluster (Main · Hide · Quit). -->
-    <main class="caption-player-controller caption-controller-window mini-player" aria-label="Live subtitle controls">
-      <div id="controller-drag" class="controller-drag mp-brand" role="button" tabindex="0" aria-label="Move subtitle controller">
-        <strong>Realtime Noel</strong>
-        <span id="controller-live-call-status" class="mp-status" role="status" aria-live="polite" aria-atomic="true">Captions ready</span>
+    <main class="caption-player-controller caption-controller-window mini-player" data-i18n-aria="controller.windowLabel" aria-label="라이브 자막 제어">
+      <div id="controller-drag" class="controller-drag mp-brand" role="button" tabindex="0" data-i18n-aria="controller.move" aria-label="자막 컨트롤러 이동">
+        <strong data-i18n="app.name">NOVA</strong>
+        <span id="controller-live-call-status" class="mp-status" role="status" aria-live="polite" aria-atomic="true" data-i18n="controller.captionsReady">자막 준비됨</span>
         <span class="mp-vu" aria-hidden="true"><i id="controller-vu-fill"></i></span>
       </div>
       <div class="controller-body">
-        <div class="controller-cluster mp-transport" role="group" aria-label="Caption engine">
-          <button id="controller-restart" type="button" class="mp-icon controller-primary" title="Restart captions — the Live Call session stays connected" aria-label="Restart captions">
+        <div class="controller-cluster mp-transport" role="group" data-i18n-aria="controller.captionEngine" aria-label="자막 엔진">
+          <button id="controller-restart" type="button" class="mp-icon controller-primary" data-i18n-title="controller.restart" title="자막 다시 시작" data-i18n-aria="controller.restart" aria-label="자막 다시 시작">
             <svg viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" aria-hidden="true"><path d="M13.4 6.4A5.6 5.6 0 1 0 13.9 9"/><path d="M13.6 2.6v3.8H9.8" stroke-linejoin="round"/></svg>
           </button>
-          <button id="controller-stop" type="button" class="mp-icon" title="Stop captions only — guests remain in the Live Call" aria-label="Stop captions">
+          <button id="controller-stop" type="button" class="mp-icon" data-i18n-title="controller.stop" title="자막 정지" data-i18n-aria="controller.stop" aria-label="자막 정지">
             <svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor" aria-hidden="true"><rect x="3.5" y="3.5" width="9" height="9" rx="1.6"/></svg>
           </button>
           <div id="controller-live-call" class="mp-live-call" aria-label="Live Call" hidden>
-            <button id="controller-go-live" type="button" class="controller-go-live" title="Start the Live Call for every participant">Go-Live</button>
-            <button id="controller-host-speak" type="button" class="mp-icon" title="Reclaim the speaking floor so the host microphone is heard" aria-label="Host Speak" hidden>
+            <button id="controller-go-live" type="button" class="controller-go-live" data-i18n="controller.goLive">Go-Live</button>
+            <button id="controller-host-speak" type="button" class="mp-icon" data-i18n-aria="controller.hostSpeak" aria-label="호스트 발언" hidden>
               <svg viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true"><rect x="6" y="1.8" width="4" height="7.4" rx="2" fill="currentColor" stroke="none"/><path d="M3.4 7.4a4.6 4.6 0 0 0 9.2 0M8 12v2.4"/></svg>
             </button>
-            <button id="controller-end-live-call" type="button" class="controller-button controller-danger mp-end" title="End the Live Call for every participant">End</button>
-            <span id="controller-elapsed" class="controller-readout mp-elapsed" aria-label="Live elapsed time" hidden>00:00</span>
+            <button id="controller-end-live-call" type="button" class="controller-button controller-danger mp-end" data-i18n="controller.end">종료</button>
+            <span id="controller-elapsed" class="controller-readout mp-elapsed" data-i18n-aria="controller.elapsed" aria-label="라이브 경과 시간" hidden>00:00</span>
           </div>
         </div>
-        <div class="controller-cluster mp-adjust" role="group" aria-label="Subtitle appearance">
-          <div class="controller-group" aria-label="Subtitle font size">
-            <button id="controller-font-down" type="button" class="controller-icon" aria-label="Decrease subtitle font size">A-</button>
+        <div class="controller-cluster mp-adjust" role="group" data-i18n-aria="controller.appearance" aria-label="자막 표시">
+          <div class="controller-group" data-i18n-aria="controller.fontSize" aria-label="자막 글자 크기">
+            <button id="controller-font-down" type="button" class="controller-icon" data-i18n-aria="controller.fontDown" aria-label="자막 글자 크기 줄이기">A-</button>
             <span id="controller-font-size" class="controller-readout">38px</span>
-            <button id="controller-font-up" type="button" class="controller-icon" aria-label="Increase subtitle font size">A+</button>
+            <button id="controller-font-up" type="button" class="controller-icon" data-i18n-aria="controller.fontUp" aria-label="자막 글자 크기 키우기">A+</button>
           </div>
-          <div class="controller-group controller-position" aria-label="Subtitle position">
-            <button type="button" class="controller-chip mp-pos" data-controller-position="top-center" title="Top" aria-label="Subtitles at the top">
+          <div class="controller-group controller-position" data-i18n-aria="controller.position" aria-label="자막 위치">
+            <button type="button" class="controller-chip mp-pos" data-controller-position="top-center" data-i18n-aria="controller.positionTop" aria-label="자막 상단">
               <svg viewBox="0 0 14 14" width="13" height="13" fill="currentColor" aria-hidden="true"><rect x="1.5" y="2" width="11" height="2.4" rx="1.1"/><rect x="3.5" y="9.6" width="7" height="1.6" rx="0.8" opacity="0.35"/></svg>
             </button>
-            <button type="button" class="controller-chip mp-pos" data-controller-position="middle-center" title="Middle" aria-label="Subtitles in the middle">
+            <button type="button" class="controller-chip mp-pos" data-controller-position="middle-center" data-i18n-aria="controller.positionMiddle" aria-label="자막 중앙">
               <svg viewBox="0 0 14 14" width="13" height="13" fill="currentColor" aria-hidden="true"><rect x="1.5" y="5.8" width="11" height="2.4" rx="1.1"/></svg>
             </button>
-            <button type="button" class="controller-chip mp-pos" data-controller-position="bottom-center" title="Bottom" aria-label="Subtitles at the bottom">
+            <button type="button" class="controller-chip mp-pos" data-controller-position="bottom-center" data-i18n-aria="controller.positionBottom" aria-label="자막 하단">
               <svg viewBox="0 0 14 14" width="13" height="13" fill="currentColor" aria-hidden="true"><rect x="3.5" y="2.8" width="7" height="1.6" rx="0.8" opacity="0.35"/><rect x="1.5" y="9.6" width="11" height="2.4" rx="1.1"/></svg>
             </button>
           </div>
-          <label class="controller-opacity" title="Subtitle background opacity">
+          <label class="controller-opacity" data-i18n-title="controller.opacity" title="자막 배경 불투명도">
             <svg viewBox="0 0 14 14" width="13" height="13" aria-hidden="true"><circle cx="7" cy="7" r="5.4" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M7 1.6a5.4 5.4 0 0 1 0 10.8Z" fill="currentColor"/></svg>
-            <input id="controller-opacity" type="range" min="0.2" max="1" step="0.01" aria-label="Subtitle background opacity" />
+            <input id="controller-opacity" type="range" min="0.2" max="1" step="0.01" data-i18n-aria="controller.opacity" aria-label="자막 배경 불투명도" />
             <output id="controller-opacity-value">92%</output>
           </label>
-          <div class="controller-group controller-gap" aria-label="Subtitle edge gap" title="Distance from the screen edge">
+          <div class="controller-group controller-gap" data-i18n-aria="controller.gap" aria-label="자막 가장자리 여백">
             <svg viewBox="0 0 14 14" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" aria-hidden="true"><path d="M2 1.6h10M2 12.4h10M7 4v6M5.2 5.6 7 3.8l1.8 1.8M5.2 8.4 7 10.2l1.8-1.8"/></svg>
-            <button id="controller-gap-down" type="button" class="controller-icon" aria-label="Move subtitles closer to the edge">−</button>
+            <button id="controller-gap-down" type="button" class="controller-icon" data-i18n-aria="controller.gapDown" aria-label="자막을 가장자리에 가깝게">−</button>
             <span id="controller-gap-value" class="controller-readout">48</span>
-            <button id="controller-gap-up" type="button" class="controller-icon" aria-label="Move subtitles away from the edge">+</button>
+            <button id="controller-gap-up" type="button" class="controller-icon" data-i18n-aria="controller.gapUp" aria-label="자막을 가장자리에서 멀게">+</button>
           </div>
         </div>
-        <div id="controller-voice-provider" class="controller-language-set" role="radiogroup" aria-label="통역 음성 엔진" hidden>
-          <span>Voice</span>
+        <div id="controller-voice-provider" class="controller-language-set" role="radiogroup" data-i18n-aria="controller.voiceEngine" aria-label="통역 음성 엔진" hidden>
+          <span data-i18n="controller.voice">음성</span>
           <button type="button" class="controller-lang-option" data-controller-voice-provider="gemini" role="radio" aria-checked="true">Gemini</button>
           <button type="button" class="controller-lang-option" data-controller-voice-provider="openai" role="radio" aria-checked="false">OpenAI</button>
         </div>
-        <div class="controller-cluster mp-window" role="group" aria-label="App controls">
-          <button id="controller-main-window" type="button" class="mp-pill" title="Bring the main window to the front. The Live Call keeps running.">Main</button>
-          <button id="controller-hide" type="button" class="mp-icon" title="Hide the controller. Captions keep running." aria-label="Hide the controller">
+        <div class="controller-cluster mp-window" role="group" data-i18n-aria="controller.appControls" aria-label="앱 제어">
+          <button id="controller-main-window" type="button" class="mp-pill" data-i18n="controller.mainWindow">메인</button>
+          <button id="controller-hide" type="button" class="mp-icon" data-i18n-aria="controller.hide" aria-label="컨트롤러 숨기기">
             <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true"><path d="M3.5 6.2 8 10.4l4.5-4.2"/></svg>
           </button>
-          <button id="controller-quit" type="button" class="mp-icon controller-danger" title="Quit Realtime Noel" aria-label="Quit Realtime Noel">
+          <button id="controller-quit" type="button" class="mp-icon controller-danger" data-i18n-aria="controller.quit" aria-label="종료">
             <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" aria-hidden="true"><path d="M8 1.8v6"/><path d="M4.2 4.1a5.4 5.4 0 1 0 7.6 0"/></svg>
           </button>
         </div>
