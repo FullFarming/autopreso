@@ -8,6 +8,8 @@ import path from "node:path";
 // what was actually said.
 
 const MAX_LINES_PER_SESSION = 20_000;
+const MIN_BLOCK_MILLISECONDS = 15 * 60 * 1_000;
+const META_SUFFIX = ".meta.json";
 const MAX_LINE_CHARS = 2_000;
 const MAX_TITLE_CHARS = 120;
 const MAX_PROMPT_CHARS = 120_000;
@@ -18,6 +20,9 @@ export function createSessionTranscripts({
   now = () => new Date(),
   log = console,
   persistDelayMs = 1000,
+  // Layout floor for a session that died before recording anything: the records
+  // calendar still needs a block with non-zero height to be clickable.
+  minBlockMs = MIN_BLOCK_MILLISECONDS,
 } = {}) {
   if (!storageDir) throw new Error("session transcripts require a storageDir");
   /** @type {any} */
@@ -32,6 +37,8 @@ export function createSessionTranscripts({
     await fs.mkdir(storageDir, { recursive: true });
     const payload = {
       id: session.id,
+      kind: session.kind === "live-call" ? "live-call" : "local",
+      liveSessionId: session.liveSessionId ?? "",
       title: session.title,
       startedAt: session.startedAt,
       endedAt: session.endedAt,
@@ -43,6 +50,23 @@ export function createSessionTranscripts({
     const temp = `${target}.tmp`;
     await fs.writeFile(temp, JSON.stringify(payload), { mode: 0o600 });
     await fs.rename(temp, target);
+    await writeMetaFile(session);
+  }
+
+  // Sidecar index. list() reads only these, so opening a month of the records
+  // calendar does not JSON.parse every transcript -- a 2-hour meeting is ~3MB of
+  // lines, and the old list() parsed all of it to produce six fields.
+  async function writeMetaFile(session) {
+    const target = path.join(storageDir, `${encodeURIComponent(session.id)}${META_SUFFIX}`);
+    const temp = `${target}.tmp`;
+    try {
+      await fs.writeFile(temp, JSON.stringify(metaOf(session, { minBlockMs })), { mode: 0o600 });
+      await fs.rename(temp, target);
+    } catch (error) {
+      // The transcript itself is already safely on disk; a missing sidecar only
+      // costs a full parse on the next listing, which then rewrites it.
+      log?.warn?.(`[transcripts] meta sidecar write failed for ${session.id}: ${error?.message ?? error}`);
+    }
   }
 
   function schedulePersist() {
@@ -64,14 +88,19 @@ export function createSessionTranscripts({
     await writeSessionFile(active);
   }
 
-  /** @param {{ sessionId?: string, title?: string }} [args] */
-  async function begin({ sessionId, title = "" } = {}) {
+  /** @param {{ sessionId?: string, title?: string, kind?: string, liveSessionId?: string, startedAt?: string }} [args] */
+  async function begin({ sessionId, title = "", kind = "local", liveSessionId = "", startedAt: startedAtOverride = "" } = {}) {
     if (typeof sessionId !== "string" || !sessionId) return null;
-    if (active && active.id === sessionId) return metaOf(active);
+    if (active && active.id === sessionId) return metaOf(active, { minBlockMs });
     if (active) await end();
-    const startedAt = now();
+    // A Live Call goes live before captions start, and the calendar must place
+    // the meeting at the CALL's start, so an explicit start wins over the clock.
+    const overrideMs = Date.parse(startedAtOverride);
+    const startedAt = Number.isFinite(overrideMs) ? new Date(overrideMs) : now();
     active = {
       id: sessionId,
+      kind: kind === "live-call" ? "live-call" : "local",
+      liveSessionId: typeof liveSessionId === "string" ? liveSessionId.slice(0, 200) : "",
       title: normalizeLineText(title).slice(0, MAX_TITLE_CHARS),
       startedAt: startedAt.toISOString(),
       startedMs: startedAt.getTime(),
@@ -82,7 +111,7 @@ export function createSessionTranscripts({
       audioTail: Promise.resolve(),
     };
     await schedulePersist();
-    return metaOf(active);
+    return metaOf(active, { minBlockMs });
   }
 
   async function recordLine(message = {}) {
@@ -205,7 +234,7 @@ export function createSessionTranscripts({
       audioSources: new Set(),
     };
     await writeSessionFile(session);
-    return metaOf(session);
+    return metaOf(session, { minBlockMs });
   }
 
   async function end() {
@@ -217,13 +246,14 @@ export function createSessionTranscripts({
     active.endedAt = now().toISOString();
     await active.audioTail;
     active.finalizedAudio = await finalizeAudio(active);
-    const meta = metaOf(active);
+    const meta = metaOf(active, { minBlockMs });
     await persistActive();
     active = null;
     return meta;
   }
 
-  async function list() {
+  /** @param {{ kind?: string, from?: string, to?: string }} [filter] */
+  async function list(filter = {}) {
     let entries;
     try {
       entries = await fs.readdir(storageDir);
@@ -232,21 +262,53 @@ export function createSessionTranscripts({
     }
     const sessions = [];
     for (const entry of entries) {
-      if (!entry.endsWith(".json") || entry.endsWith(".tmp")) continue;
-      const session = await readSessionFile(path.join(storageDir, entry));
-      if (session) sessions.push(metaOf(session));
+      if (!entry.endsWith(".json") || entry.endsWith(".tmp") || entry.endsWith(META_SUFFIX)) continue;
+      const meta = await readMeta(entry);
+      if (meta) sessions.push(meta);
     }
     sessions.sort((a, b) => b.startedAt.localeCompare(a.startedAt));
-    return sessions;
+    return sessions.filter((session) => matchesFilter(session, filter));
+  }
+
+  /** Sidecar first; on a miss, parse the transcript once and backfill it. */
+  async function readMeta(entry) {
+    const id = entry.slice(0, -".json".length);
+    const metaPath = path.join(storageDir, `${id}${META_SUFFIX}`);
+    try {
+      const parsed = JSON.parse(await fs.readFile(metaPath, "utf8"));
+      if (parsed && typeof parsed === "object" && typeof parsed.id === "string" && parsed.id) return parsed;
+    } catch {
+      // No sidecar, or an unreadable one: fall through to the full parse.
+    }
+    const session = await readSessionFile(path.join(storageDir, entry));
+    if (!session) return null;
+    const meta = metaOf(session, { minBlockMs });
+    // Self-healing, so records written before sidecars existed need no migration.
+    await writeMetaFile(session);
+    return meta;
+  }
+
+  /** @param {any} session @param {{ kind?: string, from?: string, to?: string }} [filter] */
+  function matchesFilter(session, { kind, from, to } = {}) {
+    if (kind && session.kind !== kind) return false;
+    // A meeting counts as inside the window when it OVERLAPS it, so a 2-hour
+    // call that began before the visible range still appears in it.
+    const startMs = Date.parse(session.startedAt);
+    const endMs = Date.parse(session.effectiveEnd || session.startedAt);
+    const fromMs = from ? Date.parse(from) : Number.NEGATIVE_INFINITY;
+    const toMs = to ? Date.parse(to) : Number.POSITIVE_INFINITY;
+    if (!Number.isFinite(startMs)) return false;
+    const end = Number.isFinite(endMs) ? endMs : startMs;
+    return end >= fromMs && startMs <= toMs;
   }
 
   async function get(sessionId) {
     if (active && active.id === sessionId) {
-      return { meta: metaOf(active), lines: [...active.lines], summary: active.summary ?? null };
+      return { meta: metaOf(active, { minBlockMs }), lines: [...active.lines], summary: active.summary ?? null };
     }
     const session = await readSessionFile(sessionPath(sessionId));
     if (!session) return null;
-    return { meta: metaOf(session), lines: session.lines, summary: session.summary ?? null };
+    return { meta: metaOf(session, { minBlockMs }), lines: session.lines, summary: session.summary ?? null };
   }
 
   /**
@@ -292,17 +354,38 @@ function buildWavFile(pcm, sampleRate) {
   return Buffer.concat([header, pcm]);
 }
 
-function metaOf(session) {
+function metaOf(session, { minBlockMs = MIN_BLOCK_MILLISECONDS } = {}) {
+  const startedAt = session.startedAt ?? "";
+  const endedAt = session.endedAt ?? "";
   return {
     id: session.id,
+    // Records written before the calendar existed have no kind; they were all
+    // local caption sessions, so that is the safe default.
+    kind: session.kind === "live-call" ? "live-call" : "local",
+    liveSessionId: typeof session.liveSessionId === "string" ? session.liveSessionId : "",
     title: session.title ?? "",
-    startedAt: session.startedAt ?? "",
-    endedAt: session.endedAt ?? "",
+    startedAt,
+    endedAt,
+    // A guessed end is never persisted -- it is derived on read so the rule can
+    // change and a crashed session stays honest about being unterminated.
+    ...deriveEnd({ startedAt, endedAt, lines: session.lines, minBlockMs }),
     lineCount: session.lines?.length ?? 0,
     hasSummary: Boolean(session.summary),
     audioSources: session.finalizedAudio
       ?? (Array.isArray(session.audioSources) ? session.audioSources : [...(session.audioSources ?? [])].sort()),
   };
+}
+
+/** End time for calendar layout: the real end, else the last line, else a floor. */
+function deriveEnd({ startedAt, endedAt, lines, minBlockMs }) {
+  if (endedAt) return { effectiveEnd: endedAt, isUnterminated: false };
+  const lastLineAt = Array.isArray(lines) && lines.length > 0 ? lines[lines.length - 1]?.at : "";
+  if (typeof lastLineAt === "string" && lastLineAt) {
+    return { effectiveEnd: lastLineAt, isUnterminated: true };
+  }
+  const startedMs = Date.parse(startedAt);
+  if (!Number.isFinite(startedMs)) return { effectiveEnd: "", isUnterminated: true };
+  return { effectiveEnd: new Date(startedMs + minBlockMs).toISOString(), isUnterminated: true };
 }
 
 async function readSessionFile(filePath) {
@@ -311,6 +394,10 @@ async function readSessionFile(filePath) {
     if (!parsed || typeof parsed !== "object" || typeof parsed.id !== "string" || !parsed.id) return null;
     return {
       id: parsed.id,
+      // Absent on records written before the calendar existed: those were all
+      // local caption sessions.
+      kind: parsed.kind === "live-call" ? "live-call" : "local",
+      liveSessionId: typeof parsed.liveSessionId === "string" ? parsed.liveSessionId : "",
       title: typeof parsed.title === "string" ? parsed.title : "",
       startedAt: typeof parsed.startedAt === "string" ? parsed.startedAt : "",
       startedMs: Date.parse(parsed.startedAt) || 0,

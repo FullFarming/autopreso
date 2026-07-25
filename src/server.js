@@ -264,9 +264,14 @@ export async function startServer(options) {
     return summary;
   };
 
-  app.get("/api/subtitles/sessions", async (_req, res) => {
+  app.get("/api/subtitles/sessions", async (req, res) => {
     if (!sessionTranscripts) return res.json({ ok: true, data: [] });
-    res.json({ ok: true, data: await sessionTranscripts.list() });
+    // The records calendar asks for one visible range at a time, so the response
+    // is bounded by what is on screen rather than by the whole history.
+    const kind = req.query.kind === "live-call" || req.query.kind === "local" ? req.query.kind : undefined;
+    const from = typeof req.query.from === "string" ? req.query.from : undefined;
+    const to = typeof req.query.to === "string" ? req.query.to : undefined;
+    res.json({ ok: true, data: await sessionTranscripts.list({ kind, from, to }) });
   });
 
   app.get("/api/subtitles/sessions/:id", async (req, res) => {
@@ -593,7 +598,19 @@ export async function startServer(options) {
         try {
           validateSubtitleSettings(message.settings);
           await subtitles.start({ sessionId: message.sessionId, settings: message.settings });
-          await sessionTranscripts?.begin({ sessionId: message.sessionId });
+          // Optional meeting identity. When captions are running for a Live Call
+          // the record must be anchored to the CALL's start and carry its title,
+          // because that is what the records calendar places on the grid. Every
+          // field is bounded and validated inside begin(); absent means a plain
+          // local caption session, which is the historical behaviour.
+          const meeting = message.meeting && typeof message.meeting === "object" ? message.meeting : {};
+          await sessionTranscripts?.begin({
+            sessionId: message.sessionId,
+            kind: meeting.kind === "live-call" ? "live-call" : "local",
+            liveSessionId: typeof meeting.liveSessionId === "string" ? meeting.liveSessionId : "",
+            title: typeof meeting.title === "string" ? meeting.title : "",
+            startedAt: typeof meeting.startedAt === "string" ? meeting.startedAt : "",
+          });
         } catch (error) {
           client.send(JSON.stringify({ type: "subtitle:error", message: error.message, code: "SUBTITLE_START_FAILED" }));
         }
