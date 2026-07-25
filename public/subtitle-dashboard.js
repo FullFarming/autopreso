@@ -1410,7 +1410,12 @@ async function startSubtitles() {
 
     state.sessionId = crypto.randomUUID();
     translatedAudioGuard.reset();
-    state.ws.send(JSON.stringify({ type: "subtitle:start", sessionId: state.sessionId, settings: state.settings }));
+    state.ws.send(JSON.stringify({
+      type: "subtitle:start",
+      sessionId: state.sessionId,
+      settings: state.settings,
+      meeting: await describeActiveMeeting(),
+    }));
     if (state.settings.outputMode !== "audio") setPreviewStatus("자막 대기 중", 1800);
 
     for (const capture of captures) {
@@ -2912,6 +2917,30 @@ async function startLiveCallMicCapture() {
 }
 
 let hasAutoStartedCaptionsForLiveCall = false;
+
+// Identity for the transcript record. A caption session started while a Live Call
+// is live IS that meeting, so the record is anchored to the call's own start time
+// and title -- that is what puts it on the records calendar. Captions started
+// without a call stay a plain local session and never reach the calendar.
+async function describeActiveMeeting() {
+  const bridge = window.realtimeNoelDesktop;
+  if (!bridge?.getLiveCallState) return { kind: "local" };
+  let liveState = null;
+  try {
+    liveState = await bridge.getLiveCallState();
+  } catch {
+    return { kind: "local" };
+  }
+  if (!liveState?.armed || !liveState.live) return { kind: "local" };
+  return {
+    kind: "live-call",
+    liveSessionId: typeof liveState.sessionId === "string" ? liveState.sessionId : "",
+    title: typeof liveState.title === "string" ? liveState.title : "",
+    // Absent means the server falls back to its own clock rather than dropping
+    // the record.
+    startedAt: typeof liveState.liveStartedAt === "string" ? liveState.liveStartedAt : "",
+  };
+}
 
 async function syncLiveCallAudioBridge() {
   const bridge = window.realtimeNoelDesktop;

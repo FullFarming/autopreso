@@ -1627,6 +1627,10 @@ function registerOverlayIpc(settingsStore, { localAppOrigin, liveWorkspaceUrl, l
         live: liveCallSession.status === "live",
         sessionId: liveCallSession.sessionId,
         liveStartedAt: liveCallSession.liveStartedAt ?? null,
+        // The records calendar places a meeting by its title and the moment the
+        // call actually went live, so the renderer needs both when it starts
+        // captions for this call.
+        title: liveCallSession.title ?? "",
         // Gateway/host-audio health. The controller polls this handler, so a
         // dead bridge is no longer invisible behind a still-ticking timer.
         bridge: liveBridgeStatus(),

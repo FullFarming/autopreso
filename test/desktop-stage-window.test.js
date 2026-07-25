@@ -284,3 +284,28 @@ test("the controller's Main button raises the main window without touching the c
   // Exposed on the preload bridge the controller actually talks to.
   assert.match(preloadSource, /showMainWindow: \(\) => ipcRenderer\.invoke\("app:show-main-window"\)/u);
 });
+
+// The calendar is only as good as this wiring: without it every record is
+// "local" and a real Live Call never appears on the grid.
+test("captions started during a Live Call are recorded as that meeting", () => {
+  const dashboard = fs.readFileSync(new URL("../public/subtitle-dashboard.js", import.meta.url), "utf8");
+
+  // The renderer asks the main process who is live, and sends it with the start.
+  assert.match(dashboard, /async function describeActiveMeeting/u);
+  assert.match(dashboard, /meeting: await describeActiveMeeting\(\)/u);
+  assert.match(dashboard, /kind: "live-call"/u);
+  // No call, or an unreachable bridge, must degrade to a local record rather
+  // than throwing inside session start.
+  const body = dashboard.slice(
+    dashboard.indexOf("async function describeActiveMeeting"),
+    dashboard.indexOf("async function syncLiveCallAudioBridge"),
+  );
+  assert.match(body, /catch \{\s*return \{ kind: "local" \};/u);
+  assert.match(body, /if \(!liveState\?\.armed \|\| !liveState\.live\) return \{ kind: "local" \};/u);
+
+  // liveStartedAt is stamped at Go-Live, not at arm time, and the title has to
+  // reach the renderer for the calendar to label the block.
+  const state = sourceBetween('ipcMain.handle("live-call:get-state"', 'ipcMain.handle("live-call:host-speak"');
+  assert.match(state, /liveStartedAt: liveCallSession\.liveStartedAt/u);
+  assert.match(state, /title: liveCallSession\.title/u);
+});
