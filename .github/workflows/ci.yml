@@ -6,8 +6,12 @@ on:
   pull_request:
     branches: [main]
 
+# Three independent npm projects with three separate lockfiles (there is no npm
+# workspace), so each needs its own `npm ci`. They run as parallel jobs to keep
+# the signal specific: a red X names the suite that broke.
 jobs:
-  test:
+  desktop:
+    name: desktop + CLI
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -18,3 +22,39 @@ jobs:
       - run: npm ci
       - run: npm run typecheck
       - run: npm test
+
+  media-gateway:
+    name: media gateway
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: media-gateway/package-lock.json
+      - run: npm ci
+        working-directory: media-gateway
+      - run: npm test
+        working-directory: media-gateway
+
+  webapp:
+    name: participant webapp
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: webapp/package-lock.json
+      - run: npm ci
+        working-directory: webapp
+      - run: npm run typecheck
+        working-directory: webapp
+      # Runs test:live AND test:core. The webapp's TS tests need
+      # --experimental-strip-types plus lib/security/test-typescript-loader.mjs,
+      # so they are enumerated in scripts rather than auto-discovered;
+      # test/webapp-test-coverage.test.js fails if a file is left out.
+      - run: npm test
+        working-directory: webapp
