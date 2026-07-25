@@ -42,7 +42,8 @@
   },
   "build": {
     "appId": "com.realtime-noel.app",
-    "productName": "Realtime Noel",
+    "productName": "NOVA",
+    "icon": "assets/icon.png",
     "files": [
       "assets/**",
       "electron/**",
@@ -56,9 +57,9 @@
       "entitlements": "build/entitlements.mac.plist",
       "entitlementsInherit": "build/entitlements.mac.plist",
       "extendInfo": {
-        "NSAudioCaptureUsageDescription": "Realtime Noel needs system audio access to generate live translated subtitles.",
-        "NSMicrophoneUsageDescription": "Realtime Noel needs microphone access to generate live translated subtitles.",
-        "NSScreenCaptureUsageDescription": "Realtime Noel needs screen and system audio recording access to capture presentation audio."
+        "NSAudioCaptureUsageDescription": "NOVA needs system audio access to generate live translated subtitles.",
+        "NSMicrophoneUsageDescription": "NOVA needs microphone access to generate live translated subtitles.",
+        "NSScreenCaptureUsageDescription": "NOVA needs screen and system audio recording access to capture presentation audio."
       },
       "target": [
         {
