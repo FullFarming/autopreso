@@ -13,6 +13,9 @@ packages/*/bin/
 .env.*
 !.env.example
 
+# Supabase CLI local project link state
+supabase/.temp/
+
 # Logs
 *.log
 npm-debug.log*
@@ -32,6 +35,18 @@ __pycache__/
 .pytest_cache/
 .venv/
 venv/
+
+# Agent/tool scratch state. These held ~183 files and made `git status`
+# unreadable, which is how 161 real source files went uncommitted for weeks.
+# Ignoring them does not delete them.
+.bkit/
+.lazyweb/
+.playwright-cli/
+.claude/agent-memory/
+.claude/worktrees/
+
+# Design-QA and audit screenshots: regenerable artifacts, not sources.
+output/
 
 # Editor and OS files
 .DS_Store
