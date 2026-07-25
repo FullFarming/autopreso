@@ -590,3 +590,79 @@ test("subtitle:start carries optional meeting identity into the record", async (
     await new Promise((resolve) => httpServer.close(resolve));
   }
 });
+
+// The point of Live Call at this stage: a participant speaks, and that turn ends
+// up in the host's session record with attribution. Participant speech never
+// touches the local audio pipeline -- the gateway mirrors its captions to the
+// host, the main process forwards them over IPC, and the dashboard relays them
+// here. That relay had no test, so a silent break would have cost the recording.
+test("a participant's mirrored caption is recorded on the host with attribution", async () => {
+  const transcriptsDir = await makeStorageDir();
+  const { httpServer, url } = await startServer({
+    host: "127.0.0.1",
+    port: 0,
+    moonshineModel: "medium",
+    openaiApiKey: "test",
+    env: { OPENAI_API_KEY: "sk-test", GEMINI_API_KEY: "AIza-test" },
+    transcriptsDir,
+    createTranscription: () => ({ ready: async () => {}, sendAudio: () => {}, stop: () => {}, close: () => {} }),
+    createSubtitleWebSocket: (socketUrl, protocols, init) => new FakeRealtimeSocket(socketUrl, init),
+  });
+
+  let ws;
+  try {
+    ws = new WebSocket(url.replace("http:", "ws:") + "/ws");
+    await new Promise((resolve, reject) => { ws.once("open", resolve); ws.once("error", reject); });
+    ws.send(JSON.stringify({
+      type: "subtitle:start",
+      sessionId: "participant-record",
+      settings: { inputMode: "mic", translationProvider: "gemini" },
+      meeting: { kind: "live-call", liveSessionId: "sb-1", title: "Town Hall", startedAt: "2026-07-25T06:00:00.000Z" },
+    }));
+    await waitForWebSocketMessage(ws, (message) => message.type === "subtitle:status" && message.status === "api_ready");
+
+    // The translated lane: this is what viewers read and what the overlay shows.
+    ws.send(JSON.stringify({
+      type: "subtitle:live-call-caption",
+      partial: false,
+      targetLanguage: "en",
+      speaker: "김게스트 · 영업",
+      translatedText: "Our occupancy recovered in the third quarter.",
+      sourceText: "3분기에 객실 점유율이 회복되었습니다",
+    }));
+    await waitForWebSocketMessage(ws, (message) => message.type === "subtitle:committed");
+
+    // The untranslated source lane is relayed record-only: it must reach the
+    // record so 원문 survives, but must never be broadcast to the overlay.
+    ws.send(JSON.stringify({
+      type: "subtitle:live-call-caption",
+      recordOnly: true,
+      partial: false,
+      targetLanguage: "ko",
+      speaker: "김게스트 · 영업",
+      translatedText: "3분기에 객실 점유율이 회복되었습니다",
+    }));
+
+    ws.send(JSON.stringify({ type: "subtitle:stop", sessionId: "participant-record" }));
+    await waitForWebSocketMessage(ws, (message) => message.type === "subtitle:session-summary" || message.type === "subtitle:status");
+
+    let record = null;
+    for (let attempt = 0; attempt < 40 && !record; attempt += 1) {
+      const body = await (await fetch(new URL("/api/subtitles/sessions/participant-record", url))).json();
+      if (body.ok && body.data?.lines?.length >= 2) record = body.data;
+      else await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    assert.ok(record, "the participant's speech never reached the host session record");
+
+    const spoken = record.lines.find((line) => line.translatedText.includes("occupancy recovered"));
+    assert.ok(spoken, "the translated participant turn is missing from the record");
+    assert.equal(spoken.speaker, "김게스트 · 영업", "the record must keep who said it");
+
+    const original = record.lines.find((line) => line.sourceText.includes("객실 점유율"));
+    assert.ok(original, "the untranslated 원문 is missing from the record");
+    assert.equal(original.speaker, "김게스트 · 영업");
+  } finally {
+    ws?.close();
+    await new Promise((resolve) => httpServer.close(resolve));
+  }
+});
