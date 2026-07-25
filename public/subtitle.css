@@ -1,3 +1,109 @@
+/* ── NOVA design tokens ──────────────────────────────────────────────────────
+   Derived from TDS (Toss Design System) as shipped on npm; see
+   docs/TOSS_DESIGN_REFERENCE.md for the source of every value.
+
+   Two deliberate departures from TDS, both driven by this product:
+   1. TDS dark base is #17171c. Ours is #0A0A0B, because the subtitle is the
+      protagonist and the shell must recede further than a general-purpose app's.
+      The LADDER is what is copied from Toss, not the absolute values: depth is
+      expressed by progressive lightening with no shadow anywhere.
+   2. Toss is mobile-first. Radii on large surfaces follow Toss's real containers
+      (dialog 24 / sheet 28) rather than the 16 cap an earlier pass assumed.
+   ─────────────────────────────────────────────────────────────────────────── */
+:root {
+  /* Surface ladder — recessed → base → layered → floating. */
+  --nova-bg-recessed: #06060a;
+  --nova-bg: #0a0a0b;
+  --nova-surface: #14141a;
+  --nova-surface-raised: #1c1c24;
+  --nova-surface-float: #2c2c35;
+  --nova-hairline: #26262f;
+  --nova-hairline-strong: #3c3c47;
+  --nova-scrim: rgba(0, 0, 0, 0.56);
+
+  /* Text ramp — TDS dark greys, violet-biased at ~285° OKLCH (not an inversion
+     of the light ramp; Toss shifts hue between modes on purpose). */
+  --nova-text: #ffffff;
+  --nova-text-strong: #e4e4e5;
+  --nova-text-body: #c3c3c6;
+  --nova-text-muted: #9e9ea4;
+  --nova-text-subtle: #7e7e87;
+  --nova-text-disabled: #62626d;
+
+  /* Accents — TDS *dark* values, which are brighter and less saturated than the
+     light ones. Blue is the single primary and stays rationed: one primary
+     action per screen, never as decoration. */
+  --nova-blue: #3485fa;
+  --nova-blue-strong: #449bff;
+  --nova-red: #f04251;
+  --nova-green: #16bb76;
+  --nova-yellow: #ffb134;
+  --nova-purple: #ae3dd1;
+
+  /* Overlay ramp: lets one control composite over any surface. */
+  --nova-overlay-100: rgba(255, 255, 255, 0.07);
+  --nova-overlay-200: rgba(255, 255, 255, 0.11);
+  --nova-overlay-300: rgba(255, 255, 255, 0.16);
+
+  /* Type scale (TDS named tiers). Line-heights follow the TDS law:
+     11–17 → ×1.5 · 18–29 → +9 · ≥30 → +10. */
+  --nova-t1: 30px;   --nova-t1-lh: 40px;
+  --nova-t3: 22px;   --nova-t3-lh: 31px;
+  --nova-t4: 20px;   --nova-t4-lh: 29px;
+  --nova-t5: 17px;   --nova-t5-lh: 25.5px;
+  --nova-t6: 15px;   --nova-t6-lh: 22.5px;
+  --nova-t7: 13px;   --nova-t7-lh: 19.5px;
+  --nova-t8: 11px;   --nova-t8-lh: 16.5px;
+  /* List density: inside a list row TDS overrides line-height to fontSize×1.35,
+     NOT the ×1.5 of body prose. This is invisible in every published type table
+     and it is the single biggest density lever in TDS -- lists must use these or
+     they render ~11% looser than Toss's forever. */
+  --nova-lh-list: 1.35;
+  --nova-lh-tight: 1.252;
+  --nova-lh-body: 1.5;
+
+  /* Spacing. TDS ships no scale; these are the values its components actually
+     use. 24 is the universal horizontal inset -- the most repeated number in the
+     whole library. */
+  --nova-inset: 24px;
+  --nova-inset-narrow: 20px;
+  --nova-gap-16: 16px;
+  --nova-gap-12: 12px;
+  --nova-gap-8: 8px;
+  --nova-gap-4: 4px;
+
+  /* Radius is anchored to component size, not a free scale. */
+  --nova-r-sm: 8px;
+  --nova-r-row: 12px;     /* list-row press/hover underlay */
+  --nova-r-md: 14px;
+  --nova-r-lg: 16px;
+  --nova-r-panel: 24px;   /* dialog-class surfaces */
+  --nova-r-sheet: 28px;
+  --nova-r-pill: 999px;
+
+  /* Motion. Beziers verbatim from TDS; springs are the fitted equivalents of its
+     eight spring configs. Note --nova-ease is (0.6,0,0,0.6) and is NOT CSS ease. */
+  --nova-ease: cubic-bezier(0.6, 0, 0, 0.6);
+  --nova-ease-out: cubic-bezier(0.25, 0.1, 0.25, 1);
+  --nova-ease-expo: cubic-bezier(0.16, 1, 0.3, 1);
+  --nova-ease-back: cubic-bezier(0.34, 1.56, 0.64, 1);
+  --nova-dur-rapid: 200ms;
+  --nova-spring-rapid: cubic-bezier(0.378, 0.838, 0.334, 1.024);
+  --nova-dur-quick: 350ms;
+  --nova-spring-quick: cubic-bezier(0.282, 1.081, 0.338, 0.988);
+  --nova-dur-color: 300ms;
+}
+
+/* TDS components skip their effects entirely under reduced motion rather than
+   shortening them. */
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --nova-dur-rapid: 1ms;
+    --nova-dur-quick: 1ms;
+    --nova-dur-color: 1ms;
+  }
+}
+
 :root {
   /* Editorial palette: ink near-black and a restrained off-white canvas.
      Legacy --cw-* names kept; values remapped onto the editorial scale. */
@@ -3195,74 +3301,298 @@ button[aria-busy="true"] { opacity: 0.6; cursor: progress; }
 .live-handoff-action span.is-error { color: #ff6b5e; }
 button.secondary { border-color: rgba(255, 255, 255, 0.42); }
 
-/* Session records: per-session transcript + AI summary cards. */
-/* Spotify shelf: album-art session cards in one sideways-scrolling row.
-   Clicking a card opens the detail view (원문 + 요약). */
-.session-records-list {
+/* ── Records calendar ────────────────────────────────────────────────────────
+   Outlook-style month/week/day over Live Call meetings, built on the NOVA
+   tokens. Depth comes from progressive lightening, never shadow (TDS dark
+   model). The old album-art shelf is gone: a gradient tile carries no
+   information about when a meeting happened. */
+
+.records-cal-panel { display: grid; gap: var(--nova-gap-12); }
+
+.records-cal-toolbar {
   display: flex;
-  gap: 14px;
-  overflow-x: auto;
-  padding: 4px 2px 10px;
-  scroll-snap-type: x proximity;
+  align-items: center;
+  gap: var(--nova-gap-8);
 }
-.session-record-card {
-  display: flex;
-  flex: 0 0 172px;
-  flex-direction: column;
-  gap: 10px;
-  padding: 12px;
+.records-cal-nav { display: inline-flex; align-items: center; gap: var(--nova-gap-4); }
+
+.records-cal-step {
+  align-items: center;
+  /* The global `button` rule sets flex: 1; without this the icon buttons stretch
+     across the toolbar instead of staying square. */
+  flex: none;
+  background: var(--nova-overlay-100);
   border: 0;
-  border-radius: 12px;
-  background: rgba(255, 255, 255, 0.035);
-  color: inherit;
+  border-radius: var(--nova-r-row);
+  color: var(--nova-text-body);
   cursor: pointer;
-  text-align: left;
-  scroll-snap-align: start;
-  transition: background 0.2s ease, transform 0.2s ease;
+  display: inline-flex;
+  height: 30px;
+  justify-content: center;
+  padding: 0;
+  transition: background var(--nova-dur-color) var(--nova-ease-out);
+  width: 30px;
 }
-.session-record-card:hover,
-.session-record-card:focus-visible {
-  background: rgba(255, 255, 255, 0.09);
-  transform: translateY(-2px);
+.records-cal-step:hover { background: var(--nova-overlay-200); color: var(--nova-text); }
+
+.records-cal-today {
+  background: var(--nova-overlay-100);
+  flex: none;
+  border: 0;
+  border-radius: var(--nova-r-row);
+  color: var(--nova-text-body);
+  cursor: pointer;
+  font-size: var(--nova-t7);
+  font-weight: 600;
+  height: 30px;
+  padding: 0 12px;
+  transition: background var(--nova-dur-color) var(--nova-ease-out);
 }
-.session-record-cover {
-  position: relative;
-  display: grid;
-  place-items: center;
-  aspect-ratio: 1;
-  width: 100%;
-  border-radius: 10px;
-  box-shadow: 0 10px 26px rgba(0, 0, 0, 0.4);
+.records-cal-today:hover { background: var(--nova-overlay-200); color: var(--nova-text); }
+
+.records-cal-period {
+  color: var(--nova-text);
+  font-size: var(--nova-t4);
+  line-height: var(--nova-t4-lh);
+  font-weight: 700;
+  margin: 0 auto 0 var(--nova-gap-8);
+}
+
+/* Segmented control: TDS group radius 15, item radius 12. */
+.records-cal-views {
+  background: var(--nova-overlay-100);
+  border-radius: 15px;
+  display: inline-flex;
+  gap: 2px;
+  padding: 2px;
+}
+.records-cal-views button {
+  background: transparent;
+  flex: none;
+  border: 0;
+  border-radius: var(--nova-r-row);
+  color: var(--nova-text-muted);
+  cursor: pointer;
+  font-size: var(--nova-t7);
+  font-weight: 600;
+  height: 26px;
+  padding: 0 12px;
+  transition: background var(--nova-dur-color) var(--nova-ease-out), color var(--nova-dur-color) var(--nova-ease-out);
+}
+.records-cal-views button.is-selected { background: var(--nova-surface-float); color: var(--nova-text); }
+
+.records-cal-status { color: var(--nova-text-subtle); font-size: var(--nova-t7); min-height: 16px; }
+
+.records-cal-grid {
+  background: var(--nova-surface);
+  border: 1px solid var(--nova-hairline);
+  border-radius: var(--nova-r-panel);
   overflow: hidden;
 }
-.session-record-cover strong {
-  color: rgba(255, 255, 255, 0.92);
-  font-size: 34px;
-  font-weight: 700;
-  letter-spacing: 0.02em;
-  text-shadow: 0 2px 10px rgba(0, 0, 0, 0.35);
+
+/* ── Month ── */
+.records-month-head,
+.records-month-body { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); }
+.records-month-head {
+  border-bottom: 1px solid var(--nova-hairline);
+  color: var(--nova-text-subtle);
+  font-size: var(--nova-t8);
+  font-weight: 600;
 }
-.session-record-cover em {
-  position: absolute;
-  left: 8px;
-  bottom: 8px;
-  border-radius: 9999px;
-  padding: 2px 9px;
-  background: rgba(0, 0, 0, 0.55);
-  color: rgba(255, 255, 255, 0.72);
-  font-size: 10.5px;
-  font-style: normal;
+.records-month-head span { padding: 10px 12px; text-align: center; }
+
+.records-month-body { grid-auto-rows: minmax(96px, auto); }
+.records-month-cell {
+  border-bottom: 1px solid var(--nova-hairline);
+  border-right: 1px solid var(--nova-hairline);
+  display: grid;
+  gap: 3px;
+  grid-auto-rows: max-content;
+  min-width: 0;
+  padding: 6px;
 }
-.session-record-cover em.has-summary { color: #ffffff; background: rgba(10, 132, 255, 0.65); }
-.session-record-heading { display: grid; gap: 4px; }
-.session-record-heading strong {
+.records-month-cell:nth-child(7n) { border-right: 0; }
+.records-month-body > .records-month-cell:nth-last-child(-n + 7) { border-bottom: 0; }
+.records-month-cell.is-outside { background: var(--nova-bg-recessed); }
+.records-month-cell.is-outside .records-month-date { color: var(--nova-text-disabled); }
+
+.records-month-date {
+  color: var(--nova-text-body);
+  font-size: var(--nova-t7);
+  font-weight: 600;
+  justify-self: start;
+  line-height: 1;
+  padding: 3px 5px;
+}
+/* Today is the one blue thing on the grid -- blue stays rationed. */
+.records-month-cell.is-today .records-month-date {
+  background: var(--nova-blue);
+  border-radius: var(--nova-r-pill);
   color: #ffffff;
-  font-size: 13.5px;
+}
+
+.records-chip {
+  align-items: baseline;
+  background: var(--nova-overlay-100);
+  border: 0;
+  border-left: 2px solid var(--nova-blue);
+  border-radius: 6px;
+  color: var(--nova-text-strong);
+  cursor: pointer;
+  display: flex;
+  /* Global `button` centres and stretches; a chip is left-read and content-sized. */
+  justify-content: flex-start;
+  flex: none;
+  gap: 5px;
+  font-size: var(--nova-t8);
+  line-height: var(--nova-lh-list);
+  min-width: 0;
+  padding: 3px 6px;
+  text-align: left;
+  transition: background var(--nova-dur-color) var(--nova-ease-out);
+}
+.records-chip:hover { background: var(--nova-overlay-300); }
+.records-chip b { color: var(--nova-text-muted); font-weight: 600; flex: none; }
+.records-chip span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.records-chip.is-unterminated { border-left-color: var(--nova-yellow); }
+
+/* ── Week / day time grid ── */
+.records-time { display: grid; }
+.records-time-head {
+  border-bottom: 1px solid var(--nova-hairline);
+  display: grid;
+  grid-template-columns: 52px repeat(var(--records-day-count), minmax(0, 1fr));
+}
+.records-time-day {
+  color: var(--nova-text-muted);
+  font-size: var(--nova-t8);
+  font-weight: 600;
+  padding: 10px 8px;
+  text-align: center;
+}
+.records-time-day.is-today { color: var(--nova-blue-strong); }
+
+.records-time-body {
+  display: grid;
+  grid-template-columns: 52px repeat(var(--records-day-count), minmax(0, 1fr));
+  max-height: 460px;
+  overflow-y: auto;
+}
+.records-time-gutter { display: grid; grid-auto-rows: var(--records-hour-height); }
+.records-time-gutter span {
+  color: var(--nova-text-disabled);
+  font-size: var(--nova-t8);
+  padding: 2px 8px 0 0;
+  text-align: right;
+}
+.records-time-column {
+  border-left: 1px solid var(--nova-hairline);
+  display: grid;
+  grid-auto-rows: var(--records-hour-height);
+  position: relative;
+}
+.records-time-slot { border-bottom: 1px solid var(--nova-hairline); }
+
+.records-block {
+  background: color-mix(in srgb, var(--nova-blue) 26%, var(--nova-surface));
+  border: 0;
+  border-left: 2px solid var(--nova-blue);
+  border-radius: var(--nova-r-sm);
+  color: var(--nova-text);
+  cursor: pointer;
+  display: grid;
+  font-size: var(--nova-t8);
+  /* The global `button` rule centres content; a calendar block reads top-left.
+     justify-CONTENT is the one that matters here: it centres the grid track
+     itself, so justify-items alone leaves the text visually centred. */
+  align-content: start;
+  justify-content: start;
+  justify-items: start;
+  gap: 1px;
+  line-height: var(--nova-lh-tight);
+  overflow: hidden;
+  padding: 3px 6px;
+  position: absolute;
+  text-align: left;
+  transition: background var(--nova-dur-color) var(--nova-ease-out);
+}
+.records-block:hover { background: color-mix(in srgb, var(--nova-blue) 38%, var(--nova-surface)); }
+.records-block b { color: var(--nova-text-strong); font-weight: 600; }
+.records-block span { color: var(--nova-text-body); overflow: hidden; text-overflow: ellipsis; }
+.records-block.is-unterminated {
+  background: color-mix(in srgb, var(--nova-yellow) 22%, var(--nova-surface));
+  border-left-color: var(--nova-yellow);
+}
+
+/* ── Caption-only sessions: TDS list rows. The press/hover underlay is INSET
+   (4px/6px, radius 12) so it floats inside the row and never touches the
+   divider -- this is the detail that makes a Toss list read as Toss. ── */
+.records-local { border-top: 1px solid var(--nova-hairline); padding-top: var(--nova-gap-8); }
+.records-local[hidden] { display: none; }
+.records-local summary {
+  color: var(--nova-text-muted);
+  cursor: pointer;
+  font-size: var(--nova-t7);
+  font-weight: 600;
+  padding: 4px 2px;
+}
+.records-local-list { display: grid; }
+
+.records-local-row {
+  align-items: center;
+  background: transparent;
+  border: 0;
+  color: var(--nova-text);
+  cursor: pointer;
+  display: flex;
+  gap: var(--nova-gap-16);
+  min-height: 44px;
+  padding: var(--nova-gap-12) var(--nova-inset);
+  position: relative;
+  text-align: left;
+  width: 100%;
+}
+.records-local-row::before {
+  background: var(--nova-hairline);
+  bottom: 0;
+  content: "";
+  height: 1px;
+  left: var(--nova-inset);
+  position: absolute;
+  width: calc(100% - var(--nova-inset));
+}
+.records-local-row:last-child::before { display: none; }
+.records-local-row::after {
+  background: transparent;
+  border-radius: var(--nova-r-row);
+  content: "";
+  inset: 4px 6px;
+  position: absolute;
+  transition: background var(--nova-dur-rapid) var(--nova-spring-rapid);
+}
+.records-local-row:hover::after,
+.records-local-row:focus-visible::after { background: var(--nova-overlay-100); }
+.records-local-heading { display: grid; gap: 2px; min-width: 0; position: relative; }
+.records-local-heading strong {
+  color: var(--nova-text);
+  font-size: var(--nova-t5);
+  font-weight: 600;
+  line-height: var(--nova-lh-list);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.session-record-heading span { color: rgba(255, 255, 255, 0.56); font-size: 11.5px; }
+.records-local-heading span {
+  color: var(--nova-text-muted);
+  font-size: var(--nova-t7);
+  line-height: var(--nova-lh-list);
+}
+.records-local-right {
+  color: var(--nova-text-subtle);
+  font-size: var(--nova-t8);
+  margin-left: auto;
+  position: relative;
+}
 
 /* Detail subview: hide the list/topic/log panels, show 원문 + 요약 columns. */
 #records-page.is-detail-view #session-records-panel,
