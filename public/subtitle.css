@@ -1152,8 +1152,10 @@ button:disabled {
    sits beside it, adjust cluster fills the middle, window controls pin right.
    The window hugs this height exactly (fit-height IPC) — no empty bands. */
 .subtitle-controller-body .caption-controller-window {
-  width: 100vw;
-  max-width: none;
+  /* Hugs its content: the window then resizes to this width via the fit-size
+     IPC, so there is never slack for a cluster to be pushed across. */
+  width: max-content;
+  max-width: 100vw;
   display: flex;
   align-items: center;
   gap: 10px;
@@ -1161,7 +1163,7 @@ button:disabled {
 }
 
 .subtitle-controller-body .controller-body {
-  flex: 1 1 auto;
+  flex: 0 1 auto;
   flex-direction: row;
   flex-wrap: wrap;
   align-items: center;
@@ -1324,7 +1326,7 @@ button:disabled {
 .subtitle-controller-body .controller-go-live { padding: 0 13px; }
 
 .subtitle-controller-body .mp-window {
-  margin-left: auto;
+  margin-left: 0;
   flex: none;
 }
 

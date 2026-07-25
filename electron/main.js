@@ -21,6 +21,9 @@ const PREFERRED_PORT = 3210;
 const DESKTOP_SOURCE_TIMEOUT_MS = 7_000;
 const ALLOWED_RENDERER_PERMISSIONS = new Set(["media", "display-capture", "clipboard-sanitized-write"]);
 const OVERLAY_TOP_LEVEL = "screen-saver";
+// The console hugs its content, which before Go-Live is much narrower than the
+// old fixed 720 floor.
+const CONTROLLER_MIN_WIDTH = 420;
 const DEFAULT_LIVE_WORKSPACE_URL = "https://realtime-noel-web.vercel.app/";
 const MAILTO_MAX_URL_LENGTH = 4_096;
 const MAX_LIVE_COVER_BYTES = 5 * 1024 * 1024;
@@ -808,7 +811,10 @@ function createControllerWindow(url) {
   // elapsed readout grown to `360:12` — its minutes are unbounded, so it widens
   // by a character about an hour into a call and used to push the row over
   // mid-session. The remainder is headroom for one more control.
-  const width = Math.min(1344, Math.max(720, primaryDisplay.workArea.width - 48));
+  // Only the INITIAL width: the renderer measures the console's real content
+  // width and the fit-size IPC resizes the window to hug it, in every session
+  // state. A fixed width left slack that pushed the right-hand cluster away.
+  const width = Math.min(1152, Math.max(CONTROLLER_MIN_WIDTH, primaryDisplay.workArea.width - 48));
   // Mini-player console: a single packed row. This is only the INITIAL
   // height — the renderer measures its exact content height and the
   // subtitle-controller:fit-height IPC resizes the window to hug it, so the
@@ -821,7 +827,7 @@ function createControllerWindow(url) {
     y,
     width,
     height,
-    minWidth: 720,
+    minWidth: CONTROLLER_MIN_WIDTH,
     minHeight: height,
     frame: false,
     transparent: true,
@@ -1825,17 +1831,31 @@ function registerOverlayIpc(settingsStore, { localAppOrigin, liveWorkspaceUrl, l
   });
   // The console asks for the exact content height so the transparent window
   // hugs it — no empty band, even when the voice row appears in audio mode.
-  ipcMain.on("subtitle-controller:fit-height", (event, contentHeight) => {
+  ipcMain.on("subtitle-controller:fit-height", (event, contentHeight, contentWidth) => {
     if (!isAllowedOrigin(event.sender.getURL(), new Set([localAppOrigin]))) return;
     if (!controllerWindow || controllerWindow.isDestroyed()) return;
     const height = Number(contentHeight);
     if (!Number.isFinite(height)) return;
-    const clamped = Math.round(Math.min(240, Math.max(64, height)));
+    const clampedHeight = Math.round(Math.min(240, Math.max(64, height)));
     const [x, y] = controllerWindow.getPosition();
-    const [width, currentHeight] = controllerWindow.getSize();
-    if (clamped === currentHeight) return;
-    controllerWindow.setMinimumSize(Math.min(720, width), clamped);
-    controllerWindow.setBounds({ x, y, width, height: clamped });
+    const [currentWidth, currentHeight] = controllerWindow.getSize();
+    // Width follows the content as well. The console's clusters change with the
+    // session -- the Live Call group, Host Speak and the voice row all come and
+    // go -- so a fixed width leaves slack, and the right-hand cluster was being
+    // pushed across it. Never wider than the work area.
+    const workArea = screen.getDisplayNearestPoint({ x, y }).workArea;
+    const requestedWidth = Number(contentWidth);
+    const clampedWidth = Number.isFinite(requestedWidth) && requestedWidth > 0
+      ? Math.round(Math.min(workArea.width - 48, Math.max(CONTROLLER_MIN_WIDTH, requestedWidth)))
+      : currentWidth;
+    if (clampedHeight === currentHeight && clampedWidth === currentWidth) return;
+    // Keep the console optically where it was instead of letting a width change
+    // drag it sideways.
+    const centeredX = Math.round(x + (currentWidth - clampedWidth) / 2);
+    const maxX = workArea.x + workArea.width - clampedWidth;
+    const nextX = Math.min(Math.max(workArea.x, centeredX), Math.max(workArea.x, maxX));
+    controllerWindow.setMinimumSize(Math.min(CONTROLLER_MIN_WIDTH, clampedWidth), clampedHeight);
+    controllerWindow.setBounds({ x: nextX, y, width: clampedWidth, height: clampedHeight });
   });
   ipcMain.handle("subtitle-controller:set-visible", (_event, visible) => {
     if (!controllerWindow || controllerWindow.isDestroyed()) createControllerWindow(server.url);

@@ -321,11 +321,23 @@ if (dragStrip && window.realtimeNoelDesktop?.moveControllerBy) {
 const consoleRoot = document.querySelector(".caption-controller-window");
 if (consoleRoot && window.realtimeNoelDesktop?.fitControllerHeight && typeof ResizeObserver !== "undefined") {
   let lastRequestedHeight = 0;
+  let lastRequestedWidth = 0;
   const requestFit = () => {
-    const height = Math.ceil(consoleRoot.getBoundingClientRect().height);
-    if (!height || height === lastRequestedHeight) return;
+    const rect = consoleRoot.getBoundingClientRect();
+    const height = Math.ceil(rect.height);
+    // Width too: the console hugs its content, and the clusters change with the
+    // session (Live Call group, Host Speak, the voice row), so a fixed window
+    // width leaves slack the right-hand cluster used to be pushed across.
+    // A small buffer, because the shell is capped at the window width: without
+    // it the row WRAPS the moment a control grows (the elapsed readout gains a
+    // character about an hour into a call) instead of the window widening, and
+    // the console silently becomes two rows tall mid-session.
+    const width = Math.ceil(rect.width) + 16;
+    if (!height) return;
+    if (height === lastRequestedHeight && width === lastRequestedWidth) return;
     lastRequestedHeight = height;
-    window.realtimeNoelDesktop.fitControllerHeight(height);
+    lastRequestedWidth = width;
+    window.realtimeNoelDesktop.fitControllerHeight(height, width);
   };
   new ResizeObserver(requestFit).observe(consoleRoot);
   requestFit();

@@ -1040,16 +1040,24 @@ test("controller is a one-row mini-player: brand/drag zone, transport, adjust, w
 });
 
 test("controller window hugs its content and shows live signal + elapsed time", async () => {
-  const [controllerJs, main, preload] = await Promise.all([
+  const [controllerJs, main, preload, css] = await Promise.all([
     read("public/subtitle-controller.js"),
     read("electron/main.js"),
     read("electron/preload.js"),
+    read("public/subtitle.css"),
   ]);
   // Fit-height: renderer measures, main clamps and resizes — no empty band.
   assert.match(controllerJs, /fitControllerHeight/);
-  assert.match(preload, /fitControllerHeight: \(height\) => ipcRenderer\.send\("subtitle-controller:fit-height", height\)/);
+  assert.match(preload, /fitControllerHeight: \(height, width\) => ipcRenderer\.send\("subtitle-controller:fit-height", height, width\)/);
   assert.match(main, /ipcMain\.on\("subtitle-controller:fit-height"/);
   assert.match(main, /Math\.min\(240, Math\.max\(64, height\)\)/);
+  // The console hugs its content WIDTH too. A fixed width left slack that the
+  // right-hand cluster was pushed across, so the clusters no longer pin apart.
+  assert.match(css, /\.caption-controller-window \{[^}]*width: max-content/u);
+  assert.match(css, /\.subtitle-controller-body \.mp-window \{[^}]*margin-left: 0/u);
+  assert.match(main, /Math\.max\(CONTROLLER_MIN_WIDTH, requestedWidth\)/);
+  // Width changes must not drag the console sideways.
+  assert.match(main, /currentWidth - clampedWidth\) \/ 2/);
   // VU meter rides the existing subtitle:input-status broadcast (no new wire).
   assert.match(controllerJs, /subtitle:input-status/);
   assert.match(controllerJs, /updateVuMeter/);

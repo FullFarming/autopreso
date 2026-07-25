@@ -12,7 +12,7 @@ contextBridge.exposeInMainWorld("realtimeNoelDesktop", {
   startRegisteredLiveCall: (sessionId) => ipcRenderer.invoke("live-call:start-registered", sessionId),
   getLiveCallState: () => ipcRenderer.invoke("live-call:get-state"),
   moveControllerBy: (deltaX, deltaY) => ipcRenderer.send("subtitle-controller:move-by", deltaX, deltaY),
-  fitControllerHeight: (height) => ipcRenderer.send("subtitle-controller:fit-height", height),
+  fitControllerHeight: (height, width) => ipcRenderer.send("subtitle-controller:fit-height", height, width),
   goLiveCall: () => ipcRenderer.invoke("live-call:go-live"),
   hostSpeak: () => ipcRenderer.invoke("live-call:host-speak"),
   ensureLiveCallBridge: () => ipcRenderer.invoke("live-call:bridge-ensure"),
