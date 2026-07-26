@@ -569,58 +569,10 @@ as $$
     );
 $$;
 
--- 5. Realtime broadcast policies: viewers keep receiving session-status
---    events while paused; hosts keep their preparing/live/paused channels.
-alter policy live_broadcast_viewer_receive on realtime.messages
-  using (
-    extension = 'broadcast'
-    and cardinality(string_to_array(realtime.topic(), ':')) = 3
-    and split_part(realtime.topic(), ':', 1) = 'live'
-    and exists (
-      select 1
-      from public.live_sessions session_row
-      join public.viewer_grants grant_row on grant_row.session_id = session_row.id
-      where session_row.id::text = split_part(realtime.topic(), ':', 2)
-        and split_part(realtime.topic(), ':', 3) = any(session_row.languages)
-        and session_row.status in ('live', 'paused')
-        and session_row.expires_at > now()
-        and grant_row.user_id = (select auth.uid())::text
-        and grant_row.revoked_at is null
-        and grant_row.expires_at > now()
-    )
-  );
-
-alter policy live_broadcast_host_receive on realtime.messages
-  using (
-    extension = 'broadcast'
-    and cardinality(string_to_array(realtime.topic(), ':')) = 3
-    and split_part(realtime.topic(), ':', 1) = 'live'
-    and exists (
-      select 1
-      from public.live_sessions session_row
-      where session_row.id::text = split_part(realtime.topic(), ':', 2)
-        and split_part(realtime.topic(), ':', 3) = any(session_row.languages)
-        and session_row.host_id = (select auth.uid())::text
-        and session_row.status in ('preparing', 'live', 'paused')
-        and session_row.expires_at > now()
-    )
-  );
-
-alter policy live_broadcast_host_send on realtime.messages
-  with check (
-    extension = 'broadcast'
-    and cardinality(string_to_array(realtime.topic(), ':')) = 3
-    and split_part(realtime.topic(), ':', 1) = 'live'
-    and exists (
-      select 1
-      from public.live_sessions session_row
-      where session_row.id::text = split_part(realtime.topic(), ':', 2)
-        and split_part(realtime.topic(), ':', 3) = any(session_row.languages)
-        and session_row.host_id = (select auth.uid())::text
-        and session_row.status in ('preparing', 'live', 'paused')
-        and session_row.expires_at > now()
-    )
-  );
+-- 5. Realtime broadcast policies remain absent. 202607190002 deliberately
+--    retired direct database Broadcast delivery when media-gateway became the
+--    only caption transport. Pause/resume authorization is handled by the
+--    service-role RPC and gateway topic authorization above.
 
 -- 6. Function privileges (security definer + revoke pattern).
 revoke all on function public.pause_live_session(uuid, text, integer)

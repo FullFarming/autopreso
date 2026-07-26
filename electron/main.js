@@ -6,6 +6,7 @@ import path from "node:path";
 import { WebSocket } from "ws";
 
 import { startServer } from "../src/server.js";
+import { sanitizeLiveCaptionDisplayLanguage, shouldDisplayLiveCaption } from "../src/live-caption-display-policy.js";
 import { createSettingsStore, migrateSettingsFile } from "../src/settings-store.js";
 // The renderer owns the UI language choice (localStorage); it pushes the value
 // over IPC so the application menu speaks the same language.
@@ -632,6 +633,20 @@ function sanitizeLiveCallDraft(draft) {
     glossaryPack: "general_cre",
     maxViewers,
     languages: languages.length ? languages : ["ko", "en"],
+    displayLanguage: sanitizeLiveCaptionDisplayLanguage(source.displayLanguage),
+  };
+}
+
+function toLiveCallApiInput(config) {
+  return {
+    title: config.title,
+    scheduledAt: config.scheduledAt,
+    sessionType: config.sessionType,
+    outputMode: config.outputMode,
+    voiceProvider: config.voiceProvider,
+    glossaryPack: config.glossaryPack,
+    maxViewers: config.maxViewers,
+    languages: config.languages,
   };
 }
 
@@ -1003,6 +1018,7 @@ let liveBridgeReconnectAttempts = 0;
 // host is never left watching a running timer over dead air.
 let liveBridgeAlert = null;
 let hasNotifiedLiveBridgeFailure = false;
+let hostSpeakInFlight = null;
 
 function setLiveBridgeAlert(alert) {
   liveBridgeAlert = alert;
@@ -1150,6 +1166,10 @@ async function ensureLiveGatewayBridge() {
   liveGatewayBridge = bridge;
   socket.on("open", () => socket.send(JSON.stringify({ type: "authenticate", token: connection.token })));
   socket.on("message", (data) => {
+    // 2026-07-26 fix: a replaced socket can flush queued callbacks after a new
+    // bridge owns the session. Fence it so stale producer epochs never repaint
+    // the canonical desktop transcript.
+    if (liveGatewayBridge !== bridge) return;
     let message;
     try {
       message = JSON.parse(data.toString("utf8"));
@@ -1171,9 +1191,10 @@ async function ensureLiveGatewayBridge() {
       clearLiveBridgeAlert();
       console.info("[live-bridge] gateway host pipeline is running");
     } else if (message.type === "caption") {
-      // Bidirectional captions: the gateway pipeline now mirrors every live
-      // caption (host and participant speech alike) to the host socket. Fan
-      // it out to the renderers so the desktop can show it in real time.
+      // 2026-07-26 fix: the gateway retains both language lanes for web history,
+      // while the laptop and extended overlays receive exactly the selected
+      // language. Same-language source captions are valid display output.
+      if (!shouldDisplayLiveCaption(message, armedSession.displayLanguage)) return;
       for (const rendererWindow of BrowserWindow.getAllWindows()) {
         if (!rendererWindow.isDestroyed()) rendererWindow.webContents.send("live-call:caption", message);
       }
@@ -1238,12 +1259,61 @@ function hostSpeakViaGateway(gatewayUrl, token) {
   });
 }
 
+function hostSpeakViaActiveBridge() {
+  const bridge = liveGatewayBridge;
+  if (!bridge?.ready || bridge.socket.readyState !== WebSocket.OPEN) return null;
+  if (hostSpeakInFlight) return hostSpeakInFlight;
+  hostSpeakInFlight = new Promise((resolve) => {
+    const socket = bridge.socket;
+    let settled = false;
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      socket.off("message", onMessage);
+      socket.off("close", onClose);
+      resolve(result);
+    };
+    const onMessage = (data) => {
+      let message;
+      try { message = JSON.parse(data.toString("utf8")); } catch { return; }
+      if (message.type === "host-speak-started") finish({ ok: true });
+      else if (message.type === "error") finish({ ok: false, code: typeof message.code === "string" ? message.code : "GATEWAY_ERROR" });
+    };
+    const onClose = () => finish({ ok: false, code: "GATEWAY_CLOSED" });
+    const timer = setTimeout(() => finish({ ok: false, code: "GATEWAY_TIMEOUT" }), 3_000);
+    socket.on("message", onMessage);
+    socket.once("close", onClose);
+    try { socket.send(JSON.stringify({ type: "host-speak" })); } catch { finish({ ok: false, code: "GATEWAY_UNREACHABLE" }); }
+  }).finally(() => { hostSpeakInFlight = null; });
+  return hostSpeakInFlight;
+}
+
 // After the host ends a Live Call, pull the speaker-attributed transcript
 // (and the meeting summary, when the workspace has already generated it)
 // and import both into the local Records store. The summary generation on
 // the workspace is asynchronous, so it is retried briefly before importing
 // without one — the local server then generates its own from the lines.
 async function archiveLiveCallSession(endedSession, localAppOrigin) {
+  // 2026-07-26 fix: the gateway-canonical desktop session already owns this
+  // exact record id. Wait for the renderer to finalize it and preserve its
+  // bilingual source/translation lines; import is only a crash fallback.
+  const localRecordUrl = new URL(
+    `/api/subtitles/sessions/live-${encodeURIComponent(endedSession.sessionId)}`,
+    localAppOrigin,
+  );
+  for (let attempt = 0; attempt < 16; attempt += 1) {
+    try {
+      const response = await net.fetch(localRecordUrl.href);
+      const payload = response.ok ? await response.json() : null;
+      if (payload?.ok === true
+        && typeof payload.data?.endedAt === "string"
+        && payload.data.endedAt
+        && Array.isArray(payload.data?.lines)
+        && payload.data.lines.length > 0) return;
+    } catch { /* fallback import below */ }
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
   const language = endedSession.languages?.[0] ?? "ko";
   const transcript = await liveCallApi(
     endedSession.baseUrl,
@@ -1417,7 +1487,7 @@ function registerOverlayIpc(settingsStore, { localAppOrigin, liveWorkspaceUrl, l
     if (!login.ok) {
       return { ok: false, code: login.code === "NO_STORED_LOGIN" ? "HOST_LOGIN_REQUIRED" : login.code };
     }
-    const created = await liveCallApi(liveWorkspaceUrl, "/api/live-sessions", { body: input });
+    const created = await liveCallApi(liveWorkspaceUrl, "/api/live-sessions", { body: toLiveCallApiInput(input) });
     if (!created.ok) return created;
     const sessionData = created.data;
     if (!sessionData || typeof sessionData.id !== "string" || !sessionData.id) {
@@ -1476,7 +1546,13 @@ function registerOverlayIpc(settingsStore, { localAppOrigin, liveWorkspaceUrl, l
     let liveDomainText = "";
     try {
       const savedSettings = await settingsStore.load();
-      liveGlossaryText = String(savedSettings?.subtitle?.glossary ?? "").trim().slice(0, 16_000);
+      // 40k, matching MAX_SUBTITLE_GLOSSARY_CHARS and the gateway's own ceiling.
+      // At 16k this silently cut the shipped presets mid-file (the hotel one is
+      // 27.5k), so local captions ran the FULL termbase while Live Call ran a
+      // truncated one missing its trailing sections — proper nouns, place names,
+      // and the 번역 메모리 block. That is why Live Call translation quality did
+      // not match captions-only mode. Pinned by test/glossary-presets.test.js.
+      liveGlossaryText = String(savedSettings?.subtitle?.glossary ?? "").trim().slice(0, 40_000);
       liveTranslationTone = savedSettings?.subtitle?.tone === "business" ? "business" : "natural";
       liveDomainText = String(savedSettings?.subtitle?.translationDomain ?? "").trim().slice(0, 2_000);
     } catch { /* settings parity is best-effort */ }
@@ -1489,6 +1565,7 @@ function registerOverlayIpc(settingsStore, { localAppOrigin, liveWorkspaceUrl, l
       status: sessionData.status,
       title: config.title,
       languages: config.languages,
+      displayLanguage: sanitizeLiveCaptionDisplayLanguage(config.displayLanguage),
       startedAt: new Date().toISOString(),
       // The gateway host `start` message must mirror the session settings the
       // webapp created — the renderer audio bridge sends these verbatim.
@@ -1532,7 +1609,7 @@ function registerOverlayIpc(settingsStore, { localAppOrigin, liveWorkspaceUrl, l
       if (!login.ok) {
         return { ok: false, code: login.code === "NO_STORED_LOGIN" ? "HOST_LOGIN_REQUIRED" : login.code };
       }
-      const created = await liveCallApi(liveWorkspaceUrl, "/api/live-sessions", { body: input });
+      const created = await liveCallApi(liveWorkspaceUrl, "/api/live-sessions", { body: toLiveCallApiInput(input) });
       if (!created.ok) return created;
       const sessionData = created.data;
       if (!sessionData || typeof sessionData.id !== "string" || !sessionData.id) {
@@ -1574,7 +1651,7 @@ function registerOverlayIpc(settingsStore, { localAppOrigin, liveWorkspaceUrl, l
   });
   // Load a registered session and arm it, reusing its saved title, schedule,
   // cover image, and language configuration.
-  ipcMain.handle("live-call:start-registered", async (event, sessionId) => {
+  ipcMain.handle("live-call:start-registered", async (event, sessionId, options) => {
     if (liveCallEnabled !== true) return { ok: false, code: "LIVE_CALL_DISABLED" };
     if (!isAllowedOrigin(event.sender.getURL(), new Set([localAppOrigin]))) return { ok: false, code: "FORBIDDEN" };
     if (liveCallSession) return { ok: false, code: "LIVE_CALL_ALREADY_ARMED" };
@@ -1600,6 +1677,7 @@ function registerOverlayIpc(settingsStore, { localAppOrigin, liveWorkspaceUrl, l
         voiceProvider: sessionData.voiceProvider ?? "gemini",
         maxViewers: Number.isSafeInteger(sessionData.maxViewers) ? sessionData.maxViewers : 50,
         glossaryPack: sessionData.glossaryPack ?? "general_cre",
+        displayLanguage: sanitizeLiveCaptionDisplayLanguage(options?.displayLanguage),
       }, { failSessionOnError: false });
     } finally {
       isLiveCallStarting = false;
@@ -1659,6 +1737,11 @@ function registerOverlayIpc(settingsStore, { localAppOrigin, liveWorkspaceUrl, l
   ipcMain.handle("live-call:host-speak", async (event) => {
     if (!isAllowedOrigin(event.sender.getURL(), new Set([localAppOrigin]))) return { ok: false, code: "FORBIDDEN" };
     if (!liveCallSession) return { ok: false, code: "NOT_ARMED" };
+    // 2026-07-26 fix: floor alternation reuses the authenticated HOST bridge.
+    // Minting a token and opening another socket for every press exhausted the
+    // token rate limit and turned ordinary alternation into request timeouts.
+    const activeBridgeResult = await hostSpeakViaActiveBridge();
+    if (activeBridgeResult) return activeBridgeResult;
     const armedSession = liveCallSession;
     const tokenResult = await liveCallApi(
       armedSession.baseUrl,

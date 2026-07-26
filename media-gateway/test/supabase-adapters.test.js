@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
 import test from "node:test";
 
 import {
@@ -18,6 +19,88 @@ const settings = {
   glossaryPack: "hotel",
   languages: ["ko", "en"],
 };
+
+test("production replay wiring forwards the abort options to Supabase", async () => {
+  const source = await readFile(new URL("../src/server.js", import.meta.url), "utf8");
+  assert.match(source, /replayUtterances:\s*\(sessionId, language, afterSeq, limit, options\)[\s\S]*?fetchUtterancesAfter\(sessionId, language, afterSeq, limit, options\)/u);
+});
+
+test("utterance replay forwards and observes its abort signal", async () => {
+  const abortController = new AbortController();
+  let observedSignal;
+  const publisher = new SupabaseLivePublisher({
+    baseUrl: "https://dev-ref.supabase.co", serviceRoleKey: "secret",
+    async eventFanout() {}, async audioFanout() {},
+    async fetchFn(_url, init) {
+      observedSignal = init.signal;
+      return new Promise((_resolve, reject) => {
+        init.signal.addEventListener("abort", () => reject(init.signal.reason), { once: true });
+      });
+    },
+  });
+  const replay = publisher.fetchUtterancesAfter("session-1", "ko", 0, 200, { signal: abortController.signal });
+  const reason = new Error("REPLAY_ABORTED");
+  abortController.abort(reason);
+  await assert.rejects(replay, /REPLAY_ABORTED/u);
+  assert.equal(observedSignal, abortController.signal);
+});
+
+test("snapshot guard timeout fails closed without poisoning the next publish", async () => {
+  const delivered = [];
+  const mirrored = [];
+  const observedSignals = [];
+  let snapshotAttempts = 0;
+  const publisher = new SupabaseLivePublisher({
+    baseUrl: "https://dev-ref.supabase.co", serviceRoleKey: "secret",
+    snapshotGuardTimeoutMilliseconds: 5,
+    async eventFanout(_sessionId, _language, event) { delivered.push(event); },
+    async audioFanout() {},
+    async fetchFn(url, init) {
+      if (String(url).includes("persist_live_snapshot_if_active")) {
+        snapshotAttempts += 1;
+        observedSignals.push(init.signal);
+        if (snapshotAttempts === 1) return new Promise(() => {});
+      }
+      return Response.json(true);
+    },
+  });
+
+  await assert.rejects(
+    publisher.publish(
+      "session-1",
+      "ko",
+      { type: "caption", seq: 1, isFinal: true, text: "시간 초과" },
+      { onLiveEvent: async (event) => mirrored.push(event) },
+    ),
+    /SNAPSHOT_GUARD_TIMEOUT/u,
+  );
+  assert.equal(observedSignals[0]?.aborted, true);
+  assert.deepEqual(delivered, []);
+  assert.deepEqual(mirrored, []);
+
+  await publisher.publish(
+    "session-1",
+    "ko",
+    { type: "caption", seq: 2, isFinal: true, text: "다음 문장" },
+    { onLiveEvent: async (event) => mirrored.push(event) },
+  );
+  assert.equal(snapshotAttempts, 2);
+  assert.deepEqual(delivered.map((event) => event.text), ["다음 문장"]);
+  assert.deepEqual(mirrored.map((event) => event.text), ["다음 문장"]);
+});
+
+test("snapshot guard timeout configuration is bounded and fail-closed", () => {
+  const makePublisher = (snapshotGuardTimeoutMilliseconds) => new SupabaseLivePublisher({
+    baseUrl: "https://dev-ref.supabase.co", serviceRoleKey: "secret",
+    snapshotGuardTimeoutMilliseconds,
+    async eventFanout() {}, async audioFanout() {}, async fetchFn() { return Response.json(true); },
+  });
+  for (const invalid of [0, -1, 1.5, Number.NaN, 60_001]) {
+    assert.throws(() => makePublisher(invalid), /INVALID_SNAPSHOT_GUARD_TIMEOUT/u);
+  }
+  assert.doesNotThrow(() => makePublisher(undefined));
+  assert.doesNotThrow(() => makePublisher(60_000));
+});
 
 test("new Supabase secret keys use apikey only and take precedence over legacy credentials", async () => {
   const headers = [];
@@ -207,12 +290,18 @@ test("a source-lane caption persists with no duplicated original", async () => {
   });
   await publisher.publish("session-1", "ko", {
     type: "caption", seq: 1, isFinal: true, text: "안녕하세요",
+    origin: "source", utteranceKey: "session-1:input:1",
     speaker: null, sourceText: null, sourceLanguage: "ko",
     sourceEndedAt: "2026-07-23T00:00:04.000Z", emittedAt: "2026-07-23T00:00:04.100Z",
   });
   const utterance = calls.find((call) => call.url.includes("persist_live_utterance_if_active"));
   assert.equal(utterance.body.p_source_text, null);
   assert.equal(utterance.body.p_source_language, "ko");
+  assert.equal(utterance.body.p_origin, "source");
+  assert.equal(utterance.body.p_utterance_key, "session-1:input:1");
+  const snapshot = calls.find((call) => call.url.includes("persist_live_snapshot_if_active"));
+  assert.equal(snapshot.body.p_event.origin, "source");
+  assert.equal(snapshot.body.p_event.utteranceKey, "session-1:input:1");
 });
 
 test("publisher treats a guarded RPC false result as a stopped session", async () => {
@@ -242,7 +331,7 @@ test("host lease stays valid while the database session is paused", async () => 
   assert.equal(await makeAuthorizer("stopped").authorize(claims, settings, { requireLive: true }), false);
 });
 
-test("a transient snapshot persist failure does not drop the caption broadcast", async () => {
+test("a transient snapshot guard failure fails closed before caption broadcast", async () => {
   const fanned = [];
   const publisher = new SupabaseLivePublisher({
     baseUrl: "https://dev-ref.supabase.co", serviceRoleKey: "secret",
@@ -253,8 +342,59 @@ test("a transient snapshot persist failure does not drop the caption broadcast",
       return new Response("true", { status: 200, headers: { "Content-Type": "application/json" } });
     },
   });
-  await publisher.publish("session-1", "ko", { type: "caption", seq: 1, isFinal: true, text: "생존" });
-  assert.equal(fanned.length, 1, "caption must still fan out after a transient snapshot failure");
+  await assert.rejects(
+    publisher.publish("session-1", "ko", { type: "caption", seq: 1, isFinal: true, text: "차단" }),
+    /SUPABASE_PUBLISH_FAILED/u,
+  );
+  assert.equal(fanned.length, 0, "an unverified final must not reach a viewer");
+});
+
+test("live fanout is not delayed by utterance persistence", async () => {
+  const delivered = [];
+  let releasePersistence;
+  const persistenceGate = new Promise((resolve) => { releasePersistence = resolve; });
+  const publisher = new SupabaseLivePublisher({
+    baseUrl: "https://dev-ref.supabase.co", serviceRoleKey: "secret",
+    async eventFanout(_sessionId, _language, event) { delivered.push(event); },
+    async audioFanout() {},
+    async fetchFn(url) {
+      if (String(url).includes("persist_live_utterance_if_active")) await persistenceGate;
+      return new Response("true", { status: 200, headers: { "Content-Type": "application/json" } });
+    },
+  });
+  const publishing = publisher.publish("session-1", "ko", {
+    type: "caption", seq: 1, isFinal: true, text: "즉시 표시",
+    sourceEndedAt: "2026-07-23T00:00:04.000Z", emittedAt: "2026-07-23T00:00:04.100Z",
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(delivered[0]?.text, "즉시 표시");
+  releasePersistence();
+  await publishing;
+});
+
+test("a stopped snapshot guard blocks viewer and host live delivery", async () => {
+  const delivered = [];
+  const mirrored = [];
+  const publisher = new SupabaseLivePublisher({
+    baseUrl: "https://dev-ref.supabase.co", serviceRoleKey: "secret",
+    async eventFanout(_sessionId, _language, event) { delivered.push(event); },
+    async audioFanout() {},
+    async fetchFn(url) {
+      const value = String(url).includes("persist_live_snapshot_if_active") ? false : true;
+      return Response.json(value);
+    },
+  });
+  await assert.rejects(
+    publisher.publish(
+      "session-1",
+      "ko",
+      { type: "caption", seq: 1, isFinal: true, text: "중단" },
+      { onLiveEvent: async (event) => mirrored.push(event) },
+    ),
+    /SESSION_STOPPED/u,
+  );
+  assert.deepEqual(delivered, []);
+  assert.deepEqual(mirrored, []);
 });
 
 test("an utterance recording failure remains non-fatal and emits an observable recording error", async () => {
@@ -363,9 +503,10 @@ test("publisher maps persisted utterances to replayable caption events in ascend
       seen = new URL(url);
       return new Response(JSON.stringify([
         { seq: 3, speaker_label: "speaker-1", speaker_name: "김노엘", text: "셋", source_text: "three", source_language: "en", source_ended_at: "2026-07-23T00:00:03Z", emitted_at: "2026-07-23T00:00:03.100Z" },
+        { seq: 4, speaker_label: null, speaker_name: null, text: "원문", source_text: null, source_language: "ko", origin: "source", utterance_key: "session-1:input:4", source_ended_at: "2026-07-23T00:00:04Z", emitted_at: "2026-07-23T00:00:04.100Z" },
         // A row predating the provenance columns: replay must still work and
         // simply offer no original to disclose.
-        { seq: 4, speaker_label: null, speaker_name: null, text: "넷", source_ended_at: "2026-07-23T00:00:04Z", emitted_at: "2026-07-23T00:00:04.100Z" },
+        { seq: 5, speaker_label: null, speaker_name: null, text: "다섯", source_ended_at: "2026-07-23T00:00:05Z", emitted_at: "2026-07-23T00:00:05.100Z" },
       ]), { status: 200, headers: { "Content-Type": "application/json" } });
     },
   });
@@ -375,7 +516,8 @@ test("publisher maps persisted utterances to replayable caption events in ascend
   assert.equal(seen.searchParams.get("limit"), "200");
   assert.deepEqual(events.map((event) => [event.type, event.seq, event.text, event.isFinal]), [
     ["caption", 3, "셋", true],
-    ["caption", 4, "넷", true],
+    ["caption", 4, "원문", true],
+    ["caption", 5, "다섯", true],
   ]);
   // The full SpeakerAssignment shape: the webapp viewer validates every field
   // and silently drops replayed captions whose speaker is partial.
@@ -391,8 +533,8 @@ test("publisher maps persisted utterances to replayable caption events in ascend
   assert.equal(events[1].speaker, null);
   assert.equal(seen.searchParams.get("select")?.includes("source_text,source_language"), true);
   assert.deepEqual(
-    events.map((event) => [event.sourceText, event.sourceLanguage, event.translationStatus]),
-    [["three", "en", "translated"], [null, null, "verbatim"]],
+    events.map((event) => [event.sourceText, event.sourceLanguage, event.translationStatus, event.origin, event.utteranceKey]),
+    [["three", "en", "translated", undefined, undefined], [null, "ko", "verbatim", "source", "session-1:input:4"], [null, null, "verbatim", undefined, undefined]],
   );
 });
 

@@ -90,8 +90,14 @@ export function getSupabaseServerConfig(environment: Readonly<Record<string, str
   if (!url || !anonKey || !serviceRoleKey) {
     throw new LiveSecurityConfigurationError("Supabase 서버 인증 설정이 필요합니다.");
   }
-  const parsedUrl = parseSupabaseProjectUrl(url);
-  assertDevelopmentSupabaseProject(parsedUrl.projectRef, environment);
+  const parsedUrl = parseSupabaseProjectUrl(url, environment);
+  if (parsedUrl.projectRef === null) {
+    if (environment.LIVE_EXTERNAL_ENV?.trim() !== "development") {
+      throw new LiveSecurityConfigurationError("로컬 Supabase 연결에는 LIVE_EXTERNAL_ENV=development가 필요합니다.");
+    }
+  } else {
+    assertDevelopmentSupabaseProject(parsedUrl.projectRef, environment);
+  }
   if (serviceRoleKey === anonKey) {
     throw new LiveSecurityConfigurationError("Supabase service role key와 anon key는 서로 달라야 합니다.");
   }
@@ -100,11 +106,28 @@ export function getSupabaseServerConfig(environment: Readonly<Record<string, str
 
 export class LiveSecurityConfigurationError extends Error {}
 
-function parseSupabaseProjectUrl(value: string): { url: string; projectRef: string } {
+function parseSupabaseProjectUrl(
+  value: string,
+  environment: Readonly<Record<string, string | undefined>>,
+): { url: string; projectRef: string | null } {
   try {
     const parsed = new URL(value);
+    const hasRootPath = parsed.pathname === "/" || parsed.pathname === "";
+    const isExactLocal = parsed.protocol === "http:"
+      && (parsed.hostname === "127.0.0.1" || parsed.hostname === "localhost")
+      && parsed.port === "54321"
+      && !parsed.username
+      && !parsed.password
+      && hasRootPath
+      && !parsed.search
+      && !parsed.hash;
+    if (isExactLocal
+      && environment.NODE_ENV !== "production"
+      && environment.LIVE_ALLOW_LOCAL_SUPABASE?.trim() === "true") {
+      return { url: parsed.origin, projectRef: null };
+    }
     const hostnameMatch = /^([a-z0-9-]+)\.supabase\.co$/u.exec(parsed.hostname);
-    if (parsed.protocol !== "https:" || !hostnameMatch || parsed.port || (parsed.pathname !== "/" && parsed.pathname !== "") || parsed.search || parsed.hash) {
+    if (parsed.protocol !== "https:" || !hostnameMatch || parsed.port || !hasRootPath || parsed.search || parsed.hash) {
       throw new Error("invalid Supabase project URL");
     }
     return { url: parsed.origin, projectRef: hostnameMatch[1] };

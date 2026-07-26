@@ -76,11 +76,40 @@ test("gateway refuses short signing secrets at startup", () => {
 });
 
 test("gateway external providers are restricted to one exact development project and Supabase ref", () => {
-  assert.equal(readGatewayEnvironment(gatewayEnvironment()).externalEnvironment, "development");
+  const hosted = readGatewayEnvironment(gatewayEnvironment());
+  assert.equal(hosted.externalEnvironment, "development");
+  assert.equal(hosted.host, "0.0.0.0");
   assert.throws(() => readGatewayEnvironment({ ...gatewayEnvironment(), LIVE_EXTERNAL_ENV: "production" }), /개발 환경/u);
   assert.throws(() => readGatewayEnvironment({ ...gatewayEnvironment(), GOOGLE_CLOUD_PROJECT: "prod-project" }), /개발 Google Cloud/u);
   assert.throws(() => readGatewayEnvironment({ ...gatewayEnvironment(), SUPABASE_URL: "https://dev-ref.supabase.co.evil.example" }), /Supabase/u);
   assert.throws(() => readGatewayEnvironment({ ...gatewayEnvironment(), LIVE_ALLOWED_SUPABASE_REF: "another-ref" }), /Supabase/u);
+});
+
+test("gateway local Supabase exception is exact, explicit, and never available in production", () => {
+  const local = {
+    ...gatewayEnvironment(),
+    NODE_ENV: "development",
+    LIVE_ALLOW_LOCAL_SUPABASE: "true",
+    LIVE_ALLOWED_SUPABASE_REF: undefined,
+    SUPABASE_URL: "http://127.0.0.1:54321",
+  };
+  const loopbackIp = readGatewayEnvironment(local);
+  assert.equal(loopbackIp.baseUrl, "http://127.0.0.1:54321");
+  assert.equal(loopbackIp.host, "127.0.0.1");
+  const loopbackName = readGatewayEnvironment({ ...local, SUPABASE_URL: "http://localhost:54321/" });
+  assert.equal(loopbackName.baseUrl, "http://localhost:54321");
+  assert.equal(loopbackName.host, "127.0.0.1");
+  for (const rejected of [
+    { LIVE_ALLOW_LOCAL_SUPABASE: undefined },
+    { LIVE_ALLOW_LOCAL_SUPABASE: "TRUE" },
+    { NODE_ENV: "production" },
+    { SUPABASE_URL: "http://127.0.0.1:54322" },
+    { SUPABASE_URL: "http://127.0.0.1:54321/rest" },
+    { SUPABASE_URL: "http://127.0.0.1:54321?x=1" },
+    { SUPABASE_URL: "http://127.0.0.2:54321" },
+  ]) {
+    assert.throws(() => readGatewayEnvironment({ ...local, ...rejected }), /Supabase/u);
+  }
 });
 
 test("gateway prefers the new Supabase secret and temporarily accepts the legacy fallback", () => {
@@ -130,6 +159,9 @@ test("live settings accept an optional desktop glossary text and cap its size", 
   const base = { sessionType: "meeting", languages: ["ko", "en"], outputMode: "captions" };
   assert.equal(validateLiveSettings(base).glossaryText, "");
   assert.equal(validateLiveSettings({ ...base, glossaryText: "  힐튼 = Hilton  " }).glossaryText, "힐튼 = Hilton");
-  assert.equal(validateLiveSettings({ ...base, glossaryText: "가".repeat(20_000) }).glossaryText.length, 16_000);
+  // 40k, not 16k: the desktop's shipped presets run to 27.5k, and a cap below
+  // that silently dropped whichever glossary sections sat at the end of the file.
+  assert.equal(validateLiveSettings({ ...base, glossaryText: "가".repeat(20_000) }).glossaryText.length, 20_000);
+  assert.equal(validateLiveSettings({ ...base, glossaryText: "가".repeat(50_000) }).glossaryText.length, 40_000);
   assert.throws(() => validateLiveSettings({ ...base, glossaryText: 123 }), /용어집 텍스트/);
 });

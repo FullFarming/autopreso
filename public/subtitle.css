@@ -3622,6 +3622,40 @@ button[aria-busy="true"] {
   line-height: var(--nova-lh-list);
 }
 
+.live-display-language {
+  display: grid;
+  gap: var(--nova-gap-8);
+  margin: var(--nova-gap-16) 0 0;
+  border: 0;
+  padding: 0;
+}
+
+.live-display-language legend {
+  margin-bottom: var(--nova-gap-8);
+  color: var(--nova-text);
+  font-size: var(--nova-t6);
+  font-weight: 600;
+  line-height: var(--nova-lh-list);
+}
+
+.live-display-language-options {
+  grid-template-columns: none;
+  width: min(100%, 280px);
+}
+
+.live-display-language-options .seg-option span {
+  display: grid;
+  min-height: 44px;
+  place-items: center;
+}
+
+.live-display-language p {
+  margin: 0;
+  color: var(--nova-text-muted);
+  font-size: var(--nova-t7);
+  line-height: var(--nova-t7-lh);
+}
+
 .live-schedule-row {
   display: flex;
   align-items: center;

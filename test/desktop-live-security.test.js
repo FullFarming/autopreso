@@ -1,11 +1,50 @@
 import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
 import { readFileSync } from "node:fs";
 import test from "node:test";
 import vm from "node:vm";
 
+import {
+  sanitizeLiveCaptionDisplayLanguage,
+  shouldDisplayLiveCaption,
+} from "../src/live-caption-display-policy.js";
+
+
 const mainSource = readFileSync(new URL("../electron/main.js", import.meta.url), "utf8");
 const preloadSource = readFileSync(new URL("../electron/preload.js", import.meta.url), "utf8");
 const workspaceSource = readFileSync(new URL("../public/subtitle-workspace.js", import.meta.url), "utf8");
+
+test("Live Call desktop renders exactly one selected lane for both inputs and both speakers", () => {
+  for (const displayLanguage of ["ko", "en"]) {
+    for (const sourceLanguage of ["ko", "en"]) {
+      for (const isParticipant of [false, true]) {
+        const translationLanguage = sourceLanguage === "ko" ? "en" : "ko";
+        const captions = [
+          { language: sourceLanguage, sourceLanguage, origin: "source", speaker: { isParticipant } },
+          { language: translationLanguage, sourceLanguage, speaker: { isParticipant } },
+          // Provider echo: selected-language text without a cross-language
+          // source identity must never become a second screen line.
+          { language: sourceLanguage, sourceLanguage, speaker: { isParticipant } },
+        ];
+        const displayed = captions.filter((caption) => shouldDisplayLiveCaption(caption, displayLanguage));
+        assert.equal(displayed.length, 1, `${displayLanguage}/${sourceLanguage}/${isParticipant}`);
+        assert.equal(displayed[0].language, displayLanguage);
+        assert.equal(displayed[0].origin === "source", sourceLanguage === displayLanguage);
+      }
+    }
+  }
+});
+
+test("Live Call display selection defaults to Korean and rejects failed translations", () => {
+  assert.equal(sanitizeLiveCaptionDisplayLanguage("en"), "en");
+  assert.equal(sanitizeLiveCaptionDisplayLanguage("ko"), "ko");
+  for (const invalid of [undefined, null, "EN", "ja", "", {}, []]) {
+    assert.equal(sanitizeLiveCaptionDisplayLanguage(invalid), "ko");
+  }
+  assert.equal(shouldDisplayLiveCaption({ language: "ko", translationStatus: "failed" }, "ko"), false);
+  assert.equal(shouldDisplayLiveCaption({ language: "ko" }, "ko"), false);
+  assert.equal(shouldDisplayLiveCaption({ language: "ko", sourceLanguage: "ko" }, "ko"), false);
+});
 
 function sourceBetween(start, end) {
   const startIndex = mainSource.indexOf(start);
@@ -61,6 +100,9 @@ test("Live Call IPC accepts a bounded cover payload and validates decoded image 
   assert.match(sanitizer, /typeof source\.title === "string"/u);
   assert.match(sanitizer, /Number\.isInteger\(source\.maxViewers\)/u);
   assert.match(sanitizer, /Array\.isArray\(source\.languages\)/u);
+  assert.match(sanitizer, /displayLanguage: sanitizeLiveCaptionDisplayLanguage\(source\.displayLanguage\)/u);
+  assert.match(mainSource, /function toLiveCallApiInput/u);
+  assert.doesNotMatch(sourceBetween("function toLiveCallApiInput", "async function openLiveStageOverlay"), /displayLanguage/u);
   assert.match(workspaceSource, /MAX_COVER_IMAGE_BYTES = 5 \* 1024 \* 1024/u);
   assert.match(workspaceSource, /new Set\(\["image\/jpeg", "image\/png", "image\/webp"\]\)/u);
   assert.match(workspaceSource, /file\.size <= 0 \|\| file\.size > MAX_COVER_IMAGE_BYTES/u);
@@ -68,6 +110,7 @@ test("Live Call IPC accepts a bounded cover payload and validates decoded image 
   assert.match(workspaceSource, /base64: window\.btoa\(binary\)/u);
   assert.match(workspaceSource, /coverImage: liveDraftCoverData/u);
   assert.match(preloadSource, /startLiveCall: \(draft\) => ipcRenderer\.invoke\("live-call:start", draft\)/u);
+  assert.match(preloadSource, /startRegisteredLiveCall: \(sessionId, options\).*sessionId, options/u);
   assert.match(mainSource, /MAX_LIVE_COVER_BYTES = 5 \* 1024 \* 1024/u);
   assert.match(mainSource, /function validateLiveCoverImage/u);
   assert.match(mainSource, /size > MAX_LIVE_COVER_BYTES/u);
@@ -267,6 +310,39 @@ test("live call state reports gateway health so a dead bridge is not hidden behi
   const messageHandler = sourceBetween('message.type === "started"', 'message.type === "caption"');
   assert.match(messageHandler, /liveBridgeReconnectAttempts = 0/u);
   assert.match(messageHandler, /clearLiveBridgeAlert\(\)/u);
+});
+
+test("active bridge host-speak is single-flight and does not leak listeners across repeated handoffs", async () => {
+  class FakeSocket extends EventEmitter {
+    readyState = 1;
+    sends = [];
+    send(payload) { this.sends.push(JSON.parse(payload)); }
+  }
+  const socket = new FakeSocket();
+  const context = {
+    liveGatewayBridge: { ready: true, socket },
+    hostSpeakInFlight: null,
+    WebSocket: { OPEN: 1 },
+    JSON,
+    setTimeout,
+    clearTimeout,
+  };
+  const api = vm.runInNewContext(
+    `${sourceBetween("function hostSpeakViaActiveBridge", "// After the host ends")}; hostSpeakViaActiveBridge`,
+    context,
+  );
+  for (let turn = 0; turn < 12; turn += 1) {
+    const first = api();
+    const duplicate = api();
+    assert.equal(first, duplicate, "rapid duplicate presses share one request");
+    assert.equal(socket.sends.at(-1).type, "host-speak");
+    socket.emit("message", Buffer.from(JSON.stringify({ type: "host-speak-started" })));
+    assert.equal((await first).ok, true);
+    await Promise.resolve();
+    assert.equal(socket.listenerCount("message"), 0);
+    assert.equal(socket.listenerCount("close"), 0);
+  }
+  assert.equal(socket.sends.length, 12, "no token-mint fallback socket is used for active handoffs");
 });
 
 // ── Boot survives a malformed settings.json ────────────────────────────────

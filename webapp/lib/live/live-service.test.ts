@@ -327,6 +327,132 @@ test("Supabase snapshot maps persisted speaker voice status", async () => {
   assert.equal(snapshot?.speakers[0]?.voiceStatus, "ready");
 });
 
+test("getSnapshot rehydrates the full caption history from live_utterances", async () => {
+  // live_snapshots.captions holds only the LATEST caption by design
+  // (jsonb_build_array of one event, replaced on conflict). The durable record
+  // is live_utterances. A viewer that joins, reconnects, or switches language
+  // clears its in-memory captions and repopulates from this snapshot, so if the
+  // snapshot serves one caption the entire visible history is destroyed — which
+  // is exactly what participants saw when toggling EN -> KO -> EN.
+  const sessionRow = {
+    id: crypto.randomUUID(), host_id: "host-1", session_type: "meeting", output_mode: "captions",
+    max_viewers: 50, glossary_pack: "general_cre", title: "Townhall",
+    status: "live", languages: ["ko", "en"], viewer_count: 1, version: 1, voice_provider: "gemini",
+    admission_open_until: null, expires_at: new Date(Date.now() + 60_000).toISOString(),
+  };
+  const emittedAt = new Date().toISOString();
+  const utteranceRows = [3, 2, 1].map((seq) => ({
+    seq,
+    speaker_label: "speaker-1",
+    speaker_name: "Noel Kim",
+    text: `번역된 문장 ${seq}`,
+    source_text: `source sentence ${seq}`,
+    source_language: "en",
+    source_ended_at: emittedAt,
+    emitted_at: emittedAt,
+  }));
+  const secretKey = `sb_secret_${"b".repeat(24)}`;
+  let utterancesQuery = "";
+  const store = new SupabaseLiveSessionStore("https://dev-ref.supabase.co", { key: secretKey, kind: "secret" }, async (url) => {
+    const target = String(url);
+    if (target.includes("session_speakers")) return Response.json([]);
+    if (target.includes("live_utterances")) {
+      utterancesQuery = target;
+      return Response.json(utteranceRows);
+    }
+    if (target.includes("live_snapshots")) {
+      return Response.json([{ last_seq: 3, captions: [], speaker_legend: [] }]);
+    }
+    return Response.json([sessionRow]);
+  });
+
+  const snapshot = await store.getSnapshot("session-1", "ko");
+
+  assert.equal(snapshot?.captions.length, 3, "the whole history must be replayed, not just the latest caption");
+  assert.deepEqual(snapshot?.captions.map((caption) => caption.seq), [1, 2, 3]);
+  assert.equal(snapshot?.lastSeq, 3);
+  // Only this language's rows, oldest-first, so seq ordering is preserved.
+  assert.match(utterancesQuery, /language=eq\.ko/u);
+  // The oldest bounded window is followed by gateway keyset replay, avoiding
+  // both a five-second giant snapshot and a gap before the live edge.
+  assert.match(utterancesQuery, /order=seq\.asc/u);
+  // The viewer contract validates every SpeakerAssignment field and silently
+  // drops captions whose speaker shape is partial.
+  const speaker = snapshot?.captions[0]?.speaker;
+  assert.equal(speaker?.speakerId, "speaker-1");
+  assert.equal(speaker?.label, "Noel Kim");
+  assert.equal(typeof speaker?.colorToken, "string");
+  assert.equal(speaker?.voiceStatus, "disabled");
+  assert.equal(speaker?.voiceName, null);
+  assert.equal(typeof speaker?.lastSeenAt, "string");
+  // 원문보기 disclosure has to survive rehydration too.
+  assert.equal(snapshot?.captions[0]?.sourceText, "source sentence 1");
+  assert.equal(snapshot?.captions[0]?.isFinal, true);
+});
+
+test("getSnapshot preserves source-lane provenance from live_utterances", async () => {
+  const sessionRow = {
+    id: crypto.randomUUID(), host_id: "host-1", session_type: "meeting", output_mode: "captions",
+    max_viewers: 50, glossary_pack: "general_cre", title: "Townhall", status: "live",
+    languages: ["ko", "en"], viewer_count: 1, version: 1, voice_provider: "gemini",
+    admission_open_until: null, expires_at: new Date(Date.now() + 60_000).toISOString(),
+  };
+  const emittedAt = new Date().toISOString();
+  const store = new SupabaseLiveSessionStore(
+    "https://dev-ref.supabase.co",
+    { key: `sb_secret_${"b".repeat(24)}`, kind: "secret" },
+    async (url) => {
+      const target = String(url);
+      if (target.includes("session_speakers")) return Response.json([]);
+      if (target.includes("live_utterances")) return Response.json([{
+        seq: 1, speaker_label: null, speaker_name: null, text: "원문입니다.",
+        source_text: null, source_language: "ko", origin: "source",
+        utterance_key: "session-1:input:1", source_ended_at: emittedAt, emitted_at: emittedAt,
+      }]);
+      if (target.includes("live_snapshots")) return Response.json([]);
+      return Response.json([sessionRow]);
+    },
+  );
+  const snapshot = await store.getSnapshot("session-1", "ko");
+  assert.equal(snapshot?.captions[0]?.origin, "source");
+  assert.equal(snapshot?.captions[0]?.utteranceKey, "session-1:input:1");
+});
+
+test("getSnapshot serves a bounded oldest window whose lastSeq resumes gateway paging", async () => {
+  const sessionRow = {
+    id: crypto.randomUUID(), host_id: "host-1", session_type: "meeting", output_mode: "captions",
+    max_viewers: 50, glossary_pack: "general_cre", title: "Long call", status: "live",
+    languages: ["ko"], viewer_count: 1, version: 1, voice_provider: "gemini",
+    admission_open_until: null, expires_at: new Date(Date.now() + 60_000).toISOString(),
+  };
+  const emittedAt = new Date().toISOString();
+  const allRows = Array.from({ length: 200 }, (_, index) => ({
+    seq: index + 1, speaker_label: null, speaker_name: null, text: `line ${index + 1}`,
+    source_text: "source", source_language: "en", origin: null, utterance_key: `u-${index + 1}`,
+    source_ended_at: emittedAt, emitted_at: emittedAt,
+  }));
+  const utteranceQueries: string[] = [];
+  const store = new SupabaseLiveSessionStore(
+    "https://dev-ref.supabase.co",
+    { key: `sb_secret_${"b".repeat(24)}`, kind: "secret" },
+    async (url) => {
+      const target = String(url);
+      if (target.includes("session_speakers")) return Response.json([]);
+      if (target.includes("live_snapshots")) return Response.json([{ last_seq: 450, captions: [], speaker_legend: [] }]);
+      if (target.includes("live_utterances")) {
+        utteranceQueries.push(target);
+        return Response.json(allRows);
+      }
+      return Response.json([sessionRow]);
+    },
+  );
+  const snapshot = await store.getSnapshot("session-1", "ko");
+  assert.equal(snapshot?.captions.length, 200);
+  assert.equal(snapshot?.lastSeq, 200, "the snapshot-row live edge must not skip gateway replay pages");
+  assert.equal(utteranceQueries.length, 1);
+  assert.match(utteranceQueries[0], /order=seq\.asc/u);
+});
+
 test("Supabase rows reject unknown or meeting-scoped OpenAI voice providers", async () => {
   const expiresAt = new Date(Date.now() + 60_000).toISOString();
   const baseRow = {

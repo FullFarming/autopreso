@@ -52,7 +52,14 @@ function buildPolishSystemPrompt(targetLanguage, { tone, glossary, domain } = {}
     "Japanese set phrases that signal stance rather than content (持ち帰って検討します, 前向きに検討します, 落とし所) carry their business sense, not their literal words.",
   );
 
-  lines.push("6. STYLE: preserve the live draft's wording when it is already correct, but finish it into a natural, idiomatic final subtitle rather than literal translation, and keep terminology consistent.");
+  lines.push(
+    "6. NUMBERS: never restate a figure in the source language's counting system — convert the SCALE, never the currency, and never apply an exchange rate.",
+    "Korean counts in myriads (만 10^4, 억 10^8, 조 10^12); English counts in million/billion/trillion; Japanese keeps 万/億/兆.",
+    "English output: 3,000억 원 → KRW 300 billion; 300억 원 → KRW 30 billion; 1조 5,000억 원 → KRW 1.5 trillion; 5,000만 원 → KRW 50 million. Never write '3,000억' or 'hundred million' in English output.",
+    "Korean output: KRW 300 billion → 3,000억 원; 1.5 trillion won → 1조 5,000억 원; USD 30 million → 3,000만 달러. Never leave 'billion'/'million' untranslated in Korean output.",
+    "Keep the magnitude identical, keep the currency the speaker used, and leave percentages, years, quarters, floor areas, and counts exactly as spoken.",
+  );
+  lines.push("7. STYLE: preserve the live draft's wording when it is already correct, but finish it into a natural, idiomatic final subtitle rather than literal translation, and keep terminology consistent.");
   if (targetLanguage === "ko") {
     // EN->KO is the direction most prone to translationese; force a rewrite
     // into native Korean rather than English-shaped Korean.
@@ -67,7 +74,7 @@ function buildPolishSystemPrompt(targetLanguage, { tone, glossary, domain } = {}
   }
 
   lines.push(
-    "7. RESTRAINT (default for everything else): everyday or conversational lines — greetings, logistics, asides, small talk — get a plain, faithful translation with minimal edits.",
+    "8. RESTRAINT (default for everything else): everyday or conversational lines — greetings, logistics, asides, small talk — get a plain, faithful translation with minimal edits.",
     "Do not formalize, embellish, or rewrite beyond what the rules above require; when no rule applies, the basic natural translation is the correct output.",
   );
 

@@ -114,6 +114,15 @@ export async function startServer(options) {
   const sessionTranscripts = options.transcriptsDir
     ? createSessionTranscripts({ storageDir: options.transcriptsDir, log: options.log ?? console })
     : null;
+  let transcriptRecordTail = Promise.resolve();
+  const pendingLiveCallSources = new Map();
+  const recentlyRecordedLiveCallSources = new Set();
+  const queueTranscriptLine = (line) => {
+    transcriptRecordTail = transcriptRecordTail
+      .then(() => sessionTranscripts?.recordLine(line))
+      .catch((error) => (options.log ?? console).warn?.(`[session-transcripts] record skipped: ${error?.message ?? error}`));
+    return transcriptRecordTail;
+  };
   // Per-viewer subtitle channels: every lane message gets a seq stamp and is
   // fanned out through the hub so a client subscribed to specific languages
   // (subtitle:subscribe) only receives its own lanes. Clients that never
@@ -128,7 +137,7 @@ export async function startServer(options) {
       }
     }
     if (message.type !== "subtitle:committed") return;
-    void sessionTranscripts?.recordLine(message);
+    void queueTranscriptLine(message);
     void subtitleHistory.record(message)
       .then((snapshot) => broadcast(wss, { type: "subtitle:history", ...snapshot }))
       .catch((error) => broadcast(wss, {
@@ -549,7 +558,11 @@ export async function startServer(options) {
           // record (Records shows the original alongside the translation)
           // but NEVER onto the overlay — screen captions stay
           // translation-direction only, exactly like the subtitle policy.
-          void sessionTranscripts?.recordLine({
+          const utteranceKey = typeof message.utteranceKey === "string" && message.utteranceKey
+            ? message.utteranceKey.slice(0, 240)
+            : null;
+          if (utteranceKey && recentlyRecordedLiveCallSources.delete(utteranceKey)) return;
+          pendingLiveCallSources.set(utteranceKey ?? Symbol("unkeyed-live-source"), {
             speaker: String(message.speaker ?? "").trim().slice(0, 80),
             sourceText: translatedText,
             translatedText: "",
@@ -558,11 +571,25 @@ export async function startServer(options) {
         }
         if (translatedText) {
           const speakerName = String(message.speaker ?? "").trim().slice(0, 80);
+          let sourceText = String(message.sourceText ?? "").trim();
+          const utteranceKey = typeof message.utteranceKey === "string" && message.utteranceKey
+            ? message.utteranceKey.slice(0, 240)
+            : null;
+          if (utteranceKey && message.partial !== true) {
+            const pending = pendingLiveCallSources.get(utteranceKey);
+            if (!sourceText && pending) sourceText = pending.sourceText;
+            pendingLiveCallSources.delete(utteranceKey);
+            recentlyRecordedLiveCallSources.add(utteranceKey);
+            if (recentlyRecordedLiveCallSources.size > 500) {
+              recentlyRecordedLiveCallSources.delete(recentlyRecordedLiveCallSources.values().next().value);
+            }
+          }
           broadcastSubtitleMessage({
             type: message.partial ? "subtitle:partial" : "subtitle:committed",
             source: "live-call",
             targetLanguage: String(message.targetLanguage ?? ""),
-            sourceText: String(message.sourceText ?? ""),
+            sourceText,
+            sourceLanguage: String(message.sourceLanguage ?? ""),
             translatedText,
             ...(speakerName ? {
               speaker: speakerName,
@@ -597,7 +624,12 @@ export async function startServer(options) {
       if (message.type === "subtitle:start") {
         try {
           validateSubtitleSettings(message.settings);
-          await subtitles.start({ sessionId: message.sessionId, settings: message.settings });
+          // 2026-07-26 fix: Live Call captions have one producer: the media gateway. Keep the
+          // local transcript lifecycle open while leaving the independent
+          // realtime translation manager cold.
+          if (message.captionProducer !== "gateway") {
+            await subtitles.start({ sessionId: message.sessionId, settings: message.settings });
+          }
           // Optional meeting identity. When captions are running for a Live Call
           // the record must be anchored to the CALL's start and carry its title,
           // because that is what the records calendar places on the grid. Every
@@ -625,6 +657,15 @@ export async function startServer(options) {
         // Archive the raw session audio (24 kHz PCM16) alongside the
         // transcript so Records can replay what was actually said.
         void sessionTranscripts?.appendAudioChunk(message.source, message.audio);
+      }
+
+      if (message.type === "subtitle:producer-stop") {
+        if (typeof message.sessionId !== "string" || message.sessionId.length === 0) return;
+        await subtitles.stop(message.sessionId);
+        client.send(JSON.stringify({
+          type: "subtitle:producer-stopped",
+          requestId: typeof message.requestId === "string" ? message.requestId : "",
+        }));
       }
 
       if (message.type === "subtitle:subscribe") {
@@ -668,6 +709,10 @@ export async function startServer(options) {
       if (message.type === "subtitle:stop") {
         if (typeof message.sessionId !== "string" || message.sessionId.length === 0) return;
         await subtitles.stop(message.sessionId);
+        for (const sourceLine of pendingLiveCallSources.values()) void queueTranscriptLine(sourceLine);
+        pendingLiveCallSources.clear();
+        recentlyRecordedLiveCallSources.clear();
+        await transcriptRecordTail;
         // Close the transcript session and, when a provider key exists,
         // generate the AI summary automatically. Best-effort: a summary
         // failure never blocks or breaks the stop.

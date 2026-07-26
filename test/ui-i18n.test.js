@@ -165,6 +165,13 @@ test("the application menu labels are translated for both languages", () => {
   }
 });
 
+test("the Live Call screen-language choice explains its separate web history", () => {
+  assert.match(MESSAGES.en["live.displayLanguage"], /Screen caption language/u);
+  assert.match(MESSAGES.en["live.displayLanguageHelp"], /web history keeps both EN and KO/u);
+  assert.match(MESSAGES.ko["live.displayLanguage"], /화면 자막 언어/u);
+  assert.match(MESSAGES.ko["live.displayLanguageHelp"], /웹 기록에는 EN·KO를 모두 유지/u);
+});
+
 test("the i18n module stays free of load-time DOM and storage coupling", async () => {
   const source = await readFile(path.join(ROOT, "public/subtitle-i18n.js"), "utf8");
   assert.doesNotMatch(source, /innerHTML/u, "DOM is built with textContent/attributes only");

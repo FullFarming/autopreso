@@ -97,38 +97,37 @@ export function formatTurnTime(iso: string): string {
  * the length of the meeting. Every prop is a primitive or an identity-stable
  * object (see useStableTurns) so the default shallow comparison is enough.
  */
-const MeetingTurnCard = memo(function MeetingTurnCard({ turn, isCollapsed, recentFromIndex, onToggle }: {
+const MeetingTurnCard = memo(function MeetingTurnCard({ turn, recentFromIndex, pendingText = "" }: {
   turn: MeetingTurn;
-  isCollapsed: boolean;
   recentFromIndex: number;
-  onToggle: (key: string) => void;
+  /** The in-progress sentence, when it belongs to THIS speaker's turn. It is
+   *  rendered as the tail of this same paragraph so the transcript only ever
+   *  grows: rendering it as its own card meant the text was written separately
+   *  and then jumped up into the paragraph when it finalized. */
+  pendingText?: string;
 }) {
-  const bodyId = `${turn.key}-body`;
   return (
-    <article className={`live-turn-card ${isCollapsed ? "is-collapsed" : ""}`}>
+    <article className="live-turn-card">
+      {/* Plain header, not a control. Folding used to live here, but a speaker
+          adding one more sentence then made the paragraph bundle and visibly
+          drop text mid-meeting. A live transcript must only ever append; the
+          RECORDS view (MeetingMinutes) is where a static transcript can be
+          summarised per paragraph and expanded to the full original. */}
       <header>
-        {/* The whole header is the fold control: a speaker paragraph is the
-            natural unit to collapse, and the header is the only part that
-            stays visible when it is folded. */}
-        <button type="button" className="live-turn-toggle"
-          aria-expanded={!isCollapsed} aria-controls={bodyId}
-          onClick={() => onToggle(turn.key)}>
-          <span className="live-speaker-dot" style={{ backgroundColor: turn.speakerColor }} aria-hidden="true" />
-          <strong>{turn.speakerLabel}</strong>
-          <time dateTime={turn.startedAt}>{formatTurnTime(turn.startedAt)}</time>
-          <span className="live-turn-count">{turn.texts.length}</span>
-          <span className="live-turn-chevron" aria-hidden="true" />
-        </button>
+        <span className="live-speaker-dot" style={{ backgroundColor: turn.speakerColor }} aria-hidden="true" />
+        <strong>{turn.speakerLabel}</strong>
+        <time dateTime={turn.startedAt}>{formatTurnTime(turn.startedAt)}</time>
       </header>
-      {/* Collapsed clamps rather than unmounts, so the text stays in the DOM
-          for browser find and copy. */}
-      <p id={bodyId} className="live-turn-body">
+      <p className="live-turn-body">
         {turn.texts.map((text, textIndex) => (
           <span key={`${turn.key}-${textIndex}`}
             className={`live-turn-text ${textIndex >= recentFromIndex ? "is-recent" : ""}`}>
             {text}{" "}
           </span>
         ))}
+        {pendingText
+          ? <span className="live-turn-text is-recent is-pending" data-caption-state="updating">{pendingText}</span>
+          : null}
       </p>
     </article>
   );
@@ -144,20 +143,6 @@ export default function MeetingTurnFeed({ captions, floorHolder, emptyMessage }:
   const [isPinnedToLatest, setIsPinnedToLatest] = useState(true);
   const isPinnedRef = useRef(true);
   isPinnedRef.current = isPinnedToLatest;
-  // Collapsed paragraphs, keyed by turn. A Live Call runs for hours, so a
-  // speaker's turn can grow to dozens of sentences; folding one lets a reader
-  // skim who spoke when without scrolling through the whole thing. Keyed by
-  // turn.key (the turn's first caption seq), which is stable while the turn
-  // keeps growing, so a fold survives every re-render and new caption.
-  const [collapsedTurnKeys, setCollapsedTurnKeys] = useState<ReadonlySet<string>>(new Set());
-  const toggleTurnCollapsed = useCallback((key: string) => {
-    setCollapsedTurnKeys((previous) => {
-      const next = new Set(previous);
-      if (next.has(key)) next.delete(key);
-      else next.add(key);
-      return next;
-    });
-  }, []);
   const turns = useStableTurns(captions);
   // Reference-app treatment: everything already read fades to gray; only the
   // two most recently completed sentences stay white.
@@ -193,6 +178,15 @@ export default function MeetingTurnFeed({ captions, floorHolder, emptyMessage }:
     }
     return null;
   }, [captions]);
+
+  // A partial CONTINUES the newest paragraph when it is the same speaker; a
+  // different speaker genuinely starts a new turn and gets its own paragraph.
+  const livePartialBelongsToLastTurn = useMemo(() => {
+    if (!livePartial) return false;
+    const lastTurn = turns.at(-1);
+    if (!lastTurn) return false;
+    return lastTurn.speakerLabel === speakerMetaLine(livePartial.speaker);
+  }, [livePartial, turns]);
 
   // Writing scrollTop needs scrollHeight read back, and that read is a forced
   // synchronous layout anywhere the DOM is still dirty — measured at ~0.5ms per
@@ -255,18 +249,19 @@ export default function MeetingTurnFeed({ captions, floorHolder, emptyMessage }:
             <>
               {turns.map((turn, turnIndex) => (
                 <MeetingTurnCard key={turn.key} turn={turn}
-                  isCollapsed={collapsedTurnKeys.has(turn.key)}
                   recentFromIndex={turnRecentFrom[turnIndex]}
-                  onToggle={toggleTurnCollapsed} />
+                  pendingText={livePartialBelongsToLastTurn && turnIndex === turns.length - 1
+                    ? livePartial?.text ?? ""
+                    : ""} />
               ))}
-              {livePartial && (
+              {livePartial && !livePartialBelongsToLastTurn && (
                 <article className="live-turn-card is-live" data-caption-state="updating">
                   <header>
                     <span className="live-speaker-dot" style={{ backgroundColor: resolveSpeakerColor(livePartial.speaker) }} aria-hidden="true" />
                     <strong>{speakerMetaLine(livePartial.speaker)}</strong>
                     <span className="live-speaking-waves" aria-hidden="true"><i /><i /><i /></span>
                   </header>
-                  <p><span className="live-turn-text is-recent">{livePartial.text}</span></p>
+                  <p><span className="live-turn-text is-recent is-pending">{livePartial.text}</span></p>
                 </article>
               )}
             </>

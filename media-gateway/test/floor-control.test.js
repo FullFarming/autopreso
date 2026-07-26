@@ -48,10 +48,14 @@ function createFloorGateway({ floorController, pipelineHooks = {}, gatewayOption
       const pipeline = {
         settings,
         frames: [],
+        captures: [],
         floorSpeakers: [],
         async start() {},
         async tick() {},
-        async acceptAudio(frame) { this.frames.push(frame); },
+        async acceptAudio(frame, capturedAt, floorSpeaker) {
+          this.frames.push(frame);
+          this.captures.push({ capturedAt, floorSpeaker });
+        },
         setFloorSpeaker(speaker) { this.floorSpeakers.push(speaker); },
         async endAudioStream() {},
         async close() {},
@@ -139,6 +143,7 @@ test("speak-start takes the floor, notifies everyone, and routes speaker audio i
   host.send(Buffer.alloc(INPUT_FRAME_BYTES));
   await new Promise((resolve) => setTimeout(resolve, 100));
   assert.equal(pipelines[0].frames.length, 1);
+  assert.equal(pipelines[0].captures[0].floorSpeaker.participantId, "grant-speaker");
 
   // Explicit speak-end releases the floor and broadcasts a null holder.
   const speakerEnded = waitForJson(speaker, (message) => message.type === "speak-ended");
@@ -153,6 +158,7 @@ test("speak-start takes the floor, notifies everyone, and routes speaker audio i
   host.send(Buffer.alloc(INPUT_FRAME_BYTES));
   await new Promise((resolve) => setTimeout(resolve, 100));
   assert.equal(pipelines[0].frames.length, 2);
+  assert.equal(pipelines[0].captures[1].floorSpeaker, null);
 });
 
 test("a second speaker preempts the current one and non-holders may not send audio", async (context) => {
@@ -188,6 +194,65 @@ test("a second speaker preempts the current one and non-holders may not send aud
   speakerA.send(Buffer.alloc(INPUT_FRAME_BYTES));
   await new Promise((resolve) => setTimeout(resolve, 100));
   assert.equal(speakerA.readyState, WebSocket.OPEN);
+});
+
+test("delayed floor identity cannot race a second take or host preemption into split ownership", async (context) => {
+  let releaseFirstProfile;
+  const firstProfileGate = new Promise((resolve) => { releaseFirstProfile = resolve; });
+  const takeCalls = [];
+  const releaseCalls = [];
+  const { gateway, pipelines } = createFloorGateway({
+    gatewayOptions: {
+      floorTakeCooldownMilliseconds: 0,
+      async fetchFloorParticipant(_sessionId, participantId) {
+        if (participantId === "grant-a") await firstProfileGate;
+        return { department: participantId };
+      },
+    },
+    floorController: {
+      async take(_sessionId, grantId) {
+        takeCalls.push(grantId);
+        return { ok: true, participantId: grantId, displayName: grantId };
+      },
+      async release(_sessionId, grantId) { releaseCalls.push(grantId); return true; },
+    },
+  });
+  await new Promise((resolve) => gateway.server.listen(0, "127.0.0.1", resolve));
+  context.after(async () => gateway.close());
+  const { port } = gateway.server.address();
+  const host = await startHost(port);
+  const speakerA = await joinViewer(port, "grant-a");
+  const speakerB = await joinViewer(port, "grant-b");
+  context.after(() => host.terminate());
+  context.after(() => speakerA.terminate());
+  context.after(() => speakerB.terminate());
+
+  speakerA.send(JSON.stringify({ type: "speak-start" }));
+  while (takeCalls.length < 1) await new Promise((resolve) => setImmediate(resolve));
+  speakerB.send(JSON.stringify({ type: "speak-start" }));
+  host.send(JSON.stringify({ type: "host-speak" }));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(takeCalls, ["grant-a"], "the second take must wait for the first identity lookup");
+
+  const aMessages = [];
+  const bMessages = [];
+  const hostMessages = [];
+  speakerA.on("message", (data) => aMessages.push(JSON.parse(data.toString("utf8"))));
+  speakerB.on("message", (data) => bMessages.push(JSON.parse(data.toString("utf8"))));
+  host.on("message", (data) => hostMessages.push(JSON.parse(data.toString("utf8"))));
+  releaseFirstProfile();
+  for (let attempt = 0; attempt < 100
+    && (!aMessages.some((message) => message.type === "speak-started")
+      || !bMessages.some((message) => message.type === "speak-started")
+      || !hostMessages.some((message) => message.type === "host-speak-started")); attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.equal(aMessages.some((message) => message.type === "speak-started"), true);
+  assert.equal(bMessages.some((message) => message.type === "speak-started"), true);
+  assert.equal(hostMessages.some((message) => message.type === "host-speak-started"), true);
+  assert.deepEqual(takeCalls, ["grant-a", "grant-b"]);
+  assert.deepEqual(releaseCalls, ["grant-b"], "host preemption releases the actual final DB holder");
+  assert.equal(pipelines[0].floorSpeakers.at(-1), null, "gateway and DB finish with the host owning audio");
 });
 
 test("translation restart preserves the active speaker and live call identity", async (context) => {

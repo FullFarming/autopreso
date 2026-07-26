@@ -1,6 +1,25 @@
 [규칙]
 - 아래는 대칭 용어쌍이다. 한→영, 영→한 어느 방향이든 원문에 한쪽이 나오면 반드시 그 짝으로 옮긴다.
-- 약어는 양방향 모두 원문 그대로 유지(번역 금지): NOI, CapEx, CAPEX, OPEX, IRR, REIT, LP, GP, FI, SI, WALE, CBD, GBD, YBD, Cap Rate, NOC, LOI, MOU, SPC, PFV, PF, LTV, DSCR, GFA, TI, DD, IM, RFP, NDA, M&A, JV, AUM, ROI, KPI, B2B, B2C, Q1, Q2, Q3, Q4, Q&A, AI, AX, DX, LLM, RAG, API, MCP, SaaS, PoC, MVP, GPU, K-Pop, K-Content.
+- 약어는 양방향 모두 원문 그대로 유지(번역 금지): NOI, CapEx, CAPEX, OPEX, IRR, REIT, LP, GP, FI, SI, WALE, CBD, GBD, YBD, Cap Rate, NOC, LOI, MOU, SPC, PFV, PF, LTV, DSCR, GFA, TI, DD, IM, RFP, NDA, M&A, JV, AUM, ROI, KPI, B2B, B2C, Q1, Q2, Q3, Q4, Q&A, AI, AX, DX, LLM, RAG, API, MCP, SaaS, PoC, MVP, GPU, K-Pop, K-Content, CMG, PDS, OS, CTS, CWB, IAC, ADV, RET, TR, PJT, APAC, ANZ, HBU, MICE, MD, YoY, YTD, HQ, R&D, ESG, FM, AM, PM.
+
+[숫자 표기 규칙 — 자릿수 단위를 반드시 바꾼다]
+- 한국어는 만/억/조(10^4/10^8/10^12)로 세고, 영어 비즈니스 화법은 million/billion/trillion으로 센다. 크기(magnitude)와 통화는 그대로 두고 자릿수 단위 표기만 바꾼다. 환율 환산은 절대 하지 않는다.
+- 영어 출력: 3,000억 원 → KRW 300 billion / 300억 원 → KRW 30 billion / 1조 5,000억 원 → KRW 1.5 trillion / 5,000만 원 → KRW 50 million / 3억 달러 → USD 300 million. 영어 문장에 "3,000억"이나 "hundred million"을 남기지 말 것.
+- 한국어 출력: KRW 300 billion → 3,000억 원 / 1.5 trillion won → 1조 5,000억 원 / USD 30 million → 3,000만 달러 / $500 million → 5억 달러. 한국어 문장에 billion/million을 그대로 남기지 말 것.
+- USD 641K, 6.7 Mil, USD 7.41M 처럼 K/M/Mil이 붙으면 각각 "천/백만" 단위로 옮긴다(641K = 64만 1천 달러). "케이", "밀"이라고 읽지 말 것.
+- 퍼센트, 연도, 분기, 면적(㎡·평), 층수(B2~5F = 지하 2층~지상 5층), 인원수, 지번·호수는 들린 그대로 옮긴다. 숫자를 임의로 반올림하거나 근사치를 지어내지 말 것.
+- 평과 ㎡는 서로 바꾸지 않는다(1평 ≈ 3.3058㎡). 연면적(GFA)과 전용면적(Net Area)은 서로 다른 개념이므로 절대 섞지 말 것.
+
+[약어·중의어 주의 — 반드시 문맥으로 판단]
+- PM은 Property Management(자산관리)다. Project Management가 아니다(그쪽은 PDS).
+- MD 컨설팅의 MD는 merchandising(테넌트 구성)이다. Managing Director가 아니다.
+- CRE는 상업용 부동산 전체를 뜻할 때도 있고, 캐피탈마켓 그룹 산하 팀 이름일 때도 있다.
+- ANZ는 호주·뉴질랜드 권역을 뜻할 때도 있고 고객사(ANZ 은행)를 뜻할 때도 있다. 임의로 확장하지 말 것.
+- Deal Size는 금액·면적·인원 중 무엇이든 담을 수 있다. 항상 "거래 금액"으로 단정하지 말 것.
+- Identified Stock Assets의 stock은 기존 건물 재고다. 주식도 아니고 회계상 재고자산도 아니다.
+- Disposition / Disposal은 자산 매각이다. 폐기·처분이 아니다.
+- 리뉴얼은 맥락에 따라 (임차) 재계약이 아니라 매장·건물 리모델링을 뜻한다. Renewal(재계약)과 구분할 것.
+- Advisory-DCT, Consulting_LCT, DTR2, LM, WPR, BDS, GSC, LO 같은 사내 조직 코드는 확장하지 말고 글자 그대로 읽는다.
 - 회사·브랜드·지명 등 고유명사는 아래 표기로 고정한다. 또렷이 들리지 않으면 임의로 음차하거나 새 문장을 지어내지 말 것.
 - 회사명 동일 지칭: 쿠시먼앤드웨이크필드 / 쿠시먼 / Cushman & Wakefield / C&W 는 모두 같은 회사다. 어느 표기·발음이 들리든 영어 출력은 Cushman & Wakefield(코리아 법인은 Cushman & Wakefield Korea), 한국어 출력은 쿠시먼앤드웨이크필드(코리아 법인은 쿠시먼앤드웨이크필드 코리아)로 통일한다. Kushman, Kushiman, Kushima, Kusiman, K-Field, 쿠시만, 쿠쉬먼 같은 잘못된 음차로 출력하지 말 것.
 
@@ -10,6 +29,19 @@
 쿠시먼앤드웨이크필드 코리아 = Cushman & Wakefield Korea
 쿠시먼앤드웨이크필드코리아 = Cushman & Wakefield Korea
 쿠시먼 코리아 = Cushman & Wakefield Korea
+- 실시간 STT는 Cushman을 Kushi, Kushman, Kusiman, K-Field, 쿠시만, 쿠쉬먼처럼 계속 다르게 음차한다. 아래 짝으로 강제 교정하며, 새 음차를 임의로 만들지 않는다.
+Kushi = Cushman & Wakefield
+Kushman = Cushman & Wakefield
+Kushiman = Cushman & Wakefield
+Kusiman = Cushman & Wakefield
+K-Field = Cushman & Wakefield
+K-Field Korea = Cushman & Wakefield Korea
+Kushi = 쿠시먼앤드웨이크필드
+Kushman = 쿠시먼앤드웨이크필드
+Kushiman = 쿠시먼앤드웨이크필드
+Kusiman = 쿠시먼앤드웨이크필드
+K-Field = 쿠시먼앤드웨이크필드
+K-Field Korea = 쿠시먼앤드웨이크필드 코리아
 캐피탈 마켓 그룹 = Capital Markets Group
 CW 인베스트먼트 어드바이저리 = CW Investment Advisory
 코람코자산운용 = Koramco Asset Management
@@ -279,3 +311,413 @@ track record = 트랙레코드
 state of the art = 최첨단
 pain point = 페인 포인트 (애로사항)
 end-to-end = 엔드투엔드 (전 과정)
+
+[상업용 부동산 컨설팅 — 서비스 라인/수임 (한국어 = English)]
+임대자문 / 임대인 대리 = landlord representation
+임차자문 / 임차인 대리 = tenant representation
+리테일 임대차 = retail leasing
+물류 임대차 = logistics leasing
+임대차 관리 = leasing management
+자산관리 서비스 = asset services
+시설관리 = facility management
+프로젝트·개발 서비스 = project and development services
+프로젝트 및 공사 관리 = project and construction management
+설계 및 프로젝트 관리 = design and project management
+자산 리뉴얼 컨설팅 = asset renewal consulting
+공간 기획 및 설계 = space planning and design
+투자 자문 = investment advisory
+개발 자문 = development advisory
+구조화 금융 = structured financing
+기업 맞춤형 솔루션 = corporate tailored solution
+컨설팅 용역 = consulting engagement
+중개계약 = brokerage agreement
+전속 수임 = exclusive assignment
+수임 확정 = mandate assigned
+주요 수행실적 = executed project record
+거래 종결 = closed deal
+거래상대 = counterparty
+사업성 검토 = feasibility study
+시장실사 = market due diligence
+최유효 활용방안 = highest and best use
+착수보고 = kick-off report
+최종보고 = final report
+제안서 = proposal
+제안서 템플릿 = proposal template
+감수 완료 = review complete
+업무 범위 = scope of work
+기존 재고 물건 = identified stock assets
+프린시펄 워크 = principal work
+파이프라인 = pipeline
+
+[상업용 부동산 — 개발/인허가 심화 (한국어 = English)]
+기부채납 = public contribution of land or facilities
+대수선 = major repair
+시행부지 = development site
+복합개발 = mixed-use development
+주상복합 = mixed-use residential building
+도시형 생활주택 = urban-type housing
+상업시설 = retail facility
+상업시설 활성화 = retail repositioning
+전환 검토 = conversion review
+토지 이용 = land use
+필지 = land parcel
+구군 = district
+휴게소 = highway rest area
+서비스센터 = service centre
+컨셉스토어 = concept store
+카드뉴스 = card news
+
+[실적·조직 지표 (한국어 = English)]
+전년 동기 대비 = year-on-year
+연초 이후 누계 = year-to-date
+상반기 = first half
+하반기 = second half
+임직원 수 = headcount
+고객 대면 인력 = client-facing staff
+언론 점유율 = share of voice
+주요 언론사 = top-tier media
+언론 노출 = media exposure
+성장 동력 = growth engine
+사업 환경 = business climate
+매출 전망 = revenue outlook
+실현 매출 = actual revenue
+잠재 매출 = potential revenue
+수수료 규모 = fee size
+전환율 = conversion rate
+준법 사전 승인 = compliance pre-approval
+법인 인감 = company seal
+
+[직위·조직 단위 (한국어 = English)]
+본부장 = Head of Division
+그룹장 = Group Head
+팀장 = Team Leader
+파트장 = Part Leader
+과장님 = Manager
+차장님 = Deputy General Manager
+부장님 = General Manager
+이사님 = Director
+상무님 = Executive Director
+전무님 = Senior Executive Director
+사업본부 = business division
+마케팅팀 = Marketing team
+디자인팀 = Design team
+- 부문/본부는 영어로 division, 슬라이드 표 안의 "부서" 컬럼은 department로 옮긴다.
+- 임차자문과 임차인 대리는 같은 서비스 라인이다. Tenant Representative는 사람이 아니라 서비스 라인 이름이므로 "임차인 대표"로 옮기지 말 것.
+- Sale Advisory와 Disposition Advisory는 같은 덱에서 다른 라벨로 쓰인다. 둘 다 매각 자문이며, 처분(폐기)이 아니다.
+
+[영어 라벨 = 한국어 (덱 표기 고정)]
+Disposition Advisory = 매각 자문
+Plant Disposal = 공장 매각
+Sale & Acquisition = 매입·매각 자문
+PF Arrangement = PF 주선
+Key Wins = 주요 수주 성과
+Deal Done Revenue = 성사 거래 기준 매출
+Global Korea Desk = 글로벌 코리아 데스크
+Industrial Sector Group = 인더스트리얼 섹터 그룹
+Win Announcement = 수주 공지
+Net Area = 전용면적
+pax = 재실 인원
+holding up = 견조하게 유지되다
+that delivers = 성과로 이어지는
+outperform the market = 시장을 상회하는 성과를 내다
+transaction volume = 거래량
+cross-border capital = 크로스보더 자본
+overseas expansion = 해외 진출
+get in front of = 먼저 접점을 만들다
+remain competitive = 경쟁력을 유지하다
+first location = 1호점
+
+[관용·비유 표현 추가 — 타운홀 화법 (한국어 = English)]
+견조하다 = hold up well
+지형이 재편되다 = the landscape is being reshaped
+접점을 만들다 = get in front of a client
+선점하다 = secure ahead of competitors
+급변하는 = rapidly changing
+대대적인 = sweeping
+거래 위축 = subdued transaction activity
+자본 유치 = attracting capital
+해외 진출 모색 = seeking overseas expansion
+성과로 연결하다 = turn into results
+누락되는 요청 = missed requests
+끊김 없는 = seamless
+최종 목표 = ultimate target
+재원 재배분 = reallocation of resources
+
+[고유명사 추가 — 회사/브랜드 (한국어 = English)]
+넷마블 = Netmarble
+몰로코 = Moloco
+콘티넨탈 = Continental
+CJ올리브네트웍스 = CJ OliveNetworks
+라인게임즈 = Line Games
+쿠팡 = Coupang
+롯데렌탈 = Lotte Rental
+위워크 = WeWork
+HD한국조선해양 = HD Korea Shipbuilding & Offshore Engineering
+현대오일뱅크 = Hyundai Oilbank
+GS칼텍스 = GS Caltex
+GS건설 = GS E&C
+한화건설 = Hanwha E&C
+한화생명 = Hanwha Life
+NH투자증권 = NH Investment & Securities
+LB자산운용 = LB Asset Management
+DS네트웍스 = DS Networks
+삼성SDS = Samsung SDS
+하인스 = Hines
+올리브영 = Olive Young
+신라스테이 = Shilla Stay
+이마트 = E-mart
+패스트파이브 = FASTFIVE
+무신사 = MUSINSA
+머큐어 = Mercure
+씨티 = Citi
+- The Retail Edit, CW Portal, C&W Studio, Proposal Builder, Contents Hub, CW Archive, APAC PlusOne, Corporate IQ는 사내 제품·간행물 이름이므로 번역하지 않는다.
+
+[고유명사 추가 — 자산/프로젝트 (한국어 = English)]
+케이트윈타워 = K-Twin Tower
+하이드파크 명동 = HydePark Myeongdong
+넷마블 G타워 = Netmarble G-Tower
+구로 G타워 = Guro G-Tower
+센트로폴리스 = Centropolis
+블루스퀘어 = Blue Square
+잠실 MICE = Jamsil MICE
+송도 크리스탈 오션 = Songdo Crystal Ocean
+하남드림휴게소 = Hanam Dream Rest Area
+청라 루원시티 = Cheongna Lu1 City
+아트포레스트 = Art Forest
+힐링웨이 = Healing Way
+센텀타워 = Centum Tower
+종로플레이스 = Jongno Place
+트윈시티 남산 = Twin City Namsan
+센터필드 = Centerfield
+대원빌딩 = Daewon Building
+용산 시티파크 = Yongsan City Park
+이마트 타워 = E-mart Tower
+영경빌딩 = Yeongyeong Building
+- 넷마블 G타워와 구로 G타워는 같은 자산(연면적 172,975㎡)을 가리키는 두 표기다.
+
+[캐피탈마켓 심화 — 자금조달/딜 소싱 (한국어 = English)]
+자본조달비용 = capital costs
+선순위 대출 금리 = senior loan pricing
+양극화 = polarization
+준공 물량 = completion volumes
+총 거래액 = total transaction value
+누적 매출 = cumulative revenue
+검토 건수 = deals reviewed
+통매각 / 일괄매각 = en-bloc disposition
+역제안 = reverse inquiry
+직접 소싱 = direct sourcing
+사옥 유동화 = corporate HQ monetization
+사옥 실수요자 = corporate end-user
+네트워크 자산 = network assets
+경쟁 구도 조성 = creating competitive tension
+우량 수임 = premium mandate
+고액자산가 = high-net-worth client
+단독 수임 = sole-source mandate
+우선출자 = preferred equity
+세일앤리스백 = sale and leaseback
+미집행 약정 자본 = committed but undeployed capital
+대주 참여 의향 = lender appetite
+투자 심리 = investment appetite
+명도 절차 = eviction process
+부실채권 = non-performing loan
+자본·차입 주선 = capital and debt arrangement
+시가 반영 = mark-to-market
+임대료 정상화 = rent normalization
+기술 실사 = technical due diligence
+
+[임차인 서비스 심화 (한국어 = English)]
+임대차 자문 = lease advisory
+전속 자산 = exclusive asset
+임대차 거래 건 = lease transaction
+창고 임대차 = warehouse lease
+공장 임대차 = plant lease
+맞춤형 개발 = built-to-suit
+피트아웃 = fit-out
+워크플레이스 전략 = workplace strategy
+부지 선정 = site selection
+부지 실사 = site diligence
+기본용역계약 = master service agreement
+교차 판매 = cross-sell
+단일 창구 = single point of contact
+해외 진출 한국 기업 = Korean outbound corporates
+확률가중 파이프라인 = probability-weighted pipeline
+연간 사업계획 = annual operating plan
+총매출 = gross revenue
+순매출 = net revenue
+원청 계약 = principal contract
+운영비 절감 = operating cost saving
+공동 고객 미팅 = joint client calls
+상시 이메일 마케팅 = always-on e-marketing
+계열사 = affiliate
+- occupier는 임차인(공간 사용자)이다. "점유자"는 명도·퇴거 뉘앙스이므로 쓰지 말 것.
+- property owners and occupiers는 "소유주 및 임차인"으로 두 축을 모두 살려 옮긴다.
+- PM은 슬라이드에 월 수수료(Fee/month)가 붙어 있으면 Property Management(부동산 관리)이고, 공사·이전 프로젝트 맥락이면 Project Management(사업관리)다.
+- GTR/DTR/LM/CS/CRE/GTR·DTR 뒤의 숫자(DTR 3 & 4)는 조직 이름의 일부이며 건수가 아니다.
+
+[개발·인허가 심화 2 (한국어 = English)]
+인허가 지연 = permitting delay
+민관 공동개발 = public-private joint development
+지주 공동사업 = landowner-driven development
+통합시설관리 = integrated facility management
+개발 전 주기 = the full development lifecycle
+농산물산지유통센터 = agricultural products processing center
+창고시설 = warehouse facility
+동식물관련시설 = animal and plant-related facility
+전력 확보 제약 = power constraints
+고사양 대형 시설 = large high-spec facility
+
+[호텔·리빙 심화 (한국어 = English)]
+가족호텔 = family hotel
+코리빙 = co-living
+플렉시블 리빙 = flexible living
+임대주택 = rental housing
+프리미엄 캡슐호텔 = premium capsule hotel
+프리오프닝 = pre-opening
+인바운드 관광 = inbound tourism
+호텔 공급 부족 = hotel supply shortage
+호텔 컨버전 = hotel conversion
+
+[리테일 심화 (한국어 = English)]
+가두상권 리테일 = high-street retail
+저층부 리테일 = lower-floor retail
+공실 리테일 공간 = vacant retail space
+MD 컨설팅 = merchandising consulting
+브랜딩 솔루션 서비스 = branding solution service
+소비자 라이프스타일 분석 = consumer lifestyle analysis
+목표 고객층 = target demographic
+상권 펀더멘털 = district fundamentals
+시장 지배력 = long-term dominance
+
+[리스크·거버넌스 (한국어 = English)]
+고객 편중 리스크 = client concentration risk
+금리·자금조달 리스크 = interest rate and financing risk
+정책·규제 리스크 = policy and regulatory risk
+규제 불확실성 = regulatory uncertainty
+선점 우위 = first-mover advantage
+리스크 분산 = risk diversification
+고객 포트폴리오 다각화 = diversified client portfolio
+대외비 = confidential — internal
+다양성·형평성·포용성 = diversity, equity and inclusion
+상업용 부동산 종합서비스 기업 = commercial real estate services firm
+소유주 및 임차인 = property owners and occupiers
+인재 리뷰 = talent review
+사례 공유 = case study sharing
+
+[영어 슬로건·구어 = 한국어 (직역 금지)]
+Record Breaker = 신기록 달성
+Mandate Machine = 수임 폭발
+Just Dropped = 신규 출시
+Potential Unlocked = 잠재력 실현
+Reset Higher = 상향 고착
+usual suspects = 익숙한 단골 고객군
+competitive tension = 매수 경쟁 구도
+conversion play = 컨버전 전략
+Painful Losses = 아쉬운 실패
+Risk Diversion = 리스크 분산
+ten bagger = 텐배거
+Worst case = 최악의 경우
+Best case = 최선의 경우
+lessons learnt = 배운 점
+- Mandate/Mandated는 수임(전속 자문 계약 획득)이다. 명령·위임장이 아니다.
+- Closed는 거래 종결이다. 폐쇄·문을 닫았다가 아니다.
+- Disposal/Disposition은 자산 매각이다. 폐기·처분이 아니다.
+- "Risk Diversion"은 덱의 오타이며 뜻은 risk diversification(리스크 분산)이다.
+- 000% 달성, 0000 sqm, M****, TBD, TBC, "-"는 미기입 자리표시자다. 숫자로 읽지 말 것.
+- 금액 뒤의 B는 billion, M/mil/MIL은 million, K는 thousand다. 덱마다 통화가 달라(OS는 M=백만 원, PDS는 MIL=백만 달러) 임의로 통일하지 말 것.
+- 괄호로 감싼 숫자는 덱에 따라 음수일 수도 있고 합계일 수도 있다. 부호를 임의로 붙이지 말 것.
+- "for 3 years", "/month" 같은 기간·주기 한정어는 반드시 함께 옮긴다.
+- General Director/Director/Agent/Deputy MD/Head of ... Korea는 덱에 인쇄된 영문 직함이다. Agent는 담당자를 뜻하며 AI 에이전트가 아니고, Deputy MD의 MD는 Managing Director이며 MD 컨설팅의 merchandising과 다르다.
+
+[고유명사 추가 2 — 고객사/투자자 (한국어 = English)]
+CJ대한통운 = CJ Logistics
+롯데건설 = Lotte E&C
+롯데백화점 = Lotte Department Store
+풀무원 = Pulmuone
+JB자산운용 = JB Asset Management
+캡스톤자산운용 = Capstone Asset Management
+현대엔지니어링 = Hyundai Engineering
+현대모비스 = Hyundai Mobis
+현대글로비스 = Hyundai Glovis
+현대로템 = Hyundai Rotem
+현대카드 = Hyundai Card
+현대건설기계 = HD Construction Equipment
+기아 = KIA
+제네시스 = Genesis
+한국타이어 = Hankook Tire
+코리안리 = Korean Re
+신한은행 = Shinhan Bank
+메리츠증권 = Meritz Securities
+크래프톤 = Krafton
+넥슨 = Nexon
+스마일게이트 = Smilegate
+코스콤 = Koscom
+헥토 = Hecto
+컬리 = Kurly
+셀트리온 = Celltrion
+라인플러스 = Line Plus
+휴비스 = Huvis
+버킷플레이스 = Bucket Place
+서울우유 = Seoul Milk
+한진 = Hanjin
+다이와하우스 = Daiwa House
+콘티텍 / 콘티테크 = ContiTech
+킨드릴 = Kyndryl
+포르쉐 = Porsche
+아디다스 = Adidas
+캄파리 = Campari
+게스 = Guess
+제너럴밀스 = General Mills
+라이엇게임즈 = Riot Games
+포시즌스 = Four Seasons
+퍼스트캐빈 = First Cabin
+보코 = Voco
+파트너스그룹 = Partners Group
+베어링 = Baring
+
+[고유명사 추가 2 — 자산/프로젝트 (한국어 = English)]
+대신파이낸스센터 = Daishin Finance Center
+눈스퀘어 = Noon Square
+케이스퀘어 홍대 = K-Square Hongdae
+디큐브시티 = D-Cube City
+원그로브 = One Grove
+김포 로지스포인트 = Gimpo Logis Point
+브라이튼 해운대 = BRIGHTEN Haeundae
+아클레르 광진 = Aclair Gwangjin
+의정부 데이터센터 = Uijeongbu Data Center
+- 하이드파크 명동은 덱에 Hyde Park Myeongdong / Hydepark, Myeongdong 두 표기로 나온다. 같은 자산이며 영어 출력은 HydePark Myeongdong으로 통일한다.
+- 강원 스마트팜·APC 센터는 Gangwon Smart Farm & APC Center / Gangwon Smartfarm / Smart Farm & APC Center in Kangwon 세 표기로 나온다. 같은 프로젝트다.
+- Gangwon과 Kangwon은 같은 지명이며, 강원특별자치도의 공식 영문은 Gangwon State다.
+
+[지명 추가 (한국어 = English)]
+이태원 = Itaewon
+신도림 = Sindorim
+목동 = Mokdong
+의정부 = Uijeongbu
+신림 = Sillim
+군포 = Gunpo
+일산 = Ilsan
+김포 = Gimpo
+고양 = Goyang
+화성 = Hwaseong
+구미 = Gumi
+양재 = Yangjae
+강원 = Gangwon
+경기 = Gyeonggi
+아차산 = Mt. Achasan
+청량리 = Cheongnyangni
+하남 = Hanam
+청라 = Cheongna
+가산동 = Gasan-dong
+해운대 = Haeundae
+청담동 = Cheongdam-dong
+구로 = Guro
+금천구 = Geumcheon-gu
+종로구 = Jongno-gu
+강남구 = Gangnam-gu
+용산구 = Yongsan-gu
+광진구 = Gwangjin-gu
+횡성 = Hoengseong
+양산 = Yangsan
+파사데나 = Pasadena
+서울기타 = Other Seoul
+북아시아 = North Asia

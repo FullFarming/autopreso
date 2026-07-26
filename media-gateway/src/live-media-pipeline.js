@@ -1,6 +1,7 @@
 import { AUDIO_CONFIG, normalizeLiveLanguage, textPlausiblyInLanguage, validateLiveSettings } from "./config.js";
 import { OrderedTaskQueue } from "./ordered-task-queue.js";
 import { applyGlossaryCorrections } from "./glossary-corrections.js";
+import { isOutputInTargetLanguage, sourceLaneMatches } from "./language-gate.js";
 import { SpeakerRegistry } from "./speaker-registry.js";
 
 const INPUT_FRAME_BYTES = AUDIO_CONFIG.inputSampleRate * 2 * AUDIO_CONFIG.chunkMilliseconds / 1_000;
@@ -38,6 +39,9 @@ export class LiveMediaPipeline {
   #languageRecovery = new Map();
   #recentUtteranceKeys = new Map();
   #presentationCaptionState = new Map();
+  #meetingInputCaption = null;
+  #meetingInputCaptionCounter = 0;
+  #meetingInputFinalQueues = new Map();
   /** Per-lane throttle for caption-emission failure logs. */
   #emissionFailureLoggedAt = new Map();
   #floorSpeaker = null;
@@ -194,6 +198,7 @@ export class LiveMediaPipeline {
             outputSampleRate: AUDIO_CONFIG.outputSampleRate,
             contextCompression: true,
             sessionResumption: true,
+            correlateInputCaption: isMeeting,
             onCaption: (caption) => this.#publishPresentationCaption(language, caption),
             ...(isMeeting && languageIndex === 0
               ? { onInputCaption: (caption) => this.#publishMeetingInputCaption(caption) }
@@ -242,7 +247,7 @@ export class LiveMediaPipeline {
     throw new Error("UNSUPPORTED_SESSION_TYPE");
   }
 
-  async acceptAudio(frame, capturedAt = this.now()) {
+  async acceptAudio(frame, capturedAt = this.now(), capturedFloorSpeaker = undefined) {
     this.#assertRunning();
     if (!(frame instanceof Uint8Array) || frame.byteLength !== INPUT_FRAME_BYTES) throw new Error("INVALID_AUDIO_FRAME");
     if (this.#isPaused) return false;
@@ -250,9 +255,19 @@ export class LiveMediaPipeline {
     this.#lastAudioAt = this.now();
     this.#didEndTurn = false;
     if (usesLiveTranslateCaptions(this.sessionType)) {
+      // The gateway snapshots the producer identity when it accepts the frame.
+      // Its ordered audio tail may reach this method after speak-end or a host
+      // reclaim, so resolving from the current floor here can steal the late
+      // final for the host. `undefined` keeps the direct-call compatibility;
+      // explicit null is a host frame captured while the floor was free.
+      const floorSpeaker = this.sessionType === "meeting"
+        ? (capturedFloorSpeaker === undefined
+          ? this.#floorAttribution(capturedAt)
+          : capturedFloorSpeaker)
+        : null;
       const results = await Promise.all([...this.#liveSessions].map(async ([language, session]) => {
         try {
-          await session.sendAudio(frame);
+          await session.sendAudio(frame, { capturedAt, floorSpeaker });
           return null;
         } catch {
           this.#liveSessions.delete(language);
@@ -346,9 +361,10 @@ export class LiveMediaPipeline {
       const partial = lane.pending;
       lane.pending = null;
       try {
-        const isSourceLane = Boolean(partial.normalizedSourceLanguage)
-          && language === partial.normalizedSourceLanguage
-          && textPlausiblyInLanguage(partial.normalizedText, language);
+        // Same detection-backed decision as the final path: an interim must not
+        // flash raw English on the KO lane just because the STT labelled
+        // contaminated English as Korean.
+        const isSourceLane = sourceLaneMatches(partial.normalizedText, partial.normalizedSourceLanguage, language);
         let textOut = partial.normalizedText;
         // Partials never carry "failed": a throw below skips publication
         // entirely rather than fail-open, so an interim caption is only ever
@@ -369,6 +385,9 @@ export class LiveMediaPipeline {
         // A final published while this partial was translating supersedes it.
         if (partial.epoch !== lane.epoch) continue;
         if (lane.lastText === textOut) continue;
+        // Output-language gate, same as finals: never show an interim that is
+        // not in this lane's language.
+        if (!isOutputInTargetLanguage(textOut, language)) continue;
         lane.lastText = textOut;
         const caption = {
           type: "caption",
@@ -384,8 +403,7 @@ export class LiveMediaPipeline {
           sourceEndedAt: new Date(this.now()).toISOString(),
           emittedAt: new Date(this.now()).toISOString(),
         };
-        await this.dependencies.publisher.publish(this.sessionId, language, caption);
-        this.onHostEvent?.(caption);
+        await this.#publishCaption(language, caption, { mirrorToHost: true });
       } catch {
         // Partial captions are best-effort; the finalized utterance retries.
       }
@@ -461,7 +479,12 @@ export class LiveMediaPipeline {
       }
       return this.#floorSpeaker;
     }
-    if (recentFloor) return recentFloor.speaker;
+    if (recentFloor) {
+      // 2026-07-26 fix: Grace applies only to audio captured before release.
+      // New host audio after release must not inherit the former participant.
+      if (Number.isFinite(sourceStartedAtMs) && sourceStartedAtMs >= recentFloor.releasedAt) return null;
+      return recentFloor.speaker;
+    }
     return null;
   }
 
@@ -538,9 +561,11 @@ export class LiveMediaPipeline {
           // The STT detection is per-result and can be wrong, so passthrough
           // additionally requires the text's script to match the lane language
           // — otherwise misdetected Korean would surface raw on the en lane.
-          const isSourceLane = Boolean(normalizedSourceLanguage)
-            && language === normalizedSourceLanguage
-            && textPlausiblyInLanguage(normalizedText, language);
+          // sourceLaneMatches applies the desktop engine's count+ratio detection
+          // instead of a bare script-presence test: English carrying a single
+          // Korean place name used to count as Korean and was published
+          // untranslated on the KO lane.
+          const isSourceLane = sourceLaneMatches(normalizedText, normalizedSourceLanguage, language);
           // laneReady: the published text is genuinely in the lane language
           // (verbatim source or successful translation) — the TTS gate.
           let laneReady = isSourceLane;
@@ -574,6 +599,32 @@ export class LiveMediaPipeline {
           if (!isSourceLane && cooldownActive) translationStatus = "failed";
           if (signal.aborted) throw new Error("QUEUE_TASK_TIMEOUT");
           this.#assertRunning();
+          // Output-language gate — desktop parity (shouldDisplay). A lane must
+          // never publish text that is not in its own language. This is exactly
+          // where fail-open used to leak the untranslated English source onto
+          // the Korean lane, making captions alternate 한글 / 영어. Suppress
+          // instead, and suppress BEFORE #nextCaptionSeq so a dropped lane never
+          // burns a caption seq (contract C1: only committed captions consume).
+          // A "translated" result that is not actually in the lane language is
+          // no translation at all (a provider echoing the source, a mislabelled
+          // lane). Downgrade it to "failed" rather than presenting it to the
+          // viewer as a real translation.
+          //
+          // Note what this does NOT do: it does not drop the caption. The record
+          // has to stay hole-free so a viewer browsing this language's
+          // transcript later still sees the utterance, and live_utterances.text
+          // is NOT NULL so the original travels as the lane text (with the same
+          // string in sourceText, which is what the records view labels as 원문).
+          // Keeping raw English OFF a Korean screen is the VIEWER's job.
+          // Publishing here and filtering at the desktop boundary lets both
+          // lanes record while the screen stays single-lane.
+          if (!isSourceLane && translationStatus === "translated"
+            && !isOutputInTargetLanguage(translatedText, language)) {
+            translationStatus = "failed";
+            laneReady = false;
+          }
+          // Never synthesize speech from text that is not in the lane language.
+          if (translationStatus === "failed") laneReady = false;
           const caption = {
             type: "caption",
             seq: this.#nextCaptionSeq(language),
@@ -599,11 +650,10 @@ export class LiveMediaPipeline {
               partialLane.pending = null;
               partialLane.lastText = "";
             }
-            await this.dependencies.publisher.publish(this.sessionId, language, caption);
             // Bidirectional captions: the HOST socket (desktop app) receives
             // every finalized caption too, so participant speech is visible
             // and recordable on the host side in real time.
-            this.onHostEvent?.(caption);
+            await this.#publishCaption(language, caption, { mirrorToHost: true });
             this.observeLatency?.("caption_publish_latency_ms", Math.max(0, this.now() - finalizedAt));
           }
           if (!hasAudioOutput(this.outputMode)) return { ttsCompletion: null };
@@ -653,6 +703,18 @@ export class LiveMediaPipeline {
     const event = { type: "language-status", sessionId: this.sessionId, language, status, ...(code ? { code } : {}) };
     this.onHostEvent?.(event);
     await this.dependencies.publisher.publish(this.sessionId, language, event);
+  }
+
+  async #publishCaption(language, caption, { mirrorToHost }) {
+    let didMirror = false;
+    await this.dependencies.publisher.publish(this.sessionId, language, caption, {
+      onLiveEvent: () => {
+        didMirror = true;
+        if (mirrorToHost) this.onHostEvent?.(caption);
+      },
+    });
+    // Test/in-memory publishers may implement the older three-argument seam.
+    if (mirrorToHost && !didMirror) this.onHostEvent?.(caption);
   }
 
   async #publishLegend() {
@@ -777,7 +839,8 @@ export class LiveMediaPipeline {
    *  same-language speech because echoTargetLanguage=false). The model's own
    *  languageCode wins when it matches a session language; the script check
    *  is the fallback (ko/en/ja have disjoint scripts). */
-  async #publishMeetingInputCaption({ text, isFinal, languageCode } = {}) {
+  async #publishMeetingInputCaption(value = {}) {
+    const { text, isFinal, languageCode } = value;
     const normalized = String(text ?? "").normalize("NFC").trim();
     if (!normalized) return;
     const hinted = normalizeLiveLanguage(languageCode);
@@ -785,11 +848,35 @@ export class LiveMediaPipeline {
       ? hinted
       : this.languages.find((language) => textPlausiblyInLanguage(normalized, language));
     if (!lane) return;
+    const utteranceKey = typeof value.utteranceKey === "string" && value.utteranceKey
+      ? value.utteranceKey
+      : this.#meetingInputCaption && this.#meetingInputCaption.isFinal !== true
+        ? this.#meetingInputCaption.utteranceKey
+        : `${this.sessionId}:input:${++this.#meetingInputCaptionCounter}`;
+    this.#meetingInputCaption = {
+      text: normalized,
+      language: lane,
+      isFinal: Boolean(isFinal),
+      utteranceKey,
+      capturedAt: value.capturedAt,
+      floorSpeaker: value.floorSpeaker ?? null,
+    };
+    if (isFinal) {
+      for (const language of this.languages) {
+        if (language === lane) continue;
+        const queue = this.#meetingInputFinalQueues.get(language) ?? [];
+        queue.push(this.#meetingInputCaption);
+        if (queue.length > 100) queue.shift();
+        this.#meetingInputFinalQueues.set(language, queue);
+      }
+    }
     // origin:"source" = the untranslated input transcript on its own-language
-    // lane. The webapp keeps it (the 한/EN toggle shows the full record in
-    // each language); the desktop overlay drops it to match the subtitle
-    // policy exactly (Korean input shows only English, and vice versa).
-    await this.#publishPresentationCaption(lane, { text: normalized, isFinal, origin: "source" });
+    // lane. The webapp keeps both lanes; the desktop picks exactly its selected
+    // language, so same-language speech uses this source lane as the one line.
+    await this.#publishPresentationCaption(lane, {
+      text: normalized, isFinal, origin: "source", utteranceKey,
+      capturedAt: value.capturedAt, floorSpeaker: value.floorSpeaker ?? null,
+    });
   }
 
   async #publishPresentationCaption(language, value) {
@@ -797,6 +884,27 @@ export class LiveMediaPipeline {
     let text = String(value.text ?? "").normalize("NFC").trim();
     if (!text) return;
     const isFinal = Boolean(value.isFinal);
+    let sourceContext = null;
+    if (value.origin !== "source") {
+      const queue = this.#meetingInputFinalQueues.get(language) ?? [];
+      if (typeof value.sourceText === "string" && value.sourceText.trim()) {
+        const providerSourceContext = {
+          text: value.sourceText,
+          language: normalizeLiveLanguage(value.sourceLanguage),
+          utteranceKey: value.utteranceKey,
+          capturedAt: value.capturedAt,
+          floorSpeaker: value.floorSpeaker ?? null,
+        };
+        const matchingIndex = findCanonicalInputContext(queue, providerSourceContext);
+        sourceContext = matchingIndex >= 0 ? queue[matchingIndex] : providerSourceContext;
+        // A matched later identity/source proves every earlier queued source
+        // missed this target lane. Finals consume that stale prefix atomically;
+        // partials only observe it so their eventual final can still correlate.
+        if (isFinal && matchingIndex >= 0) queue.splice(0, matchingIndex + 1);
+      } else {
+        sourceContext = isFinal ? (queue.shift() ?? this.#meetingInputCaption) : this.#meetingInputCaption;
+      }
+    }
     // Latency was previously observed ONLY on #processFinalUtterance, which no
     // session type reaches — so the live path emitted no metric at all and the
     // p95 2.5s committed-caption target could not be measured. Split polish out
@@ -811,6 +919,7 @@ export class LiveMediaPipeline {
       const polishStartedAt = this.now();
       const polished = await this.dependencies.captionPolish.polish({
         translatedText: text,
+        sourceText: sourceContext?.text ?? "",
         targetLanguage: language,
         tone: this.translationTone,
         glossary: this.glossaryText,
@@ -819,27 +928,48 @@ export class LiveMediaPipeline {
       text = String(polished ?? "").trim() || text;
       this.observeLatency?.("caption_polish_latency_ms", Math.max(0, this.now() - polishStartedAt));
     }
-    if (isFinal && this.glossaryText) {
-      text = applyGlossaryCorrections(text, { glossary: this.glossaryText, targetLanguage: language });
-    }
+    // Runs on EVERY caption, interims included, and is NOT gated on a glossary
+    // being configured. Two reasons:
+    //   - number notation (만/억/조 ↔ million/billion/trillion) lives inside this
+    //     pass and is arithmetic, not terminology, so it has to apply to every
+    //     session — gating it on glossaryText skipped it entirely whenever no
+    //     preset was picked.
+    //   - the caption IS the final artifact. Correcting only finals meant the
+    //     screen showed "3,000억" and then visibly rewrote itself to
+    //     "KRW 300 billion" when the final landed, and the record disagreed with
+    //     what the reader had just seen.
+    // Measured at ~0.13ms per line against the 19KB CRE glossary, so the interim
+    // path can afford it.
+    text = applyGlossaryCorrections(text, {
+      glossary: this.glossaryText,
+      targetLanguage: language,
+      sourceText: sourceContext?.text ?? "",
+    });
     // Dedupe identity is (text, isFinal, TIME) — never text alone. A provider
     // re-emitting the same committed line lands within milliseconds; a speaker
     // genuinely repeating themselves ("네, 맞습니다.", "OK.") does not. Keying
     // on text alone swallowed every repeated acknowledgement for the whole
     // session, because this memo also has no eviction. The 1s window is the
     // same adjacency rule streaming ASR commit policies use.
+    const utteranceKey = sourceContext?.utteranceKey ?? value.utteranceKey ?? null;
     const previous = this.#presentationCaptionState.get(language);
     const publishedAt = this.now();
     if (previous?.text === text
       && previous.isFinal === isFinal
+      && (!isFinal || (utteranceKey && previous.utteranceKey === utteranceKey))
       && publishedAt - previous.publishedAt < REEMISSION_WINDOW_MILLISECONDS) {
       return;
     }
-    this.#presentationCaptionState.set(language, { text, isFinal, publishedAt });
+    this.#presentationCaptionState.set(language, {
+      text, isFinal, publishedAt, utteranceKey,
+    });
     // Meeting captions attribute to the Speak-floor holder while one is
     // active (partials and finals alike); otherwise the shared "presenter"
     // lane, exactly like presentation mode.
-    const floor = this.sessionType === "meeting" ? this.#floorAttribution(Number.NaN) : null;
+    const floor = this.sessionType === "meeting"
+      ? (value.floorSpeaker ?? sourceContext?.floorSpeaker
+        ?? this.#floorAttribution(Number(value.capturedAt ?? sourceContext?.capturedAt)))
+      : null;
     const caption = {
       type: "caption",
       // Only the committed line consumes durable seq space (contract C1).
@@ -849,14 +979,30 @@ export class LiveMediaPipeline {
       speaker: floor ? this.#floorSpeakerAssignment(floor) : null,
       text,
       isFinal,
+      ...(sourceContext ? {
+        sourceText: sourceContext.text,
+        sourceLanguage: sourceContext.language,
+      } : value.origin === "source" ? {
+        sourceText: null,
+        sourceLanguage: language,
+      } : {}),
+      ...(utteranceKey ? { utteranceKey } : {}),
       ...(value.origin === "source" ? { origin: "source" } : {}),
+      // A translated lane that came back NOT in its own language is a broken
+      // translation (provider echoing the source, a mislabelled lane). It is
+      // still published — the transcript must not have a hole — but it is
+      // labelled so the viewer never renders it as a real translation. This is
+      // the same record-vs-display split as origin:"source": recording is
+      // unconditional, DISPLAY is filtered client-side.
+      ...(value.origin !== "source" && !isOutputInTargetLanguage(text, language)
+        ? { translationStatus: "failed" }
+        : {}),
       sourceEndedAt: value.sourceEndedAt ?? new Date(this.now()).toISOString(),
       emittedAt: new Date(this.now()).toISOString(),
     };
-    await this.dependencies.publisher.publish(this.sessionId, language, caption);
     // Bidirectional captions: the desktop host mirrors meeting captions in
     // real time (participant Speak speech is invisible to its local engine).
-    if (this.sessionType === "meeting") this.onHostEvent?.(caption);
+    await this.#publishCaption(language, caption, { mirrorToHost: this.sessionType === "meeting" });
     // Only committed captions carry the p95 2.5s target; interim latency is a
     // different (and much looser) question.
     if (isFinal) this.observeLatency?.("caption_publish_latency_ms", Math.max(0, this.now() - startedAt));
@@ -897,6 +1043,43 @@ export class LiveMediaPipeline {
   #assertRunning() {
     if (this.#isStopped) throw new Error("LIVE_PIPELINE_STOPPED");
   }
+}
+
+function findCanonicalInputContext(queue, providerContext) {
+  const providerKey = typeof providerContext.utteranceKey === "string" ? providerContext.utteranceKey : "";
+  if (providerKey) {
+    const exactKeyIndex = queue.findIndex((entry) => entry.utteranceKey === providerKey);
+    if (exactKeyIndex >= 0) return exactKeyIndex;
+  }
+
+  const sourceText = String(providerContext.text ?? "").normalize("NFC").trim();
+  const sourceLanguage = normalizeLiveLanguage(providerContext.language);
+  const textMatches = [];
+  for (let index = 0; index < queue.length; index += 1) {
+    const entry = queue[index];
+    if (String(entry.text ?? "").normalize("NFC").trim() !== sourceText) continue;
+    if (sourceLanguage && entry.language !== sourceLanguage) continue;
+    textMatches.push(index);
+  }
+  // A single exact source match is a safe FIFO resynchronization when provider
+  // sessions reconnect with different generations. When a speaker repeats the
+  // same sentence, use the lane-local coordinate only inside the text/language
+  // candidates: equal counters alone are not trustworthy because two Gemini
+  // sessions may segment the same audio differently.
+  if (textMatches.length === 1) return textMatches[0];
+  const providerCoordinate = parseGeminiUtteranceCoordinate(providerKey);
+  if (providerCoordinate && textMatches.length > 1) {
+    const coordinateMatches = textMatches.filter(
+      (index) => parseGeminiUtteranceCoordinate(queue[index].utteranceKey) === providerCoordinate,
+    );
+    if (coordinateMatches.length === 1) return coordinateMatches[0];
+  }
+  return -1;
+}
+
+function parseGeminiUtteranceCoordinate(value) {
+  const match = /^gemini:[^:]+:(\d+):(\d+)$/u.exec(String(value ?? ""));
+  return match ? `${match[1]}:${match[2]}` : null;
 }
 
 function resolveSourceStartedAt({ sourceStartOffsetMs, sourceEndOffsetMs, sourceEndedAt }) {

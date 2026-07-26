@@ -119,7 +119,7 @@ restartButton?.addEventListener("click", () => {
 
 // ── Live Call draft: local persistence + cover preview ────────────────────
 
-const DRAFT_FIELDS = ["liveDraftTitle", "liveDraftDate", "liveDraftTime", "liveDraftCapacity"];
+const DRAFT_FIELDS = ["liveDraftTitle", "liveDraftDate", "liveDraftTime", "liveDraftCapacity", "liveDisplayLanguage"];
 const MAX_COVER_IMAGE_BYTES = 5 * 1024 * 1024;
 const ALLOWED_COVER_IMAGE_TYPES = new Set(["image/jpeg", "image/png", "image/webp"]);
 
@@ -147,9 +147,10 @@ function persistLiveDraft() {
 }
 
 for (const name of DRAFT_FIELDS) {
-  const field = form?.elements?.[name];
-  field?.addEventListener?.("change", persistLiveDraft);
-  field?.addEventListener?.("input", persistLiveDraft);
+  for (const field of form?.querySelectorAll(`[name="${name}"]`) ?? []) {
+    field.addEventListener("change", persistLiveDraft);
+    field.addEventListener("input", persistLiveDraft);
+  }
 }
 restoreLiveDraft();
 
@@ -289,6 +290,10 @@ function liveDraftScheduledAt() {
   return Number.isFinite(stamp) ? new Date(stamp).toISOString() : null;
 }
 
+function liveDisplayLanguage() {
+  return fieldValue("liveDisplayLanguage") === "en" ? "en" : "ko";
+}
+
 // When Start fails on host sign-in, remember it: a later successful save in
 // Settings returns here and retries automatically instead of making the user
 // re-navigate and press Start again.
@@ -314,6 +319,7 @@ startLiveCallButton?.addEventListener("click", async () => {
       scheduledAt: liveDraftScheduledAt(),
       maxViewers: Number.parseInt(fieldValue("liveDraftCapacity"), 10) || 50,
       languages: [...document.querySelectorAll('input[name="translationLanguages"]:checked')].map((input) => input.value),
+      displayLanguage: liveDisplayLanguage(),
       coverImage: liveDraftCoverData,
     };
     const result = await bridge.startLiveCall(draft);
@@ -389,6 +395,7 @@ async function collectLiveDraft() {
     scheduledAt: liveDraftScheduledAt(),
     maxViewers: Number.parseInt(fieldValue("liveDraftCapacity"), 10) || 50,
     languages: [...document.querySelectorAll('input[name="translationLanguages"]:checked')].map((input) => input.value),
+    displayLanguage: liveDisplayLanguage(),
     coverImage: liveDraftCoverData,
   };
 }
@@ -459,7 +466,7 @@ async function startRegisteredSession(sessionId, button) {
   button.setAttribute("aria-busy", "true");
   setLiveStatus(t("live.loadingRegistered"));
   try {
-    const result = await bridge.startRegisteredLiveCall(sessionId);
+    const result = await bridge.startRegisteredLiveCall(sessionId, { displayLanguage: liveDisplayLanguage() });
     setLiveStatus(result?.ok
       ? t("live.stageUp", { code: result.admissionCode ?? "?" })
       : liveCallFailureMessage(result?.code, "live.registeredStartFailed"));

@@ -71,6 +71,17 @@ function getAudioContextConstructor(): typeof AudioContext {
   return candidate as typeof AudioContext;
 }
 
+function closeAudioContextWithoutBlocking(context: AudioContext | null): void {
+  if (!context) return;
+  try {
+    void context.close().catch(() => {
+      console.warn("[live-speak] AudioContext close failed");
+    });
+  } catch {
+    console.warn("[live-speak] AudioContext close failed");
+  }
+}
+
 function classifyCaptureError(error: unknown): SpeakCaptureError {
   if (error instanceof SpeakCaptureError) return error;
   const name = error instanceof Error ? error.name : "";
@@ -154,7 +165,7 @@ export async function prepareSpeakCapture(): Promise<PreparedSpeakCapture> {
     if (context.state !== "running") throw new SpeakCaptureError("AUDIO_INIT_FAILED");
   } catch (error) {
     if (stream) stopStream(stream);
-    await context?.close().catch(() => undefined);
+    closeAudioContextWithoutBlocking(context);
     throw classifyCaptureError(error);
   }
   if (!stream || !context) throw new SpeakCaptureError("AUDIO_INIT_FAILED");
@@ -167,14 +178,17 @@ function buildPreparedCapture(
 ): PreparedSpeakCapture {
   let isStopped = false;
   let isStarted = false;
-  let activeStop: (() => Promise<void>) | null = null;
+  let activeStop: (() => void) | null = null;
 
   const stopPrepared = async () => {
     if (isStopped) return;
     isStopped = true;
-    await activeStop?.();
+    activeStop?.();
     stopStream(preparedStream);
-    await preparedContext.close().catch(() => undefined);
+    // Browser-owned AudioContext shutdown is best-effort cleanup. Safari can
+    // leave close() pending indefinitely; microphone tracks and the speaking
+    // floor must already be released and stop() must still settle immediately.
+    closeAudioContextWithoutBlocking(preparedContext);
   };
 
   return {
@@ -185,7 +199,7 @@ function buildPreparedCapture(
       let worklet: AudioWorkletNode | null = null;
       let processor: ScriptProcessorNode | null = null;
 
-      const stopNodes = async () => {
+      const stopNodes = () => {
         options.onLevel?.(0);
         if (worklet) worklet.port.onmessage = null;
         if (processor) processor.onaudioprocess = null;
@@ -207,6 +221,7 @@ function buildPreparedCapture(
         if (typeof preparedContext.audioWorklet?.addModule === "function") {
           try {
             await preparedContext.audioWorklet.addModule("/live-audio-worklet.js");
+            if (isStopped) throw new Error("CAPTURE_STOPPED");
             const candidate: unknown = Reflect.get(globalThis, "AudioWorkletNode");
             if (typeof candidate !== "function") throw new Error("AUDIO_WORKLET_NODE_UNAVAILABLE");
             const WorkletNodeConstructor = candidate as typeof AudioWorkletNode;
@@ -229,6 +244,7 @@ function buildPreparedCapture(
           }
         }
 
+        if (isStopped) throw new Error("CAPTURE_STOPPED");
         if (!worklet) {
           const createScriptProcessor = preparedContext.createScriptProcessor;
           if (typeof createScriptProcessor !== "function") throw new Error("SCRIPT_PROCESSOR_UNAVAILABLE");

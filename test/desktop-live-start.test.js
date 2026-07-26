@@ -164,10 +164,13 @@ test("cover upload validates bounded image bytes and uses a raw request body", (
   assert.doesNotMatch(main, /JSON\.stringify\(bytes\)/u);
 });
 
-test("controller Host Speak reclaims the floor through a short-lived gateway connection", () => {
+test("controller Host Speak reuses the running bridge before opening a fallback connection", () => {
   const main = read("electron/main.js");
   assert.match(main, /ipcMain\.handle\("live-call:host-speak"/u);
   assert.match(main, /function hostSpeakViaGateway/u);
+  assert.match(main, /function hostSpeakViaActiveBridge/u);
+  assert.match(main, /const activeBridgeResult = await hostSpeakViaActiveBridge\(\)/u);
+  assert.match(main, /if \(activeBridgeResult\) return activeBridgeResult/u);
   assert.match(main, /"host-speak-started"/u);
   assert.match(main, /\/api\/live-config/u);
   // Arms via the workspace even without captions running: the controller is
@@ -183,6 +186,19 @@ test("controller Host Speak reclaims the floor through a short-lived gateway con
   const controllerJs = read("public/subtitle-controller.js");
   assert.match(controllerJs, /hostSpeak\(\)/u);
   assert.match(controllerJs, /hostSpeakButton\.hidden = !state\.live/u);
+});
+
+test("Live Call archive preserves a finalized gateway-canonical local record", () => {
+  const main = read("electron/main.js");
+  const archive = main.slice(
+    main.indexOf("async function archiveLiveCallSession"),
+    main.indexOf("function showDashboardWindow"),
+  );
+  assert.match(archive, /api\/subtitles\/sessions\/live-/u);
+  const localCheck = archive.indexOf("payload?.ok === true");
+  const remoteTranscript = archive.indexOf("/transcript?language=");
+  assert.ok(localCheck >= 0 && remoteTranscript > localCheck,
+    "the bilingual local record must win before source-only fallback import");
 });
 
 test("controller can be moved by pointer drag and recovered from the application menu", () => {
@@ -224,6 +240,10 @@ test("desktop go-live refreshes the version and the dashboard bridges host audio
   assert.match(main, /stopLiveGatewayBridge\("live call ended"\)/u);
   assert.match(main, /gatewaySettings: \{/u);
   assert.match(main, /inputSource: "mic"/u);
+  assert.match(main, /displayLanguage: sanitizeLiveCaptionDisplayLanguage\(config\.displayLanguage\)/u);
+  assert.match(main, /shouldDisplayLiveCaption\(message, armedSession\.displayLanguage\)/u);
+  assert.match(main, /body: toLiveCallApiInput\(input\)/u);
+  assert.match(main, /start-registered", async \(event, sessionId, options\)/u);
   // Host Speak's short-lived control socket must use the same trusted headers.
   assert.match(main, /new WebSocket\(gatewayUrl, \{ headers: trustedGatewayHeaders\(token\) \}\)/u);
 

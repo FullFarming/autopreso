@@ -19,12 +19,31 @@ import type {
   RecordingStatusEvent,
   SpeakerAssignment,
 } from "@/lib/live-contract";
-import { getReconnectDelayMilliseconds, getReconnectStatus } from "./connection-resilience";
+import {
+  getReconnectDelayMilliseconds,
+  getReconnectStatus,
+  waitForSocketOpen,
+  withAbortTimeout,
+} from "./connection-resilience";
 import type { MeetingSummary } from "@/lib/live/summary";
 import MeetingMinutes, { type TranscriptEntry } from "./MeetingMinutes";
-import { isPinnedToLatest as isPinnedNearTop, newestFirst } from "@/lib/live/caption-feed";
+import {
+  getCachedLanguageCaptions,
+  isDisplayableCaption,
+  isPinnedToLatest as isPinnedNearTop,
+  LanguageSnapshotRegistry,
+  loadLanguageSnapshotOnce,
+  mergeLanguageCaptionCache,
+  newestFirst,
+} from "@/lib/live/caption-feed";
 import { countdownMsUntil, formatCountdown } from "@/lib/live/countdown";
 import MeetingTurnFeed from "./MeetingTurnFeed";
+import {
+  requestForegroundRecovery,
+  type ForegroundRecoveryEvent,
+  type ForegroundRecoveryState,
+} from "./foreground-recovery";
+import { buildViewerSurfaceUrl, getViewerSurfaceRedirect } from "./viewer-surface-routing";
 import {
   prepareSpeakCapture,
   SpeakCaptureError,
@@ -185,12 +204,6 @@ function mergeViewerSnapshot(current: ViewerState, snapshot: LiveSnapshot): View
       scheduledAt: snapshot.session.scheduledAt,
       sessionType: snapshot.session.sessionType,
       outputMode: snapshot.session.outputMode,
-      // status MUST be carried through. It is the sole input to the
-      // snapshot-failure guard in subscribe(), which rethrows when the session
-      // is live or paused. Dropping it here left status undefined after the
-      // first successful merge, so from then on a failed snapshot during a
-      // language switch silently produced an empty caption pane with no error —
-      // subscribe() had already cleared captions.
       status: snapshot.session.status,
       maxViewers: snapshot.session.maxViewers,
       languages: snapshot.session.languages,
@@ -309,6 +322,7 @@ function isCaptionEvent(value: unknown): value is CaptionEvent {
     && (value.sourceLanguage === undefined || value.sourceLanguage === null || typeof value.sourceLanguage === "string")
     && (value.translationStatus === undefined || value.translationStatus === "verbatim"
       || value.translationStatus === "translated" || value.translationStatus === "failed")
+    && (value.origin === undefined || value.origin === "source")
     && typeof value.sourceEndedAt === "string"
     && typeof value.emittedAt === "string";
 }
@@ -419,35 +433,6 @@ function getJoinErrorMessage(error: unknown): string {
 
 function captionLaneKey(caption: CaptionEvent): string {
   return caption.speaker?.speakerId ?? "presenter";
-}
-
-function normalizeCaptionText(text: string): string {
-  return text.normalize("NFC").replace(/\s+/gu, " ").trim().toLocaleLowerCase();
-}
-
-function mergeCaptionTimeline(current: CaptionEvent[], incoming: CaptionEvent): CaptionEvent[] {
-  const lane = captionLaneKey(incoming);
-  const normalizedText = normalizeCaptionText(incoming.text);
-  if (!normalizedText) return current;
-
-  const isDuplicateFinal = incoming.isFinal && current.some((caption) => caption.isFinal
-    && (caption.seq === incoming.seq
-      || (captionLaneKey(caption) === lane && normalizeCaptionText(caption.text) === normalizedText)));
-  if (isDuplicateFinal) {
-    return current.filter((caption) => caption.isFinal
-      || (captionLaneKey(caption) !== lane && captionLaneKey(caption) !== "live"));
-  }
-
-  const existingPartial = current.find((caption) => !caption.isFinal && captionLaneKey(caption) === lane);
-  if (!incoming.isFinal && existingPartial?.seq === incoming.seq
-    && normalizeCaptionText(existingPartial.text) === normalizedText) return current;
-
-  // A finalized caption also clears the synthetic "live" interim lane the
-  // gateway uses for meeting-mode partials, so stale partial text never
-  // lingers in the live sheet after the utterance is committed.
-  const withoutCurrentPartial = current.filter((caption) => caption.isFinal
-    || (captionLaneKey(caption) !== lane && !(incoming.isFinal && captionLaneKey(caption) === "live")));
-  return [...withoutCurrentPartial, incoming].slice(-200);
 }
 
 export function floorHolderName(holder: LiveFloorHolder | null): string | null {
@@ -573,8 +558,12 @@ export function ViewerStage({ sessionType, outputMode, captions, speakers, statu
   // place; a floating jump control returns to the live edge (top).
   const historyRef = useRef<HTMLDivElement>(null);
   const [isPinnedToLatest, setIsPinnedToLatest] = useState(true);
-  const finalCaptions = captions.filter((caption) => caption.isFinal);
-  const partialCaptions = captions.filter((caption) => !caption.isFinal);
+  // The web record shows the complete selected language lane. Source speech is
+  // valid history in its own lane; a failed translation is the only caption
+  // hidden because it does not reliably belong to the selected language.
+  const displayCaptions = useMemo(() => captions.filter(isDisplayableCaption), [captions]);
+  const finalCaptions = displayCaptions.filter((caption) => caption.isFinal);
+  const partialCaptions = displayCaptions.filter((caption) => !caption.isFinal);
   const orderedFinalCaptions = newestFirst(finalCaptions);
   const latestFinalSeq = finalCaptions.at(-1)?.seq ?? 0;
   const latestPartialText = partialCaptions.at(-1)?.text ?? "";
@@ -621,7 +610,7 @@ export function ViewerStage({ sessionType, outputMode, captions, speakers, statu
           <p>{deliveryMethod.description} Audio stays muted until you choose Audio On.</p>
         </div>
       ) : sessionType === "meeting" ? (
-        <MeetingTurnFeed captions={captions} floorHolder={floorHolder}
+        <MeetingTurnFeed captions={displayCaptions} floorHolder={floorHolder}
           emptyMessage="Speaker chapters will appear here when the meeting starts." />
       ) : (
         <div className="live-caption-stack">
@@ -736,6 +725,19 @@ export default function LiveViewer({ compact = false }: { compact?: boolean }) {
   const fallbackPipRef = useRef<FallbackPip | null>(null);
   const pipFrameRef = useRef<PipFrame>({ sessionType: "presentation", outputMode: "captions", captions: [], status: "Not connected" });
   const requestedLanguageRef = useRef("");
+  const foregroundRecoveryStateRef = useRef<ForegroundRecoveryState>({ inFlight: null });
+
+  useEffect(() => {
+    const target = getViewerSurfaceRedirect(
+      window.location.pathname,
+      window.navigator.userAgent,
+      window.navigator.maxTouchPoints,
+    );
+    if (!target) return;
+    // The opaque QR credential stays in the fragment until the destination
+    // surface consumes it. Replacing only the path avoids a history loop.
+    window.location.replace(buildViewerSurfaceUrl(target, window.location.search, window.location.hash));
+  }, []);
 
   useEffect(() => {
     if (!viewer || isSessionEnded || sessionStatus !== "preparing") return;
@@ -755,6 +757,15 @@ export default function LiveViewer({ compact = false }: { compact?: boolean }) {
   // starting at 1. Track lastSeq per language so a reconnect or language
   // toggle can ask the gateway to replay exactly the missed gap.
   const lastSeqByLanguageRef = useRef<Record<string, number>>({});
+  // Every language records continuously, so switching EN<->KO must show that
+  // language's transcript IMMEDIATELY. Clearing to [] and waiting on the
+  // snapshot fetch made the pane blank for the length of a network round trip,
+  // which read as "the record was lost and is being rebuilt". The cache keeps
+  // what this viewer has already received per language; the snapshot then tops
+  // it up rather than being the only source.
+  const captionsByLanguageRef = useRef<Record<string, CaptionEvent[]>>({});
+  const captionCacheSessionIdRef = useRef("");
+  const snapshotRegistryRef = useRef(new LanguageSnapshotRegistry());
   const getLastSeq = useCallback((forLanguage: string): number => lastSeqByLanguageRef.current[forLanguage] ?? 0, []);
   const setLastSeq = useCallback((forLanguage: string, seq: number) => {
     const current = lastSeqByLanguageRef.current[forLanguage] ?? 0;
@@ -763,12 +774,25 @@ export default function LiveViewer({ compact = false }: { compact?: boolean }) {
   const outputModeRef = useRef<LiveOutputMode>("captions");
   const handleEventRef = useRef<(event: LiveBroadcastEvent) => void>(() => {});
   const setCaptionSnapshot = useCallback((snapshot: LiveSnapshot) => {
-    const confirmed = snapshot.captions
-      .filter((caption) => caption.isFinal)
-      .reduce<CaptionEvent[]>((timeline, caption) => mergeCaptionTimeline(timeline, caption), []);
-    setCaptions(confirmed);
-    setSpeakers(snapshot.speakers);
+    // A delayed snapshot from a previous QR/session cannot repopulate the
+    // freshly-cleared cache when both sessions happen to use the same language.
+    if (captionCacheSessionIdRef.current !== snapshot.session.id) return;
+    // Merge ON TOP of whatever this viewer already had for the language, so a
+    // snapshot bounded to the newest N never discards older lines the viewer
+    // still holds.
+    const nextCache = mergeLanguageCaptionCache(
+      captionsByLanguageRef.current,
+      snapshot.language,
+      snapshot.captions.filter((caption) => caption.isFinal),
+    );
+    captionsByLanguageRef.current = nextCache;
+    // 2026-07-26 fix: A slow snapshot may warm only its own language cache.
+    // It must not replace captions, speakers, or lifecycle state selected while
+    // that request was in flight.
     setLastSeq(snapshot.language, snapshot.lastSeq);
+    if (snapshot.language !== languageRef.current) return;
+    setCaptions(nextCache[snapshot.language] ?? []);
+    setSpeakers(snapshot.speakers);
     setSessionStatus(snapshot.session.status);
   }, [setLastSeq]);
   const handleAudioQueueRestart = useCallback(() => {
@@ -792,13 +816,16 @@ export default function LiveViewer({ compact = false }: { compact?: boolean }) {
     if (button) button.dataset.level = String(Math.min(4, Math.ceil(level * 8)));
   }, []);
 
-  const stopSpeakCapture = useCallback(async () => {
+  const stopSpeakCapture = useCallback(() => {
     const session = speakSessionRef.current;
     speakSessionRef.current = null;
     const prepared = preparedSpeakCaptureRef.current;
     preparedSpeakCaptureRef.current = null;
     updateSpeakLevel(0);
-    await (session?.stop() ?? prepared?.stop())?.catch(() => undefined);
+    const stopping = session?.stop() ?? prepared?.stop();
+    if (stopping) void stopping.catch(() => {
+      console.warn("[live-speak] capture cleanup failed");
+    });
   }, [updateSpeakLevel]);
 
   const endSpeaking = useCallback(async (sendEnd: boolean) => {
@@ -806,9 +833,15 @@ export default function LiveViewer({ compact = false }: { compact?: boolean }) {
     speakStartTimerRef.current = null;
     speakStateRef.current = "idle";
     setSpeakState("idle");
-    await stopSpeakCapture();
     const socket = audioSocketRef.current;
-    if (sendEnd && socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ type: "speak-end" }));
+    try {
+      if (sendEnd && socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ type: "speak-end" }));
+    } finally {
+      // Release the shared floor before browser audio cleanup. AudioContext.close
+      // may never settle on a suspended mobile browser, but that must not leave
+      // every other participant blocked behind this viewer.
+      stopSpeakCapture();
+    }
   }, [stopSpeakCapture]);
 
   speakSocketMessageRef.current = (event) => {
@@ -1073,10 +1106,7 @@ export default function LiveViewer({ compact = false }: { compact?: boolean }) {
       audioPendingSocketRef.current = candidate;
       candidate.binaryType = "arraybuffer";
       try {
-        await new Promise<void>((resolve, reject) => {
-          candidate.addEventListener("open", () => resolve(), { once: true });
-          candidate.addEventListener("error", () => reject(new Error("Unable to connect to the live gateway.")), { once: true });
-        });
+        await waitForSocketOpen(candidate);
         const subscribed = new Promise<void>((resolve, reject) => {
           const timeout = window.setTimeout(() => {
             candidate.close();
@@ -1141,15 +1171,24 @@ export default function LiveViewer({ compact = false }: { compact?: boolean }) {
           return;
         }
         if (hasConnected) {
-          // Snapshot stays as the fallback when replay could not close the gap.
-          const snapshot = await readApi<LiveSnapshot>(await fetch(
-            `/api/live-sessions/${currentViewer.session.id}/snapshot?language=${encodeURIComponent(nextLanguage)}`,
-            { headers: { authorization: `Bearer ${currentViewer.viewerToken}` } },
-          ));
-          if (snapshot.lastSeq >= getLastSeq(nextLanguage)) {
-            setCaptionSnapshot(snapshot);
+          try {
+            // 2026-07-26 fix: Snapshot is a reconnect fallback, not a connection gate.
+            // A timed-out history read must not close a socket that already
+            // authenticated, subscribed, and can receive buffered replay.
+            const snapshot = await withAbortTimeout(async (signal) => readApi<LiveSnapshot>(await fetch(
+              `/api/live-sessions/${currentViewer.session.id}/snapshot?language=${encodeURIComponent(nextLanguage)}`,
+              { headers: { authorization: `Bearer ${currentViewer.viewerToken}` }, signal },
+            )));
+            if (snapshot.lastSeq >= getLastSeq(nextLanguage)) {
+              setCaptionSnapshot(snapshot);
+              snapshotRegistryRef.current.finish(currentViewer.session.id, nextLanguage, true);
+            }
+            if (languageRef.current === nextLanguage) {
+              setViewer((activeViewer) => activeViewer ? mergeViewerSnapshot(activeViewer, snapshot) : activeViewer);
+            }
+          } catch {
+            // 2026-07-26 fix: The gateway replay path remains live and closes the missed gap.
           }
-          setViewer((activeViewer) => activeViewer ? mergeViewerSnapshot(activeViewer, snapshot) : activeViewer);
         }
         hasConnected = true;
         const previous = audioSocketRef.current;
@@ -1264,8 +1303,9 @@ export default function LiveViewer({ compact = false }: { compact?: boolean }) {
         if (event.seq <= getLastSeq(event.language)) return;
         setLastSeq(event.language, event.seq);
       }
-      if (event.language !== languageRef.current) return;
-      setCaptions((current) => mergeCaptionTimeline(current, event));
+      const nextCache = mergeLanguageCaptionCache(captionsByLanguageRef.current, event.language, [event]);
+      captionsByLanguageRef.current = nextCache;
+      if (event.language === languageRef.current) setCaptions(nextCache[event.language] ?? []);
       return;
     }
     if (event.type === "recording-status") {
@@ -1303,42 +1343,99 @@ export default function LiveViewer({ compact = false }: { compact?: boolean }) {
   }, [endSpeaking, getLastSeq, restartInterpretationAudio, setLastSeq, showSpeakerOverlay]);
   handleEventRef.current = handleEvent;
 
-  const subscribe = useCallback(async (nextLanguage: string, currentViewer: ViewerState) => {
-    // 언어 교체의 순서는 계약입니다: 기존 소켓과 오디오를 먼저 제거하고,
-    // 새 스냅샷을 읽은 뒤 새 언어를 구독해 과거 이벤트가 섞이지 않게 합니다.
+  const subscribe = useCallback(async (
+    nextLanguage: string,
+    currentViewer: ViewerState,
+    expectedConnectionGeneration?: number,
+  ) => {
+    // 2026-07-26 fix: Attach first. The gateway buffers live events while replaying from lastSeq,
+    // so the socket closes the snapshot race instead of opening one.
     await endSpeaking(true);
+    // Foreground recovery closes the half-open socket synchronously before this
+    // await. Leaving, changing language, or ending the session increments the
+    // generation and prevents that old recovery from resurrecting a connection.
+    if (expectedConnectionGeneration !== undefined
+      && expectedConnectionGeneration !== audioConnectionGenerationRef.current) return;
     disconnectGateway();
+    // 2026-07-26 fix: Sequence numbers restart per session. A viewer who leaves and joins a
+    // different QR session in the same tab must not inherit either captions or
+    // resume cursors from the previous call.
+    if (captionCacheSessionIdRef.current !== currentViewer.session.id) {
+      captionCacheSessionIdRef.current = currentViewer.session.id;
+      captionsByLanguageRef.current = {};
+      lastSeqByLanguageRef.current = {};
+      snapshotRegistryRef.current.reset(currentViewer.session.id);
+      setSpeakers([]);
+    }
     languageRef.current = nextLanguage;
-    setCaptions([]);
-    setSpeakers([]);
+    // Show this language's known transcript at once — never a blank pane.
+    setCaptions(getCachedLanguageCaptions(captionsByLanguageRef.current, nextLanguage));
     // Per-language lastSeq memory is kept across language switches so the
     // gateway can replay only the true gap when this language is revisited.
-    setStatus("Loading recent captions");
+    setStatus(getCachedLanguageCaptions(captionsByLanguageRef.current, nextLanguage).length
+      ? "Connecting · captions restored"
+      : "Connecting · live captions");
 
+    await connectGateway(currentViewer, nextLanguage);
+
+    // 2026-07-26 fix: Frequent EN↔KO switching is a local cache selection.
+    // The gateway still resubscribes with lastSeq for live replay, while each
+    // language's full HTTP history is fetched only until its first success.
     let snapshot: LiveSnapshot | null = null;
     try {
-      snapshot = await readApi<LiveSnapshot>(await fetch(
-        `/api/live-sessions/${currentViewer.session.id}/snapshot?language=${encodeURIComponent(nextLanguage)}`,
-        { headers: { authorization: `Bearer ${currentViewer.viewerToken}` } },
-      ));
-    } catch (snapshotError) {
-      // Before Go-Live there is nothing to replay; a pre-live snapshot
-      // failure must not abort the join (it used to surface as a bogus
-      // "grant expired" banner on the waiting screen). Only a session that is
-      // definitely running treats snapshot failures as real errors — an
-      // absent/unknown status fails safe toward waiting, not toward a banner.
-      const sessionStatus = currentViewer.session.status;
-      if (sessionStatus === "live" || sessionStatus === "paused") throw snapshotError;
+      snapshot = await loadLanguageSnapshotOnce(
+        snapshotRegistryRef.current,
+        currentViewer.session.id,
+        nextLanguage,
+        () => withAbortTimeout(async (signal) => readApi<LiveSnapshot>(await fetch(
+          `/api/live-sessions/${currentViewer.session.id}/snapshot?language=${encodeURIComponent(nextLanguage)}`,
+          { headers: { authorization: `Bearer ${currentViewer.viewerToken}` }, signal },
+        ))),
+      );
+    } catch {
+      // 2026-07-26 fix: The attached socket and its server-side replay buffer are authoritative.
+      // Snapshot is only a bounded history/status accelerator; timing it out
+      // must not tear down a healthy live stream or blank the restored cache.
     }
     if (snapshot) {
       setCaptionSnapshot(snapshot);
       const refreshedViewer = mergeViewerSnapshot(currentViewer, snapshot);
-      setViewer(refreshedViewer);
-      await connectGateway(refreshedViewer, nextLanguage);
-      return;
+      if (languageRef.current === nextLanguage) setViewer(refreshedViewer);
     }
-    await connectGateway(currentViewer, nextLanguage);
   }, [connectGateway, disconnectGateway, endSpeaking, setCaptionSnapshot]);
+
+  useEffect(() => {
+    if (!viewer || !language || isSessionEnded || sessionStatus === "stopped") return;
+
+    const recover = (event: ForegroundRecoveryEvent) => {
+      const operation = requestForegroundRecovery(
+        foregroundRecoveryStateRef.current,
+        event,
+        document.visibilityState,
+        () => {
+          // Do this before any await: a mobile browser may retain a half-open
+          // WebSocket after suspension and never deliver its close event.
+          disconnectGateway();
+          const recoveryGeneration = audioConnectionGenerationRef.current;
+          return subscribe(languageRef.current, viewer, recoveryGeneration);
+        },
+      );
+      void operation?.catch(() => {
+        // connectGateway owns actionable status/error copy and bounded retries.
+      });
+    };
+    const handleVisibilityChange = () => recover("visibilitychange");
+    const handlePageShow = () => recover("pageshow");
+    const handleOnline = () => recover("online");
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+    window.addEventListener("pageshow", handlePageShow);
+    window.addEventListener("online", handleOnline);
+    return () => {
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+      window.removeEventListener("pageshow", handlePageShow);
+      window.removeEventListener("online", handleOnline);
+    };
+  }, [disconnectGateway, isSessionEnded, language, sessionStatus, subscribe, viewer]);
 
   const join = useCallback(async () => {
     const normalizedDisplayName = normalizeDisplayName(displayName);
@@ -1437,6 +1534,11 @@ export default function LiveViewer({ compact = false }: { compact?: boolean }) {
   }, [admissionCode, department, displayName, jobTitle, joinMethod, pendingInviteToken, subscribe]);
 
   useEffect(() => {
+    if (getViewerSurfaceRedirect(
+      window.location.pathname,
+      window.navigator.userAgent,
+      window.navigator.maxTouchPoints,
+    )) return;
     const params = new URLSearchParams(window.location.search);
     requestedLanguageRef.current = params.get("language") ?? "";
     const inviteToken = takeInviteTokenFromHash();

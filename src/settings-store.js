@@ -65,7 +65,11 @@ export const DEFAULT_SUBTITLE_SETTINGS = Object.freeze({
   verticalOffset: 48,
 });
 
-export const MAX_SUBTITLE_GLOSSARY_CHARS = 16000;
+// Has to clear the LARGEST shipped preset, not a round number: at 16,000 the
+// store rejected the hotel-investment preset (27.5k) outright and the webapp and
+// gateway silently sliced it, dropping whichever sections sat at the end.
+// test/glossary-presets.test.js pins all three ceilings against the presets.
+export const MAX_SUBTITLE_GLOSSARY_CHARS = 40000;
 export const MAX_SUBTITLE_DOMAIN_CHARS = 2000;
 export const MAX_SUBTITLE_VERTICAL_OFFSET = 600;
 export const MAX_SUBTITLE_FONT_FAMILY_CHARS = 400;

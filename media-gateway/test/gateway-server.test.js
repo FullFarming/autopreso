@@ -291,6 +291,48 @@ test("a reconnecting host replaces ownership without closing the old pipeline tw
   assert.equal(pipelines[1].closed, 0);
 });
 
+test("a grace-reattached host receives canonical captions from the preserved pipeline", async (context) => {
+  let emitHostEvent;
+  const gateway = createGatewayServer({
+    gatewaySecret: "gateway-secret",
+    viewerSecret: "viewer-secret",
+    viewerAuthorizer: { async authorize() { return true; } },
+    hostAuthorizer: { async authorize() { return true; } },
+    hostReconnectGraceMilliseconds: 45_000,
+    async pipelineFactory(_settings, _previous, onHostEvent) {
+      emitHostEvent = onHostEvent;
+      return {
+        async start() {}, async tick() {}, async acceptAudio() {}, async endAudioStream() {}, async close() {},
+      };
+    },
+  });
+  await new Promise((resolve) => gateway.server.listen(0, "127.0.0.1", resolve));
+  context.after(async () => gateway.close());
+  const url = `ws://127.0.0.1:${gateway.server.address().port}/live`;
+  const first = await connectHost(url);
+  let received = nextJson(first);
+  first.send(JSON.stringify({
+    type: "start", sessionId: "session-1", version: 1,
+    sessionType: "meeting", outputMode: "captions", languages: ["ko"],
+  }));
+  assert.equal((await received).type, "started");
+  first.terminate();
+  await once(first, "close");
+
+  const second = await connectHost(url);
+  context.after(() => second.terminate());
+  received = nextJson(second);
+  second.send(JSON.stringify({
+    type: "start", sessionId: "session-1", version: 2,
+    sessionType: "meeting", outputMode: "captions", languages: ["ko"],
+  }));
+  assert.equal((await received).type, "started");
+
+  received = nextJson(second);
+  emitHostEvent({ type: "caption", seq: 1, language: "ko", text: "재연결 후 자막", isFinal: true });
+  assert.equal((await received).text, "재연결 후 자막");
+});
+
 test("a failed replacement candidate is closed while the active host remains owned", async (context) => {
   const pipelines = [];
   const gateway = createGatewayServer({

@@ -21,6 +21,10 @@ export function resolveTextToSpeechV1Client(textToSpeechModule) {
   return TextToSpeechClient;
 }
 
+export function listenMediaGateway(server, config) {
+  return new Promise((resolve) => server.listen(config.port, config.host, resolve));
+}
+
 export async function startMediaGateway(config = readGatewayEnvironment()) {
   const [{ GoogleGenAI }, speechModule, textToSpeechModule, translateModule] = await Promise.all([
     import("@google/genai"),
@@ -53,7 +57,7 @@ export async function startMediaGateway(config = readGatewayEnvironment()) {
     floorController,
     hostReconnectGraceMilliseconds: config.hostReconnectGraceMilliseconds,
     fetchFloorParticipant: (sessionId, participantId) => floorController.getParticipant(sessionId, participantId),
-    replayUtterances: (sessionId, language, afterSeq, limit) => publisher.fetchUtterancesAfter(sessionId, language, afterSeq, limit),
+    replayUtterances: (sessionId, language, afterSeq, limit, options) => publisher.fetchUtterancesAfter(sessionId, language, afterSeq, limit, options),
     async pipelineFactory(message, previousPipeline, onHostEvent) {
       // Per-language caption seq survives host reconnects and process
       // restarts: seed from persisted max(seq), best-effort, and never go
@@ -114,7 +118,7 @@ export async function startMediaGateway(config = readGatewayEnvironment()) {
       });
     },
   });
-  await new Promise((resolve) => gateway.server.listen(config.port, "0.0.0.0", resolve));
+  await listenMediaGateway(gateway.server, config);
   return gateway;
 }
 

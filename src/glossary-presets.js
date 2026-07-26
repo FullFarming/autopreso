@@ -259,14 +259,25 @@ if (hospitalityPreset && !hospitalityPreset.glossary.includes("[추가 2026-06-2
   hospitalityPreset.glossary = `${hospitalityPreset.glossary}\n\n${HOSPITALITY_PANEL_260623_TERMS}`;
 }
 
+/** The preset an untouched install runs with. Event-specific termbases (hotel,
+ *  F&B) are one-click switches FROM this, never the starting point — resolution
+ *  used to take the first pair match, and hotel-investment-en-ko is listed
+ *  before the library, so a fresh install silently defaulted every EN↔KO session
+ *  to the hotel glossary (MRG, RevPAR, hotel translation memory). */
+const DEFAULT_PRESET_ID = "default-cre-ai-en-ko";
+
 export function getDefaultSubtitleGlossaryContext(languagePair = {}) {
   const a = normalizePresetLanguage(languagePair.a) || "en";
   const b = normalizePresetLanguage(languagePair.b) || "ko";
   const targetSet = new Set([a, b]);
-  const preset = GLOSSARY_PRESETS.find((entry) => {
+  const matchesPair = (entry) => {
     const pairSet = new Set([entry.languagePair.a, entry.languagePair.b]);
     return pairSet.size === targetSet.size && [...targetSet].every((language) => pairSet.has(language));
-  });
+  };
+  // The designated default wins for its own language pair; every other pair
+  // falls back to the first prepared preset that covers it.
+  const preset = GLOSSARY_PRESETS.find((entry) => entry.id === DEFAULT_PRESET_ID && matchesPair(entry))
+    ?? GLOSSARY_PRESETS.find(matchesPair);
   if (!preset) return { glossary: "", domain: "" };
   return { glossary: preset.glossary, domain: preset.domain };
 }

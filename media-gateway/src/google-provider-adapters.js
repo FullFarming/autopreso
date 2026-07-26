@@ -73,6 +73,7 @@ const TTS_RESPONSE_HIGH_WATER_BYTES = 144_000;
 const TTS_RESPONSE_LOW_WATER_BYTES = 72_000;
 const MAX_TTS_RESPONSE_BUFFER_BYTES = 480_000;
 const GEMINI_INPUT_CHUNK_BYTES = 3_200;
+const INPUT_CONTEXT_MAX_AGE_MILLISECONDS = 1_000;
 
 export class GeminiLiveTranslateAdapter {
   constructor({
@@ -80,18 +81,23 @@ export class GeminiLiveTranslateAdapter {
     model,
     reconnectDelay = (attempt) => new Promise((resolve) => setTimeout(resolve, Math.min(500 * 2 ** Math.min(attempt - 1, 6), 30_000))),
     finalFlushMilliseconds = 2_500,
+    now = Date.now,
   }) {
     this.client = client;
     this.model = model;
     this.reconnectDelay = reconnectDelay;
     this.finalFlushMilliseconds = finalFlushMilliseconds;
+    this.now = now;
   }
 
   /** `onCallbackError` receives any error thrown by a caption/audio handler. It
    *  exists so a failing caption path is observable instead of silent — see the
    *  comment on `enqueueCallback`. Defaults to a no-op so existing callers keep
    *  today's fail-open behaviour, minus the silence. */
-  async open({ language, onCaption, onAudio, onInterruption, onInputCaption = null, onCallbackError = null }) {
+  async open({
+    language, onCaption, onAudio, onInterruption, onInputCaption = null,
+    onCallbackError = null, correlateInputCaption = false,
+  }) {
     const targetLanguageCode = LIVE_TRANSLATION_LANGUAGE_CODES.get(language) ?? language;
     let session = null;
     let resumptionHandle = null;
@@ -111,6 +117,12 @@ export class GeminiLiveTranslateAdapter {
     let outputLane = makeTranscriptLane();
     let inputLane = makeTranscriptLane();
     let inputTranscriptLanguageCode = null;
+    let nextUtteranceIdentity = 0;
+    const utteranceNamespace = encodeURIComponent(String(language));
+    const inputContexts = [];
+    const captureSegments = [];
+    let pendingOutputFinal = null;
+    let pendingOutputTimer = null;
     let finalFlushTimer = null;
     const clearFinalFlushTimer = () => {
       if (finalFlushTimer !== null) clearTimeout(finalFlushTimer);
@@ -120,6 +132,11 @@ export class GeminiLiveTranslateAdapter {
       outputLane = makeTranscriptLane();
       inputLane = makeTranscriptLane();
       inputTranscriptLanguageCode = null;
+      inputContexts.length = 0;
+      captureSegments.length = 0;
+      pendingOutputFinal = null;
+      if (pendingOutputTimer !== null) clearTimeout(pendingOutputTimer);
+      pendingOutputTimer = null;
       clearFinalFlushTimer();
     };
     const emitLane = async (lane, emit, { flushAll = false } = {}) => {
@@ -142,9 +159,92 @@ export class GeminiLiveTranslateAdapter {
         lane.committedLength = 0;
       }
     };
-    const emitInput = typeof onInputCaption === "function"
-      ? (caption) => onInputCaption({ ...caption, languageCode: inputTranscriptLanguageCode })
-      : null;
+    const emitInput = async (caption) => {
+      let inputContext = inputContexts.at(-1) ?? null;
+      if (caption.isFinal) {
+        // Segment transitions and input/output final callbacks advance on
+        // independent schedules. Indexing by inputContexts.length reused the
+        // oldest retained host segment after it had already produced finals,
+        // so the first participant final was persisted as host/null. Consume
+        // the oldest transition that has not produced an input final; repeated
+        // turns by the current speaker deliberately reuse the last segment.
+        const capture = captureSegments.find((segment) => segment.hasInputFinal !== true)
+          ?? captureSegments.at(-1)
+          ?? null;
+        if (capture) capture.hasInputFinal = true;
+        inputContext = {
+          sourceText: caption.text,
+          sourceLanguage: inputTranscriptLanguageCode,
+          // Every target language owns an independent Gemini session. Include
+          // that lane in the identity so equal generation/counter values from
+          // two sessions can never merge unrelated database utterances.
+          utteranceKey: `gemini:${utteranceNamespace}:${activeConnectionGeneration}:${++nextUtteranceIdentity}`,
+          capturedAt: capture?.capturedAt,
+          floorSpeaker: capture?.floorSpeaker ?? null,
+          createdAt: this.now(),
+          captureSegment: capture,
+        };
+        inputContexts.push(inputContext);
+        if (inputContexts.length > 100) {
+          retireCaptureSegment(inputContexts.shift());
+        }
+      }
+      await onInputCaption?.({ ...caption, languageCode: inputTranscriptLanguageCode, ...(inputContext ?? {}) });
+      if (caption.isFinal && pendingOutputFinal) {
+        const pending = pendingOutputFinal;
+        pendingOutputFinal = null;
+        if (pendingOutputTimer !== null) clearTimeout(pendingOutputTimer);
+        pendingOutputTimer = null;
+        await deliverOutput(pending, takeInputContext());
+      }
+    };
+    const takeInputContext = () => {
+      while (inputContexts.length > 0
+        && this.now() - inputContexts[0].createdAt > INPUT_CONTEXT_MAX_AGE_MILLISECONDS) {
+        retireCaptureSegment(inputContexts.shift());
+      }
+      return inputContexts.shift() ?? null;
+    };
+    function retireCaptureSegment(context) {
+      const index = captureSegments.indexOf(context?.captureSegment);
+      // Keep the active tail: repeated utterances by the same producer need a
+      // capture identity even when no new audio-boundary segment is appended.
+      if (index >= 0 && index < captureSegments.length - 1) {
+        captureSegments.splice(0, index + 1);
+      }
+    }
+    async function deliverOutput(caption, context) {
+      const publicContext = context ? {
+        sourceText: context.sourceText,
+        sourceLanguage: context.sourceLanguage,
+        utteranceKey: context.utteranceKey,
+        capturedAt: context.capturedAt,
+        floorSpeaker: context.floorSpeaker,
+      } : {};
+      await onCaption({ ...caption, ...publicContext });
+      if (caption.isFinal && context) {
+        retireCaptureSegment(context);
+      }
+    }
+    const emitOutput = async (caption) => {
+      const context = caption.isFinal ? takeInputContext() : (inputContexts[0] ?? null);
+      if (caption.isFinal && !context && correlateInputCaption) {
+        if (pendingOutputFinal) await deliverOutput(pendingOutputFinal, null);
+        pendingOutputFinal = caption;
+        if (pendingOutputTimer !== null) clearTimeout(pendingOutputTimer);
+        pendingOutputTimer = setTimeout(() => {
+          pendingOutputTimer = null;
+          enqueueCallback(async () => {
+            if (!pendingOutputFinal || isClosed) return;
+            const pending = pendingOutputFinal;
+            pendingOutputFinal = null;
+            await deliverOutput(pending, null);
+          });
+        }, 120);
+        return;
+      }
+      await deliverOutput(caption, context);
+    };
     // Silence flush: the model sends no turn signal during continuous talk,
     // so a short pause commits whatever remains as the final segment.
     const armFinalFlushTimer = (generation) => {
@@ -153,9 +253,9 @@ export class GeminiLiveTranslateAdapter {
         finalFlushTimer = null;
         enqueueCallback(async () => {
           if (generation !== activeConnectionGeneration || isClosed) return;
-          await emitLane(outputLane, onCaption, { flushAll: true });
+          await emitLane(inputLane, emitInput, { flushAll: true });
           if (generation !== activeConnectionGeneration || isClosed) return;
-          if (emitInput) await emitLane(inputLane, emitInput, { flushAll: true });
+          await emitLane(outputLane, emitOutput, { flushAll: true });
           inputTranscriptLanguageCode = null;
         });
       }, this.finalFlushMilliseconds);
@@ -258,7 +358,7 @@ export class GeminiLiveTranslateAdapter {
                 await onInterruption?.();
                 if (connectionGeneration !== activeConnectionGeneration || isClosed) return;
               }
-              if (emitInput && inputTranscription?.text) {
+              if (inputTranscription?.text) {
                 inputLane.accumulated = mergeLiveTranscript(inputLane.accumulated, inputTranscription.text);
                 if (inputTranscription.languageCode) inputTranscriptLanguageCode = inputTranscription.languageCode;
                 if (!isTurnComplete) {
@@ -269,18 +369,23 @@ export class GeminiLiveTranslateAdapter {
               if (transcription?.text) {
                 outputLane.accumulated = mergeLiveTranscript(outputLane.accumulated, transcription.text);
                 if (!isTurnComplete) {
-                  await emitLane(outputLane, onCaption);
+                  await emitLane(outputLane, emitOutput);
                   if (connectionGeneration !== activeConnectionGeneration || isClosed) return;
                 }
               }
               if (isTurnComplete) {
                 clearFinalFlushTimer();
-                await emitLane(outputLane, onCaption, { flushAll: true });
+                await emitLane(inputLane, emitInput, { flushAll: true });
                 if (connectionGeneration !== activeConnectionGeneration || isClosed) return;
-                if (emitInput) {
-                  await emitLane(inputLane, emitInput, { flushAll: true });
-                  if (connectionGeneration !== activeConnectionGeneration || isClosed) return;
-                }
+                await emitLane(outputLane, emitOutput, { flushAll: true });
+                if (connectionGeneration !== activeConnectionGeneration || isClosed) return;
+                // A completed provider turn is a hard correlation boundary.
+                // Any input left unmatched here had no translated output; it
+                // must not be attached to the next turn's otherwise unrelated
+                // output. Keep only the latest capture marker so continuing
+                // audio with the same floor can still be attributed.
+                inputContexts.length = 0;
+                if (captureSegments.length > 1) captureSegments.splice(0, captureSegments.length - 1);
                 inputTranscriptLanguageCode = null;
               } else if (transcription?.text || inputTranscription?.text) {
                 armFinalFlushTimer(connectionGeneration);
@@ -328,7 +433,20 @@ export class GeminiLiveTranslateAdapter {
     };
     await connect();
     return {
-      async sendAudio(frame) {
+      async sendAudio(frame, metadata = null) {
+        if (metadata && Number.isFinite(metadata.capturedAt)) {
+          const previous = captureSegments.at(-1);
+          const previousParticipantId = previous?.floorSpeaker?.participantId ?? null;
+          const participantId = metadata.floorSpeaker?.participantId ?? null;
+          if (!previous || previousParticipantId !== participantId) {
+            captureSegments.push({
+              capturedAt: metadata.capturedAt,
+              floorSpeaker: metadata.floorSpeaker ?? null,
+              hasInputFinal: false,
+            });
+            if (captureSegments.length > 100) captureSegments.shift();
+          }
+        }
         const pcm = Buffer.from(frame);
         return enqueueInput(async () => {
           if (reconnecting) await reconnecting;
@@ -374,6 +492,8 @@ export class GeminiLiveTranslateAdapter {
         activeConnectionGeneration = 0;
         clearInputTail();
         clearFinalFlushTimer();
+        if (pendingOutputTimer !== null) clearTimeout(pendingOutputTimer);
+        pendingOutputTimer = null;
         await inputQueue;
         closeSessionOnce(session);
       },
@@ -850,7 +970,13 @@ function translationLanguageName(language) {
  *  The machine-translation fallback runs ONLY when Gemini fails or times out,
  *  so captions never stall or drop. */
 export class GeminiTextTranslateAdapter {
-  constructor({ client, model = "gemini-3.5-flash", fallback = null, timeoutMilliseconds = 3_500, partialTimeoutMilliseconds = 2_500 }) {
+  // Interims get a much tighter budget than finals (1.2s vs 3.5s). Partial
+  // lanes translate one at a time and drop the intermediate transcripts
+  // (latest-wins), so a slow call does not just delay itself — it holds the lane
+  // while fresher speech piles up behind it, which is what makes a caption feel
+  // stuck. Abandoning a stale interim lets the next, fresher one go out; nothing
+  // is lost because the finalized utterance translates again on its own budget.
+  constructor({ client, model = "gemini-3.5-flash", fallback = null, timeoutMilliseconds = 3_500, partialTimeoutMilliseconds = 1_200 }) {
     if (!client?.models?.generateContent) throw new Error("GEMINI_TEXT_CLIENT_UNAVAILABLE");
     this.client = client;
     this.model = model;

@@ -1085,13 +1085,18 @@ test("electron main creates always-on-top click-through overlay", () => {
   assert.match(launcher, /spawn\(path\.join\(rootDir, "node_modules", "\.bin", "electron"\)/);
 });
 
-test("live-call captions keep the screen policy: translation-only display, identity badge, source recorded", () => {
+test("live-call captions keep one selected display lane, including same-language source", () => {
   const dashboard = readFileSync(path.join(rootDir, "public", "subtitle-dashboard.js"), "utf8");
-  // Screen captions render only the translated direction; the source lane
-  // finals travel record-only so the session record keeps the 원문.
+  // Main selects the one display language; a source on that language must
+  // render just like a translation into that language.
   assert.match(dashboard, /caption\.origin === "source"/);
-  assert.match(dashboard, /recordOnly: true/);
+  assert.doesNotMatch(dashboard, /recordOnly: true/);
   assert.match(dashboard, /speakerDepartment/);
+  assert.doesNotMatch(dashboard, /caption\.speaker\?\.isParticipant !== true/u,
+    "gateway-canonical host captions must reach the desktop too");
+  assert.match(dashboard, /captionProducer: "gateway"/u);
+  assert.doesNotMatch(dashboard, /hasAutoStartedCaptionsForLiveCall/u,
+    "Live Call must not auto-start the independent local producer");
   assert.doesNotMatch(dashboard, /\$\{caption\.speaker[^}]*\}:/, "no Name: text prefix in relayed captions");
 
   const overlay = readFileSync(path.join(rootDir, "public", "subtitle-overlay.js"), "utf8");
@@ -1102,6 +1107,44 @@ test("live-call captions keep the screen policy: translation-only display, ident
   assert.match(server, /liveCallSpeaker/);
   assert.match(server, /message\.recordOnly === true/);
   assert.match(server, /sourceText: translatedText/);
+});
+
+test("Live Call cold standby fences one producer and returns to the gateway after recovery", () => {
+  const dashboard = readFileSync(path.join(rootDir, "public", "subtitle-dashboard.js"), "utf8");
+  const sync = dashboard.slice(
+    dashboard.indexOf("async function syncLiveCallAudioBridge"),
+    dashboard.indexOf("if (window.realtimeNoelDesktop?.ensureLiveCallBridge)"),
+  );
+  const initialize = sync.indexOf('activeCaptionProducer === "none"');
+  const fallback = sync.indexOf('["reconnecting", "failed"].includes');
+  assert.ok(initialize >= 0 && fallback > initialize,
+    "the transcript session must exist before a first-poll reconnect fallback starts");
+  assert.match(sync, /\["reconnecting", "failed"\]\.includes\(liveState\.bridge\?\.state\)[\s\S]*startLocalLiveCallFallback/u);
+  assert.match(sync, /bridge\?\.state === "connected"[\s\S]*restoreGatewayCaptionProducer/u);
+  assert.match(dashboard, /subtitle:producer-stop/u);
+  assert.match(dashboard, /subtitle:producer-stopped/u);
+  assert.match(dashboard, /if \(!isProducerStopped\)[\s\S]*return;[\s\S]*activeCaptionProducer = "gateway"/u,
+    "an unacknowledged local stop must not promote the gateway producer");
+  assert.match(dashboard, /activeCaptionProducer !== "gateway"/u,
+    "gateway events must stay fenced while the local fallback owns the overlay");
+});
+
+test("Live Call shutdown finalizes either gateway or local fallback producer state", () => {
+  const dashboard = readFileSync(path.join(rootDir, "public", "subtitle-dashboard.js"), "utf8");
+  const sync = dashboard.slice(
+    dashboard.indexOf("async function syncLiveCallAudioBridge"),
+    dashboard.indexOf("async function startGatewayCaptionSession"),
+  );
+  assert.match(sync, /!liveState\?\.armed \|\| !liveState\.live[\s\S]*activeCaptionProducer !== "none"[\s\S]*await stopSubtitles\(\)/u,
+    "an ended call must finalize records even when the local fallback owns captions");
+  assert.match(sync, /stopLiveCallAudioBridge\("live call ended"\)/u);
+
+  const fallback = dashboard.slice(
+    dashboard.indexOf("async function startLocalLiveCallFallback"),
+    dashboard.indexOf("async function restoreGatewayCaptionProducer"),
+  );
+  assert.match(fallback, /catch \(error\)[\s\S]*await stopSubtitles\(\)[\s\S]*throw error/u,
+    "a failed fallback transition must release capture and finalize its record");
 });
 
 // ── Settings import must reject non-object sections ────────────────────────

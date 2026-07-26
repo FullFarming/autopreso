@@ -70,11 +70,31 @@ export function isMetricsRequestAuthorized(request, metricsToken) {
   return actual.length === expected.length && timingSafeEqual(actual, expected);
 }
 
-export function getOpaqueClientKey(request, secret) {
+export function getOpaqueClientKey(request, secret, environment = process.env) {
   const forwarded = singleHeader(request.headers["x-forwarded-for"]);
-  const candidate = forwarded && forwarded.length <= 512 ? forwarded.split(",", 1)[0].trim() : "";
-  const address = isIP(candidate) ? candidate : normalizeAddress(request.socket?.remoteAddress);
+  const address = isCloudRunRuntime(environment)
+    ? googleProxyClientAddress(forwarded) ?? normalizeAddress(request.socket?.remoteAddress)
+    : normalizeAddress(request.socket?.remoteAddress);
   return createHmac("sha256", secret).update("gateway-client\0").update(address).digest("hex");
+}
+
+function googleProxyClientAddress(value) {
+  if (typeof value !== "string" || value.length > 512) return null;
+  const addresses = value.split(",").map((entry) => entry.trim());
+  if (addresses.length < 2) return null;
+  // Google External Application Load Balancers append two values to any
+  // caller-supplied prefix: <client-ip>,<load-balancer-ip>. Values before that
+  // suffix are explicitly untrusted and must never select a limiter bucket.
+  const clientAddress = normalizeAddress(addresses.at(-2));
+  const loadBalancerAddress = normalizeAddress(addresses.at(-1));
+  return clientAddress !== "unknown" && loadBalancerAddress !== "unknown" ? clientAddress : null;
+}
+
+function isCloudRunRuntime(environment) {
+  return environment.LIVE_GATEWAY_TRUST_GOOGLE_XFF_SUFFIX === "true"
+    && ["K_SERVICE", "K_REVISION", "K_CONFIGURATION"].every(
+      (name) => typeof environment[name] === "string" && environment[name].trim(),
+    );
 }
 
 function canonicalOrigin(value) {

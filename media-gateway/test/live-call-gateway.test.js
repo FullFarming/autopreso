@@ -7,6 +7,7 @@ import { WebSocket } from "ws";
 
 import { AUDIO_CONFIG } from "../src/config.js";
 import { createGatewayServer } from "../src/gateway-server.js";
+import { SupabaseLivePublisher } from "../src/supabase-adapters.js";
 
 const INPUT_FRAME_BYTES = AUDIO_CONFIG.inputSampleRate * 2 * AUDIO_CONFIG.chunkMilliseconds / 1_000;
 
@@ -148,6 +149,119 @@ async function joinViewer(port, grantId, { language = "ko", lastSeq } = {}) {
   return viewer;
 }
 
+test("one WebSocket meeting keeps host, participant, viewer, and replay captions in parity", async (context) => {
+  const persisted = [];
+  let releaseReplay;
+  const replayGate = new Promise((resolve) => { releaseReplay = resolve; });
+  let gateway;
+  const publisher = new SupabaseLivePublisher({
+    baseUrl: "https://dev-ref.supabase.co",
+    serviceRoleKey: "secret",
+    snapshotGuardTimeoutMilliseconds: 50,
+    async eventFanout(sessionId, language, event) {
+      await gateway.broadcastEvent(sessionId, language, event);
+    },
+    async audioFanout() {},
+    async fetchFn(url, init) {
+      if (String(url).includes("persist_live_snapshot_if_active")) {
+        persisted.push(JSON.parse(String(init.body)).p_event);
+      }
+      return Response.json(true);
+    },
+  });
+  gateway = createGatewayServer({
+    gatewaySecret: "gateway-secret",
+    viewerSecret: "viewer-secret",
+    viewerAuthorizer: { async authorize() { return true; } },
+    hostAuthorizer: { async authorize() { return true; } },
+    floorTakeCooldownMilliseconds: 0,
+    floorController: {
+      async take() { return { ok: true, displayName: "참여자", participantId: "participant-1" }; },
+      async release() { return true; },
+    },
+    async replayUtterances(_sessionId, _language, afterSeq, limit) {
+      await replayGate;
+      return persisted.filter((caption) => caption.seq > afterSeq).slice(0, limit);
+    },
+    async pipelineFactory(settings, _previous, onHostEvent) {
+      let floorSpeaker = null;
+      let sequence = 0;
+      return {
+        async start() {},
+        async tick() {},
+        setFloorSpeaker(speaker) { floorSpeaker = speaker; },
+        async acceptAudio() {
+          const caption = {
+            type: "caption",
+            seq: ++sequence,
+            sessionId: settings.sessionId,
+            language: "ko",
+            speaker: floorSpeaker
+              ? { speakerId: `participant:${floorSpeaker.participantId}`, label: floorSpeaker.displayName }
+              : null,
+            text: "같은 문장",
+            isFinal: true,
+            sourceEndedAt: "2026-07-26T00:00:00.000Z",
+            emittedAt: "2026-07-26T00:00:00.100Z",
+          };
+          await publisher.publish(settings.sessionId, "ko", caption, { onLiveEvent: onHostEvent });
+        },
+        async endAudioStream() {},
+        async close() {},
+      };
+    },
+  });
+  await new Promise((resolve) => gateway.server.listen(0, "127.0.0.1", resolve));
+  context.after(async () => gateway.close());
+  const { port } = gateway.server.address();
+  const host = await connectHost(port, { ...START_MESSAGE, outputMode: "captions", languages: ["ko"] });
+  const viewer = await joinViewer(port, "grant-speaker", { language: "ko" });
+  context.after(() => host.terminate());
+  context.after(() => viewer.terminate());
+  const nextHost = bufferJson(host);
+  const nextViewer = bufferJson(viewer);
+
+  const hostFirst = nextHost((message) => message.type === "caption" && message.seq === 1);
+  const viewerFirst = nextViewer((message) => message.type === "live-event" && message.payload.type === "caption" && message.payload.seq === 1);
+  host.send(Buffer.alloc(INPUT_FRAME_BYTES));
+  assert.equal((await within(hostFirst, "host first caption")).text, "같은 문장");
+  assert.equal((await within(viewerFirst, "viewer first caption")).payload.text, "같은 문장");
+
+  viewer.send(JSON.stringify({ type: "speak-start" }));
+  await within(nextViewer((message) => message.type === "speak-started"), "participant speak start");
+  const hostParticipant = nextHost((message) => message.type === "caption" && message.seq === 2);
+  const viewerParticipant = nextViewer((message) => message.type === "live-event" && message.payload.type === "caption" && message.payload.seq === 2);
+  viewer.send(Buffer.alloc(INPUT_FRAME_BYTES));
+  assert.equal((await within(hostParticipant, "participant caption on host")).speaker.speakerId, "participant:participant-1");
+  assert.equal((await within(viewerParticipant, "participant caption on viewer")).payload.speaker.speakerId, "participant:participant-1");
+
+  viewer.send(JSON.stringify({ type: "speak-end" }));
+  await within(nextViewer((message) => message.type === "speak-ended"), "participant speak end");
+  const hostAgain = nextHost((message) => message.type === "caption" && message.seq === 3);
+  const viewerAgain = nextViewer((message) => message.type === "live-event" && message.payload.type === "caption" && message.payload.seq === 3);
+  host.send(Buffer.alloc(INPUT_FRAME_BYTES));
+  assert.equal((await within(hostAgain, "host resumed caption")).speaker, null);
+  assert.equal((await within(viewerAgain, "viewer resumed caption")).payload.speaker, null);
+  assert.deepEqual(persisted.map((caption) => [caption.seq, caption.text]), [
+    [1, "같은 문장"], [2, "같은 문장"], [3, "같은 문장"],
+  ]);
+
+  const replayViewer = await joinViewer(port, "grant-replay", { language: "ko", lastSeq: 0 });
+  context.after(() => replayViewer.terminate());
+  const nextReplay = bufferJson(replayViewer);
+  releaseReplay();
+  const replayed = [];
+  for (let seq = 1; seq <= 3; seq += 1) {
+    replayed.push(await within(
+      nextReplay((message) => message.type === "live-event" && message.payload.type === "caption" && message.payload.seq === seq),
+      `replay caption ${seq}`,
+    ));
+  }
+  assert.deepEqual(replayed.map((message) => [message.payload.seq, message.payload.text, message.payload.replay]), [
+    [1, "같은 문장", true], [2, "같은 문장", true], [3, "같은 문장", true],
+  ]);
+});
+
 test("a hung caption replay cannot grow the live-event buffer without bound", async (context) => {
   // The replay never resolves, so the buffer would previously accumulate every
   // live event for the rest of the session.
@@ -177,6 +291,85 @@ test("a hung caption replay cannot grow the live-event buffer without bound", as
   // instead of them piling up behind a replay that will never finish.
   assert.ok(received.length >= 100, `overflow must fall through to live delivery, got ${received.length}`);
   assert.match(gateway.metrics.render(), /replay_buffer_overflow_total/u);
+});
+
+test("a newer subscription aborts a hung replay and fences its stale closure", async (context) => {
+  const signals = [];
+  let calls = 0;
+  const { gateway } = createLiveGateway({
+    gatewayOptions: {
+      async replayUtterances(_sessionId, language, _afterSeq, _limit, { signal }) {
+        signals.push(signal);
+        calls += 1;
+        if (calls === 1) return new Promise(() => {});
+        return [{ type: "caption", seq: 1, text: `${language} replay`, isFinal: true }];
+      },
+    },
+  });
+  await new Promise((resolve) => gateway.server.listen(0, "127.0.0.1", resolve));
+  context.after(async () => gateway.close());
+  const viewer = await joinViewer(gateway.server.address().port, "grant-resubscribe", { lastSeq: 0 });
+  context.after(() => viewer.terminate());
+  await waitFor(() => signals.length === 1);
+  const next = bufferJson(viewer);
+  viewer.send(JSON.stringify({ type: "subscribe", sessionId: "session-1", language: "en", lastSeq: 0 }));
+  await next((message) => message.type === "subscribed" && message.language === "en");
+  const replay = await next((message) => message.type === "live-event");
+  assert.equal(signals[0].aborted, true);
+  assert.equal(replay.payload.language ?? "en", "en");
+  assert.equal(replay.payload.text, "en replay");
+});
+
+test("caption replay timeout fails visibly instead of skipping buffered history", async (context) => {
+  const { gateway, timers } = createLiveGateway({
+    gatewayOptions: {
+      replayTimeoutMilliseconds: 123,
+      async replayUtterances() { return new Promise(() => {}); },
+    },
+  });
+  await new Promise((resolve) => gateway.server.listen(0, "127.0.0.1", resolve));
+  context.after(async () => gateway.close());
+  const viewer = await joinViewer(gateway.server.address().port, "grant-timeout", { lastSeq: 0 });
+  context.after(() => viewer.terminate());
+  const next = bufferJson(viewer);
+  await gateway.broadcastEvent("session-1", "ko", { type: "caption", seq: 1, text: "buffered", isFinal: true });
+  await waitFor(() => timers.some((timer) => timer.delay === 123));
+  timers.find((timer) => timer.delay === 123).callback();
+  const error = await next((message) => message.type === "error");
+  assert.equal(error.code, "REPLAY_FAILED");
+  assert.match(gateway.metrics.render(), /caption_replay_timeouts_total 1/u);
+});
+
+test("a large replay keyset-pages to the live edge without a 200-caption gap", async (context) => {
+  let releaseFirstPage;
+  const firstPageGate = new Promise((resolve) => { releaseFirstPage = resolve; });
+  const calls = [];
+  const { gateway } = createLiveGateway({
+    gatewayOptions: {
+      async replayUtterances(_sessionId, language, afterSeq, limit) {
+        calls.push(afterSeq);
+        if (calls.length === 1) await firstPageGate;
+        const end = Math.min(450, afterSeq + limit);
+        return Array.from({ length: Math.max(0, end - afterSeq) }, (_, index) => ({
+          type: "caption", seq: afterSeq + index + 1, language,
+          text: `line ${afterSeq + index + 1}`, isFinal: true,
+        }));
+      },
+    },
+  });
+  await new Promise((resolve) => gateway.server.listen(0, "127.0.0.1", resolve));
+  context.after(async () => gateway.close());
+  const viewer = await joinViewer(gateway.server.address().port, "grant-paged", { lastSeq: 0 });
+  context.after(() => viewer.terminate());
+  const received = [];
+  viewer.on("message", (data) => {
+    const message = JSON.parse(data.toString("utf8"));
+    if (message.type === "live-event") received.push(message.payload.seq);
+  });
+  releaseFirstPage();
+  await waitFor(() => received.length === 450);
+  assert.deepEqual(calls, [0, 200, 400]);
+  assert.deepEqual(received, Array.from({ length: 450 }, (_, index) => index + 1));
 });
 
 test("a viewer can subscribe to the four-letter script subtags the host UI offers", async (context) => {
@@ -488,10 +681,12 @@ test("truly concurrent speak-starts from two viewers resolve to exactly one hold
   const nextSpeakerA = bufferJson(speakerA);
   const nextSpeakerB = bufferJson(speakerB);
 
-  // Both speak-starts are in flight at the same time before either resolves.
+  // 2026-07-26 fix: both requests arrive concurrently, but the per-session floor lock permits
+  // only one DB take/profile/set transaction to be in flight at a time.
   speakerA.send(JSON.stringify({ type: "speak-start" }));
   speakerB.send(JSON.stringify({ type: "speak-start" }));
-  await waitFor(() => takeGates.size === 2);
+  await waitFor(() => takeGates.size === 1);
+  assert.equal(takeGates.has("grant-a"), true);
 
   const hostFloors = [];
   host.on("message", (data) => {
@@ -501,6 +696,7 @@ test("truly concurrent speak-starts from two viewers resolve to exactly one hold
   const aStarted = nextSpeakerA((message) => message.type === "speak-started" || message.type === "error");
   takeGates.get("grant-a")();
   assert.equal((await within(aStarted, "speaker A start")).type, "speak-started");
+  await waitFor(() => takeGates.has("grant-b"));
   const aPreempted = nextSpeakerA((message) => message.type === "speak-ended");
   const bStarted = nextSpeakerB((message) => message.type === "speak-started" || message.type === "error");
   takeGates.get("grant-b")();

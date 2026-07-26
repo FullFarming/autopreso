@@ -70,17 +70,14 @@ function getValidatedSupabaseUrl(environment: Environment): string {
     throw new LiveSecurityConfigurationError("개발 외부 서비스 연결에는 LIVE_EXTERNAL_ENV=development가 필요합니다.");
   }
   const allowedProjectRef = environment.LIVE_ALLOWED_SUPABASE_REF?.trim() ?? "";
-  if (!/^[a-z0-9-]+$/u.test(allowedProjectRef)) {
-    throw new LiveSecurityConfigurationError("허용된 Supabase 개발 프로젝트가 필요합니다.");
-  }
 
   const serverUrl = environment.SUPABASE_URL?.trim() ?? "";
   const publicUrl = environment.NEXT_PUBLIC_SUPABASE_URL?.trim() ?? "";
   if (!serverUrl && !publicUrl) {
     throw new LiveSecurityConfigurationError("Supabase 프로젝트 URL이 필요합니다.");
   }
-  const parsedServerUrl = serverUrl ? parseProjectUrl(serverUrl, allowedProjectRef) : null;
-  const parsedPublicUrl = publicUrl ? parseProjectUrl(publicUrl, allowedProjectRef) : null;
+  const parsedServerUrl = serverUrl ? parseProjectUrl(serverUrl, allowedProjectRef, environment) : null;
+  const parsedPublicUrl = publicUrl ? parseProjectUrl(publicUrl, allowedProjectRef, environment) : null;
   if (parsedServerUrl && parsedPublicUrl && parsedServerUrl !== parsedPublicUrl) {
     throw new LiveSecurityConfigurationError("서버와 공개 Supabase 프로젝트 URL이 일치해야 합니다.");
   }
@@ -89,15 +86,28 @@ function getValidatedSupabaseUrl(environment: Environment): string {
   return resolvedUrl;
 }
 
-function parseProjectUrl(value: string, allowedProjectRef: string): string {
+function parseProjectUrl(value: string, allowedProjectRef: string, environment: Environment): string {
   try {
     const parsed = new URL(value);
-    if (parsed.protocol !== "https:"
+    const hasRootPath = parsed.pathname === "/" || parsed.pathname === "";
+    const isExactLocal = parsed.protocol === "http:"
+      && (parsed.hostname === "127.0.0.1" || parsed.hostname === "localhost")
+      && parsed.port === "54321"
+      && !parsed.username
+      && !parsed.password
+      && hasRootPath
+      && !parsed.search
+      && !parsed.hash;
+    const canUseLocal = environment.NODE_ENV !== "production"
+      && environment.LIVE_ALLOW_LOCAL_SUPABASE?.trim() === "true";
+    if (isExactLocal && canUseLocal) return parsed.origin;
+    if (!/^[a-z0-9-]+$/u.test(allowedProjectRef)
+      || parsed.protocol !== "https:"
       || parsed.hostname !== `${allowedProjectRef}.supabase.co`
       || parsed.username
       || parsed.password
       || parsed.port
-      || (parsed.pathname !== "/" && parsed.pathname !== "")
+      || !hasRootPath
       || parsed.search
       || parsed.hash) {
       throw new Error("invalid Supabase project URL");

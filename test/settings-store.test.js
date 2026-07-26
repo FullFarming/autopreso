@@ -9,6 +9,7 @@ import {
   DEFAULT_SETTINGS,
   DEFAULT_SUBTITLE_SETTINGS,
   MAX_AGENT_INSTRUCTIONS_CHARS,
+  MAX_SUBTITLE_GLOSSARY_CHARS,
   migrateSettingsFile,
   validateApiKeys,
   validateSubtitleSettings,
@@ -200,11 +201,14 @@ test("createSettingsStore persists and validates the subtitle glossary", async (
   const reloaded = createSettingsStore({ filePath, env: {}, readCodexAuth: noCodexAuth });
   assert.match((await reloaded.load()).subtitle.glossary, /operator/);
 
-  // A serious interpreting termbase (domain + idioms + economics) runs well
-  // past 8k chars; the cap exists only to keep the polish prompt sane.
-  await store.save({ subtitle: { glossary: "y".repeat(12000) } });
+  // A serious interpreting termbase (domain + idioms + economics + proper nouns)
+  // runs well past 20k chars — the shipped hotel preset alone is 27.5k. The cap
+  // exists only to keep the polish prompt sane, so it is derived from the
+  // exported constant rather than hardcoded, and pinned against the presets in
+  // test/glossary-presets.test.js.
+  await store.save({ subtitle: { glossary: "y".repeat(MAX_SUBTITLE_GLOSSARY_CHARS) } });
   await assert.rejects(
-    () => store.save({ subtitle: { glossary: "x".repeat(16001) } }),
+    () => store.save({ subtitle: { glossary: "x".repeat(MAX_SUBTITLE_GLOSSARY_CHARS + 1) } }),
     /glossary/,
   );
 });

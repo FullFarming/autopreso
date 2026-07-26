@@ -1,7 +1,75 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
+import { readFileSync } from "node:fs";
+
 import { GLOSSARY_PRESETS } from "../src/glossary-presets.js";
+import { MAX_SUBTITLE_GLOSSARY_CHARS } from "../src/settings-store.js";
+
+// A shipped preset that does not fit the configured glossary limit is worse than
+// a missing one: the desktop settings store REJECTS it outright, while the
+// webapp and the gateway silently slice it, dropping whichever sections happen
+// to sit at the end. Every ceiling in the repo has to clear the largest preset.
+test("every shipped preset fits every glossary size limit in the repo", () => {
+  const largest = GLOSSARY_PRESETS.reduce((max, preset) => Math.max(max, preset.glossary.length), 0);
+
+  assert.ok(
+    largest <= MAX_SUBTITLE_GLOSSARY_CHARS,
+    `largest preset is ${largest} chars but the desktop store rejects over ${MAX_SUBTITLE_GLOSSARY_CHARS}`,
+  );
+
+  const webappLimit = Number(
+    /MAX_GLOSSARY_CHARS = (\d+)/u.exec(readFileSync("webapp/lib/settings.ts", "utf8"))?.[1],
+  );
+  assert.ok(
+    largest <= webappLimit,
+    `largest preset is ${largest} chars but webapp/lib/settings.ts slices at ${webappLimit}`,
+  );
+
+  // electron/main.js mirrors the saved glossary into the Live Call start
+  // message. This site was missed when the other three ceilings were raised, so
+  // local captions used the full glossary while Live Call silently got one cut
+  // mid-file — the reported "라이브콜 번역 퀄리티가 다르다".
+  const desktopLiveLimit = Number(
+    /subtitle\?\.glossary \?\? ""\)\.trim\(\)\.slice\(0, ([\d_]+)\)/u
+      .exec(readFileSync("electron/main.js", "utf8"))?.[1]
+      ?.replace(/_/gu, ""),
+  );
+  assert.ok(
+    largest <= desktopLiveLimit,
+    `largest preset is ${largest} chars but electron/main.js slices the Live Call glossary at ${desktopLiveLimit}`,
+  );
+
+  const gatewayLimit = Number(
+    /glossaryText \?\? ""\)\.trim\(\)\.slice\(0, ([\d_]+)\)/u
+      .exec(readFileSync("media-gateway/src/config.js", "utf8"))?.[1]
+      ?.replace(/_/gu, ""),
+  );
+  assert.ok(
+    largest <= gatewayLimit,
+    `largest preset is ${largest} chars but media-gateway/src/config.js slices at ${gatewayLimit}`,
+  );
+});
+
+test("the BASE CRE glossary is what a session gets before anyone picks a preset", async () => {
+  const { getDefaultSubtitleGlossaryContext } = await import("../src/glossary-presets.js");
+  const cre = GLOSSARY_PRESETS.find((preset) => preset.id === "default-cre-ai-en-ko");
+
+  // Resolution used to return the FIRST preset matching the language pair, and
+  // hotel-investment-en-ko is listed before the library — so an untouched
+  // install silently ran the HOTEL termbase (MRG, RevPAR, hotel translation
+  // memory) as its default for every EN<->KO session. The everyday default has
+  // to be the general CRE consulting glossary.
+  for (const pair of [{ a: "en", b: "ko" }, { a: "ko", b: "en" }, {}]) {
+    const context = getDefaultSubtitleGlossaryContext(pair);
+    assert.equal(context.glossary, cre.glossary, `wrong default for pair ${JSON.stringify(pair)}`);
+    assert.equal(context.domain, cre.domain);
+  }
+
+  // Other pairs still resolve to their own prepared preset.
+  const fnb = GLOSSARY_PRESETS.find((preset) => preset.id === "fnb-leasing-ko-ja");
+  assert.equal(getDefaultSubtitleGlossaryContext({ a: "ko", b: "ja" }).glossary, fnb.glossary);
+});
 
 test("built-in glossary presets cover both prepared industries with full content", () => {
   const ids = GLOSSARY_PRESETS.map((preset) => preset.id);

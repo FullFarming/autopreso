@@ -67,10 +67,12 @@ export function createGatewayServer({
   hostReconnectGraceMilliseconds = 45_000,
   fetchFloorParticipant = null,
   replayUtterances = null,
+  replayTimeoutMilliseconds = 5_000,
 }) {
   if (!Number.isFinite(heartbeatIntervalMilliseconds) || heartbeatIntervalMilliseconds <= 0) throw new Error("INVALID_HEARTBEAT_INTERVAL");
   if (!Number.isFinite(viewerAuthorizeTimeoutMilliseconds) || viewerAuthorizeTimeoutMilliseconds <= 0) throw new Error("INVALID_VIEWER_AUTHORIZE_TIMEOUT");
   if (!Number.isFinite(hostStartTimeoutMilliseconds) || hostStartTimeoutMilliseconds <= 0) throw new Error("INVALID_HOST_START_TIMEOUT");
+  if (!Number.isFinite(replayTimeoutMilliseconds) || replayTimeoutMilliseconds <= 0) throw new Error("INVALID_REPLAY_TIMEOUT");
   if (!Number.isSafeInteger(maxQueuedHostOperations) || maxQueuedHostOperations < 0) throw new Error("INVALID_HOST_QUEUE_LIMIT");
   if (!Number.isFinite(audioBurstMilliseconds) || audioBurstMilliseconds < AUDIO_CONFIG.chunkMilliseconds) throw new Error("INVALID_AUDIO_BURST");
   if (!Number.isFinite(maxSessionAudioMilliseconds) || maxSessionAudioMilliseconds <= 0) throw new Error("INVALID_SESSION_AUDIO_DURATION");
@@ -94,6 +96,7 @@ export function createGatewayServer({
   const hostSessions = new Map();
   const hostOperationTails = new Map();
   const hostOperationCounts = new Map();
+  const floorOperationTails = new Map();
   const successfullyClosedPipelines = new WeakSet();
   const pipelineCloseFlights = new WeakMap();
   const pipelinesPendingClose = new Set();
@@ -165,6 +168,16 @@ export function createGatewayServer({
       const remaining = (hostOperationCounts.get(sessionId) ?? 1) - 1;
       if (remaining === 0) hostOperationCounts.delete(sessionId);
       else hostOperationCounts.set(sessionId, remaining);
+    });
+    return result;
+  };
+  const withFloorSessionLock = (sessionId, operation) => {
+    const previous = floorOperationTails.get(sessionId) ?? Promise.resolve();
+    const result = previous.catch(() => undefined).then(operation);
+    const tail = result.catch(() => undefined);
+    floorOperationTails.set(sessionId, tail);
+    void tail.then(() => {
+      if (floorOperationTails.get(sessionId) === tail) floorOperationTails.delete(sessionId);
     });
     return result;
   };
@@ -313,7 +326,7 @@ export function createGatewayServer({
     const languages = state?.settings.languages ?? [];
     await Promise.all(languages.map((language) => deliverEvent(sessionId, language, payload)));
   };
-  const releaseFloor = async (sessionId, { grantId = null, reason = "ended", notifyHolder = true } = {}) => {
+  const releaseFloor = (sessionId, { grantId = null, reason = "ended", notifyHolder = true } = {}) => withFloorSessionLock(sessionId, async () => {
     const holder = floorHolders.get(sessionId);
     if (!holder) return;
     if (grantId !== null && holder.grantId !== grantId) return;
@@ -330,7 +343,7 @@ export function createGatewayServer({
     }
     if (notifyHolder) sendJson(holder.webSocket, { type: "speak-ended", sessionId, reason });
     await broadcastFloor(sessionId, null);
-  };
+  });
   const server = createServer((request, response) => {
     if (request.url === "/health" || request.url === "/healthz") {
       response.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
@@ -412,8 +425,15 @@ export function createGatewayServer({
     let reauthorizeTimer = null;
     let reauthorizeInFlight = null;
     let reauthorizeGeneration = 0;
+    let replayAbortController = null;
+    let replayGeneration = 0;
     let tokenExpiryTimer = null;
     const authorizationControllers = new Set();
+    const cancelReplay = () => {
+      replayGeneration += 1;
+      replayAbortController?.abort(new Error("REPLAY_CANCELLED"));
+      replayAbortController = null;
+    };
     const runViewerAuthorization = async (sessionId, language) => {
       const abortController = new AbortController();
       authorizationControllers.add(abortController);
@@ -458,6 +478,7 @@ export function createGatewayServer({
       reauthorizeTimer = null;
       reauthorizeInFlight = null;
       reauthorizeGeneration += 1;
+      cancelReplay();
       viewerMetadata.delete(webSocket);
       for (const abortController of authorizationControllers) abortController.abort();
       authorizationControllers.clear();
@@ -505,7 +526,11 @@ export function createGatewayServer({
             state.pendingFrames += 1;
             const capturedAt = Date.now();
             state.audioTail = state.audioTail
-              .then(() => state.pipeline.acceptAudio(new Uint8Array(data.buffer, data.byteOffset, data.byteLength), capturedAt))
+              .then(() => state.pipeline.acceptAudio(
+                new Uint8Array(data.buffer, data.byteOffset, data.byteLength),
+                capturedAt,
+                null,
+              ))
               .catch((error) => closePipelineSocket(webSocket, error))
               .finally(() => { state.pendingFrames -= 1; });
             metrics.increment("audio_frames_total");
@@ -577,6 +602,10 @@ export function createGatewayServer({
                 }
                 previous.detached = false;
                 previous.webSocket = webSocket;
+                // 2026-07-26 fix: the preserved pipeline owns a mutable output sink. Updating
+                // it makes captions follow the newly attached host instead of
+                // continuing to write to the closed pre-reconnect socket.
+                previous.hostOutput.webSocket = webSocket;
                 previous.settings.version = hostMessage.version;
                 stopHostLease(previous);
                 startHostLease(previous, claims);
@@ -591,6 +620,7 @@ export function createGatewayServer({
                 };
               }
               let candidate = null;
+              const hostOutput = { webSocket };
               const operationAbortController = new AbortController();
               const abortForShutdown = () => operationAbortController.abort(
                 shutdownAbortController.signal.reason ?? new Error("GATEWAY_SHUTTING_DOWN"),
@@ -609,7 +639,7 @@ export function createGatewayServer({
                 const factoryPromise = Promise.resolve().then(() => pipelineFactory(
                   hostMessage,
                   previous?.pipeline ?? null,
-                  (event) => sendJson(webSocket, event),
+                  (event) => sendJson(hostOutput.webSocket, event),
                   { signal: operationAbortController.signal },
                 ));
                 void factoryPromise.then((lateCandidate) => {
@@ -641,6 +671,7 @@ export function createGatewayServer({
               const state = {
                 pipeline: candidate,
                 webSocket,
+                hostOutput,
                 audioTail: Promise.resolve(),
                 pendingFrames: 0,
                 settings: {
@@ -741,8 +772,18 @@ export function createGatewayServer({
           holder.pendingFrames += 1;
           holder.lastFrameAt = now();
           const capturedAt = Date.now();
+          const capturedFloorSpeaker = {
+            participantId: holder.participantId,
+            displayName: holder.displayName,
+            department: holder.department,
+            jobTitle: holder.jobTitle,
+          };
           holder.audioTail = holder.audioTail
-            .then(() => state.pipeline.acceptAudio(new Uint8Array(data.buffer, data.byteOffset, data.byteLength), capturedAt))
+            .then(() => state.pipeline.acceptAudio(
+              new Uint8Array(data.buffer, data.byteOffset, data.byteLength),
+              capturedAt,
+              capturedFloorSpeaker,
+            ))
             .catch(() => releaseFloor(claims.sessionId, { reason: "error" }))
             .finally(() => { holder.pendingFrames -= 1; });
           metrics.increment("floor_audio_frames_total");
@@ -750,15 +791,16 @@ export function createGatewayServer({
         }
         const message = parseJson(data);
         if (message.type === "speak-start") {
-          const speakStartReceivedAt = now();
-          if (!floorController) throw new Error("FLOOR_UNAVAILABLE");
-          if (!viewerMetadata.get(webSocket)) throw new Error("INVALID_SUBSCRIPTION");
-          const state = hostSessions.get(claims.sessionId);
-          if (!state) {
-            sendJson(webSocket, { type: "error", code: "SESSION_NOT_STARTED", message: gatewayMessage("SESSION_NOT_STARTED") });
-            return;
-          }
-          const activeHolder = floorHolders.get(claims.sessionId);
+          await withFloorSessionLock(claims.sessionId, async () => {
+            const speakStartReceivedAt = now();
+            if (!floorController) throw new Error("FLOOR_UNAVAILABLE");
+            if (!viewerMetadata.get(webSocket)) throw new Error("INVALID_SUBSCRIPTION");
+            const state = hostSessions.get(claims.sessionId);
+            if (!state) {
+              sendJson(webSocket, { type: "error", code: "SESSION_NOT_STARTED", message: gatewayMessage("SESSION_NOT_STARTED") });
+              return;
+            }
+            const activeHolder = floorHolders.get(claims.sessionId);
           if (activeHolder?.webSocket === webSocket && activeHolder.grantId === claims.grantId) {
             // A Speak button may be tapped again while the client reconciles
             // UI state. The existing grant is sticky until another holder or
@@ -848,7 +890,8 @@ export function createGatewayServer({
             audio: { sampleRate: AUDIO_CONFIG.inputSampleRate, channels: 1, chunkMilliseconds: AUDIO_CONFIG.chunkMilliseconds },
           });
           await broadcastFloor(claims.sessionId, holder);
-          metrics.observe("floor_broadcast_latency_ms", Math.max(0, now() - speakStartReceivedAt));
+            metrics.observe("floor_broadcast_latency_ms", Math.max(0, now() - speakStartReceivedAt));
+          });
           return;
         }
         if (message.type === "speak-end") {
@@ -863,6 +906,7 @@ export function createGatewayServer({
           reauthorizeTimer = null;
           reauthorizeInFlight = null;
           reauthorizeGeneration += 1;
+          cancelReplay();
           viewerMetadata.delete(webSocket);
           for (const abortController of authorizationControllers) abortController.abort();
           return;
@@ -880,6 +924,8 @@ export function createGatewayServer({
           throw new Error("INVALID_SUBSCRIPTION");
         }
         if (!await runViewerAuthorization(message.sessionId, language)) throw new Error("GRANT_REVOKED");
+        cancelReplay();
+        const currentReplayGeneration = replayGeneration;
         removeViewer(topic, webSocket, viewerTopics);
         topic = `${message.sessionId}:${language}`;
         const viewers = viewerTopics.get(topic) ?? new Set();
@@ -907,17 +953,49 @@ export function createGatewayServer({
         }, AUTHORIZATION_CADENCE_MILLISECONDS);
         if (shouldReplay) {
           let replayedThroughSeq = message.lastSeq;
+          const abortController = new AbortController();
+          replayAbortController = abortController;
+          const replayTimer = setTimeoutFn(
+            () => abortController.abort(new Error("REPLAY_TIMEOUT")),
+            replayTimeoutMilliseconds,
+          );
           try {
-            const rows = await replayUtterances(message.sessionId, language, message.lastSeq, 200);
-            for (const row of Array.isArray(rows) ? rows : []) {
-              if (webSocket.readyState !== WebSocket.OPEN) break;
-              const payload = { ...row, replay: true };
-              sendJson(webSocket, { type: "live-event", payload });
-              if (Number.isFinite(payload.seq)) replayedThroughSeq = Math.max(replayedThroughSeq, payload.seq);
+            for (let page = 0; ; page += 1) {
+              if (page > 0 && !await ensureViewerAuthorization({ force: true })) throw new Error("GRANT_REVOKED");
+              const pageStartSeq = replayedThroughSeq;
+              const replayRequest = Promise.resolve().then(() => replayUtterances(
+                message.sessionId,
+                language,
+                replayedThroughSeq,
+                200,
+                { signal: abortController.signal },
+              ));
+              const rows = await waitForAbort(replayRequest, abortController.signal);
+              if (currentReplayGeneration !== replayGeneration || viewerMetadata.get(webSocket) !== metadata) return;
+              for (const row of Array.isArray(rows) ? rows : []) {
+                if (webSocket.readyState !== WebSocket.OPEN) break;
+                const payload = { ...row, replay: true };
+                sendJson(webSocket, { type: "live-event", payload });
+                if (Number.isFinite(payload.seq)) replayedThroughSeq = Math.max(replayedThroughSeq, payload.seq);
+              }
+              if (!Array.isArray(rows) || rows.length < 200) break;
+              if (replayedThroughSeq <= pageStartSeq) throw new Error("REPLAY_NOT_ADVANCING");
             }
-          } catch {
-            metrics.increment("caption_replay_failures_total");
+          } catch (error) {
+            if (currentReplayGeneration === replayGeneration) {
+              if (error instanceof Error && error.message === "REPLAY_TIMEOUT") {
+                metrics.increment("caption_replay_timeouts_total");
+              } else {
+                metrics.increment("caption_replay_failures_total");
+              }
+              closeWithError(webSocket, "REPLAY_FAILED", "누락된 자막 기록을 안전하게 복원하지 못했습니다.", 4411);
+            }
+            return;
+          } finally {
+            clearTimeoutFn(replayTimer);
+            if (replayAbortController === abortController) replayAbortController = null;
           }
+          if (currentReplayGeneration !== replayGeneration || viewerMetadata.get(webSocket) !== metadata) return;
           const buffered = metadata.replayBuffer ?? [];
           metadata.replayBuffer = null;
           for (const payload of buffered) {
@@ -1008,6 +1086,7 @@ export function createGatewayServer({
       clearInterval(tickTimer);
       clearInterval(heartbeatTimer);
       await Promise.all([...hostOperationTails.values()]);
+      await Promise.all([...floorOperationTails.values()]);
       // 2026-07-19 fix: detach ownership before terminating sockets. Their close
       // handlers must not observe and close a pipeline already owned by shutdown.
       const ownedHostStates = [...hostSessions.values()];

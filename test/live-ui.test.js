@@ -97,7 +97,7 @@ test("host sends canonical session settings through REST and gateway", async () 
     read("webapp/components/live/live-audio-client.ts"),
   ]);
 
-  assert.match(dashboard, /body: JSON\.stringify\(\{ title, scheduledAt, sessionType, languages, outputMode, voiceProvider, maxViewers, glossaryPack \}\)/);
+  assert.match(dashboard, /body: JSON\.stringify\(\{ title, scheduledAt: currentSchedule\.scheduledAt, sessionType, languages, outputMode, voiceProvider, maxViewers, glossaryPack \}\)/);
   assert.match(dashboard, /sessionType: previousSession\.sessionType/);
   assert.match(dashboard, /outputMode: previousSession\.outputMode/);
   assert.match(dashboard, /voiceProvider: previousSession\.voiceProvider/);
@@ -110,7 +110,7 @@ test("host sends canonical session settings through REST and gateway", async () 
   assert.match(audioClient, /maxViewers: number/);
   assert.match(audioClient, /glossaryPack: GlossaryPack/);
   const createSessionBlock = dashboard.match(/const createSession = useCallback[\s\S]*?const stopBroadcast/u)?.[0] ?? "";
-  assert.match(createSessionBlock, /JSON\.stringify\(\{ title, scheduledAt, sessionType, languages, outputMode, voiceProvider, maxViewers, glossaryPack \}\)/);
+  assert.match(createSessionBlock, /JSON\.stringify\(\{ title, scheduledAt: currentSchedule\.scheduledAt, sessionType, languages, outputMode, voiceProvider, maxViewers, glossaryPack \}\)/);
   assert.doesNotMatch(createSessionBlock, /JSON\.stringify\([\s\S]*inputSource/u,
     "capture-only inputSource must not be sent to the strict persisted-session API");
 });
@@ -268,6 +268,45 @@ test("desktop and mobile watch routes share the same viewer component", async ()
   assert.match(mobile, /compact/);
 });
 
+test("viewer routes preserve QR fragments while correcting iPhone and iPad surfaces", async () => {
+  const [viewer, routing, routingTest] = await Promise.all([
+    read("webapp/components/live/LiveViewer.tsx"),
+    read("webapp/components/live/viewer-surface-routing.ts"),
+    read("webapp/components/live/viewer-surface-routing.test.ts"),
+  ]);
+
+  assert.match(routing, /pathname === "\/m\/watch" && isIpadUserAgent/u);
+  assert.match(routing, /pathname === "\/watch" && \/\\b\(\?:iPhone\|iPod\)\\b\//u);
+  assert.match(routing, /`\$\{target\}\$\{search\}\$\{hash\}`/u);
+  assert.match(routingTest, /opaque%2Btoken%3D/u);
+  const redirectIndex = viewer.indexOf("window.location.replace(buildViewerSurfaceUrl");
+  const consumeIndex = viewer.indexOf("const inviteToken = takeInviteTokenFromHash()");
+  assert.ok(redirectIndex >= 0 && consumeIndex > redirectIndex,
+    "surface correction must run before the QR fragment is consumed");
+  assert.match(viewer, /if \(getViewerSurfaceRedirect\([\s\S]*?\)\) return;[\s\S]*?takeInviteTokenFromHash\(\)/u);
+});
+
+test("mobile viewer reconnects once on foreground and keeps full history accessible", async () => {
+  const [viewer, recovery, feed, css] = await Promise.all([
+    read("webapp/components/live/LiveViewer.tsx"),
+    read("webapp/components/live/foreground-recovery.ts"),
+    read("webapp/components/live/MeetingTurnFeed.tsx"),
+    read("webapp/app/globals.css"),
+  ]);
+
+  assert.match(recovery, /if \(state\.inFlight\) return state\.inFlight/u);
+  assert.match(viewer, /document\.addEventListener\("visibilitychange"/u);
+  assert.match(viewer, /window\.addEventListener\("pageshow"/u);
+  assert.match(viewer, /window\.addEventListener\("online"/u);
+  assert.match(viewer, /disconnectGateway\(\);[\s\S]*?const recoveryGeneration = audioConnectionGenerationRef\.current/u);
+  assert.match(viewer, /expectedConnectionGeneration !== audioConnectionGenerationRef\.current\) return/u);
+  assert.match(feed, /turns\.map\(/u, "the complete transcript must remain in the DOM");
+  assert.match(css, /content-visibility: auto/u);
+  assert.match(css, /contain-intrinsic-size: auto 96px/u);
+  assert.match(css, /\.live-viewer-shell\.is-compact \.live-language-switch button \{ min-width: 44px; min-height: 44px;/u);
+  assert.match(css, /\.live-viewer-shell\.is-compact \.live-language-switch button:focus-visible[\s\S]*?outline: 2px solid var\(--nova-blue\)/u);
+});
+
 test("speaker captions never identify a speaker by color alone", async () => {
   const component = await read("webapp/components/live/SpeakerCaption.tsx");
   const css = await read("webapp/app/globals.css");
@@ -403,22 +442,60 @@ test("gateway slow-consumer close automatically reconnects without clearing the 
 });
 
 test("viewer keeps one stable partial row and archives only final captions after the snapshot floor", async () => {
-  const [viewer, speaker] = await Promise.all([
+  const [viewer, speaker, captionFeed] = await Promise.all([
     read("webapp/components/live/LiveViewer.tsx"),
     read("webapp/components/live/SpeakerCaption.tsx"),
+    read("webapp/lib/live/caption-feed.ts"),
   ]);
 
-  assert.match(viewer, /function mergeCaptionTimeline/);
+  // 2026-07-26 fix: Timeline identity and ordering are shared by snapshot,
+  // WebSocket, host, and participant events, so the merge contract belongs in
+  // the feed module rather than as a private Viewer implementation detail.
+  assert.match(captionFeed, /export function mergeCaptionTimeline/);
+  assert.match(viewer, /mergeLanguageCaptionCache/);
   assert.match(viewer, /key=\{`final-\$\{caption\.seq\}`\}/);
   assert.match(viewer, /key=\{`partial-\$\{captionLaneKey\(caption\)\}`\}/);
-  assert.match(viewer, /const finalCaptions = captions\.filter\(\(caption\) => caption\.isFinal\)/);
-  assert.match(viewer, /const partialCaptions = captions\.filter\(\(caption\) => !caption\.isFinal\)/);
+  // Finals and partials are split out of displayCaptions, not the raw record.
+  // Web history shows source speech in its own selected language lane and hides
+  // only failed translations.
+  assert.match(viewer, /const displayCaptions = useMemo\(\(\) => captions\.filter\(isDisplayableCaption\), \[captions\]\)/);
+  assert.match(captionFeed, /if \(caption\.origin === "source"\) return true/u);
+  assert.match(captionFeed, /incoming\.filter\(\(event\) => event\.language === language\)/u);
+  assert.match(viewer, /const finalCaptions = displayCaptions\.filter\(\(caption\) => caption\.isFinal\)/);
+  assert.match(viewer, /const partialCaptions = displayCaptions\.filter\(\(caption\) => !caption\.isFinal\)/);
+  assert.match(viewer, /<MeetingTurnFeed captions=\{displayCaptions\}/);
   assert.match(viewer, /event\.seq <= getLastSeq\(event\.language\)/);
+  assert.match(viewer, /if \(event\.language === languageRef\.current\) setCaptions/u);
   assert.match(viewer, /setCaptionSnapshot\(snapshot\)/);
   assert.match(viewer, /aria-relevant="additions"/);
   assert.match(viewer, /aria-live="off"/);
   assert.match(speaker, />Listening</);
   assert.doesNotMatch(speaker, /인식 중/);
+});
+
+test("the live UI consumes the lossless language cache and append-only partial tail", async () => {
+  const [viewer, feed, captionFeed, css] = await Promise.all([
+    read("webapp/components/live/LiveViewer.tsx"),
+    read("webapp/components/live/MeetingTurnFeed.tsx"),
+    read("webapp/lib/live/caption-feed.ts"),
+    read("webapp/app/globals.css"),
+  ]);
+
+  // 2026-07-26 fix: These checks bind the tested 5,000-event data contract to
+  // the actual screen path. A green cache-only test is insufficient if the
+  // language selector clears that cache or the feed remounts partial text.
+  assert.match(captionFeed, /const COMMITTED_CAPTION_LIMIT = 5_000/u);
+  assert.doesNotMatch(captionFeed, /CAPTION_WINDOW_SIZE|slice\(-200\)/u);
+  assert.match(viewer, /const captionsByLanguageRef = useRef<Record<string, CaptionEvent\[\]>>\(\{\}\)/u);
+  assert.match(viewer, /setCaptions\(getCachedLanguageCaptions\(captionsByLanguageRef\.current, nextLanguage\)\)/u);
+  assert.match(viewer, /mergeLanguageCaptionCache\(captionsByLanguageRef\.current, event\.language, \[event\]\)/u);
+  assert.match(feed, /pendingText=\{livePartialBelongsToLastTurn/u);
+  assert.match(feed, /className="live-turn-text is-recent is-pending" data-caption-state="updating"/u);
+  assert.doesNotMatch(feed, /live-turn-card\.is-collapsed|collapsedTurnKeys/u);
+
+  // DESIGN.md §8.2: pending text keeps its layout and uses the semantic system
+  // blue dashed underline rather than introducing a new colour or spinner.
+  assert.match(css, /\.live-turn-card p \.live-turn-text\.is-pending\s*\{[^}]*text-decoration:\s*underline dashed var\(--nova-blue\) 1px;[^}]*text-underline-offset:\s*\.2em;/su);
 });
 
 test("desktop Live workspace exposes only the local Start action", async () => {
@@ -625,35 +702,49 @@ test("caption controls sit below the title and no audio control is surfaced", as
   assert.match(css, /\.live-text-size-slider\.is-open \{ display: inline-flex/u);
 });
 
-test("speaker paragraphs fold so a multi-hour record stays skimmable", async () => {
+test("the in-progress sentence extends the current paragraph instead of standing alone", async () => {
+  const feed = await read("webapp/components/live/MeetingTurnFeed.tsx");
+
+  // The partial used to render as its own <article class="live-turn-card is-live">
+  // BELOW the record. When it finalized it vanished from there and reappended to
+  // the paragraph above, so the reader watched text get written separately and
+  // then jump into the record — the reported "따로 적혔다가 다시 기록에 붙여지는"
+  // behaviour. A live transcript must only ever grow at its tail.
+  assert.match(feed, /pendingText/u, "the live text must be handed to the current paragraph");
+  // Same speaker -> the partial is the tail of that speaker's existing paragraph.
+  assert.match(feed, /livePartialBelongsToLastTurn|belongsToLastTurn/u);
+  // A partial from a DIFFERENT speaker still opens its own paragraph, which is
+  // correct: that is a new turn, not a continuation.
+  assert.match(feed, /<article className="live-turn-card is-live"/u);
+});
+
+test("the LIVE feed never folds a speaker paragraph", async () => {
   const [feed, css] = await Promise.all([
     read("webapp/components/live/MeetingTurnFeed.tsx"),
     read("webapp/app/globals.css"),
   ]);
 
-  // The header is the control, and it must be a real button with the
-  // expanded/controls wiring — a div with onClick is not keyboard reachable.
-  assert.match(feed, /<button type="button" className="live-turn-toggle"/u);
-  assert.match(feed, /aria-expanded=\{!isCollapsed\}\s+aria-controls=\{bodyId\}/u);
-  assert.match(feed, /<p id=\{bodyId\} className="live-turn-body">/u);
+  // Folding was removed from the live feed on 2026-07-26. While a paragraph
+  // could collapse, a speaker who said one more sentence made the feed bundle
+  // and then visibly drop text — a live transcript that rewrites itself under
+  // the reader. The live feed is now append-only: every sentence stays exactly
+  // where it appeared. Grouping-and-folding belongs in the RECORDS view
+  // (MeetingMinutes), where the transcript is static and summaries can expand
+  // to the full original.
+  assert.doesNotMatch(feed, /live-turn-toggle/u);
+  assert.doesNotMatch(feed, /aria-expanded/u);
+  assert.doesNotMatch(feed, /collapsedTurnKeys|toggleTurnCollapsed|isCollapsed/u);
+  assert.doesNotMatch(feed, /live-turn-count|live-turn-chevron/u);
+  assert.doesNotMatch(css, /\.live-turn-card\.is-collapsed/u);
 
-  // Fold state is keyed by turn.key, which is derived from the turn's first
-  // caption seq, so a fold survives re-render and the turn growing.
-  assert.match(feed, /collapsedTurnKeys\.has\(turn\.key\)/u);
-  assert.match(feed, /key: `turn-\$\{caption\.seq\}`/u);
+  // The paragraph body and its speaker header stay — only the control is gone,
+  // and the header must no longer be a button.
+  assert.match(feed, /<p className="live-turn-body">/u);
+  assert.match(feed, /<strong>\{turn\.speakerLabel\}<\/strong>/u);
 
-  // The in-progress paragraph must never be foldable: only the finals map
-  // renders a toggle, so exactly one live-turn-toggle exists in the source.
-  assert.equal((feed.match(/live-turn-toggle/gu) ?? []).length, 1);
+  // The in-progress paragraph is still rendered inside the record.
   const liveCard = feed.match(/<article className="live-turn-card is-live"[\s\S]*?<\/article>/u);
   assert.ok(liveCard, "the live partial card must remain present");
-  assert.doesNotMatch(liveCard[0], /live-turn-toggle|aria-expanded/u);
-
-  // Collapsed CLAMPS rather than unmounts, so browser find and copy still
-  // reach the folded text.
-  assert.match(css, /\.live-turn-card\.is-collapsed \.live-turn-body\s*\{[^}]*-webkit-line-clamp:\s*1/s);
-  assert.doesNotMatch(feed, /\{!isCollapsed && <p/u);
-  assert.match(css, /\.live-turn-toggle:focus-visible\s*\{[^}]*outline:/s);
 });
 
 test("meeting timestamps use a deterministic fixed KST clock", async () => {
@@ -930,6 +1021,9 @@ test("desktop Live Call draft always issues QR and code, validates local cover d
   assert.match(workspace, /t\("live\.stageUp", \{ code: result\.admissionCode/);
   assert.match(html, /id="live-draft-cover-rules"/);
   assert.match(html, /id="live-draft-cover-status"[^>]*role="status"[^>]*aria-live="polite"/);
+  assert.match(html, /name="liveDisplayLanguage"[^>]*value="ko"[^>]*checked/);
+  assert.match(html, /name="liveDisplayLanguage"[^>]*value="en"/);
+  assert.match(html, /id="live-display-language-help"[^>]*data-i18n="live\.displayLanguageHelp"/);
   assert.match(html, /id="live-host-login-status"[^>]*role="status"[^>]*aria-live="polite"/);
   assert.doesNotMatch(html, /id="open-meeting-mode"|name="liveHostWorkspaceUrl"|Open Live Call/);
   assert.match(css, /\.live-draft-cover-status\.is-error/);
@@ -944,6 +1038,9 @@ test("desktop Live Call draft always issues QR and code, validates local cover d
   assert.match(workspace, /size: file\.size/);
   assert.match(workspace, /base64: window\.btoa\(binary\)/);
   assert.match(workspace, /coverImage: liveDraftCoverData/);
+  assert.match(workspace, /DRAFT_FIELDS = \[[^\]]*"liveDisplayLanguage"/);
+  assert.match(workspace, /displayLanguage: liveDisplayLanguage\(\)/);
+  assert.match(workspace, /startRegisteredLiveCall\(sessionId, \{ displayLanguage: liveDisplayLanguage\(\) \}\)/);
   assert.match(workspace, /result\?\.code === "HOST_LOGIN_REQUIRED"/);
   assert.match(workspace, /t\("live\.hostLoginRequired"\)/);
   assertLocalized("live.hostLoginRequired", { en: /Open Settings and save the host authorization/ });
@@ -1127,9 +1224,14 @@ test("meeting turn cards are memoised on identity-stable turns", async () => {
   // change a prop on all of them and defeat the memo.
   assert.match(feed, /recentFromIndex=\{turnRecentFrom\[turnIndex\]\}/u);
   assert.match(feed, /textIndex >= recentFromIndex/u);
-  // The toggle callback must be stable, or every card's props change per render.
-  assert.match(feed, /const toggleTurnCollapsed = useCallback/u);
-  assert.match(feed, /onToggle=\{toggleTurnCollapsed\}/u);
+  // The card now takes only primitives and identity-stable objects — no
+  // callback prop at all — which is the strongest possible form of the
+  // stability the fold's useCallback used to provide.
+  assert.doesNotMatch(feed, /onToggle/u);
+  // pendingText is a string, so the card still takes only primitives and
+  // identity-stable objects — no callback prop — and memo can bail out on every
+  // paragraph except the newest one.
+  assert.match(feed, /const MeetingTurnCard = memo\(function MeetingTurnCard\(\{ turn, recentFromIndex, pendingText = "" \}/u);
 
   // Scanning back for the in-progress line beats filtering thousands of
   // captions on every streaming update.
@@ -1169,14 +1271,12 @@ test("meeting feed animations are compositor-only and respect reduced motion", a
     assert.doesNotMatch(block[0], /(?:^|[;{\s])(?:height|width|top|left|bottom|right|margin|padding|font-size)\s*:/u);
     assert.match(block[0], /transform|opacity/u);
   }
-  assert.match(css, /\.live-turn-chevron\s*\{[^}]*transition:\s*transform/s);
 
   // Reduced motion has to cover the paragraph entry animation, not only the
   // fold chevron: the entry animation is the one that fires on every new turn.
   const reduced = css.match(/@media \(prefers-reduced-motion: reduce\) \{\s*\n\s*\.live-turn-card \{[\s\S]*?\n\}/u);
   assert.ok(reduced, "the feed needs a reduced-motion block");
   assert.match(reduced[0], /\.live-turn-card \{ animation: none; \}/u);
-  assert.match(reduced[0], /\.live-turn-chevron \{ transition: none; \}/u);
 
   // will-change measured no benefit here (959 vs 960 frames over 8s, worse p95)
   // and hundreds of permanently promoted cards is a compositor-memory leak, so

@@ -83,7 +83,9 @@ export function validateLiveSettings(value) {
   if (value.glossaryText !== undefined && typeof value.glossaryText !== "string") {
     throw new Error("용어집 텍스트가 올바르지 않습니다.");
   }
-  const glossaryText = String(value.glossaryText ?? "").trim().slice(0, 16_000);
+  // 40k, not 16k: the shipped presets run to 27.5k, and slicing one mid-file
+  // drops its trailing sections (proper nouns, place names) without any signal.
+  const glossaryText = String(value.glossaryText ?? "").trim().slice(0, 40_000);
   // Tone + domain mirror the desktop subtitle settings so the second-pass
   // polish behaves identically for web viewers.
   const translationTone = value.translationTone ?? "natural";
@@ -106,7 +108,6 @@ export function readGatewayEnvironment(environment = process.env) {
     "LIVE_VIEWER_TOKEN_SECRET",
     "LIVE_EXTERNAL_ENV",
     "LIVE_ALLOWED_GCP_PROJECT",
-    "LIVE_ALLOWED_SUPABASE_REF",
   ];
   for (const name of required) {
     if (typeof environment[name] !== "string" || !environment[name].trim()) {
@@ -135,15 +136,28 @@ export function readGatewayEnvironment(environment = process.env) {
   } catch {
     throw new Error("Supabase URL이 올바르지 않습니다.");
   }
-  const allowedSupabaseRef = environment.LIVE_ALLOWED_SUPABASE_REF.trim();
-  if (supabaseUrl.protocol !== "https:"
-    || supabaseUrl.hostname !== `${allowedSupabaseRef}.supabase.co`
-    || supabaseUrl.username
-    || supabaseUrl.password
-    || supabaseUrl.port
-    || supabaseUrl.search
-    || supabaseUrl.hash
-    || (supabaseUrl.pathname !== "/" && supabaseUrl.pathname !== "")) {
+  const hasRootPath = supabaseUrl.pathname === "/" || supabaseUrl.pathname === "";
+  const isExactLocalSupabase = supabaseUrl.protocol === "http:"
+    && (supabaseUrl.hostname === "127.0.0.1" || supabaseUrl.hostname === "localhost")
+    && supabaseUrl.port === "54321"
+    && !supabaseUrl.username
+    && !supabaseUrl.password
+    && hasRootPath
+    && !supabaseUrl.search
+    && !supabaseUrl.hash;
+  const canUseLocalSupabase = environment.NODE_ENV !== "production"
+    && String(environment.LIVE_ALLOW_LOCAL_SUPABASE ?? "").trim() === "true";
+  const allowedSupabaseRef = String(environment.LIVE_ALLOWED_SUPABASE_REF ?? "").trim();
+  const isAllowedHostedSupabase = /^[a-z0-9-]+$/u.test(allowedSupabaseRef)
+    && supabaseUrl.protocol === "https:"
+    && supabaseUrl.hostname === `${allowedSupabaseRef}.supabase.co`
+    && !supabaseUrl.username
+    && !supabaseUrl.password
+    && !supabaseUrl.port
+    && !supabaseUrl.search
+    && !supabaseUrl.hash
+    && hasRootPath;
+  if (!(isExactLocalSupabase && canUseLocalSupabase) && !isAllowedHostedSupabase) {
     throw new Error("허용된 개발 Supabase 프로젝트와 일치하지 않습니다.");
   }
   const sttLanguageCodes = String(environment.STT_LANGUAGE_CODES ?? "ko-KR,en-US,ja-JP").split(",").map((value) => value.trim()).filter(Boolean);
@@ -154,6 +168,7 @@ export function readGatewayEnvironment(environment = process.env) {
   }
   return {
     port: Number(environment.PORT ?? 8080),
+    host: isExactLocalSupabase && canUseLocalSupabase ? "127.0.0.1" : "0.0.0.0",
     geminiApiKey: environment.GEMINI_API_KEY,
     geminiLiveModel: environment.GEMINI_LIVE_MODEL,
     geminiTextModel: String(environment.GEMINI_TEXT_MODEL ?? "gemini-3.5-flash").trim() || "gemini-3.5-flash",

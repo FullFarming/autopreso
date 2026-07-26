@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import test from "node:test";
 
 import {
@@ -265,4 +266,116 @@ test("an AudioContext resume rejection is not misreported as microphone permissi
   } finally {
     for (const restoreGlobal of restore.reverse()) restoreGlobal();
   }
+});
+
+test("active speaking stop settles after releasing tracks even when AudioContext close never settles", async () => {
+  const track = createTrack();
+  let closeCount = 0;
+  class FakeContext {
+    state = "running";
+    sampleRate = 16_000;
+    destination = {};
+    audioWorklet = { async addModule() { throw new Error("use processor"); } };
+    resume() { return Promise.resolve(); }
+    createMediaStreamSource() { return { connect() {}, disconnect() {} }; }
+    createScriptProcessor() { return { onaudioprocess: null, connect() {}, disconnect() {} }; }
+    close() {
+      closeCount += 1;
+      return new Promise<void>(() => {});
+    }
+  }
+  const restore = [
+    replaceGlobal("AudioContext", FakeContext),
+    replaceGlobal("navigator", { mediaDevices: { async getUserMedia() { return { getTracks: () => [track] }; } } }),
+  ];
+  try {
+    const prepared = await prepareSpeakCapture();
+    const session = await prepared.start(new FakeSocket() as unknown as WebSocket);
+    const result = await Promise.race([
+      session.stop().then(() => "stopped"),
+      new Promise<string>((resolve) => setTimeout(() => resolve("timed-out"), 50)),
+    ]);
+    assert.equal(result, "stopped");
+    assert.equal(track.stopCount, 1);
+    assert.equal(closeCount, 1);
+    await session.stop();
+    assert.equal(track.stopCount, 1);
+    assert.equal(closeCount, 1);
+  } finally {
+    for (const restoreGlobal of restore.reverse()) restoreGlobal();
+  }
+});
+
+test("AudioContext close rejection is observable but does not reject or delay stop", async () => {
+  const track = createTrack();
+  const warnings: string[] = [];
+  const originalWarn = console.warn;
+  class FakeContext {
+    state = "running";
+    resume() { return Promise.resolve(); }
+    close() { return Promise.reject(new Error("close failed")); }
+  }
+  const restore = [
+    replaceGlobal("AudioContext", FakeContext),
+    replaceGlobal("navigator", { mediaDevices: { async getUserMedia() { return { getTracks: () => [track] }; } } }),
+  ];
+  console.warn = (message?: unknown) => { warnings.push(String(message)); };
+  try {
+    const prepared = await prepareSpeakCapture();
+    await prepared.stop();
+    await Promise.resolve();
+    assert.equal(track.stopCount, 1);
+    assert.deepEqual(warnings, ["[live-speak] AudioContext close failed"]);
+  } finally {
+    console.warn = originalWarn;
+    for (const restoreGlobal of restore.reverse()) restoreGlobal();
+  }
+});
+
+test("rapid stop during worklet preparation cannot resurrect capture resources", async () => {
+  const track = createTrack();
+  let releaseWorklet: (() => void) | undefined;
+  let didCreateSource = false;
+  let closeCount = 0;
+  class FakeContext {
+    state = "running";
+    sampleRate = 16_000;
+    destination = {};
+    audioWorklet = { addModule: () => new Promise<void>((resolve) => { releaseWorklet = resolve; }) };
+    resume() { return Promise.resolve(); }
+    close() { closeCount += 1; return Promise.resolve(); }
+    createMediaStreamSource() { didCreateSource = true; return { connect() {}, disconnect() {} }; }
+    createScriptProcessor() { return { onaudioprocess: null, connect() {}, disconnect() {} }; }
+  }
+  const restore = [
+    replaceGlobal("AudioContext", FakeContext),
+    replaceGlobal("navigator", { mediaDevices: { async getUserMedia() { return { getTracks: () => [track] }; } } }),
+  ];
+  try {
+    const prepared = await prepareSpeakCapture();
+    const starting = prepared.start(new FakeSocket() as unknown as WebSocket);
+    assert.ok(releaseWorklet);
+    await prepared.stop();
+    releaseWorklet();
+    await assert.rejects(
+      starting,
+      (error: unknown) => error instanceof SpeakCaptureError && error.code === "AUDIO_INIT_FAILED",
+    );
+    assert.equal(didCreateSource, false);
+    assert.equal(track.stopCount, 1);
+    assert.equal(closeCount, 1);
+  } finally {
+    for (const restoreGlobal of restore.reverse()) restoreGlobal();
+  }
+});
+
+test("viewer releases UI and gateway floor before starting browser audio cleanup", () => {
+  const source = readFileSync(new URL("./LiveViewer.tsx", import.meta.url), "utf8");
+  const start = source.indexOf("const endSpeaking = useCallback");
+  const end = source.indexOf("speakSocketMessageRef.current", start);
+  assert.ok(start >= 0 && end > start);
+  const body = source.slice(start, end);
+  assert.ok(body.indexOf('setSpeakState("idle")') < body.indexOf('type: "speak-end"'));
+  assert.ok(body.indexOf('type: "speak-end"') < body.indexOf("stopSpeakCapture();"));
+  assert.equal(body.includes("await stopSpeakCapture()"), false);
 });

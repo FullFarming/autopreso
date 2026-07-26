@@ -20,6 +20,13 @@ function request(headers = {}, remoteAddress = "203.0.113.10") {
   return { headers, socket: { remoteAddress } };
 }
 
+const CLOUD_RUN_ENVIRONMENT = Object.freeze({
+  K_SERVICE: "realtime-noel-media-gateway",
+  K_REVISION: "realtime-noel-media-gateway-00023-8bk",
+  K_CONFIGURATION: "realtime-noel-media-gateway",
+  LIVE_GATEWAY_TRUST_GOOGLE_XFF_SUFFIX: "true",
+});
+
 test("production gateway policy fails closed on missing origins and metrics secret", () => {
   assert.throws(() => readGatewaySecurityPolicy({ NODE_ENV: "production" }), /ALLOWED_ORIGINS/u);
   assert.throws(() => readGatewaySecurityPolicy({
@@ -76,6 +83,52 @@ test("metrics authentication is exact and client bucket keys never contain the r
   const key = getOpaqueClientKey(request({ "x-forwarded-for": "198.51.100.7" }), "gateway-secret");
   assert.match(key, /^[0-9a-f]{64}$/u);
   assert.equal(key.includes("198.51.100.7"), false);
+});
+
+test("connection bucket ignores attacker-controlled XFF prefixes and trusts only the Google proxy suffix", () => {
+  const first = getOpaqueClientKey(request({
+    "x-forwarded-for": "192.0.2.10, 198.51.100.7, 203.0.113.20",
+  }, "10.0.0.4"), "gateway-secret", CLOUD_RUN_ENVIRONMENT);
+  const spoofedPrefix = getOpaqueClientKey(request({
+    "x-forwarded-for": "192.0.2.99, 198.51.100.7, 203.0.113.20",
+  }, "10.0.0.4"), "gateway-secret", CLOUD_RUN_ENVIRONMENT);
+  const differentClient = getOpaqueClientKey(request({
+    "x-forwarded-for": "192.0.2.10, 198.51.100.8, 203.0.113.20",
+  }, "10.0.0.4"), "gateway-secret", CLOUD_RUN_ENVIRONMENT);
+
+  assert.equal(first, spoofedPrefix, "untrusted prefixes must not create fresh limiter buckets");
+  assert.notEqual(first, differentClient, "the proxy-observed client IP must still separate callers");
+});
+
+test("connection bucket falls back to the peer when the trusted XFF suffix is incomplete or malformed", () => {
+  const peerOnly = getOpaqueClientKey(request({}, "10.0.0.4"), "gateway-secret");
+  const singleValue = getOpaqueClientKey(
+    request({ "x-forwarded-for": "198.51.100.7" }, "10.0.0.4"),
+    "gateway-secret",
+    CLOUD_RUN_ENVIRONMENT,
+  );
+  const malformedSuffix = getOpaqueClientKey(request({
+    "x-forwarded-for": "198.51.100.7, not-an-ip",
+  }, "10.0.0.4"), "gateway-secret", CLOUD_RUN_ENVIRONMENT);
+
+  assert.equal(singleValue, peerOnly);
+  assert.equal(malformedSuffix, peerOnly);
+});
+
+test("connection bucket ignores forwarded headers unless the Google proxy contract is explicit", () => {
+  const peerOnly = getOpaqueClientKey(request({}, "198.51.100.40"), "gateway-secret", {});
+  const forwarded = request({
+    "x-forwarded-for": "192.0.2.10, 198.51.100.7, 203.0.113.20",
+  }, "198.51.100.40");
+  const outsideCloudRun = getOpaqueClientKey(forwarded, "gateway-secret", {});
+  const cloudRunWithoutExplicitProxy = getOpaqueClientKey(forwarded, "gateway-secret", {
+    K_SERVICE: "gateway",
+    K_REVISION: "gateway-1",
+    K_CONFIGURATION: "gateway",
+  });
+
+  assert.equal(outsideCloudRun, peerOnly);
+  assert.equal(cloudRunWithoutExplicitProxy, peerOnly);
 });
 
 test("connection limiter enforces total, per-client, and attempt-token limits with idempotent release", () => {

@@ -28,6 +28,55 @@ export interface LiveSessionStore {
 
 const ACTIVE_SESSION_STATUSES: ReadonlyArray<LiveSession["status"]> = ["preparing", "live", "paused"];
 
+/** Keyset page size for complete snapshot history reconstruction. */
+const SNAPSHOT_HISTORY_LIMIT = 200;
+
+interface UtteranceRow {
+  seq: number;
+  speaker_label: string | null;
+  speaker_name: string | null;
+  text: string;
+  source_text: string | null;
+  source_language: string | null;
+  origin: string | null;
+  utterance_key: string | null;
+  source_ended_at: string;
+  emitted_at: string;
+}
+
+/** Mirrors the gateway's row -> CaptionEvent mapping (SupabaseLivePublisher
+ *  .fetchUtterancesAfter). The viewer contract validates EVERY
+ *  SpeakerAssignment field and silently drops captions whose speaker shape is
+ *  partial, so replayed history has to carry the complete shape. */
+function captionFromUtterance(sessionId: string, language: string, row: UtteranceRow): CaptionEvent {
+  const caption: CaptionEvent = {
+    type: "caption",
+    seq: Number(row.seq),
+    sessionId,
+    language,
+    speaker: row.speaker_label || row.speaker_name
+      ? {
+        speakerId: String(row.speaker_label ?? row.speaker_name),
+        label: row.speaker_name ?? row.speaker_label ?? "",
+        colorToken: "speaker-teal",
+        voiceName: null,
+        voiceStatus: "disabled",
+        lastSeenAt: row.emitted_at,
+      }
+      : null,
+    text: row.text,
+    isFinal: true,
+    sourceText: row.source_text ?? null,
+    sourceLanguage: row.source_language ?? null,
+    translationStatus: row.source_text ? "translated" : "verbatim",
+    sourceEndedAt: row.source_ended_at,
+    emittedAt: row.emitted_at,
+  };
+  if (row.origin === "source") caption.origin = "source";
+  if (row.utterance_key) caption.utteranceKey = row.utterance_key;
+  return caption;
+}
+
 export class MemoryLiveSessionStore implements LiveSessionStore {
   private readonly sessions = new Map<string, LiveSession>();
   private readonly snapshots = new Map<string, { lastSeq: number; captions: CaptionEvent[]; speakers: SpeakerAssignment[] }>();
@@ -322,19 +371,47 @@ export class SupabaseLiveSessionStore implements LiveSessionStore {
   }
 
   async getSnapshot(sessionId: string, language: string): Promise<LiveSnapshot | null> {
-    const [session, rows, speakerRows] = await Promise.all([
+    const [session, rows, speakerRows, utteranceRows] = await Promise.all([
       this.get(sessionId),
       this.request<Array<{ last_seq: number; captions: CaptionEvent[]; speaker_legend: SpeakerAssignment[] }>>(`/rest/v1/live_snapshots?session_id=eq.${encodeURIComponent(sessionId)}&language=eq.${encodeURIComponent(language)}&limit=1`, { method: "GET" }),
       this.request<SpeakerAssignment[]>(`/rest/v1/session_speakers?session_id=eq.${encodeURIComponent(sessionId)}&select=speakerId:speaker_id,label,colorToken:color_token,voiceName:voice_name,voiceStatus:voice_status,lastSeenAt:last_seen_at`, { method: "GET" }),
+      this.fetchUtteranceHistoryWindow(sessionId, language),
     ]);
     if (!session) return null;
+    // History comes from live_utterances, NOT from live_snapshots.captions:
+    // that column stores a single-element array (the latest caption, replaced
+    // on every conflict), so serving it made a viewer that joined, reconnected,
+    // or switched language lose everything it had already shown. Falling back
+    // to the snapshot row keeps sessions recorded before this change readable.
+    const history = [...utteranceRows]
+      .sort((left, right) => Number(left.seq) - Number(right.seq))
+      .map((row) => captionFromUtterance(sessionId, language, row));
+    const snapshotCaptions = rows[0]?.captions ?? [];
+    const captions = history.length > 0 ? history : snapshotCaptions;
     return {
       session,
       language,
-      lastSeq: rows[0]?.last_seq ?? 0,
-      captions: rows[0]?.captions ?? [],
+      // lastSeq must cover whatever we actually served, or the gateway's
+      // gap-replay would resend captions the viewer already has.
+      lastSeq: history.length > 0
+        ? Math.max(...history.map((caption) => caption.seq), 0)
+        : Math.max(rows[0]?.last_seq ?? 0, ...snapshotCaptions.map((caption) => caption.seq), 0),
+      captions,
       speakers: rows[0]?.speaker_legend ?? speakerRows,
     };
+  }
+
+  private async fetchUtteranceHistoryWindow(sessionId: string, language: string): Promise<UtteranceRow[]> {
+    const query = new URLSearchParams({
+      session_id: `eq.${sessionId}`,
+      language: `eq.${language}`,
+      select: "seq,speaker_label,speaker_name,text,source_text,source_language,origin,utterance_key,source_ended_at,emitted_at",
+      // 2026-07-26 fix: Serve the oldest bounded window, then let the gateway
+      // keyset-replay every later page. One giant snapshot exceeded 5 seconds.
+      order: "seq.asc",
+      limit: String(SNAPSHOT_HISTORY_LIMIT),
+    });
+    return this.request<UtteranceRow[]>(`/rest/v1/live_utterances?${query}`, { method: "GET" });
   }
 
   private async request<T>(path: string, init: RequestInit): Promise<T> {

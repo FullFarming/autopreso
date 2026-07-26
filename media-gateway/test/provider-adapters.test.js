@@ -926,17 +926,241 @@ test("Gemini Live Translate accumulates transcription deltas like the desktop pi
   // Next utterance must start from a clean slate.
   messageHandler({ serverContent: { outputTranscription: { text: "Next topic" }, turnComplete: true } });
   await new Promise((resolve) => setImmediate(resolve));
-  assert.deepEqual(captions, [
+  assert.deepEqual(captions.map(({ text, isFinal }) => ({ text, isFinal })), [
     { text: "Hello", isFinal: false },
     { text: "Hello every", isFinal: false },
     { text: "Hello everyone", isFinal: false },
     { text: "Hello everyone", isFinal: true },
     { text: "Next topic", isFinal: true },
   ]);
-  assert.deepEqual(inputCaptions, [
+  assert.deepEqual(inputCaptions.map(({ text, isFinal, languageCode }) => ({ text, isFinal, languageCode })), [
     { text: "안녕하세요", isFinal: false, languageCode: "ko-KR" },
     { text: "안녕하세요", isFinal: true, languageCode: "ko-KR" },
   ]);
+  await session.close();
+});
+
+test("Gemini Live Translate correlates each output with same-turn source and capture identity", async () => {
+  const captions = [];
+  let messageHandler;
+  const adapter = new GeminiLiveTranslateAdapter({
+    model: "gemini-3.5-live-translate-preview",
+    client: { live: { async connect(options) {
+      messageHandler = options.callbacks.onmessage;
+      return { sendRealtimeInput() {}, close() {} };
+    } } },
+  });
+  const session = await adapter.open({
+    language: "en", correlateInputCaption: true,
+    onCaption: (caption) => captions.push(caption), onAudio: async () => {},
+  });
+  await session.sendAudio(Buffer.alloc(3_200), {
+    capturedAt: 100, floorSpeaker: { participantId: "A", displayName: "발표자A" },
+  });
+  await session.sendAudio(Buffer.alloc(3_200), {
+    capturedAt: 200, floorSpeaker: { participantId: "B", displayName: "발표자B" },
+  });
+  messageHandler({ serverContent: {
+    inputTranscription: { text: "첫 원문", languageCode: "ko-KR" },
+    outputTranscription: { text: "First translation" }, turnComplete: true,
+  } });
+  messageHandler({ serverContent: {
+    inputTranscription: { text: "둘째 원문", languageCode: "ko-KR" },
+    outputTranscription: { text: "Second translation" }, turnComplete: true,
+  } });
+  for (let tick = 0; tick < 4; tick += 1) await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(captions.map((caption) => [
+    caption.sourceText, caption.sourceLanguage, caption.floorSpeaker?.participantId, caption.capturedAt,
+  ]), [["첫 원문", "ko-KR", "A", 100], ["둘째 원문", "ko-KR", "B", 200]]);
+  assert.notEqual(captions[0].utteranceKey, captions[1].utteranceKey);
+  await session.close();
+});
+
+test("Gemini capture segments do not let retained host audio steal a late participant final", async () => {
+  const captions = [];
+  let messageHandler;
+  const adapter = new GeminiLiveTranslateAdapter({
+    model: "gemini-3.5-live-translate-preview",
+    client: { live: { async connect(options) {
+      messageHandler = options.callbacks.onmessage;
+      return { sendRealtimeInput() {}, close() {} };
+    } } },
+  });
+  const session = await adapter.open({
+    language: "en", correlateInputCaption: true,
+    onCaption: (caption) => captions.push(caption), onAudio: async () => {},
+  });
+
+  await session.sendAudio(Buffer.alloc(3_200), { capturedAt: 100, floorSpeaker: null });
+  messageHandler({ serverContent: {
+    inputTranscription: { text: "호스트 발언", languageCode: "ko-KR" },
+    outputTranscription: { text: "Host speech" }, turnComplete: true,
+  } });
+  for (let tick = 0; tick < 4; tick += 1) await new Promise((resolve) => setImmediate(resolve));
+
+  const participant = { participantId: "P-9", displayName: "Participant Nine" };
+  await session.sendAudio(Buffer.alloc(3_200), { capturedAt: 200, floorSpeaker: participant });
+  // Host reclaims before Gemini returns the participant's final. The retained
+  // first host segment must not win merely because inputContexts is empty.
+  await session.sendAudio(Buffer.alloc(3_200), { capturedAt: 300, floorSpeaker: null });
+  messageHandler({ serverContent: {
+    inputTranscription: { text: "참가자 늦은 발언", languageCode: "ko-KR" },
+    outputTranscription: { text: "Late participant speech" }, turnComplete: true,
+  } });
+  messageHandler({ serverContent: {
+    inputTranscription: { text: "호스트 다음 발언", languageCode: "ko-KR" },
+    outputTranscription: { text: "Next host speech" }, turnComplete: true,
+  } });
+  for (let tick = 0; tick < 6; tick += 1) await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(captions[1].floorSpeaker?.participantId, "P-9");
+  assert.equal(captions[1].sourceText, "참가자 늦은 발언");
+  assert.equal(captions[2].floorSpeaker, null);
+  assert.equal(captions[2].sourceText, "호스트 다음 발언");
+  await session.close();
+});
+
+test("Gemini Live Translate namespaces utterance identities by canonical target lane", async () => {
+  const connections = new Map();
+  const inputCaptions = new Map();
+  const outputCaptions = new Map();
+  const adapter = new GeminiLiveTranslateAdapter({
+    model: "gemini-3.5-live-translate-preview",
+    client: { live: { async connect(options) {
+      connections.set(options.config.translationConfig.targetLanguageCode, options.callbacks.onmessage);
+      return { sendRealtimeInput() {}, close() {} };
+    } } },
+  });
+  const sessions = [];
+  for (const language of ["ko", "en"]) {
+    sessions.push(await adapter.open({
+      language,
+      correlateInputCaption: true,
+      onInputCaption: (caption) => inputCaptions.set(language, caption),
+      onCaption: (caption) => outputCaptions.set(language, caption),
+      onAudio: async () => {},
+    }));
+    connections.get(language)({ serverContent: {
+      inputTranscription: { text: `${language} source`, languageCode: "en-US" },
+      outputTranscription: { text: `${language} output` },
+      turnComplete: true,
+    } });
+  }
+  for (let tick = 0; tick < 4; tick += 1) await new Promise((resolve) => setImmediate(resolve));
+
+  for (const language of ["ko", "en"]) {
+    assert.equal(inputCaptions.get(language).utteranceKey, outputCaptions.get(language).utteranceKey);
+    assert.match(outputCaptions.get(language).utteranceKey, new RegExp(`^gemini:${language}:\\d+:\\d+$`, "u"));
+  }
+  assert.notEqual(outputCaptions.get("ko").utteranceKey, outputCaptions.get("en").utteranceKey);
+  await Promise.all(sessions.map((session) => session.close()));
+});
+
+test("Gemini Live Translate waits briefly when output final arrives before its input final", async () => {
+  const captions = [];
+  let messageHandler;
+  const adapter = new GeminiLiveTranslateAdapter({
+    model: "gemini-3.5-live-translate-preview",
+    client: { live: { async connect(options) {
+      messageHandler = options.callbacks.onmessage;
+      return { sendRealtimeInput() {}, close() {} };
+    } } },
+  });
+  const session = await adapter.open({
+    language: "en", correlateInputCaption: true,
+    onCaption: (caption) => captions.push(caption), onAudio: async () => {},
+  });
+  messageHandler({ serverContent: { outputTranscription: { text: "Output first" }, turnComplete: true } });
+  messageHandler({ serverContent: { inputTranscription: { text: "입력 원문", languageCode: "ko-KR" }, turnComplete: true } });
+  for (let tick = 0; tick < 5; tick += 1) await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(captions.length, 1);
+  assert.equal(captions[0].sourceText, "입력 원문");
+  assert.equal(captions[0].sourceLanguage, "ko-KR");
+  assert.equal(typeof captions[0].utteranceKey, "string");
+  await session.close();
+});
+
+test("Gemini Live Translate pairs delayed outputs with queued input turns in order", async () => {
+  const captions = [];
+  let messageHandler;
+  let clock = 1_000;
+  const adapter = new GeminiLiveTranslateAdapter({
+    model: "gemini-3.5-live-translate-preview",
+    now: () => clock,
+    client: { live: { async connect(options) {
+      messageHandler = options.callbacks.onmessage;
+      return { sendRealtimeInput() {}, close() {} };
+    } } },
+  });
+  const session = await adapter.open({
+    language: "en", correlateInputCaption: true,
+    onCaption: (caption) => captions.push(caption), onAudio: async () => {},
+  });
+  await session.sendAudio(Buffer.alloc(3_200), { capturedAt: 100, floorSpeaker: { participantId: "A", displayName: "A" } });
+  messageHandler({ serverContent: { inputTranscription: { text: "A 원문。", languageCode: "ko-KR" } } });
+  await session.sendAudio(Buffer.alloc(3_200), { capturedAt: 200, floorSpeaker: { participantId: "B", displayName: "B" } });
+  messageHandler({ serverContent: { inputTranscription: { text: "B 원문。", languageCode: "ko-KR" } } });
+  messageHandler({ serverContent: { outputTranscription: { text: "A output。" } } });
+  clock += 1;
+  messageHandler({ serverContent: { outputTranscription: { text: "B output。" }, turnComplete: true } });
+  for (let tick = 0; tick < 8; tick += 1) await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(captions.map((caption) => [caption.text, caption.sourceText, caption.floorSpeaker?.participantId]), [
+    ["A output。", "A 원문。", "A"],
+    ["B output。", "B 원문。", "B"],
+  ]);
+  assert.notEqual(captions[0].utteranceKey, captions[1].utteranceKey);
+  await session.close();
+});
+
+test("Gemini Live Translate does not carry a missing turn output into the next turn", async () => {
+  const captions = [];
+  let messageHandler;
+  const adapter = new GeminiLiveTranslateAdapter({
+    model: "gemini-3.5-live-translate-preview",
+    client: { live: { async connect(options) {
+      messageHandler = options.callbacks.onmessage;
+      return { sendRealtimeInput() {}, close() {} };
+    } } },
+  });
+  const session = await adapter.open({
+    language: "en", correlateInputCaption: true,
+    onCaption: (caption) => captions.push(caption), onAudio: async () => {},
+  });
+  messageHandler({ serverContent: { inputTranscription: { text: "A 원문", languageCode: "ko-KR" }, turnComplete: true } });
+  messageHandler({ serverContent: {
+    inputTranscription: { text: "B 원문", languageCode: "ko-KR" },
+    outputTranscription: { text: "B output" }, turnComplete: true,
+  } });
+  for (let tick = 0; tick < 6; tick += 1) await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(captions.length, 1);
+  assert.equal(captions[0].sourceText, "B 원문");
+  await session.close();
+});
+
+test("Gemini Live Translate discards expired input context instead of misattributing output", async () => {
+  const captions = [];
+  let messageHandler;
+  let clock = 1_000;
+  const adapter = new GeminiLiveTranslateAdapter({
+    model: "gemini-3.5-live-translate-preview",
+    now: () => clock,
+    client: { live: { async connect(options) {
+      messageHandler = options.callbacks.onmessage;
+      return { sendRealtimeInput() {}, close() {} };
+    } } },
+  });
+  const session = await adapter.open({
+    language: "en", correlateInputCaption: true,
+    onCaption: (caption) => captions.push(caption), onAudio: async () => {},
+  });
+  messageHandler({ serverContent: { inputTranscription: { text: "만료 원문。", languageCode: "ko-KR" } } });
+  await new Promise((resolve) => setImmediate(resolve));
+  clock += 1_500;
+  messageHandler({ serverContent: { inputTranscription: { text: "현재 원문。", languageCode: "ko-KR" } } });
+  messageHandler({ serverContent: { outputTranscription: { text: "Current output。" }, turnComplete: true } });
+  for (let tick = 0; tick < 6; tick += 1) await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(captions.length, 1);
+  assert.equal(captions[0].sourceText, "현재 원문。");
   await session.close();
 });
 

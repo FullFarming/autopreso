@@ -649,7 +649,7 @@ test("a participant's mirrored caption is recorded on the host with attribution"
     let record = null;
     for (let attempt = 0; attempt < 40 && !record; attempt += 1) {
       const body = await (await fetch(new URL("/api/subtitles/sessions/participant-record", url))).json();
-      if (body.ok && body.data?.lines?.length >= 2) record = body.data;
+      if (body.ok && body.data?.lines?.length >= 1) record = body.data;
       else await new Promise((resolve) => setTimeout(resolve, 100));
     }
     assert.ok(record, "the participant's speech never reached the host session record");
@@ -661,6 +661,82 @@ test("a participant's mirrored caption is recorded on the host with attribution"
     const original = record.lines.find((line) => line.sourceText.includes("객실 점유율"));
     assert.ok(original, "the untranslated 원문 is missing from the record");
     assert.equal(original.speaker, "김게스트 · 영업");
+  } finally {
+    ws?.close();
+    await new Promise((resolve) => httpServer.close(resolve));
+  }
+});
+
+test("a gateway-canonical Live Call records captions without opening the local translation producer", async () => {
+  const transcriptsDir = await makeStorageDir();
+  let localSocketCount = 0;
+  const { httpServer, url } = await startServer({
+    host: "127.0.0.1",
+    port: 0,
+    env: {},
+    transcriptsDir,
+    createTranscription: () => ({ ready: async () => {}, sendAudio: () => {}, stop: () => {}, close: () => {} }),
+    createSubtitleWebSocket: () => { localSocketCount += 1; return new FakeRealtimeSocket(); },
+  });
+  let ws;
+  try {
+    ws = new WebSocket(url.replace("http:", "ws:") + "/ws");
+    await new Promise((resolve, reject) => { ws.once("open", resolve); ws.once("error", reject); });
+    ws.send(JSON.stringify({
+      type: "subtitle:start",
+      captionProducer: "gateway",
+      sessionId: "live-session-1",
+      settings: { inputMode: "mic", translationProvider: "gemini" },
+      meeting: { kind: "live-call", liveSessionId: "session-1", title: "Canonical call" },
+    }));
+    ws.send(JSON.stringify({
+      type: "subtitle:live-call-caption",
+      recordOnly: true,
+      partial: false,
+      targetLanguage: "ko",
+      utteranceKey: "session-1:input:1",
+      translatedText: "안녕하세요",
+      speaker: "Host",
+    }));
+    ws.send(JSON.stringify({
+      type: "subtitle:live-call-caption",
+      partial: false,
+      targetLanguage: "en",
+      utteranceKey: "session-1:input:1",
+      sourceLanguage: "ko",
+      sourceText: "안녕하세요",
+      translatedText: "Hello.",
+      speaker: "Host",
+    }));
+    await waitForWebSocketMessage(ws, (message) => message.type === "subtitle:committed");
+    ws.send(JSON.stringify({
+      type: "subtitle:live-call-caption",
+      recordOnly: true,
+      partial: false,
+      targetLanguage: "ko",
+      utteranceKey: "session-1:input:2",
+      translatedText: "안녕하세요",
+      speaker: "Host",
+    }));
+    ws.send(JSON.stringify({
+      type: "subtitle:live-call-caption",
+      partial: false,
+      targetLanguage: "en",
+      utteranceKey: "session-1:input:2",
+      sourceLanguage: "ko",
+      sourceText: "안녕하세요",
+      translatedText: "Hello.",
+      speaker: "Host",
+    }));
+    await waitForWebSocketMessage(ws, (message) => message.type === "subtitle:committed");
+    ws.send(JSON.stringify({ type: "subtitle:stop", sessionId: "live-session-1" }));
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    const body = await (await fetch(new URL("/api/subtitles/sessions/live-session-1", url))).json();
+    assert.equal(body.ok, true);
+    assert.equal(body.data.lines[0].sourceText, "안녕하세요");
+    assert.equal(body.data.lines[0].translatedText, "Hello.");
+    assert.equal(body.data.lines.length, 2, "identical text in two utterances must remain two recorded lines");
+    assert.equal(localSocketCount, 0, "the local Gemini/OpenAI producer must remain cold");
   } finally {
     ws?.close();
     await new Promise((resolve) => httpServer.close(resolve));

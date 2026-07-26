@@ -606,27 +606,9 @@ input:focus-visible {
    most recently completed sentences render at full strength. */
 .live-turn-card p .live-turn-text { opacity: .42; transition: opacity .5s ease; }
 .live-turn-card p .live-turn-text.is-recent { opacity: 1; }
-/* Foldable speaker paragraphs. A Live Call runs for hours, so one speaker's
-   turn can reach dozens of sentences; folding it keeps the who-spoke-when
-   skeleton readable. The header is the control and stays visible when folded. */
-.live-turn-toggle { display: flex; align-items: center; gap: 8px; width: 100%; margin: -4px -4px 0; padding: 4px; border: 0; border-radius: 8px; background: none; color: inherit; font: inherit; text-align: left; cursor: pointer; }
-.live-turn-toggle:hover { background: rgba(255,255,255,.04); }
-.live-turn-toggle:focus-visible { outline: 2px solid var(--brand-blue); outline-offset: 1px; }
-.live-turn-toggle strong { font-weight: 600; }
-/* Sentence count sits right of the time and gives the fold a reason: it says
-   how much is hidden without a sentence of explanation. */
-.live-turn-count { margin-left: auto; color: rgba(255,255,255,.34); font-size: 10px; font-weight: 400; font-variant-numeric: tabular-nums; }
-.live-turn-chevron { flex: none; width: 7px; height: 7px; border-right: 1.5px solid rgba(255,255,255,.42); border-bottom: 1.5px solid rgba(255,255,255,.42); transform: rotate(45deg) translateY(-1px); transition: transform .17s cubic-bezier(.16,1,.3,1); }
-.live-turn-card.is-collapsed .live-turn-chevron { transform: rotate(-45deg) translateY(1px); }
-/* Clamp instead of unmounting so browser find and copy still reach the text. */
-.live-turn-card.is-collapsed .live-turn-body { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 1; overflow: hidden; }
-.live-turn-card.is-collapsed .live-turn-body .live-turn-text { opacity: .42; }
-/* Reduced motion has to cover the paragraph entry animation too, not just the
-   fold chevron: the entry animation is the one a reader sees on every new
-   sentence for hours. */
+/* Reduced motion covers the paragraph entry and sentence contrast transition. */
 @media (prefers-reduced-motion: reduce) {
   .live-turn-card { animation: none; }
-  .live-turn-chevron { transition: none; }
   .live-turn-card p .live-turn-text { transition: none; }
 }
 .live-jump-latest { position: absolute; bottom: 118px; left: 50%; transform: translateX(-50%); z-index: 2; border: 1px solid rgba(255,255,255,.2); border-radius: 9999px; background: rgba(20,18,16,.92); color: var(--on-dark); padding: 8px 16px; font-size: 11px; font-weight: 600; backdrop-filter: blur(8px); }
@@ -733,12 +715,17 @@ input:focus-visible {
 .live-viewer-shell.is-compact .live-viewer-toolbar { position: sticky; top: 0; z-index: 4; display: flex; grid-row: 1; flex-wrap: nowrap; gap: 4px 6px; min-height: calc(44px + env(safe-area-inset-top)); margin: 0; border: none; border-radius: 0; background: var(--dark); box-shadow: none; padding: calc(4px + env(safe-area-inset-top)) 12px 4px; }
 .live-viewer-shell.is-compact .live-viewer-toolbar > strong { grid-column: 1 / 4; grid-row: 1; min-width: 0; margin: 0; overflow: hidden; align-self: center; color: #fff; font-size: 11px; letter-spacing: .12em; text-overflow: ellipsis; text-transform: uppercase; }
 .live-viewer-shell.is-compact .live-viewer-delivery-method { color: rgba(255,255,255,.45); }
-.live-viewer-shell.is-compact .live-viewer-toolbar button { min-height: 30px; border-color: rgba(255,255,255,.2); background: transparent; color: #fff; padding: 0 8px; font-size: 10px; white-space: nowrap; }
+.live-viewer-shell.is-compact .live-viewer-toolbar button { min-height: 44px; min-width: 44px; border-color: rgba(255,255,255,.2); background: transparent; color: #fff; padding: 0 8px; font-size: 10px; white-space: nowrap; }
 .live-viewer-shell.is-compact .live-viewer-toolbar button.is-selected { background: rgba(255,255,255,.16); }
 .live-viewer-shell.is-compact .live-viewer-toolbar .live-leave-button { position: absolute; top: calc(2px + env(safe-area-inset-top)); right: 8px; width: 44px; min-width: 44px; border-color: transparent; color: var(--brand-grey-25); padding: 0; }
 .live-viewer-shell.is-compact .live-language-switch { flex: none; border-color: rgba(255,255,255,.16); background: rgba(255,255,255,.07); padding: 2px; }
-.live-viewer-shell.is-compact .live-language-switch button { min-height: 26px; color: rgba(255,255,255,.55); padding: 0 8px; }
+.live-viewer-shell.is-compact .live-language-switch button { min-width: 44px; min-height: 44px; color: rgba(255,255,255,.55); padding: 0 8px; }
 .live-viewer-shell.is-compact .live-language-switch button.is-selected { background: #fff; color: #000; }
+.live-viewer-shell.is-compact .live-viewer-toolbar button:focus-visible,
+.live-viewer-shell.is-compact .live-language-switch button:focus-visible {
+  outline: 2px solid var(--nova-blue);
+  outline-offset: 2px;
+}
 .live-viewer-shell.is-compact .live-viewer-toolbar > button[aria-label^="Turn translated audio"],
 .live-viewer-shell.is-compact .live-viewer-toolbar > button[aria-label="Translated audio is on"],
 .live-viewer-session-context { grid-row: 2; padding: 8px 18px 7px; background: var(--dark); }
@@ -1118,6 +1105,10 @@ input:focus-visible {
    hover underlay INSET inside the row so it never touches the divider. */
 .live-turn-card {
   border-radius: var(--nova-r-row);
+  /* Keep every caption in the DOM and accessibility tree while allowing the
+     browser to skip paint/layout work for long off-screen meeting history. */
+  content-visibility: auto;
+  contain-intrinsic-size: auto 96px;
   line-height: var(--nova-lh-list);
   position: relative;
 }
@@ -1131,3 +1122,11 @@ input:focus-visible {
   transition: background var(--nova-dur-press-in) var(--nova-ease-out);
 }
 .live-turn-card:hover::after { background: var(--nova-overlay-100); }
+/* 2026-07-26 fix: The in-progress sentence stays inline at the paragraph tail. DESIGN.md §8.2
+   uses the system-blue dashed underline as the provisional signal: same size,
+   weight, and position, with no spinner or layout shift. */
+.live-turn-card p .live-turn-text.is-pending {
+  opacity: .82;
+  text-decoration: underline dashed var(--nova-blue) 1px;
+  text-underline-offset: .2em;
+}

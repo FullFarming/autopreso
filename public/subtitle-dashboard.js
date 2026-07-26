@@ -1509,6 +1509,7 @@ async function startSubtitles() {
       state.streamers.push(streamer);
     }
     state.running = true;
+    activeCaptionProducer = "local";
     stopButton.disabled = false;
     syncRuntimeOutputVisibility();
     setConnectionStatus(t("status.receivingCaptions"), "active");
@@ -1533,6 +1534,7 @@ async function stopSubtitles() {
     state.ws.send(JSON.stringify({ type: "subtitle:stop", sessionId }));
   }
   state.running = false;
+  activeCaptionProducer = "none";
   startButton.disabled = false;
   stopButton.disabled = true;
   syncRuntimeOutputVisibility();
@@ -2988,7 +2990,7 @@ async function startLiveCallMicCapture() {
   }
 }
 
-let hasAutoStartedCaptionsForLiveCall = false;
+let activeCaptionProducer = "none";
 
 // Identity for the transcript record. A caption session started while a Live Call
 // is live IS that meeting, so the record is anchored to the call's own start time
@@ -3021,18 +3023,18 @@ async function syncLiveCallAudioBridge() {
   try { liveState = await bridge.getLiveCallState(); } catch { return; }
   if (!liveState?.armed || !liveState.live) {
     if (liveBridgeCapture) stopLiveCallAudioBridge("live call ended");
-    hasAutoStartedCaptionsForLiveCall = false;
+    if (activeCaptionProducer !== "none" || state.sessionId) await stopSubtitles();
     return;
-  }
-  // Going live should put the host straight into caption mode: start the
-  // local subtitle engine once per call if it is not already running.
-  if (!hasAutoStartedCaptionsForLiveCall) {
-    hasAutoStartedCaptionsForLiveCall = true;
-    if (!state.running) document.getElementById("start-subtitles")?.click();
   }
   if (isLiveBridgeStarting) return;
   isLiveBridgeStarting = true;
   try {
+    if (activeCaptionProducer === "none") await startGatewayCaptionSession(liveState);
+    if (["reconnecting", "failed"].includes(liveState.bridge?.state) && activeCaptionProducer !== "local") {
+      await startLocalLiveCallFallback(liveState);
+    } else if (liveState.bridge?.state === "connected" && activeCaptionProducer === "local") {
+      await restoreGatewayCaptionProducer();
+    }
     const result = await bridge.ensureLiveCallBridge();
     if (!result?.ok) {
       console.warn(`[live-bridge] gateway bridge unavailable: ${result?.code ?? "unknown"}`);
@@ -3041,22 +3043,114 @@ async function syncLiveCallAudioBridge() {
     // Capture starts once and keeps feeding frames; main drops them until the
     // gateway pipeline reports started.
     if (!liveBridgeCapture) await startLiveCallMicCapture();
+  } catch (error) {
+    console.warn(`[live-bridge] producer transition failed: ${error?.message ?? error}`);
   } finally {
     isLiveBridgeStarting = false;
   }
 }
 
-if (window.realtimeNoelDesktop?.ensureLiveCallBridge) {
-  window.setInterval(() => { void syncLiveCallAudioBridge(); }, 3_000);
+async function startGatewayCaptionSession(liveState) {
+  if (state.running) await stopSubtitles();
+  await ensureWebSocketOpen();
+  state.settings = readSettingsFromForm();
+  state.sessionId = `live-${String(liveState.sessionId ?? crypto.randomUUID())}`;
+  translatedAudioGuard.reset();
+  state.ws.send(JSON.stringify({
+    type: "subtitle:start",
+    captionProducer: "gateway",
+    sessionId: state.sessionId,
+    settings: state.settings,
+    meeting: {
+      kind: "live-call",
+      liveSessionId: String(liveState.sessionId ?? ""),
+      title: String(liveState.title ?? ""),
+      startedAt: String(liveState.liveStartedAt ?? ""),
+    },
+  }));
+  activeCaptionProducer = "gateway";
+  state.running = true;
+  startButton.disabled = true;
+  stopButton.disabled = false;
+  syncRuntimeOutputVisibility();
+  setConnectionStatus(t("status.receivingCaptions"), "active");
 }
 
-// ── Live Call participant captions → local subtitle system ────────────────
-// The gateway mirrors every live caption to the desktop host socket and the
-// main process forwards it over the live-call:caption IPC channel. Speak
-// (participant) speech never passes through the local audio pipeline, so it
-// is relayed into the server's live-call caption ingest — the overlay,
-// preview, history, and session records then treat it exactly like a native
-// line. Host speech is skipped: the local engine already captions it.
+async function startLocalLiveCallFallback(liveState) {
+  let captures = [];
+  try {
+    captures = await captureSelectedAudio(state.settings);
+    state.streams = captures.map((capture) => capture.stream);
+    state.ws.send(JSON.stringify({
+      type: "subtitle:start",
+      sessionId: state.sessionId,
+      settings: state.settings,
+      meeting: {
+        kind: "live-call",
+        liveSessionId: String(liveState.sessionId ?? ""),
+        title: String(liveState.title ?? ""),
+        startedAt: String(liveState.liveStartedAt ?? ""),
+      },
+    }));
+    for (const capture of captures) {
+      const streamer = await createAudioStreamer(capture.stream, capture.source, capture.label, (audio) => {
+        if ((state.ws?.bufferedAmount ?? 0) > 1_000_000) return;
+        if (state.ws?.readyState !== WebSocket.OPEN || !state.sessionId) return;
+        state.ws.send(JSON.stringify({
+          type: "subtitle:audio",
+          sessionId: state.sessionId,
+          source: capture.source,
+          audio,
+        }));
+      });
+      state.streamers.push(streamer);
+    }
+    activeCaptionProducer = "local";
+    setConnectionStatus(t("status.reconnecting"), "error");
+    setPreviewStatus(t("status.reconnecting"), 3_000);
+  } catch (error) {
+    for (const capture of captures) capture.stream.getTracks().forEach((track) => track.stop());
+    await stopSubtitles();
+    throw error;
+  }
+}
+
+async function restoreGatewayCaptionProducer() {
+  if (state.ws?.readyState !== WebSocket.OPEN || !state.sessionId) return;
+  const requestId = crypto.randomUUID();
+  const isProducerStopped = await new Promise((resolve) => {
+    const timer = window.setTimeout(() => finish(false), 2_000);
+    function finish(didStop) {
+      window.clearTimeout(timer);
+      state.ws?.removeEventListener("message", onMessage);
+      resolve(didStop);
+    }
+    function onMessage(event) {
+      let message;
+      try { message = JSON.parse(event.data); } catch { return; }
+      if (message.type === "subtitle:producer-stopped" && message.requestId === requestId) finish(true);
+    }
+    state.ws.addEventListener("message", onMessage);
+    state.ws.send(JSON.stringify({ type: "subtitle:producer-stop", sessionId: state.sessionId, requestId }));
+  });
+  // 2026-07-26 fix: Gateway promotion is acknowledgement-gated. Keeping the
+  // local producer selected on an ambiguous stop prevents dual final captions.
+  if (!isProducerStopped) {
+    setConnectionStatus(t("status.reconnecting"), "error");
+    return;
+  }
+  stopLocalStreams();
+  activeCaptionProducer = "gateway";
+  setConnectionStatus(t("status.receivingCaptions"), "active");
+}
+
+if (window.realtimeNoelDesktop?.ensureLiveCallBridge) {
+  window.setInterval(() => { void syncLiveCallAudioBridge(); }, 1_000);
+}
+
+// ── Live Call canonical captions → local subtitle system ──────────────────
+// 2026-07-26 fix: Gateway events for both host and participant speech enter
+// one local ingest path so overlay, preview, history, and records stay equal.
 // ── UI language changes ───────────────────────────────────────────────────
 // subtitle-workspace.js repaints every static data-i18n node; the dynamic
 // panels this file renders have to be rebuilt from their current state.
@@ -3076,34 +3170,24 @@ subscribeToLanguage(() => {
 
 if (window.realtimeNoelDesktop?.onLiveCallCaption) {
   window.realtimeNoelDesktop.onLiveCallCaption((caption) => {
-    if (!caption || caption.speaker?.isParticipant !== true) return;
+    if (!caption || activeCaptionProducer !== "gateway") return;
     if (state.ws?.readyState !== WebSocket.OPEN) return;
     const text = String(caption.text ?? "").trim();
     if (!text) return;
-    // Screen captions follow the subtitle policy exactly: only the
-    // TRANSLATED direction renders (Korean input → English, English input →
-    // Korean). The untranslated source lane (origin:"source") never reaches
-    // the overlay — its FINALS are relayed record-only so the session record
-    // keeps the 원문 alongside the translation.
-    if (caption.origin === "source") {
-      if (caption.isFinal !== true) return;
-      state.ws.send(JSON.stringify({
-        type: "subtitle:live-call-caption",
-        recordOnly: true,
-        partial: false,
-        targetLanguage: String(caption.language ?? ""),
-        sourceText: "",
-        speaker: String(caption.speaker?.name ?? caption.speaker?.label ?? t("live.participant")),
-        translatedText: text,
-      }));
-      return;
-    }
+    const speakerName = String(caption.speaker?.name
+      ?? caption.speaker?.label
+      ?? (caption.speaker?.isParticipant === true ? t("live.participant") : ""));
+    // Main has already selected the one desktop lane. A source caption in that
+    // language is the correct screen line, not record-only metadata.
+    if (caption.translationStatus === "failed") return;
     state.ws.send(JSON.stringify({
       type: "subtitle:live-call-caption",
       partial: caption.isFinal !== true,
       targetLanguage: String(caption.language ?? ""),
-      sourceText: "",
-      speaker: String(caption.speaker?.name ?? caption.speaker?.label ?? t("live.participant")),
+      sourceLanguage: String(caption.sourceLanguage ?? ""),
+      utteranceKey: String(caption.utteranceKey ?? ""),
+      sourceText: String(caption.sourceText ?? (caption.origin === "source" ? text : "")),
+      speaker: speakerName,
       speakerDepartment: String(caption.speaker?.department ?? ""),
       speakerJobTitle: String(caption.speaker?.jobTitle ?? ""),
       translatedText: text,

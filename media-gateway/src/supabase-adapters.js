@@ -1,34 +1,59 @@
 import { encodeAudioFrame } from "./binary-audio.js";
 
+const DEFAULT_SNAPSHOT_GUARD_TIMEOUT_MILLISECONDS = 5_000;
+const MAX_SNAPSHOT_GUARD_TIMEOUT_MILLISECONDS = 60_000;
+
 export class SupabaseLivePublisher {
-  constructor({ baseUrl, supabaseApiKey, supabaseKeyType, serviceRoleKey, eventFanout, audioFanout, fetchFn = fetch }) {
+  constructor({
+    baseUrl,
+    supabaseApiKey,
+    supabaseKeyType,
+    serviceRoleKey,
+    eventFanout,
+    audioFanout,
+    fetchFn = fetch,
+    snapshotGuardTimeoutMilliseconds = DEFAULT_SNAPSHOT_GUARD_TIMEOUT_MILLISECONDS,
+  }) {
+    if (!Number.isSafeInteger(snapshotGuardTimeoutMilliseconds)
+      || snapshotGuardTimeoutMilliseconds < 1
+      || snapshotGuardTimeoutMilliseconds > MAX_SNAPSHOT_GUARD_TIMEOUT_MILLISECONDS) {
+      throw new Error("INVALID_SNAPSHOT_GUARD_TIMEOUT");
+    }
     this.baseUrl = baseUrl;
     this.supabaseCredential = resolveSupabaseCredential({ supabaseApiKey, supabaseKeyType, serviceRoleKey });
     this.eventFanout = eventFanout;
     this.audioFanout = audioFanout;
     this.fetchFn = fetchFn;
+    this.snapshotGuardTimeoutMilliseconds = snapshotGuardTimeoutMilliseconds;
   }
 
-  async publish(sessionId, language, event) {
+  async publish(sessionId, language, event, { onLiveEvent = null } = {}) {
     let recordingError = null;
     if (event.type === "caption" && event.isFinal) {
-      // Snapshot persistence is best-effort: a transient failure must not drop
-      // the caption. A genuine "session stopped" RPC decline (false) still
-      // stops emission.
-      let snapshotResult;
-      try {
-        snapshotResult = await this.#request("/rest/v1/rpc/persist_live_snapshot_if_active", {
-          method: "POST",
-          body: JSON.stringify({
-            p_session_id: sessionId,
-            p_language: language,
-            p_event: event,
-          }),
-        });
-      } catch {
-        snapshotResult = undefined; // transient — intentionally swallowed
-      }
+      // 2026-07-26 security: Snapshot RPC is the active-session guard. No
+      // viewer or host delivery occurs until it confirms this final is live.
+      const snapshotResult = await this.#requestSnapshotGuard("/rest/v1/rpc/persist_live_snapshot_if_active", {
+        method: "POST",
+        body: JSON.stringify({
+          p_session_id: sessionId,
+          p_language: language,
+          p_event: event,
+        }),
+      });
       if (snapshotResult === false) throw new Error("SESSION_STOPPED");
+    }
+    if (event.type === "speaker-legend") {
+      await this.#guardedRpc("persist_session_speakers_if_active", {
+        p_session_id: sessionId,
+        p_language: language,
+        p_speakers: event.speakers,
+      });
+    }
+    await Promise.all([
+      this.eventFanout(sessionId, language, event),
+      typeof onLiveEvent === "function" ? onLiveEvent(event) : undefined,
+    ]);
+    if (event.type === "caption" && event.isFinal) {
       // Meeting-record persistence is best-effort: a declined or failing RPC
       // (row cap, transient network) must not interrupt the live broadcast.
       try {
@@ -49,6 +74,8 @@ export class SupabaseLivePublisher {
             // Null on the source lane, where p_text already IS the original.
             p_source_text: event.sourceText ?? null,
             p_source_language: event.sourceLanguage ?? null,
+            p_origin: event.origin ?? null,
+            p_utterance_key: event.utteranceKey ?? null,
           }),
         });
         if (utteranceResult !== true) recordingError = createRecordingError(sessionId, language, event.seq);
@@ -56,15 +83,22 @@ export class SupabaseLivePublisher {
         recordingError = createRecordingError(sessionId, language, event.seq);
       }
     }
-    if (event.type === "speaker-legend") {
-      await this.#guardedRpc("persist_session_speakers_if_active", {
-        p_session_id: sessionId,
-        p_language: language,
-        p_speakers: event.speakers,
-      });
-    }
-    await this.eventFanout(sessionId, language, event);
     if (recordingError) await this.eventFanout(sessionId, language, recordingError);
+  }
+
+  async #requestSnapshotGuard(path, init) {
+    const abortController = new AbortController();
+    const timer = setTimeout(() => {
+      abortController.abort(new Error("SNAPSHOT_GUARD_TIMEOUT"));
+    }, this.snapshotGuardTimeoutMilliseconds);
+    try {
+      return await waitForAbort(
+        this.#request(path, { ...init, signal: abortController.signal }),
+        abortController.signal,
+      );
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   async #guardedRpc(name, payload) {
@@ -98,16 +132,16 @@ export class SupabaseLivePublisher {
   }
 
   /** Persisted utterances with seq > afterSeq for viewer replay (contract C2). */
-  async fetchUtterancesAfter(sessionId, language, afterSeq, limit = 200) {
+  async fetchUtterancesAfter(sessionId, language, afterSeq, limit = 200, { signal } = {}) {
     const query = new URLSearchParams({
       session_id: `eq.${sessionId}`,
       language: `eq.${language}`,
       seq: `gt.${afterSeq}`,
-      select: "seq,speaker_label,speaker_name,text,source_text,source_language,source_ended_at,emitted_at",
+      select: "seq,speaker_label,speaker_name,text,source_text,source_language,origin,utterance_key,source_ended_at,emitted_at",
       order: "seq.asc",
       limit: String(limit),
     });
-    const rows = await this.#request(`/rest/v1/live_utterances?${query}`, { method: "GET" });
+    const rows = await this.#request(`/rest/v1/live_utterances?${query}`, { method: "GET", signal });
     if (!Array.isArray(rows)) return [];
     return rows.map((row) => ({
       type: "caption",
@@ -138,6 +172,10 @@ export class SupabaseLivePublisher {
       sourceText: row.source_text ?? null,
       sourceLanguage: row.source_language ?? null,
       translationStatus: row.source_text ? "translated" : "verbatim",
+      ...(row.origin === "source" ? { origin: "source" } : {}),
+      ...(typeof row.utterance_key === "string" && row.utterance_key.length > 0
+        ? { utteranceKey: row.utterance_key }
+        : {}),
       sourceEndedAt: row.source_ended_at,
       emittedAt: row.emitted_at,
     }));
@@ -163,6 +201,28 @@ export class SupabaseLivePublisher {
     const text = await response.text();
     return text.length > 0 ? JSON.parse(text) : undefined;
   }
+}
+
+function waitForAbort(promise, signal) {
+  if (signal.aborted) return Promise.reject(abortReason(signal, "SNAPSHOT_GUARD_TIMEOUT"));
+  return new Promise((resolve, reject) => {
+    const onAbort = () => reject(abortReason(signal, "SNAPSHOT_GUARD_TIMEOUT"));
+    signal.addEventListener("abort", onAbort, { once: true });
+    Promise.resolve(promise).then(
+      (value) => {
+        signal.removeEventListener("abort", onAbort);
+        resolve(value);
+      },
+      (error) => {
+        signal.removeEventListener("abort", onAbort);
+        reject(error);
+      },
+    );
+  });
+}
+
+function abortReason(signal, fallbackCode) {
+  return signal.reason instanceof Error ? signal.reason : new Error(fallbackCode);
 }
 
 function createRecordingError(sessionId, language, seq) {

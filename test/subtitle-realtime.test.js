@@ -18,7 +18,7 @@ import {
   normalizeSubtitleSettings,
 } from "../src/subtitle-realtime.js";
 import { handleGeminiLiveMessage } from "../src/gemini-live-translate.js";
-import { getDefaultSubtitleGlossaryContext } from "../src/glossary-presets.js";
+import { GLOSSARY_PRESETS, getDefaultSubtitleGlossaryContext } from "../src/glossary-presets.js";
 
 test("detectSourceLanguage stays English when Hangul only stray-contaminates English speech (EN→KO robustness)", () => {
   // English being spoken: Latin-dominant with a stray Hangul char (Gemini
@@ -136,8 +136,13 @@ test("the built-in glossary repairs common Cushman mistranscriptions without wai
   );
 });
 
-test("the built-in glossary preserves panel brand names and hospitality operating terms", () => {
-  const { glossary } = getDefaultSubtitleGlossaryContext({ a: "ko", b: "en" });
+test("the HOTEL preset preserves panel brand names and hospitality operating terms", () => {
+  // These are hotel-session terms (First Cabin, Noon Square, third-party
+  // operator, low manning model, 힐튼 가든 인), so they belong to the hotel
+  // preset — not to the everyday default, which is now the general CRE
+  // consulting glossary. The company-name repairs above DO stay in the default,
+  // because STT garbles "Cushman" in every session regardless of topic.
+  const glossary = GLOSSARY_PRESETS.find((preset) => preset.id === "hotel-investment-en-ko").glossary;
 
   assert.equal(
     applyGlossaryCorrections("First Cabin Myeongdong opened near Noon Square.", { glossary, targetLanguage: "ko" }),

@@ -22,6 +22,7 @@ import {
 } from "./live-audio-client";
 import MeetingSummaryCard from "./MeetingSummaryCard";
 import { resolveSpeakerColor } from "./SpeakerCaption";
+import { getDefaultLiveSchedule, validateLiveSchedule } from "./live-session-schedule";
 
 const LANGUAGE_OPTIONS = LANGUAGE_CODES.map((code) => ({ code, label: LANGUAGE_LABELS[code] }));
 
@@ -220,8 +221,9 @@ async function requestGatewayCredentials(sessionId: string): Promise<GatewayCred
 
 export default function LiveHostDashboard() {
   const [title, setTitle] = useState("");
-  const [sessionDate, setSessionDate] = useState(() => new Date().toISOString().slice(0, 10));
-  const [startTime, setStartTime] = useState("09:00");
+  const [sessionDate, setSessionDate] = useState("");
+  const [startTime, setStartTime] = useState("");
+  const [scheduleNow, setScheduleNow] = useState<number | null>(null);
   const [sessionType, setSessionType] = useState<LiveSessionType>("presentation");
   const [outputMode, setOutputMode] = useState<LiveOutputMode>("captions");
   const [voiceProvider, setVoiceProvider] = useState<LiveVoiceProvider>("gemini");
@@ -256,11 +258,23 @@ export default function LiveHostDashboard() {
 
   const languageLabel = useMemo<Map<string, string>>(() => new Map(LANGUAGE_OPTIONS.map((item) => [item.code, item.label])), []);
   const isOpenAIVoiceLanguageSupported = useMemo(() => languages.every(isOpenAIVoiceTarget), [languages]);
-  const scheduledAt = useMemo(() => {
-    if (!sessionDate || !startTime) return "";
-    const date = new Date(`${sessionDate}T${startTime}:00`);
-    return Number.isNaN(date.valueOf()) ? "" : date.toISOString();
-  }, [sessionDate, startTime]);
+  const scheduleValidation = useMemo(() => scheduleNow === null
+    ? { scheduledAt: "", error: "" }
+    : validateLiveSchedule(sessionDate, startTime, scheduleNow), [scheduleNow, sessionDate, startTime]);
+  const scheduledAt = scheduleValidation.scheduledAt;
+
+  useEffect(() => {
+    const initializeSchedule = () => {
+      const now = new Date();
+      const defaults = getDefaultLiveSchedule(now);
+      setScheduleNow(now.getTime());
+      setSessionDate((current) => current || defaults.sessionDate);
+      setStartTime((current) => current || defaults.startTime);
+    };
+    initializeSchedule();
+    const timer = window.setInterval(() => setScheduleNow(Date.now()), 30_000);
+    return () => window.clearInterval(timer);
+  }, []);
 
   useEffect(() => {
     if (voiceProvider === "openai" && (sessionType === "meeting" || !isOpenAIVoiceLanguageSupported)) {
@@ -277,13 +291,18 @@ export default function LiveHostDashboard() {
   }, []);
 
   const createSession = useCallback(async () => {
+    const currentSchedule = validateLiveSchedule(sessionDate, startTime, Date.now());
+    if (currentSchedule.error) {
+      setError(currentSchedule.error);
+      return;
+    }
     setIsBusy(true);
     setError("");
     try {
       const next = await readResponse<LiveSession>(await fetch("/api/live-sessions", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ title, scheduledAt, sessionType, languages, outputMode, voiceProvider, maxViewers, glossaryPack }),
+        body: JSON.stringify({ title, scheduledAt: currentSchedule.scheduledAt, sessionType, languages, outputMode, voiceProvider, maxViewers, glossaryPack }),
       }));
       setSessionType(next.sessionType);
       setOutputMode(next.outputMode);
@@ -317,7 +336,7 @@ export default function LiveHostDashboard() {
     } finally {
       setIsBusy(false);
     }
-  }, [glossaryPack, languages, maxViewers, outputMode, scheduledAt, sessionType, title, voiceProvider]);
+  }, [glossaryPack, languages, maxViewers, outputMode, sessionDate, sessionType, startTime, title, voiceProvider]);
 
   const stopBroadcast = useCallback(async () => {
     const client = audioClientRef.current;
@@ -985,14 +1004,21 @@ export default function LiveHostDashboard() {
                 <label className="live-text-field">
                   <span>Date</span>
                   <input type="text" inputMode="numeric" pattern="\d{4}-\d{2}-\d{2}" placeholder="YYYY-MM-DD"
-                    value={sessionDate} onChange={(event) => setSessionDate(event.target.value)} required />
+                    value={sessionDate} onChange={(event) => setSessionDate(event.target.value)}
+                    aria-invalid={!session && Boolean(scheduleValidation.error)}
+                    aria-describedby={!session && scheduleValidation.error ? "live-schedule-error" : undefined} required />
                 </label>
                 <label className="live-text-field">
                   <span>Start time</span>
                   <input type="text" inputMode="numeric" pattern="(?:[01]\d|2[0-3]):[0-5]\d" placeholder="HH:MM"
-                    value={startTime} onChange={(event) => setStartTime(event.target.value)} required />
+                    value={startTime} onChange={(event) => setStartTime(event.target.value)}
+                    aria-invalid={!session && Boolean(scheduleValidation.error)}
+                    aria-describedby={!session && scheduleValidation.error ? "live-schedule-error" : undefined} required />
                 </label>
               </div>
+              {!session && scheduleNow !== null && scheduleValidation.error && (
+                <p id="live-schedule-error" className="live-error" role="alert">{scheduleValidation.error}</p>
+              )}
               <div className="live-mode-grid live-mode-grid-two" role="radiogroup" aria-label="Session format">
                 {SESSION_TYPE_OPTIONS.map((option) => (
                   <button key={option.value} type="button" role="radio" aria-checked={sessionType === option.value}
@@ -1129,7 +1155,7 @@ export default function LiveHostDashboard() {
                   setSessionType(session.sessionType); setOutputMode(session.outputMode); setVoiceProvider(session.voiceProvider); setMaxViewers(session.maxViewers);
                   setGlossaryPack(session.glossaryPack); setLanguages([...session.languages]); setIsEditingSession(false);
                 }}>Cancel</button>}
-                <button type="button" className="accent-btn live-primary-action" disabled={isBusy || !title.trim() || !scheduledAt}
+                <button type="button" className="accent-btn live-primary-action" disabled={isBusy || !title.trim() || (!session && !scheduledAt)}
                   onClick={() => void (session ? applySession() : createSession())}>
                   {isBusy ? "Creating…" : session ? "Apply changes" : "Create Live"}
                 </button>
@@ -1141,7 +1167,7 @@ export default function LiveHostDashboard() {
             {wizardStep === 1 ? (
               <>
                 <button type="button" className="glass-btn" onClick={() => setWizardStep(2)}>Advanced settings</button>
-                <button type="button" className="accent-btn" disabled={isBusy || !title.trim() || !scheduledAt}
+                <button type="button" className="accent-btn" disabled={isBusy || !title.trim() || (!session && !scheduledAt)}
                   onClick={() => void (session ? applySession() : createSession())}>
                   {isBusy ? "Creating…" : session ? "Apply changes" : "Create Session"}
                 </button>

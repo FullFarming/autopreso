@@ -1,10 +1,12 @@
 // Client settings persisted in localStorage (no database, per spec).
 
-import { DOMAIN_HOSPITALITY, GLOSSARY_HOSPITALITY } from "./presets";
+import { DOMAIN_GENERAL_CRE, GLOSSARY_GENERAL_CRE } from "./presets";
 import type { LanguageCode } from "./languageDetect";
 import type { EngineKind, InputMode, LanguagePairId, ToneKind } from "./types";
 
-export const MAX_GLOSSARY_CHARS = 16000;
+// Must clear the largest shipped preset (27.5k) — at 16,000 the loader sliced
+// presets mid-file and dropped their trailing sections with no signal.
+export const MAX_GLOSSARY_CHARS = 40000;
 export const MAX_DOMAIN_CHARS = 2000;
 
 export type PipPosition = "bottom" | "middle" | "top";
@@ -40,11 +42,12 @@ export const DEFAULT_SETTINGS: AppSettings = {
   direction: "both",
   tone: "natural",
   engine: "openai",
-  // Ship with the prepared hotel-investment termbase active out of the box —
-  // glossary/domain are part of the program, not an empty field to fill.
-  glossary: GLOSSARY_HOSPITALITY,
-  domain: DOMAIN_HOSPITALITY,
-  presetId: "hospitality",
+  // Ship with the general CRE-consulting termbase active out of the box — it is
+  // the everyday default; hotel and F&B are event-specific switches from it.
+  // Glossary/domain are part of the program, not an empty field to fill.
+  glossary: GLOSSARY_GENERAL_CRE,
+  domain: DOMAIN_GENERAL_CRE,
+  presetId: "cre",
   pipPosition: "bottom",
   pipFontSize: 34,
   pipShowSource: true,

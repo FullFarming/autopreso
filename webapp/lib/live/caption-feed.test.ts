@@ -1,7 +1,19 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { isPinnedToLatest, newestFirst, PIN_THRESHOLD_PX } from "./caption-feed";
+import type { CaptionEvent } from "../live-contract";
+import {
+  getCachedLanguageCaptions,
+  isDisplayableCaption,
+  isPinnedToLatest,
+  LanguageSnapshotRegistry,
+  loadLanguageSnapshotOnce,
+  mergeCaptionTimeline,
+  mergeLanguageCaptionCache,
+  newestFirst,
+  PIN_THRESHOLD_PX,
+} from "./caption-feed";
+import { waitForSocketOpen, withAbortTimeout } from "../../components/live/connection-resilience";
 import { countdownMsUntil, formatCountdown } from "./countdown";
 
 test("newestFirst reverses without mutating the source array", () => {
@@ -35,4 +47,290 @@ test("countdownMsUntil returns remaining ms and null for missing or invalid sche
   assert.equal(countdownMsUntil("2026-07-23T09:59:00.000Z", now), -60_000);
   assert.equal(countdownMsUntil(null, now), null);
   assert.equal(countdownMsUntil("not-a-date", now), null);
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Web history vs Electron overlay. The web keeps each complete language lane,
+// including source speech in its own language. A failed translation is the only
+// event hidden because it cannot be trusted to belong to its claimed lane.
+// ─────────────────────────────────────────────────────────────────────────────
+test("the source-language transcript displays in its selected web history lane", () => {
+  assert.equal(isDisplayableCaption({ origin: "source", translationStatus: "verbatim" }), true);
+  assert.equal(isDisplayableCaption({ origin: "source", translationStatus: "failed" }), true,
+    "translation failure metadata must not hide the canonical source record");
+});
+
+test("a failed translation is recorded but never displayed", () => {
+  assert.equal(isDisplayableCaption({ translationStatus: "failed" }), false);
+});
+
+test("genuine translations display", () => {
+  assert.equal(isDisplayableCaption({ translationStatus: "translated" }), true);
+  // Captions from a gateway that sends no provenance at all must still render,
+  // or an older deployment would show a blank feed.
+  assert.equal(isDisplayableCaption({}), true);
+  assert.equal(isDisplayableCaption({ translationStatus: "verbatim" }), true);
+});
+
+function caption(seq: number, text: string, overrides: Partial<CaptionEvent> = {}): CaptionEvent {
+  return {
+    type: "caption",
+    seq,
+    sessionId: "session-1",
+    language: "ko",
+    speaker: null,
+    text,
+    isFinal: true,
+    sourceEndedAt: `2026-07-26T00:00:${String(seq).padStart(2, "0")}.000Z`,
+    emittedAt: `2026-07-26T00:00:${String(seq).padStart(2, "0")}.100Z`,
+    ...overrides,
+  };
+}
+
+test("repeated words with different canonical sequences are preserved", () => {
+  const once = mergeCaptionTimeline([], caption(1, "네"));
+  const twice = mergeCaptionTimeline(once, caption(2, "네"));
+
+  assert.deepEqual(twice.map((event) => [event.seq, event.text]), [[1, "네"], [2, "네"]]);
+});
+
+test("a growing partial updates in place and its final leaves one committed line", () => {
+  const firstPartial = mergeCaptionTimeline([], caption(3, "안녕", { isFinal: false }));
+  const grownPartial = mergeCaptionTimeline(firstPartial, caption(3, "안녕하세요", { isFinal: false }));
+  const committed = mergeCaptionTimeline(grownPartial, caption(3, "안녕하세요"));
+
+  assert.deepEqual(grownPartial.map((event) => [event.seq, event.text, event.isFinal]), [[3, "안녕하세요", false]]);
+  assert.deepEqual(committed.map((event) => [event.seq, event.text, event.isFinal]), [[3, "안녕하세요", true]]);
+});
+
+test("a late partial cannot resurrect after its sequence is committed", () => {
+  const committed = mergeCaptionTimeline([], caption(4, "확정"));
+  const withLatePartial = mergeCaptionTimeline(committed, caption(4, "확", { isFinal: false }));
+
+  assert.deepEqual(withLatePartial, committed);
+});
+
+test("snapshot and live arrivals merge by sequence instead of request completion order", () => {
+  let timeline = mergeCaptionTimeline([], caption(103, "실시간 103"));
+  timeline = mergeCaptionTimeline(timeline, caption(101, "스냅샷 101"));
+  timeline = mergeCaptionTimeline(timeline, caption(102, "스냅샷 102"));
+
+  assert.deepEqual(timeline.map((event) => event.seq), [101, 102, 103]);
+});
+
+test("language cache merges independently and restores the selected language immediately", () => {
+  let cache: Record<string, CaptionEvent[]> = {};
+  cache = mergeLanguageCaptionCache(cache, "ko", [caption(1, "한국어", { language: "ko" })]);
+  cache = mergeLanguageCaptionCache(cache, "en", [caption(1, "English", { language: "en" })]);
+  cache = mergeLanguageCaptionCache(cache, "ko", [caption(2, "다시 한국어", { language: "ko" })]);
+
+  assert.deepEqual(cache.ko.map((event) => event.text), ["한국어", "다시 한국어"]);
+  assert.deepEqual(cache.en.map((event) => event.text), ["English"]);
+});
+
+test("source and late translation form one canonical utterance in separate language lanes", () => {
+  const speaker = {
+    speakerId: "host",
+    label: "Host",
+    colorToken: "speaker-blue",
+    voiceName: null,
+    voiceStatus: "disabled" as const,
+    lastSeenAt: "2026-07-26T00:00:01.000Z",
+  };
+  let cache: Record<string, CaptionEvent[]> = {};
+  cache = mergeLanguageCaptionCache(cache, "en", [caption(1, "Welcome", {
+    language: "en", origin: "source", translationStatus: "verbatim", speaker,
+  })]);
+  assert.deepEqual(getCachedLanguageCaptions(cache, "en").map((event) => event.text), ["Welcome"]);
+  assert.deepEqual(getCachedLanguageCaptions(cache, "ko"), []);
+
+  cache = mergeLanguageCaptionCache(cache, "ko", [caption(1, "환영합니다", {
+    language: "ko", translationStatus: "translated", speaker,
+  })]);
+  assert.deepEqual([cache.en[0]?.seq, cache.en[0]?.speaker?.speakerId], [1, "host"]);
+  assert.deepEqual([cache.ko[0]?.seq, cache.ko[0]?.speaker?.speakerId], [1, "host"]);
+  assert.equal(cache.en.length, 1);
+  assert.equal(cache.ko.length, 1);
+});
+
+test("repeating one utterance preserves two finals in both source and translated lanes", () => {
+  let cache: Record<string, CaptionEvent[]> = {};
+  for (const seq of [1, 2]) {
+    cache = mergeLanguageCaptionCache(cache, "en", [caption(seq, "Yes", {
+      language: "en", origin: "source", translationStatus: "verbatim",
+    })]);
+    cache = mergeLanguageCaptionCache(cache, "ko", [caption(seq, "네", {
+      language: "ko", translationStatus: "translated",
+    })]);
+  }
+
+  assert.deepEqual(cache.en.map((event) => [event.seq, event.text]), [[1, "Yes"], [2, "Yes"]]);
+  assert.deepEqual(cache.ko.map((event) => [event.seq, event.text]), [[1, "네"], [2, "네"]]);
+});
+
+test("language cache rejects cross-lane events instead of mixing EN and KO", () => {
+  const malformed = caption(1, "한국어가 EN에 섞이면 안 됨", { language: "ko" });
+  const pollutedCurrent = { en: [malformed] };
+  const cache = mergeLanguageCaptionCache(pollutedCurrent, "en", [
+    caption(2, "Still Korean", { language: "ko" }),
+    caption(2, "English only", { language: "en" }),
+  ]);
+
+  assert.deepEqual(cache.en.map((event) => [event.language, event.text]), [["en", "English only"]]);
+});
+
+test("host and participant captions append through the same canonical event path", () => {
+  const participant = {
+    speakerId: "participant-1",
+    label: "Participant",
+    colorToken: "speaker-blue",
+    voiceName: null,
+    voiceStatus: "disabled" as const,
+    lastSeenAt: "2026-07-26T00:00:02.000Z",
+  };
+  const hostEvent = caption(1, "호스트 발화");
+  const participantEvent = caption(2, "참여자 발화", { speaker: participant });
+  const timeline = mergeCaptionTimeline(mergeCaptionTimeline([], hostEvent), participantEvent);
+
+  assert.deepEqual(timeline.map((event) => [event.seq, event.speaker?.speakerId ?? "presenter", event.text]), [
+    [1, "presenter", "호스트 발화"],
+    [2, "participant-1", "참여자 발화"],
+  ]);
+});
+
+test("repeated KO and EN switching never cross-contaminates either transcript", () => {
+  let cache: Record<string, CaptionEvent[]> = {};
+  for (let seq = 1; seq <= 12; seq += 1) {
+    const language = seq % 2 === 0 ? "en" : "ko";
+    cache = mergeLanguageCaptionCache(cache, language, [caption(seq, `${language}-${seq}`, { language })]);
+  }
+
+  assert.deepEqual(cache.ko.map((event) => event.text), ["ko-1", "ko-3", "ko-5", "ko-7", "ko-9", "ko-11"]);
+  assert.deepEqual(cache.en.map((event) => event.text), ["en-2", "en-4", "en-6", "en-8", "en-10", "en-12"]);
+});
+
+test("1,200 captions per lane survive twenty instant switches without blanking or reload", () => {
+  const ko = Array.from({ length: 1_200 }, (_value, index) => caption(index + 1, `ko-${index + 1}`, { language: "ko" }));
+  const en = Array.from({ length: 1_200 }, (_value, index) => caption(index + 1, `en-${index + 1}`, { language: "en" }));
+  let cache = mergeLanguageCaptionCache({}, "ko", ko);
+  cache = mergeLanguageCaptionCache(cache, "en", en);
+  const koIdentity = cache.ko;
+  const enIdentity = cache.en;
+
+  for (let switchIndex = 0; switchIndex < 20; switchIndex += 1) {
+    const language = switchIndex % 2 === 0 ? "ko" : "en";
+    const selected = getCachedLanguageCaptions(cache, language);
+    assert.equal(selected.length, 1_200);
+    assert.equal(selected[0]?.language, language);
+    assert.equal(selected.at(-1)?.language, language);
+    assert.equal(selected, language === "ko" ? koIdentity : enIdentity,
+      "switching must reuse the warm cache instead of reloading it");
+  }
+});
+
+test("warmed EN and KO toggles do not reload either language snapshot", async () => {
+  const snapshots = new LanguageSnapshotRegistry();
+  snapshots.reset("session-1");
+  let snapshotLoads = 0;
+  const selectLanguage = (sessionId: string, language: string) => loadLanguageSnapshotOnce(
+    snapshots,
+    sessionId,
+    language,
+    async () => {
+      snapshotLoads += 1;
+      return { sessionId, language };
+    },
+  );
+
+  await selectLanguage("session-1", "en");
+  await selectLanguage("session-1", "ko");
+  assert.equal(snapshotLoads, 2, "warming each language requires one snapshot");
+
+  for (let switchIndex = 0; switchIndex < 20; switchIndex += 1) {
+    await selectLanguage("session-1", switchIndex % 2 === 0 ? "en" : "ko");
+  }
+  assert.equal(snapshotLoads, 2, "warm language switches must be cache-only");
+
+  snapshots.reset("session-2");
+  await selectLanguage("session-2", "en");
+  assert.equal(snapshotLoads, 3, "a different session must not inherit warmed history");
+});
+
+class FakeSocketOpenTarget {
+  readonly listeners = new Map<string, Set<EventListener>>();
+  isClosed = false;
+
+  addEventListener(type: string, listener: EventListener): void {
+    const listeners = this.listeners.get(type) ?? new Set();
+    listeners.add(listener);
+    this.listeners.set(type, listeners);
+  }
+
+  removeEventListener(type: string, listener: EventListener): void {
+    this.listeners.get(type)?.delete(listener);
+  }
+
+  close(): void {
+    this.isClosed = true;
+  }
+
+  emit(type: "open" | "error"): void {
+    for (const listener of this.listeners.get(type) ?? []) listener(new Event(type));
+  }
+}
+
+test("a half-open websocket is bounded and closed", async () => {
+  const socket = new FakeSocketOpenTarget();
+
+  await assert.rejects(waitForSocketOpen(socket, 5), /timed out/u);
+  assert.equal(socket.isClosed, true);
+});
+
+test("a websocket that opens before the deadline is kept", async () => {
+  const socket = new FakeSocketOpenTarget();
+  const opened = waitForSocketOpen(socket, 100);
+  socket.emit("open");
+
+  await opened;
+  assert.equal(socket.isClosed, false);
+});
+
+test("snapshot work receives an abort signal at its deadline", async () => {
+  await assert.rejects(withAbortTimeout((signal) => new Promise<never>((_resolve, reject) => {
+    signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+  }), 5), /timed out/u);
+});
+
+test("a 450-event gateway replay remains lossless in the UI cache", () => {
+  const replay = Array.from({ length: 450 }, (_value, index) => caption(index + 1, `replay-${index + 1}`));
+  const cache = mergeLanguageCaptionCache({}, "ko", replay);
+
+  assert.equal(cache.ko.length, 450);
+  assert.deepEqual(cache.ko.map((event) => event.seq), Array.from({ length: 450 }, (_value, index) => index + 1));
+});
+
+test("the retained committed record reaches the 5,000-event product boundary", () => {
+  const record = Array.from({ length: 5_000 }, (_value, index) => caption(index + 1, `record-${index + 1}`));
+  const cache = mergeLanguageCaptionCache({}, "ko", record);
+
+  assert.equal(cache.ko.length, 5_000);
+  assert.equal(cache.ko[0]?.seq, 1);
+  assert.equal(cache.ko.at(-1)?.seq, 5_000);
+});
+
+test("one partial is retained in addition to 5,000 committed captions and replaced in place", () => {
+  const record = Array.from({ length: 5_000 }, (_value, index) => caption(index + 1, `record-${index + 1}`));
+  let cache = mergeLanguageCaptionCache({}, "ko", record);
+  cache = mergeLanguageCaptionCache(cache, "ko", [caption(5_001, "진행", { isFinal: false })]);
+  cache = mergeLanguageCaptionCache(cache, "ko", [caption(5_001, "진행 중", { isFinal: false })]);
+
+  assert.equal(cache.ko.filter((event) => event.isFinal).length, 5_000);
+  assert.deepEqual(cache.ko.filter((event) => !event.isFinal).map((event) => event.text), ["진행 중"]);
+});
+
+test("an older snapshot final cannot erase a newer live partial", () => {
+  let timeline = mergeCaptionTimeline([], caption(451, "지금 말하는 중", { isFinal: false }));
+  timeline = mergeCaptionTimeline(timeline, caption(450, "이전 확정"));
+
+  assert.deepEqual(timeline.map((event) => [event.seq, event.isFinal]), [[450, true], [451, false]]);
 });

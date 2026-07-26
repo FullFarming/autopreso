@@ -628,6 +628,43 @@ test("development Supabase connections require an exact allowlisted project ref"
   );
 });
 
+test("local Supabase requires an explicit non-production loopback exception", () => {
+  const localEnvironment = {
+    NODE_ENV: "development",
+    LIVE_EXTERNAL_ENV: "development",
+    LIVE_ALLOW_LOCAL_SUPABASE: "true",
+    SUPABASE_URL: "http://127.0.0.1:54321",
+    NEXT_PUBLIC_SUPABASE_URL: "http://127.0.0.1:54321/",
+    SUPABASE_SECRET_KEY: `sb_secret_${"a".repeat(24)}`,
+    NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY: `sb_publishable_${"b".repeat(24)}`,
+    NEXT_PUBLIC_SUPABASE_ANON_KEY: "anon-test-key",
+    SUPABASE_SERVICE_ROLE_KEY: "service-role-test-key",
+  };
+  assert.equal(getSupabaseServerAccess(localEnvironment).url, "http://127.0.0.1:54321");
+  assert.equal(getSupabasePublicAccess(localEnvironment).url, "http://127.0.0.1:54321");
+  assert.equal(getSupabaseServerConfig(localEnvironment).url, "http://127.0.0.1:54321");
+  assert.equal(getSupabaseServerConfig({
+    ...localEnvironment,
+    SUPABASE_URL: undefined,
+    NEXT_PUBLIC_SUPABASE_URL: "http://localhost:54321",
+  }).url, "http://localhost:54321");
+
+  for (const rejected of [
+    { LIVE_ALLOW_LOCAL_SUPABASE: undefined },
+    { LIVE_ALLOW_LOCAL_SUPABASE: "TRUE" },
+    { NODE_ENV: "production" },
+    { LIVE_EXTERNAL_ENV: undefined },
+    { SUPABASE_URL: "http://127.0.0.1:54322", NEXT_PUBLIC_SUPABASE_URL: "http://127.0.0.1:54322" },
+    { SUPABASE_URL: "http://127.0.0.1:54321/rest", NEXT_PUBLIC_SUPABASE_URL: "http://127.0.0.1:54321/rest" },
+    { SUPABASE_URL: "http://127.0.0.1:54321?x=1", NEXT_PUBLIC_SUPABASE_URL: "http://127.0.0.1:54321?x=1" },
+    { SUPABASE_URL: "http://127.0.0.2:54321", NEXT_PUBLIC_SUPABASE_URL: "http://127.0.0.2:54321" },
+  ]) {
+    const environment = { ...localEnvironment, ...rejected };
+    assert.throws(() => getSupabaseServerAccess(environment), LiveSecurityConfigurationError);
+    assert.throws(() => getSupabaseServerConfig(environment), LiveSecurityConfigurationError);
+  }
+});
+
 test("new Supabase secret keys are sent only as apikey", () => {
   const secretKey = `sb_secret_${"a".repeat(24)}`;
   const publishableKey = `sb_publishable_${"b".repeat(24)}`;
