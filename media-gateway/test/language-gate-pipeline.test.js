@@ -336,6 +336,42 @@ test("provider input language wins over script heuristics for code-switched sour
   assert.equal(captions[0].origin, "source");
 });
 
+test("provider input languages outside the session fail closed for partials and finals", async () => {
+  const state = makeDependencies();
+  const { pipeline, sessions } = makeLivePipeline(state);
+  await pipeline.start();
+  const input = sessions.get("ko").onInputCaption;
+
+  await input({ text: "Vietnam market update", isFinal: false, languageCode: "vi-VN" });
+  await sessions.get("ko").onCaption({ text: "베트남 시장 업데이트", isFinal: false, languageCode: "ko-KR" });
+  await input({ text: "Vietnam market update.", isFinal: true, languageCode: "vi" });
+  await sessions.get("ko").onCaption({ text: "베트남 시장 업데이트입니다.", isFinal: true, languageCode: "ko-KR" });
+  await input({ text: "일본 시장 업데이트", isFinal: false, languageCode: "ja-JP" });
+  await input({ text: "일본 시장 업데이트입니다.", isFinal: true, languageCode: "ja" });
+  await input({ text: "Looks English but the hint is malformed.", isFinal: true, languageCode: "not-a-language" });
+
+  assert.equal(state.captions().length, 0, "unsupported or malformed explicit hints must not become source rows");
+});
+
+test("missing and und input hints retain script fallback while explicit KO and EN remain canonical", async () => {
+  const state = makeDependencies();
+  const { pipeline, sessions } = makeLivePipeline(state);
+  await pipeline.start();
+  const input = sessions.get("ko").onInputCaption;
+
+  await input({ text: "Fallback English partial", isFinal: false });
+  await input({ text: "한국어 미확정 코드입니다.", isFinal: true, languageCode: "und" });
+  await input({ text: "명시적 한국어입니다.", isFinal: true, languageCode: "ko-KR" });
+  await input({ text: "Explicit English.", isFinal: true, languageCode: "en-US" });
+
+  assert.deepEqual(state.captions().map(({ language, isFinal, origin }) => ({ language, isFinal, origin })), [
+    { language: "en", isFinal: false, origin: "source" },
+    { language: "ko", isFinal: true, origin: "source" },
+    { language: "ko", isFinal: true, origin: "source" },
+    { language: "en", isFinal: true, origin: "source" },
+  ]);
+});
+
 test("KO and EN same-language output echoes are dropped before durable publish", async () => {
   const state = makeDependencies();
   const { pipeline, sessions } = makeLivePipeline(state);
@@ -400,6 +436,40 @@ test("provider output language metadata rejects a target mismatch before publish
   });
 
   assert.equal(state.captions().length, 0);
+});
+
+test("output callbacks drop unsupported explicit languages but allow und to use the target gate", async () => {
+  const state = makeDependencies();
+  const { pipeline, sessions } = makeLivePipeline(state);
+  await pipeline.start();
+  const koreanOutput = sessions.get("ko").onCaption;
+
+  await koreanOutput({
+    text: "겉보기에는 한국어인 베트남어 콜백",
+    isFinal: false,
+    languageCode: "ko-KR",
+    sourceText: "Vietnamese source",
+    sourceLanguage: "vi",
+  });
+  await koreanOutput({
+    text: "겉보기에는 한국어인 일본어 콜백입니다.",
+    isFinal: true,
+    languageCode: "ko-KR",
+    sourceText: "Japanese source",
+    sourceLanguage: "ja-JP",
+  });
+  await koreanOutput({
+    text: "언어 미확정 상태의 정상 한국어 번역입니다.",
+    isFinal: true,
+    languageCode: "und",
+    sourceText: "A valid English source.",
+    sourceLanguage: "en-US",
+  });
+
+  const captions = state.captions();
+  assert.equal(captions.length, 1);
+  assert.equal(captions[0].language, "ko");
+  assert.equal(captions[0].text, "언어 미확정 상태의 정상 한국어 번역입니다.");
 });
 
 // ─────────────────────────────────────────────────────────────────────────────

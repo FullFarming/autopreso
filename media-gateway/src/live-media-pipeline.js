@@ -843,19 +843,56 @@ export class LiveMediaPipeline {
     const { text, isFinal, languageCode } = value;
     const normalized = String(text ?? "").normalize("NFC").trim();
     if (!normalized) return;
+    const rawLanguageCode = typeof languageCode === "string" ? languageCode.trim() : "";
+    const hasExplicitLanguageCode = languageCode !== undefined
+      && languageCode !== null
+      && String(languageCode).trim() !== "";
+    const isExplicitlyUnknown = rawLanguageCode.toLowerCase() === "und";
     const hinted = normalizeLiveLanguage(languageCode);
-    // 2026-07-26 fix: Provider result metadata is the primary language signal.
-    // Script is only a fallback because names, numbers, and code-switched
-    // sentences can legitimately look unlike their provider-classified lane.
-    const lane = this.languages.includes(hinted)
-      ? hinted
-      : this.languages.find((language) => textPlausiblyInLanguage(normalized, language));
-    if (!lane) return;
     const utteranceKey = typeof value.utteranceKey === "string" && value.utteranceKey
       ? value.utteranceKey
       : this.#meetingInputCaption && this.#meetingInputCaption.isFinal !== true
         ? this.#meetingInputCaption.utteranceKey
         : `${this.sessionId}:input:${++this.#meetingInputCaptionCounter}`;
+    // 2026-07-26 fix: Provider result metadata is the primary language signal.
+    // Script is only a fallback because names, numbers, and code-switched
+    // sentences can legitimately look unlike their provider-classified lane.
+    // A recognized provider language outside this session is not uncertainty:
+    // falling back to script would relabel Vietnamese/Japanese as EN/KO and
+    // persist a false source record. Only missing or explicit BCP-47 `und`
+    // metadata may use the legacy script fallback. Malformed explicit values
+    // fail closed at the same boundary.
+    const isCanonicalEnglishKoreanBridge = hinted === "en" || hinted === "ko";
+    const isRejectedLanguage = (hinted && !this.languages.includes(hinted) && !isCanonicalEnglishKoreanBridge)
+      || (hasExplicitLanguageCode && !hinted && !isExplicitlyUnknown);
+    if (isRejectedLanguage || (hinted && !this.languages.includes(hinted))) {
+      // Keep a non-publishable correlation fence. Without it, an output partial
+      // can inherit the previous input context after this source row is omitted
+      // (unsupported language, or the absent source lane of a one-lane pair).
+      this.#meetingInputCaption = {
+        text: normalized,
+        language: hinted,
+        isFinal: Boolean(isFinal),
+        utteranceKey,
+        capturedAt: value.capturedAt,
+        floorSpeaker: value.floorSpeaker ?? null,
+        // A one-lane EN/KO session may legitimately translate the other core
+        // language without publishing a source lane. Other explicit languages
+        // are rejected until that language is part of the session.
+        isUnsupportedLanguage: Boolean(isRejectedLanguage),
+      };
+      if (isFinal) {
+        for (const language of this.languages) {
+          const queue = this.#meetingInputFinalQueues.get(language) ?? [];
+          queue.push(this.#meetingInputCaption);
+          if (queue.length > 100) queue.shift();
+          this.#meetingInputFinalQueues.set(language, queue);
+        }
+      }
+      return;
+    }
+    const lane = hinted || this.languages.find((language) => textPlausiblyInLanguage(normalized, language));
+    if (!lane) return;
     this.#meetingInputCaption = {
       text: normalized,
       language: lane,
@@ -916,7 +953,12 @@ export class LiveMediaPipeline {
     // target-lane boundary when available; script inspection remains a legacy
     // fallback only when Gemini omits the language code.
     if (value.origin !== "source"
-      && ((sourceLanguage && sourceLanguage === language)
+      && ((sourceContext?.isUnsupportedLanguage === true)
+        || (sourceLanguage
+          && !this.languages.includes(sourceLanguage)
+          && sourceLanguage !== "en"
+          && sourceLanguage !== "ko")
+        || (sourceLanguage && sourceLanguage === language)
         || (providerOutputLanguage && providerOutputLanguage !== language))) {
       return;
     }
