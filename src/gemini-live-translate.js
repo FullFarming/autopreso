@@ -6,6 +6,7 @@
 // PCM16 mono 24 kHz output is forwarded only after strict envelope validation.
 
 import { isSupportedSubtitleLanguage, toGeminiLanguageCode } from "./subtitle-languages.js";
+import { createCaptionPcmResampler } from "./caption-pcm-resampler.js";
 
 // 2026-07-23 fix: the translate-preview model accepts setup on v1beta but
 // closes with 1007 "Request contains an invalid argument" on the FIRST audio
@@ -14,14 +15,10 @@ import { isSupportedSubtitleLanguage, toGeminiLanguageCode } from "./subtitle-la
 const GEMINI_LIVE_URL =
   "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContent";
 const DEFAULT_GEMINI_MODEL = "gemini-3.5-live-translate-preview";
-const INPUT_SAMPLE_RATE = 24000;
 const GEMINI_SAMPLE_RATE = 16000;
 const TRANSLATED_AUDIO_SAMPLE_RATE = 24000;
 const TRANSLATED_AUDIO_MIME_TYPE = "audio/pcm;rate=24000";
 const MAX_TRANSLATED_AUDIO_BYTES = 256 * 1024;
-const GEMINI_RESAMPLER_TAPS = 129;
-const GEMINI_RESAMPLER_HALF_LENGTH = (GEMINI_RESAMPLER_TAPS - 1) / 2;
-const GEMINI_RESAMPLER_CUTOFF_HZ = 7_200;
 
 function decodeTranslatedAudio(inlineData) {
   if (!inlineData || typeof inlineData !== "object") return null;
@@ -74,72 +71,6 @@ export function resamplePcm16Base64(base64, fromRate, toRate) {
     output.writeInt16LE(Math.round(current + (next - current) * fraction), i * 2);
   }
   return output.toString("base64");
-}
-
-function sinc(value) {
-  if (Math.abs(value) < Number.EPSILON) return 1;
-  const angle = Math.PI * value;
-  return Math.sin(angle) / angle;
-}
-
-function createResamplerKernel(fraction) {
-  const cutoff = GEMINI_RESAMPLER_CUTOFF_HZ / INPUT_SAMPLE_RATE;
-  const firstOffset = Math.ceil(fraction - GEMINI_RESAMPLER_HALF_LENGTH);
-  const lastOffset = Math.floor(fraction + GEMINI_RESAMPLER_HALF_LENGTH);
-  const weights = [];
-  let weightSum = 0;
-  for (let offset = firstOffset; offset <= lastOffset; offset += 1) {
-    const distance = offset - fraction;
-    const window = 0.42
-      + 0.5 * Math.cos((Math.PI * distance) / GEMINI_RESAMPLER_HALF_LENGTH)
-      + 0.08 * Math.cos((2 * Math.PI * distance) / GEMINI_RESAMPLER_HALF_LENGTH);
-    const weight = 2 * cutoff * sinc(2 * cutoff * distance) * window;
-    weights.push({ offset, weight });
-    weightSum += weight;
-  }
-  return weights.map(({ offset, weight }) => ({ offset, weight: weight / weightSum }));
-}
-
-function createGeminiInputResampler() {
-  const kernels = [createResamplerKernel(0), createResamplerKernel(0.5)];
-  let history = new Int16Array(0);
-  let inputSampleOffset = 0;
-  let nextOutputPosition = 0;
-
-  return function downsample(base64) {
-    const inputBuffer = Buffer.from(base64, "base64");
-    const input = new Int16Array(Math.floor(inputBuffer.length / 2));
-    for (let index = 0; index < input.length; index += 1) input[index] = inputBuffer.readInt16LE(index * 2);
-    if (input.length === 0) return base64;
-
-    const combined = new Int16Array(history.length + input.length);
-    combined.set(history);
-    combined.set(input, history.length);
-    const combinedOffset = inputSampleOffset - history.length;
-    const inputEnd = inputSampleOffset + input.length;
-    const output = [];
-
-    while (Math.floor(nextOutputPosition) < inputEnd) {
-      const delayedCenter = nextOutputPosition - GEMINI_RESAMPLER_HALF_LENGTH;
-      const centerIndex = Math.floor(delayedCenter);
-      const fraction = delayedCenter - centerIndex;
-      const kernel = fraction < 0.25 ? kernels[0] : kernels[1];
-      let sample = 0;
-      for (const { offset, weight } of kernel) {
-        const combinedIndex = centerIndex + offset - combinedOffset;
-        if (combinedIndex >= 0 && combinedIndex < combined.length) sample += combined[combinedIndex] * weight;
-      }
-      output.push(Math.max(-32_768, Math.min(32_767, Math.round(sample))));
-      nextOutputPosition += INPUT_SAMPLE_RATE / GEMINI_SAMPLE_RATE;
-    }
-
-    const historyLength = Math.min(GEMINI_RESAMPLER_TAPS - 1, combined.length);
-    history = combined.slice(combined.length - historyLength);
-    inputSampleOffset = inputEnd;
-    const outputBuffer = Buffer.alloc(output.length * 2);
-    output.forEach((sample, index) => outputBuffer.writeInt16LE(sample, index * 2));
-    return outputBuffer.toString("base64");
-  };
 }
 
 /** @param {any} settings @param {string} targetLanguage @param {string|null} resumptionHandle */
@@ -349,7 +280,7 @@ export function handleGeminiLiveMessage(raw, ctx = {}) {
 
 /** @param {any} options */
 export function createGeminiTransport({ settings = {}, targetLanguage = "ko", apiKey = "" } = {}) {
-  const downsampleGeminiInput = createGeminiInputResampler();
+  const downsampleGeminiInput = createCaptionPcmResampler();
   return {
     // The Live API rejects realtimeInput sent before setupComplete; the
     // channel must buffer audio until the ack arrives.
@@ -365,7 +296,7 @@ export function createGeminiTransport({ settings = {}, targetLanguage = "ko", ap
       return JSON.stringify({
         realtimeInput: {
           audio: {
-            data: downsampleGeminiInput(base64Pcm24k),
+            data: downsampleGeminiInput(Buffer.from(base64Pcm24k, "base64")).toString("base64"),
             mimeType: `audio/pcm;rate=${GEMINI_SAMPLE_RATE}`,
           },
         },

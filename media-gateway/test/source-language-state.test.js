@@ -3,11 +3,11 @@ import test from "node:test";
 
 import { createSourceLanguageState } from "../src/source-language-state.js";
 
-test("a strong Korean source lock survives English terms and provider flips", () => {
+test("caption-only strong script evidence may correct the current utterance language", () => {
   const state = createSourceLanguageState();
   assert.equal(state.observe({ providerLanguage: "ko-KR", transcript: "국내 상업용 부동산 시장입니다" }), "ko");
   assert.equal(state.observe({ providerLanguage: "en-US", transcript: "국내 CRE market Cushman & Wakefield 임대료입니다" }), "ko");
-  assert.equal(state.observe({ providerLanguage: "en-US", transcript: "This later provider sample looks strongly English" }), "ko");
+  assert.equal(state.observe({ providerLanguage: "en-US", transcript: "This later provider sample looks strongly English" }), "en");
 });
 
 test("the first strong script may correct a weak provider seed", () => {
@@ -34,21 +34,15 @@ test("non-string provider evidence is rejected without coercion", () => {
   assert.equal(state.observe({ providerLanguage: { toString() { throw new Error("must not run"); } }, transcript: {} }), "");
 });
 
-test("a Japanese provider hint disambiguates kanji-only text from Chinese", () => {
+test("kanji-only text follows the caption-only Han-script decision", () => {
   const state = createSourceLanguageState();
-  assert.equal(state.observe({ providerLanguage: "ja-JP", transcript: "東京都庁" }), "ja");
+  assert.equal(state.observe({ providerLanguage: "ja-JP", transcript: "東京都庁" }), "zh-Hans");
 });
 
-// The captions engine (src/subtitle-realtime.js) is the reference. These pin the
-// thresholds to it, because the gateway drifted later on both languages and that
-// drift is what changes which language a caption is attributed to.
-test("thresholds match the captions engine rather than the gateway's old ones", () => {
-  // KOREAN_MIX_MIN_CHARS is 3: three Hangul chars are enough, where the gateway
-  // used to demand four.
+// The captions-only per-channel state is the reference. Its conservative strong
+// lock protects short CRE names from being mistaken for a direction change.
+test("thresholds match the captions-only per-channel language state", () => {
   assert.equal(createSourceLanguageState().observe({ transcript: "회복세" }), "ko");
-
-  // LANGUAGE_LOCK_MIN_SIGNAL_CHARS 4 at LANGUAGE_LOCK_MIN_CONFIDENCE 0.68: four
-  // Latin chars suffice, where the gateway used to demand eight at 0.78.
   assert.equal(createSourceLanguageState().observe({ transcript: "Cost" }), "en");
 
   // Mixed Korean+English is judged ko/(ko+en), the way captions judges it, so a
@@ -58,8 +52,8 @@ test("thresholds match the captions engine rather than the gateway's old ones", 
     "ko",
   );
 
-  // A capitalised English phrase locks English: the gateway-only proper-noun
-  // carve-out pushed these down the weak path, which captions has no equivalent of.
+  // With no earlier lock a proper noun can seed a weak English decision, but it
+  // cannot replace an established Korean utterance lock.
   assert.equal(createSourceLanguageState().observe({ transcript: "Cushman Wakefield Korea" }), "en");
 });
 

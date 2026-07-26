@@ -25,8 +25,8 @@ function makeDependencies() {
     synthesized,
     dependencies: {
       liveTranslate: {
-        async open({ language, onCaption, onAudio, onInterruption, onInputCaption }) {
-          const session = { language, onCaption, onAudio, onInterruption, onInputCaption, sent: [], ended: 0, async sendAudio(frame, metadata) { this.sent.push({ frame, metadata }); }, async audioStreamEnd() { this.ended += 1; }, async close() {} };
+        async open({ language, inputSource, channelId, onCaption, onAudio, onInterruption, onInputCaption, onInputObservation }) {
+          const session = { language, inputSource, channelId, onCaption, onAudio, onInterruption, onInputCaption, onInputObservation, sent: [], ended: 0, async sendAudio(frame, metadata) { this.sent.push({ frame, metadata }); }, async audioStreamEnd() { this.ended += 1; }, async close() {} };
           liveSessions.push(session);
           return session;
         },
@@ -118,6 +118,127 @@ test("presentation opens one provider session per language, not per viewer", asy
   await pipeline.acceptAudio(new Uint8Array(1_280), 0);
   assert.equal(state.liveSessions.length, 2);
   assert.deepEqual(state.liveSessions.map((session) => session.sent.length), [1, 1]);
+});
+
+test("meeting reports input observations from every target lane while publishing one canonical source lane", async () => {
+  const state = makeDependencies();
+  const pipeline = new LiveMediaPipeline({ sessionId: "s-consensus", mode: "meeting", languages: ["ko", "en"], dependencies: state.dependencies });
+  await pipeline.start();
+
+  assert.ok(state.liveSessions.every((session) => typeof session.onInputObservation === "function"));
+  await state.liveSessions[1].onInputObservation({ text: "안녕하세요.", isFinal: true, languageCode: "ko-KR" });
+  await state.liveSessions[0].onInputObservation({ text: "안녕하세요.", isFinal: true, languageCode: "ko-KR" });
+  await state.liveSessions[0].onInputCaption({ text: "안녕하세요.", isFinal: true, languageCode: "ko-KR" });
+
+  const sources = state.events.filter((event) => event.type === "caption" && event.origin === "source");
+  assert.equal(sources.length, 1);
+  assert.equal(sources[0].language, "ko");
+});
+
+test("a blocked target audio lane cannot delay another target lane", async () => {
+  const state = makeDependencies();
+  let releaseSlow;
+  const slowGate = new Promise((resolve) => { releaseSlow = resolve; });
+  state.dependencies.liveTranslate.open = async (options) => {
+    const isSlow = options.language === "ko";
+    const session = {
+      ...options,
+      sent: 0,
+      async sendAudio() { this.sent += 1; if (isSlow) await slowGate; },
+      async audioStreamEnd() {},
+      async close() {},
+    };
+    state.liveSessions.push(session);
+    return session;
+  };
+  const pipeline = new LiveMediaPipeline({ sessionId: "s-audio-isolation", mode: "meeting", languages: ["ko", "en"], dependencies: state.dependencies, now: () => 1_000 });
+  await pipeline.start();
+
+  await pipeline.acceptAudio(new Uint8Array(1_280), 1_000);
+  await pipeline.acceptAudio(new Uint8Array(1_280), 1_000);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(state.liveSessions.find((session) => session.language === "en").sent, 2);
+  releaseSlow();
+  await pipeline.close();
+});
+
+test("a blocked system source lane cannot delay or receive mic source audio", async () => {
+  const state = makeDependencies();
+  let releaseSystem;
+  const systemGate = new Promise((resolve) => { releaseSystem = resolve; });
+  state.dependencies.liveTranslate.open = async (options) => {
+    const session = {
+      ...options, sent: [],
+      async sendAudio(frame, metadata) { this.sent.push({ frame, metadata }); if (options.inputSource === "system") await systemGate; },
+      async audioStreamEnd() {}, async close() {},
+    };
+    state.liveSessions.push(session);
+    return session;
+  };
+  const pipeline = new LiveMediaPipeline({ sessionId: "s-source-isolation", mode: "meeting", languages: ["ko"], dependencies: state.dependencies, now: () => 1_000 });
+  await pipeline.start();
+  await pipeline.acceptAudio(new Uint8Array(1_280).fill(1), 1_000, null, "system");
+  await pipeline.acceptAudio(new Uint8Array(1_280).fill(2), 1_000, null, "mic");
+  await new Promise((resolve) => setImmediate(resolve));
+  const mic = state.liveSessions.find((session) => session.inputSource === "mic");
+  assert.equal(mic.sent.length, 1);
+  assert.equal(mic.sent[0].metadata.source, "mic");
+  assert.equal(mic.sent[0].frame[0], 2);
+  releaseSystem();
+  await pipeline.close();
+});
+
+test("system and mic copies of one utterance produce one source row and one translated row", async () => {
+  const state = makeDependencies();
+  const pipeline = new LiveMediaPipeline({ sessionId: "s-source-dedupe", mode: "meeting", languages: ["ko"], dependencies: state.dependencies, now: () => 1_000 });
+  await pipeline.start();
+  await pipeline.acceptAudio(new Uint8Array(1_280), 1_000, null, "mic");
+  const system = state.liveSessions.find((session) => session.inputSource === "system");
+  const mic = state.liveSessions.find((session) => session.inputSource === "mic");
+  for (const session of [system, mic]) {
+    const input = { text: "This is the same source sentence.", isFinal: true, languageCode: "en-US", targetLanguage: "ko", inputSource: session.inputSource };
+    await session.onInputObservation(input);
+    await session.onInputCaption(input);
+    await session.onCaption({ text: "동일한 번역 문장입니다.", isFinal: true, sourceText: input.text, sourceLanguage: "en-US", inputSource: session.inputSource });
+  }
+  const finals = state.events.filter((event) => event.type === "caption" && event.isFinal);
+  assert.equal(finals.filter((event) => event.origin === "source").length, 0, "an absent EN record lane stays absent");
+  assert.equal(finals.filter((event) => event.language === "ko").length, 1);
+});
+
+test("duplicate-source suppression stays hard-bounded during a long meeting", async () => {
+  const state = makeDependencies();
+  const pipeline = new LiveMediaPipeline({ sessionId: "s-source-dedupe-bound", mode: "meeting", languages: ["ko"], dependencies: state.dependencies, now: () => 1_000 });
+  await pipeline.start();
+  await pipeline.acceptAudio(new Uint8Array(1_280), 1_000, null, "mic");
+  const system = state.liveSessions.find((session) => session.inputSource === "system");
+  const mic = state.liveSessions.find((session) => session.inputSource === "mic");
+  for (let index = 0; index < 300; index += 1) {
+    const text = `Unique duplicated source sentence number ${index}.`;
+    await system.onInputObservation({ text, isFinal: true, languageCode: "en-US" });
+    await mic.onInputObservation({ text, isFinal: true, languageCode: "en-US" });
+  }
+  await mic.onCaption({ text: "첫 번째 오래된 번역입니다.", isFinal: true, sourceText: "Unique duplicated source sentence number 0.", sourceLanguage: "en-US" });
+  await mic.onCaption({ text: "최신 중복 번역입니다.", isFinal: true, sourceText: "Unique duplicated source sentence number 299.", sourceLanguage: "en-US" });
+  const finals = state.events.filter((event) => event.type === "caption" && event.isFinal);
+  assert.equal(finals.length, 1, "oldest suppression entry is evicted while the newest remains suppressed");
+  assert.equal(finals[0].text, "첫 번째 오래된 번역입니다.");
+});
+
+test("caption polish policy supports off, selective, and full modes", async () => {
+  for (const [policy, expectedCalls] of [["off", 0], ["selective", 0], ["full", 1]]) {
+    const state = makeDependencies();
+    let calls = 0;
+    state.dependencies.captionPolish = { async polish({ translatedText }) { calls += 1; return translatedText; } };
+    const pipeline = new LiveMediaPipeline({
+      sessionId: `s-polish-${policy}`, mode: "meeting", languages: ["ko"], dependencies: state.dependencies,
+      captionPolishPolicy: policy,
+    });
+    await pipeline.start();
+    await state.liveSessions[0].onCaption({ text: "일반 번역 문장입니다.", isFinal: true });
+    assert.equal(calls, expectedCalls, policy);
+    await pipeline.close();
+  }
 });
 
 test("Presentation keeps Gemini captions and routes only translated audio through OpenAI", async () => {
@@ -345,6 +466,7 @@ test("Presentation OpenAI voice failure clears audio but leaves Gemini captions 
   await pipeline.start();
   assert.equal(await pipeline.acceptAudio(new Uint8Array(1_280), 1_000), true);
   await state.liveSessions[0].onCaption({ text: "captions survive", isFinal: true });
+  await new Promise((resolve) => setImmediate(resolve));
   assert.equal(state.events.some((event) => event.type === "caption" && event.text === "captions survive"), true);
   assert.equal(state.events.some((event) => event.type === "language-status" && event.code === "VOICE_UNAVAILABLE"), true);
   assert.equal(state.events.some((event) => event.type === "audio-control" && event.action === "clear"), true);

@@ -5,7 +5,7 @@ import test from "node:test";
 
 import { WebSocket } from "ws";
 
-import { createGatewayServer } from "../src/gateway-server.js";
+import { createGatewayServer, decodeHostAudioFrame } from "../src/gateway-server.js";
 
 const SECURITY_POLICY = Object.freeze({
   allowedOrigins: new Set(["https://portal.example.com"]),
@@ -32,7 +32,7 @@ function createTestGateway(options = {}) {
     async pipelineFactory() {
       return {
         async start() {}, async tick() {}, async endAudioStream() {}, async close() {},
-        async acceptAudio(frame) { acceptedFrames.push(frame); },
+        async acceptAudio(frame, capturedAt, floorSpeaker, source) { acceptedFrames.push({ frame, capturedAt, floorSpeaker, source }); },
       };
     },
     ...options,
@@ -88,6 +88,41 @@ test("host input rejects a PCM frame that is not exactly 1280 bytes", async (con
   socket.send(Buffer.alloc(1_278));
   assert.equal(JSON.parse((await reply)[0].toString()).code, "INVALID_AUDIO_FRAME");
   assert.equal(acceptedFrames.length, 0);
+});
+
+test("source-tagged host frames preserve source while legacy frames remain accepted", () => {
+  const pcm = Buffer.alloc(1_280, 7);
+  const tagged = Buffer.concat([Buffer.from([0x4e, 0x01, 0x02, 0x00]), pcm]);
+  const decoded = decodeHostAudioFrame(tagged);
+  assert.equal(decoded.source, "mic");
+  assert.deepEqual(Buffer.from(decoded.pcm), pcm);
+  assert.equal(decodeHostAudioFrame(pcm).source, null);
+});
+
+test("malformed source-tagged host frames fail closed without legacy fallback", () => {
+  for (const header of [
+    [0x00, 0x01, 0x01, 0x00],
+    [0x4e, 0x02, 0x01, 0x00],
+    [0x4e, 0x01, 0x03, 0x00],
+    [0x4e, 0x01, 0x01, 0x01],
+  ]) {
+    assert.throws(() => decodeHostAudioFrame(Buffer.concat([Buffer.from(header), Buffer.alloc(1_280)])), /INVALID_AUDIO_FRAME/u);
+  }
+});
+
+test("tagged host source reaches the pipeline without changing PCM", async (context) => {
+  const { gateway, acceptedFrames } = createTestGateway();
+  await new Promise((resolve) => gateway.server.listen(0, "127.0.0.1", resolve));
+  context.after(async () => gateway.close());
+  const socket = await startGatewayHost(gateway);
+  context.after(() => socket.terminate());
+  const pcm = Buffer.alloc(1_280, 9);
+  socket.send(Buffer.concat([Buffer.from([0x4e, 0x01, 0x01, 0x00]), pcm]));
+  for (let attempt = 0; attempt < 10 && acceptedFrames.length === 0; attempt += 1) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  assert.equal(acceptedFrames[0].source, "system");
+  assert.deepEqual(Buffer.from(acceptedFrames[0].frame), pcm);
 });
 
 test("host audio cannot be submitted faster than the configured real-time burst", async (context) => {

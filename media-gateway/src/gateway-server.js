@@ -17,6 +17,8 @@ const AUTH_TIMEOUT_MILLISECONDS = 5_000;
 const AUTHORIZATION_CADENCE_MILLISECONDS = 2_500;
 const AUTHORIZATION_CACHE_MILLISECONDS = 5_000;
 const INPUT_FRAME_BYTES = AUDIO_CONFIG.inputSampleRate * 2 * AUDIO_CONFIG.chunkMilliseconds / 1_000;
+const TAGGED_AUDIO_HEADER_BYTES = 4;
+const TAGGED_AUDIO_FRAME_BYTES = TAGGED_AUDIO_HEADER_BYTES + INPUT_FRAME_BYTES;
 const INPUT_BYTES_PER_SECOND = AUDIO_CONFIG.inputSampleRate * 2;
 /** Applies only when a take would cut off a live speaker, so the floor cannot
  *  be volleyed back and forth between two participants. */
@@ -37,6 +39,22 @@ const MAX_REPLAY_BUFFER_EVENTS = 500;
 const DEFAULT_DURABLE_RECOVERY_RETRY_DELAYS_MILLISECONDS = [1_000, 2_000, 4_000, 8_000, 16_000, 20_000];
 const DEFAULT_DURABLE_RECOVERY_ATTEMPT_TIMEOUT_MILLISECONDS = 10_000;
 const DEFAULT_RECOVERY_AUDIO_SPOOL_MILLISECONDS = 30_000;
+
+export function decodeHostAudioFrame(data) {
+  const frame = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+  if (frame.byteLength === INPUT_FRAME_BYTES) return { pcm: frame, source: null };
+  if (frame.byteLength !== TAGGED_AUDIO_FRAME_BYTES
+    || frame[0] !== 0x4e
+    || frame[1] !== 0x01
+    || (frame[2] !== 0x01 && frame[2] !== 0x02)
+    || frame[3] !== 0x00) {
+    throw new Error("INVALID_AUDIO_FRAME");
+  }
+  return {
+    pcm: frame.subarray(TAGGED_AUDIO_HEADER_BYTES),
+    source: frame[2] === 0x01 ? "system" : "mic",
+  };
+}
 
 export function createGatewayServer({
   pipelineFactory,
@@ -348,7 +366,19 @@ export function createGatewayServer({
     const languages = state?.settings.languages ?? [];
     await Promise.all(languages.map((language) => deliverEvent(sessionId, language, payload)));
   };
-  const spoolRecoveryAudio = (state, frame, capturedAt, capturedFloorSpeaker, frameOrder) => {
+  const getHostAudioLane = (state, source) => {
+    const key = source ?? "legacy";
+    let lane = state.audioLanes.get(key);
+    if (!lane) {
+      lane = { tail: Promise.resolve(), pendingFrames: 0 };
+      state.audioLanes.set(key, lane);
+    }
+    return lane;
+  };
+  const drainHostAudioLanes = (state) => Promise.all(
+    [...state.audioLanes.values()].map((lane) => lane.tail.catch(() => undefined)),
+  );
+  const spoolRecoveryAudio = (state, frame, capturedAt, capturedFloorSpeaker, frameOrder, source = null) => {
     const cutoff = capturedAt - recoveryAudioSpoolMilliseconds;
     while (state.recoveryAudioSpool.length > 0
       && (state.recoveryAudioSpool[0].capturedAt < cutoff
@@ -366,6 +396,7 @@ export function createGatewayServer({
       capturedAt,
       capturedFloorSpeaker,
       frameOrder,
+      source,
     });
     state.recoveryAudioSpool.sort((left, right) => left.frameOrder - right.frameOrder);
     state.recoveryAudioSpoolBytes += frame.byteLength;
@@ -380,14 +411,24 @@ export function createGatewayServer({
       state.recoveryAudioSpoolBytes -= dropped.frame.byteLength;
       metrics.increment("durable_recovery_audio_frames_dropped_total");
     }
+    const sourceQueues = new Map();
     while (state.recoveryAudioSpool.length > 0) {
       const queued = state.recoveryAudioSpool.shift();
       state.recoveryAudioSpoolBytes -= queued.frame.byteLength;
-      // The fresh replacement owns a new provider stream. Re-stamp delivery
-      // time so its normal 750ms stale-frame guard does not discard audio that
-      // was intentionally retained by the bounded recovery spool.
-      await candidate.acceptAudio(queued.frame, now(), queued.capturedFloorSpeaker);
+      const sourceKey = queued.source ?? "legacy";
+      const sourceQueue = sourceQueues.get(sourceKey) ?? [];
+      sourceQueue.push(queued);
+      sourceQueues.set(sourceKey, sourceQueue);
     }
+    await Promise.all([...sourceQueues.values()].map(async (sourceQueue) => {
+      for (const queued of sourceQueue) {
+        // 2026-07-26 fix: preserve order inside one capture source while
+        // allowing an initializing or stalled sibling source to drain
+        // independently. The replacement owns fresh provider streams, so
+        // delivery time is re-stamped for the normal stale-frame guard.
+        await candidate.acceptAudio(queued.frame, now(), queued.capturedFloorSpeaker, queued.source);
+      }
+    }));
   };
   const requestPipelineRecovery = (sessionId, failedPipeline, error) => {
     const state = hostSessions.get(sessionId);
@@ -455,7 +496,7 @@ export function createGatewayServer({
             if (shouldRestorePaused) candidate.pause?.();
             const activeHolder = floorHolders.get(sessionId);
             await Promise.all([
-              current.audioTail.catch(() => undefined),
+              drainHostAudioLanes(current),
               activeHolder?.audioTail?.catch(() => undefined),
             ]);
             await drainRecoveryAudio(current, candidate);
@@ -681,58 +722,62 @@ export function createGatewayServer({
           if (isBinary) {
             const state = hostSessions.get(claims.sessionId);
             if (!state || state.webSocket !== webSocket) throw new Error("SESSION_NOT_STARTED");
+            const decoded = decodeHostAudioFrame(data);
             if (floorHolders.has(claims.sessionId)) {
               // A participant holds the speaking floor: their audio wins.
               metrics.increment("dropped_audio_frames_total");
               return;
             }
-            if (data.byteLength !== INPUT_FRAME_BYTES) throw new Error("INVALID_AUDIO_FRAME");
-            consumeAudioBudget(claims.sessionId, data.byteLength);
+            consumeAudioBudget(claims.sessionId, decoded.pcm.byteLength);
             const capturedAt = now();
             const frameOrder = ++state.nextAudioFrameOrder;
             if (state.recoveryFlight) {
               spoolRecoveryAudio(
                 state,
-                new Uint8Array(data.buffer, data.byteOffset, data.byteLength),
+                decoded.pcm,
                 capturedAt,
                 null,
                 frameOrder,
+                decoded.source,
               );
               metrics.increment("audio_frames_total");
               return;
             }
-            if (state.pendingFrames * AUDIO_CONFIG.chunkMilliseconds >= AUDIO_CONFIG.staleFrameMilliseconds) {
+            const audioLane = getHostAudioLane(state, decoded.source);
+            if (audioLane.pendingFrames * AUDIO_CONFIG.chunkMilliseconds >= AUDIO_CONFIG.staleFrameMilliseconds) {
               metrics.increment("dropped_audio_frames_total");
               return;
             }
-            state.pendingFrames += 1;
-            state.audioTail = state.audioTail
+            audioLane.pendingFrames += 1;
+            audioLane.tail = audioLane.tail
               .then(async () => {
                 if (state.recoveryFlight) {
                   spoolRecoveryAudio(
                     state,
-                    new Uint8Array(data.buffer, data.byteOffset, data.byteLength),
+                    decoded.pcm,
                     capturedAt,
                     null,
                     frameOrder,
+                    decoded.source,
                   );
                   return;
                 }
                 return state.pipeline.acceptAudio(
-                  new Uint8Array(data.buffer, data.byteOffset, data.byteLength),
+                  decoded.pcm,
                   capturedAt,
                   null,
+                  decoded.source,
                 );
               })
               .catch((error) => closePipelineSocket(webSocket, error))
-              .finally(() => { state.pendingFrames -= 1; });
+              .finally(() => { audioLane.pendingFrames -= 1; });
             metrics.increment("audio_frames_total");
             return;
           }
           const message = parseJson(data);
           const active = hostSessions.get(claims.sessionId);
           if (message.type === "audioStreamEnd" && active?.webSocket === webSocket) {
-            await active.audioTail;
+            await drainHostAudioLanes(active);
             await active.pipeline.endAudioStream();
             sendJson(webSocket, { type: "audio-stream-ended", sessionId: claims.sessionId });
             return;
@@ -875,8 +920,7 @@ export function createGatewayServer({
                 pipeline: candidate,
                 webSocket,
                 hostOutput,
-                audioTail: Promise.resolve(),
-                pendingFrames: 0,
+                audioLanes: new Map(),
                 settings: {
                   sessionId: claims.sessionId,
                   version: hostMessage.version,
@@ -997,6 +1041,7 @@ export function createGatewayServer({
               capturedAt,
               capturedFloorSpeaker,
               frameOrder,
+              "participant",
             );
             metrics.increment("floor_audio_frames_total");
             return;
@@ -1015,6 +1060,7 @@ export function createGatewayServer({
                   capturedAt,
                   capturedFloorSpeaker,
                   frameOrder,
+                  "participant",
                 );
                 return;
               }
@@ -1022,6 +1068,7 @@ export function createGatewayServer({
                 new Uint8Array(data.buffer, data.byteOffset, data.byteLength),
                 capturedAt,
                 capturedFloorSpeaker,
+                "participant",
               );
             })
             .catch(() => releaseFloor(claims.sessionId, { reason: "error" }))

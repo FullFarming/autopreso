@@ -75,6 +75,21 @@ test("gateway refuses short signing secrets at startup", () => {
   );
 });
 
+test("gateway parses three-way caption polish weights and rejects invalid totals", () => {
+  const config = readGatewayEnvironment({
+    ...gatewayEnvironment(),
+    LIVE_CAPTION_POLISH_OFF_BPS: "1000",
+    LIVE_CAPTION_POLISH_SELECTIVE_BPS: "8000",
+    LIVE_CAPTION_POLISH_FULL_BPS: "1000",
+  });
+  assert.deepEqual(config.captionPolishPolicyWeights, { off: 1_000, selective: 8_000, full: 1_000 });
+  assert.deepEqual(readGatewayEnvironment(gatewayEnvironment()).captionPolishPolicyWeights, { off: 0, selective: 10_000, full: 0 });
+  assert.throws(() => readGatewayEnvironment({ ...gatewayEnvironment(), LIVE_CAPTION_POLISH_OFF_BPS: "1.5" }), /POLISH/u);
+  assert.throws(() => readGatewayEnvironment({
+    ...gatewayEnvironment(), LIVE_CAPTION_POLISH_OFF_BPS: "5001", LIVE_CAPTION_POLISH_SELECTIVE_BPS: "5000",
+  }), /POLISH/u);
+});
+
 test("gateway external providers are restricted to one exact development project and Supabase ref", () => {
   const hosted = readGatewayEnvironment(gatewayEnvironment());
   assert.equal(hosted.externalEnvironment, "development");

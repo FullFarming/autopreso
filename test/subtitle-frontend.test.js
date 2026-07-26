@@ -41,6 +41,7 @@ function extractFunctionBody(source, signature) {
 test("subtitle dashboard exposes main controls, Gemma recording, and settings drawer", () => {
   const html = readFileSync(path.join(rootDir, "public", "subtitle.html"), "utf8");
   const js = readFileSync(path.join(rootDir, "public", "subtitle-dashboard.js"), "utf8");
+  const captureJs = readFileSync(path.join(rootDir, "public", "subtitle-audio-capture.js"), "utf8");
   const workspaceJs = readFileSync(path.join(rootDir, "public", "subtitle-workspace.js"), "utf8");
   const controllerHtml = readFileSync(path.join(rootDir, "public", "subtitle-controller.html"), "utf8");
   const controllerJs = readFileSync(path.join(rootDir, "public", "subtitle-controller.js"), "utf8");
@@ -201,7 +202,7 @@ test("subtitle dashboard exposes main controls, Gemma recording, and settings dr
   assert.match(js, /apiKeysPatch\.openaiSecondary = openaiSecondaryKeyInput\.value\.trim\(\)/);
   assert.match(js, /saveOpenAISecondaryKey/);
   assert.match(js, /apiKeys: \{ openaiSecondary: openaiSecondaryKey \}/);
-  assert.match(js, /AUDIO_PROCESSOR_BUFFER_SIZE = 1024/);
+  assert.match(captureJs, /CAPTION_AUDIO_PROCESSOR_BUFFER_SIZE = 1_024/);
   // Key registration must be explicit for BOTH providers: a clear
   // registered/unregistered badge, not a vague placeholder.
   assert.match(js, /"key\.registered" : "key\.unregistered"/);
@@ -375,7 +376,9 @@ test("subtitle dashboard exposes main controls, Gemma recording, and settings dr
   // A persisted mic deviceId can go stale (unplugged/renumbered device). The
   // capture must fall back to the system default mic instead of failing the
   // whole mic input on OverconstrainedError.
-  assert.match(js, /captureMicrophoneAudio[\s\S]*?deviceId: \{ exact: micSelect\.value \}[\s\S]*?catch[\s\S]*?getUserMedia/);
+  assert.match(js, /captureMicrophoneStream\(navigator\.mediaDevices, micSelect\.value/);
+  assert.match(captureJs, /deviceId: \{ exact: deviceId \}/);
+  assert.match(captureJs, /catch \(error\)[\s\S]*?getUserMedia\(\{ audio: getMicrophoneAudioConstraints\(\) \}\)/);
   // Mic failure guidance must point at the actual macOS panel (Microphone),
   // which is separate from Screen & System Audio Recording.
   assert.match(js, /t\("error\.micDenied"\)/);
@@ -389,9 +392,9 @@ test("subtitle dashboard exposes main controls, Gemma recording, and settings dr
   assert.match(js, /Promise\.allSettled\(tasks\)/);
   assert.match(js, /withMediaCaptureTimeout/);
   assert.match(js, /stopMediaStream\(stream\)/);
-  assert.match(js, /echoCancellation: true/);
-  assert.match(js, /noiseSuppression: true/);
-  assert.match(js, /autoGainControl: true/);
+  assert.match(captureJs, /echoCancellation: true/);
+  assert.match(captureJs, /noiseSuppression: true/);
+  assert.match(captureJs, /autoGainControl: true/);
   // System/loopback audio must be requested as a plain `audio: true` signal.
   // Electron defers loopback routing to the main process, so passing a
   // device-style audio constraints object (echoCancellation,
@@ -659,7 +662,7 @@ test("subtitle dashboard cannot hang forever while checking audio inputs", () =>
 test("subtitle dashboard actively starts Web Audio and reports blocked tracks", () => {
   const js = readFileSync(path.join(rootDir, "public", "subtitle-dashboard.js"), "utf8");
   const streamerStart = js.indexOf("async function createAudioStreamer");
-  const contextIndex = js.indexOf('const context = new AudioContext({ sampleRate: SAMPLE_RATE, latencyHint: "interactive" })', streamerStart);
+  const contextIndex = js.indexOf('const context = new AudioContext({ sampleRate: CAPTION_AUDIO_SAMPLE_RATE, latencyHint: "interactive" })', streamerStart);
   const resumeIndex = js.indexOf("await ensureAudioContextRunning(context, sourceName)", streamerStart);
   const watchIndex = js.indexOf("watchAudioTrackState(media, sourceName)", streamerStart);
   const processIndex = js.indexOf("processor.onaudioprocess", streamerStart);
@@ -677,34 +680,37 @@ test("subtitle dashboard actively starts Web Audio and reports blocked tracks", 
 
 test("subtitle dashboard requests native interactive 24 kHz capture with stateful resampling fallback", () => {
   const js = readFileSync(path.join(rootDir, "public", "subtitle-dashboard.js"), "utf8");
+  const captureJs = readFileSync(path.join(rootDir, "public", "subtitle-audio-capture.js"), "utf8");
   const streamerStart = js.indexOf("async function createAudioStreamer");
   const streamerEnd = js.indexOf("async function ensureAudioContextRunning", streamerStart);
   const streamerSource = js.slice(streamerStart, streamerEnd);
 
-  assert.match(streamerSource, /new AudioContext\(\{ sampleRate: SAMPLE_RATE, latencyHint: "interactive" \}\)/);
-  assert.match(streamerSource, /context\.sampleRate === SAMPLE_RATE/);
-  assert.match(streamerSource, /\? \{ samples: input, carry: new Float32Array\(0\) \}/);
-  assert.match(streamerSource, /: resample\(input, context\.sampleRate, SAMPLE_RATE, carry\);/);
+  assert.match(streamerSource, /new AudioContext\(\{ sampleRate: CAPTION_AUDIO_SAMPLE_RATE, latencyHint: "interactive" \}\)/);
+  assert.match(streamerSource, /createCaptionAudioChunker\(\{ inputSampleRate: context\.sampleRate/);
+  assert.match(captureJs, /inputSampleRate === CAPTION_AUDIO_SAMPLE_RATE/);
+  assert.match(captureJs, /: resample\(input, inputSampleRate, CAPTION_AUDIO_SAMPLE_RATE, carry\);/);
 });
 
 test("subtitle dashboard aggregates resampled input into exact 100 ms Live API frames", () => {
   const js = readFileSync(path.join(rootDir, "public", "subtitle-dashboard.js"), "utf8");
+  const captureJs = readFileSync(path.join(rootDir, "public", "subtitle-audio-capture.js"), "utf8");
   const streamerStart = js.indexOf("async function createAudioStreamer");
   const streamerEnd = js.indexOf("async function ensureAudioContextRunning", streamerStart);
   const streamerSource = js.slice(streamerStart, streamerEnd);
 
-  assert.match(js, /const SAMPLE_RATE = 24000;/);
-  assert.match(js, /const LIVE_AUDIO_CHUNK_DURATION_MS = 100;/);
-  assert.match(js, /const LIVE_AUDIO_CHUNK_SAMPLES = SAMPLE_RATE \* LIVE_AUDIO_CHUNK_DURATION_MS \/ 1_000;/);
+  assert.match(captureJs, /CAPTION_AUDIO_SAMPLE_RATE = 24_000;/);
+  assert.match(captureJs, /CAPTION_AUDIO_CHUNK_DURATION_MS = 100;/);
+  assert.match(captureJs, /CAPTION_AUDIO_CHUNK_SAMPLES = CAPTION_AUDIO_SAMPLE_RATE/);
   assert.equal(2_400 / 24_000 * 1_000, 100);
-  assert.match(streamerSource, /let pendingSamples = new Float32Array\(0\);/);
-  assert.match(streamerSource, /availableSamples\.set\(pendingSamples\);/);
-  assert.match(streamerSource, /availableSamples\.set\(resampled\.samples, pendingSamples\.length\);/);
-  assert.match(streamerSource, /while \(availableSamples\.length - offset >= LIVE_AUDIO_CHUNK_SAMPLES\)/);
-  assert.match(streamerSource, /availableSamples\.subarray\(offset, offset \+ LIVE_AUDIO_CHUNK_SAMPLES\)/);
-  assert.match(streamerSource, /offset \+= LIVE_AUDIO_CHUNK_SAMPLES;/);
-  assert.match(streamerSource, /pendingSamples = availableSamples\.slice\(offset\);/);
-  assert.match(streamerSource, /close: async \(\) => \{[\s\S]*?pendingSamples = new Float32Array\(0\);/);
+  assert.match(captureJs, /let pendingSamples = new Float32Array\(0\);/);
+  assert.match(captureJs, /availableSamples\.set\(pendingSamples\);/);
+  assert.match(captureJs, /availableSamples\.set\(resampled\.samples, pendingSamples\.length\);/);
+  assert.match(captureJs, /while \(availableSamples\.length - offset >= CAPTION_AUDIO_CHUNK_SAMPLES\)/);
+  assert.match(captureJs, /availableSamples\.subarray\(offset, offset \+ CAPTION_AUDIO_CHUNK_SAMPLES\)/);
+  assert.match(captureJs, /offset \+= CAPTION_AUDIO_CHUNK_SAMPLES;/);
+  assert.match(captureJs, /pendingSamples = availableSamples\.slice\(offset\);/);
+  assert.match(captureJs, /reset\(\) \{[\s\S]*?pendingSamples = new Float32Array\(0\);/);
+  assert.match(streamerSource, /close: async \(\) => \{[\s\S]*?chunker\.reset\(\);/);
 });
 
 test("translated playback isolates system loopback without suppressing microphone input", () => {
@@ -909,7 +915,8 @@ test("subtitle overlay defaults to the observed two-line rolling-caption layout"
   // maxSubtitleLines setting (up to a cap), driving the CSS height clamp.
   assert.match(js, /function maxSubtitleLines/);
   assert.match(js, /MAX_SUBTITLE_LINES_CAP = 8/);
-  assert.match(js, /lane\.renderMode === "live-call"[\s\S]*?Math\.min\(3, maxSubtitleLines\(\)\)[\s\S]*?: maxSubtitleLines\(\)/);
+  assert.doesNotMatch(js, /lane\.renderMode === "live-call"|Math\.min\(3, maxSubtitleLines\(\)\)/,
+    "Live Call must use the Caption-only line budget without a renderer fork");
   // Anti-overlap: when 2+ languages share a zone (e.g. EN+KO both at the
   // bottom) each lane auto-shrinks its visible line count and the zone reflows,
   // so the stacked boxes stay compact and never overlap or run off-screen.

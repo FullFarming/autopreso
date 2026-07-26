@@ -26,6 +26,33 @@ export function listenMediaGateway(server, config) {
   return new Promise((resolve) => server.listen(config.port, config.host, resolve));
 }
 
+export function createCaptionPolishPolicyResolver({
+  defaultPolicy = "selective",
+  policyWeights = { off: 0, selective: 10_000, full: 0 },
+} = {}) {
+  const policies = new Set(["off", "selective", "full"]);
+  if (!policies.has(defaultPolicy)) throw new Error("INVALID_CAPTION_POLISH_POLICY");
+  const weights = Object.fromEntries([...policies].map((policy) => [policy, policyWeights?.[policy]]));
+  if (Object.values(weights).some((value) => !Number.isInteger(value) || value < 0 || value > 10_000)
+    || Object.values(weights).reduce((sum, value) => sum + value, 0) > 10_000) {
+    throw new Error("INVALID_CAPTION_POLISH_CANARY");
+  }
+  return (sessionId) => {
+    let hash = 2_166_136_261;
+    for (const character of String(sessionId)) {
+      hash ^= character.codePointAt(0);
+      hash = Math.imul(hash, 16_777_619) >>> 0;
+    }
+    const bucket = hash % 10_000;
+    let upperBound = 0;
+    for (const policy of ["off", "selective", "full"]) {
+      upperBound += weights[policy];
+      if (bucket < upperBound) return policy;
+    }
+    return defaultPolicy;
+  };
+}
+
 export async function startMediaGateway(config = readGatewayEnvironment()) {
   const [{ GoogleGenAI }, speechModule, textToSpeechModule, translateModule] = await Promise.all([
     import("@google/genai"),
@@ -50,6 +77,10 @@ export async function startMediaGateway(config = readGatewayEnvironment()) {
     audioFanout(sessionId, language, frame) { return gateway.broadcastAudio(sessionId, language, frame); },
   });
   const floorController = new SupabaseFloorController(config);
+  const resolveCaptionPolishPolicy = createCaptionPolishPolicyResolver({
+    defaultPolicy: "selective",
+    policyWeights: config.captionPolishPolicyWeights,
+  });
   gateway = createGatewayServer({
     gatewaySecret: config.gatewaySecret,
     viewerSecret: config.viewerSecret,
@@ -82,6 +113,7 @@ export async function startMediaGateway(config = readGatewayEnvironment()) {
         translationTone: message.translationTone,
         domainText: message.domainText,
         languages: message.languages,
+        captionPolishPolicy: resolveCaptionPolishPolicy(message.sessionId),
         speakerRegistry: previousPipeline?.speakers,
         initialSequences,
         getSubscriberCount: (language) => gateway.subscriberCount(message.sessionId, language),

@@ -6,6 +6,8 @@ import path from "node:path";
 import { WebSocket } from "ws";
 
 import { startServer } from "../src/server.js";
+import { createCaptionPcmResampler } from "../src/caption-pcm-resampler.js";
+import { encodeLiveAudioWireFrame } from "../src/live-audio-wire.js";
 import { sanitizeLiveCaptionDisplayLanguage, shouldDisplayLiveCaption } from "../src/live-caption-display-policy.js";
 import { buildLiveCallGlossary } from "../src/live-call-glossary.js";
 import { createSettingsStore, migrateSettingsFile } from "../src/settings-store.js";
@@ -1016,8 +1018,12 @@ function reassertOverlayTop() {
 // desktop cannot connect from the renderer. The main process owns the HOST
 // gateway socket instead — authenticated via the trusted non-browser path
 // (x-realtime-noel-client + Bearer HOST token, no Origin) — and the renderer
-// only captures the microphone and forwards 40ms PCM frames over IPC.
+// captures the same 24 kHz / 100 ms PCM packets as Caption-only. The adapter
+// below keeps the proven Caption-only FIR and 16 kHz / 40 ms PCM payload while
+// adding the gateway's versioned source tag.
 const LIVE_BRIDGE_FRAME_BYTES = 1280;
+const CAPTION_BRIDGE_PACKET_BYTES = 4_800;
+const liveBridgeAudioAdapters = new Map();
 let liveGatewayBridge = null; // { socket, ready, session }
 // Reconnect state. The timer id MUST be stored so stopLiveGatewayBridge can
 // cancel it — without that, ending a call left a pending retry that reopened the
@@ -1168,11 +1174,32 @@ function stopLiveGatewayBridge(reason) {
   clearLiveBridgeReconnect();
   clearLiveBridgeCredentialRefresh();
   liveBridgeReconnectAttempts = 0;
+  liveBridgeAudioAdapters.clear();
   const bridge = liveGatewayBridge;
   if (!bridge) return;
   liveGatewayBridge = null;
   try { bridge.socket.close(1000, reason || "bridge stopped"); } catch { /* closed */ }
   console.info(`[live-bridge] stopped${reason ? ` (${reason})` : ""}`);
+}
+
+function adaptCaptionPcmForGateway(source, bytes) {
+  let adapter = liveBridgeAudioAdapters.get(source);
+  if (!adapter) {
+    adapter = { pending: Buffer.alloc(0), downsample: createCaptionPcmResampler() };
+    liveBridgeAudioAdapters.set(source, adapter);
+  }
+  const resampled = adapter.downsample(bytes);
+  const available = adapter.pending.length > 0
+    ? Buffer.concat([adapter.pending, resampled])
+    : resampled;
+  const frames = [];
+  let offset = 0;
+  while (available.length - offset >= LIVE_BRIDGE_FRAME_BYTES) {
+    frames.push(available.subarray(offset, offset + LIVE_BRIDGE_FRAME_BYTES));
+    offset += LIVE_BRIDGE_FRAME_BYTES;
+  }
+  adapter.pending = Buffer.from(available.subarray(offset));
+  return frames;
 }
 
 async function ensureLiveGatewayBridge() {
@@ -1243,9 +1270,9 @@ async function ensureLiveGatewayBridge() {
       scheduleLiveGatewayCredentialRefresh(bridge, connection.expiresAt);
       console.info("[live-bridge] gateway host pipeline is running");
     } else if (message.type === "caption") {
-      // 2026-07-26 fix: the gateway retains both language lanes for web history,
-      // while the laptop and extended overlays receive exactly the selected
-      // language. Same-language source captions are valid display output.
+      // The gateway retains both language lanes for web history. Desktop
+      // surfaces receive only the translated lane opposite this utterance's
+      // detected source language, independent of the old fixed display setting.
       if (!shouldDisplayLiveCaption(message, armedSession.displayLanguage)) return;
       for (const rendererWindow of [dashboardWindow, ...overlayWindows.values()]) {
         if (!rendererWindow) continue;
@@ -1855,30 +1882,61 @@ function registerOverlayIpc(settingsStore, { localAppOrigin, liveWorkspaceUrl, l
     if (!isAllowedOrigin(event.sender.getURL(), new Set([localAppOrigin]))) return { ok: false, code: "FORBIDDEN" };
     return ensureLiveGatewayBridge();
   });
-  ipcMain.on("live-call:audio-frame", (event, frame) => {
+  ipcMain.handle("live-call:audio-failed", async (event, detail) => {
+    if (!isAllowedOrigin(event.sender.getURL(), new Set([localAppOrigin]))) return { ok: false, code: "FORBIDDEN" };
+    if (!liveCallSession || liveCallSession.status !== "live") return { ok: false, code: "NOT_LIVE" };
+    const safeDetail = String(detail ?? "")
+      .replace(/[\u0000-\u001f\u007f]/gu, " ")
+      .trim()
+      .slice(0, 300);
+    stopLiveGatewayBridge("host audio capture failed");
+    setLiveBridgeAlert({
+      state: "failed",
+      code: "HOST_AUDIO_CAPTURE_FAILED",
+      message: safeDetail || "호스트 오디오를 시작하지 못했습니다. 입력 설정과 권한을 확인한 뒤 Live Call을 다시 시작하세요.",
+    });
+    notifyLiveBridgeFailure(
+      "Host audio unavailable",
+      safeDetail || "Check the selected audio input and macOS permissions, then restart the Live Call.",
+    );
+    return { ok: false, code: "HOST_AUDIO_CAPTURE_FAILED" };
+  });
+  ipcMain.on("live-call:audio-frame", (event, packet) => {
     if (!isAllowedOrigin(event.sender.getURL(), new Set([localAppOrigin]))) return;
     const bridge = liveGatewayBridge;
     if (!bridge?.ready || bridge.socket.readyState !== WebSocket.OPEN) return;
-    // Electron IPC may deliver the renderer's ArrayBuffer as a Buffer,
-    // Uint8Array, or ArrayBuffer depending on version — accept all views.
-    const bytes = Buffer.isBuffer(frame)
-      ? frame
-      : frame instanceof ArrayBuffer
-        ? Buffer.from(frame)
-        : ArrayBuffer.isView(frame)
-          ? Buffer.from(frame.buffer, frame.byteOffset, frame.byteLength)
+    const isKnownSource = packet?.source === "system" || packet?.source === "mic";
+    const pcm = packet?.pcm;
+    const bytes = Buffer.isBuffer(pcm)
+      ? pcm
+      : pcm instanceof ArrayBuffer
+        ? Buffer.from(pcm)
+        : ArrayBuffer.isView(pcm)
+          ? Buffer.from(pcm.buffer, pcm.byteOffset, pcm.byteLength)
           : null;
-    if (!bytes || bytes.length !== LIVE_BRIDGE_FRAME_BYTES) {
+    if (!isKnownSource || packet.sampleRate !== 24_000
+      || packet.frameDurationMs !== 100 || !bytes || bytes.length !== CAPTION_BRIDGE_PACKET_BYTES) {
       if (!bridge.didLogBadFrame) {
         bridge.didLogBadFrame = true;
-        console.warn(`[live-bridge] dropped frame: type=${Object.prototype.toString.call(frame)} bytes=${bytes?.length ?? "n/a"}`);
+        console.warn(`[live-bridge] dropped caption PCM packet: source=${String(packet?.source)} bytes=${bytes?.length ?? "n/a"}`);
       }
       return;
     }
-    bridge.forwardedFrames = (bridge.forwardedFrames ?? 0) + 1;
-    if (bridge.forwardedFrames === 1) console.info("[live-bridge] first audio frame forwarded to gateway");
-    if (bridge.forwardedFrames % 250 === 0) console.info(`[live-bridge] ${bridge.forwardedFrames} audio frames forwarded`);
-    bridge.socket.send(bytes);
+    const pcmFrames = adaptCaptionPcmForGateway(packet.source, bytes);
+    for (const pcmFrame of pcmFrames) {
+      const frame = encodeLiveAudioWireFrame(packet.source, pcmFrame);
+      if (!frame) {
+        if (!bridge.didLogBadFrame) {
+          bridge.didLogBadFrame = true;
+          console.warn("[live-bridge] dropped malformed gateway audio frame");
+        }
+        continue;
+      }
+      bridge.forwardedFrames = (bridge.forwardedFrames ?? 0) + 1;
+      if (bridge.forwardedFrames === 1) console.info("[live-bridge] first audio frame forwarded to gateway");
+      if (bridge.forwardedFrames % 250 === 0) console.info(`[live-bridge] ${bridge.forwardedFrames} audio frames forwarded`);
+      bridge.socket.send(frame);
+    }
   });
   ipcMain.handle("live-call:end", async (event) => {
     if (!isAllowedOrigin(event.sender.getURL(), new Set([localAppOrigin]))) return { ok: false, code: "FORBIDDEN" };

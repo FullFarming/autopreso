@@ -16,7 +16,8 @@ contextBridge.exposeInMainWorld("realtimeNoelDesktop", {
   goLiveCall: () => ipcRenderer.invoke("live-call:go-live"),
   hostSpeak: () => ipcRenderer.invoke("live-call:host-speak"),
   ensureLiveCallBridge: () => ipcRenderer.invoke("live-call:bridge-ensure"),
-  sendLiveCallAudioFrame: (frame) => ipcRenderer.send("live-call:audio-frame", frame),
+  reportLiveCallAudioFailure: (detail) => ipcRenderer.invoke("live-call:audio-failed", detail),
+  sendLiveCallAudioFrame: (packet) => ipcRenderer.send("live-call:audio-frame", packet),
   onLiveCallCaption: (listener) => {
     const handler = (_event, caption) => listener(caption);
     ipcRenderer.on("live-call:caption", handler);

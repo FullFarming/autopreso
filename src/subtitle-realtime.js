@@ -6,11 +6,19 @@ import { createGeminiTransport } from "./gemini-live-translate.js";
 import { DEFAULT_SUBTITLE_SETTINGS } from "./settings-store.js";
 import { createSubtitleLanguageState } from "./subtitle-language-state.js";
 import {
+  countLanguageSignalChars,
+  createCrossChannelEchoDeduper,
+  createSourceLanguageConsensus,
+  detectLanguage as detectCaptionLanguage,
+  detectSourceLanguage as detectCaptionSourceLanguage,
+  isOutputInTargetLanguage,
+  sourceConsensusContract,
+} from "../packages/caption-core/index.js";
+import {
   MAX_TRANSLATION_LANGUAGES,
   isSupportedSubtitleLanguage,
   normalizeSubtitleLanguageCode,
   resolveConfiguredLanguageForScript,
-  subtitleLanguageCharPattern,
   subtitleLanguageLabel,
   subtitleLanguagePrefixTokens,
   toOpenAITranslationLanguageCode,
@@ -57,52 +65,6 @@ const RECONNECT_BASE_MS = 500;
 const RECONNECT_MAX_MS = 5000;
 const MAX_AUTO_RECONNECTS = 10;
 const AUDIO_OUTPUT_MODES = new Set(["captions_audio", "audio"]);
-const LANGUAGE_LOCK_MIN_SIGNAL_CHARS = 4;
-const LANGUAGE_LOCK_MIN_CONFIDENCE = 0.68;
-// Korean-preference gate for MIXED Korean+English source text. Korean (Hangul) is
-// the unambiguously-detectable script, so we trust it — but only when there is
-// ENOUGH of it to mean Korean is actually being spoken, not a stray Hangul char
-// (a Gemini mis-transcription, a Korean name) contaminating otherwise-English
-// speech. The old "any Hangul → Korean" rule made KO→EN rock-solid but flipped
-// EN→KO to the English source on the slightest contamination. Require both a
-// minimum Hangul COUNT and a minimum Hangul RATIO.
-const KOREAN_MIX_MIN_CHARS = 3;
-const KOREAN_MIX_MIN_RATIO = 0.2;
-// Cross-channel source-language arbitration window. Both sibling channels (ko-target,
-// en-target) hear the same audio and report the source language they detect. The
-// authoritative source only CHANGES when the fresh reports agree (consensus); a lone
-// channel's flip against the others is held off (hysteresis). This resolves Gemini
-// returning a contradictory languageCode on ONE channel (e.g. langCode=en for Korean
-// audio on the ko channel while the en channel correctly says ko), which made both a
-// Korean echo and the English translation show and "중간에 계속 변함".
-const SOURCE_VOTE_WINDOW_MS = 4000;
-// How long a consensus source language stays authoritative WITHOUT being re-confirmed
-// by a fresh consensus. Past this, the hold expires and channels fall back to their
-// own per-channel detection. This bounds the hysteresis so a real KO→EN switch (the
-// held "ko" stops being re-confirmed the moment English starts) is recognized within
-// this window instead of waiting for both channels' languageCodes to agree on "en"
-// — the "영어로 얘기하는데 영어로 인식이 늦음" delay. Brief lone flips are still shorter
-// than this, so they stay suppressed.
-const SOURCE_HOLD_MS = 2000;
-const SOURCE_SOLO_FALLBACK_MS = 15_000;
-const SOURCE_SOLO_FALLBACK_REPORTS = 8;
-// When the two channels DISAGREE on the source language, a sibling whose source is
-// sustained Latin English (this many Latin chars, detected as English) is decisive:
-// English words can't be mistaken for Korean, whereas one channel often hallucinates a
-// Korean-SCRIPT transliteration of English ("디스커션 앤드…") that looks like Korean. So
-// "sustained English words → English is being spoken" (the user's hint), which makes the
-// transliterating channel suppress its English echo instead of both directions flipping.
-const SUSTAINED_ENGLISH_MIN_CHARS = 12;
-// The sustained-English tie-break judges only this many trailing chars of the
-// source buffer, so pre-switch English can't outvote the language actually
-// being spoken NOW (see reportSource).
-const SOURCE_TAIL_JUDGE_CHARS = 80;
-// Output display gate: text with at least this many signal chars is long
-// enough to judge; below it the lenient "unknown is fine" rule applies.
-const OUTPUT_LANGUAGE_JUDGE_MIN_CHARS = 8;
-// Relaxed vs the lock confidence so correct translations carrying foreign
-// proper nouns ("OpenAI 모델은...") are not misclassified as mixed.
-const OUTPUT_LANGUAGE_MIN_CONFIDENCE = 0.55;
 function redactTransportDiagnostic(value) {
   return String(value ?? "")
     .replace(/([?&](?:key|api_key|token)=)[^&\s]+/gi, "$1[redacted-secret]")
@@ -768,19 +730,7 @@ function createTranslationChannel({ source, targetLanguage, apiKeyRole, settings
     if (sourceLanguage === "unknown") return false;
     const translationRole = translationRoleForSource(sourceLanguage, targetLanguage, settings);
     if (!translationRole) return false;
-    // Output-language gate — passes when the TARGET language is meaningfully
-    // PRESENT, not when it DOMINATES. A Korean translation legitimately carries
-    // English proper nouns/acronyms (Cushman & Wakefield, Hilton Garden Inn, ADR,
-    // GOP, Value-Add…) whose Latin characters often OUTNUMBER the Hangul; the old
-    // dominance check then misclassified the line as English and suppressed the
-    // Korean subtitle entirely — the EN→KO "no subtitle / English passes through"
-    // asymmetry (KO→EN was unaffected because English output rarely contains
-    // Korean). A same-language echo (e.g. English on the KO channel) has ~zero
-    // target-language characters and is still rejected; the echo guards cover the
-    // rest. Short text is too small to judge → lenient.
-    const totalSignal = countLanguageSignalChars(translatedText);
-    if (totalSignal < OUTPUT_LANGUAGE_JUDGE_MIN_CHARS) return true;
-    return countLanguageCharsFor(translatedText, targetLanguage) >= 3;
+    return isOutputInTargetLanguage(translatedText, targetLanguage);
   }
 
   function resolvedSourceLanguage(options = {}) {
@@ -809,7 +759,7 @@ function createTranslationChannel({ source, targetLanguage, apiKeyRole, settings
   function deferPartialForSourceArbitration() {
     if (!translatedText.trim()) return;
     if (!partialHoldStartedAt) partialHoldStartedAt = Date.now();
-    const maxWaitMs = SOURCE_HOLD_MS + partialMaxHoldMs();
+    const maxWaitMs = sourceConsensusContract.holdMilliseconds + partialMaxHoldMs();
     const elapsed = Date.now() - partialHoldStartedAt;
     if (elapsed >= maxWaitMs) return;
     clearPartialTimer();
@@ -897,7 +847,7 @@ function createTranslationChannel({ source, targetLanguage, apiKeyRole, settings
       channelKey: targetLanguage,
     }) ?? detectedLanguage;
     if (sourceLanguage === "unknown") return;
-    const outputLanguage = detectLanguage(translatedText, { minimumSignalChars: 1 });
+    const outputLanguage = detectCaptionLanguage(translatedText, { minimumSignalChars: 1 });
     // Direction switch with a correct-language subtitle on screen → complete
     // that sentence as a committed line before any clearing below.
     if (
@@ -1385,10 +1335,6 @@ function sourcesForInputMode(inputMode) {
   return ["system", "mic"];
 }
 
-function normalizeCrossChannelText(text) {
-  return String(text ?? "").toLowerCase().replace(/[^a-z0-9가-힣ぁ-んァ-ヶ一-龯]/g, "");
-}
-
 // SHARED cross-channel echo registry. Catches Gemini's same-language echo: when
 // the audio is English, the EN-target channel hallucinates a Korean-transliterated
 // source and echoes the English back, while the KO-target channel transcribes the
@@ -1396,196 +1342,15 @@ function normalizeCrossChannelText(text) {
 // recorded SOURCE, that output is the source verbatim → an echo. This is the ONLY
 // piece that is shared across the sibling channels.
 export function createCrossChannelEchoRegistry() {
-  const recentSources = new Map();
-  // Channels register a clearEcho callback + a getter for their last-emitted
-  // partial so a freshly-recorded source can RETROACTIVELY clear a sibling's echo
-  // partial that beat it in the cross-channel race (turns a ~1.5s flash into ~200ms).
-  const channels = new Map();
-  const CROSS_CHANNEL_WINDOW_MS = 6000;
-  // Cross-channel source-language arbitration (see SOURCE_VOTE_WINDOW_MS). Each
-  // channel reports the source language IT detected; the authoritative source only
-  // moves on consensus, so one channel's hallucinated languageCode flip can't make
-  // it echo the source / both directions show at once.
-  const sourceReports = new Map();
-  let authoritativeSource = "unknown";
-  let authoritativeAt = 0;
-  let authoritativeIsConsensus = false;
-  let sourceReportSequence = 0;
-  let soloChallenge = { language: "unknown", count: 0, firstAt: 0, lastAt: 0 };
+  const echoDeduper = createCrossChannelEchoDeduper();
+  const sourceConsensus = createSourceLanguageConsensus();
   return {
-    reportSource(channelKey, language, sourceText = "", options = {}) {
-      if (!language || language === "unknown") return;
-      const now = Date.now();
-      // Judge sustained English on the RECENT TAIL of the source, not the whole
-      // accumulated buffer: right after an EN→KO switch the buffer still carries
-      // the earlier English, and judging the full text kept forcing the
-      // authoritative source to "en" while the speaker was already in Korean —
-      // the "영어→한글 전환 인식이 늦음" lag. The tail flips to Korean within a few
-      // words, letting the fresh Korean consensus take over immediately.
-      const tail = String(sourceText).slice(-SOURCE_TAIL_JUDGE_CHARS);
-      const latinCount = (tail.match(/[A-Za-z]/g) || []).length;
-      // Use detectSourceLanguage (it applies the Korean-preference ratio gate) so
-      // Korean speech studded with English jargon ("…hotel conversion strategy…") is
-      // NOT mistaken for English here — only genuinely English-dominant source counts.
-      const sustainedEnglish = latinCount >= SUSTAINED_ENGLISH_MIN_CHARS
-        && detectSourceLanguage(tail) === "en";
-      sourceReportSequence += 1;
-      sourceReports.set(channelKey, {
-        language,
-        sustainedEnglish,
-        isStrong: options.isStrong === true,
-        at: now,
-        sequence: sourceReportSequence,
-      });
-      const fresh = [...sourceReports.values()].filter((r) => now - r.at < SOURCE_VOTE_WINDOW_MS);
-      const langs = fresh.map((r) => r.language);
-      if (authoritativeIsConsensus && language === authoritativeSource) {
-        soloChallenge = { language: "unknown", count: 0, firstAt: 0, lastAt: 0 };
-      } else if (authoritativeIsConsensus && options.isStrong === true && language !== authoritativeSource) {
-        soloChallenge = soloChallenge.language === language
-          && now - soloChallenge.lastAt < SOURCE_VOTE_WINDOW_MS
-          ? { ...soloChallenge, count: soloChallenge.count + 1, lastAt: now }
-          : { language, count: 1, firstAt: now, lastAt: now };
-      }
-      const canUseSoloFallback = authoritativeIsConsensus
-        && soloChallenge.count >= SOURCE_SOLO_FALLBACK_REPORTS
-        && now - soloChallenge.firstAt >= SOURCE_SOLO_FALLBACK_MS
-        && !fresh.some((report) => report.language === authoritativeSource);
-      // A genuine MULTI-channel consensus (≥2 siblings agreeing) moves the authoritative
-      // source. A single reporter or a disagreement otherwise leaves it untouched, so
-      // channels fall back to their own per-channel detection (preserving the per-channel-
-      // pollution fix). Once both siblings agree, that consensus HOLDS against a later
-      // lone flip for SOURCE_HOLD_MS (hysteresis).
-      if (langs.length >= 2 && langs.every((l) => l === langs[0])) {
-        authoritativeSource = langs[0];
-        authoritativeAt = now;
-        authoritativeIsConsensus = true;
-        soloChallenge = { language: "unknown", count: 0, firstAt: 0, lastAt: 0 };
-      } else if (canUseSoloFallback) {
-        authoritativeSource = soloChallenge.language;
-        authoritativeAt = now;
-        authoritativeIsConsensus = false;
-        soloChallenge = { language: "unknown", count: 0, firstAt: 0, lastAt: 0 };
-      } else if (
-        fresh.some((r) => r.sustainedEnglish)
-        // The tie-break resolves a genuine cross-channel DISAGREEMENT, so it needs
-        // ≥2 fresh sibling reports. (Reaching this branch with 2+ fresh reports
-        // already implies they disagree — an agreement would have taken the consensus
-        // branch above.) A LONE sustained-Latin report is not a disagreement: it is
-        // just as likely a Latin transliteration of continuing Korean speech, which is
-        // why a held Korean consensus must survive it.
-        && fresh.length >= 2
-        // A consensus blocks the tie-break only while it is still FRESH. The guard
-        // used to be an unconditional `!authoritativeIsConsensus`, which killed the
-        // tie-break permanently after the first consensus of the session (see
-        // resolveSource) — exactly the state in which it is needed most: the speaker
-        // switches to English, the en-target channel hallucinates a Hangul
-        // transliteration, the ko-target channel hears real Latin English, and
-        // nothing could release the frozen "ko".
-        && !(authoritativeIsConsensus && now - authoritativeAt <= SOURCE_HOLD_MS)
-        && !(authoritativeSource !== "unknown" && now - authoritativeAt <= SOURCE_HOLD_MS
-          && fresh.some((r) => r.language === authoritativeSource && r.isStrong))
-      ) {
-        // Disagreement, but a sibling sees sustained Latin English → English IS being
-        // spoken; the disagreeing channel is transliterating it to Korean script.
-        authoritativeSource = "en";
-        authoritativeAt = now;
-        authoritativeIsConsensus = false;
-        soloChallenge = { language: "unknown", count: 0, firstAt: 0, lastAt: 0 };
-      } else if (
-        !authoritativeIsConsensus
-        &&
-        authoritativeSource !== "unknown"
-        && !fresh.some((r) => r.language === authoritativeSource)
-        && now - authoritativeAt > SOURCE_HOLD_MS
-      ) {
-        // NO fresh report supports the held source anymore — the consensus that
-        // installed it has dissolved (the speaker switched). Release the hold
-        // NOW instead of waiting out SOURCE_HOLD_MS, so channels fall back to
-        // their own detection and the new direction is picked up immediately
-        // ("영어로 인입되다가 바로 한글로 인입" 전환 지연 제거). A genuine
-        // hallucinated lone flip keeps at least one supporting report fresh, so
-        // the hysteresis still protects against it.
-        authoritativeSource = "unknown";
-        authoritativeAt = 0;
-        authoritativeIsConsensus = false;
-        soloChallenge = { language: "unknown", count: 0, firstAt: 0, lastAt: 0 };
-      }
-    },
-    resolveSource(fallback = "unknown", options = {}) {
-      if (options.isStrong === true && fallback !== "unknown" && fallback !== authoritativeSource) {
-        const now = Date.now();
-        if (authoritativeIsConsensus && authoritativeSource !== "unknown") return authoritativeSource;
-        const ownReport = options.channelKey === undefined ? null : sourceReports.get(options.channelKey);
-        const competingReports = [...sourceReports.entries()]
-          .filter(([channelKey, report]) => channelKey !== options.channelKey
-            && report.language === authoritativeSource
-            && now - report.at < SOURCE_HOLD_MS)
-          .map(([, report]) => report);
-        if (competingReports.some((report) => report.isStrong)) return authoritativeSource;
-        const newestCompetingSequence = Math.max(0, ...competingReports.map((report) => report.sequence));
-        if (!ownReport || ownReport.sequence > newestCompetingSequence) return fallback;
-      }
-      // A consensus that has not been re-confirmed recently is stale — yield to the
-      // caller's per-channel detection so a genuine language switch is picked up
-      // promptly instead of being pinned to the previous direction. SOURCE_HOLD_MS
-      // applies to a CONSENSUS hold too: the hold used to return unconditionally
-      // here, so the first time both channels agreed (the first Korean sentence of
-      // any bilingual meeting) pinned the arbitrated source for the WHOLE session.
-      // When the speaker then switched to English and the en-target channel
-      // hallucinated a Hangul transliteration, the frozen "ko" made the ko channel
-      // treat the source as its own language and show NOTHING to Korean viewers
-      // while English viewers got their own words echoed back. `authoritativeAt` is
-      // refreshed on every fresh consensus, so continuous same-direction speech
-      // re-confirms it every few hundred ms and never goes stale — the hysteresis
-      // against brief lone flips is unchanged.
-      if (authoritativeSource === "unknown") return fallback;
-      if (Date.now() - authoritativeAt > SOURCE_HOLD_MS) return fallback;
-      return authoritativeSource;
-    },
-    resetSource(channelKey) {
-      if (channelKey === undefined) {
-        sourceReports.clear();
-        authoritativeSource = "unknown";
-        authoritativeAt = 0;
-        authoritativeIsConsensus = false;
-        soloChallenge = { language: "unknown", count: 0, firstAt: 0, lastAt: 0 };
-        return;
-      }
-      sourceReports.delete(channelKey);
-      const now = Date.now();
-      const fresh = [...sourceReports.values()].filter((report) => now - report.at < SOURCE_VOTE_WINDOW_MS);
-      if (fresh.some((report) => report.language === authoritativeSource)) return;
-      if (!authoritativeIsConsensus && now - authoritativeAt > SOURCE_HOLD_MS) {
-        authoritativeSource = "unknown";
-        authoritativeAt = 0;
-        authoritativeIsConsensus = false;
-        soloChallenge = { language: "unknown", count: 0, firstAt: 0, lastAt: 0 };
-      }
-    },
-    registerChannel(channelKey, hooks) {
-      channels.set(channelKey, hooks);
-    },
-    recordSource(channelKey, text) {
-      const norm = normalizeCrossChannelText(text);
-      if (norm.length < 4) return;
-      recentSources.set(channelKey, { norm, at: Date.now() });
-      for (const [key, hooks] of channels) {
-        if (key === channelKey) continue;
-        const last = normalizeCrossChannelText(hooks.getLastPartial?.() ?? "");
-        if (last.length >= 6 && (norm.includes(last) || last.includes(norm))) hooks.clearEcho?.();
-      }
-    },
-    outputEchoesAnotherSource(channelKey, outputText) {
-      const out = normalizeCrossChannelText(outputText);
-      if (out.length < 6) return false;
-      const now = Date.now();
-      for (const [key, rec] of recentSources) {
-        if (key === channelKey || now - rec.at > CROSS_CHANNEL_WINDOW_MS || rec.norm.length < 6) continue;
-        if (rec.norm.includes(out) || out.includes(rec.norm)) return true;
-      }
-      return false;
-    },
+    reportSource: sourceConsensus.reportSource,
+    resolveSource: sourceConsensus.resolveSource,
+    resetSource: sourceConsensus.resetSource,
+    registerChannel: echoDeduper.registerChannel,
+    recordSource: echoDeduper.recordSource,
+    outputEchoesAnotherSource: echoDeduper.outputEchoesAnotherSource,
   };
 }
 
@@ -2296,7 +2061,7 @@ export function isSameLanguageEcho(sourceText, translatedText, targetLanguage) {
   if (!target) return false;
   const output = String(translatedText ?? "").trim();
   if (!output) return false;
-  if (detectLanguage(output, { minimumSignalChars: 1 }) !== target) return false;
+  if (detectCaptionLanguage(output, { minimumSignalChars: 1 }) !== target) return false;
   const source = String(sourceText ?? "").trim();
   if (source && hasOtherLanguageSignal(source, target)) return false;
   const sourceLanguage = detectSourceLanguage(source, { minimumSignalChars: 1 });
@@ -2314,63 +2079,8 @@ function hasOtherLanguageSignal(value, target) {
   return Object.entries(counts).some(([language, count]) => language !== target && count >= 2);
 }
 
-// Any letter of any supported script counts as signal. The extra scripts
-// (Cyrillic, Thai, Arabic, accented Latin) never appear in en/ko/ja text, so
-// legacy behavior is unchanged — but ru/th/ar output would otherwise never
-// reach the partial-display thresholds.
-const EXTRA_SIGNAL_CHAR = /[À-ÖØ-öø-ÿĀ-ỹА-яЁёก-๛؀-ۿ]/;
-
-function countLanguageSignalChars(value) {
-  let count = 0;
-  for (const char of String(value ?? "")) {
-    if (KOREAN_CHAR.test(char) || JAPANESE_CHAR.test(char) || ENGLISH_CHAR.test(char) || EXTRA_SIGNAL_CHAR.test(char)) count += 1;
-  }
-  return count;
-}
-
-// Count characters belonging to a specific language's script. Used by the output
-// gate to confirm the target language is present even when English proper nouns
-// inflate the Latin character count of a Korean/Japanese translation.
-function countLanguageCharsFor(value, language) {
-  const pattern = subtitleLanguageCharPattern(language);
-  let count = 0;
-  for (const char of String(value ?? "")) {
-    if (pattern.test(char)) count += 1;
-  }
-  return count;
-}
-
 export function detectSourceLanguage(value, options = {}) {
-  return detectLanguage(value, { preferKoreanWhenMixedWithEnglish: true, ...options });
-}
-
-function detectLanguage(value, options = {}) {
-  const text = String(value ?? "");
-  const counts = { ko: 0, ja: 0, en: 0 };
-  for (const char of text) {
-    if (KOREAN_CHAR.test(char)) counts.ko += 1;
-    else if (JAPANESE_CHAR.test(char)) counts.ja += 1;
-    else if (ENGLISH_CHAR.test(char)) counts.en += 1;
-  }
-  const signalCount = counts.ko + counts.ja + counts.en;
-  const minimumSignalChars = options.minimumSignalChars ?? LANGUAGE_LOCK_MIN_SIGNAL_CHARS;
-  if (signalCount < minimumSignalChars) return "unknown";
-  if (options.preferKoreanWhenMixedWithEnglish && counts.ko > 0 && counts.en > 0 && counts.ja === 0) {
-    // Trust Hangul as the direction signal ONLY when there is enough of it to mean
-    // Korean is actually being spoken — a meaningful COUNT and RATIO. A stray Hangul
-    // char or two in otherwise-English speech no longer flips the source to Korean
-    // (which used to echo the English source on the EN→KO direction); real Korean
-    // speech (even jargon-heavy) easily clears both thresholds, so KO→EN stays solid.
-    const koRatio = counts.ko / (counts.ko + counts.en);
-    if (counts.ko >= KOREAN_MIX_MIN_CHARS && koRatio >= KOREAN_MIX_MIN_RATIO) return "ko";
-    // Otherwise fall through to dominance/confidence: English-dominant text → English.
-  }
-  const entries = Object.entries(counts).sort((a, b) => b[1] - a[1]);
-  const [dominantLanguage, dominantCount] = entries[0];
-  if (dominantCount === entries[1][1]) return "unknown";
-  const confidence = dominantCount / signalCount;
-  if (confidence < (options.minimumConfidence ?? LANGUAGE_LOCK_MIN_CONFIDENCE)) return "unknown";
-  return dominantLanguage;
+  return detectCaptionSourceLanguage(value, options);
 }
 
 function normalizeLanguageCode(value) {

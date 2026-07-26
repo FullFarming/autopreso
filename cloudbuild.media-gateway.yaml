@@ -1,0 +1,11 @@
+steps:
+  - name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - --file
+      - media-gateway/Dockerfile
+      - --tag
+      - asia-northeast3-docker.pkg.dev/${PROJECT_ID}/cloud-run-source-deploy/realtime-noel-media-gateway:${BUILD_ID}
+      - .
+images:
+  - asia-northeast3-docker.pkg.dev/${PROJECT_ID}/cloud-run-source-deploy/realtime-noel-media-gateway:${BUILD_ID}

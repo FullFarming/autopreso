@@ -3,15 +3,18 @@ import {
   createTranslatedAudioGuard,
   shouldGateTranslatedAudioInput,
 } from "./subtitle-audio-player.js";
+import {
+  CAPTION_AUDIO_PROCESSOR_BUFFER_SIZE,
+  CAPTION_AUDIO_SAMPLE_RATE,
+  captureMicrophoneStream,
+  createCaptionAudioChunker,
+  pcm16ArrayBufferToBase64,
+} from "./subtitle-audio-capture.js";
 import { buildMonthGrid, buildTimeGrid } from "./records-calendar.js";
 // Every user-visible string in this file resolves through t(); subtitle-workspace.js
 // owns restoring/persisting the choice and the declarative data-i18n pass.
 import { getLanguage, subscribe as subscribeToLanguage, t } from "./subtitle-i18n.js";
 
-const SAMPLE_RATE = 24000;
-const LIVE_AUDIO_CHUNK_DURATION_MS = 100;
-const LIVE_AUDIO_CHUNK_SAMPLES = SAMPLE_RATE * LIVE_AUDIO_CHUNK_DURATION_MS / 1_000;
-const AUDIO_PROCESSOR_BUFFER_SIZE = 1024;
 const LOCAL_SERVER_DASHBOARD_URL = "http://127.0.0.1:3210/subtitle.html";
 const HISTORY_TIME_ZONE = "Asia/Seoul";
 const INPUT_SIGNAL_THRESHOLD = 0.035;
@@ -1598,7 +1601,7 @@ async function startSubtitles() {
     if (state.settings.outputMode !== "audio") setPreviewStatus(t("status.waitingForCaptions"), 1800);
 
     for (const capture of captures) {
-      const streamer = await createAudioStreamer(capture.stream, capture.source, capture.label, (audio) => {
+      const streamer = await createAudioStreamer(capture.stream, capture.source, capture.label, (packet) => {
         // Backpressure guard: if the server stops draining our socket, drop
         // frames instead of letting the browser's ws buffer grow without bound
         // (audio queues up, subtitles fall behind, then appear frozen).
@@ -1613,7 +1616,7 @@ async function startSubtitles() {
             type: "subtitle:audio",
             sessionId: state.sessionId,
             source: capture.source,
-            audio,
+            audio: pcm16ArrayBufferToBase64(packet.pcm),
           }));
         }
       });
@@ -1783,22 +1786,9 @@ async function captureSystemAudio() {
 }
 
 async function captureMicrophoneAudio() {
-  const audio = {
-    echoCancellation: true,
-    noiseSuppression: true,
-    autoGainControl: true,
-  };
-  if (!micSelect.value) return navigator.mediaDevices.getUserMedia({ audio });
-  try {
-    return await navigator.mediaDevices.getUserMedia({ audio: { ...audio, deviceId: { exact: micSelect.value } } });
-  } catch (error) {
-    // A persisted device id can go stale (mic unplugged, ids renumbered) and
-    // then the exact constraint throws OverconstrainedError. Permission errors
-    // would fail again anyway, so always retry once on the system default mic
-    // rather than losing the whole mic input.
+  return captureMicrophoneStream(navigator.mediaDevices, micSelect.value, (error) => {
     console.warn(`[subtitle] selected microphone failed (${error?.name ?? error}); retrying with system default`);
-    return navigator.mediaDevices.getUserMedia({ audio });
-  }
+  });
 }
 
 function withMediaCaptureTimeout(promise, sourceName) {
@@ -1835,14 +1825,13 @@ function stopMediaStream(stream) {
 
 
 async function createAudioStreamer(media, sourceName, label, onChunk) {
-  const context = new AudioContext({ sampleRate: SAMPLE_RATE, latencyHint: "interactive" });
+  const context = new AudioContext({ sampleRate: CAPTION_AUDIO_SAMPLE_RATE, latencyHint: "interactive" });
   await ensureAudioContextRunning(context, sourceName);
   const source = context.createMediaStreamSource(media);
-  const processor = context.createScriptProcessor(AUDIO_PROCESSOR_BUFFER_SIZE, 1, 1);
+  const processor = context.createScriptProcessor(CAPTION_AUDIO_PROCESSOR_BUFFER_SIZE, 1, 1);
   const analyser = context.createAnalyser();
   analyser.fftSize = 256;
-  let carry = new Float32Array(0);
-  let pendingSamples = new Float32Array(0);
+  const chunker = createCaptionAudioChunker({ inputSampleRate: context.sampleRate, source: sourceName, onChunk });
   const meter = startAudioLevelMeter(sourceName, label, analyser);
   const cleanupTrackDiagnostics = watchAudioTrackState(media, sourceName);
 
@@ -1852,21 +1841,7 @@ async function createAudioStreamer(media, sourceName, label, onChunk) {
   });
 
   processor.onaudioprocess = (event) => {
-    const input = event.inputBuffer.getChannelData(0);
-    const resampled = context.sampleRate === SAMPLE_RATE
-      ? { samples: input, carry: new Float32Array(0) }
-      : resample(input, context.sampleRate, SAMPLE_RATE, carry);
-    carry = resampled.carry;
-    if (resampled.samples.length === 0) return;
-    const availableSamples = new Float32Array(pendingSamples.length + resampled.samples.length);
-    availableSamples.set(pendingSamples);
-    availableSamples.set(resampled.samples, pendingSamples.length);
-    let offset = 0;
-    while (availableSamples.length - offset >= LIVE_AUDIO_CHUNK_SAMPLES) {
-      onChunk(pcm16ToBase64(availableSamples.subarray(offset, offset + LIVE_AUDIO_CHUNK_SAMPLES)));
-      offset += LIVE_AUDIO_CHUNK_SAMPLES;
-    }
-    pendingSamples = availableSamples.slice(offset);
+    chunker.push(event.inputBuffer.getChannelData(0));
   };
 
   source.connect(processor);
@@ -1880,7 +1855,7 @@ async function createAudioStreamer(media, sourceName, label, onChunk) {
     close: async () => {
       // A trailing fragment shorter than the Live API's 100 ms frame belongs to
       // the ending session and must not leak into a later session.
-      pendingSamples = new Float32Array(0);
+      chunker.reset();
       cleanupTrackDiagnostics();
       meter.close();
       processor.disconnect();
@@ -2020,36 +1995,6 @@ function selectedMicrophoneLabel() {
 
 function getAudioTrackLabel(stream, fallback) {
   return stream.getAudioTracks()[0]?.label || fallback;
-}
-
-function resample(input, fromRate, toRate, carry) {
-  const merged = new Float32Array(carry.length + input.length);
-  merged.set(carry);
-  merged.set(input, carry.length);
-  const ratio = fromRate / toRate;
-  const outputLength = Math.floor((merged.length - 1) / ratio);
-  const output = new Float32Array(outputLength);
-  for (let index = 0; index < outputLength; index += 1) {
-    const sourceIndex = index * ratio;
-    const left = Math.floor(sourceIndex);
-    const right = Math.min(left + 1, merged.length - 1);
-    const weight = sourceIndex - left;
-    output[index] = merged[left] * (1 - weight) + merged[right] * weight;
-  }
-  const consumed = Math.floor(outputLength * ratio);
-  return { samples: output, carry: merged.slice(consumed) };
-}
-
-function pcm16ToBase64(samples) {
-  const pcm = new Int16Array(samples.length);
-  for (let index = 0; index < samples.length; index += 1) {
-    const sample = Math.max(-1, Math.min(1, samples[index]));
-    pcm[index] = sample < 0 ? sample * 0x8000 : sample * 0x7fff;
-  }
-  const bytes = new Uint8Array(pcm.buffer);
-  let binary = "";
-  for (let index = 0; index < bytes.length; index += 1) binary += String.fromCharCode(bytes[index]);
-  return btoa(binary);
 }
 
 // Device labels stay empty until the page has held a mic permission grant at
@@ -3010,11 +2955,9 @@ function formatCaptureFailure(source, error) {
 
 // ── Live Call host audio bridge ────────────────────────────────────────────
 // Cloud Run only admits the desktop through the trusted non-browser path, so
-// the MAIN process owns the gateway host socket. This renderer's only job is
-// the microphone: once the call is live it captures 16 kHz mono PCM and
-// forwards 40ms (1280-byte) frames over IPC.
-const LIVE_BRIDGE_SAMPLE_RATE = 16_000;
-const LIVE_BRIDGE_FRAME_SAMPLES = LIVE_BRIDGE_SAMPLE_RATE * 40 / 1_000;
+// the MAIN process owns the gateway host socket. Capture remains in this
+// renderer and deliberately uses the same source selection, microphone
+// constraints, 24 kHz engine, and 100 ms framing as Caption-only.
 let liveBridgeCapture = null;
 let isLiveBridgeStarting = false;
 
@@ -3022,84 +2965,39 @@ function stopLiveCallAudioBridge(reason) {
   if (!liveBridgeCapture) return;
   const capture = liveBridgeCapture;
   liveBridgeCapture = null;
-  try { capture.processor?.disconnect(); } catch { /* detached */ }
-  try { capture.sourceNode?.disconnect(); } catch { /* detached */ }
-  try { capture.stream?.getTracks().forEach((track) => track.stop()); } catch { /* stopped */ }
-  try { void capture.audioContext?.close(); } catch { /* closed */ }
-  console.info(`[live-bridge] mic capture stopped${reason ? ` (${reason})` : ""}`);
-}
-
-function resampleLinear(input, fromRate, toRate) {
-  if (fromRate === toRate) return input;
-  const outputLength = Math.floor(input.length * toRate / fromRate);
-  const output = new Float32Array(outputLength);
-  const step = fromRate / toRate;
-  for (let index = 0; index < outputLength; index += 1) {
-    const position = index * step;
-    const base = Math.floor(position);
-    const fraction = position - base;
-    const next = Math.min(base + 1, input.length - 1);
-    output[index] = input[base] * (1 - fraction) + input[next] * fraction;
-  }
-  return output;
+  for (const streamer of capture.streamers ?? []) void streamer.close?.();
+  for (const stream of capture.streams ?? []) stopMediaStream(stream);
+  console.info(`[live-bridge] audio capture stopped${reason ? ` (${reason})` : ""}`);
 }
 
 async function startLiveCallMicCapture() {
-  const capture = { pcmQueue: new Float32Array(0) };
+  const capture = { streams: [], streamers: [] };
   liveBridgeCapture = capture;
   try {
-    capture.stream = await navigator.mediaDevices.getUserMedia({
-      audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true },
-    });
-    capture.audioContext = new AudioContext({ sampleRate: LIVE_BRIDGE_SAMPLE_RATE });
-    capture.sourceNode = capture.audioContext.createMediaStreamSource(capture.stream);
-    capture.processor = capture.audioContext.createScriptProcessor(4096, 1, 1);
-    capture.processor.onaudioprocess = (audioEvent) => {
-      if (liveBridgeCapture !== capture) return;
-      const captured = resampleLinear(
-        audioEvent.inputBuffer.getChannelData(0),
-        capture.audioContext.sampleRate,
-        LIVE_BRIDGE_SAMPLE_RATE,
-      );
-      // Silent-mic detector: a live session where every frame is ~0 means the
-      // OS handed us a muted/wrong device — the gateway then captions nothing
-      // ("Audio Timeout"). Logged with the [live-bridge] prefix so the main
-      // process mirrors it into the app log.
-      let rmsEnergy = 0;
-      for (let sampleIndex = 0; sampleIndex < captured.length; sampleIndex += 1) {
-        rmsEnergy += captured[sampleIndex] * captured[sampleIndex];
-      }
-      capture.rmsSum = (capture.rmsSum ?? 0) + rmsEnergy;
-      capture.rmsSamples = (capture.rmsSamples ?? 0) + captured.length;
-      const rmsNow = Date.now();
-      if (rmsNow - (capture.rmsLoggedAt ?? 0) >= 5_000 && capture.rmsSamples > 0) {
-        const rms = Math.sqrt(capture.rmsSum / capture.rmsSamples);
-        console.info(`[live-bridge] mic rms=${rms.toFixed(4)}${rms < 0.001 ? " — SILENT INPUT: check macOS mic permission and the selected input device" : ""}`);
-        capture.rmsSum = 0;
-        capture.rmsSamples = 0;
-        capture.rmsLoggedAt = rmsNow;
-      }
-      const merged = new Float32Array(capture.pcmQueue.length + captured.length);
-      merged.set(capture.pcmQueue);
-      merged.set(captured, capture.pcmQueue.length);
-      let offset = 0;
-      while (merged.length - offset >= LIVE_BRIDGE_FRAME_SAMPLES) {
-        const frame = new Int16Array(LIVE_BRIDGE_FRAME_SAMPLES);
-        for (let index = 0; index < LIVE_BRIDGE_FRAME_SAMPLES; index += 1) {
-          const sample = Math.max(-1, Math.min(1, merged[offset + index]));
-          frame[index] = sample < 0 ? sample * 0x8000 : sample * 0x7fff;
-        }
-        window.realtimeNoelDesktop.sendLiveCallAudioFrame(frame.buffer);
-        offset += LIVE_BRIDGE_FRAME_SAMPLES;
-      }
-      capture.pcmQueue = merged.slice(offset);
-    };
-    capture.sourceNode.connect(capture.processor);
-    capture.processor.connect(capture.audioContext.destination);
-    console.info("[live-bridge] host microphone is streaming to the gateway");
+    state.settings = readSettingsFromForm();
+    const sources = await captureSelectedAudio(state.settings);
+    if (liveBridgeCapture !== capture) {
+      for (const source of sources) stopMediaStream(source.stream);
+      return { ok: false, cancelled: true };
+    }
+    capture.streams = sources.map((source) => source.stream);
+    for (const source of sources) {
+      const streamer = await createAudioStreamer(source.stream, source.source, source.label, (packet) => {
+        if (liveBridgeCapture !== capture) return;
+        window.realtimeNoelDesktop.sendLiveCallAudioFrame(packet);
+      });
+      capture.streamers.push(streamer);
+    }
+    console.info(`[live-bridge] ${sources.map((source) => source.source).join("+")} audio is streaming to the gateway`);
+    return { ok: true };
   } catch (error) {
-    console.warn(`[live-bridge] microphone unavailable: ${error?.message ?? error}`);
-    stopLiveCallAudioBridge("microphone unavailable");
+    console.warn(`[live-bridge] audio capture unavailable: ${error?.message ?? error}`);
+    for (const streamer of capture.streamers) void streamer.close?.();
+    for (const stream of capture.streams) stopMediaStream(stream);
+    capture.streamers = [];
+    capture.streams = [];
+    capture.failed = true;
+    return { ok: false, error };
   }
 }
 
@@ -3140,6 +3038,7 @@ async function syncLiveCallAudioBridge() {
     if (activeCaptionSessionOwner === "live-call") await stopSubtitles();
     return;
   }
+  if (liveBridgeCapture?.failed) return;
   if (isLiveBridgeStarting) return;
   isLiveBridgeStarting = true;
   try {
@@ -3158,7 +3057,19 @@ async function syncLiveCallAudioBridge() {
     }
     // Capture starts once and keeps feeding frames; main drops them until the
     // gateway pipeline reports started.
-    if (!liveBridgeCapture) await startLiveCallMicCapture();
+    if (!liveBridgeCapture) {
+      const captureResult = await startLiveCallMicCapture();
+      if (captureResult.cancelled) return;
+      if (!captureResult.ok) {
+        const error = captureResult.error instanceof Error
+          ? captureResult.error
+          : new Error(String(captureResult.error ?? t("error.micFailed", { reason: "unknown" })));
+        showError(error);
+        setConnectionStatus(error.message, "error");
+        await bridge.reportLiveCallAudioFailure?.(error.message);
+        return;
+      }
+    }
   } catch (error) {
     console.warn(`[live-bridge] producer transition failed: ${error?.message ?? error}`);
   } finally {
@@ -3210,14 +3121,14 @@ async function startLocalLiveCallFallback(liveState) {
       },
     }));
     for (const capture of captures) {
-      const streamer = await createAudioStreamer(capture.stream, capture.source, capture.label, (audio) => {
+      const streamer = await createAudioStreamer(capture.stream, capture.source, capture.label, (packet) => {
         if ((state.ws?.bufferedAmount ?? 0) > 1_000_000) return;
         if (state.ws?.readyState !== WebSocket.OPEN || !state.sessionId) return;
         state.ws.send(JSON.stringify({
           type: "subtitle:audio",
           sessionId: state.sessionId,
           source: capture.source,
-          audio,
+          audio: pcm16ArrayBufferToBase64(packet.pcm),
         }));
       });
       state.streamers.push(streamer);

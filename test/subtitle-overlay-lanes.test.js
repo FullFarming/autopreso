@@ -270,7 +270,7 @@ test("append-only word rendering keeps already-shown words stable as a partial g
   assert.match(dom.zoneText("bottom-center"), /expanding rapidly with recovering demand/);
 });
 
-test("Live Call floor boundaries clear the previous speaker while one speaker rolls completed sentences", async () => {
+test("Live Call floor boundaries clear only the uncommitted tail while completed sentences linger", async () => {
   const dom = installDom({ withDesktopFloor: true });
   await loadOverlay("live-call-floor-boundary");
   const ws = dom.getWs();
@@ -293,7 +293,11 @@ test("Live Call floor boundaries clear the previous speaker while one speaker ro
   assert.match(dom.zoneText("bottom-center"), /host's final sentence/);
 
   dom.fireFloor({ holder: { participantId: "participant-1", name: "Participant" } });
-  assert.equal(dom.zoneText("bottom-center"), "", "speaker handoff must clear the host final immediately");
+  assert.equal(
+    dom.zoneText("bottom-center"),
+    "The host's final sentence remains readable.",
+    "speaker handoff must preserve the committed Caption-only roll-up",
+  );
 
   ws.recv({
     type: "subtitle:partial",
@@ -325,7 +329,10 @@ test("Live Call floor boundaries clear the previous speaker while one speaker ro
     translatedText: "The participant spoke through the web app.",
     seq: 4,
   });
-  assert.equal(dom.zoneText("bottom-center"), "The participant spoke through the web app.");
+  assert.equal(
+    dom.zoneText("bottom-center"),
+    "The host's final sentence remains readable. The participant spoke through the web app.",
+  );
 
   ws.recv({
     type: "subtitle:committed",
@@ -337,7 +344,7 @@ test("Live Call floor boundaries clear the previous speaker while one speaker ro
   });
   assert.equal(
     dom.zoneText("bottom-center"),
-    "The participant spoke through the web app. A new utterance replaces the old final.",
+    "The host's final sentence remains readable. The participant spoke through the web app. A new utterance replaces the old final.",
     "the same speaker's next completed sentence rolls up below the previous final",
   );
 });
@@ -359,7 +366,7 @@ test("a new Live Call partial keeps the previous final until the next sentence c
   );
 });
 
-test("Live Call starts the growing sentence on a new movie-caption row and caps it at three lines", async () => {
+test("Live Call uses the Caption-only natural flow and configured line budget", async () => {
   const dom = installDom();
   await loadOverlay("live-call-movie-row");
   const ws = dom.getWs();
@@ -376,9 +383,9 @@ test("Live Call starts the growing sentence on a new movie-caption row and caps 
   const lane = zone?.querySelector(".subtitle-lane");
   const box = zone?.querySelector(".subtitle-box");
   const flow = zone?.querySelector(".subtitle-flow");
-  assert.ok(lane?.classList.contains("is-live-call"), "only Live Call receives the movie-row treatment");
-  assert.ok(flow?.children.some((child) => child.tag === "br"), "the new sentence must grow below the completed sentence");
-  assert.equal(box?.style["--subtitle-line-clamp"], "3", "Live Call never occupies more than three movie-style lines");
+  assert.equal(lane?.classList.contains("is-live-call"), false, "Live Call must not have a renderer fork");
+  assert.equal(flow?.children.some((child) => child.tag === "br"), false, "both modes must wrap from one natural word flow");
+  assert.equal(box?.style["--subtitle-line-clamp"], "8", "Live Call follows the same configured budget as Caption-only");
 });
 
 test("captions-only keeps the reference flow unchanged", async () => {
@@ -420,7 +427,7 @@ test("Live Call speaker identity stays above the caption until its lane or floor
   assert.equal(dom.speakerText("bottom-center"), "Host", "identity must not use the previous five-second badge timer");
 
   dom.fireFloor({ holder: { participantId: "participant-1", name: "김노엘" } });
-  assert.equal(dom.speakerText("bottom-center"), "", "a floor boundary clears the previous speaker and caption together");
+  assert.equal(dom.speakerText("bottom-center"), "", "a floor boundary clears the previous speaker identity");
 
   ws.recv({
     type: "subtitle:partial",

@@ -158,6 +158,7 @@ test("Live Call IPC uses exact origin checks for read and mutation channels", ()
     "live-call:get-host-login-status",
     "live-call:get-state",
     "live-call:go-live",
+    "live-call:audio-failed",
   ]) {
     const start = handlers.indexOf(`ipcMain.handle("${channel}"`);
     assert.notEqual(start, -1, channel);
@@ -205,6 +206,7 @@ function loadLiveBridgeReconnect(overrides = {}) {
     liveBridgeReconnectTimer: null,
     liveBridgeReconnectAttempts: 0,
     liveBridgeCredentialRefreshTimer: null,
+    liveBridgeAudioAdapters: new Map(),
     liveBridgeAlert: null,
     hasNotifiedLiveBridgeFailure: false,
     clearLiveBridgeCredentialRefresh: () => {},

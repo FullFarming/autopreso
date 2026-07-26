@@ -24,6 +24,7 @@
     "assets/",
     "electron/",
     "LICENSE",
+    "packages/caption-core/",
     "public/",
     "src/"
   ],
@@ -47,6 +48,7 @@
     "files": [
       "assets/**",
       "electron/**",
+      "packages/caption-core/**",
       "public/**",
       "src/**",
       "package.json"

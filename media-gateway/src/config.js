@@ -166,6 +166,21 @@ export function readGatewayEnvironment(environment = process.env) {
   if (!Number.isFinite(hostReconnectGraceMilliseconds) || hostReconnectGraceMilliseconds < 0) {
     throw new Error("LIVE_HOST_RECONNECT_GRACE_MS가 올바르지 않습니다.");
   }
+  const readPolishWeight = (name, fallback) => {
+    const raw = environment[name] ?? String(fallback);
+    if (!/^\d+$/u.test(String(raw))) throw new Error(`${name} 환경변수가 올바르지 않습니다.`);
+    const value = Number(raw);
+    if (!Number.isSafeInteger(value) || value < 0 || value > 10_000) throw new Error(`${name} 환경변수가 올바르지 않습니다.`);
+    return value;
+  };
+  const captionPolishPolicyWeights = {
+    off: readPolishWeight("LIVE_CAPTION_POLISH_OFF_BPS", 0),
+    selective: readPolishWeight("LIVE_CAPTION_POLISH_SELECTIVE_BPS", 10_000),
+    full: readPolishWeight("LIVE_CAPTION_POLISH_FULL_BPS", 0),
+  };
+  if (Object.values(captionPolishPolicyWeights).reduce((sum, value) => sum + value, 0) > 10_000) {
+    throw new Error("LIVE_CAPTION_POLISH 정책 비율 합계는 10000 이하여야 합니다.");
+  }
   return {
     port: Number(environment.PORT ?? 8080),
     host: isExactLocalSupabase && canUseLocalSupabase ? "127.0.0.1" : "0.0.0.0",
@@ -182,6 +197,7 @@ export function readGatewayEnvironment(environment = process.env) {
     viewerSecret: environment.LIVE_VIEWER_TOKEN_SECRET.trim(),
     sttLanguageCodes,
     hostReconnectGraceMilliseconds,
+    captionPolishPolicyWeights,
     externalEnvironment: "development",
   };
 }

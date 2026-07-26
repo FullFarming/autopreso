@@ -18,6 +18,7 @@ const geminiSource = readFileSync(new URL("../src/gemini-live-translate.js", imp
 const realtimeSource = readFileSync(new URL("../src/subtitle-realtime.js", import.meta.url), "utf8");
 const serverSource = readFileSync(new URL("../src/server.js", import.meta.url), "utf8");
 const dashboardSource = readFileSync(new URL("../public/subtitle-dashboard.js", import.meta.url), "utf8");
+const audioCaptureSource = readFileSync(new URL("../public/subtitle-audio-capture.js", import.meta.url), "utf8");
 const audioPlayerSource = readFileSync(new URL("../public/subtitle-audio-player.js", import.meta.url), "utf8");
 
 const VALID_PCM = Buffer.alloc(4_800, 1).toString("base64");
@@ -402,7 +403,7 @@ test("desktop translated audio blocks replay and its own system-loopback feedbac
     "streaming feedback isolation must distinguish system loopback from microphone input");
   requireSource(dashboardSource, /isFeedbackSuppressed = shouldGateTranslatedAudioInput[\s\S]{0,180}sourceName/u,
     "input status must report source-specific feedback isolation");
-  requireSource(dashboardSource, /echoCancellation:\s*true/u, "microphone echo cancellation must be enabled");
-  requireSource(dashboardSource, /noiseSuppression:\s*true/u, "microphone noise suppression must be enabled");
-  requireSource(dashboardSource, /autoGainControl:\s*true/u, "microphone automatic gain control must be enabled");
+  requireSource(audioCaptureSource, /echoCancellation:\s*true/u, "microphone echo cancellation must be enabled");
+  requireSource(audioCaptureSource, /noiseSuppression:\s*true/u, "microphone noise suppression must be enabled");
+  requireSource(audioCaptureSource, /autoGainControl:\s*true/u, "microphone automatic gain control must be enabled");
 });

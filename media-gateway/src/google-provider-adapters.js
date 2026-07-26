@@ -95,8 +95,38 @@ const TTS_RESPONSE_HIGH_WATER_BYTES = 144_000;
 const TTS_RESPONSE_LOW_WATER_BYTES = 72_000;
 const MAX_TTS_RESPONSE_BUFFER_BYTES = 480_000;
 const GEMINI_INPUT_CHUNK_BYTES = 3_200;
-const INPUT_CONTEXT_MAX_AGE_MILLISECONDS = 1_000;
 const MAX_GEMINI_LIVE_AUDIO_PART_BYTES = 192_000;
+
+export class SourceOutputCorrelationPolicy {
+  constructor({ minWaitMs = 80, maxWaitMs = 600, minContextAgeMs = 1_000, maxContextAgeMs = 5_000, sampleLimit = 128 } = {}) {
+    this.minWaitMs = minWaitMs;
+    this.maxWaitMs = maxWaitMs;
+    this.minContextAgeMs = minContextAgeMs;
+    this.maxContextAgeMs = maxContextAgeMs;
+    this.sampleLimit = sampleLimit;
+    this.samples = [];
+  }
+
+  observe(milliseconds) {
+    const value = Math.max(0, Number(milliseconds) || 0);
+    this.samples.push(value);
+    if (this.samples.length > this.sampleLimit) this.samples.shift();
+  }
+
+  p99() {
+    if (this.samples.length === 0) return 120;
+    const sorted = [...this.samples].sort((left, right) => left - right);
+    return sorted[Math.min(sorted.length - 1, Math.ceil(sorted.length * 0.99) - 1)];
+  }
+
+  outputWaitMs() {
+    return Math.min(this.maxWaitMs, Math.max(this.minWaitMs, Math.ceil(this.p99() * 1.25)));
+  }
+
+  contextMaxAgeMs() {
+    return Math.min(this.maxContextAgeMs, Math.max(this.minContextAgeMs, Math.ceil(this.p99() * 3)));
+  }
+}
 
 export class GeminiLiveTranslateAdapter {
   constructor({
@@ -125,8 +155,8 @@ export class GeminiLiveTranslateAdapter {
    *  comment on `enqueueCallback`. Defaults to a no-op so existing callers keep
    *  today's fail-open behaviour, minus the silence. */
   async open({
-    language, onCaption, onAudio, onInterruption, onInputCaption = null,
-    onCallbackError = null, correlateInputCaption = false,
+    language, channelId = language, onCaption, onAudio, onInterruption, onInputCaption = null, onInputObservation = null,
+    onCallbackError = null, correlateInputCaption = false, observeLatency = null,
   }) {
     const targetLanguageCode = LIVE_TRANSLATION_LANGUAGE_CODES.get(language) ?? language;
     let session = null;
@@ -184,7 +214,8 @@ export class GeminiLiveTranslateAdapter {
     let inputTranscriptLanguageCode = null;
     let outputTranscriptLanguageCode = null;
     let nextUtteranceIdentity = 0;
-    const utteranceNamespace = encodeURIComponent(String(language));
+    const utteranceNamespace = encodeURIComponent(String(channelId));
+    const correlationPolicy = new SourceOutputCorrelationPolicy();
     const inputContexts = [];
     const captureSegments = [];
     let pendingOutputFinal = null;
@@ -258,6 +289,7 @@ export class GeminiLiveTranslateAdapter {
           utteranceKey: `gemini:${utteranceNamespace}:${activeConnectionGeneration}:${++nextUtteranceIdentity}`,
           capturedAt: capture?.capturedAt,
           floorSpeaker: capture?.floorSpeaker ?? null,
+          inputSource: capture?.inputSource ?? null,
           createdAt: this.now(),
           captureSegment: capture,
         };
@@ -266,25 +298,33 @@ export class GeminiLiveTranslateAdapter {
           retireCaptureSegment(inputContexts.shift());
         }
       }
-      const callbackCaption = { ...caption, languageCode: inputTranscriptLanguageCode, ...(inputContext ?? {}) };
+      const callbackCaption = { ...caption, languageCode: inputTranscriptLanguageCode, targetLanguage: language, ...(inputContext ?? {}) };
+      const publishInputCallbacks = async () => {
+        await onInputObservation?.(callbackCaption);
+        await onInputCaption?.(callbackCaption);
+      };
       if (caption.isFinal) {
         if (await waitForDetachedFinalCapacity()) {
-          dispatchFinalCallback(() => onInputCaption?.(callbackCaption));
+          dispatchFinalCallback(publishInputCallbacks);
         }
       }
-      else await onInputCaption?.(callbackCaption);
+      else await publishInputCallbacks();
       if (caption.isFinal && pendingOutputFinal && !isFinalDrainCancelled) {
         const pending = pendingOutputFinal;
         pendingOutputFinal = null;
         if (pendingOutputTimer !== null) clearTimeout(pendingOutputTimer);
         pendingOutputTimer = null;
-        await deliverOutput(pending, takeInputContext());
+        const skew = Math.max(0, this.now() - pending.queuedAt);
+        correlationPolicy.observe(skew);
+        observeLatency?.("source_output_correlation_latency_ms", skew);
+        await deliverOutput(pending.caption, takeInputContext());
       }
     };
     const takeInputContext = () => {
       while (inputContexts.length > 0
-        && this.now() - inputContexts[0].createdAt > INPUT_CONTEXT_MAX_AGE_MILLISECONDS) {
+        && this.now() - inputContexts[0].createdAt > correlationPolicy.contextMaxAgeMs()) {
         retireCaptureSegment(inputContexts.shift());
+        observeLatency?.("source_output_context_expired_total", 1);
       }
       return inputContexts.shift() ?? null;
     };
@@ -303,6 +343,7 @@ export class GeminiLiveTranslateAdapter {
         utteranceKey: context.utteranceKey,
         capturedAt: context.capturedAt,
         floorSpeaker: context.floorSpeaker,
+        inputSource: context.inputSource,
       } : {};
       const callbackCaption = { ...caption, ...publicContext };
       if (caption.isFinal) {
@@ -320,19 +361,26 @@ export class GeminiLiveTranslateAdapter {
         ? { ...caption, languageCode: outputTranscriptLanguageCode }
         : caption;
       const context = caption.isFinal ? takeInputContext() : (inputContexts[0] ?? null);
+      if (caption.isFinal && context) {
+        const skew = Math.max(0, this.now() - context.createdAt);
+        correlationPolicy.observe(skew);
+        observeLatency?.("source_output_correlation_latency_ms", skew);
+      }
       if (caption.isFinal && !context && correlateInputCaption) {
-        if (pendingOutputFinal) await deliverOutput(pendingOutputFinal, null);
-        pendingOutputFinal = captionWithLanguage;
+        if (pendingOutputFinal) await deliverOutput(pendingOutputFinal.caption, null);
+        pendingOutputFinal = { caption: captionWithLanguage, queuedAt: this.now() };
         if (pendingOutputTimer !== null) clearTimeout(pendingOutputTimer);
+        const waitMilliseconds = correlationPolicy.outputWaitMs();
+        observeLatency?.("source_output_correlation_wait_ms", waitMilliseconds);
         pendingOutputTimer = setTimeout(() => {
           pendingOutputTimer = null;
           enqueueCallback(async () => {
             if (!pendingOutputFinal || isClosed) return;
             const pending = pendingOutputFinal;
             pendingOutputFinal = null;
-            await deliverOutput(pending, null);
+            await deliverOutput(pending.caption, null);
           });
-        }, 120);
+        }, waitMilliseconds);
         return;
       }
       await deliverOutput(captionWithLanguage, context);
@@ -600,6 +648,7 @@ export class GeminiLiveTranslateAdapter {
             captureSegments.push({
               capturedAt: metadata.capturedAt,
               floorSpeaker: metadata.floorSpeaker ?? null,
+              inputSource: ["system", "mic", "participant"].includes(metadata.source) ? metadata.source : null,
               hasInputFinal: false,
               hasInputPartial: false,
             });
@@ -679,7 +728,7 @@ export class GeminiLiveTranslateAdapter {
         // Keep the record gap-free, but fail closed on identity: an output that
         // reached us without its source before the boundary is published with
         // no speaker rather than being attached to the new floor holder.
-        if (orphanedOutputFinal) enqueueCallback(() => deliverOutput(orphanedOutputFinal, null));
+        if (orphanedOutputFinal) enqueueCallback(() => deliverOutput(orphanedOutputFinal.caption, null));
       },
       async close() {
         if (isClosed) return;
@@ -701,7 +750,7 @@ export class GeminiLiveTranslateAdapter {
           if (pendingOutputFinal) {
             const pending = pendingOutputFinal;
             pendingOutputFinal = null;
-            await deliverOutput(pending, null);
+            await deliverOutput(pending.caption, null);
           }
           await Promise.allSettled([...detachedFinalCallbacks]);
         })();

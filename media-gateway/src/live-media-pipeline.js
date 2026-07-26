@@ -3,6 +3,7 @@ import { OrderedTaskQueue } from "./ordered-task-queue.js";
 import { applyGlossaryCorrections } from "./glossary-corrections.js";
 import { isOutputInTargetLanguage, sourceLaneMatches } from "./language-gate.js";
 import { SpeakerRegistry } from "./speaker-registry.js";
+import { createCrossChannelEchoDeduper, createSourceLanguageConsensus, crossChannelEchoContract } from "../../packages/caption-core/index.js";
 
 const INPUT_FRAME_BYTES = AUDIO_CONFIG.inputSampleRate * 2 * AUDIO_CONFIG.chunkMilliseconds / 1_000;
 const OUTPUT_CHUNK_BYTES = AUDIO_CONFIG.outputSampleRate * 2 * 250 / 1_000;
@@ -25,10 +26,27 @@ const EMISSION_FAILURE_LOG_INTERVAL_MS = 30_000;
 const PARTIAL_STABILITY_MILLISECONDS = 140;
 const PARTIAL_MAX_HOLD_MILLISECONDS = 500;
 const PARTIAL_MIN_SIGNAL_CHARACTERS = 12;
+const MAX_AUDIO_LANE_PENDING_FRAMES = Math.max(1, Math.floor(AUDIO_CONFIG.staleFrameMilliseconds / AUDIO_CONFIG.chunkMilliseconds));
+const CAPTION_POLISH_POLICIES = new Set(["off", "selective", "full"]);
+const AUDIO_SOURCES = new Set(["system", "mic", "participant"]);
+const MAX_SUPPRESSED_SOURCE_TEXTS = 256;
+
+export function shouldPolishCaption(policy, { text = "", tone = "", glossary = "", domain = "", sourceText = "", targetLanguage = "" } = {}) {
+  if (policy === "off") return false;
+  if (policy === "full") return true;
+  if (policy !== "selective") throw new Error("INVALID_CAPTION_POLISH_POLICY");
+  if (tone === "business" || String(domain).trim()) return true;
+  const corrected = applyGlossaryCorrections(text, { glossary, sourceText, targetLanguage });
+  return corrected !== String(text).trim();
+}
 
 export class LiveMediaPipeline {
   #liveSessions = new Map();
   #voiceSessions = new Map();
+  #liveAudioLanes = new Map();
+  #voiceAudioLanes = new Map();
+  #sourceSessionFlights = new Map();
+  #suppressedSourceTexts = new Map();
   #translationQueues = new Map();
   #ttsQueues = new Map();
   #lastAudioAt = null;
@@ -84,6 +102,7 @@ export class LiveMediaPipeline {
     observeLatency = null,
     setTimeoutFn = setTimeout,
     clearTimeoutFn = clearTimeout,
+    captionPolishPolicy = "full",
   }) {
     const settings = validateLiveSettings({
       sessionType,
@@ -122,6 +141,10 @@ export class LiveMediaPipeline {
     this.observeLatency = observeLatency;
     this.setTimeoutFn = setTimeoutFn;
     this.clearTimeoutFn = clearTimeoutFn;
+    if (!CAPTION_POLISH_POLICIES.has(captionPolishPolicy)) throw new Error("INVALID_CAPTION_POLISH_POLICY");
+    this.captionPolishPolicy = captionPolishPolicy;
+    this.sourceLanguageConsensus = createSourceLanguageConsensus({ now });
+    this.crossChannelEchoDedupers = new Map(this.languages.map((language) => [language, createCrossChannelEchoDeduper({ now })]));
     this.speakers = speakerRegistry ?? new SpeakerRegistry({
       sessionType: settings.sessionType,
       outputMode: settings.outputMode,
@@ -203,54 +226,7 @@ export class LiveMediaPipeline {
       // surfaces the input transcript (source-language lane, like the desktop
       // channel hub), captions carry floor attribution, and voice — when the
       // session has audio output — is OpenAI, never Gemini.
-      const isMeeting = this.sessionType === "meeting";
-      const opened = await Promise.all(this.languages.map(async (language, languageIndex) => {
-        try {
-          const session = await this.dependencies.liveTranslate.open({
-            language,
-            inputSampleRate: AUDIO_CONFIG.inputSampleRate,
-            outputSampleRate: AUDIO_CONFIG.outputSampleRate,
-            contextCompression: true,
-            sessionResumption: true,
-            correlateInputCaption: isMeeting,
-            onCaption: (caption) => this.#publishPresentationCaption(language, caption),
-            ...(isMeeting && languageIndex === 0
-              ? { onInputCaption: (caption) => this.#publishMeetingInputCaption(caption) }
-              : {}),
-            onAudio: !isMeeting && this.voiceProvider === "gemini"
-              ? (audio) => this.#publishPresentationAudio(language, audio)
-              : async () => {},
-            onInterruption: () => this.#publishAudioControl(language, "clear", "interrupted"),
-            onCallbackError: (error) => this.#recordCaptionEmissionFailure(language, error),
-          });
-          await this.#publishLanguageStatus(language, "ready");
-          return [language, session];
-        } catch {
-          await this.#publishLanguageStatus(language, "unavailable", "LANGUAGE_UNAVAILABLE");
-          return null;
-        }
-      }));
-      this.#liveSessions = new Map(opened.filter(Boolean));
-      if (this.#liveSessions.size === 0) throw new Error("LANGUAGE_UNAVAILABLE");
-      if (hasAudioOutput(this.outputMode) && (this.voiceProvider === "openai" || isMeeting)) {
-        const voiceSessions = await Promise.all(this.languages.map(async (language) => {
-          try {
-            const session = await this.dependencies.openaiLiveTranslate.open({
-              language: language.toLowerCase().split("-")[0],
-              inputSampleRate: AUDIO_CONFIG.inputSampleRate,
-              outputSampleRate: AUDIO_CONFIG.outputSampleRate,
-              onAudio: (audio) => this.#publishPresentationAudio(language, audio),
-              onInterruption: () => this.#publishAudioControl(language, "clear", "interrupted"),
-            });
-            return [language, session];
-          } catch {
-            await this.#publishAudioControl(language, "clear", "voice_unavailable");
-            await this.#publishLanguageStatus(language, "ready", "VOICE_UNAVAILABLE");
-            return null;
-          }
-        }));
-        this.#voiceSessions = new Map(voiceSessions.filter(Boolean));
-      }
+      await this.#ensureSourceSessions("system", { publishStatus: true });
       if (typeof this.dependencies.publisher.markLive === "function") await this.dependencies.publisher.markLive(this.sessionId);
       return;
     }
@@ -261,6 +237,79 @@ export class LiveMediaPipeline {
     throw new Error("UNSUPPORTED_SESSION_TYPE");
   }
 
+  async #ensureSourceSessions(source, { publishStatus = false } = {}) {
+    if (!AUDIO_SOURCES.has(source)) throw new Error("INVALID_AUDIO_SOURCE");
+    if ([...this.#liveAudioLanes.values()].some((lane) => lane.source === source)) return;
+    if (this.#sourceSessionFlights.has(source)) return this.#sourceSessionFlights.get(source);
+    const flight = (async () => {
+      const isMeeting = this.sessionType === "meeting";
+      const opened = await Promise.all(this.languages.map(async (language, languageIndex) => {
+        const key = `${source}:${language}`;
+        try {
+          const session = await this.dependencies.liveTranslate.open({
+            language,
+            inputSource: source,
+            channelId: key,
+            inputSampleRate: AUDIO_CONFIG.inputSampleRate,
+            outputSampleRate: AUDIO_CONFIG.outputSampleRate,
+            contextCompression: true,
+            sessionResumption: true,
+            correlateInputCaption: isMeeting,
+            observeLatency: this.observeLatency,
+            onCaption: (caption) => this.#publishPresentationCaption(language, { ...caption, inputSource: source }, { inputSource: source }),
+            ...(isMeeting ? {
+              onInputObservation: (caption) => this.#observeMeetingInputCaption(key, caption),
+              ...(languageIndex === 0 ? { onInputCaption: (caption) => this.#publishMeetingInputCaption({ ...caption, inputSource: source }) } : {}),
+            } : {}),
+            onAudio: !isMeeting && this.voiceProvider === "gemini"
+              ? (audio) => this.#publishPresentationAudio(language, audio)
+              : async () => {},
+            onInterruption: () => this.#publishAudioControl(language, "clear", "interrupted"),
+            onCallbackError: (error) => this.#recordCaptionEmissionFailure(language, error),
+          });
+          if (publishStatus) await this.#publishLanguageStatus(language, "ready");
+          return { key, language, session };
+        } catch {
+          if (publishStatus) await this.#publishLanguageStatus(language, "unavailable", "LANGUAGE_UNAVAILABLE");
+          return null;
+        }
+      }));
+      for (const entry of opened.filter(Boolean)) {
+        this.#liveSessions.set(entry.key, entry.session);
+        this.sourceLanguageConsensus.registerChannel(entry.key);
+        this.crossChannelEchoDedupers.get(entry.language)?.registerChannel(source);
+        this.#liveAudioLanes.set(entry.key, this.#createAudioLane(entry.key, entry.language, entry.session, "caption", source));
+      }
+      if (!opened.some(Boolean)) throw new Error("LANGUAGE_UNAVAILABLE");
+      if (hasAudioOutput(this.outputMode) && (this.voiceProvider === "openai" || isMeeting)) {
+        const voices = await Promise.all(this.languages.map(async (language) => {
+          const key = `${source}:${language}`;
+          try {
+            const session = await this.dependencies.openaiLiveTranslate.open({
+              language: language.toLowerCase().split("-")[0], inputSource: source,
+              inputSampleRate: AUDIO_CONFIG.inputSampleRate, outputSampleRate: AUDIO_CONFIG.outputSampleRate,
+              onAudio: (audio) => this.#publishPresentationAudio(language, audio),
+              onInterruption: () => this.#publishAudioControl(language, "clear", "interrupted"),
+            });
+            return { key, language, session };
+          } catch {
+            if (publishStatus) {
+              await this.#publishAudioControl(language, "clear", "voice_unavailable");
+              await this.#publishLanguageStatus(language, "ready", "VOICE_UNAVAILABLE");
+            }
+            return null;
+          }
+        }));
+        for (const entry of voices.filter(Boolean)) {
+          this.#voiceSessions.set(entry.key, entry.session);
+          this.#voiceAudioLanes.set(entry.key, this.#createAudioLane(entry.key, entry.language, entry.session, "voice", source));
+        }
+      }
+    })().finally(() => this.#sourceSessionFlights.delete(source));
+    this.#sourceSessionFlights.set(source, flight);
+    return flight;
+  }
+
   #reservePresentationFinal(language) {
     const previous = this.#presentationFinalTails.get(language) ?? Promise.resolve();
     let release;
@@ -269,7 +318,7 @@ export class LiveMediaPipeline {
     return { previous, release };
   }
 
-  async acceptAudio(frame, capturedAt = this.now(), capturedFloorSpeaker = undefined) {
+  async acceptAudio(frame, capturedAt = this.now(), capturedFloorSpeaker = undefined, inputSource = null) {
     this.#assertRunning();
     if (!(frame instanceof Uint8Array) || frame.byteLength !== INPUT_FRAME_BYTES) throw new Error("INVALID_AUDIO_FRAME");
     if (this.#isPaused) return false;
@@ -277,6 +326,8 @@ export class LiveMediaPipeline {
     this.#lastAudioAt = this.now();
     this.#didEndTurn = false;
     if (usesLiveTranslateCaptions(this.sessionType)) {
+      const source = AUDIO_SOURCES.has(inputSource) ? inputSource : "system";
+      await this.#ensureSourceSessions(source);
       // The gateway snapshots the producer identity when it accepts the frame.
       // Its ordered audio tail may reach this method after speak-end or a host
       // reclaim, so resolving from the current floor here can steal the late
@@ -287,30 +338,82 @@ export class LiveMediaPipeline {
           ? this.#floorAttribution(capturedAt)
           : capturedFloorSpeaker)
         : null;
-      const results = await Promise.all([...this.#liveSessions].map(async ([language, session]) => {
-        try {
-          await session.sendAudio(frame, { capturedAt, floorSpeaker });
-          return null;
-        } catch {
-          this.#liveSessions.delete(language);
-          await session.close().catch(() => undefined);
-          await this.#publishLanguageStatus(language, "unavailable", "LANGUAGE_UNAVAILABLE");
-          return language;
-        }
-      }));
-      if (results.some(Boolean) && this.#liveSessions.size === 0) throw new Error("LANGUAGE_UNAVAILABLE");
-      await Promise.all([...this.#voiceSessions].map(async ([language, session]) => {
-        try {
-          await session.sendAudio(frame);
-        } catch {
-          this.#voiceSessions.delete(language);
-          await session.close().catch(() => undefined);
-          await this.#publishAudioControl(language, "clear", "voice_unavailable");
-          await this.#publishLanguageStatus(language, "ready", "VOICE_UNAVAILABLE");
-        }
-      }));
+      for (const lane of this.#liveAudioLanes.values()) {
+        if (lane.source !== source) continue;
+        this.#enqueueAudioLane(lane, () => lane.session.sendAudio(Uint8Array.from(frame), {
+          capturedAt, floorSpeaker, source,
+        }));
+      }
+      for (const lane of this.#voiceAudioLanes.values()) {
+        if (lane.source !== source) continue;
+        this.#enqueueAudioLane(lane, () => lane.session.sendAudio(Uint8Array.from(frame)));
+      }
     }
     return true;
+  }
+
+  #createAudioLane(key, language, session, kind, source) {
+    return { key, language, session, kind, source, tail: Promise.resolve(), pendingFrames: 0, failed: false };
+  }
+
+  #enqueueAudioLane(lane, task) {
+    if (lane.failed) return false;
+    if (lane.pendingFrames >= MAX_AUDIO_LANE_PENDING_FRAMES) {
+      this.observeLatency?.(`${lane.kind}_audio_lane_frames_dropped_total`, 1);
+      return false;
+    }
+    const isIdle = lane.pendingFrames === 0;
+    lane.pendingFrames += 1;
+    const work = isIdle
+      ? this.#runAudioLaneTask(task)
+      : lane.tail.then(() => (lane.failed ? undefined : this.#runAudioLaneTask(task)));
+    lane.tail = work.catch(async () => {
+      if (lane.failed) return;
+      lane.failed = true;
+      if (lane.kind === "caption") {
+        this.#liveSessions.delete(lane.key);
+        this.#liveAudioLanes.delete(lane.key);
+        this.sourceLanguageConsensus.unregisterChannel(lane.key);
+        if (![...this.#liveAudioLanes.values()].some((entry) => entry.source === lane.source && entry.language === lane.language)) {
+          this.crossChannelEchoDedupers.get(lane.language)?.unregisterChannel(lane.source);
+        }
+        await this.#runAudioLaneTask(() => lane.session.close()).catch(() => undefined);
+        if (![...this.#liveAudioLanes.values()].some((entry) => entry.language === lane.language)) {
+          await this.#publishLanguageStatus(lane.language, "unavailable", "LANGUAGE_UNAVAILABLE");
+        }
+        if (this.#liveSessions.size === 0 && !this.#didReportFatalError) {
+          this.#didReportFatalError = true;
+          this.onFatalError?.(new Error("LANGUAGE_UNAVAILABLE"));
+        }
+      } else {
+        this.#voiceSessions.delete(lane.key);
+        this.#voiceAudioLanes.delete(lane.key);
+        await this.#runAudioLaneTask(() => lane.session.close()).catch(() => undefined);
+        await this.#publishAudioControl(lane.language, "clear", "voice_unavailable");
+        await this.#publishLanguageStatus(lane.language, "ready", "VOICE_UNAVAILABLE");
+      }
+    }).finally(() => { lane.pendingFrames = Math.max(0, lane.pendingFrames - 1); });
+    return true;
+  }
+
+  async #runAudioLaneTask(task) {
+    let timeout;
+    try {
+      let work;
+      try {
+        work = Promise.resolve(task());
+      } catch (error) {
+        work = Promise.reject(error);
+      }
+      return await Promise.race([
+        work,
+        new Promise((_, reject) => {
+          timeout = this.setTimeoutFn(() => reject(new Error("AUDIO_LANE_TIMEOUT")), AUDIO_CONFIG.staleFrameMilliseconds);
+        }),
+      ]);
+    } finally {
+      if (timeout !== undefined) this.clearTimeoutFn(timeout);
+    }
   }
 
   async tick() {
@@ -460,6 +563,7 @@ export class LiveMediaPipeline {
         this.#requiresFreshMeetingSourceContext = true;
         this.#presentationCaptionState.clear();
         this.#cancelAllPresentationPartials();
+        this.sourceLanguageConsensus.resetForSpeakerBoundary();
         for (const session of this.#liveSessions.values()) session.setFloorSpeaker?.(next);
       }
       // Speaker→speaker preemption keeps a grace record for the previous
@@ -482,6 +586,7 @@ export class LiveMediaPipeline {
       this.#requiresFreshMeetingSourceContext = true;
       this.#presentationCaptionState.clear();
       this.#cancelAllPresentationPartials();
+      this.sourceLanguageConsensus.resetForSpeakerBoundary();
       for (const session of this.#liveSessions.values()) session.setFloorSpeaker?.(null);
     }
     this.#floorSpeaker = null;
@@ -1030,12 +1135,19 @@ export class LiveMediaPipeline {
     const { text, isFinal, languageCode } = value;
     const normalized = String(text ?? "").normalize("NFC").trim();
     if (!normalized) return;
+    const inputSource = AUDIO_SOURCES.has(value.inputSource) ? value.inputSource : "system";
+    if (this.#isSuppressedSource(inputSource, normalized)) return;
     const rawLanguageCode = typeof languageCode === "string" ? languageCode.trim() : "";
     const hasExplicitLanguageCode = languageCode !== undefined
       && languageCode !== null
       && String(languageCode).trim() !== "";
     const isExplicitlyUnknown = rawLanguageCode.toLowerCase() === "und";
-    const hinted = normalizeLiveLanguage(languageCode);
+    const providerHint = normalizeLiveLanguage(languageCode);
+    const consensusHint = this.sourceLanguageConsensus.resolveSource(providerHint || "unknown", {
+      isStrong: String(value.text ?? "").trim().length >= 4,
+      channelKey: value.targetLanguage,
+    });
+    const hinted = consensusHint === "unknown" ? providerHint : consensusHint;
     const utteranceKey = typeof value.utteranceKey === "string" && value.utteranceKey
       ? value.utteranceKey
       : this.#meetingInputCaption && this.#meetingInputCaption.isFinal !== true
@@ -1080,6 +1192,7 @@ export class LiveMediaPipeline {
     }
     const lane = hinted || this.languages.find((language) => textPlausiblyInLanguage(normalized, language));
     if (!lane) return;
+    if (this.crossChannelEchoDedupers.get(lane)?.outputEchoesAnotherSource(inputSource, normalized)) return;
     this.#requiresFreshMeetingSourceContext = false;
     this.#meetingInputCaption = {
       text: normalized,
@@ -1108,10 +1221,55 @@ export class LiveMediaPipeline {
     });
   }
 
+  async #observeMeetingInputCaption(channelId, value = {}) {
+    const language = normalizeLiveLanguage(value.languageCode);
+    if (!language) return;
+    this.sourceLanguageConsensus.reportSource(channelId, language, value.text, {
+      isStrong: String(value.text ?? "").trim().length >= 4,
+    });
+    const source = String(channelId).split(":", 1)[0];
+    let normalizedText = "";
+    let isDuplicate = false;
+    for (const deduper of this.crossChannelEchoDedupers.values()) {
+      const observation = deduper.observeSource(source, value.text);
+      normalizedText ||= observation.normalizedText;
+      isDuplicate ||= observation.isDuplicate;
+    }
+    if (isDuplicate && normalizedText) {
+      const currentTime = this.now();
+      for (const [key, expiresAt] of this.#suppressedSourceTexts) {
+        if (expiresAt <= currentTime) this.#suppressedSourceTexts.delete(key);
+      }
+      while (this.#suppressedSourceTexts.size >= MAX_SUPPRESSED_SOURCE_TEXTS) {
+        this.#suppressedSourceTexts.delete(this.#suppressedSourceTexts.keys().next().value);
+      }
+      this.#suppressedSourceTexts.set(
+        `${source}\u0000${normalizedText}`,
+        currentTime + crossChannelEchoContract.windowMilliseconds,
+      );
+    }
+  }
+
+  #isSuppressedSource(source, text) {
+    const normalized = this.crossChannelEchoDedupers.values().next().value?.normalize(text) ?? "";
+    const key = `${source}\u0000${normalized}`;
+    const expiresAt = this.#suppressedSourceTexts.get(key) ?? 0;
+    if (expiresAt <= this.now()) {
+      this.#suppressedSourceTexts.delete(key);
+      return false;
+    }
+    return true;
+  }
+
   async #publishPresentationCaption(language, value, options = {}) {
     if (!hasCaptionOutput(this.outputMode) || this.#isPaused) return;
     let text = String(value.text ?? "").normalize("NFC").trim();
     if (!text) return;
+    const inputSource = AUDIO_SOURCES.has(options.inputSource ?? value.inputSource)
+      ? (options.inputSource ?? value.inputSource)
+      : "system";
+    const echoDeduper = this.crossChannelEchoDedupers.get(language);
+    if (value.origin !== "source" && echoDeduper?.outputEchoesAnotherSource(inputSource, text)) return;
     const isFinal = Boolean(value.isFinal);
     let sourceContext = Object.hasOwn(options, "sourceContext") ? options.sourceContext : null;
     if (value.origin !== "source" && !Object.hasOwn(options, "sourceContext")) {
@@ -1134,6 +1292,8 @@ export class LiveMediaPipeline {
         sourceContext = isFinal ? (queue.shift() ?? this.#meetingInputCaption) : this.#meetingInputCaption;
       }
     }
+    if (value.origin !== "source" && this.#isSuppressedSource(inputSource, sourceContext?.text ?? value.sourceText)) return;
+    if (value.origin !== "source") echoDeduper?.recordSource(inputSource, text);
     const sourceLanguage = normalizeLiveLanguage(sourceContext?.language);
     const providerOutputLanguage = normalizeLiveLanguage(value.languageCode);
     // 2026-07-26 fix: Gemini can echo the input on the output callback even
@@ -1175,7 +1335,16 @@ export class LiveMediaPipeline {
     // pipeline: the LLM second-pass polish (business register, terminology,
     // proper-noun repair; fail-open) followed by the deterministic glossary
     // pass as the guaranteed safety net.
-    if (isFinal && value.origin !== "source" && this.dependencies.captionPolish) {
+    const shouldPolish = isFinal && value.origin !== "source" && this.dependencies.captionPolish
+      && shouldPolishCaption(this.captionPolishPolicy, {
+        text, sourceText: sourceContext?.text ?? "", targetLanguage: language,
+        tone: this.translationTone, glossary: this.glossaryText, domain: this.domainText,
+      });
+    if (isFinal && value.origin !== "source") {
+      this.observeLatency?.(`caption_polish_policy_${this.captionPolishPolicy}_total`, 1);
+      this.observeLatency?.(shouldPolish ? "caption_polish_attempts_total" : "caption_polish_skipped_total", 1);
+    }
+    if (shouldPolish) {
       const polishStartedAt = this.now();
       const polished = await this.dependencies.captionPolish.polish({
         translatedText: text,
@@ -1312,6 +1481,10 @@ export class LiveMediaPipeline {
     for (const abortController of this.#ttsAbortControllers) {
       abortController.abort(new Error("LIVE_PIPELINE_STOPPED"));
     }
+    await Promise.all([
+      ...[...this.#liveAudioLanes.values()].map((lane) => lane.tail),
+      ...[...this.#voiceAudioLanes.values()].map((lane) => lane.tail),
+    ]);
     await Promise.all([
       ...[...this.#liveSessions.values()].map((session) => session.close()),
       ...[...this.#voiceSessions.values()].map((session) => session.close()),

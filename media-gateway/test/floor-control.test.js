@@ -52,9 +52,9 @@ function createFloorGateway({ floorController, pipelineHooks = {}, gatewayOption
         floorSpeakers: [],
         async start() {},
         async tick() {},
-        async acceptAudio(frame, capturedAt, floorSpeaker) {
+        async acceptAudio(frame, capturedAt, floorSpeaker, source) {
           this.frames.push(frame);
-          this.captures.push({ capturedAt, floorSpeaker });
+          this.captures.push({ capturedAt, floorSpeaker, source });
         },
         setFloorSpeaker(speaker) { this.floorSpeakers.push(speaker); },
         async endAudioStream() {},
@@ -144,6 +144,7 @@ test("speak-start takes the floor, notifies everyone, and routes speaker audio i
   await new Promise((resolve) => setTimeout(resolve, 100));
   assert.equal(pipelines[0].frames.length, 1);
   assert.equal(pipelines[0].captures[0].floorSpeaker.participantId, "grant-speaker");
+  assert.equal(pipelines[0].captures[0].source, "participant");
 
   // Explicit speak-end releases the floor and broadcasts a null holder.
   const speakerEnded = waitForJson(speaker, (message) => message.type === "speak-ended");
@@ -159,6 +160,7 @@ test("speak-start takes the floor, notifies everyone, and routes speaker audio i
   await new Promise((resolve) => setTimeout(resolve, 100));
   assert.equal(pipelines[0].frames.length, 2);
   assert.equal(pipelines[0].captures[1].floorSpeaker, null);
+  assert.equal(pipelines[0].captures[1].source, null);
 });
 
 test("a second speaker preempts the current one and non-holders may not send audio", async (context) => {

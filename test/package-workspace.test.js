@@ -12,7 +12,14 @@ function readJson(relativePath) {
 test("root package keeps platform sidecars as optional published packages, not local workspaces", () => {
   const rootPackage = readJson("package.json");
 
-  assert.deepEqual(rootPackage.files, ["assets/", "electron/", "LICENSE", "public/", "src/"]);
+  assert.deepEqual(rootPackage.files, [
+    "assets/",
+    "electron/",
+    "LICENSE",
+    "packages/caption-core/",
+    "public/",
+    "src/",
+  ]);
   assert.equal(rootPackage.bin["realtime-noel"], "src/cli.js");
   assert.equal(rootPackage.main, "electron/main.js");
   assert.equal(rootPackage.scripts.dev, "node ./src/cli.js");

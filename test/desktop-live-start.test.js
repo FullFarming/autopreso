@@ -124,6 +124,7 @@ test("every Live state IPC checks the exact local renderer origin", () => {
     "live-call:get-state",
     "live-call:go-live",
     "live-call:host-speak",
+    "live-call:audio-failed",
     "live-call:end",
   ]) {
     const start = main.indexOf(`ipcMain.handle("${channel}"`);
@@ -200,6 +201,51 @@ test("gateway floor changes clear every Electron caption surface before the next
   assert.match(preload, /removeListener\("live-call:floor", handler\)/u);
 });
 
+test("Live host IPC accepts only source-tagged Caption-only PCM and writes the versioned gateway envelope", () => {
+  const main = read("electron/main.js");
+  const preload = read("electron/preload.js");
+  const handler = main.slice(
+    main.indexOf('ipcMain.on("live-call:audio-frame"'),
+    main.indexOf('ipcMain.handle("live-call:end"'),
+  );
+
+  assert.match(preload, /sendLiveCallAudioFrame: \(packet\) => ipcRenderer\.send\("live-call:audio-frame", packet\)/u);
+  assert.match(handler, /packet\?\.source === "system" \|\| packet\?\.source === "mic"/u);
+  assert.match(handler, /packet\.sampleRate !== 24_000/u);
+  assert.match(handler, /packet\.frameDurationMs !== 100/u);
+  assert.match(handler, /bytes\.length !== CAPTION_BRIDGE_PACKET_BYTES/u);
+  assert.match(handler, /adaptCaptionPcmForGateway/u,
+    "the main process keeps the proven 16 kHz/40 ms PCM adapter");
+  assert.match(handler, /encodeLiveAudioWireFrame\(packet\.source, pcmFrame\)/u,
+    "every gateway PCM frame must carry its validated source tag");
+  assert.match(main, /const liveBridgeAudioAdapters = new Map\(\)/u,
+    "system and mic carry/resample state must not corrupt one another");
+  assert.match(main, /createCaptionPcmResampler\(\)/u,
+    "Live and Caption-only must share the same stateful FIR downsampler");
+});
+
+test("Live host capture failure stops the bridge and becomes visible instead of running silent", () => {
+  const main = read("electron/main.js");
+  const preload = read("electron/preload.js");
+  const dashboard = read("public/subtitle-dashboard.js");
+  const failureHandler = main.slice(
+    main.indexOf('ipcMain.handle("live-call:audio-failed"'),
+    main.indexOf('ipcMain.on("live-call:audio-frame"'),
+  );
+
+  assert.match(dashboard, /return \{ ok: false, error \}/u);
+  assert.match(dashboard, /showError\(error\)/u);
+  assert.match(dashboard, /setConnectionStatus\(error\.message, "error"\)/u);
+  assert.match(dashboard, /reportLiveCallAudioFailure\?\.\(error\.message\)/u);
+  assert.match(dashboard, /if \(liveBridgeCapture\?\.failed\) return/u,
+    "a rejected permission must not trigger a hidden retry loop every second");
+  assert.match(preload, /reportLiveCallAudioFailure: \(detail\) => ipcRenderer\.invoke\("live-call:audio-failed", detail\)/u);
+  assert.match(failureHandler, /isAllowedOrigin/u);
+  assert.match(failureHandler, /stopLiveGatewayBridge\("host audio capture failed"\)/u);
+  assert.match(failureHandler, /HOST_AUDIO_CAPTURE_FAILED/u);
+  assert.match(failureHandler, /notifyLiveBridgeFailure/u);
+});
+
 test("Live Call archive preserves a finalized gateway-canonical local record", () => {
   const main = read("electron/main.js");
   const archive = main.slice(
@@ -261,12 +307,14 @@ test("desktop go-live refreshes the version and the dashboard bridges host audio
 
   const preload = read("electron/preload.js");
   assert.match(preload, /ensureLiveCallBridge: \(\) => ipcRenderer\.invoke\("live-call:bridge-ensure"\)/u);
-  assert.match(preload, /sendLiveCallAudioFrame: \(frame\) => ipcRenderer\.send\("live-call:audio-frame", frame\)/u);
+  assert.match(preload, /sendLiveCallAudioFrame: \(packet\) => ipcRenderer\.send\("live-call:audio-frame", packet\)/u);
 
-  // The dashboard captures 16 kHz mono and forwards 40ms PCM16 frames.
+  // The dashboard uses the exact Caption-only capture contract; main adapts it
+  // to the legacy gateway wire until the gateway accepts source-tagged packets.
   const dashboard = read("public/subtitle-dashboard.js");
-  assert.match(dashboard, /LIVE_BRIDGE_SAMPLE_RATE = 16_000/u);
-  assert.match(dashboard, /sendLiveCallAudioFrame\(frame\.buffer\)/u);
+  assert.match(dashboard, /captureSelectedAudio\(state\.settings\)/u);
+  assert.match(dashboard, /sendLiveCallAudioFrame\(packet\)/u);
+  assert.doesNotMatch(dashboard, /LIVE_BRIDGE_SAMPLE_RATE|resampleLinear/u);
   assert.match(dashboard, /stopLiveCallAudioBridge\("live call ended"\)/u);
   assert.match(dashboard, /syncLiveCallAudioBridge/u);
 

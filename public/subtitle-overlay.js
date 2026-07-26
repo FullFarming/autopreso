@@ -123,7 +123,7 @@ initOverlayRestartControls();
 // forwards that boundary directly to every overlay, which avoids waiting for a
 // translated fragment before removing the previous speaker's final sentence.
 if (window.realtimeNoelDesktop?.onLiveCallFloor) {
-  window.realtimeNoelDesktop.onLiveCallFloor(() => clearSubtitle());
+  window.realtimeNoelDesktop.onLiveCallFloor(() => handleLiveCallFloorBoundary());
 }
 
 function connect() {
@@ -313,7 +313,7 @@ function ensureLane(targetLanguage) {
     translation.append(flow);
     box.append(source, translation);
     shell.append(speakerLabel, box);
-    lane = { key, shell, speakerLabel, box, source, translation, flow, lines: [], predicted: "", predictedState: "partial", sourceLines: [], timer: null, trimTimer: null, position: null, partial: false, renderMode: "captions", lastSeq: -1, lastEventType: "", lastEventText: "", lastCommittedText: "" };
+    lane = { key, shell, speakerLabel, box, source, translation, flow, lines: [], predicted: "", predictedState: "partial", sourceLines: [], timer: null, trimTimer: null, position: null, partial: false, lastSeq: -1, lastEventType: "", lastEventText: "", lastCommittedText: "" };
     lanes.set(key, lane);
   }
   const position = positionForLanguage(targetLanguage);
@@ -363,15 +363,33 @@ function languagesAssignedToZone(position) {
 // shrinks so the stacked boxes stay compact and never collide. The budget is
 // stable per language config, so it never flickers as subtitles come and go.
 function visibleLineLimitFor(lane) {
-  // Caption-only remains the immutable reference. Live Call alone gets the
-  // broadcast-safe three-line ceiling requested for the shared presentation
-  // overlay, even when a previously saved caption preference is larger.
-  const base = lane.renderMode === "live-call"
-    ? Math.min(3, maxSubtitleLines())
-    : maxSubtitleLines();
+  const base = maxSubtitleLines();
   const sharing = languagesAssignedToZone(lane.position);
   if (sharing <= 1) return base;
   return Math.max(1, Math.ceil(base / sharing));
+}
+
+function handleLiveCallFloorBoundary() {
+  activeSourceLanguage = null;
+  previousSourceLanguage = null;
+  lastDirectionSwitchAt = 0;
+  activeDirectionLastAt = 0;
+  activeDirectionSentenceClosed = true;
+  for (const lane of lanes.values()) {
+    lane.predicted = "";
+    lane.predictedState = "partial";
+    lane.partial = false;
+    if (lane.lastEventType === "subtitle:partial") {
+      lane.lastEventType = "";
+      lane.lastEventText = "";
+    }
+    lane.speakerLabel.hidden = true;
+    lane.speakerLabel.textContent = "";
+    if (lane.timer) clearTimeout(lane.timer);
+    lane.timer = null;
+    reflowZone(lane.position);
+    if (lane.lines.length > 0) armLinger(lane, "final");
+  }
 }
 
 // Re-render every lane in a zone so their line budgets reflect current crowding.
@@ -495,7 +513,6 @@ function updateLiveCallSpeaker(message, lane) {
 function renderCommittedSubtitle(message, fromSnapshot = false) {
   if (isAudioOnlyOutput()) return;
   const lane = ensureLane(message.targetLanguage);
-  setLaneRenderMode(lane, message);
   if (!acceptLaneEvent(lane, message, fromSnapshot)) return;
   if (!acceptDirection(message)) return;
   updateLiveCallSpeaker(message, lane);
@@ -526,7 +543,6 @@ function renderPredictedSubtitle(message, fromSnapshot = false) {
   if (isAudioOnlyOutput()) return;
   if (!shouldRenderPredictedSubtitle(message)) return;
   const lane = ensureLane(message.targetLanguage);
-  setLaneRenderMode(lane, message);
   if (!acceptLaneEvent(lane, message, fromSnapshot)) return;
   if (!acceptDirection(message)) return;
   // A new live hypothesis for direction X→Y means the speaker is currently
@@ -542,11 +558,6 @@ function renderPredictedSubtitle(message, fromSnapshot = false) {
   lane.partial = true;
   reflowZone(lane.position);
   armLinger(lane, "live");
-}
-
-function setLaneRenderMode(lane, message) {
-  lane.renderMode = message.source === "live-call" ? "live-call" : "captions";
-  lane.shell.classList.toggle("is-live-call", lane.renderMode === "live-call");
 }
 
 function armLinger(lane, mode = "final") {
@@ -623,11 +634,9 @@ function renderLane(lane) {
   // text perfectly still while new words append.
   const tokens = [];
   for (const text of lane.lines) {
-    if (lane.renderMode === "live-call" && tokens.length > 0) tokens.push({ kind: "break", state: "committed" });
     for (const word of tokenizeWords(text)) tokens.push({ word, state: "committed" });
   }
   for (const text of predictedParts) {
-    if (lane.renderMode === "live-call" && tokens.length > 0) tokens.push({ kind: "break", state: predictedState });
     for (const word of tokenizeWords(text)) tokens.push({ word, state: predictedState });
   }
   const limit = visibleLineLimitFor(lane);

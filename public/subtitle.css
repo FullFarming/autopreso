@@ -1454,12 +1454,6 @@ button:disabled {
   animation: subtitle-word-in 240ms ease both;
 }
 
-/* Live Call can receive many partials per second from either speaker. Keep its
-   words instant and spatially stable; Caption-only retains the reference fade. */
-.subtitle-lane.is-live-call .subtitle-word {
-  animation: none;
-}
-
 @media (prefers-reduced-motion: reduce) {
   .subtitle-word { animation: none; }
 }
@@ -1691,14 +1685,16 @@ button:disabled {
   align-self: flex-start;
   max-width: 100%;
   overflow: hidden;
-  border-radius: 8px;
-  background: rgb(from var(--cw-indigo) r g b / var(--subtitle-opacity));
-  color: var(--cw-white);
+  border-radius: var(--nova-r-sm);
+  background: var(--nova-overlay-300);
+  color: var(--nova-text-muted);
   padding: 6px 12px;
   font-family: var(--subtitle-font-family);
   font-size: clamp(15px, calc(var(--translation-font-size) * 0.42), 22px);
   font-weight: 600;
   line-height: 1.35;
+  letter-spacing: -0.02em;
+  word-break: keep-all;
   text-align: left;
   text-overflow: ellipsis;
   white-space: nowrap;

@@ -2,8 +2,17 @@ import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import test from "node:test";
 
-import { ChirpTextToSpeechAdapter, CloudSpeechToTextAdapter, CloudTranslationAdvancedAdapter, GeminiLiveTranslateAdapter, GeminiTextTranslateAdapter } from "../src/google-provider-adapters.js";
+import { ChirpTextToSpeechAdapter, CloudSpeechToTextAdapter, CloudTranslationAdvancedAdapter, GeminiLiveTranslateAdapter, GeminiTextTranslateAdapter, SourceOutputCorrelationPolicy } from "../src/google-provider-adapters.js";
 import { SupabaseViewerAuthorizer } from "../src/supabase-adapters.js";
+
+test("source/output correlation policy learns rolling p99 within hard bounds", () => {
+  const policy = new SourceOutputCorrelationPolicy();
+  assert.equal(policy.outputWaitMs(), 150);
+  assert.equal(policy.contextMaxAgeMs(), 1_000);
+  for (const value of [80, 120, 240, 400, 900, 20_000]) policy.observe(value);
+  assert.equal(policy.outputWaitMs(), 600);
+  assert.equal(policy.contextMaxAgeMs(), 5_000);
+});
 
 test("Chirp uses v1 bidirectional PCM streaming and yields audio before ending input", async () => {
   const streams = [];
@@ -1222,6 +1231,30 @@ test("Gemini Live Translate correlates each output with same-turn source and cap
     caption.sourceText, caption.sourceLanguage, caption.floorSpeaker?.participantId, caption.capturedAt,
   ]), [["첫 원문", "ko-KR", "A", 100], ["둘째 원문", "ko-KR", "B", 200]]);
   assert.notEqual(captions[0].utteranceKey, captions[1].utteranceKey);
+  await session.close();
+});
+
+test("Gemini Live Translate exposes target-lane input observations with host source metadata", async () => {
+  const observations = [];
+  let messageHandler;
+  const adapter = new GeminiLiveTranslateAdapter({
+    model: "gemini-3.5-live-translate-preview",
+    client: { live: { async connect(options) {
+      messageHandler = options.callbacks.onmessage;
+      return { sendRealtimeInput() {}, close() {} };
+    } } },
+  });
+  const session = await adapter.open({
+    language: "en",
+    onInputObservation: (caption) => observations.push(caption),
+    onCaption: async () => {}, onAudio: async () => {},
+  });
+  await session.sendAudio(Buffer.alloc(3_200), { capturedAt: 100, floorSpeaker: null, source: "system" });
+  messageHandler({ serverContent: { inputTranscription: { text: "테스트입니다.", languageCode: "ko-KR" }, turnComplete: true } });
+  for (let tick = 0; tick < 4; tick += 1) await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(observations.length, 1);
+  assert.equal(observations[0].targetLanguage, "en");
+  assert.equal(observations[0].inputSource, "system");
   await session.close();
 });
 

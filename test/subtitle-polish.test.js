@@ -1,13 +1,12 @@
 // @ts-nocheck - injects a fake generateText to exercise the polish contract.
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
 import { test } from "node:test";
 
+import { captionPolishContract } from "../packages/caption-core/index.js";
 import { createSubtitlePolisher } from "../src/subtitle-polish.js";
 
-test("desktop polish keeps a six-second budget for full glossary prompts", async () => {
-  const source = await readFile(new URL("../src/subtitle-polish.js", import.meta.url), "utf8");
-  assert.match(source, /DEFAULT_TIMEOUT_MS\s*=\s*6000/u);
+test("desktop polish keeps a six-second budget for full glossary prompts", () => {
+  assert.equal(captionPolishContract.timeoutMilliseconds, 6_000);
 });
 
 function recordingGenerateText(text) {
