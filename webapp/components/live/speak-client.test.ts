@@ -426,3 +426,40 @@ test("viewer exposes the connecting Speak state without changing its visual comp
   assert.match(render, /role="status" aria-live="polite"/u);
   assert.match(render, /aria-describedby="live-speak-connection-status"/u);
 });
+
+test("ended-session language changes reload minutes without reconnecting the gateway", () => {
+  const source = readFileSync(new URL("./LiveViewer.tsx", import.meta.url), "utf8");
+  const start = source.indexOf("const changeLanguage = useCallback");
+  const end = source.indexOf("const openPip", start);
+  assert.ok(start >= 0 && end > start);
+  const changeLanguage = source.slice(start, end);
+  const endedBranch = changeLanguage.indexOf("if (isSessionEnded)");
+  const loadMinutes = changeLanguage.indexOf("loadMinutes(nextLanguage)", endedBranch);
+  const subscribe = changeLanguage.indexOf("subscribe(nextLanguage, viewer)");
+
+  assert.ok(endedBranch >= 0, "ended records need a dedicated language-switch path");
+  assert.ok(loadMinutes > endedBranch && loadMinutes < subscribe,
+    "ended language switches must load records and return before gateway subscription");
+});
+
+test("minutes retry transcript independently after summary succeeds", () => {
+  const source = readFileSync(new URL("./LiveViewer.tsx", import.meta.url), "utf8");
+  const effectStart = source.indexOf("// Contract C7: summaries are generated automatically after End");
+  const effectEnd = source.indexOf("// 호스트가 라이브를 종료하면", effectStart);
+  assert.ok(effectStart >= 0 && effectEnd > effectStart);
+  const effect = source.slice(effectStart, effectEnd);
+
+  assert.match(effect, /summaryRecord && isTranscriptLoaded/u,
+    "a loaded summary must not stop retries while the transcript request is unresolved");
+  assert.match(effect, /summaryRecord \? "transcript" : isTranscriptLoaded \? "summary" : "both"/u,
+    "the retry must request only the record resource that is still unresolved");
+  assert.doesNotMatch(effect, /if \(!isSessionEnded \|\| summaryRecord\) return/u);
+});
+
+test("meeting minutes distinguish transcript failure from a successful empty record", () => {
+  const source = readFileSync(new URL("./MeetingMinutes.tsx", import.meta.url), "utf8");
+  assert.match(source, /transcriptError/u);
+  assert.match(source, /isTranscriptLoaded/u);
+  assert.match(source, /Unable to load the transcript/u);
+  assert.match(source, /No transcript is available/u);
+});

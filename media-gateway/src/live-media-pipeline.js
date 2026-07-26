@@ -773,11 +773,12 @@ export class LiveMediaPipeline {
 
   async #publishCaption(language, caption, { mirrorToHost }) {
     let didMirror = false;
+    const shouldMirrorToHost = mirrorToHost && caption.translationStatus === "translated";
     try {
       await this.dependencies.publisher.publish(this.sessionId, language, caption, {
         onLiveEvent: () => {
           didMirror = true;
-          if (mirrorToHost) this.onHostEvent?.(caption);
+          if (shouldMirrorToHost) this.onHostEvent?.(caption);
         },
       });
     } catch (error) {
@@ -785,7 +786,7 @@ export class LiveMediaPipeline {
       throw error;
     }
     // Test/in-memory publishers may implement the older three-argument seam.
-    if (mirrorToHost && !didMirror) this.onHostEvent?.(caption);
+    if (shouldMirrorToHost && !didMirror) this.onHostEvent?.(caption);
   }
 
   #reportFatalPublisherError(error) {
@@ -1098,8 +1099,9 @@ export class LiveMediaPipeline {
       }
     }
     // origin:"source" = the untranslated input transcript on its own-language
-    // lane. The webapp keeps both lanes; the desktop picks exactly its selected
-    // language, so same-language speech uses this source lane as the one line.
+    // lane. The webapp keeps both lanes for the bilingual record; the desktop
+    // mirror excludes this row and renders only a successful opposite-language
+    // translation.
     await this.#publishPresentationCaption(lane, {
       text: normalized, isFinal, origin: "source", utteranceKey,
       capturedAt: value.capturedAt, floorSpeaker: value.floorSpeaker ?? null,
@@ -1173,7 +1175,7 @@ export class LiveMediaPipeline {
     // pipeline: the LLM second-pass polish (business register, terminology,
     // proper-noun repair; fail-open) followed by the deterministic glossary
     // pass as the guaranteed safety net.
-    if (isFinal && this.dependencies.captionPolish) {
+    if (isFinal && value.origin !== "source" && this.dependencies.captionPolish) {
       const polishStartedAt = this.now();
       const polished = await this.dependencies.captionPolish.polish({
         translatedText: text,
@@ -1237,6 +1239,11 @@ export class LiveMediaPipeline {
       ? (value.floorSpeaker ?? sourceContext?.floorSpeaker
         ?? this.#floorAttribution(capturedAt))
       : null;
+    const translationStatus = value.origin === "source"
+      ? "verbatim"
+      : isOutputInTargetLanguage(text, language)
+        ? "translated"
+        : "failed";
     const caption = {
       type: "caption",
       // Only the committed line consumes durable seq space (contract C1).
@@ -1259,12 +1266,10 @@ export class LiveMediaPipeline {
       // A translated lane that came back NOT in its own language is a broken
       // translation (provider echoing the source, a mislabelled lane). It is
       // still published — the transcript must not have a hole — but it is
-      // labelled so the viewer never renders it as a real translation. This is
-      // the same record-vs-display split as origin:"source": recording is
-      // unconditional, DISPLAY is filtered client-side.
-      ...(value.origin !== "source" && !isOutputInTargetLanguage(text, language)
-        ? { translationStatus: "failed" }
-        : {}),
+      // labelled so display paths never render it as a real translation. This
+      // is the same record-vs-display split as origin:"source": recording is
+      // unconditional, while the host mirror is filtered at this boundary.
+      translationStatus,
       ...(Number.isFinite(capturedAt)
         ? { sourceStartedAt: new Date(capturedAt).toISOString() }
         : {}),

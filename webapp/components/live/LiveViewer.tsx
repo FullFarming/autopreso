@@ -406,6 +406,16 @@ async function readApi<T>(response: Response): Promise<T> {
   return payload.data;
 }
 
+type SettledRequest<T> = { ok: true; value: T } | { ok: false; error: unknown };
+
+async function settleRequest<T>(request: Promise<T>): Promise<SettledRequest<T>> {
+  try {
+    return { ok: true, value: await request };
+  } catch (error: unknown) {
+    return { ok: false, error };
+  }
+}
+
 class ApiRequestError extends Error {
   constructor(message: string, readonly code: string) {
     super(message);
@@ -697,7 +707,11 @@ export default function LiveViewer({ compact = false }: { compact?: boolean }) {
   const [isSessionEnded, setIsSessionEnded] = useState(false);
   const [summaryRecord, setSummaryRecord] = useState<{ summary: MeetingSummary; createdAt: string } | null>(null);
   const [transcript, setTranscript] = useState<TranscriptEntry[]>([]);
+  const [isTranscriptLoaded, setIsTranscriptLoaded] = useState(false);
+  const [summaryError, setSummaryError] = useState("");
+  const [transcriptError, setTranscriptError] = useState("");
   const [isMinutesLoading, setIsMinutesLoading] = useState(false);
+  const minutesLoadGenerationRef = useRef(0);
   const isSessionEndedRef = useRef(false);
   const markSessionEndedRef = useRef<() => void>(() => {});
   const [speakState, setSpeakState] = useState<"idle" | "starting" | "speaking">("idle");
@@ -938,24 +952,51 @@ export default function LiveViewer({ compact = false }: { compact?: boolean }) {
     }, 5_000);
   }, [endSpeaking]);
 
-  const loadMinutes = useCallback(async () => {
-    if (!viewer || !languageRef.current) return;
+  const loadMinutes = useCallback(async (
+    requestedLanguage: string = languageRef.current,
+    resource: "both" | "summary" | "transcript" = "both",
+  ) => {
+    if (!viewer || !requestedLanguage) return;
+    const generation = minutesLoadGenerationRef.current + 1;
+    minutesLoadGenerationRef.current = generation;
     setIsMinutesLoading(true);
     const headers = { authorization: `Bearer ${viewer.viewerToken}` };
-    const language = encodeURIComponent(languageRef.current);
+    const language = encodeURIComponent(requestedLanguage);
+    const fetchMinutesResource = async <T,>(path: string): Promise<T> => readApi<T>(await fetch(path, { headers }));
     try {
-      const [summaryResult, transcriptResult] = await Promise.allSettled([
-        readApi<{ summary: MeetingSummary; createdAt: string }>(await fetch(
-          `/api/live-sessions/${viewer.session.id}/summary?language=${language}`, { headers },
+      const [summaryResult, transcriptResult] = await Promise.all([
+        resource === "transcript" ? Promise.resolve(null) : settleRequest(fetchMinutesResource<{ summary: MeetingSummary; createdAt: string }>(
+          `/api/live-sessions/${viewer.session.id}/summary?language=${language}`,
         )),
-        readApi<{ utterances: TranscriptEntry[] }>(await fetch(
-          `/api/live-sessions/${viewer.session.id}/transcript?language=${language}`, { headers },
+        resource === "summary" ? Promise.resolve(null) : settleRequest(fetchMinutesResource<{ utterances: TranscriptEntry[] }>(
+          `/api/live-sessions/${viewer.session.id}/transcript?language=${language}`,
         )),
       ]);
-      if (summaryResult.status === "fulfilled") setSummaryRecord(summaryResult.value);
-      if (transcriptResult.status === "fulfilled") setTranscript(transcriptResult.value.utterances);
+      // A late EN response must never replace the KO record selected while it
+      // was in flight. The same generation guard covers manual retries.
+      if (generation !== minutesLoadGenerationRef.current || requestedLanguage !== languageRef.current) return;
+      if (summaryResult?.ok) {
+        setSummaryRecord(summaryResult.value);
+        setSummaryError("");
+      } else if (summaryResult && summaryResult.error instanceof ApiRequestError
+        && summaryResult.error.code === "SUMMARY_NOT_READY") {
+        setSummaryRecord(null);
+        setSummaryError("");
+      } else if (summaryResult) {
+        setSummaryRecord(null);
+        setSummaryError("Unable to load the AI summary. Check again.");
+      }
+      if (transcriptResult?.ok) {
+        setTranscript(transcriptResult.value.utterances);
+        setIsTranscriptLoaded(true);
+        setTranscriptError("");
+      } else if (transcriptResult) {
+        setTranscript([]);
+        setIsTranscriptLoaded(false);
+        setTranscriptError("Unable to load the transcript. Check again.");
+      }
     } finally {
-      setIsMinutesLoading(false);
+      if (generation === minutesLoadGenerationRef.current) setIsMinutesLoading(false);
     }
   }, [viewer]);
 
@@ -963,7 +1004,7 @@ export default function LiveViewer({ compact = false }: { compact?: boolean }) {
   // record is not ready (SUMMARY_NOT_READY), poll with exponential backoff
   // (3s → 6s → 12s → … capped at 48s, ~2 minutes total).
   useEffect(() => {
-    if (!isSessionEnded || summaryRecord) return;
+    if (!isSessionEnded || (summaryRecord && isTranscriptLoaded)) return;
     let attempt = 0;
     let timer: number | null = null;
     let isDisposed = false;
@@ -972,7 +1013,8 @@ export default function LiveViewer({ compact = false }: { compact?: boolean }) {
       const delay = Math.min(3_000 * 2 ** attempt, 48_000);
       timer = window.setTimeout(() => {
         attempt += 1;
-        void loadMinutes().finally(() => { if (!isDisposed) scheduleNext(); });
+        const missingResource = summaryRecord ? "transcript" : isTranscriptLoaded ? "summary" : "both";
+        void loadMinutes(languageRef.current, missingResource).finally(() => { if (!isDisposed) scheduleNext(); });
       }, delay);
     };
     scheduleNext();
@@ -980,7 +1022,7 @@ export default function LiveViewer({ compact = false }: { compact?: boolean }) {
       isDisposed = true;
       if (timer !== null) window.clearTimeout(timer);
     };
-  }, [isSessionEnded, loadMinutes, summaryRecord]);
+  }, [isSessionEnded, isTranscriptLoaded, loadMinutes, summaryRecord]);
 
   // 호스트가 라이브를 종료하면 뷰어는 에러가 아니라 회의록 화면으로 전환합니다.
   markSessionEndedRef.current = () => {
@@ -992,7 +1034,7 @@ export default function LiveViewer({ compact = false }: { compact?: boolean }) {
     setStatus("Live ended");
     void endSpeaking(false);
     disconnectGateway();
-    void loadMinutes();
+    void loadMinutes(languageRef.current);
   };
 
   const resolveViewerDisconnect = useCallback(async (currentViewer: ViewerState) => {
@@ -1571,12 +1613,21 @@ export default function LiveViewer({ compact = false }: { compact?: boolean }) {
     languageRef.current = nextLanguage;
     setLanguage(nextLanguage);
     setError("");
+    if (isSessionEnded) {
+      setSummaryRecord(null);
+      setTranscript([]);
+      setIsTranscriptLoaded(false);
+      setSummaryError("");
+      setTranscriptError("");
+      void loadMinutes(nextLanguage);
+      return;
+    }
     try {
       await subscribe(nextLanguage, viewer);
     } catch (switchError) {
       setError(switchError instanceof Error ? switchError.message : "Unable to change language.");
     }
-  }, [language, subscribe, viewer]);
+  }, [isSessionEnded, language, loadMinutes, subscribe, viewer]);
 
   const openPip = useCallback(async () => {
     const pipApi = (window as Window & { documentPictureInPicture?: { requestWindow(options: { width: number; height: number }): Promise<Window> } }).documentPictureInPicture;
@@ -1885,7 +1936,12 @@ export default function LiveViewer({ compact = false }: { compact?: boolean }) {
       {isSessionEnded ? (
         <div className="live-ended-view">
           <MeetingMinutes summary={summaryRecord?.summary ?? null} summaryCreatedAt={summaryRecord?.createdAt ?? null}
-            transcript={transcript} isLoading={isMinutesLoading} onRetry={() => void loadMinutes()} />
+            transcript={transcript} isTranscriptLoaded={isTranscriptLoaded}
+            summaryError={summaryError} transcriptError={transcriptError}
+            isLoading={isMinutesLoading} onRetry={() => {
+              const missingResource = summaryRecord ? "transcript" : isTranscriptLoaded ? "summary" : "both";
+              void loadMinutes(languageRef.current, missingResource);
+            }} />
         </div>
       ) : sessionStatus === "preparing" ? (
         <section className="live-waiting-screen" aria-label="Waiting for the host">

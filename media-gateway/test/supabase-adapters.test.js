@@ -484,6 +484,38 @@ test("publisher fans out locally and persists only through active-session RPCs",
   assert.equal(calls[0].body.p_translation_status, "translated");
 });
 
+test("publisher removes live-only speaker headings from the exact snapshot contract", async () => {
+  const calls = [];
+  const liveEvents = [];
+  const publisher = new SupabaseLivePublisher({
+    baseUrl: "https://dev-ref.supabase.co", serviceRoleKey: "secret",
+    async eventFanout(_sessionId, _language, event) { liveEvents.push(event); },
+    async audioFanout() {},
+    async fetchFn(url, init) {
+      calls.push({ url, body: JSON.parse(init.body) });
+      return new Response("true", { status: 200, headers: { "Content-Type": "application/json" } });
+    },
+  });
+  const caption = {
+    type: "caption", seq: 1, sessionId: "session-1", language: "ko",
+    speaker: null,
+    speakerRole: "host", speakerName: "Host", speakerDepartment: "", speakerJobTitle: "",
+    text: "화면용 발표자 제목은 저장 계약과 분리합니다.", isFinal: true,
+    sourceText: "Keep display metadata out of persistence.", sourceLanguage: "en",
+    translationStatus: "translated",
+    sourceEndedAt: "2026-07-26T00:00:04.000Z", emittedAt: "2026-07-26T00:00:04.100Z",
+  };
+
+  await publisher.publish("session-1", "ko", caption);
+  const durableEvent = calls[0].body.p_event;
+  assert.deepEqual(
+    Object.keys(durableEvent).filter((key) => key.startsWith("speaker") && key !== "speaker"),
+    [],
+    "the deployed snapshot RPC rejects these unknown top-level keys",
+  );
+  assert.equal(liveEvents[0].speakerRole, "host", "live delivery keeps the screen heading metadata");
+});
+
 test("a source-lane caption persists with no duplicated original", async () => {
   const calls = [];
   const publisher = new SupabaseLivePublisher({

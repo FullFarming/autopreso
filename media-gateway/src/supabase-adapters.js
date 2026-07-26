@@ -45,6 +45,14 @@ export class SupabaseLivePublisher {
     if (event.type === "caption" && event.isFinal) {
       let durableResult;
       try {
+        // These headings exist only on the live Electron event. The deployed
+        // snapshot RPC intentionally rejects unknown top-level keys; durable
+        // identity remains in the validated nested speaker object/columns.
+        const durableEvent = { ...event };
+        delete durableEvent.speakerRole;
+        delete durableEvent.speakerName;
+        delete durableEvent.speakerDepartment;
+        delete durableEvent.speakerJobTitle;
         // 2026-07-26 fix: The database commits the active snapshot and complete
         // utterance row in one transaction. Delivery begins only afterwards,
         // so every visible final is durable and replayable.
@@ -53,7 +61,7 @@ export class SupabaseLivePublisher {
           body: JSON.stringify({
             p_session_id: sessionId,
             p_language: language,
-            p_event: event,
+            p_event: durableEvent,
             p_seq: event.seq,
             p_text: event.text,
             p_speaker_label: event.speaker?.speakerId ?? null,

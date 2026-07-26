@@ -42,5 +42,10 @@ test("fresh bootstrap contains the reconciliation migration byte-for-byte", asyn
   const marker = `-- ${migrationName}`;
   const sectionStart = bootstrap.lastIndexOf(marker);
   assert.notEqual(sectionStart, -1);
-  assert.equal(bootstrap.slice(sectionStart + marker.length + 1), sql);
+  const contentStart = sectionStart + marker.length + 1;
+  const nextSection = bootstrap.indexOf("\n-- 20", contentStart);
+  const section = nextSection === -1
+    ? bootstrap.slice(contentStart)
+    : bootstrap.slice(contentStart, nextSection);
+  assert.equal(section, sql);
 });

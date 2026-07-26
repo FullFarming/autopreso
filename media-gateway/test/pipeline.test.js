@@ -1342,13 +1342,13 @@ test("a finalized utterance invalidates in-flight partial work for its lanes", a
   assert.equal(captions.some((event) => !event.isFinal && event.text.includes("stale")), false);
 });
 
-test("captions are mirrored to the host socket for bidirectional desktop display", async () => {
+test("translated captions are mirrored to the host socket for bidirectional desktop display", async () => {
   const state = makeDependencies();
   const hostEvents = [];
   const pipeline = new LiveMediaPipeline({
     sessionId: "s-host-mirror",
     mode: "meeting",
-    languages: ["ko"],
+    languages: ["en"],
     dependencies: state.dependencies,
     onHostEvent: (event) => hostEvents.push(event),
   });
@@ -1362,7 +1362,7 @@ test("captions are mirrored to the host socket for bidirectional desktop display
   await pipeline.acceptFinalUtterance({ speakerLabel: "A", text: "참가자 발언입니다", sourceLanguage: "ko-KR", sourceEndedAt: "2026-07-19T00:00:00.000Z" });
   const captions = hostEvents.filter((event) => event.type === "caption");
   assert.equal(captions.length, 1);
-  assert.equal(captions[0].text, "참가자 발언입니다");
+  assert.equal(captions[0].text, "en:translated 참가자 발언입니다");
   assert.equal(captions[0].speaker.isParticipant, true);
   assert.equal(captions[0].speaker.name, "김참가");
   assert.equal(captions[0].speakerRole, "participant");
@@ -1726,6 +1726,92 @@ test("meeting translated finals carry the same source text into polish, host mir
   const source = state.events.find((event) => event.type === "caption" && event.origin === "source");
   assert.equal(persisted.utteranceKey, source.utteranceKey);
   assert.deepEqual(mirrored, persisted);
+});
+
+test("meeting keeps bilingual records but mirrors only translated captions to the desktop", async () => {
+  const state = makeDependencies();
+  const hostEvents = [];
+  const polishCalls = [];
+  state.dependencies.captionPolish = {
+    async polish(input) {
+      polishCalls.push(input);
+      return input.translatedText;
+    },
+  };
+  const pipeline = new LiveMediaPipeline({
+    sessionId: "s-screen-translation-only",
+    sessionType: "meeting",
+    outputMode: "captions",
+    languages: ["en", "ko"],
+    dependencies: state.dependencies,
+    onHostEvent: (event) => hostEvents.push(event),
+  });
+  await pipeline.start();
+  const inputSession = state.liveSessions[0];
+  const koreanSession = state.liveSessions.find((session) => session.language === "ko");
+
+  await inputSession.onInputCaption({
+    text: "This source belongs only in the bilingual web record.",
+    isFinal: true,
+    languageCode: "en-US",
+    utteranceKey: "turn-1",
+  });
+  await koreanSession.onCaption({
+    text: "이 원문은 이중 언어 웹 기록에만 포함됩니다.",
+    isFinal: true,
+    sourceText: "This source belongs only in the bilingual web record.",
+    sourceLanguage: "en-US",
+    utteranceKey: "turn-1",
+  });
+
+  const persisted = state.events.filter((event) => event.type === "caption" && event.isFinal);
+  assert.deepEqual(persisted.map((event) => [event.language, event.origin ?? null]), [
+    ["en", "source"],
+    ["ko", null],
+  ], "the web record must retain both source and translated lanes");
+  assert.equal(polishCalls.length, 1, "the untranslated source record must never consume the polish budget");
+  assert.equal(polishCalls[0].targetLanguage, "ko");
+  assert.deepEqual(
+    hostEvents.filter((event) => event.type === "caption").map((event) => [event.language, event.text]),
+    [["ko", "이 원문은 이중 언어 웹 기록에만 포함됩니다."]],
+    "the desktop screen must receive only the opposite-language translation",
+  );
+  await pipeline.close();
+});
+
+test("meeting never mirrors a failed target-lane echo to the desktop", async () => {
+  const state = makeDependencies();
+  const hostEvents = [];
+  const pipeline = new LiveMediaPipeline({
+    sessionId: "s-screen-failed-hidden",
+    sessionType: "meeting",
+    outputMode: "captions",
+    languages: ["en", "ko"],
+    dependencies: state.dependencies,
+    onHostEvent: (event) => hostEvents.push(event),
+  });
+  await pipeline.start();
+  const inputSession = state.liveSessions[0];
+  const koreanSession = state.liveSessions.find((session) => session.language === "ko");
+  await inputSession.onInputCaption({
+    text: "This untranslated echo must stay in records only.",
+    isFinal: true,
+    languageCode: "en-US",
+    utteranceKey: "turn-failed",
+  });
+  await koreanSession.onCaption({
+    text: "This untranslated echo must stay in records only.",
+    isFinal: true,
+    sourceText: "This untranslated echo must stay in records only.",
+    sourceLanguage: "en-US",
+    utteranceKey: "turn-failed",
+  });
+
+  const failed = state.events.find((event) => event.type === "caption" && event.translationStatus === "failed");
+  assert.ok(failed, "the failed lane remains durable for audit/history continuity");
+  assert.equal(hostEvents.some((event) => event.translationStatus === "failed"), false);
+  assert.equal(hostEvents.some((event) => event.origin === "source"), false);
+  await pipeline.close();
 });
 
 test("a later input partial cannot steal an earlier final's source correlation", async () => {

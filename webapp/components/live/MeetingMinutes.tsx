@@ -51,10 +51,22 @@ export function formatMinuteTime(iso: string): string {
   return `${hours}:${minutes}`;
 }
 
-export default function MeetingMinutes({ summary, summaryCreatedAt, transcript, isLoading, onRetry }: {
+export default function MeetingMinutes({
+  summary,
+  summaryCreatedAt,
+  transcript,
+  isTranscriptLoaded,
+  summaryError,
+  transcriptError,
+  isLoading,
+  onRetry,
+}: {
   summary: MeetingSummary | null;
   summaryCreatedAt: string | null;
   transcript: TranscriptEntry[];
+  isTranscriptLoaded: boolean;
+  summaryError: string;
+  transcriptError: string;
   isLoading: boolean;
   onRetry: () => void;
 }) {
@@ -85,14 +97,20 @@ export default function MeetingMinutes({ summary, summaryCreatedAt, transcript, 
           ? <MeetingSummaryCard summary={summary} createdAt={summaryCreatedAt} />
           : (
             <div className="live-minutes-pending">
-              <p>{isLoading ? "Loading meeting notes…" : "The AI summary is not ready yet. It will appear after the host creates it."}</p>
+              <p role={summaryError ? "alert" : undefined}>{summaryError
+                || (isLoading ? "Loading meeting notes…" : "The AI summary is not ready yet. Check again shortly.")}</p>
               <button type="button" disabled={isLoading} onClick={onRetry}>{isLoading ? "Loading…" : "Check again"}</button>
             </div>
           )}
       </section>
       <section id="live-minutes-panel-transcript" className="live-minutes-panel" role="tabpanel"
         aria-labelledby="live-minutes-tab-transcript" hidden={activeTab !== "transcript"}>
-        {turns.length > 0 ? (
+        {transcriptError ? (
+          <div className="live-minutes-pending">
+            <p role="alert">{transcriptError || "Unable to load the transcript. Check again."}</p>
+            <button type="button" disabled={isLoading} onClick={onRetry}>{isLoading ? "Loading…" : "Check again"}</button>
+          </div>
+        ) : turns.length > 0 ? (
           <div className="live-minutes-record">
             {turns.map((turn) => (
               <article key={turn.key}>
@@ -104,7 +122,9 @@ export default function MeetingMinutes({ summary, summaryCreatedAt, transcript, 
               </article>
             ))}
           </div>
-        ) : <p className="live-minutes-empty">No transcript is available.</p>}
+        ) : isTranscriptLoaded
+          ? <p className="live-minutes-empty">No transcript is available.</p>
+          : <p className="live-minutes-empty">{isLoading ? "Loading transcript…" : "The transcript is not ready yet."}</p>}
       </section>
     </div>
   );
