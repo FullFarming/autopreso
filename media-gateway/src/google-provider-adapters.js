@@ -1,6 +1,7 @@
-import { AUDIO_CONFIG, STT_CONFIG, textPlausiblyInLanguage } from "./config.js";
+import { AUDIO_CONFIG, normalizeLiveLanguage, STT_CONFIG, textPlausiblyInLanguage } from "./config.js";
 import { selectRelevantGlossary } from "./caption-polish.js";
 import { Pcm16StreamConditioner } from "./pcm-conditioning.js";
+import { createSourceLanguageState } from "./source-language-state.js";
 import { StableTranscriptSegmenter, StableUtteranceSegmenter } from "./stable-utterance-segmenter.js";
 import { segmentTextForStreamingTts } from "./tts-text-segmentation.js";
 
@@ -70,6 +71,24 @@ export function lastSentenceBoundaryEnd(text) {
     if (/[\s"'”’)\]]/u.test(next)) return index + 1;
   }
   return 0;
+}
+
+function firstSentenceBoundaryEnd(text) {
+  const value = String(text ?? "");
+  for (let index = 0; index < value.length; index += 1) {
+    const char = value[index];
+    if ("。！？…".includes(char)) return index + 1;
+    if (!".!?".includes(char)) continue;
+    const next = value[index + 1];
+    if (next !== undefined && /[\s"'”’)\]]/u.test(next)) return index + 1;
+  }
+  return 0;
+}
+
+function firstSentenceOrTail(text) {
+  const value = String(text ?? "");
+  const boundary = firstSentenceBoundaryEnd(value);
+  return boundary > 0 ? value.slice(0, boundary) : value;
 }
 
 const TTS_RESPONSE_HIGH_WATER_BYTES = 144_000;
@@ -157,6 +176,8 @@ export class GeminiLiveTranslateAdapter {
     const makeTranscriptLane = () => ({ accumulated: "", committedLength: 0 });
     let outputLane = makeTranscriptLane();
     let inputLane = makeTranscriptLane();
+    const sourceLanguageState = createSourceLanguageState();
+    let transcriptEpoch = 0;
     let inputTranscriptLanguageCode = null;
     let outputTranscriptLanguageCode = null;
     let nextUtteranceIdentity = 0;
@@ -170,9 +191,11 @@ export class GeminiLiveTranslateAdapter {
       if (finalFlushTimer !== null) clearTimeout(finalFlushTimer);
       finalFlushTimer = null;
     };
-    const resetTranscriptLanes = () => {
+    const resetTranscriptLanes = ({ invalidateQueued = false } = {}) => {
+      if (invalidateQueued) transcriptEpoch += 1;
       outputLane = makeTranscriptLane();
       inputLane = makeTranscriptLane();
+      sourceLanguageState.reset();
       inputTranscriptLanguageCode = null;
       outputTranscriptLanguageCode = null;
       inputContexts.length = 0;
@@ -182,13 +205,17 @@ export class GeminiLiveTranslateAdapter {
       pendingOutputTimer = null;
       clearFinalFlushTimer();
     };
-    const emitLane = async (lane, emit, { flushAll = false } = {}) => {
-      const uncommitted = lane.accumulated.slice(lane.committedLength);
-      const boundary = flushAll ? uncommitted.length : lastSentenceBoundaryEnd(uncommitted);
-      if (boundary > 0) {
+    const emitLane = async (lane, emit, { flushAll = false, afterCommit = null } = {}) => {
+      while (true) {
+        const uncommitted = lane.accumulated.slice(lane.committedLength);
+        const boundary = flushAll ? uncommitted.length : firstSentenceBoundaryEnd(uncommitted);
+        if (boundary <= 0) break;
         const segment = uncommitted.slice(0, boundary).trim();
         lane.committedLength += boundary;
         if (segment) await emit({ text: segment, isFinal: true });
+        const remainingTail = lane.accumulated.slice(lane.committedLength).trim();
+        if (await afterCommit?.(remainingTail) === false) return;
+        if (flushAll) break;
       }
       if (flushAll) {
         lane.accumulated = "";
@@ -313,14 +340,21 @@ export class GeminiLiveTranslateAdapter {
     // fragment the same utterance.
     const armFinalFlushTimer = (generation) => {
       clearFinalFlushTimer();
+      const scheduledTranscriptEpoch = transcriptEpoch;
       finalFlushTimer = setTimeout(() => {
         finalFlushTimer = null;
         enqueueCallback(async () => {
-          if (generation !== activeConnectionGeneration || isClosed) return;
-          await emitLane(inputLane, emitInput, { flushAll: true });
-          if (generation !== activeConnectionGeneration || isClosed) return;
+          if (generation !== activeConnectionGeneration || scheduledTranscriptEpoch !== transcriptEpoch || isClosed) return;
+          await emitLane(inputLane, emitInput, {
+            flushAll: true,
+            afterCommit: () => {
+              if (generation !== activeConnectionGeneration || scheduledTranscriptEpoch !== transcriptEpoch || isClosed) return false;
+              sourceLanguageState.reset();
+              inputTranscriptLanguageCode = null;
+            },
+          });
+          if (generation !== activeConnectionGeneration || scheduledTranscriptEpoch !== transcriptEpoch || isClosed) return;
           await emitLane(outputLane, emitOutput, { flushAll: true });
-          inputTranscriptLanguageCode = null;
         });
       }, this.finalFlushMilliseconds);
     };
@@ -389,8 +423,15 @@ export class GeminiLiveTranslateAdapter {
             if (message.goAway) void reconnect();
             const transcription = message.serverContent?.outputTranscription;
             const inputTranscription = message.serverContent?.inputTranscription;
+            const outputTranscriptText = typeof transcription?.text === "string" ? transcription.text : "";
+            const providerOutputLanguageCode = typeof transcription?.languageCode === "string"
+              && transcription.languageCode.length <= 128
+              ? transcription.languageCode
+              : "";
             const isTurnComplete = Boolean(message.serverContent?.turnComplete || message.serverContent?.generationComplete);
             const isInterrupted = Boolean(message.serverContent?.interrupted);
+            if (isInterrupted) transcriptEpoch += 1;
+            const messageTranscriptEpoch = transcriptEpoch;
             let hasOversizedAudioPart = false;
             const audioParts = (message.serverContent?.modelTurn?.parts ?? []).flatMap((part) => {
               const inlineData = part.inlineData ?? part.inline_data;
@@ -421,7 +462,7 @@ export class GeminiLiveTranslateAdapter {
               });
             }
             enqueueCallback(async () => {
-              if (connectionGeneration !== activeConnectionGeneration || isClosed) return;
+              if (connectionGeneration !== activeConnectionGeneration || messageTranscriptEpoch !== transcriptEpoch || isClosed) return;
               if (isInterrupted) {
                 // A barge-in abandons the current utterance; stale accumulated
                 // text must not leak into the next one.
@@ -433,30 +474,67 @@ export class GeminiLiveTranslateAdapter {
                 // caption polish back in front of playout.
                 await audioTail;
                 await onInterruption?.();
-                if (connectionGeneration !== activeConnectionGeneration || isClosed) return;
+                if (connectionGeneration !== activeConnectionGeneration || messageTranscriptEpoch !== transcriptEpoch || isClosed) return;
               }
-              if (inputTranscription?.text) {
-                inputLane.accumulated = mergeLiveTranscript(inputLane.accumulated, inputTranscription.text);
-                if (inputTranscription.languageCode) inputTranscriptLanguageCode = inputTranscription.languageCode;
+              const inputTranscriptText = typeof inputTranscription?.text === "string" ? inputTranscription.text : "";
+              if (inputTranscriptText) {
+                inputLane.accumulated = mergeLiveTranscript(inputLane.accumulated, inputTranscriptText);
+                const observedSourceLanguage = sourceLanguageState.observe({
+                  providerLanguage: inputTranscription.languageCode,
+                  transcript: firstSentenceOrTail(inputLane.accumulated.slice(inputLane.committedLength)),
+                });
+                const providerSourceLanguage = typeof inputTranscription.languageCode === "string"
+                  && inputTranscription.languageCode.length <= 128
+                  ? inputTranscription.languageCode
+                  : "";
+                if (observedSourceLanguage) {
+                  if (normalizeLiveLanguage(inputTranscriptLanguageCode) !== observedSourceLanguage) {
+                    inputTranscriptLanguageCode = normalizeLiveLanguage(providerSourceLanguage) === observedSourceLanguage
+                      ? providerSourceLanguage
+                      : observedSourceLanguage;
+                  }
+                }
                 if (!isTurnComplete) {
-                  await emitLane(inputLane, emitInput);
-                  if (connectionGeneration !== activeConnectionGeneration || isClosed) return;
+                  await emitLane(inputLane, emitInput, {
+                    afterCommit: (remainingTail) => {
+                      if (connectionGeneration !== activeConnectionGeneration || messageTranscriptEpoch !== transcriptEpoch || isClosed) return false;
+                      sourceLanguageState.reset();
+                      const nextSourceLanguage = remainingTail
+                        ? sourceLanguageState.observe({
+                          providerLanguage: inputTranscription.languageCode,
+                          transcript: firstSentenceOrTail(remainingTail),
+                        }) || null
+                        : null;
+                      inputTranscriptLanguageCode = nextSourceLanguage
+                        && normalizeLiveLanguage(providerSourceLanguage) === nextSourceLanguage
+                        ? providerSourceLanguage
+                        : nextSourceLanguage;
+                    },
+                  });
+                  if (connectionGeneration !== activeConnectionGeneration || messageTranscriptEpoch !== transcriptEpoch || isClosed) return;
                 }
               }
-              if (transcription?.text) {
-                if (transcription.languageCode) outputTranscriptLanguageCode = transcription.languageCode;
-                outputLane.accumulated = mergeLiveTranscript(outputLane.accumulated, transcription.text);
+              if (outputTranscriptText) {
+                if (providerOutputLanguageCode) outputTranscriptLanguageCode = providerOutputLanguageCode;
+                outputLane.accumulated = mergeLiveTranscript(outputLane.accumulated, outputTranscriptText);
                 if (!isTurnComplete) {
                   await emitLane(outputLane, emitOutput);
-                  if (connectionGeneration !== activeConnectionGeneration || isClosed) return;
+                  if (connectionGeneration !== activeConnectionGeneration || messageTranscriptEpoch !== transcriptEpoch || isClosed) return;
                 }
               }
               if (isTurnComplete) {
                 clearFinalFlushTimer();
-                await emitLane(inputLane, emitInput, { flushAll: true });
-                if (connectionGeneration !== activeConnectionGeneration || isClosed) return;
+                await emitLane(inputLane, emitInput, {
+                  flushAll: true,
+                  afterCommit: () => {
+                    if (connectionGeneration !== activeConnectionGeneration || messageTranscriptEpoch !== transcriptEpoch || isClosed) return false;
+                    sourceLanguageState.reset();
+                    inputTranscriptLanguageCode = null;
+                  },
+                });
+                if (connectionGeneration !== activeConnectionGeneration || messageTranscriptEpoch !== transcriptEpoch || isClosed) return;
                 await emitLane(outputLane, emitOutput, { flushAll: true });
-                if (connectionGeneration !== activeConnectionGeneration || isClosed) return;
+                if (connectionGeneration !== activeConnectionGeneration || messageTranscriptEpoch !== transcriptEpoch || isClosed) return;
                 // A completed provider turn is a hard correlation boundary.
                 // Any input left unmatched here had no translated output; it
                 // must not be attached to the next turn's otherwise unrelated
@@ -464,7 +542,6 @@ export class GeminiLiveTranslateAdapter {
                 // audio with the same floor can still be attributed.
                 inputContexts.length = 0;
                 if (captureSegments.length > 1) captureSegments.splice(0, captureSegments.length - 1);
-                inputTranscriptLanguageCode = null;
                 outputTranscriptLanguageCode = null;
               }
             });
@@ -488,7 +565,7 @@ export class GeminiLiveTranslateAdapter {
       // it after resumption can splice unrelated speech across generations.
       clearInputTail();
       // Ditto for half-accumulated transcripts.
-      resetTranscriptLanes();
+      resetTranscriptLanes({ invalidateQueued: true });
       reconnecting = (async () => {
         while (!isClosed) {
           reconnectAttempts += 1;
@@ -577,8 +654,10 @@ export class GeminiLiveTranslateAdapter {
         // consume the participant marker before newly captured host audio.
         // A participant takeover is different: any unfinalized host marker is
         // ambiguous and must be discarded before participant audio begins.
+        transcriptEpoch += 1;
         inputLane = makeTranscriptLane();
         outputLane = makeTranscriptLane();
+        sourceLanguageState.reset();
         inputTranscriptLanguageCode = null;
         outputTranscriptLanguageCode = null;
         if (nextFloorSpeaker) {

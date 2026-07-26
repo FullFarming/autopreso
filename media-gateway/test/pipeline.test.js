@@ -71,6 +71,46 @@ function makeDependencies() {
   };
 }
 
+function makeManualClock(start = 0) {
+  let now = start;
+  let nextId = 0;
+  const timers = new Map();
+  return {
+    now: () => now,
+    setTimeoutFn(callback, delay) {
+      const id = ++nextId;
+      timers.set(id, { callback, dueAt: now + delay });
+      return id;
+    },
+    clearTimeoutFn(id) {
+      timers.delete(id);
+    },
+    async advance(milliseconds) {
+      const target = now + milliseconds;
+      let callbackCount = 0;
+      while (true) {
+        const next = [...timers.entries()]
+          .filter(([, timer]) => timer.dueAt <= target)
+          .sort((left, right) => left[1].dueAt - right[1].dueAt)[0];
+        if (!next) break;
+        const [id, timer] = next;
+        timers.delete(id);
+        now = timer.dueAt;
+        timer.callback();
+        callbackCount += 1;
+        if (callbackCount > 100) throw new Error("TIMER_LOOP");
+        await new Promise((resolve) => setImmediate(resolve));
+      }
+      now = target;
+      await new Promise((resolve) => setImmediate(resolve));
+      return callbackCount;
+    },
+    get pendingCount() {
+      return timers.size;
+    },
+  };
+}
+
 test("presentation opens one provider session per language, not per viewer", async () => {
   const state = makeDependencies();
   const pipeline = new LiveMediaPipeline({ sessionId: "s1", mode: "presentation", languages: ["en", "ko"], dependencies: state.dependencies, now: () => 0 });
@@ -107,7 +147,7 @@ test("Presentation keeps Gemini captions and routes only translated audio throug
   assert.equal(state.openaiVoiceSessions[0].sent.length, 1);
 });
 
-test("Presentation coalesces repeated partial snapshots and publishes one ordered final", async () => {
+test("Presentation cancels rapid partial snapshots when their ordered final arrives", async () => {
   const state = makeDependencies();
   const pipeline = new LiveMediaPipeline({
     sessionId: "presentation-caption-coalescing",
@@ -125,16 +165,165 @@ test("Presentation coalesces repeated partial snapshots and publishes one ordere
   await state.liveSessions[0].onCaption({ text: "안녕하세요", isFinal: true, utteranceKey: "turn-1" });
   const captions = state.events.filter((event) => event.type === "caption");
   assert.deepEqual(captions.map((event) => [event.text, event.isFinal]), [
-    ["안녕", false],
-    ["안녕하세요", false],
     ["안녕하세요", true],
   ]);
-  // Contract C1: interim captions carry the seq their committed line WILL
-  // take, without consuming it. Two partials and the final that supersedes
-  // them are all the same committed line, so all three report seq 1. The
-  // durable counter only advances on the final.
-  assert.deepEqual(captions.map((event) => event.seq), [1, 1, 1]);
+  // The final supersedes every not-yet-visible revision and remains the first
+  // durable sequence in the lane.
+  assert.deepEqual(captions.map((event) => event.seq), [1]);
   assert.deepEqual(captions.filter((event) => event.isFinal).map((event) => event.seq), [1]);
+});
+
+test("Live Call emits only the latest rapid revision within the captions-only 500 ms hold", async () => {
+  const state = makeDependencies();
+  const clock = makeManualClock(1_000);
+  const pipeline = new LiveMediaPipeline({
+    sessionId: "partial-stability",
+    sessionType: "meeting",
+    outputMode: "captions",
+    languages: ["en"],
+    dependencies: state.dependencies,
+    now: clock.now,
+    setTimeoutFn: clock.setTimeoutFn,
+    clearTimeoutFn: clock.clearTimeoutFn,
+  });
+  await pipeline.start();
+  const session = state.liveSessions[0];
+
+  await session.onCaption({ text: "The first growing revision", isFinal: false });
+  await clock.advance(139);
+  await session.onCaption({ text: "The second growing revision", isFinal: false });
+  await clock.advance(140);
+  await session.onCaption({ text: "The latest stable revision", isFinal: false });
+  await clock.advance(221);
+
+  const partials = state.events.filter((event) => event.type === "caption" && !event.isFinal);
+  assert.deepEqual(partials.map((event) => event.text), ["The latest stable revision"]);
+  await pipeline.close();
+});
+
+test("an undersized partial expires without a zero-delay timer loop", async () => {
+  const state = makeDependencies();
+  const clock = makeManualClock(1_000);
+  const pipeline = new LiveMediaPipeline({
+    sessionId: "short-partial-deadline",
+    sessionType: "meeting",
+    outputMode: "captions",
+    languages: ["en"],
+    dependencies: state.dependencies,
+    now: clock.now,
+    setTimeoutFn: clock.setTimeoutFn,
+    clearTimeoutFn: clock.clearTimeoutFn,
+  });
+  await pipeline.start();
+  await state.liveSessions[0].onCaption({ text: "Tiny", isFinal: false });
+  const callbackCount = await clock.advance(1_000);
+  assert.ok(callbackCount <= 4, `short hold armed ${callbackCount} callbacks`);
+  assert.equal(clock.pendingCount, 0);
+  assert.equal(state.events.some((event) => event.type === "caption"), false);
+  await pipeline.close();
+});
+
+test("a stalled partial publisher keeps only one active publication and one latest revision", async () => {
+  const state = makeDependencies();
+  const published = [];
+  const releases = [];
+  let active = 0;
+  let maximumActive = 0;
+  state.dependencies.publisher.publish = async (_sessionId, _language, event, { onLiveEvent } = {}) => {
+    if (event.type !== "caption") return;
+    published.push(event.text);
+    active += 1;
+    maximumActive = Math.max(maximumActive, active);
+    await onLiveEvent?.(event);
+    await new Promise((resolve) => releases.push(resolve));
+    active -= 1;
+  };
+  const pipeline = new LiveMediaPipeline({
+    sessionId: "partial-backpressure",
+    sessionType: "meeting",
+    outputMode: "captions",
+    languages: ["en"],
+    dependencies: state.dependencies,
+  });
+  await pipeline.start();
+  const session = state.liveSessions[0];
+
+  await session.onCaption({ text: "First complete-looking partial.", isFinal: false });
+  await new Promise((resolve) => setImmediate(resolve));
+  for (let index = 0; index < 50; index += 1) {
+    await session.onCaption({ text: `Latest revision number ${index}.`, isFinal: false });
+  }
+  assert.deepEqual(published, ["First complete-looking partial."]);
+  assert.equal(maximumActive, 1);
+
+  releases.shift()?.();
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(published, ["First complete-looking partial.", "Latest revision number 49."]);
+  assert.equal(maximumActive, 1);
+  releases.shift()?.();
+  await pipeline.close();
+});
+
+test("a final waits behind an active partial and cancels every queued revision", async () => {
+  const state = makeDependencies();
+  const published = [];
+  let releasePartial;
+  state.dependencies.publisher.publish = async (_sessionId, _language, event, { onLiveEvent } = {}) => {
+    await onLiveEvent?.(event);
+    if (event.type !== "caption") return;
+    if (event.type === "caption" && !event.isFinal) {
+      await new Promise((resolve) => { releasePartial = resolve; });
+    }
+    published.push([event.text, event.isFinal]);
+  };
+  const pipeline = new LiveMediaPipeline({
+    sessionId: "partial-final-order",
+    sessionType: "meeting",
+    outputMode: "captions",
+    languages: ["en"],
+    dependencies: state.dependencies,
+  });
+  await pipeline.start();
+  const session = state.liveSessions[0];
+  await session.onCaption({ text: "Visible partial sentence.", isFinal: false });
+  await new Promise((resolve) => setImmediate(resolve));
+  await session.onCaption({ text: "Queued revision sentence.", isFinal: false });
+  const finalPublication = session.onCaption({ text: "Final sentence.", isFinal: true });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(published, []);
+  releasePartial?.();
+  await finalPublication;
+  assert.deepEqual(published, [
+    ["Visible partial sentence.", false],
+    ["Final sentence.", true],
+  ]);
+  await pipeline.close();
+});
+
+test("floor changes and stop cancel pending stabilized partials", async () => {
+  for (const action of ["floor", "stop"]) {
+    const state = makeDependencies();
+    const clock = makeManualClock(1_000);
+    const pipeline = new LiveMediaPipeline({
+      sessionId: `partial-cancel-${action}`,
+      sessionType: "meeting",
+      outputMode: "captions",
+      languages: ["en"],
+      dependencies: state.dependencies,
+      now: clock.now,
+      setTimeoutFn: clock.setTimeoutFn,
+      clearTimeoutFn: clock.clearTimeoutFn,
+    });
+    await pipeline.start();
+    await state.liveSessions[0].onCaption({ text: "Pending long-enough revision", isFinal: false });
+    if (action === "floor") pipeline.setFloorSpeaker({ participantId: "next", displayName: "다음 화자" });
+    else await pipeline.close();
+    await clock.advance(1_000);
+    assert.equal(state.events.some((event) => event.type === "caption"), false);
+    assert.equal(clock.pendingCount, 0);
+    if (action === "floor") await pipeline.close();
+  }
 });
 
 test("Presentation OpenAI voice failure clears audio but leaves Gemini captions running", async () => {
@@ -1218,7 +1407,7 @@ test("a realistic interim/commit stream loses no committed caption at the viewer
   // Three utterances, each streamed as partials then committed.
   for (let utterance = 0; utterance < 3; utterance += 1) {
     for (let step = 0; step < 5; step += 1) {
-      await state.liveSessions[0].onCaption({ text: `u${utterance} step ${step}`, isFinal: false });
+      await state.liveSessions[0].onCaption({ text: `u${utterance} step ${step}.`, isFinal: false });
     }
     await state.liveSessions[0].onCaption({ text: `utterance ${utterance} committed.`, isFinal: true });
   }
@@ -1330,7 +1519,7 @@ test("meeting live-translate captions carry floor attribution while a participan
   pipeline.setFloorSpeaker({ participantId: "p1", displayName: "김참가" });
   await enSession.onCaption({ text: "Hello from the floor, everyone", isFinal: true });
   const captions = state.events.filter((event) => event.type === "caption" && event.language === "en");
-  assert.equal(captions[0].speaker, null);
+  assert.equal(captions.length, 1, "the pending host partial is cancelled at the floor boundary");
   assert.equal(captions.at(-1).speaker?.name, "김참가");
   assert.equal(captions.at(-1).speaker?.isParticipant, true);
 });
@@ -1346,7 +1535,6 @@ test("the meeting input transcript feeds the source-language lane like the deskt
   await firstSession.onInputCaption({ text: "안녕하세요 여러분 반갑습니다", isFinal: true, languageCode: "ko-KR" });
   const koCaptions = state.events.filter((event) => event.type === "caption" && event.language === "ko");
   assert.deepEqual(koCaptions.map((event) => [event.text, event.isFinal]), [
-    ["안녕하세요 여러분", false],
     ["안녕하세요 여러분 반갑습니다", true],
   ]);
   // English speech routes to the en lane by script when the hint is absent.
@@ -1762,11 +1950,11 @@ test("actual Gemini partials keep flowing while ordered finals wait on caption p
 
   messageHandler({ serverContent: {
     inputTranscription: { text: "둘째 원문", languageCode: "ko-KR" },
-    outputTranscription: { text: "Second translation growing" },
+    outputTranscription: { text: "Second translation growing." },
   } });
   await settle();
   assert.equal(
-    state.events.some((event) => event.type === "caption" && !event.isFinal && event.text === "Second translation growing"),
+    state.events.some((event) => event.type === "caption" && !event.isFinal && event.text === "Second translation growing."),
     true,
   );
 
@@ -1819,7 +2007,8 @@ test("actual participant KO callback keeps EN partial growth when output languag
   for (let tick = 0; tick < 8; tick += 1) await new Promise((resolve) => setImmediate(resolve));
 
   const english = state.events.filter((event) => event.type === "caption" && event.language === "en");
-  assert.equal(english.some((event) => event.isFinal === false && event.text === "Hello"), true);
+  assert.equal(english.some((event) => event.isFinal === false && event.text === "Hello"), false,
+    "a five-character provider guess stays hidden until the sentence is committed");
   const final = english.find((event) => event.isFinal === true);
   assert.equal(final?.text, "Hello everyone.");
   assert.equal(final?.sourceLanguage, "ko");
@@ -1939,8 +2128,9 @@ test("floor transition never lets a new participant partial inherit the host sou
   const source = state.liveSessions.find((session) => typeof session.onInputCaption === "function");
   const english = state.liveSessions.find((session) => session.language === "en");
 
-  await source.onInputCaption({ text: "호스트 문장", isFinal: false, languageCode: "ko-KR" });
-  await english.onCaption({ text: "Host sentence", isFinal: false });
+  await source.onInputCaption({ text: "호스트 문장.", isFinal: false, languageCode: "ko-KR" });
+  await english.onCaption({ text: "Host sentence.", isFinal: false });
+  await new Promise((resolve) => setImmediate(resolve));
   const hostTranslation = state.events.find((event) => event.type === "caption" && event.language === "en");
   pipeline.setFloorSpeaker({ participantId: "new-speaker", displayName: "새 참가자" });
 
@@ -1950,8 +2140,9 @@ test("floor transition never lets a new participant partial inherit the host sou
     1,
     "an output partial arriving before its new source must not reuse the host utterance",
   );
-  await source.onInputCaption({ text: "새 참가자 문장", isFinal: false, languageCode: "ko-KR" });
-  await english.onCaption({ text: "New participant sentence", isFinal: false });
+  await source.onInputCaption({ text: "새 참가자 문장.", isFinal: false, languageCode: "ko-KR" });
+  await english.onCaption({ text: "New participant sentence.", isFinal: false });
+  await new Promise((resolve) => setImmediate(resolve));
 
   const participantTranslation = state.events.filter(
     (event) => event.type === "caption" && event.language === "en",

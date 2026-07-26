@@ -1655,3 +1655,147 @@ test("close drains one unfinished source/output pair in order", async () => {
   assert.equal(outputCaptions.at(-1).utteranceKey, inputCaptions.at(-1).utteranceKey);
   assert.equal(outputCaptions.at(-1).floorSpeaker?.participantId, "participant-1");
 });
+
+test("Gemini locks mixed Korean source until punctuation then permits English in the same provider turn", async () => {
+  const inputCaptions = [];
+  let messageHandler;
+  const adapter = new GeminiLiveTranslateAdapter({
+    model: "gemini-3.5-live-translate-preview",
+    client: { live: { async connect(options) {
+      messageHandler = options.callbacks.onmessage;
+      return { sendRealtimeInput() {}, close() {} };
+    } } },
+  });
+  const session = await adapter.open({
+    language: "en",
+    onInputCaption: (caption) => { inputCaptions.push({ ...caption }); },
+    onCaption: async () => {},
+    onAudio: async () => {},
+  });
+
+  messageHandler({ serverContent: { inputTranscription: {
+    text: "국내 CRE market과 Cushman & Wakefield 임대료입니다。 We will continue with the next agenda item. ",
+    languageCode: "ko-KR",
+  } } });
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.deepEqual(
+    inputCaptions.filter((caption) => caption.isFinal).map(({ text, languageCode }) => ({ text, languageCode })),
+    [
+      { text: "국내 CRE market과 Cushman & Wakefield 임대료입니다。", languageCode: "ko-KR" },
+      { text: "We will continue with the next agenda item.", languageCode: "en" },
+    ],
+  );
+  await session.close();
+});
+
+test("a floor boundary rejects provider transcript callbacks queued for the old floor", async () => {
+  const inputCaptions = [];
+  let messageHandler;
+  let releaseFirstPartial;
+  const firstPartialBlocked = new Promise((resolve) => { releaseFirstPartial = resolve; });
+  const adapter = new GeminiLiveTranslateAdapter({
+    model: "gemini-3.5-live-translate-preview",
+    client: { live: { async connect(options) {
+      messageHandler = options.callbacks.onmessage;
+      return { sendRealtimeInput() {}, close() {} };
+    } } },
+  });
+  const session = await adapter.open({
+    language: "en",
+    onInputCaption: async (caption) => {
+      inputCaptions.push({ ...caption });
+      if (caption.text === "이전 화자의") await firstPartialBlocked;
+    },
+    onCaption: async () => {},
+    onAudio: async () => {},
+  });
+
+  messageHandler({ serverContent: { inputTranscription: { text: "이전 화자의", languageCode: "ko-KR" } } });
+  await new Promise((resolve) => setImmediate(resolve));
+  messageHandler({ serverContent: { inputTranscription: { text: " 폐기될 꼬리", languageCode: "ko-KR" } } });
+  session.setFloorSpeaker({ participantId: "next", displayName: "Next" });
+  releaseFirstPartial();
+  messageHandler({ serverContent: { inputTranscription: {
+    text: "The new speaker starts here",
+    languageCode: "en-US",
+  }, turnComplete: true } });
+  for (let tick = 0; tick < 4; tick += 1) await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(
+    inputCaptions.some((caption) => caption.text.includes("폐기될 꼬리")),
+    false,
+    JSON.stringify(inputCaptions.map(({ text, isFinal, languageCode }) => ({ text, isFinal, languageCode }))),
+  );
+  assert.equal(inputCaptions.at(-1).text, "The new speaker starts here");
+  assert.equal(inputCaptions.at(-1).isFinal, true);
+  assert.equal(inputCaptions.at(-1).languageCode, "en-US");
+  await session.close();
+});
+
+test("an interruption resets the source lock before the next utterance", async () => {
+  const inputCaptions = [];
+  let messageHandler;
+  const adapter = new GeminiLiveTranslateAdapter({
+    model: "gemini-3.5-live-translate-preview",
+    client: { live: { async connect(options) {
+      messageHandler = options.callbacks.onmessage;
+      return { sendRealtimeInput() {}, close() {} };
+    } } },
+  });
+  const session = await adapter.open({
+    language: "en",
+    onInputCaption: (caption) => { inputCaptions.push({ ...caption }); },
+    onCaption: async () => {},
+    onAudio: async () => {},
+    onInterruption: async () => {},
+  });
+
+  messageHandler({ serverContent: { inputTranscription: {
+    text: "한국어로 시작한 중단 발화",
+    languageCode: "ko-KR",
+  } } });
+  await new Promise((resolve) => setImmediate(resolve));
+  messageHandler({ serverContent: { interrupted: true } });
+  messageHandler({ serverContent: { inputTranscription: {
+    text: "The replacement utterance is fully English",
+    languageCode: "en-US",
+  }, turnComplete: true } });
+  for (let tick = 0; tick < 4; tick += 1) await new Promise((resolve) => setImmediate(resolve));
+
+  assert.deepEqual(
+    inputCaptions.filter((caption) => caption.isFinal).map(({ text, languageCode }) => ({ text, languageCode })),
+    [{ text: "The replacement utterance is fully English", languageCode: "en-US" }],
+  );
+  await session.close();
+});
+
+test("Gemini rejects malformed output transcript text and oversized language metadata", async () => {
+  const captions = [];
+  let messageHandler;
+  const adapter = new GeminiLiveTranslateAdapter({
+    model: "gemini-3.5-live-translate-preview",
+    client: { live: { async connect(options) {
+      messageHandler = options.callbacks.onmessage;
+      return { sendRealtimeInput() {}, close() {} };
+    } } },
+  });
+  const session = await adapter.open({
+    language: "ko",
+    onCaption: (caption) => { captions.push({ ...caption }); },
+    onAudio: async () => {},
+  });
+
+  messageHandler({ serverContent: { outputTranscription: {
+    text: { toString() { throw new Error("must not run"); } },
+    languageCode: "ko",
+  }, turnComplete: true } });
+  messageHandler({ serverContent: { outputTranscription: {
+    text: "정상 번역",
+    languageCode: "x".repeat(129),
+  }, turnComplete: true } });
+  for (let tick = 0; tick < 3; tick += 1) await new Promise((resolve) => setImmediate(resolve));
+
+  assert.deepEqual(captions, [{ text: "정상 번역", isFinal: true }]);
+  await session.close();
+});

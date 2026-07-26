@@ -37,6 +37,39 @@ function makeDependencies({ translate } = {}) {
   };
 }
 
+function makeManualClock(start = 0) {
+  let now = start;
+  let nextId = 0;
+  const timers = new Map();
+  return {
+    now: () => now,
+    setTimeoutFn(callback, delay) {
+      const id = ++nextId;
+      timers.set(id, { callback, dueAt: now + delay });
+      return id;
+    },
+    clearTimeoutFn(id) {
+      timers.delete(id);
+    },
+    async advance(milliseconds) {
+      const target = now + milliseconds;
+      while (true) {
+        const next = [...timers.entries()]
+          .filter(([, timer]) => timer.dueAt <= target)
+          .sort((left, right) => left[1].dueAt - right[1].dueAt)[0];
+        if (!next) break;
+        const [id, timer] = next;
+        timers.delete(id);
+        now = timer.dueAt;
+        timer.callback();
+        await new Promise((resolve) => setImmediate(resolve));
+      }
+      now = target;
+      await new Promise((resolve) => setImmediate(resolve));
+    },
+  };
+}
+
 function makePipeline(state, languages = ["ko"]) {
   return new LiveMediaPipeline({
     sessionId: "s1",
@@ -254,7 +287,7 @@ test("genuine Korean speech on the Korean lane still passes through verbatim", a
 // there too, or none of it applies to a real Live Call.
 // ─────────────────────────────────────────────────────────────────────────────
 
-function makeLivePipeline(state, languages = ["ko", "en"]) {
+function makeLivePipeline(state, languages = ["ko", "en"], clock = null) {
   const sessions = new Map();
   state.dependencies.liveTranslate = {
     async open({ language, onCaption, onInputCaption }) {
@@ -268,7 +301,11 @@ function makeLivePipeline(state, languages = ["ko", "en"]) {
     outputMode: "captions",
     languages,
     dependencies: state.dependencies,
-    now: () => 0,
+    now: clock?.now ?? (() => 0),
+    ...(clock ? {
+      setTimeoutFn: clock.setTimeoutFn,
+      clearTimeoutFn: clock.clearTimeoutFn,
+    } : {}),
   });
   return { pipeline, sessions };
 }
@@ -355,11 +392,13 @@ test("provider input languages outside the session fail closed for partials and 
 
 test("missing and und input hints retain script fallback while explicit KO and EN remain canonical", async () => {
   const state = makeDependencies();
-  const { pipeline, sessions } = makeLivePipeline(state);
+  const clock = makeManualClock(1_000);
+  const { pipeline, sessions } = makeLivePipeline(state, ["ko", "en"], clock);
   await pipeline.start();
   const input = sessions.get("ko").onInputCaption;
 
   await input({ text: "Fallback English partial", isFinal: false });
+  await clock.advance(500);
   await input({ text: "한국어 미확정 코드입니다.", isFinal: true, languageCode: "und" });
   await input({ text: "명시적 한국어입니다.", isFinal: true, languageCode: "ko-KR" });
   await input({ text: "Explicit English.", isFinal: true, languageCode: "en-US" });
@@ -401,11 +440,13 @@ test("KO and EN same-language output echoes are dropped before durable publish",
 
 test("partial and final echoes stay suppressed while the opposite translation survives", async () => {
   const state = makeDependencies();
-  const { pipeline, sessions } = makeLivePipeline(state);
+  const clock = makeManualClock(1_000);
+  const { pipeline, sessions } = makeLivePipeline(state, ["ko", "en"], clock);
   await pipeline.start();
 
-  await sessions.get("ko").onInputCaption({ text: "안녕하세요", isFinal: false, languageCode: "ko-KR" });
-  await sessions.get("ko").onCaption({ text: "안녕하세요", isFinal: false, languageCode: "ko-KR" });
+  await sessions.get("ko").onInputCaption({ text: "안녕하세요 오늘 회의를 시작합니다", isFinal: false, languageCode: "ko-KR" });
+  await sessions.get("ko").onCaption({ text: "안녕하세요 오늘 회의를 시작합니다", isFinal: false, languageCode: "ko-KR" });
+  await clock.advance(500);
   await sessions.get("ko").onInputCaption({ text: "안녕하세요.", isFinal: true, languageCode: "ko-KR" });
   await sessions.get("ko").onCaption({ text: "안녕하세요.", isFinal: true, languageCode: "ko-KR" });
   await sessions.get("en").onCaption({
@@ -506,10 +547,12 @@ test("number notation applies on the live path even with no glossary configured"
 
 test("an interim carries the same corrections as the final, so nothing changes under the reader", async () => {
   const state = makeDependencies();
-  const { pipeline, sessions } = makeLivePipeline(state, ["en"]);
+  const clock = makeManualClock(1_000);
+  const { pipeline, sessions } = makeLivePipeline(state, ["en"], clock);
   await pipeline.start();
 
   await sessions.get("en").onCaption({ text: "The fund raised 3천억 원", isFinal: false });
+  await clock.advance(500);
   await sessions.get("en").onCaption({ text: "The fund raised 3천억 원.", isFinal: true });
 
   const captions = state.captions();

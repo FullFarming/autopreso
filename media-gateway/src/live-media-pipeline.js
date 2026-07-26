@@ -19,6 +19,12 @@ const FLOOR_ATTRIBUTION_GRACE_MILLISECONDS = 6_000;
 const REEMISSION_WINDOW_MILLISECONDS = 1_000;
 /** A persistently broken lane logs once per interval, not once per caption. */
 const EMISSION_FAILURE_LOG_INTERVAL_MS = 30_000;
+// Keep Live Call's visible revision cadence aligned with captions-only. Gemini
+// often revises the same tail several times in a few hundred milliseconds;
+// forwarding every snapshot makes the caption look as if it is being rewritten.
+const PARTIAL_STABILITY_MILLISECONDS = 140;
+const PARTIAL_MAX_HOLD_MILLISECONDS = 500;
+const PARTIAL_MIN_SIGNAL_CHARACTERS = 12;
 
 export class LiveMediaPipeline {
   #liveSessions = new Map();
@@ -50,6 +56,8 @@ export class LiveMediaPipeline {
   #recentFloor = null;
   /** Meeting-mode interim caption lanes: per-language latest-wins throttle. */
   #partialLanes = new Map();
+  /** Gemini caption lanes: per-language debounce with a bounded first paint. */
+  #presentationPartialLanes = new Map();
 
   constructor({
     sessionId,
@@ -155,6 +163,7 @@ export class LiveMediaPipeline {
   pause() {
     this.#assertRunning();
     this.#isPaused = true;
+    this.#cancelAllPresentationPartials();
   }
 
   resume() {
@@ -439,6 +448,7 @@ export class LiveMediaPipeline {
         this.#meetingInputCaption = null;
         this.#requiresFreshMeetingSourceContext = true;
         this.#presentationCaptionState.clear();
+        this.#cancelAllPresentationPartials();
         for (const session of this.#liveSessions.values()) session.setFloorSpeaker?.(next);
       }
       // Speaker→speaker preemption keeps a grace record for the previous
@@ -460,6 +470,7 @@ export class LiveMediaPipeline {
       this.#meetingInputCaption = null;
       this.#requiresFreshMeetingSourceContext = true;
       this.#presentationCaptionState.clear();
+      this.#cancelAllPresentationPartials();
       for (const session of this.#liveSessions.values()) session.setFloorSpeaker?.(null);
     }
     this.#floorSpeaker = null;
@@ -860,6 +871,107 @@ export class LiveMediaPipeline {
     }, chunk);
   }
 
+  #presentationPartialLane(language) {
+    let lane = this.#presentationPartialLanes.get(language);
+    if (!lane) {
+      lane = {
+        epoch: 0,
+        firstPendingAt: null,
+        pending: null,
+        timer: null,
+        isPublishing: false,
+        inFlight: Promise.resolve(),
+      };
+      this.#presentationPartialLanes.set(language, lane);
+    }
+    return lane;
+  }
+
+  #schedulePresentationPartial(language, value, sourceContext) {
+    const lane = this.#presentationPartialLane(language);
+    const now = this.now();
+    if (lane.firstPendingAt === null) lane.firstPendingAt = now;
+    lane.pending = { value, sourceContext, epoch: lane.epoch };
+    if (lane.timer) this.clearTimeoutFn(lane.timer);
+
+    const elapsed = Math.max(0, now - lane.firstPendingAt);
+    const hasSentenceBoundary = /[.!?。！？…]$/.test(String(value.text ?? "").trim());
+    const hasMinimumSignal = countSignalCharacters(value.text) >= PARTIAL_MIN_SIGNAL_CHARACTERS;
+    if (hasSentenceBoundary || (hasMinimumSignal && elapsed >= PARTIAL_MAX_HOLD_MILLISECONDS)) {
+      this.#flushPresentationPartial(language, lane);
+      return;
+    }
+    const delay = Math.max(0, Math.min(
+      PARTIAL_STABILITY_MILLISECONDS,
+      PARTIAL_MAX_HOLD_MILLISECONDS - elapsed,
+    ));
+    lane.timer = this.setTimeoutFn(() => {
+      lane.timer = null;
+      const current = lane.pending;
+      if (!current || current.epoch !== lane.epoch || this.#isStopped || this.#isPaused) return;
+      const heldFor = Math.max(0, this.now() - lane.firstPendingAt);
+      if (countSignalCharacters(current.value.text) >= PARTIAL_MIN_SIGNAL_CHARACTERS
+        && heldFor >= PARTIAL_MAX_HOLD_MILLISECONDS) {
+        this.#flushPresentationPartial(language, lane);
+        return;
+      }
+      if (heldFor >= PARTIAL_MAX_HOLD_MILLISECONDS) {
+        // Captions-only also drops an under-sized hold at the deadline. Re-
+        // arming here with a zero delay creates a hot timer loop until the next
+        // provider delta arrives.
+        lane.pending = null;
+        lane.firstPendingAt = null;
+        return;
+      }
+      this.#schedulePresentationPartial(language, current.value, current.sourceContext);
+    }, delay);
+  }
+
+  #flushPresentationPartial(language, lane) {
+    if (lane.timer) {
+      this.clearTimeoutFn(lane.timer);
+      lane.timer = null;
+    }
+    if (lane.isPublishing) return;
+    const pending = lane.pending;
+    lane.pending = null;
+    lane.firstPendingAt = null;
+    if (!pending || pending.epoch !== lane.epoch || this.#isStopped || this.#isPaused) return;
+    lane.isPublishing = true;
+    lane.inFlight = this.#publishPresentationCaption(
+      language,
+      pending.value,
+      { stabilized: true, sourceContext: pending.sourceContext, partialEpoch: pending.epoch },
+    ).catch((error) => this.#recordCaptionEmissionFailure(language, error)).finally(() => {
+      lane.isPublishing = false;
+      const latest = lane.pending;
+      if (latest && latest.epoch === lane.epoch && !this.#isStopped && !this.#isPaused) {
+        this.#schedulePresentationPartial(language, latest.value, latest.sourceContext);
+      }
+    });
+  }
+
+  #cancelPresentationPartial(language) {
+    const lane = this.#presentationPartialLanes.get(language);
+    if (!lane) return Promise.resolve();
+    lane.epoch += 1;
+    lane.pending = null;
+    lane.firstPendingAt = null;
+    if (lane.timer) {
+      this.clearTimeoutFn(lane.timer);
+      lane.timer = null;
+    }
+    return lane.inFlight;
+  }
+
+  #cancelAllPresentationPartials() {
+    const inFlight = [];
+    for (const language of this.#presentationPartialLanes.keys()) {
+      inFlight.push(this.#cancelPresentationPartial(language));
+    }
+    return inFlight;
+  }
+
   /** The desktop channel-hub pattern: the source-language lane is fed by the
    *  input transcript (the target-language session stays silent for
    *  same-language speech because echoTargetLanguage=false). The model's own
@@ -946,13 +1058,13 @@ export class LiveMediaPipeline {
     });
   }
 
-  async #publishPresentationCaption(language, value) {
+  async #publishPresentationCaption(language, value, options = {}) {
     if (!hasCaptionOutput(this.outputMode) || this.#isPaused) return;
     let text = String(value.text ?? "").normalize("NFC").trim();
     if (!text) return;
     const isFinal = Boolean(value.isFinal);
-    let sourceContext = null;
-    if (value.origin !== "source") {
+    let sourceContext = Object.hasOwn(options, "sourceContext") ? options.sourceContext : null;
+    if (value.origin !== "source" && !Object.hasOwn(options, "sourceContext")) {
       const queue = this.#meetingInputFinalQueues.get(language) ?? [];
       if (typeof value.sourceText === "string" && value.sourceText.trim()) {
         const providerSourceContext = {
@@ -996,6 +1108,11 @@ export class LiveMediaPipeline {
       && value.origin !== "source"
       && this.#requiresFreshMeetingSourceContext
       && !sourceContext) return;
+    if (!isFinal && !options.stabilized) {
+      this.#schedulePresentationPartial(language, { ...value, text }, sourceContext);
+      return;
+    }
+    if (isFinal) await this.#cancelPresentationPartial(language);
     const finalOrder = isFinal ? this.#reservePresentationFinal(language) : null;
     try {
     // Latency was previously observed ONLY on #processFinalUtterance, which no
@@ -1042,6 +1159,10 @@ export class LiveMediaPipeline {
     // fanout, and persistence remain in provider arrival order. Partials never
     // wait on this gate and therefore keep the live line moving.
     if (finalOrder) await finalOrder.previous;
+    if (!isFinal) {
+      const partialLane = this.#presentationPartialLanes.get(language);
+      if (partialLane && options.partialEpoch !== partialLane.epoch) return;
+    }
     // Dedupe identity is (text, isFinal, TIME) — never text alone. A provider
     // re-emitting the same committed line lands within milliseconds; a speaker
     // genuinely repeating themselves ("네, 맞습니다.", "OK.") does not. Keying
@@ -1133,6 +1254,7 @@ export class LiveMediaPipeline {
 
   async close() {
     this.#isStopped = true;
+    const partialPublications = this.#cancelAllPresentationPartials();
     for (const abortController of this.#ttsAbortControllers) {
       abortController.abort(new Error("LIVE_PIPELINE_STOPPED"));
     }
@@ -1142,6 +1264,7 @@ export class LiveMediaPipeline {
       ...[...this.#translationQueues.values()].map((queue) => queue.drain()),
       ...[...this.#ttsQueues.values()].map((queue) => queue.drain()),
       ...this.#presentationFinalTails.values(),
+      ...partialPublications,
     ]);
   }
 
@@ -1217,6 +1340,10 @@ function createUtteranceKey({ speakerLabel, text, sourceStartOffsetMs, sourceEnd
     ? `${sourceStartOffsetMs}:${sourceEndOffsetMs}`
     : String(sourceEndedAt ?? "");
   return `${String(speakerLabel)}\u0000${sourceIdentity}\u0000${text}`;
+}
+
+function countSignalCharacters(value) {
+  return (String(value ?? "").match(/[\p{L}\p{N}]/gu) ?? []).length;
 }
 
 export { textPlausiblyInLanguage } from "./config.js";
