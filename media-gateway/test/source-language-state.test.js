@@ -38,3 +38,39 @@ test("a Japanese provider hint disambiguates kanji-only text from Chinese", () =
   const state = createSourceLanguageState();
   assert.equal(state.observe({ providerLanguage: "ja-JP", transcript: "東京都庁" }), "ja");
 });
+
+// The captions engine (src/subtitle-realtime.js) is the reference. These pin the
+// thresholds to it, because the gateway drifted later on both languages and that
+// drift is what changes which language a caption is attributed to.
+test("thresholds match the captions engine rather than the gateway's old ones", () => {
+  // KOREAN_MIX_MIN_CHARS is 3: three Hangul chars are enough, where the gateway
+  // used to demand four.
+  assert.equal(createSourceLanguageState().observe({ transcript: "회복세" }), "ko");
+
+  // LANGUAGE_LOCK_MIN_SIGNAL_CHARS 4 at LANGUAGE_LOCK_MIN_CONFIDENCE 0.68: four
+  // Latin chars suffice, where the gateway used to demand eight at 0.78.
+  assert.equal(createSourceLanguageState().observe({ transcript: "Cost" }), "en");
+
+  // Mixed Korean+English is judged ko/(ko+en), the way captions judges it, so a
+  // Korean sentence carrying an English term still locks Korean.
+  assert.equal(
+    createSourceLanguageState().observe({ transcript: "이 자산의 caprate 전망은 회복세입니다" }),
+    "ko",
+  );
+
+  // A capitalised English phrase locks English: the gateway-only proper-noun
+  // carve-out pushed these down the weak path, which captions has no equivalent of.
+  assert.equal(createSourceLanguageState().observe({ transcript: "Cushman Wakefield Korea" }), "en");
+});
+
+test("ambiguous text abstains instead of defaulting to English", () => {
+  // Captions returns "unknown" below its thresholds and displays nothing. The old
+  // ladder guessed English, and a wrong lock silently blanks a lane through the
+  // sourceLanguage === language suppression.
+  assert.equal(createSourceLanguageState().observe({ transcript: "ok" }), "");
+  assert.equal(createSourceLanguageState().observe({ transcript: "..." }), "");
+
+  // Abstaining never overrides the provider's own languageCode, which Google
+  // documents as the reliable half of the signal.
+  assert.equal(createSourceLanguageState().observe({ providerLanguage: "ko", transcript: "ok" }), "ko");
+});

@@ -43,7 +43,10 @@ class FakeElement {
     this.classList = new FakeClassList();
     // Plain object so code can assign `style.transform = ...` and the test can
     // read it back; setProperty is used for CSS custom properties.
-    this.style = { setProperty() {}, transform: "" };
+    this.style = {
+      setProperty(name, value) { this[name] = String(value); },
+      transform: "",
+    };
   }
   // Minimal layout metrics so updateRollUp (browser-only) can run under the stub:
   // a word flow is FAKE_LINE_PX tall per child word, and a translation-line window
@@ -143,13 +146,19 @@ function installDom({ withDesktopFloor = false } = {}) {
   }
   globalThis.location = { protocol: "http:", host: "localhost:3210" };
   globalThis.WebSocket = FakeWebSocket;
-  return { overlay, getWs: () => fakeWs, fireFloor: (floor) => floorListener?.(floor), zoneText };
+  return { overlay, getWs: () => fakeWs, fireFloor: (floor) => floorListener?.(floor), zoneText, speakerText };
 
   function zoneText(zone) {
     const z = overlay.querySelector(`[data-zone="${zone}"]`);
     const box = z?.querySelector(".subtitle-box");
     if (!box || box.hidden) return "";
     return (box.querySelector(".translation-line")?.textContent ?? "").trim();
+  }
+
+  function speakerText(zone) {
+    const z = overlay.querySelector(`[data-zone="${zone}"]`);
+    const label = z?.querySelector(".live-call-speaker-label");
+    return !label || label.hidden ? "" : label.textContent.trim();
   }
 }
 
@@ -348,6 +357,80 @@ test("a new Live Call partial keeps the previous final until the next sentence c
     "Previous final. Current utterance",
     "Live Call must use the captions-only final-plus-live-tail layout",
   );
+});
+
+test("Live Call starts the growing sentence on a new movie-caption row and caps it at three lines", async () => {
+  const dom = installDom();
+  await loadOverlay("live-call-movie-row");
+  const ws = dom.getWs();
+  ws.open();
+  ws.recv({
+    ...SETTINGS,
+    settings: { subtitle: { ...SETTINGS.settings.subtitle, maxSubtitleLines: 8 } },
+  });
+
+  ws.recv({ type: "subtitle:committed", source: "live-call", targetLanguage: "en", sourceLanguage: "ko", translatedText: "Previous final.", seq: 1 });
+  ws.recv({ type: "subtitle:partial", source: "live-call", targetLanguage: "en", sourceLanguage: "ko", translatedText: "Current utterance grows here", seq: 2 });
+
+  const zone = dom.overlay.querySelector('[data-zone="bottom-center"]');
+  const lane = zone?.querySelector(".subtitle-lane");
+  const box = zone?.querySelector(".subtitle-box");
+  const flow = zone?.querySelector(".subtitle-flow");
+  assert.ok(lane?.classList.contains("is-live-call"), "only Live Call receives the movie-row treatment");
+  assert.ok(flow?.children.some((child) => child.tag === "br"), "the new sentence must grow below the completed sentence");
+  assert.equal(box?.style["--subtitle-line-clamp"], "3", "Live Call never occupies more than three movie-style lines");
+});
+
+test("captions-only keeps the reference flow unchanged", async () => {
+  const dom = installDom();
+  await loadOverlay("caption-reference-flow");
+  const ws = dom.getWs();
+  ws.open();
+  ws.recv(SETTINGS);
+
+  ws.recv({ type: "subtitle:committed", targetLanguage: "en", sourceLanguage: "ko", translatedText: "Reference final.", seq: 1 });
+  ws.recv({ type: "subtitle:partial", targetLanguage: "en", sourceLanguage: "ko", translatedText: "Reference partial continues", seq: 2 });
+
+  const zone = dom.overlay.querySelector('[data-zone="bottom-center"]');
+  const lane = zone?.querySelector(".subtitle-lane");
+  const flow = zone?.querySelector(".subtitle-flow");
+  assert.equal(lane?.classList.contains("is-live-call"), false);
+  assert.equal(flow?.children.some((child) => child.tag === "br"), false, "the immutable captions-only renderer keeps its existing continuous flow");
+});
+
+test("Live Call speaker identity stays above the caption until its lane or floor clears", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"] });
+  const dom = installDom({ withDesktopFloor: true });
+  await loadOverlay("live-call-speaker-label");
+  const ws = dom.getWs();
+  ws.open();
+  ws.recv(SETTINGS);
+
+  ws.recv({
+    type: "subtitle:partial",
+    source: "live-call",
+    targetLanguage: "en",
+    sourceLanguage: "ko",
+    translatedText: "The host is presenting the investment assumptions",
+    liveCallSpeaker: { role: "host", name: "Ignored host name", department: "Ignored", jobTitle: "Ignored" },
+  });
+  assert.equal(dom.speakerText("bottom-center"), "Host");
+
+  t.mock.timers.tick(6_000);
+  assert.equal(dom.speakerText("bottom-center"), "Host", "identity must not use the previous five-second badge timer");
+
+  dom.fireFloor({ holder: { participantId: "participant-1", name: "김노엘" } });
+  assert.equal(dom.speakerText("bottom-center"), "", "a floor boundary clears the previous speaker and caption together");
+
+  ws.recv({
+    type: "subtitle:partial",
+    source: "live-call",
+    targetLanguage: "en",
+    sourceLanguage: "ko",
+    translatedText: "The participant is speaking through the web application",
+    liveCallSpeaker: { role: "participant", name: "김노엘", department: "전략기획실", jobTitle: "PM" },
+  });
+  assert.equal(dom.speakerText("bottom-center"), "김노엘 · 전략기획실 · PM");
 });
 
 test("Live Call final roll-up respects the configured line budget and keeps the newest sentence", async () => {

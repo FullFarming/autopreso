@@ -162,7 +162,7 @@ export function readGatewayEnvironment(environment = process.env) {
   }
   const sttLanguageCodes = String(environment.STT_LANGUAGE_CODES ?? "ko-KR,en-US,ja-JP").split(",").map((value) => value.trim()).filter(Boolean);
   if (sttLanguageCodes.length < 1 || sttLanguageCodes.length > 3) throw new Error("STT_LANGUAGE_CODES는 1개 이상 3개 이하여야 합니다.");
-  const hostReconnectGraceMilliseconds = Number(environment.LIVE_HOST_RECONNECT_GRACE_MS ?? 45_000);
+  const hostReconnectGraceMilliseconds = Number(environment.LIVE_HOST_RECONNECT_GRACE_MS ?? 90_000);
   if (!Number.isFinite(hostReconnectGraceMilliseconds) || hostReconnectGraceMilliseconds < 0) {
     throw new Error("LIVE_HOST_RECONNECT_GRACE_MS가 올바르지 않습니다.");
   }

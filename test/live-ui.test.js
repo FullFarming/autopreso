@@ -774,16 +774,28 @@ test("meeting timestamps use a deterministic fixed KST clock", async () => {
 });
 
 test("viewer lifecycle never combines waiting and live, and announces the host-ended record", async () => {
-  const [viewer, css] = await Promise.all([
+  const [viewer, minutes, css] = await Promise.all([
     read("webapp/components/live/LiveViewer.tsx"),
+    read("webapp/components/live/MeetingMinutes.tsx"),
     read("webapp/app/globals.css"),
   ]);
 
   assert.match(viewer, /sessionStatus=\{sessionStatus\}/);
   assert.match(viewer, /sessionStatus === "live"[\s\S]{0,100}\? "Live now"[\s\S]{0,100}sessionStatus === "paused" \? "Paused by host" : "Live unavailable"/);
-  assert.match(viewer, /className="live-session-ended-banner" role="status" aria-live="assertive"/);
-  assert.match(viewer, />Live session ended</);
-  assert.match(viewer, />The host ended the call\. Your meeting record is below\.</);
+  assert.match(viewer, /className="live-end-label" role="status" aria-label="Live session ended">END<\/span>[\s\S]{0,180}className="live-leave-button"/);
+  assert.doesNotMatch(viewer, /live-session-ended-banner/);
+  const endedRecordStart = viewer.indexOf("{isSessionEnded ? (");
+  const endedRecordEnd = viewer.indexOf(') : sessionStatus === "preparing"', endedRecordStart);
+  const endedRecordSource = viewer.slice(endedRecordStart, endedRecordEnd);
+  assert.doesNotMatch(endedRecordSource + minutes, />Live session ended<|>The meeting has ended<|The host ended the call\. Your meeting record is below\./);
+  assert.match(minutes, /role="tablist" aria-label="Meeting record"/);
+  assert.match(minutes, /aria-controls="live-minutes-panel-summary"/);
+  assert.match(minutes, /aria-controls="live-minutes-panel-transcript"/);
+  assert.match(minutes, /hidden=\{activeTab !== "summary"\}/);
+  assert.match(minutes, /hidden=\{activeTab !== "transcript"\}/);
+  assert.doesNotMatch(minutes, /fetch\(/);
+  assert.match(css, /@keyframes live-end-pulse/);
+  assert.match(css, /prefers-reduced-motion: reduce[\s\S]*\.live-end-label[\s\S]*animation: none/);
   assert.match(viewer, /function isRecordingStatusEvent/);
   assert.match(viewer, /event\.type === "recording-status"[\s\S]{0,120}setError\(event\.message\)/);
   assert.match(viewer, /\{!isSessionEnded && \(\s*<footer className="live-viewer-footer"/u,
@@ -795,6 +807,25 @@ test("viewer lifecycle never combines waiting and live, and announces the host-e
   assert.match(css, /\.live-viewer-shell\.is-compact \.live-minutes::\-webkit-scrollbar-track\s*\{[^}]*background:\s*#000/s);
   assert.doesNotMatch(css, /\.live-viewer-shell\.is-compact \.live-minutes\s*\{[^}]*scrollbar-width:\s*none/s,
     "the ended transcript must retain a visible scroll affordance");
+});
+
+test("approved Stage B keeps a 16:9 cover, left session context, right QR, and bounded attendance", async () => {
+  const [stage, css] = await Promise.all([
+    read("webapp/components/live/LiveStageView.tsx"),
+    read("webapp/app/globals.css"),
+  ]);
+
+  assert.match(stage, /className="live-stage-grid"[\s\S]*className="live-stage-session"[\s\S]*className=\{`live-stage-access/);
+  assert.match(stage, /participants\.slice\(0, 5\)/);
+  assert.match(stage, /overflowCount > 0[\s\S]*>\+\{overflowCount\}</);
+  assert.match(stage, /isCountingDown \? \([\s\S]*className="live-stage-ring"/);
+  assert.doesNotMatch(stage, /className="live-stage-ring"[\s\S]{0,220}Waiting for host/);
+  assert.match(stage, /function StageLoader/);
+  assert.match(stage, /coverState === "loading"/);
+  assert.match(css, /\.live-stage-frame \{[^}]*aspect-ratio: 16 \/ 9/s);
+  assert.match(css, /\.live-stage-grid \{[^}]*grid-template-columns:/s);
+  assert.match(css, /\.live-stage-cover \{[^}]*object-fit: cover[^}]*object-position: center/s);
+  assert.match(css, /\.live-stage-loader i \{[^}]*animation: live-stage-load/s);
 });
 
 test("meeting minutes group by participant identity while preserving the display label", async () => {
@@ -1383,4 +1414,9 @@ test("meeting feed animations are compositor-only and respect reduced motion", a
   // the feed must not declare it.
   const feedCss = css.slice(css.indexOf("/* Earnings-call style meeting feed */"), css.indexOf("/* Speaking-floor bar */"));
   assert.doesNotMatch(feedCss, /will-change/u);
+
+  // Streaming caption text can update many times a second. Animating its
+  // contrast on every partial/final transition makes the words look unstable
+  // and compounds compositor work over a two-hour session.
+  assert.match(css, /\.live-turn-card p \.live-turn-text \{ opacity: \.42; transition: none; \}/u);
 });

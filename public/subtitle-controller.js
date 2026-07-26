@@ -342,3 +342,34 @@ if (consoleRoot && window.realtimeNoelDesktop?.fitControllerHeight && typeof Res
   new ResizeObserver(requestFit).observe(consoleRoot);
   requestFit();
 }
+
+// ── Momentary caption hide ────────────────────────────────────────────────────
+// A video is playing and the captions should be off screen for a moment. This is
+// NOT the overlay setting: the engine keeps running, lines keep being recorded,
+// and because the flag lives in the main process's memory, quitting clears it.
+// The button carries the state visibly — a mute the user forgot about would
+// otherwise look exactly like broken captions.
+const muteCaptionsButton = document.getElementById("controller-mute-captions");
+if (muteCaptionsButton && window.realtimeNoelDesktop?.setOverlaysMuted) {
+  const paint = (muted) => {
+    muteCaptionsButton.setAttribute("aria-pressed", String(muted));
+    muteCaptionsButton.classList.toggle("is-muted", muted);
+    const key = muted ? "controller.showCaptions" : "controller.hideCaptions";
+    muteCaptionsButton.dataset.i18nTitle = key;
+    muteCaptionsButton.dataset.i18nAria = key;
+    muteCaptionsButton.title = t(key);
+    muteCaptionsButton.setAttribute("aria-label", t(key));
+    // The icon flips via CSS on .is-muted -- both SVGs are in the markup, since
+    // innerHTML is forbidden here and pinned by two tests.
+  };
+  muteCaptionsButton.addEventListener("click", async () => {
+    const next = muteCaptionsButton.getAttribute("aria-pressed") !== "true";
+    // Paint from what the main process reports, not from the optimistic guess:
+    // a rejected origin check returns the unchanged value.
+    paint(Boolean(await window.realtimeNoelDesktop.setOverlaysMuted(next)));
+  });
+  // The controller can be reopened mid-session, so adopt the real state.
+  void window.realtimeNoelDesktop.getOverlaysMuted?.().then((muted) => paint(Boolean(muted))).catch(() => {});
+} else if (muteCaptionsButton) {
+  muteCaptionsButton.hidden = true;
+}

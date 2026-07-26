@@ -296,6 +296,42 @@ window.addEventListener("hashchange", () => {
 const initialNavigationLink = primaryNavigationLinks.find((link) => link.getAttribute("href") === window.location.hash);
 if (initialNavigationLink) activatePrimaryNavigation(initialNavigationLink, false);
 
+// Settings uses two peer panels instead of nesting operational controls inside
+// an always-visible engine form. Switching is local-only and preserves every
+// form value because both panels remain mounted.
+const settingsViewTabs = [...document.querySelectorAll("[data-settings-view]")];
+const settingsViewPanels = [...document.querySelectorAll("[data-settings-panel]")];
+
+function activateSettingsView(view, { focus = false } = {}) {
+  const selected = view === "advanced" ? "advanced" : "general";
+  for (const tab of settingsViewTabs) {
+    const isSelected = tab.dataset.settingsView === selected;
+    tab.classList.toggle("is-selected", isSelected);
+    tab.setAttribute("aria-selected", String(isSelected));
+    tab.tabIndex = isSelected ? 0 : -1;
+    if (focus && isSelected) tab.focus();
+  }
+  for (const panel of settingsViewPanels) {
+    panel.hidden = panel.dataset.settingsPanel !== selected;
+  }
+  if (selected === "advanced" && settingsDrawer) settingsDrawer.open = true;
+}
+
+for (const tab of settingsViewTabs) {
+  tab.addEventListener("click", () => activateSettingsView(tab.dataset.settingsView));
+  tab.addEventListener("keydown", (event) => {
+    if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+    event.preventDefault();
+    const currentIndex = settingsViewTabs.indexOf(tab);
+    const nextIndex = event.key === "Home" ? 0
+      : event.key === "End" ? settingsViewTabs.length - 1
+      : (currentIndex + (event.key === "ArrowRight" ? 1 : -1) + settingsViewTabs.length) % settingsViewTabs.length;
+    activateSettingsView(settingsViewTabs[nextIndex]?.dataset.settingsView, { focus: true });
+  });
+}
+activateSettingsView("general");
+document.getElementById("manage-glossaries")?.addEventListener("click", () => activateSettingsView("advanced"));
+
 // Live Call feature flag (desktop host, REALTIME_NOEL_LIVE_CALL_ENABLED):
 // when the host disables Live Call, hide the whole entry section. Base
 // caption features are unaffected.
@@ -1099,16 +1135,35 @@ function sessionDetailElements() {
     meta: document.getElementById("session-detail-meta"),
     transcript: document.getElementById("session-detail-transcript"),
     summary: document.getElementById("session-detail-summary"),
+    participants: document.getElementById("session-detail-participants"),
     generate: document.getElementById("session-detail-generate-summary"),
     audio: document.getElementById("session-detail-audio"),
     exportButton: document.getElementById("session-detail-export"),
     tabs: [...document.querySelectorAll("[data-transcript-lang]")],
+    viewTabs: [...document.querySelectorAll("[data-record-detail-tab]")],
+    viewPanels: [...document.querySelectorAll("[data-record-detail-panel]")],
   };
 }
 
 // Held so a language tab re-renders from what is already loaded instead of
 // refetching the whole transcript.
-const openSessionDetail = { id: "", lines: [], language: "en" };
+const openSessionDetail = { id: "", lines: [], participants: [], language: "en", view: "summary" };
+
+function activateSessionDetailView(view, { focus = false } = {}) {
+  const els = sessionDetailElements();
+  const available = new Set(["summary", "transcript", "participants"]);
+  openSessionDetail.view = available.has(view) ? view : "summary";
+  for (const tab of els.viewTabs) {
+    const isSelected = tab.dataset.recordDetailTab === openSessionDetail.view;
+    tab.classList.toggle("is-selected", isSelected);
+    tab.setAttribute("aria-selected", String(isSelected));
+    tab.tabIndex = isSelected ? 0 : -1;
+    if (focus && isSelected) tab.focus();
+  }
+  for (const panel of els.viewPanels) {
+    panel.hidden = panel.dataset.recordDetailPanel !== openSessionDetail.view;
+  }
+}
 
 function renderOpenSessionTranscript() {
   const els = sessionDetailElements();
@@ -1118,7 +1173,58 @@ function renderOpenSessionTranscript() {
     const isSelected = tab.dataset.transcriptLang === openSessionDetail.language;
     tab.classList.toggle("is-selected", isSelected);
     tab.setAttribute("aria-selected", String(isSelected));
+    tab.tabIndex = isSelected ? 0 : -1;
   }
+  els.transcript.setAttribute("aria-labelledby", `session-transcript-tab-${openSessionDetail.language}`);
+}
+
+function stableParticipantColor(identity) {
+  let hash = 0;
+  for (const character of String(identity ?? "")) hash = ((hash << 5) - hash + character.codePointAt(0)) | 0;
+  return Math.abs(hash) % 5 + 1;
+}
+
+function participantName(participant, index) {
+  if (typeof participant === "string") return participant.trim() || `${t("live.participant")} ${index + 1}`;
+  return String(participant?.displayName ?? participant?.name ?? participant?.label ?? "").trim()
+    || `${t("live.participant")} ${index + 1}`;
+}
+
+function renderSessionParticipants(container, participants) {
+  container.replaceChildren();
+  if (!participants.length) {
+    const empty = document.createElement("p");
+    empty.textContent = `${t("live.participant")} · 0`;
+    container.append(empty);
+    return;
+  }
+  participants.forEach((participant, index) => {
+    const name = participantName(participant, index);
+    const identity = typeof participant === "string"
+      ? participant
+      : participant?.participantId ?? participant?.speakerId ?? participant?.id ?? name;
+    const row = document.createElement("div");
+    row.className = "session-detail-participant";
+    const avatar = document.createElement("span");
+    avatar.className = `session-detail-participant-avatar color-${stableParticipantColor(identity)}`;
+    avatar.setAttribute("aria-hidden", "true");
+    avatar.textContent = Array.from(name)[0]?.toUpperCase() ?? "";
+    const copy = document.createElement("div");
+    copy.className = "session-detail-participant-copy";
+    const heading = document.createElement("strong");
+    heading.textContent = name;
+    copy.append(heading);
+    if (participant && typeof participant === "object") {
+      const meta = [participant.department, participant.jobTitle].map((value) => String(value ?? "").trim()).filter(Boolean);
+      if (meta.length) {
+        const detail = document.createElement("span");
+        detail.textContent = meta.join(" · ");
+        copy.append(detail);
+      }
+    }
+    row.append(avatar, copy);
+    container.append(row);
+  });
 }
 
 async function openSessionRecordDetail(session) {
@@ -1138,11 +1244,16 @@ async function openSessionRecordDetail(session) {
     els.meta.textContent = `${period} · ${t("records.lineCount", { count: meta.lineCount ?? session.lineCount ?? 0 })}`;
     openSessionDetail.id = session.id;
     openSessionDetail.lines = detail.lines ?? [];
+    openSessionDetail.participants = Array.isArray(detail.participants)
+      ? detail.participants
+      : (Array.isArray(meta.participants) ? meta.participants : []);
     // Open on whichever language the record actually has, so a KO-only session
     // does not land on an empty EN tab.
     const hasEnglish = openSessionDetail.lines.some((line) => transcriptTextForLanguage(line, "en"));
     openSessionDetail.language = hasEnglish ? "en" : "ko";
     renderOpenSessionTranscript();
+    renderSessionParticipants(els.participants, openSessionDetail.participants);
+    activateSessionDetailView("summary");
     els.summary.replaceChildren();
     if (detail.summary) {
       renderSessionSummary(els.summary, detail.summary);
@@ -3180,32 +3291,72 @@ if (window.realtimeNoelDesktop?.onLiveCallCaption) {
     if (state.ws?.readyState !== WebSocket.OPEN) return;
     const text = String(caption.text ?? "").trim();
     if (!text) return;
-    const speakerName = String(caption.speaker?.name
-      ?? caption.speaker?.label
-      ?? (caption.speaker?.isParticipant === true ? t("live.participant") : ""));
+    const speakerRole = caption.speakerRole === "participant"
+      || caption.speaker?.isParticipant === true
+      ? "participant"
+      : "host";
+    const speakerName = speakerRole === "host"
+      ? "Host"
+      : String(caption.speakerName
+        ?? caption.speaker?.name
+        ?? caption.speaker?.label
+        ?? t("live.participant"));
     // Main has already removed source-language events and selected the single
     // opposite-language translation that belongs on the desktop screen.
     if (caption.translationStatus === "failed") return;
     state.ws.send(JSON.stringify({
       type: "subtitle:live-call-caption",
+      sessionId: String(caption.sessionId ?? ""),
       partial: caption.isFinal !== true,
       targetLanguage: String(caption.language ?? ""),
       sourceLanguage: String(caption.sourceLanguage ?? ""),
       utteranceKey: String(caption.utteranceKey ?? ""),
       sourceText: String(caption.sourceText ?? (caption.origin === "source" ? text : "")),
       speaker: speakerName,
-      speakerDepartment: String(caption.speaker?.department ?? ""),
-      speakerJobTitle: String(caption.speaker?.jobTitle ?? ""),
+      speakerRole,
+      speakerDepartment: speakerRole === "participant"
+        ? String(caption.speakerDepartment ?? caption.speaker?.department ?? "")
+        : "",
+      speakerJobTitle: speakerRole === "participant"
+        ? String(caption.speakerJobTitle ?? caption.speaker?.jobTitle ?? "")
+        : "",
       translatedText: text,
     }));
   });
 }
 
-// ── Session detail: language tabs + per-session export ───────────────────────
+// ── Session detail: local-only content/language tabs + per-session export ────
+for (const tab of document.querySelectorAll("[data-record-detail-tab]")) {
+  tab.addEventListener("click", () => activateSessionDetailView(tab.dataset.recordDetailTab));
+  tab.addEventListener("keydown", (event) => {
+    if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+    event.preventDefault();
+    const tabs = [...document.querySelectorAll("[data-record-detail-tab]")];
+    const currentIndex = tabs.indexOf(tab);
+    const nextIndex = event.key === "Home" ? 0
+      : event.key === "End" ? tabs.length - 1
+      : (currentIndex + (event.key === "ArrowRight" ? 1 : -1) + tabs.length) % tabs.length;
+    activateSessionDetailView(tabs[nextIndex]?.dataset.recordDetailTab, { focus: true });
+  });
+}
+
 for (const tab of document.querySelectorAll("[data-transcript-lang]")) {
   tab.addEventListener("click", () => {
     openSessionDetail.language = tab.dataset.transcriptLang === "ko" ? "ko" : "en";
     renderOpenSessionTranscript();
+  });
+  tab.addEventListener("keydown", (event) => {
+    if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+    event.preventDefault();
+    const tabs = [...document.querySelectorAll("[data-transcript-lang]")];
+    const currentIndex = tabs.indexOf(tab);
+    const nextIndex = event.key === "Home" ? 0
+      : event.key === "End" ? tabs.length - 1
+      : (currentIndex + (event.key === "ArrowRight" ? 1 : -1) + tabs.length) % tabs.length;
+    const next = tabs[nextIndex];
+    openSessionDetail.language = next?.dataset.transcriptLang === "ko" ? "ko" : "en";
+    renderOpenSessionTranscript();
+    next?.focus();
   });
 }
 

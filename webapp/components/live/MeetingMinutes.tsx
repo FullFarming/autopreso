@@ -4,7 +4,7 @@
 // speaker-attributed utterance record grouped into turns, in the viewer's
 // chosen language. Shown when the host ends the session.
 
-import { useMemo } from "react";
+import { useMemo, useState, type KeyboardEvent } from "react";
 
 import type { MeetingSummary } from "@/lib/live/summary";
 import MeetingSummaryCard from "./MeetingSummaryCard";
@@ -59,35 +59,53 @@ export default function MeetingMinutes({ summary, summaryCreatedAt, transcript, 
   onRetry: () => void;
 }) {
   const turns = useMemo(() => groupTranscript(transcript), [transcript]);
+  const [activeTab, setActiveTab] = useState<"summary" | "transcript">("summary");
+  const selectAdjacentTab = (event: KeyboardEvent<HTMLButtonElement>) => {
+    if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+    event.preventDefault();
+    const nextTab = event.key === "ArrowRight" || event.key === "End" ? "transcript" : "summary";
+    setActiveTab(nextTab);
+    document.getElementById(`live-minutes-tab-${nextTab}`)?.focus();
+  };
   return (
     <div className="live-minutes" aria-label="Meeting notes">
-      <header className="live-minutes-header">
-        <span className="live-minutes-ended-dot" aria-hidden="true" />
-        <strong>The meeting has ended</strong>
-        <p>The host ended the live session. Your meeting notes are available below.</p>
-      </header>
-      {summary
-        ? <MeetingSummaryCard summary={summary} createdAt={summaryCreatedAt} />
-        : (
-          <div className="live-minutes-pending">
-            <p>{isLoading ? "Loading meeting notes…" : "The AI summary is not ready yet. It will appear after the host creates it."}</p>
-            <button type="button" disabled={isLoading} onClick={onRetry}>{isLoading ? "Loading…" : "Check again"}</button>
+      <div className="live-minutes-tabs" role="tablist" aria-label="Meeting record">
+        <button id="live-minutes-tab-summary" type="button" role="tab" aria-selected={activeTab === "summary"}
+          aria-controls="live-minutes-panel-summary" tabIndex={activeTab === "summary" ? 0 : -1}
+          className={activeTab === "summary" ? "is-selected" : ""}
+          onClick={() => setActiveTab("summary")} onKeyDown={selectAdjacentTab}>Summary</button>
+        <button id="live-minutes-tab-transcript" type="button" role="tab" aria-selected={activeTab === "transcript"}
+          aria-controls="live-minutes-panel-transcript" tabIndex={activeTab === "transcript" ? 0 : -1}
+          className={activeTab === "transcript" ? "is-selected" : ""}
+          onClick={() => setActiveTab("transcript")} onKeyDown={selectAdjacentTab}>Transcript</button>
+      </div>
+      <section id="live-minutes-panel-summary" className="live-minutes-panel" role="tabpanel"
+        aria-labelledby="live-minutes-tab-summary" hidden={activeTab !== "summary"}>
+        {summary
+          ? <MeetingSummaryCard summary={summary} createdAt={summaryCreatedAt} />
+          : (
+            <div className="live-minutes-pending">
+              <p>{isLoading ? "Loading meeting notes…" : "The AI summary is not ready yet. It will appear after the host creates it."}</p>
+              <button type="button" disabled={isLoading} onClick={onRetry}>{isLoading ? "Loading…" : "Check again"}</button>
+            </div>
+          )}
+      </section>
+      <section id="live-minutes-panel-transcript" className="live-minutes-panel" role="tabpanel"
+        aria-labelledby="live-minutes-tab-transcript" hidden={activeTab !== "transcript"}>
+        {turns.length > 0 ? (
+          <div className="live-minutes-record">
+            {turns.map((turn) => (
+              <article key={turn.key}>
+                <header>
+                  <strong>{turn.speaker}</strong>
+                  <time dateTime={turn.startedAt}>{formatMinuteTime(turn.startedAt)}</time>
+                </header>
+                <p>{turn.texts.join(" ")}</p>
+              </article>
+            ))}
           </div>
-        )}
-      {turns.length > 0 && (
-        <section className="live-minutes-record">
-          <h3>Full transcript</h3>
-          {turns.map((turn) => (
-            <article key={turn.key}>
-              <header>
-                <strong>{turn.speaker}</strong>
-                <time dateTime={turn.startedAt}>{formatMinuteTime(turn.startedAt)}</time>
-              </header>
-              <p>{turn.texts.join(" ")}</p>
-            </article>
-          ))}
-        </section>
-      )}
+        ) : <p className="live-minutes-empty">No transcript is available.</p>}
+      </section>
     </div>
   );
 }

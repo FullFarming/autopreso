@@ -170,6 +170,13 @@ test("Live Call IPC uses exact origin checks for read and mutation channels", ()
   assert.match(mainSource, /encodeURIComponent\(sessionData\.id\)/u);
 });
 
+test("Live Call caption IPC excludes controller and unrelated windows", () => {
+  const bridge = sourceBetween("async function ensureLiveGatewayBridge", "function hostSpeakViaGateway");
+  assert.match(bridge, /\[dashboardWindow, \.\.\.overlayWindows\.values\(\)\]/u);
+  assert.doesNotMatch(bridge, /BrowserWindow\.getAllWindows\(\)/u);
+  assert.doesNotMatch(bridge, /controllerWindow/u);
+});
+
 test("Live Call failure responses and logs do not expose stored credentials", () => {
   const api = sourceBetween("async function liveCallApi", "const LIVE_DRAFT_LANGUAGES");
   assert.doesNotMatch(api, /console\.(?:log|info|debug|warn)/u);
@@ -183,7 +190,7 @@ test("Live Call failure responses and logs do not expose stored credentials", ()
 
 // ── Live Call gateway reconnect ────────────────────────────────────────────
 // The old close handler retried on a hardcoded `setTimeout(..., 3_000)`: no
-// backoff, no attempt ceiling, and the timer id was never stored so
+// backoff, no capped slow-retry mode, and the timer id was never stored so
 // stopLiveGatewayBridge could not cancel it. Each attempt makes three
 // authenticated HTTPS calls, so a dead gateway meant ~60 requests/min forever
 // while the host watched a running timer over dead air.
@@ -197,13 +204,18 @@ function loadLiveBridgeReconnect(overrides = {}) {
     liveGatewayBridge: null,
     liveBridgeReconnectTimer: null,
     liveBridgeReconnectAttempts: 0,
+    liveBridgeCredentialRefreshTimer: null,
     liveBridgeAlert: null,
     hasNotifiedLiveBridgeFailure: false,
+    clearLiveBridgeCredentialRefresh: () => {},
     isQuitting: false,
     liveCallSession: null,
     LIVE_BRIDGE_RECONNECT_BASE_MS: 1_000,
-    LIVE_BRIDGE_RECONNECT_MAX_MS: 20_000,
-    MAX_LIVE_BRIDGE_RECONNECTS: 8,
+    LIVE_BRIDGE_SLOW_RETRY_MIN_MS: 36_000,
+    LIVE_BRIDGE_SLOW_RETRY_JITTER_MS: 6_000,
+    LIVE_BRIDGE_SLOW_RETRY_AFTER: 8,
+    LIVE_BRIDGE_CREDENTIAL_REFRESH_MAX_MS: 50 * 60 * 1_000,
+    LIVE_BRIDGE_CREDENTIAL_REFRESH_SKEW_MS: 60_000,
     dialog: { showMessageBox: (options) => { dialogs.push(options); return Promise.resolve({}); } },
     showControllerWindow: () => {},
     ensureLiveGatewayBridge: () => Promise.resolve({ ok: true }),
@@ -215,23 +227,24 @@ function loadLiveBridgeReconnect(overrides = {}) {
     },
     clearTimeout: (token) => cleared.push(token),
     Promise,
-    Math,
+    Math: { min: Math.min, max: Math.max, random: () => 0 },
     ...overrides,
   };
   const api = vm.runInNewContext(
-    `${sourceBetween("function setLiveBridgeAlert", "async function ensureLiveGatewayBridge")};
+    `${sourceBetween("function setLiveBridgeAlert", "function getLiveBridgeReconnectDelay")}
+     ${sourceBetween("function getLiveBridgeReconnectDelay", "async function ensureLiveGatewayBridge")};
      ({ scheduleLiveGatewayReconnect, clearLiveBridgeReconnect, stopLiveGatewayBridge, liveBridgeStatus, clearLiveBridgeAlert })`,
     context,
   );
   return { ...api, timers, cleared, dialogs, logs, context };
 }
 
-test("gateway reconnect backs off exponentially, caps the delay, and disarms at the ceiling", async () => {
+test("gateway reconnect backs off exponentially and keeps capped retries alive past eight failures", async () => {
   const bridge = loadLiveBridgeReconnect();
   const armedSession = { sessionId: "s1", status: "live" };
   bridge.context.liveCallSession = armedSession;
 
-  const expected = [1_000, 2_000, 4_000, 8_000, 16_000, 20_000, 20_000, 20_000];
+  const expected = [1_000, 2_000, 4_000, 8_000, 16_000, 36_000, 36_000, 36_000, 36_000, 36_000];
   for (const delay of expected) {
     bridge.scheduleLiveGatewayReconnect(armedSession);
     assert.equal(bridge.timers.at(-1).delay, delay);
@@ -242,19 +255,11 @@ test("gateway reconnect backs off exponentially, caps the delay, and disarms at 
     await Promise.resolve();
     assert.equal(bridge.context.liveBridgeReconnectTimer, null);
   }
-  assert.equal(bridge.timers.length, 8, "MAX_LIVE_BRIDGE_RECONNECTS caps the attempts");
-
-  // Ceiling reached: no ninth timer, and the host is finally told.
-  bridge.scheduleLiveGatewayReconnect(armedSession);
-  assert.equal(bridge.timers.length, 8);
-  assert.equal(bridge.liveBridgeStatus().state, "failed");
-  assert.equal(bridge.liveBridgeStatus().code, "GATEWAY_RECONNECT_EXHAUSTED");
-  assert.equal(bridge.dialogs.length, 1);
-  assert.equal(bridge.dialogs[0].type, "error");
-
-  // Reporting happens ONCE, not on every subsequent close.
-  bridge.scheduleLiveGatewayReconnect(armedSession);
-  assert.equal(bridge.dialogs.length, 1);
+  assert.equal(bridge.timers.length, 10, "a two-hour session must never exhaust automatic recovery");
+  assert.equal(bridge.liveBridgeStatus().state, "reconnecting");
+  assert.equal(bridge.liveBridgeStatus().code, "GATEWAY_RECONNECTING");
+  assert.equal(bridge.dialogs.length, 1, "slow retry mode is surfaced once without stopping recovery");
+  assert.match(bridge.dialogs[0].message, /automatically|자동/u);
 });
 
 test("gateway reconnect re-arms itself when an attempt never opens a socket", async () => {
@@ -271,6 +276,61 @@ test("gateway reconnect re-arms itself when an attempt never opens a socket", as
   await Promise.resolve();
   assert.equal(bridge.timers.length, 2);
   assert.equal(bridge.timers[1].delay, 2_000);
+});
+
+test("gateway reconnect stays within thirty token requests in every fifteen-minute window", () => {
+  const context = {
+    LIVE_BRIDGE_RECONNECT_BASE_MS: 1_000,
+    LIVE_BRIDGE_SLOW_RETRY_MIN_MS: 36_000,
+    LIVE_BRIDGE_SLOW_RETRY_JITTER_MS: 6_000,
+    Math: { min: Math.min, max: Math.max },
+    Number,
+  };
+  const getDelay = vm.runInNewContext(
+    `${sourceBetween("function getLiveBridgeReconnectDelay", "function scheduleLiveGatewayReconnect")}; getLiveBridgeReconnectDelay`,
+    context,
+  );
+  assert.equal(getDelay(5, () => 0), 36_000);
+  assert.equal(getDelay(5, () => 1), 42_000);
+  assert.equal(getDelay(5, () => -1), 36_000, "negative jitter is clamped");
+  assert.equal(getDelay(5, () => 2), 42_000, "oversized jitter is clamped");
+  const requestTimes = [];
+  let elapsed = 0;
+  let attempt = 0;
+  while (elapsed <= 30 * 60 * 1_000) {
+    elapsed += getDelay(attempt, () => 0);
+    if (elapsed > 30 * 60 * 1_000) break;
+    requestTimes.push(elapsed);
+    attempt += 1;
+  }
+  for (let windowStart = 0; windowStart <= 15 * 60 * 1_000; windowStart += 1_000) {
+    const windowEnd = windowStart + 15 * 60 * 1_000;
+    const count = requestTimes.filter((time) => time > windowStart && time <= windowEnd).length;
+    assert.ok(count <= 30, `rate window ${windowStart}-${windowEnd} scheduled ${count} token requests`);
+  }
+});
+
+test("gateway recovers on the same session after more than eight transient failures", async () => {
+  let attempts = 0;
+  const armedSession = { sessionId: "long-outage", status: "live" };
+  const bridge = loadLiveBridgeReconnect({
+    ensureLiveGatewayBridge: () => {
+      attempts += 1;
+      return Promise.resolve(attempts >= 11 ? { ok: true } : { ok: false, code: "GATEWAY_UNREACHABLE" });
+    },
+  });
+  bridge.context.liveCallSession = armedSession;
+  bridge.scheduleLiveGatewayReconnect(armedSession);
+  for (let index = 0; index < 11; index += 1) {
+    const timer = bridge.timers[index];
+    assert.ok(timer, `missing retry ${index + 1}`);
+    timer.callback();
+    await Promise.resolve();
+    await Promise.resolve();
+  }
+  assert.equal(attempts, 11);
+  assert.equal(bridge.timers.length, 11, "a successful restoration stops scheduling another request");
+  assert.equal(bridge.context.liveCallSession, armedSession);
 });
 
 test("gateway reconnect never fires for a session that is no longer live, and stop cancels the timer", () => {
@@ -305,8 +365,10 @@ test("gateway reconnect never fires for a session that is no longer live, and st
 
 test("live call state reports gateway health so a dead bridge is not hidden behind a ticking timer", () => {
   assert.match(mainSource, /LIVE_BRIDGE_RECONNECT_BASE_MS = 1_000/u);
-  assert.match(mainSource, /LIVE_BRIDGE_RECONNECT_MAX_MS = 20_000/u);
-  assert.match(mainSource, /MAX_LIVE_BRIDGE_RECONNECTS = 8/u);
+  assert.match(mainSource, /LIVE_BRIDGE_SLOW_RETRY_MIN_MS = 36_000/u);
+  assert.match(mainSource, /LIVE_BRIDGE_SLOW_RETRY_JITTER_MS = 6_000/u);
+  assert.match(mainSource, /LIVE_BRIDGE_SLOW_RETRY_AFTER = 8/u);
+  assert.doesNotMatch(mainSource, /GATEWAY_RECONNECT_EXHAUSTED/u);
   // The unbounded hardcoded retry is gone.
   assert.doesNotMatch(mainSource, /setTimeout\(\(\) => \{ void ensureLiveGatewayBridge\(\); \}, 3_000\)/u);
   const closeHandler = sourceBetween('socket.on("close"', "return { ok: true, streaming: false }");
@@ -317,6 +379,61 @@ test("live call state reports gateway health so a dead bridge is not hidden behi
   const messageHandler = sourceBetween('message.type === "started"', 'message.type === "caption"');
   assert.match(messageHandler, /liveBridgeReconnectAttempts = 0/u);
   assert.match(messageHandler, /clearLiveBridgeAlert\(\)/u);
+});
+
+test("host gateway credentials rotate at least eight times in a two-hour fake clock without replacing the Live Call session", () => {
+  let now = Date.parse("2026-07-26T00:00:00.000Z");
+  const timers = [];
+  const cleared = [];
+  const armedSession = { sessionId: "two-hour-session", status: "live" };
+  const context = {
+    LIVE_BRIDGE_CREDENTIAL_REFRESH_MAX_MS: 50 * 60 * 1_000,
+    LIVE_BRIDGE_CREDENTIAL_REFRESH_SKEW_MS: 60_000,
+    liveBridgeCredentialRefreshTimer: null,
+    liveGatewayBridge: null,
+    liveCallSession: armedSession,
+    isQuitting: false,
+    Date: { now: () => now, parse: Date.parse },
+    setTimeout(callback, delay) {
+      const token = { callback, delay };
+      timers.push(token);
+      return token;
+    },
+    clearTimeout(token) { cleared.push(token); },
+    console: { warn() {}, info() {}, error() {} },
+  };
+  const api = vm.runInNewContext(
+    `${sourceBetween("function getLiveBridgeCredentialRefreshDelay", "function setLiveBridgeAlert")};
+     ({ getLiveBridgeCredentialRefreshDelay, scheduleLiveGatewayCredentialRefresh })`,
+    context,
+  );
+
+  for (let rotation = 0; rotation < 8; rotation += 1) {
+    const socket = { closeCalls: [], close(code, reason) { this.closeCalls.push([code, reason]); } };
+    const bridge = { socket, ready: true, session: armedSession };
+    context.liveGatewayBridge = bridge;
+    const expiresAt = new Date(now + 15 * 60 * 1_000).toISOString();
+    assert.equal(api.getLiveBridgeCredentialRefreshDelay(expiresAt), 14 * 60 * 1_000);
+    api.scheduleLiveGatewayCredentialRefresh(bridge, expiresAt);
+    const timer = timers.at(-1);
+    assert.equal(timer.delay, 14 * 60 * 1_000);
+    now += timer.delay;
+    timer.callback();
+    assert.equal(bridge.session, armedSession);
+    assert.deepEqual(socket.closeCalls, [[4001, "gateway credential refresh"]]);
+  }
+  assert.ok(now - Date.parse("2026-07-26T00:00:00.000Z") < 2 * 60 * 60 * 1_000);
+  assert.equal(context.liveCallSession, armedSession);
+});
+
+test("gateway connection consumes token expiry and successful starts arm controlled credential refresh", () => {
+  const fetchConnection = sourceBetween("async function fetchGatewayConnection", "function trustedGatewayHeaders");
+  assert.match(fetchConnection, /expiresAt:\s*tokenResult\.data\?\.expiresAt/u);
+  const bridge = sourceBetween("async function ensureLiveGatewayBridge", "function hostSpeakViaGateway");
+  assert.match(bridge, /scheduleLiveGatewayCredentialRefresh\(bridge, connection\.expiresAt\)/u);
+  assert.match(bridge, /message\.type === "started" \|\| message\.type === "restarted"/u);
+  const stop = sourceBetween("function stopLiveGatewayBridge", "async function ensureLiveGatewayBridge");
+  assert.match(stop, /clearLiveBridgeCredentialRefresh\(\)/u);
 });
 
 test("active bridge host-speak is single-flight and does not leak listeners across repeated handoffs", async () => {

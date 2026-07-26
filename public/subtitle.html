@@ -75,7 +75,7 @@
 
               <div class="service-strip" data-i18n-aria="status.modelConnection" aria-label="모델 연결 상태">
                 <span id="realtime-api-status" role="status" aria-live="polite" data-i18n="status.realtimeChecking">실시간 자막 확인 중</span>
-                <span id="topic-model-status" data-i18n="status.topicModelStandby">Gemma: 대기</span>
+                <span id="topic-model-status" data-i18n="status.topicModelStandby" hidden>Gemma: 대기</span>
               </div>
 
               <section class="cfg-section" aria-labelledby="cfg-languages-title">
@@ -233,8 +233,8 @@
 
               <div id="subtitle-error" class="subtitle-error" hidden></div>
 
-              <section class="preview-panel" hidden>
-                <div class="preview-label" data-i18n="preview.label">현재 자막</div>
+              <section class="preview-panel caption-task-preview" aria-labelledby="caption-preview-label">
+                <div id="caption-preview-label" class="preview-label" data-i18n="preview.label">현재 자막</div>
                 <div id="subtitle-preview" class="subtitle-preview translation-only" data-i18n-aria="preview.regionLabel" aria-label="현재 자막">
                   <div class="source-line" hidden></div>
                   <div class="translation-line" data-i18n="preview.sample">번역 자막</div>
@@ -247,7 +247,7 @@
                  They sat under Records, where they described nothing the page was
                  about -- a record's own lines are its transcript and its topics
                  are its summary chapters. -->
-            <section class="history-panel workspace-panel">
+            <section class="history-panel workspace-panel" hidden>
               <div class="panel-heading">
                 <span data-i18n="history.topics">주제</span>
                 <span class="panel-heading-actions">
@@ -259,7 +259,7 @@
               <div id="topic-list" class="topic-list" aria-live="polite"></div>
             </section>
 
-            <section id="translation-log-panel" class="translation-log-panel workspace-panel">
+            <section id="translation-log-panel" class="translation-log-panel workspace-panel" hidden>
               <div class="panel-heading">
                 <span data-i18n="history.committed">확정된 자막</span>
                 <strong id="translation-count">0</strong>
@@ -273,16 +273,16 @@
         <div class="workspace-page" data-workspace-page="livecall" id="live-call-page" data-i18n-aria="live.pageLabel" aria-label="Live Call 예약">
           <div class="workspace-single">
             <section class="command-panel workspace-panel">
-              <section class="cfg-section" aria-labelledby="live-draft-details-title">
+              <section class="cfg-section live-draft-group" aria-labelledby="live-draft-details-title">
                 <div class="cfg-heading">
-                  <h2 id="live-draft-details-title"><i>1</i><span data-i18n="live.sessionDetails">세션 정보</span></h2>
+                  <h2 id="live-draft-details-title"><span data-i18n="live.sessionDetails">세션 정보</span></h2>
                 </div>
                 <label>
                   <span data-i18n="live.title">제목</span>
                   <input name="liveDraftTitle" type="text" maxlength="100" data-i18n-placeholder="live.titlePlaceholder" placeholder="타운홀 Q&amp;A" autocomplete="off" />
                 </label>
                 <div class="live-draft-cover">
-                  <span id="live-draft-cover-rules" data-i18n="live.coverRules">커버 이미지 (선택) · 정사각형 · JPEG, PNG, WebP · 최대 5MB</span>
+                  <span id="live-draft-cover-rules">커버 이미지 (선택) · 16:9 · JPEG, PNG, WebP · 최대 5MB</span>
                   <div class="live-draft-cover-row">
                     <button id="live-draft-cover-button" type="button" class="secondary compact" aria-describedby="live-draft-cover-rules live-draft-cover-status" data-i18n="live.coverUpload">이미지 업로드</button>
                     <input id="live-draft-cover" type="file" accept="image/jpeg,image/png,image/webp" data-i18n-aria="live.coverChoose" aria-label="Live Call 커버 이미지 선택" hidden />
@@ -290,15 +290,9 @@
                   </div>
                   <span id="live-draft-cover-status" class="live-draft-cover-status" role="status" aria-live="polite" data-i18n="live.coverNone">선택된 이미지 없음</span>
                 </div>
-              </section>
-
-              <section class="cfg-section" aria-labelledby="live-draft-schedule-title">
-                <div class="cfg-heading">
-                  <h2 id="live-draft-schedule-title"><i>2</i><span data-i18n="live.schedule">일정</span></h2>
-                </div>
-                <div class="two-column">
+                <div class="two-column live-draft-schedule" aria-labelledby="live-draft-schedule-title">
                   <label>
-                    <span data-i18n="live.startDate">시작 날짜 (비우면 바로 시작)</span>
+                    <span id="live-draft-schedule-title" data-i18n="live.startDate">시작 날짜 (비우면 바로 시작)</span>
                     <input name="liveDraftDate" type="date" />
                   </label>
                   <label>
@@ -308,31 +302,30 @@
                 </div>
               </section>
 
-              <section class="cfg-section" aria-labelledby="live-draft-language-title">
+              <section class="cfg-section live-draft-group" aria-labelledby="live-draft-language-title">
                 <div class="cfg-heading">
-                  <h2 id="live-draft-language-title"><i>3</i><span data-i18n="live.language">언어</span></h2>
+                  <h2 id="live-draft-language-title"><span data-i18n="live.access">입장 · 정원</span></h2>
                 </div>
-                <div id="live-draft-languages" class="live-draft-languages" aria-live="polite"></div>
+                <div class="live-draft-participation">
+                  <div>
+                    <span class="live-draft-field-label" data-i18n="live.language">언어</span>
+                    <div id="live-draft-languages" class="live-draft-languages" aria-live="polite"></div>
+                  </div>
+                  <label>
+                    <span data-i18n="live.capacity">참가 정원 (최대 50)</span>
+                    <input name="liveDraftCapacity" type="number" min="2" max="50" step="1" value="50" />
+                  </label>
+                </div>
                 <div class="live-display-language" role="note">
                   <p data-i18n="live.captionLanguagePolicy">화면: 말한 언어의 반대 언어 한 줄 · 웹 기록: 영어·한국어 모두</p>
                 </div>
               </section>
 
-              <section class="cfg-section" aria-labelledby="live-draft-access-title">
-                <div class="cfg-heading">
-                  <h2 id="live-draft-access-title"><i>4</i><span data-i18n="live.access">입장 · 정원</span></h2>
-                </div>
-                <label>
-                  <span data-i18n="live.capacity">참가 정원 (최대 50)</span>
-                  <input name="liveDraftCapacity" type="number" min="2" max="50" step="1" value="50" />
-                </label>
-              </section>
-
               <section class="live-handoff" aria-labelledby="live-workspace-title">
                 <div class="live-handoff-copy">
-                  <span class="live-handoff-kicker" data-i18n="live.handoffKicker">선택 · LIVE CALL</span>
+                  <span data-i18n="live.handoffKicker" hidden>선택 · LIVE CALL</span>
                   <h2 id="live-workspace-title" data-i18n="live.handoffTitle">게스트와 자막 공유</h2>
-                  <span class="live-handoff-flow" data-i18n="live.handoffFlow">세션 생성 → QR·코드 공유 → Live Call 시작</span>
+                  <span data-i18n="live.handoffFlow" hidden>세션 생성 → QR 또는 코드 공유 → Live Call 시작</span>
                 </div>
                 <div class="live-handoff-action">
                   <button id="schedule-live-call" type="button" class="accent" data-i18n="live.start">Live Call 시작</button>
@@ -344,7 +337,7 @@
 
               <section class="cfg-section" aria-labelledby="live-registered-title">
                 <div class="cfg-heading">
-                  <h2 id="live-registered-title"><i>5</i><span data-i18n="live.registered">등록된 세션</span></h2>
+                  <h2 id="live-registered-title"><span data-i18n="live.registered">등록된 세션</span></h2>
                 </div>
                 <div id="live-registered-list" class="live-registered-list" aria-live="polite"></div>
                 <button id="refresh-registered-sessions" type="button" class="secondary compact" data-i18n="live.refreshRegistered">등록된 세션 새로고침</button>
@@ -398,18 +391,25 @@
               <button id="session-detail-export" type="button" class="secondary compact" data-i18n="records.export">Excel</button>
             </div>
             <div id="session-detail-audio" class="session-record-audio"></div>
-            <div class="session-detail-columns">
-              <section class="session-detail-column" data-i18n-aria="records.transcriptLabel" aria-label="원문 기록">
-                <div class="session-detail-tabs" role="tablist" data-i18n-aria="records.transcriptLangLabel" aria-label="원문 언어">
-                  <button type="button" role="tab" data-transcript-lang="en" class="is-selected" aria-selected="true">EN</button>
-                  <button type="button" role="tab" data-transcript-lang="ko" aria-selected="false">KO</button>
-                </div>
-                <div id="session-detail-transcript" class="session-record-detail" role="tabpanel"></div>
-              </section>
-              <section class="session-detail-column" data-i18n-aria="records.summaryLabel" aria-label="AI 요약">
-                <h3 data-i18n="records.summary">AI 요약</h3>
+            <div class="session-detail-view-tabs" role="tablist" aria-label="기록 보기">
+              <button id="session-detail-tab-summary" type="button" role="tab" data-record-detail-tab="summary" class="is-selected" aria-selected="true" aria-controls="session-detail-panel-summary" data-i18n="records.summary">AI 요약</button>
+              <button id="session-detail-tab-transcript" type="button" role="tab" data-record-detail-tab="transcript" aria-selected="false" aria-controls="session-detail-panel-transcript" data-i18n="records.transcript">원문</button>
+              <button id="session-detail-tab-participants" type="button" role="tab" data-record-detail-tab="participants" aria-selected="false" aria-controls="session-detail-panel-participants" data-i18n="live.participant">참가자</button>
+            </div>
+            <div class="session-detail-panels session-detail-columns">
+              <section id="session-detail-panel-summary" class="session-detail-panel" role="tabpanel" aria-labelledby="session-detail-tab-summary" data-record-detail-panel="summary">
                 <div id="session-detail-summary" class="session-record-detail"></div>
                 <button id="session-detail-generate-summary" type="button" class="secondary compact" data-i18n="records.generateSummary" hidden>AI 요약 생성</button>
+              </section>
+              <section id="session-detail-panel-transcript" class="session-detail-panel" role="tabpanel" aria-labelledby="session-detail-tab-transcript" data-record-detail-panel="transcript" hidden>
+                <div class="session-detail-tabs" role="tablist" data-i18n-aria="records.transcriptLangLabel" aria-label="원문 언어">
+                  <button id="session-transcript-tab-en" type="button" role="tab" data-transcript-lang="en" class="is-selected" aria-selected="true" aria-controls="session-detail-transcript">EN</button>
+                  <button id="session-transcript-tab-ko" type="button" role="tab" data-transcript-lang="ko" aria-selected="false" aria-controls="session-detail-transcript">KO</button>
+                </div>
+                <div id="session-detail-transcript" class="session-record-detail" role="tabpanel" aria-labelledby="session-transcript-tab-en"></div>
+              </section>
+              <section id="session-detail-panel-participants" class="session-detail-panel" role="tabpanel" aria-labelledby="session-detail-tab-participants" data-record-detail-panel="participants" hidden>
+                <div id="session-detail-participants" class="session-detail-participants" aria-live="polite"></div>
               </section>
             </div>
           </section>
@@ -420,6 +420,11 @@
         <div class="workspace-page" data-workspace-page="settings" id="settings-page" data-i18n-aria="settings.pageLabel" aria-label="앱 설정">
           <div class="workspace-single">
             <section class="command-panel workspace-panel">
+              <div class="settings-view-tabs" role="tablist" aria-label="설정 범위">
+                <button id="settings-tab-general" type="button" role="tab" data-settings-view="general" class="is-selected" aria-selected="true" aria-controls="settings-panel-general" data-i18n="page.settings.title">설정</button>
+                <button id="settings-tab-advanced" type="button" role="tab" data-settings-view="advanced" aria-selected="false" aria-controls="settings-panel-advanced" data-i18n="settings.drawerAdvanced">고급</button>
+              </div>
+              <div id="settings-panel-general" class="settings-view-panel" role="tabpanel" aria-labelledby="settings-tab-general" data-settings-panel="general">
               <section class="cfg-section" aria-labelledby="cfg-audio-title">
                 <div class="cfg-heading">
                   <h2 id="cfg-audio-title"><i data-cfg-ordinal></i><span data-i18n="cfg.audioInput">오디오 입력</span></h2>
@@ -502,7 +507,9 @@
                   <span id="live-host-login-status" class="field-status" role="status" aria-live="polite" data-i18n="settings.authorizationRequired">인증 필요</span>
                 </div>
               </section>
+              </div>
 
+              <div id="settings-panel-advanced" class="settings-view-panel" role="tabpanel" aria-labelledby="settings-tab-advanced" data-settings-panel="advanced" hidden>
               <section class="cfg-section" aria-labelledby="cfg-advanced-title">
                 <div class="cfg-heading">
                   <h2 id="cfg-advanced-title"><i data-cfg-ordinal></i><span data-i18n="cfg.engineGlossary">엔진 · 용어집</span></h2>
@@ -617,6 +624,7 @@
                   </div>
                 </details>
               </section>
+              </div>
             </section>
           </div>
         </div>

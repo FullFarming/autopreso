@@ -1,6 +1,7 @@
 import { pathToFileURL } from "node:url";
 
 import { createCaptionPolisher } from "./caption-polish.js";
+import { buildGlossaryInstruction } from "./glossary-packs.js";
 import { readGatewayEnvironment } from "./config.js";
 import { createGatewayServer } from "./gateway-server.js";
 import {
@@ -58,19 +59,18 @@ export async function startMediaGateway(config = readGatewayEnvironment()) {
     hostReconnectGraceMilliseconds: config.hostReconnectGraceMilliseconds,
     fetchFloorParticipant: (sessionId, participantId) => floorController.getParticipant(sessionId, participantId),
     replayUtterances: (sessionId, language, afterSeq, limit, options) => publisher.fetchUtterancesAfter(sessionId, language, afterSeq, limit, options),
-    async pipelineFactory(message, previousPipeline, onHostEvent) {
+    async pipelineFactory(message, previousPipeline, onHostEvent, options = {}) {
       // Per-language caption seq survives host reconnects and process
-      // restarts: seed from persisted max(seq), best-effort, and never go
-      // backwards relative to the previous in-memory pipeline (contract C1).
-      const initialSequences = { ...(previousPipeline?.lastSequences ?? {}) };
-      try {
-        const persisted = await publisher.fetchLastUtteranceSeqs(message.sessionId, message.languages);
-        for (const [language, seq] of Object.entries(persisted)) {
-          initialSequences[language] = Math.max(initialSequences[language] ?? 0, seq);
-        }
-      } catch {
-        // Best-effort: fall back to the previous pipeline counters (or 0).
-      }
+      // restarts. Durable-failure recovery is stricter: the failed final has
+      // already consumed an in-memory seq but its commit outcome is unknown,
+      // so only the reconciled durable max may seed the replacement.
+      const initialSequences = await resolvePipelineInitialSequences({
+        publisher,
+        message,
+        previousPipeline,
+        recoveryReason: options.recoveryReason,
+        signal: options.signal,
+      });
       return new LiveMediaPipeline({
         sessionId: message.sessionId,
         sessionType: message.sessionType,
@@ -87,6 +87,7 @@ export async function startMediaGateway(config = readGatewayEnvironment()) {
         getSubscriberCount: (language) => gateway.subscriberCount(message.sessionId, language),
         observeLatency: (name, value) => gateway.metrics.observe(name, value),
         onHostEvent,
+        onFatalError: options.onFatalError,
         dependencies: {
           liveTranslate: new GeminiLiveTranslateAdapter({ client: geminiClient, model: config.geminiLiveModel }),
           openaiLiveTranslate: new OpenAIRealtimeTranslationAdapter({ apiKey: config.openaiApiKey, model: config.openaiRealtimeTranslateModel }),
@@ -105,7 +106,14 @@ export async function startMediaGateway(config = readGatewayEnvironment()) {
           // 2026-07-26 fix: Match the desktop caption finalizer's six-second
           // quality budget. Live audio has a separate callback tail, so a slow
           // caption polish cannot delay interpreted audio playback.
-          captionPolish: createCaptionPolisher({ client: geminiClient, model: config.geminiTextModel, timeoutMs: 6_000 }),
+          captionPolish: createCaptionPolisher({
+            client: geminiClient,
+            model: config.geminiTextModel,
+            timeoutMs: 6_000,
+            // CRE is the product default, so it is the standing domain
+            // instruction rather than a pack nothing reads.
+            defaultDomain: buildGlossaryInstruction("general_cre"),
+          }),
           textToSpeech: message.sessionType === "presentation"
             ? new ChirpTextToSpeechAdapter({ client: textToSpeechClient })
             : new OpenAITextToSpeechAdapter({
@@ -119,6 +127,49 @@ export async function startMediaGateway(config = readGatewayEnvironment()) {
   });
   await listenMediaGateway(gateway.server, config);
   return gateway;
+}
+
+export async function resolvePipelineInitialSequences({
+  publisher,
+  message,
+  previousPipeline = null,
+  recoveryReason = null,
+  signal = null,
+}) {
+  const isDurableRecovery = recoveryReason === "durable-caption";
+  const initialSequences = isDurableRecovery ? {} : { ...(previousPipeline?.lastSequences ?? {}) };
+  try {
+    const persisted = isDurableRecovery
+      ? Object.fromEntries(await Promise.all(message.languages.map(async (language) => [
+        language,
+        await publisher.reconcileCaptionLane(message.sessionId, language, { signal }),
+      ])))
+      : await publisher.fetchLastUtteranceSeqs(message.sessionId, message.languages);
+    for (const language of message.languages) {
+      const rawPersistedSequence = persisted?.[language];
+      if (isDurableRecovery
+        && (!Object.hasOwn(persisted ?? {}, language)
+          || !Number.isSafeInteger(rawPersistedSequence)
+          || rawPersistedSequence < 0)) {
+        throw new Error("DURABLE_CAPTION_RECOVERY_SEED_INVALID");
+      }
+      const persistedSequence = Number(rawPersistedSequence ?? 0);
+      const durableSequence = Number.isSafeInteger(persistedSequence) && persistedSequence >= 0
+        ? persistedSequence
+        : 0;
+      initialSequences[language] = isDurableRecovery
+        ? durableSequence
+        : Math.max(initialSequences[language] ?? 0, durableSequence);
+    }
+  } catch (error) {
+    if (isDurableRecovery) {
+      if (error instanceof Error && error.message === "DURABLE_CAPTION_RECOVERY_SEED_INVALID") throw error;
+      throw new Error("DURABLE_CAPTION_RECOVERY_SEED_FAILED", { cause: error });
+    }
+    // Ordinary settings updates preserve the prior in-memory counters when
+    // the read is unavailable; they do not follow an ambiguous failed commit.
+  }
+  return initialSequences;
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {

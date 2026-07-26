@@ -1454,6 +1454,12 @@ button:disabled {
   animation: subtitle-word-in 240ms ease both;
 }
 
+/* Live Call can receive many partials per second from either speaker. Keep its
+   words instant and spatially stable; Caption-only retains the reference fade. */
+.subtitle-lane.is-live-call .subtitle-word {
+  animation: none;
+}
+
 @media (prefers-reduced-motion: reduce) {
   .subtitle-word { animation: none; }
 }
@@ -1671,6 +1677,33 @@ button:disabled {
   justify-content: flex-end;
 }
 
+.subtitle-lane {
+  display: flex;
+  width: min(var(--subtitle-max-width), 88vw);
+  max-width: min(var(--subtitle-max-width), 88vw);
+  flex-direction: column;
+  align-items: stretch;
+  gap: 8px;
+  pointer-events: none;
+}
+
+.live-call-speaker-label {
+  align-self: flex-start;
+  max-width: 100%;
+  overflow: hidden;
+  border-radius: 8px;
+  background: rgb(from var(--cw-indigo) r g b / var(--subtitle-opacity));
+  color: var(--cw-white);
+  padding: 6px 12px;
+  font-family: var(--subtitle-font-family);
+  font-size: clamp(15px, calc(var(--translation-font-size) * 0.42), 22px);
+  font-weight: 600;
+  line-height: 1.35;
+  text-align: left;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .subtitle-box {
   /* Stable width (border-box ⇒ padding included) so the caption never resizes as
      words stream in and the text never overflows the right edge. 88vw leaves room
@@ -1688,6 +1721,11 @@ button:disabled {
   display: grid;
   gap: 4px;
   transition: background 160ms ease;
+}
+
+.subtitle-lane .subtitle-box {
+  width: 100%;
+  max-width: 100%;
 }
 
 .subtitle-box.partial {
@@ -3573,11 +3611,44 @@ button[aria-busy="true"] {
 }
 
 #live-draft-cover-preview {
-  width: 72px;
-  height: 72px;
+  width: min(240px, 42vw);
+  aspect-ratio: 16 / 9;
   border: 1px solid var(--nova-hairline);
   border-radius: var(--nova-r-row);
   object-fit: cover;
+  object-position: center;
+}
+
+.live-draft-group {
+  display: grid;
+  gap: var(--nova-gap-16);
+}
+
+.live-draft-schedule {
+  padding-top: var(--nova-gap-16);
+  border-top: 1px solid var(--nova-hairline);
+}
+
+.live-draft-participation {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(180px, 0.36fr);
+  gap: var(--nova-gap-16);
+  align-items: end;
+}
+
+.live-draft-field-label {
+  display: block;
+  margin-bottom: var(--nova-gap-8);
+  color: var(--nova-text-muted);
+  font-size: var(--nova-t7);
+  font-weight: 600;
+  line-height: var(--nova-t7-lh);
+}
+
+@media (max-width: 760px) {
+  .live-draft-participation {
+    grid-template-columns: minmax(0, 1fr);
+  }
 }
 
 .live-draft-access-note {
@@ -3703,10 +3774,49 @@ button[aria-busy="true"] {
 }
 
 /* ── Settings drawer ─────────────────────────────────────────────────────── */
+.settings-view-tabs,
+.session-detail-view-tabs,
+.session-detail-tabs {
+  display: inline-flex;
+  justify-self: start;
+  gap: 2px;
+  border-radius: var(--nova-r-pill);
+  background: var(--nova-overlay-100);
+  padding: 2px;
+}
+
+.settings-view-tabs {
+  margin: var(--nova-inset-narrow) var(--nova-inset) 0;
+}
+
+.settings-view-tabs button,
+.session-detail-view-tabs button,
+.session-detail-tabs button {
+  flex: none;
+  min-height: 44px;
+  border: 0;
+  border-radius: var(--nova-r-pill);
+  background: transparent;
+  color: var(--nova-text-muted);
+  padding: 0 var(--nova-gap-16);
+  font-size: var(--nova-t7);
+}
+
+.settings-view-tabs button.is-selected,
+.session-detail-view-tabs button.is-selected,
+.session-detail-tabs button.is-selected {
+  background: var(--nova-surface-float);
+  color: var(--nova-text);
+}
+
+.settings-view-panel {
+  display: grid;
+}
+
 .settings-drawer {
-  overflow: hidden;
-  border-radius: var(--nova-r-lg);
-  background: var(--nova-surface-raised);
+  overflow: visible;
+  border-radius: 0;
+  background: transparent;
 }
 
 .settings-drawer summary {
@@ -3723,7 +3833,7 @@ button[aria-busy="true"] {
   display: grid;
   gap: var(--nova-gap-16);
   border: 0;
-  border-top: 1px solid var(--nova-hairline);
+  border-top: 0;
   border-radius: 0;
   background: transparent;
   padding: var(--nova-inset-narrow) var(--nova-inset) var(--nova-inset);
@@ -4109,10 +4219,25 @@ button[aria-busy="true"] {
   to { opacity: 1; transform: none; }
 }
 
-/* The inline caption preview is redundant — captions render on the overlay and
-   on every participant screen. Kept in the DOM for the caption engine. */
+/* Captions is a task surface: configuration and a representative preview stay
+   together; records are reviewed only from the Records page. */
 .workspace-page .preview-panel {
   display: none !important;
+}
+
+[data-workspace-page="captions"] .caption-task-preview {
+  display: grid !important;
+  margin: var(--nova-gap-16) var(--nova-inset) var(--nova-inset);
+  border: 1px solid var(--nova-hairline);
+  border-radius: var(--nova-r-lg);
+  background: var(--nova-bg-recessed);
+  padding: var(--nova-inset);
+}
+
+/* Desktop pages preserve a 44px interaction box. The frameless controller is a
+   separate document and intentionally keeps its compact geometry. */
+.workspace-page button {
+  min-height: 44px;
 }
 
 /* ── Light theme: monochrome invert of the workspace shell. Media (cover
@@ -4256,11 +4381,11 @@ body.theme-light .subtitle-app-shell video {
   color: var(--nova-text-body);
   cursor: pointer;
   display: inline-flex;
-  height: 30px;
+  height: 44px;
   justify-content: center;
   padding: 0;
   transition: background var(--nova-dur-color) var(--nova-ease-out);
-  width: 30px;
+  width: 44px;
 }
 .records-cal-step:hover { background: var(--nova-overlay-200); color: var(--nova-text); }
 
@@ -4273,7 +4398,7 @@ body.theme-light .subtitle-app-shell video {
   cursor: pointer;
   font-size: var(--nova-t7);
   font-weight: 600;
-  height: 30px;
+  height: 44px;
   padding: 0 12px;
   transition: background var(--nova-dur-color) var(--nova-ease-out);
 }
@@ -4304,7 +4429,7 @@ body.theme-light .subtitle-app-shell video {
   cursor: pointer;
   font-size: var(--nova-t7);
   font-weight: 600;
-  height: 26px;
+  min-height: 40px;
   padding: 0 12px;
   transition: background var(--nova-dur-color) var(--nova-ease-out), color var(--nova-dur-color) var(--nova-ease-out);
 }
@@ -4555,36 +4680,32 @@ body.theme-light .subtitle-app-shell video {
   text-transform: none;
 }
 
-.session-detail-columns {
+.session-detail-panels,
+.session-detail-panel {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
-  gap: var(--nova-gap-16);
-  margin-top: 0;
-}
-
-.session-detail-column {
-  display: grid;
-  gap: var(--nova-gap-8);
+  gap: var(--nova-gap-12);
   align-content: start;
   min-width: 0;
 }
 
-.session-detail-column h3 {
-  margin: 0;
-  color: var(--nova-text);
-  font-size: var(--nova-t6);
-  font-weight: 600;
-  line-height: var(--nova-t6-lh);
+/* Compatibility name retained for integrations that locate the detail body;
+   the approved record detail is intentionally a single tab panel, not columns. */
+.session-detail-columns {
+  grid-template-columns: minmax(0, 1fr);
 }
 
-.session-detail-column .session-record-detail {
+.settings-view-panel .settings-drawer > summary {
+  display: none;
+}
+
+.session-detail-panel .session-record-detail {
   max-height: min(58vh, 560px);
   border-top: 0;
   padding-top: 0;
 }
 
-@media (max-width: 900px) {
-  .session-detail-columns { grid-template-columns: minmax(0, 1fr); }
+.session-detail-panel > button {
+  justify-self: start;
 }
 
 .session-record-detail {
@@ -4635,10 +4756,74 @@ body.theme-light .subtitle-app-shell video {
   font-weight: 600;
 }
 
-/* Another grid-stretch case: a lone button in a one-column grid fills the
-   column unless it is told to hug its label. */
-.session-detail-column > button {
-  justify-self: start;
+.session-detail-participants {
+  display: grid;
+}
+
+.session-detail-participant {
+  display: grid;
+  grid-template-columns: 44px minmax(0, 1fr);
+  align-items: center;
+  gap: var(--nova-gap-12);
+  min-height: 64px;
+  padding: var(--nova-gap-8) var(--nova-inset);
+  position: relative;
+}
+
+.session-detail-participant::after {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  left: var(--nova-inset);
+  height: 1px;
+  background: var(--nova-hairline);
+  content: "";
+}
+
+.session-detail-participant:last-child::after {
+  display: none;
+}
+
+.session-detail-participant-avatar {
+  display: grid;
+  width: 36px;
+  height: 36px;
+  place-items: center;
+  border-radius: var(--nova-r-pill);
+  background: var(--participant-color, var(--nova-blue));
+  color: var(--nova-text);
+  font-size: var(--nova-t7);
+  font-weight: 600;
+}
+
+.session-detail-participant-avatar.color-1 { --participant-color: var(--nova-blue); }
+.session-detail-participant-avatar.color-2 { --participant-color: var(--nova-green); }
+.session-detail-participant-avatar.color-3 { --participant-color: var(--nova-purple); }
+.session-detail-participant-avatar.color-4 { --participant-color: var(--nova-yellow); color: var(--nova-bg); }
+.session-detail-participant-avatar.color-5 { --participant-color: var(--nova-red); }
+
+.session-detail-participant-copy {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.session-detail-participant-copy strong {
+  overflow: hidden;
+  color: var(--nova-text);
+  font-size: var(--nova-t6);
+  font-weight: 600;
+  line-height: var(--nova-lh-list);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.session-detail-participant-copy span,
+.session-detail-participants > p {
+  margin: 0;
+  color: var(--nova-text-muted);
+  font-size: var(--nova-t7);
+  line-height: var(--nova-t7-lh);
 }
 
 .session-record-audio { display: grid; gap: var(--nova-gap-4); }
@@ -4711,3 +4896,15 @@ body.theme-light .subtitle-app-shell video {
   line-height: var(--nova-t5-lh);
   text-transform: none;
 }
+
+/* Momentary caption hide. Both icons ship in the markup and the class picks one,
+   because innerHTML is forbidden in this codebase. Muted is deliberately loud:
+   a hide the user forgot about is indistinguishable from broken captions. */
+.subtitle-controller-body .mp-icon .mp-icon-when-muted,
+.subtitle-controller-body .mp-icon.is-muted .mp-icon-when-visible { display: none; }
+.subtitle-controller-body .mp-icon.is-muted .mp-icon-when-muted { display: block; }
+/* No colour rule here on purpose. A background override on this button would
+   not take in this region of the cascade -- not id-qualified, not class-only, not
+   even an inline !important, while the display rules directly above DO apply on
+   the same element. I could not pin the cause cheaply, so rather than leave dead
+   CSS the state is carried by the icon swap alone, which is verified working. */

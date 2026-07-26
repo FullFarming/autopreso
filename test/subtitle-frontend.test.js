@@ -909,7 +909,7 @@ test("subtitle overlay defaults to the observed two-line rolling-caption layout"
   // maxSubtitleLines setting (up to a cap), driving the CSS height clamp.
   assert.match(js, /function maxSubtitleLines/);
   assert.match(js, /MAX_SUBTITLE_LINES_CAP = 8/);
-  assert.match(js, /const base = maxSubtitleLines\(\)/);
+  assert.match(js, /lane\.renderMode === "live-call"[\s\S]*?Math\.min\(3, maxSubtitleLines\(\)\)[\s\S]*?: maxSubtitleLines\(\)/);
   // Anti-overlap: when 2+ languages share a zone (e.g. EN+KO both at the
   // bottom) each lane auto-shrinks its visible line count and the zone reflows,
   // so the stacked boxes stay compact and never overlap or run off-screen.
@@ -1105,8 +1105,10 @@ test("live-call captions relay the opposite-language lane selected by main", () 
   assert.doesNotMatch(dashboard, /\$\{caption\.speaker[^}]*\}:/, "no Name: text prefix in relayed captions");
 
   const overlay = readFileSync(path.join(rootDir, "public", "subtitle-overlay.js"), "utf8");
-  assert.match(overlay, /live-call-speaker-badge/);
-  assert.match(overlay, /showLiveCallSpeakerBadge\(message, lane\)/);
+  assert.match(overlay, /live-call-speaker-label/);
+  assert.match(overlay, /updateLiveCallSpeaker\(message, lane\)/);
+  assert.match(dashboard, /sessionId: String\(caption\.sessionId/);
+  assert.match(dashboard, /speakerRole,/);
 
   const server = readFileSync(path.join(rootDir, "src", "server.js"), "utf8");
   assert.match(server, /liveCallSpeaker/);

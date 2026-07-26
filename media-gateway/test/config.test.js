@@ -132,8 +132,8 @@ test("gateway prefers the new Supabase secret and temporarily accepts the legacy
   assert.throws(() => readGatewayEnvironment(missing), /SUPABASE_SECRET_KEY/u);
 });
 
-test("host reconnect grace window defaults to 45 seconds and honors the env override", () => {
-  assert.equal(readGatewayEnvironment(gatewayEnvironment()).hostReconnectGraceMilliseconds, 45_000);
+test("host reconnect grace window covers the desktop's maximum retry and honors the env override", () => {
+  assert.equal(readGatewayEnvironment(gatewayEnvironment()).hostReconnectGraceMilliseconds, 90_000);
   assert.equal(
     readGatewayEnvironment({ ...gatewayEnvironment(), LIVE_HOST_RECONNECT_GRACE_MS: "10000" }).hostReconnectGraceMilliseconds,
     10_000,

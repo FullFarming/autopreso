@@ -34,6 +34,13 @@
           <button id="controller-stop" type="button" class="mp-icon" data-i18n-title="controller.stop" title="자막 정지" data-i18n-aria="controller.stop" aria-label="자막 정지">
             <svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor" aria-hidden="true"><rect x="3.5" y="3.5" width="9" height="9" rx="1.6"/></svg>
           </button>
+          <!-- Momentary caption hide: for playing a video without stopping the
+               engine. Not the overlay SETTING -- captions keep being produced and
+               recorded, they are just off screen, and quitting always clears it. -->
+          <button id="controller-mute-captions" type="button" class="mp-icon" aria-pressed="false" data-i18n-title="controller.hideCaptions" title="자막 잠시 숨기기" data-i18n-aria="controller.hideCaptions" aria-label="자막 잠시 숨기기">
+            <svg class="mp-icon-when-visible" viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true"><path d="M1.8 8s2.3-4 6.2-4 6.2 4 6.2 4-2.3 4-6.2 4S1.8 8 1.8 8Z"/><circle cx="8" cy="8" r="1.9" fill="currentColor" stroke="none"/></svg>
+            <svg class="mp-icon-when-muted" viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true"><path d="M1.8 8s2.3-4 6.2-4 6.2 4 6.2 4-2.3 4-6.2 4S1.8 8 1.8 8Z"/><path d="M2.5 2.5l11 11"/></svg>
+          </button>
           <div id="controller-live-call" class="mp-live-call" aria-label="Live Call" hidden>
             <button id="controller-go-live" type="button" class="controller-go-live" data-i18n="controller.goLive">Go-Live</button>
             <button id="controller-host-speak" type="button" class="mp-icon" data-i18n-aria="controller.hostSpeak" aria-label="호스트 발언" hidden>

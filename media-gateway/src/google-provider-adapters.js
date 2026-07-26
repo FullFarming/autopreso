@@ -102,7 +102,10 @@ export class GeminiLiveTranslateAdapter {
   constructor({
     client,
     model,
-    reconnectDelay = (attempt) => new Promise((resolve) => setTimeout(resolve, Math.min(500 * 2 ** Math.min(attempt - 1, 6), 30_000))),
+    // Matches the captions engine: RECONNECT_BASE_MS 500, RECONNECT_MAX_MS 5000
+    // (src/subtitle-realtime.js:56-57). At 30s a language stayed dark six times
+    // longer than the reference on the same failure.
+    reconnectDelay = (attempt) => new Promise((resolve) => setTimeout(resolve, Math.min(500 * 2 ** Math.min(attempt - 1, 6), 5_000))),
     finalFlushMilliseconds = 800,
     finalDrainTimeoutMilliseconds = 10_000,
     maxDetachedFinalCallbacks = 64,

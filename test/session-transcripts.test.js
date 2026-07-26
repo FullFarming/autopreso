@@ -253,7 +253,7 @@ test("caption sessions record committed lines start-to-stop and auto-summarize o
 
   let ws;
   try {
-    ws = new WebSocket(url.replace("http:", "ws:") + "/ws");
+    ws = new WebSocket(url.replace("http:", "ws:") + "/ws", { headers: { Origin: url } });
     await new Promise((resolve, reject) => {
       ws.once("open", resolve);
       ws.once("error", reject);
@@ -559,7 +559,7 @@ test("subtitle:start carries optional meeting identity into the record", async (
 
   let ws;
   try {
-    ws = new WebSocket(url.replace("http:", "ws:") + "/ws");
+    ws = new WebSocket(url.replace("http:", "ws:") + "/ws", { headers: { Origin: url } });
     await new Promise((resolve, reject) => { ws.once("open", resolve); ws.once("error", reject); });
     ws.send(JSON.stringify({
       type: "subtitle:start",
@@ -611,40 +611,55 @@ test("a participant's mirrored caption is recorded on the host with attribution"
 
   let ws;
   try {
-    ws = new WebSocket(url.replace("http:", "ws:") + "/ws");
+    ws = new WebSocket(url.replace("http:", "ws:") + "/ws", { headers: { Origin: url } });
     await new Promise((resolve, reject) => { ws.once("open", resolve); ws.once("error", reject); });
     ws.send(JSON.stringify({
       type: "subtitle:start",
+      captionProducer: "gateway",
       sessionId: "participant-record",
       settings: { inputMode: "mic", translationProvider: "gemini" },
       meeting: { kind: "live-call", liveSessionId: "sb-1", title: "Town Hall", startedAt: "2026-07-25T06:00:00.000Z" },
     }));
-    await waitForWebSocketMessage(ws, (message) => message.type === "subtitle:status" && message.status === "api_ready");
+    await new Promise((resolve) => setImmediate(resolve));
 
     // The translated lane: this is what viewers read and what the overlay shows.
     ws.send(JSON.stringify({
       type: "subtitle:live-call-caption",
+      sessionId: "sb-1",
       partial: false,
       targetLanguage: "en",
-      speaker: "김게스트 · 영업",
+      speaker: "김게스트",
+      speakerRole: "participant",
+      speakerDepartment: "영업",
+      speakerJobTitle: "Director",
       translatedText: "Our occupancy recovered in the third quarter.",
       sourceText: "3분기에 객실 점유율이 회복되었습니다",
     }));
-    await waitForWebSocketMessage(ws, (message) => message.type === "subtitle:committed");
+    const participantCaption = await waitForWebSocketMessage(ws, (message) => message.type === "subtitle:committed");
+    assert.deepEqual(participantCaption.liveCallSpeaker, {
+      role: "participant",
+      name: "김게스트",
+      department: "영업",
+      jobTitle: "Director",
+    });
 
     // The untranslated source lane is relayed record-only: it must reach the
     // record so 원문 survives, but must never be broadcast to the overlay.
     ws.send(JSON.stringify({
       type: "subtitle:live-call-caption",
+      sessionId: "sb-1",
       recordOnly: true,
       partial: false,
       targetLanguage: "ko",
-      speaker: "김게스트 · 영업",
+      speaker: "김게스트",
+      speakerRole: "participant",
+      speakerDepartment: "영업",
+      speakerJobTitle: "Director",
       translatedText: "3분기에 객실 점유율이 회복되었습니다",
     }));
 
     ws.send(JSON.stringify({ type: "subtitle:stop", sessionId: "participant-record" }));
-    await waitForWebSocketMessage(ws, (message) => message.type === "subtitle:session-summary" || message.type === "subtitle:status");
+    await new Promise((resolve) => setTimeout(resolve, 25));
 
     let record = null;
     for (let attempt = 0; attempt < 40 && !record; attempt += 1) {
@@ -656,11 +671,11 @@ test("a participant's mirrored caption is recorded on the host with attribution"
 
     const spoken = record.lines.find((line) => line.translatedText.includes("occupancy recovered"));
     assert.ok(spoken, "the translated participant turn is missing from the record");
-    assert.equal(spoken.speaker, "김게스트 · 영업", "the record must keep who said it");
+    assert.equal(spoken.speaker, "김게스트", "the record must keep who said it");
 
     const original = record.lines.find((line) => line.sourceText.includes("객실 점유율"));
     assert.ok(original, "the untranslated 원문 is missing from the record");
-    assert.equal(original.speaker, "김게스트 · 영업");
+    assert.equal(original.speaker, "김게스트");
   } finally {
     ws?.close();
     await new Promise((resolve) => httpServer.close(resolve));
@@ -680,7 +695,7 @@ test("a gateway-canonical Live Call records captions without opening the local t
   });
   let ws;
   try {
-    ws = new WebSocket(url.replace("http:", "ws:") + "/ws");
+    ws = new WebSocket(url.replace("http:", "ws:") + "/ws", { headers: { Origin: url } });
     await new Promise((resolve, reject) => { ws.once("open", resolve); ws.once("error", reject); });
     ws.send(JSON.stringify({
       type: "subtitle:start",
@@ -689,44 +704,86 @@ test("a gateway-canonical Live Call records captions without opening the local t
       settings: { inputMode: "mic", translationProvider: "gemini" },
       meeting: { kind: "live-call", liveSessionId: "session-1", title: "Canonical call" },
     }));
-    ws.send(JSON.stringify({
-      type: "subtitle:live-call-caption",
-      recordOnly: true,
-      partial: false,
-      targetLanguage: "ko",
-      utteranceKey: "session-1:input:1",
-      translatedText: "안녕하세요",
-      speaker: "Host",
-    }));
-    ws.send(JSON.stringify({
+    await new Promise((resolve) => setImmediate(resolve));
+    const attacker = new WebSocket(url.replace("http:", "ws:") + "/ws");
+    await new Promise((resolve, reject) => { attacker.once("open", resolve); attacker.once("error", reject); });
+    const injected = [];
+    ws.on("message", (raw) => {
+      const message = JSON.parse(raw.toString("utf8"));
+      if (message.translatedText === "Injected caption") injected.push(message);
+    });
+    attacker.send(JSON.stringify({
       type: "subtitle:live-call-caption",
       partial: false,
       targetLanguage: "en",
+      speakerRole: "host",
+      translatedText: "Injected caption",
+      speaker: "Forged participant",
+    }));
+    const rejection = await waitForWebSocketMessage(attacker, (message) => (
+      message.code === "LIVE_CALL_CAPTION_PRODUCER_MISMATCH"
+    ));
+    assert.equal(rejection.type, "subtitle:error");
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(injected.length, 0, "a non-owner loopback socket must not inject Live Call captions");
+    attacker.close();
+    ws.send(JSON.stringify({
+      type: "subtitle:live-call-caption",
+      sessionId: "different-session",
+      partial: false,
+      targetLanguage: "en",
+      translatedText: "Wrong session caption",
+    }));
+    const sessionRejection = await waitForWebSocketMessage(ws, (message) => (
+      message.code === "LIVE_CALL_CAPTION_SESSION_MISMATCH"
+    ));
+    assert.equal(sessionRejection.type, "subtitle:error");
+    ws.send(JSON.stringify({
+      type: "subtitle:live-call-caption",
+      sessionId: "session-1",
+      recordOnly: true,
+      partial: false,
+      targetLanguage: "ko",
+      speakerRole: "host",
+      utteranceKey: "session-1:input:1",
+      translatedText: "안녕하세요",
+    }));
+    ws.send(JSON.stringify({
+      type: "subtitle:live-call-caption",
+      sessionId: "session-1",
+      partial: false,
+      targetLanguage: "en",
+      speakerRole: "host",
       utteranceKey: "session-1:input:1",
       sourceLanguage: "ko",
       sourceText: "안녕하세요",
       translatedText: "Hello.",
-      speaker: "Host",
     }));
-    await waitForWebSocketMessage(ws, (message) => message.type === "subtitle:committed");
+    const hostCaption = await waitForWebSocketMessage(ws, (message) => message.type === "subtitle:committed");
+    assert.deepEqual(hostCaption.liveCallSpeaker, {
+      role: "host",
+      name: "Host",
+      department: "",
+      jobTitle: "",
+    });
     ws.send(JSON.stringify({
       type: "subtitle:live-call-caption",
+      sessionId: "session-1",
       recordOnly: true,
       partial: false,
       targetLanguage: "ko",
       utteranceKey: "session-1:input:2",
       translatedText: "안녕하세요",
-      speaker: "Host",
     }));
     ws.send(JSON.stringify({
       type: "subtitle:live-call-caption",
+      sessionId: "session-1",
       partial: false,
       targetLanguage: "en",
       utteranceKey: "session-1:input:2",
       sourceLanguage: "ko",
       sourceText: "안녕하세요",
       translatedText: "Hello.",
-      speaker: "Host",
     }));
     await waitForWebSocketMessage(ws, (message) => message.type === "subtitle:committed");
     ws.send(JSON.stringify({ type: "subtitle:stop", sessionId: "live-session-1" }));

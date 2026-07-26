@@ -1,6 +1,13 @@
-const DEFAULT_MAX_LIVE_CALL_GLOSSARY_CHARS = 24_000;
+// Matches MAX_SUBTITLE_GLOSSARY_CHARS in src/settings-store.js. At 24_000 the
+// largest shipped preset (~27.5k) was truncated on the Live Call path only.
+const DEFAULT_MAX_LIVE_CALL_GLOSSARY_CHARS = 40_000;
 
-const EXCLUDED_SECTION = /(?:관용|비유|번역\s*메모리|translation\s*memory|문장\s*매칭|영어\s*표현|영어\s*슬로건|구어|AI[·/&]?AX|인공지능|지명|직위|조직\s*단위|영어\s*라벨)/iu;
+// Idioms and translation memory are NOT excluded: the polish prompt shared with
+// the captions path instructs the model to use them ("Treat full-sentence or
+// clause-level pairs as TRANSLATION MEMORY"), so stripping them left Live Call
+// with the instruction and none of the data. Only genuinely local-only
+// sections stay out.
+const EXCLUDED_SECTION = /(?:영어\s*슬로건|영어\s*라벨)/iu;
 const CORE_RULE_SECTION = /(?:숫자|약어|중의어|rules?|instructions?)/iu;
 const PROPER_NOUN_SECTION = /(?:고유명사|회사|기관|브랜드|자산|프로젝트|고객사|투자자|proper\s*noun|brand)/iu;
 const CRE_TERM_SECTION = /(?:상업용\s*부동산|캐피탈|임차인|임대차|오피스|투자|자본시장|개발|인허가|호텔|리빙|리테일|거래|자금조달|딜\s*소싱|운영|계약|수요|시장|리스크|거버넌스|service\s*line|capital\s*market|commercial\s*real\s*estate)/iu;
@@ -41,8 +48,10 @@ function classifySection(section) {
 }
 
 /** Build the glossary sent to the Live Call gateway without mutating the
- * captions-only glossary. Network prompts keep identity and CRE terminology;
- * broad idiom/sentence memory stays local to the higher-quality desktop path. */
+ * captions-only glossary. It carries the same identity, CRE terminology, idioms
+ * and translation memory the captions path uses -- the gateway runs the identical
+ * polish prompt and its own selectRelevantGlossary narrows per line, so sending
+ * less here only starved the model. */
 export function buildLiveCallGlossary(glossary, { maxChars = DEFAULT_MAX_LIVE_CALL_GLOSSARY_CHARS } = {}) {
   const boundedMax = Number.isSafeInteger(maxChars) && maxChars > 0
     ? Math.min(maxChars, DEFAULT_MAX_LIVE_CALL_GLOSSARY_CHARS)

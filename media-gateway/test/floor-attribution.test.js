@@ -44,7 +44,12 @@ test("final utterances while a participant holds the floor are attributed to the
   const pipeline = makeMeetingPipeline(state);
   await pipeline.start();
 
-  pipeline.setFloorSpeaker({ participantId: "participant-1", displayName: "김노엘" });
+  pipeline.setFloorSpeaker({
+    participantId: "participant-1",
+    displayName: "김노엘",
+    department: "전략기획실",
+    jobTitle: "PM",
+  });
   await pipeline.acceptFinalUtterance({
     speakerLabel: "1",
     text: "안녕하세요",
@@ -58,6 +63,10 @@ test("final utterances while a participant holds the floor are attributed to the
   assert.ok(caption, "caption should be published");
   assert.equal(caption.speaker.label, "김노엘");
   assert.equal(typeof caption.speaker.speakerId, "string");
+  assert.equal(caption.speakerRole, "participant");
+  assert.equal(caption.speakerName, "김노엘");
+  assert.equal(caption.speakerDepartment, "전략기획실");
+  assert.equal(caption.speakerJobTitle, "PM");
   assert.equal(caption.sourceStartedAt, "2026-07-22T23:59:56.000Z");
 
   // The same participant keeps the same registry slot on later utterances.
@@ -100,6 +109,10 @@ test("attribution falls back to diarization after the floor is released past the
   const captions = state.events.filter((event) => event.type === "caption");
   assert.equal(captions[0].speaker.label, "김노엘");
   assert.equal(captions[1].speaker.label, "Speaker 2");
+  assert.equal(captions[1].speakerRole, "host");
+  assert.equal(captions[1].speakerName, "Host");
+  assert.equal(captions[1].speakerDepartment, "");
+  assert.equal(captions[1].speakerJobTitle, "");
 });
 
 test("a preempting speaker does not inherit the previous holder's lagging finals (capture-time fence)", async () => {

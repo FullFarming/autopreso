@@ -1,16 +1,15 @@
 import { normalizeLiveLanguage } from "./config.js";
 
 const SHORT_SIGNAL_LIMIT = 2;
-const STRONG_HANGUL_CHARS = 4;
-const STRONG_LATIN_CHARS = 8;
+// Aligned with the captions engine (the reference): KOREAN_MIX_MIN_CHARS 3,
+// LANGUAGE_LOCK_MIN_SIGNAL_CHARS 4, LANGUAGE_LOCK_MIN_CONFIDENCE 0.68.
+// The gateway previously needed a 4th Hangul char and 8 Latin chars at 0.78,
+// so it declared both languages LATER than captions did on identical speech.
+const STRONG_HANGUL_CHARS = 3;
+const STRONG_LATIN_CHARS = 4;
+const STRONG_LATIN_RATIO = 0.68;
 const STRONG_JAPANESE_CHARS = 4;
 const LATIN_LANGUAGE_CODES = new Set(["en", "es", "fr", "de", "pt", "vi", "id", "it"]);
-
-function isLikelyProperNoun(text) {
-  const tokens = String(text).match(/[A-Za-z][A-Za-z'.-]*/g) ?? [];
-  if (tokens.length === 0 || tokens.length > 4) return false;
-  return tokens.every((token) => /^[A-Z](?:[A-Za-z'.-]*|[A-Z]+)$/.test(token));
-}
 
 function analyzeTranscript(text) {
   const transcript = (typeof text === "string" ? text : "").trim();
@@ -23,7 +22,14 @@ function analyzeTranscript(text) {
   const signal = hangul + latin + japanese + han + cyrillic + devanagari;
   if (signal === 0) return { language: "", isStrong: false, signal };
 
-  if (hangul >= STRONG_HANGUL_CHARS && hangul / signal >= 0.2) {
+  // Pure Korean: no Latin to weigh it against.
+  if (hangul >= STRONG_HANGUL_CHARS && latin === 0) {
+    return { language: "ko", isStrong: true, signal };
+  }
+  // Mixed Korean+English, judged the way captions judges it: ko / (ko + en),
+  // and only when there is no Japanese in the buffer.
+  if (hangul >= STRONG_HANGUL_CHARS && latin > 0 && japanese === 0
+    && hangul / (hangul + latin) >= 0.2) {
     return { language: "ko", isStrong: true, signal };
   }
   if (japanese >= STRONG_JAPANESE_CHARS && japanese / signal >= 0.35) {
@@ -32,16 +38,11 @@ function analyzeTranscript(text) {
   if (han >= 4 && japanese === 0) return { language: "zh-Hans", isStrong: true, signal };
   if (cyrillic >= 4) return { language: "ru", isStrong: true, signal };
   if (devanagari >= 4) return { language: "hi", isStrong: true, signal };
-  if (latin >= STRONG_LATIN_CHARS && latin / signal >= 0.78 && !isLikelyProperNoun(transcript)) {
+  if (latin >= STRONG_LATIN_CHARS && latin / signal >= STRONG_LATIN_RATIO) {
     return { language: "en", isStrong: true, signal };
   }
 
-  const language = hangul >= latin && hangul >= japanese
-    ? "ko"
-    : japanese > latin
-      ? "ja"
-      : "en";
-  return { language, isStrong: false, signal };
+  return { language: "", isStrong: false, signal };
 }
 
 /**

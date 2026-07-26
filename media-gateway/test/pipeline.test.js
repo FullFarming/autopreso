@@ -1097,6 +1097,10 @@ test("interim captions never consume the finalized caption seq space", async () 
   const finalsMax = Math.max(...finals.map((event) => event.seq));
   assert.ok(finals.every((event) => event.seq <= finalsMax));
   assert.deepEqual(finals.map((event) => event.seq), [1], "commit seq stays gap-free from 1");
+  // Without this the trailing interim leaves a 140ms partial-debounce timer
+  // armed, and the whole test FILE never exits — the gateway suite hung
+  // instead of reporting.
+  await pipeline.close();
 });
 
 // A speaker genuinely repeating a sentence is not the model re-emitting one.
@@ -1349,13 +1353,21 @@ test("captions are mirrored to the host socket for bidirectional desktop display
     onHostEvent: (event) => hostEvents.push(event),
   });
   await pipeline.start();
-  pipeline.setFloorSpeaker({ participantId: "p1", displayName: "김참가" });
+  pipeline.setFloorSpeaker({
+    participantId: "p1",
+    displayName: "김참가",
+    department: "호텔팀",
+    jobTitle: "Director",
+  });
   await pipeline.acceptFinalUtterance({ speakerLabel: "A", text: "참가자 발언입니다", sourceLanguage: "ko-KR", sourceEndedAt: "2026-07-19T00:00:00.000Z" });
   const captions = hostEvents.filter((event) => event.type === "caption");
   assert.equal(captions.length, 1);
   assert.equal(captions[0].text, "참가자 발언입니다");
   assert.equal(captions[0].speaker.isParticipant, true);
   assert.equal(captions[0].speaker.name, "김참가");
+  assert.equal(captions[0].speakerRole, "participant");
+  assert.equal(captions[0].speakerDepartment, "호텔팀");
+  assert.equal(captions[0].speakerJobTitle, "Director");
 });
 
 test("partial captions carry a full speaker assignment shape the viewer contract accepts", async () => {
@@ -1516,12 +1528,21 @@ test("meeting live-translate captions carry floor attribution while a participan
   await pipeline.start();
   const enSession = state.liveSessions.find((session) => session.language === "en");
   await enSession.onCaption({ text: "Hello from the floor", isFinal: false });
-  pipeline.setFloorSpeaker({ participantId: "p1", displayName: "김참가" });
+  pipeline.setFloorSpeaker({
+    participantId: "p1",
+    displayName: "김참가",
+    department: "호텔팀",
+    jobTitle: "Director",
+  });
   await enSession.onCaption({ text: "Hello from the floor, everyone", isFinal: true });
   const captions = state.events.filter((event) => event.type === "caption" && event.language === "en");
   assert.equal(captions.length, 1, "the pending host partial is cancelled at the floor boundary");
   assert.equal(captions.at(-1).speaker?.name, "김참가");
   assert.equal(captions.at(-1).speaker?.isParticipant, true);
+  assert.equal(captions.at(-1).speakerRole, "participant");
+  assert.equal(captions.at(-1).speakerName, "김참가");
+  assert.equal(captions.at(-1).speakerDepartment, "호텔팀");
+  assert.equal(captions.at(-1).speakerJobTitle, "Director");
 });
 
 test("the meeting input transcript feeds the source-language lane like the desktop hub", async () => {
@@ -1537,6 +1558,8 @@ test("the meeting input transcript feeds the source-language lane like the deskt
   assert.deepEqual(koCaptions.map((event) => [event.text, event.isFinal]), [
     ["안녕하세요 여러분 반갑습니다", true],
   ]);
+  assert.equal(koCaptions[0].speakerRole, "host");
+  assert.equal(koCaptions[0].speakerName, "Host");
   // English speech routes to the en lane by script when the hint is absent.
   await firstSession.onInputCaption({ text: "Let us move on to the next item", isFinal: true });
   const enCaptions = state.events.filter((event) => event.type === "caption" && event.language === "en");
@@ -1723,6 +1746,9 @@ test("a later input partial cannot steal an earlier final's source correlation",
   const translated = state.events.find((event) => event.type === "caption" && event.language === "en");
   assert.equal(translated.sourceText, "첫 번째 문장");
   assert.match(translated.utteranceKey, /:input:1$/u);
+  // The "두 번째 진행 중" partial arms a 140ms debounce timer that outlives the
+  // test; see the same close() in the seq-space test above.
+  await pipeline.close();
 });
 
 test("an explicit provider identity resynchronizes after a missing translated final", async () => {

@@ -58,6 +58,7 @@ export class LiveMediaPipeline {
   #partialLanes = new Map();
   /** Gemini caption lanes: per-language debounce with a bounded first paint. */
   #presentationPartialLanes = new Map();
+  #didReportFatalError = false;
 
   constructor({
     sessionId,
@@ -78,6 +79,7 @@ export class LiveMediaPipeline {
     initialSequence = 0,
     initialSequences = null,
     onHostEvent = null,
+    onFatalError = null,
     getSubscriberCount = null,
     observeLatency = null,
     setTimeoutFn = setTimeout,
@@ -115,6 +117,7 @@ export class LiveMediaPipeline {
       this.#captionSeq.set(language, Math.max(seed, initialSequence));
     }
     this.onHostEvent = onHostEvent;
+    this.onFatalError = onFatalError;
     this.getSubscriberCount = getSubscriberCount;
     this.observeLatency = observeLatency;
     this.setTimeoutFn = setTimeoutFn;
@@ -358,7 +361,14 @@ export class LiveMediaPipeline {
       };
     for (const language of this.languages) {
       const lane = this.#partialLane(language);
-      lane.pending = { normalizedText, normalizedSourceLanguage, sourceLanguage, speaker, epoch: lane.epoch };
+      lane.pending = {
+        normalizedText,
+        normalizedSourceLanguage,
+        sourceLanguage,
+        speaker,
+        speakerMetadata: this.#liveCaptionSpeakerMetadata(floor),
+        epoch: lane.epoch,
+      };
       if (!lane.inFlight) {
         lane.inFlight = true;
         void this.#drainPartialLane(language, lane).finally(() => { lane.inFlight = false; });
@@ -414,6 +424,7 @@ export class LiveMediaPipeline {
           sessionId: this.sessionId,
           language,
           speaker: partial.speaker,
+          ...partial.speakerMetadata,
           text: textOut,
           isFinal: false,
           sourceText: isSourceLane ? null : partial.normalizedText,
@@ -556,6 +567,23 @@ export class LiveMediaPipeline {
     return assignment;
   }
 
+  #liveCaptionSpeakerMetadata(floor) {
+    if (this.sessionType !== "meeting") return {};
+    return floor
+      ? {
+        speakerRole: "participant",
+        speakerName: floor.displayName,
+        speakerDepartment: floor.department ?? "",
+        speakerJobTitle: floor.jobTitle ?? "",
+      }
+      : {
+        speakerRole: "host",
+        speakerName: "Host",
+        speakerDepartment: "",
+        speakerJobTitle: "",
+      };
+  }
+
   async #processFinalUtterance({ speakerLabel, text, sourceLanguage, sourceStartOffsetMs, sourceEndOffsetMs, sourceEndedAt, pcmWindow = null }) {
     this.#assertRunning();
     if (this.#isPaused) {
@@ -668,6 +696,7 @@ export class LiveMediaPipeline {
             sessionId: this.sessionId,
             language,
             speaker,
+            ...this.#liveCaptionSpeakerMetadata(floor),
             text: translatedText,
             isFinal: true,
             // null on the source lane: text already IS the original, so
@@ -744,14 +773,33 @@ export class LiveMediaPipeline {
 
   async #publishCaption(language, caption, { mirrorToHost }) {
     let didMirror = false;
-    await this.dependencies.publisher.publish(this.sessionId, language, caption, {
-      onLiveEvent: () => {
-        didMirror = true;
-        if (mirrorToHost) this.onHostEvent?.(caption);
-      },
-    });
+    try {
+      await this.dependencies.publisher.publish(this.sessionId, language, caption, {
+        onLiveEvent: () => {
+          didMirror = true;
+          if (mirrorToHost) this.onHostEvent?.(caption);
+        },
+      });
+    } catch (error) {
+      this.#reportFatalPublisherError(error);
+      throw error;
+    }
     // Test/in-memory publishers may implement the older three-argument seam.
     if (mirrorToHost && !didMirror) this.onHostEvent?.(caption);
+  }
+
+  #reportFatalPublisherError(error) {
+    if (this.#didReportFatalError || !hasErrorCode(error, new Set([
+      "DURABLE_CAPTION_PERSIST_FAILED",
+      "DURABLE_CAPTION_LANE_FAILED",
+    ]))) return;
+    this.#didReportFatalError = true;
+    try {
+      this.onFatalError?.(error);
+    } catch {
+      // Recovery notification is out-of-band; it must never replace the
+      // original persistence error observed by the provider callback.
+    }
   }
 
   async #publishLegend() {
@@ -1196,6 +1244,7 @@ export class LiveMediaPipeline {
       sessionId: this.sessionId,
       language,
       speaker: floor ? this.#floorSpeakerAssignment(floor) : null,
+      ...this.#liveCaptionSpeakerMetadata(floor),
       text,
       isFinal,
       ...(sourceContext ? {
@@ -1282,13 +1331,22 @@ function findCanonicalInputContext(queue, providerContext) {
 
   const sourceText = String(providerContext.text ?? "").normalize("NFC").trim();
   const sourceLanguage = normalizeLiveLanguage(providerContext.language);
-  const textMatches = [];
+  const exactTextMatches = [];
   for (let index = 0; index < queue.length; index += 1) {
     const entry = queue[index];
     if (String(entry.text ?? "").normalize("NFC").trim() !== sourceText) continue;
-    if (sourceLanguage && entry.language !== sourceLanguage) continue;
-    textMatches.push(index);
+    exactTextMatches.push(index);
   }
+  // 2026-07-26 fix: The canonical input callback is the shared source of truth
+  // across target sessions. A sibling session can report a contradictory
+  // languageCode for the exact same transcript; requiring that hint to agree
+  // rejected the canonical context and made the target lane drop its final as
+  // a same-language echo. A unique exact transcript proves identity more
+  // strongly than the unstable per-session language hint.
+  if (exactTextMatches.length === 1) return exactTextMatches[0];
+  const textMatches = sourceLanguage
+    ? exactTextMatches.filter((index) => queue[index].language === sourceLanguage)
+    : exactTextMatches;
   // A single exact source match is a safe FIFO resynchronization when provider
   // sessions reconnect with different generations. When a speaker repeats the
   // same sentence, use the lane-local coordinate only inside the text/language
@@ -1308,6 +1366,17 @@ function findCanonicalInputContext(queue, providerContext) {
 function parseGeminiUtteranceCoordinate(value) {
   const match = /^gemini:[^:]+:(\d+):(\d+)$/u.exec(String(value ?? ""));
   return match ? `${match[1]}:${match[2]}` : null;
+}
+
+function hasErrorCode(error, codes) {
+  let current = error;
+  const visited = new Set();
+  while (current && typeof current === "object" && !visited.has(current)) {
+    visited.add(current);
+    if (current instanceof Error && codes.has(current.message)) return true;
+    current = current.cause;
+  }
+  return false;
 }
 
 function resolveSourceStartedAt({ sourceStartOffsetMs, sourceEndOffsetMs, sourceEndedAt }) {

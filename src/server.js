@@ -117,6 +117,8 @@ export async function startServer(options) {
   let transcriptRecordTail = Promise.resolve();
   const pendingLiveCallSources = new Map();
   const recentlyRecordedLiveCallSources = new Set();
+  let liveCallCaptionProducer = null;
+  let liveCallCaptionSessionId = "";
   const queueTranscriptLine = (line) => {
     transcriptRecordTail = transcriptRecordTail
       .then(() => sessionTranscripts?.recordLine(line))
@@ -466,8 +468,10 @@ export async function startServer(options) {
     subtitles.close();
   });
 
-  wss.on("connection", async (client) => {
+  wss.on("connection", async (client, request) => {
     let activeAudioSessionId = null;
+    const hasTrustedBrowserOrigin = typeof request?.headers?.origin === "string"
+      && isAllowedLocalOrigin(request.headers.origin, request.headers.host);
     client.send(JSON.stringify({ type: "config", transcriptionEngine: transcription.getLabel() }));
     if (options.settingsStore) {
       const sanitized = await options.settingsStore.getSanitized();
@@ -481,7 +485,13 @@ export async function startServer(options) {
     // Late-join sync: paint the current live subtitle lanes immediately
     // instead of waiting for the next partial.
     client.send(JSON.stringify(subtitleHub.snapshotFor(client)));
-    client.on("close", () => subtitleHub.removeClient(client));
+    client.on("close", () => {
+      subtitleHub.removeClient(client);
+      if (client === liveCallCaptionProducer) {
+        liveCallCaptionProducer = null;
+        liveCallCaptionSessionId = "";
+      }
+    });
     if (state.mode === "live") {
       client.send(JSON.stringify({ type: "whiteboard:update", elements: state.elements }));
     }
@@ -552,7 +562,38 @@ export async function startServer(options) {
         // Identity travels as structured fields — the overlay renders a
         // name·department·title badge instead of a "Name:" text prefix, and
         // the session record keeps attribution via the speaker field.
+        if (client !== liveCallCaptionProducer || !liveCallCaptionSessionId) {
+          client.send(JSON.stringify({
+            type: "subtitle:error",
+            message: "활성 Live Call 자막 채널이 아닙니다.",
+            code: "LIVE_CALL_CAPTION_PRODUCER_MISMATCH",
+          }));
+          return;
+        }
+        const relaySessionId = typeof message.sessionId === "string"
+          ? message.sessionId.trim().slice(0, 240)
+          : "";
+        if (!relaySessionId || relaySessionId !== liveCallCaptionSessionId) {
+          client.send(JSON.stringify({
+            type: "subtitle:error",
+            message: "Live Call 세션이 일치하지 않습니다.",
+            code: "LIVE_CALL_CAPTION_SESSION_MISMATCH",
+          }));
+          return;
+        }
         const translatedText = String(message.translatedText ?? "").trim();
+        const suppliedSpeakerName = String(message.speaker ?? "").trim().slice(0, 80);
+        const suppliedSpeakerRole = ["host", "participant"].includes(message.speakerRole)
+          ? message.speakerRole
+          : "";
+        const speakerRole = suppliedSpeakerRole || (suppliedSpeakerName ? "participant" : "host");
+        const speakerName = suppliedSpeakerName || "Host";
+        const speakerDepartment = speakerRole === "participant"
+          ? String(message.speakerDepartment ?? "").trim().slice(0, 80)
+          : "";
+        const speakerJobTitle = speakerRole === "participant"
+          ? String(message.speakerJobTitle ?? "").trim().slice(0, 100)
+          : "";
         if (translatedText && message.recordOnly === true) {
           // 원문 보관: the untranslated source line goes into the session
           // record (Records shows the original alongside the translation)
@@ -563,14 +604,13 @@ export async function startServer(options) {
             : null;
           if (utteranceKey && recentlyRecordedLiveCallSources.delete(utteranceKey)) return;
           pendingLiveCallSources.set(utteranceKey ?? Symbol("unkeyed-live-source"), {
-            speaker: String(message.speaker ?? "").trim().slice(0, 80),
+            speaker: speakerName,
             sourceText: translatedText,
             translatedText: "",
           });
           return;
         }
         if (translatedText) {
-          const speakerName = String(message.speaker ?? "").trim().slice(0, 80);
           let sourceText = String(message.sourceText ?? "").trim();
           const utteranceKey = typeof message.utteranceKey === "string" && message.utteranceKey
             ? message.utteranceKey.slice(0, 240)
@@ -591,14 +631,13 @@ export async function startServer(options) {
             sourceText,
             sourceLanguage: String(message.sourceLanguage ?? ""),
             translatedText,
-            ...(speakerName ? {
-              speaker: speakerName,
-              liveCallSpeaker: {
-                name: speakerName,
-                department: String(message.speakerDepartment ?? "").trim().slice(0, 80),
-                jobTitle: String(message.speakerJobTitle ?? "").trim().slice(0, 100),
-              },
-            } : {}),
+            speaker: speakerName,
+            liveCallSpeaker: {
+              role: speakerRole,
+              name: speakerName,
+              department: speakerDepartment,
+              jobTitle: speakerJobTitle,
+            },
           });
         }
       }
@@ -627,7 +666,18 @@ export async function startServer(options) {
           // 2026-07-26 fix: Live Call captions have one producer: the media gateway. Keep the
           // local transcript lifecycle open while leaving the independent
           // realtime translation manager cold.
-          if (message.captionProducer !== "gateway") {
+          const meeting = message.meeting && typeof message.meeting === "object" ? message.meeting : {};
+          if (message.captionProducer === "gateway") {
+            if (!hasTrustedBrowserOrigin || meeting.kind !== "live-call") {
+              throw new Error("LIVE_CALL_CAPTION_PRODUCER_UNTRUSTED");
+            }
+            if (liveCallCaptionProducer && liveCallCaptionProducer !== client) {
+              throw new Error("LIVE_CALL_CAPTION_PRODUCER_ACTIVE");
+            }
+            liveCallCaptionProducer = client;
+            liveCallCaptionSessionId = String(meeting.liveSessionId ?? "").trim().slice(0, 240);
+            if (!liveCallCaptionSessionId) throw new Error("LIVE_CALL_SESSION_REQUIRED");
+          } else {
             await subtitles.start({ sessionId: message.sessionId, settings: message.settings });
           }
           // Optional meeting identity. When captions are running for a Live Call
@@ -635,7 +685,6 @@ export async function startServer(options) {
           // because that is what the records calendar places on the grid. Every
           // field is bounded and validated inside begin(); absent means a plain
           // local caption session, which is the historical behaviour.
-          const meeting = message.meeting && typeof message.meeting === "object" ? message.meeting : {};
           await sessionTranscripts?.begin({
             sessionId: message.sessionId,
             kind: meeting.kind === "live-call" ? "live-call" : "local",
@@ -644,6 +693,10 @@ export async function startServer(options) {
             startedAt: typeof meeting.startedAt === "string" ? meeting.startedAt : "",
           });
         } catch (error) {
+          if (message.captionProducer === "gateway" && client === liveCallCaptionProducer) {
+            liveCallCaptionProducer = null;
+            liveCallCaptionSessionId = "";
+          }
           client.send(JSON.stringify({ type: "subtitle:error", message: error.message, code: "SUBTITLE_START_FAILED" }));
         }
       }
@@ -712,6 +765,10 @@ export async function startServer(options) {
         for (const sourceLine of pendingLiveCallSources.values()) void queueTranscriptLine(sourceLine);
         pendingLiveCallSources.clear();
         recentlyRecordedLiveCallSources.clear();
+        if (client === liveCallCaptionProducer) {
+          liveCallCaptionProducer = null;
+          liveCallCaptionSessionId = "";
+        }
         await transcriptRecordTail;
         // Close the transcript session and, when a provider key exists,
         // generate the AI summary automatically. Best-effort: a summary

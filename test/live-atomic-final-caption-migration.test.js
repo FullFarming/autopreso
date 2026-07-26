@@ -51,5 +51,7 @@ test("fresh bootstrap contains the atomic migration byte-for-byte", async () => 
   const marker = `-- ${migrationName}`;
   const sectionStart = bootstrap.lastIndexOf(marker);
   assert.notEqual(sectionStart, -1);
-  assert.equal(bootstrap.slice(sectionStart + marker.length + 1), sql);
+  const contentStart = sectionStart + marker.length + 1;
+  const nextSection = bootstrap.indexOf("\n-- 202607", contentStart);
+  assert.equal(bootstrap.slice(contentStart, nextSection === -1 ? undefined : nextSection).trimEnd(), sql.trimEnd());
 });

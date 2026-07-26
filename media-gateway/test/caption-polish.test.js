@@ -40,6 +40,8 @@ test("polish rewrites finals with the desktop finalizer prompt (tone, glossary, 
   assert.match(system, /격식체 존댓말/);
   assert.match(system, /힐튼 가든 인 = Hilton Garden Inn/);
   assert.match(system, /호텔 자산운용 미팅/);
+  assert.equal(client.requests[0].config.maxOutputTokens, 1_024,
+    "Live Call final polish must keep the captions-only output budget");
 });
 
 test("polish is skipped entirely for natural tone with no glossary or domain", async () => {

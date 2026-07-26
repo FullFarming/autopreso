@@ -290,6 +290,12 @@ function ensureLane(targetLanguage) {
   const key = laneKey(targetLanguage);
   let lane = lanes.get(key);
   if (!lane) {
+    const shell = document.createElement("div");
+    shell.className = "subtitle-lane";
+    shell.hidden = true;
+    const speakerLabel = document.createElement("div");
+    speakerLabel.className = "live-call-speaker-label";
+    speakerLabel.hidden = true;
     const box = document.createElement("div");
     box.className = "subtitle-box";
     box.hidden = true;
@@ -306,13 +312,14 @@ function ensureLane(targetLanguage) {
     flow.className = "subtitle-flow";
     translation.append(flow);
     box.append(source, translation);
-    lane = { key, box, source, translation, flow, lines: [], predicted: "", predictedState: "partial", sourceLines: [], timer: null, trimTimer: null, position: null, partial: false, lastSeq: -1, lastEventType: "", lastEventText: "", lastCommittedText: "" };
+    shell.append(speakerLabel, box);
+    lane = { key, shell, speakerLabel, box, source, translation, flow, lines: [], predicted: "", predictedState: "partial", sourceLines: [], timer: null, trimTimer: null, position: null, partial: false, renderMode: "captions", lastSeq: -1, lastEventType: "", lastEventText: "", lastCommittedText: "" };
     lanes.set(key, lane);
   }
   const position = positionForLanguage(targetLanguage);
   if (lane.position !== position) {
     const previous = lane.position;
-    zones[position].append(lane.box);
+    zones[position].append(lane.shell);
     lane.position = position;
     // Membership of both the old and new zone changed, so their crowding (and
     // thus each lane's line budget) needs recomputing.
@@ -356,7 +363,12 @@ function languagesAssignedToZone(position) {
 // shrinks so the stacked boxes stay compact and never collide. The budget is
 // stable per language config, so it never flickers as subtitles come and go.
 function visibleLineLimitFor(lane) {
-  const base = maxSubtitleLines();
+  // Caption-only remains the immutable reference. Live Call alone gets the
+  // broadcast-safe three-line ceiling requested for the shared presentation
+  // overlay, even when a previously saved caption preference is larger.
+  const base = lane.renderMode === "live-call"
+    ? Math.min(3, maxSubtitleLines())
+    : maxSubtitleLines();
   const sharing = languagesAssignedToZone(lane.position);
   if (sharing <= 1) return base;
   return Math.max(1, Math.ceil(base / sharing));
@@ -460,58 +472,33 @@ function acceptDirection(message) {
   return true;
 }
 
-// ── Live Call speaker identity badge ────────────────────────────────────────
-// Participant (Speak) captions arrive with structured identity instead of a
-// "Name:" text prefix; a pill above the caption zone shows who is talking
-// (이름 · 부서 · 직급) and fades once their lines stop.
-let liveCallSpeakerBadge = null;
-let liveCallSpeakerBadgeTimer = null;
-function showLiveCallSpeakerBadge(message, lane) {
+// ── Live Call speaker identity ──────────────────────────────────────────────
+// The label and caption share one bottom-anchored lane. Its gap therefore stays
+// fixed while the caption grows from one line to three, and the label follows
+// the subtitle lifetime instead of expiring on an unrelated timer.
+function updateLiveCallSpeaker(message, lane) {
   const speaker = message.liveCallSpeaker;
-  const name = String(speaker?.name ?? "").trim();
-  if (!name) return;
-  const text = [name, String(speaker?.department ?? "").trim(), String(speaker?.jobTitle ?? "").trim()]
+  if (message.source !== "live-call" || !speaker || typeof speaker !== "object") {
+    lane.speakerLabel.hidden = true;
+    lane.speakerLabel.textContent = "";
+    return;
+  }
+  const role = speaker.role === "participant" ? "participant" : "host";
+  const name = role === "host" ? "Host" : String(speaker.name ?? "Participant").trim() || "Participant";
+  const text = [name, role === "participant" ? String(speaker.department ?? "").trim() : "", role === "participant" ? String(speaker.jobTitle ?? "").trim() : ""]
     .filter(Boolean)
     .join(" · ");
-  if (!liveCallSpeakerBadge) {
-    liveCallSpeakerBadge = document.createElement("div");
-    liveCallSpeakerBadge.className = "live-call-speaker-badge";
-    liveCallSpeakerBadge.style.cssText = [
-      "align-self: center",
-      "margin: 0 auto 10px",
-      "padding: 7px 16px",
-      "border-radius: 9999px",
-      "background: rgba(16, 17, 22, 0.86)",
-      "box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.16) inset",
-      "color: #FFFFFF",
-      "font-size: 0.42em",
-      "font-weight: 600",
-      "line-height: 1.2",
-      "letter-spacing: 0.01em",
-      "max-width: 82%",
-      "overflow: hidden",
-      "text-overflow: ellipsis",
-      "white-space: nowrap",
-      "pointer-events: none",
-      "width: fit-content",
-    ].join(";");
-  }
-  liveCallSpeakerBadge.textContent = text;
-  const zone = zones[lane.position] ?? zones["bottom-center"];
-  if (liveCallSpeakerBadge.parentElement !== zone) zone?.prepend(liveCallSpeakerBadge);
-  liveCallSpeakerBadge.hidden = false;
-  if (liveCallSpeakerBadgeTimer !== null) clearTimeout(liveCallSpeakerBadgeTimer);
-  liveCallSpeakerBadgeTimer = setTimeout(() => {
-    if (liveCallSpeakerBadge) liveCallSpeakerBadge.hidden = true;
-  }, 5_000);
+  if (lane.speakerLabel.textContent !== text) lane.speakerLabel.textContent = text;
+  lane.speakerLabel.hidden = false;
 }
 
 function renderCommittedSubtitle(message, fromSnapshot = false) {
   if (isAudioOnlyOutput()) return;
   const lane = ensureLane(message.targetLanguage);
+  setLaneRenderMode(lane, message);
   if (!acceptLaneEvent(lane, message, fromSnapshot)) return;
   if (!acceptDirection(message)) return;
-  if (message.liveCallSpeaker) showLiveCallSpeakerBadge(message, lane);
+  updateLiveCallSpeaker(message, lane);
   clearStaleReverseLane(message);
   const parts = splitSubtitleDisplayParts(message.translatedText);
   const finalParts = parts.length > 0 ? parts : [stripSubtitlePrefix(message.translatedText)].filter(Boolean);
@@ -539,6 +526,7 @@ function renderPredictedSubtitle(message, fromSnapshot = false) {
   if (isAudioOnlyOutput()) return;
   if (!shouldRenderPredictedSubtitle(message)) return;
   const lane = ensureLane(message.targetLanguage);
+  setLaneRenderMode(lane, message);
   if (!acceptLaneEvent(lane, message, fromSnapshot)) return;
   if (!acceptDirection(message)) return;
   // A new live hypothesis for direction X→Y means the speaker is currently
@@ -548,12 +536,17 @@ function renderPredictedSubtitle(message, fromSnapshot = false) {
   // ("양방향 자막이 동시에 떠 있음"), and with a per-language zone layout the two
   // sit in different zones so neither replaces the other.
   clearStaleReverseLane(message);
-  if (message.liveCallSpeaker) showLiveCallSpeakerBadge(message, lane);
+  updateLiveCallSpeaker(message, lane);
   lane.predicted = stripSubtitlePrefix(message.translatedText);
   lane.predictedState = "partial";
   lane.partial = true;
   reflowZone(lane.position);
   armLinger(lane, "live");
+}
+
+function setLaneRenderMode(lane, message) {
+  lane.renderMode = message.source === "live-call" ? "live-call" : "captions";
+  lane.shell.classList.toggle("is-live-call", lane.renderMode === "live-call");
 }
 
 function armLinger(lane, mode = "final") {
@@ -630,9 +623,11 @@ function renderLane(lane) {
   // text perfectly still while new words append.
   const tokens = [];
   for (const text of lane.lines) {
+    if (lane.renderMode === "live-call" && tokens.length > 0) tokens.push({ kind: "break", state: "committed" });
     for (const word of tokenizeWords(text)) tokens.push({ word, state: "committed" });
   }
   for (const text of predictedParts) {
+    if (lane.renderMode === "live-call" && tokens.length > 0) tokens.push({ kind: "break", state: predictedState });
     for (const word of tokenizeWords(text)) tokens.push({ word, state: predictedState });
   }
   const limit = visibleLineLimitFor(lane);
@@ -646,6 +641,8 @@ function renderLane(lane) {
   // Reveal the box BEFORE measuring roll-up — a hidden box has zero layout
   // metrics, so updateRollUp must run while it's visible to compute the overflow.
   lane.box.hidden = tokens.length === 0;
+  lane.shell.hidden = tokens.length === 0;
+  if (tokens.length === 0) lane.speakerLabel.hidden = true;
   lane.box.classList.toggle("partial", tokens.some((entry) => entry.state === "partial"));
   // Reset the roll-up to the top ONLY when this is a fresh subtitle generation:
   // the lane went empty, or the leading word changed (a new utterance replaced the
@@ -671,8 +668,9 @@ function reconcileWords(lane, tokens) {
   if (!flow) return;
   const existing = flow.childNodes;
   let i = 0;
+  const tokenKey = (token) => token.kind === "break" ? "__sentence_break__" : token.word;
   while (i < tokens.length && i < existing.length
-    && existing[i]._word === tokens[i].word) {
+    && existing[i]._word === tokenKey(tokens[i])) {
     if (existing[i]._state !== tokens[i].state) {
       existing[i].className = `subtitle-word ${tokens[i].state}`;
       existing[i]._state = tokens[i].state;
@@ -692,12 +690,19 @@ function reconcileWords(lane, tokens) {
   // common prefix in place.
   while (flow.childNodes.length > i) flow.removeChild(flow.lastChild);
   for (; i < tokens.length; i += 1) {
-    const span = document.createElement("span");
-    span.className = `subtitle-word ${tokens[i].state}`;
-    span.textContent = `${tokens[i].word} `;
-    span._word = tokens[i].word;
-    span._state = tokens[i].state;
-    flow.appendChild(span);
+    if (tokens[i].kind === "break") {
+      const lineBreak = document.createElement("br");
+      lineBreak._word = tokenKey(tokens[i]);
+      lineBreak._state = tokens[i].state;
+      flow.appendChild(lineBreak);
+    } else {
+      const span = document.createElement("span");
+      span.className = `subtitle-word ${tokens[i].state}`;
+      span.textContent = `${tokens[i].word} `;
+      span._word = tokens[i].word;
+      span._state = tokens[i].state;
+      flow.appendChild(span);
+    }
   }
 }
 

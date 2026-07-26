@@ -34,6 +34,9 @@ const DEFAULT_FLOOR_IDLE_RELEASE_MILLISECONDS = 8_000;
  *  Sized well above a normal replay round-trip so healthy sessions never hit
  *  it, and far below anything that would matter for memory over a long call. */
 const MAX_REPLAY_BUFFER_EVENTS = 500;
+const DEFAULT_DURABLE_RECOVERY_RETRY_DELAYS_MILLISECONDS = [1_000, 2_000, 4_000, 8_000, 16_000, 20_000];
+const DEFAULT_DURABLE_RECOVERY_ATTEMPT_TIMEOUT_MILLISECONDS = 10_000;
+const DEFAULT_RECOVERY_AUDIO_SPOOL_MILLISECONDS = 30_000;
 
 export function createGatewayServer({
   pipelineFactory,
@@ -64,15 +67,33 @@ export function createGatewayServer({
   floorTakeCooldownMilliseconds = DEFAULT_FLOOR_TAKE_COOLDOWN_MILLISECONDS,
   floorResumeCooldownMilliseconds = null,
   floorIdleReleaseMilliseconds = DEFAULT_FLOOR_IDLE_RELEASE_MILLISECONDS,
-  hostReconnectGraceMilliseconds = 45_000,
+  hostReconnectGraceMilliseconds = 90_000,
   fetchFloorParticipant = null,
   replayUtterances = null,
   replayTimeoutMilliseconds = 5_000,
+  durableRecoveryRetryDelaysMilliseconds = DEFAULT_DURABLE_RECOVERY_RETRY_DELAYS_MILLISECONDS,
+  durableRecoveryAttemptTimeoutMilliseconds = DEFAULT_DURABLE_RECOVERY_ATTEMPT_TIMEOUT_MILLISECONDS,
+  recoveryAudioSpoolMilliseconds = DEFAULT_RECOVERY_AUDIO_SPOOL_MILLISECONDS,
 }) {
   if (!Number.isFinite(heartbeatIntervalMilliseconds) || heartbeatIntervalMilliseconds <= 0) throw new Error("INVALID_HEARTBEAT_INTERVAL");
   if (!Number.isFinite(viewerAuthorizeTimeoutMilliseconds) || viewerAuthorizeTimeoutMilliseconds <= 0) throw new Error("INVALID_VIEWER_AUTHORIZE_TIMEOUT");
   if (!Number.isFinite(hostStartTimeoutMilliseconds) || hostStartTimeoutMilliseconds <= 0) throw new Error("INVALID_HOST_START_TIMEOUT");
   if (!Number.isFinite(replayTimeoutMilliseconds) || replayTimeoutMilliseconds <= 0) throw new Error("INVALID_REPLAY_TIMEOUT");
+  if (!Array.isArray(durableRecoveryRetryDelaysMilliseconds)
+    || durableRecoveryRetryDelaysMilliseconds.length === 0
+    || durableRecoveryRetryDelaysMilliseconds.some((delay) => !Number.isFinite(delay) || delay < 0 || delay > 20_000)) {
+    throw new Error("INVALID_DURABLE_RECOVERY_RETRY_DELAYS");
+  }
+  if (!Number.isFinite(durableRecoveryAttemptTimeoutMilliseconds)
+    || durableRecoveryAttemptTimeoutMilliseconds <= 0
+    || durableRecoveryAttemptTimeoutMilliseconds > 60_000) {
+    throw new Error("INVALID_DURABLE_RECOVERY_ATTEMPT_TIMEOUT");
+  }
+  if (!Number.isFinite(recoveryAudioSpoolMilliseconds)
+    || recoveryAudioSpoolMilliseconds < AUDIO_CONFIG.chunkMilliseconds
+    || recoveryAudioSpoolMilliseconds > DEFAULT_RECOVERY_AUDIO_SPOOL_MILLISECONDS) {
+    throw new Error("INVALID_RECOVERY_AUDIO_SPOOL_WINDOW");
+  }
   if (!Number.isSafeInteger(maxQueuedHostOperations) || maxQueuedHostOperations < 0) throw new Error("INVALID_HOST_QUEUE_LIMIT");
   if (!Number.isFinite(audioBurstMilliseconds) || audioBurstMilliseconds < AUDIO_CONFIG.chunkMilliseconds) throw new Error("INVALID_AUDIO_BURST");
   if (!Number.isFinite(maxSessionAudioMilliseconds) || maxSessionAudioMilliseconds <= 0) throw new Error("INVALID_SESSION_AUDIO_DURATION");
@@ -110,6 +131,7 @@ export function createGatewayServer({
   const shutdownAbortController = new AbortController();
   let isShuttingDown = false;
   const audioBurstBytes = INPUT_BYTES_PER_SECOND * audioBurstMilliseconds / 1_000;
+  const recoveryAudioSpoolMaxBytes = INPUT_BYTES_PER_SECOND * recoveryAudioSpoolMilliseconds / 1_000;
   const consumeAudioBudget = (sessionId, frameBytes) => {
     const timestamp = now();
     let usage = sessionAudioUsage.get(sessionId);
@@ -326,6 +348,153 @@ export function createGatewayServer({
     const languages = state?.settings.languages ?? [];
     await Promise.all(languages.map((language) => deliverEvent(sessionId, language, payload)));
   };
+  const spoolRecoveryAudio = (state, frame, capturedAt, capturedFloorSpeaker, frameOrder) => {
+    const cutoff = capturedAt - recoveryAudioSpoolMilliseconds;
+    while (state.recoveryAudioSpool.length > 0
+      && (state.recoveryAudioSpool[0].capturedAt < cutoff
+        || state.recoveryAudioSpoolBytes + frame.byteLength > recoveryAudioSpoolMaxBytes)) {
+      const dropped = state.recoveryAudioSpool.shift();
+      state.recoveryAudioSpoolBytes -= dropped.frame.byteLength;
+      metrics.increment("durable_recovery_audio_frames_dropped_total");
+    }
+    if (frame.byteLength > recoveryAudioSpoolMaxBytes) {
+      metrics.increment("durable_recovery_audio_frames_dropped_total");
+      return false;
+    }
+    state.recoveryAudioSpool.push({
+      frame: Uint8Array.from(frame),
+      capturedAt,
+      capturedFloorSpeaker,
+      frameOrder,
+    });
+    state.recoveryAudioSpool.sort((left, right) => left.frameOrder - right.frameOrder);
+    state.recoveryAudioSpoolBytes += frame.byteLength;
+    metrics.increment("durable_recovery_audio_frames_spooled_total");
+    return true;
+  };
+  const drainRecoveryAudio = async (state, candidate) => {
+    const cutoff = now() - recoveryAudioSpoolMilliseconds;
+    while (state.recoveryAudioSpool.length > 0
+      && state.recoveryAudioSpool[0].capturedAt < cutoff) {
+      const dropped = state.recoveryAudioSpool.shift();
+      state.recoveryAudioSpoolBytes -= dropped.frame.byteLength;
+      metrics.increment("durable_recovery_audio_frames_dropped_total");
+    }
+    while (state.recoveryAudioSpool.length > 0) {
+      const queued = state.recoveryAudioSpool.shift();
+      state.recoveryAudioSpoolBytes -= queued.frame.byteLength;
+      // The fresh replacement owns a new provider stream. Re-stamp delivery
+      // time so its normal 750ms stale-frame guard does not discard audio that
+      // was intentionally retained by the bounded recovery spool.
+      await candidate.acceptAudio(queued.frame, now(), queued.capturedFloorSpeaker);
+    }
+  };
+  const requestPipelineRecovery = (sessionId, failedPipeline, error) => {
+    const state = hostSessions.get(sessionId);
+    if (!state || state.pipeline !== failedPipeline) return Promise.resolve();
+    if (state.recoveryFlight) return state.recoveryFlight;
+    // Quarantine immediately. The failed pipeline may have consumed a seq whose
+    // commit outcome is ambiguous; no later audio may enter it while the
+    // durable reconciliation/replacement loop is running.
+    const shouldRestorePaused = failedPipeline.isPaused === true;
+    try { failedPipeline.pause?.(); } catch { /* the audio gates below remain authoritative */ }
+    const recoveryAbortController = new AbortController();
+    state.recoveryAbortController = recoveryAbortController;
+    const recoveryFlight = (async () => {
+      let failureCount = 0;
+      while (!recoveryAbortController.signal.aborted && !isShuttingDown) {
+        const didRecover = await withHostSessionLock(sessionId, async () => {
+          const current = hostSessions.get(sessionId);
+          if (!current || current !== state || current.pipeline !== failedPipeline) return true;
+          let candidate = null;
+          const attemptAbortController = new AbortController();
+          current.recoveryAttemptAbortController = attemptAbortController;
+          const abortAttempt = () => attemptAbortController.abort(
+            recoveryAbortController.signal.reason ?? new Error("DURABLE_RECOVERY_CANCELLED"),
+          );
+          recoveryAbortController.signal.addEventListener("abort", abortAttempt, { once: true });
+          const attemptTimer = setTimeoutFn(
+            () => attemptAbortController.abort(new Error("DURABLE_RECOVERY_ATTEMPT_TIMEOUT")),
+            durableRecoveryAttemptTimeoutMilliseconds,
+          );
+          attemptTimer?.unref?.();
+          try {
+            const factoryPromise = Promise.resolve().then(() => pipelineFactory(
+              current.settings,
+              failedPipeline,
+              (event) => sendJson(current.hostOutput.webSocket, event),
+              {
+                signal: attemptAbortController.signal,
+                recoveryReason: "durable-caption",
+                onFatalError: (fatalError) => requestPipelineRecovery(sessionId, candidate, fatalError),
+              },
+            ));
+            void factoryPromise.then((lateCandidate) => {
+              if (attemptAbortController.signal.aborted) {
+                return closePipelineOnce(lateCandidate).catch(() => undefined);
+              }
+              return undefined;
+            }, () => undefined);
+            candidate = await waitForAbort(
+              factoryPromise,
+              attemptAbortController.signal,
+            );
+            await waitForAbort(
+              candidate.start({ signal: attemptAbortController.signal }),
+              attemptAbortController.signal,
+            );
+            const holder = floorHolders.get(sessionId);
+            if (holder) {
+              candidate.setFloorSpeaker?.({
+                participantId: holder.participantId,
+                displayName: holder.displayName,
+                department: holder.department,
+                jobTitle: holder.jobTitle,
+              });
+            }
+            if (shouldRestorePaused) candidate.pause?.();
+            const activeHolder = floorHolders.get(sessionId);
+            await Promise.all([
+              current.audioTail.catch(() => undefined),
+              activeHolder?.audioTail?.catch(() => undefined),
+            ]);
+            await drainRecoveryAudio(current, candidate);
+            current.pipeline = candidate;
+            metrics.increment("durable_caption_recoveries_total");
+            await closePipelineOnce(failedPipeline).catch(() => {
+              metrics.increment("pipeline_close_failures_total");
+            });
+            return true;
+          } catch {
+            metrics.increment("durable_caption_recovery_failures_total");
+            await closePipelineOnce(candidate).catch(() => undefined);
+            return false;
+          } finally {
+            clearTimeoutFn(attemptTimer);
+            recoveryAbortController.signal.removeEventListener("abort", abortAttempt);
+            if (current.recoveryAttemptAbortController === attemptAbortController) {
+              current.recoveryAttemptAbortController = null;
+            }
+          }
+        }, { bypassQueueLimit: true });
+        if (didRecover || recoveryAbortController.signal.aborted || isShuttingDown) return;
+        const delay = durableRecoveryRetryDelaysMilliseconds[Math.min(
+          failureCount,
+          durableRecoveryRetryDelaysMilliseconds.length - 1,
+        )];
+        failureCount += 1;
+        if (!await waitForDelay(delay, recoveryAbortController.signal, setTimeoutFn, clearTimeoutFn)) return;
+      }
+    })();
+    state.recoveryFlight = recoveryFlight.finally(() => {
+      const current = hostSessions.get(sessionId);
+      if (current === state && current.recoveryFlight === state.recoveryFlight) {
+        current.recoveryFlight = null;
+        current.recoveryAbortController = null;
+      }
+    });
+    return state.recoveryFlight;
+  };
   const releaseFloor = (sessionId, { grantId = null, reason = "ended", notifyHolder = true } = {}) => withFloorSessionLock(sessionId, async () => {
     const holder = floorHolders.get(sessionId);
     if (!holder) return;
@@ -519,18 +688,42 @@ export function createGatewayServer({
             }
             if (data.byteLength !== INPUT_FRAME_BYTES) throw new Error("INVALID_AUDIO_FRAME");
             consumeAudioBudget(claims.sessionId, data.byteLength);
+            const capturedAt = now();
+            const frameOrder = ++state.nextAudioFrameOrder;
+            if (state.recoveryFlight) {
+              spoolRecoveryAudio(
+                state,
+                new Uint8Array(data.buffer, data.byteOffset, data.byteLength),
+                capturedAt,
+                null,
+                frameOrder,
+              );
+              metrics.increment("audio_frames_total");
+              return;
+            }
             if (state.pendingFrames * AUDIO_CONFIG.chunkMilliseconds >= AUDIO_CONFIG.staleFrameMilliseconds) {
               metrics.increment("dropped_audio_frames_total");
               return;
             }
             state.pendingFrames += 1;
-            const capturedAt = Date.now();
             state.audioTail = state.audioTail
-              .then(() => state.pipeline.acceptAudio(
-                new Uint8Array(data.buffer, data.byteOffset, data.byteLength),
-                capturedAt,
-                null,
-              ))
+              .then(async () => {
+                if (state.recoveryFlight) {
+                  spoolRecoveryAudio(
+                    state,
+                    new Uint8Array(data.buffer, data.byteOffset, data.byteLength),
+                    capturedAt,
+                    null,
+                    frameOrder,
+                  );
+                  return;
+                }
+                return state.pipeline.acceptAudio(
+                  new Uint8Array(data.buffer, data.byteOffset, data.byteLength),
+                  capturedAt,
+                  null,
+                );
+              })
               .catch((error) => closePipelineSocket(webSocket, error))
               .finally(() => { state.pendingFrames -= 1; });
             metrics.increment("audio_frames_total");
@@ -574,6 +767,13 @@ export function createGatewayServer({
             ...normalizedSettings,
             sessionId: claims.sessionId,
           };
+          // A hung reconciliation/factory attempt must not sit in front of a
+          // host reattach, explicit restart, or settings update on the session
+          // lock. Cancelling only the current attempt keeps the recovery
+          // coordinator alive when the same detached session reattaches.
+          hostSessions.get(claims.sessionId)?.recoveryAttemptAbortController?.abort(
+            new Error("HOST_OPERATION_PREEMPT"),
+          );
           try {
             const prepared = await withHostSessionLock(claims.sessionId, async () => {
               if (shutdownAbortController.signal.aborted) throw shutdownAbortController.signal.reason;
@@ -640,7 +840,10 @@ export function createGatewayServer({
                   hostMessage,
                   previous?.pipeline ?? null,
                   (event) => sendJson(hostOutput.webSocket, event),
-                  { signal: operationAbortController.signal },
+                  {
+                    signal: operationAbortController.signal,
+                    onFatalError: (error) => requestPipelineRecovery(claims.sessionId, candidate, error),
+                  },
                 ));
                 void factoryPromise.then((lateCandidate) => {
                   if (operationAbortController.signal.aborted) {
@@ -682,6 +885,12 @@ export function createGatewayServer({
                   voiceProvider: hostMessage.voiceProvider,
                   maxViewers: hostMessage.maxViewers,
                   glossaryPack: hostMessage.glossaryPack,
+                  // isSameHostSettings compares these, so they must be preserved here:
+                  // omitting them made every reattach read undefined and rebuild the
+                  // pipeline (translationTone alone defaults to "natural", never "").
+                  glossaryText: hostMessage.glossaryText,
+                  translationTone: hostMessage.translationTone,
+                  domainText: hostMessage.domainText,
                   languages: [...hostMessage.languages],
                 },
                 leaseTimer: null,
@@ -689,10 +898,17 @@ export function createGatewayServer({
                 leaseInFlight: null,
                 detached: false,
                 graceTimer: null,
+                recoveryFlight: null,
+                recoveryAbortController: null,
+                recoveryAttemptAbortController: null,
+                recoveryAudioSpool: [],
+                recoveryAudioSpoolBytes: 0,
+                nextAudioFrameOrder: 0,
               };
               hostSessions.set(claims.sessionId, state);
               startHostLease(state, claims);
               if (previous) {
+                previous.recoveryAbortController?.abort(new Error("PIPELINE_REPLACED"));
                 stopHostLease(previous);
                 if (previous.graceTimer) {
                   clearTimeoutFn(previous.graceTimer);
@@ -765,25 +981,49 @@ export function createGatewayServer({
           if (!state) throw new Error("SESSION_NOT_STARTED");
           if (data.byteLength !== INPUT_FRAME_BYTES) throw new Error("INVALID_AUDIO_FRAME");
           consumeAudioBudget(claims.sessionId, data.byteLength);
-          if (holder.pendingFrames * AUDIO_CONFIG.chunkMilliseconds >= AUDIO_CONFIG.staleFrameMilliseconds) {
-            metrics.increment("dropped_audio_frames_total");
-            return;
-          }
-          holder.pendingFrames += 1;
           holder.lastFrameAt = now();
-          const capturedAt = Date.now();
+          const capturedAt = now();
+          const frameOrder = ++state.nextAudioFrameOrder;
           const capturedFloorSpeaker = {
             participantId: holder.participantId,
             displayName: holder.displayName,
             department: holder.department,
             jobTitle: holder.jobTitle,
           };
-          holder.audioTail = holder.audioTail
-            .then(() => state.pipeline.acceptAudio(
+          if (state.recoveryFlight) {
+            spoolRecoveryAudio(
+              state,
               new Uint8Array(data.buffer, data.byteOffset, data.byteLength),
               capturedAt,
               capturedFloorSpeaker,
-            ))
+              frameOrder,
+            );
+            metrics.increment("floor_audio_frames_total");
+            return;
+          }
+          if (holder.pendingFrames * AUDIO_CONFIG.chunkMilliseconds >= AUDIO_CONFIG.staleFrameMilliseconds) {
+            metrics.increment("dropped_audio_frames_total");
+            return;
+          }
+          holder.pendingFrames += 1;
+          holder.audioTail = holder.audioTail
+            .then(async () => {
+              if (state.recoveryFlight) {
+                spoolRecoveryAudio(
+                  state,
+                  new Uint8Array(data.buffer, data.byteOffset, data.byteLength),
+                  capturedAt,
+                  capturedFloorSpeaker,
+                  frameOrder,
+                );
+                return;
+              }
+              return state.pipeline.acceptAudio(
+                new Uint8Array(data.buffer, data.byteOffset, data.byteLength),
+                capturedAt,
+                capturedFloorSpeaker,
+              );
+            })
             .catch(() => releaseFloor(claims.sessionId, { reason: "error" }))
             .finally(() => { holder.pendingFrames -= 1; });
           metrics.increment("floor_audio_frames_total");
@@ -1024,6 +1264,7 @@ export function createGatewayServer({
             const current = hostSessions.get(claims.sessionId);
             if (current !== state || current.webSocket !== webSocket) return;
             stopHostLease(current);
+            current.recoveryAbortController?.abort(new Error("SESSION_ENDED"));
             if (current.graceTimer) {
               clearTimeoutFn(current.graceTimer);
               current.graceTimer = null;
@@ -1049,6 +1290,10 @@ export function createGatewayServer({
           state.graceTimer?.unref?.();
           metrics.increment("host_grace_detachments_total");
         } else if (ownsSession) {
+          // Abort before teardown queues behind the session lock. Otherwise a
+          // never-settling reconciliation owns that lock and session removal
+          // can never reach its in-lock cleanup.
+          state.recoveryAbortController?.abort(new Error("SESSION_ENDED"));
           await teardownHostSession();
         }
       }
@@ -1083,6 +1328,9 @@ export function createGatewayServer({
       if (isShuttingDown) return;
       isShuttingDown = true;
       shutdownAbortController.abort(new Error("GATEWAY_SHUTTING_DOWN"));
+      for (const state of hostSessions.values()) {
+        state.recoveryAbortController?.abort(new Error("GATEWAY_SHUTTING_DOWN"));
+      }
       clearInterval(tickTimer);
       clearInterval(heartbeatTimer);
       await Promise.all([...hostOperationTails.values()]);
@@ -1174,12 +1422,34 @@ function waitForAbort(promise, signal) {
   });
 }
 
+function waitForDelay(milliseconds, signal, setTimeoutFn, clearTimeoutFn) {
+  if (signal.aborted) return Promise.resolve(false);
+  return new Promise((resolve) => {
+    let timer = null;
+    const settle = (didFinish) => {
+      if (timer !== null) clearTimeoutFn(timer);
+      signal.removeEventListener("abort", onAbort);
+      resolve(didFinish);
+    };
+    const onAbort = () => settle(false);
+    signal.addEventListener("abort", onAbort, { once: true });
+    timer = setTimeoutFn(() => settle(true), milliseconds);
+    timer?.unref?.();
+  });
+}
+
 function isSameHostSettings(previousSettings, message) {
   return previousSettings.sessionType === message.sessionType
     && previousSettings.outputMode === message.outputMode
     && previousSettings.voiceProvider === message.voiceProvider
     && previousSettings.maxViewers === message.maxViewers
     && previousSettings.glossaryPack === message.glossaryPack
+    // Without these three, editing the desktop glossary / tone / domain and
+    // restarting reused the running pipeline with the OLD values, so the edit
+    // silently did nothing until a brand-new session.
+    && (previousSettings.glossaryText ?? "") === (message.glossaryText ?? "")
+    && (previousSettings.translationTone ?? "") === (message.translationTone ?? "")
+    && (previousSettings.domainText ?? "") === (message.domainText ?? "")
     && previousSettings.languages.length === message.languages.length
     && previousSettings.languages.every((language, index) => language === message.languages[index]);
 }

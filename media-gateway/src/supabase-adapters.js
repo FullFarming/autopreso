@@ -2,6 +2,8 @@ import { encodeAudioFrame } from "./binary-audio.js";
 
 const DEFAULT_SNAPSHOT_GUARD_TIMEOUT_MILLISECONDS = 5_000;
 const MAX_SNAPSHOT_GUARD_TIMEOUT_MILLISECONDS = 60_000;
+const DEFAULT_RECONCILIATION_TIMEOUT_MILLISECONDS = 5_000;
+const MAX_RECONCILIATION_TIMEOUT_MILLISECONDS = 5_000;
 
 export class SupabaseLivePublisher {
   constructor({
@@ -13,11 +15,17 @@ export class SupabaseLivePublisher {
     audioFanout,
     fetchFn = fetch,
     snapshotGuardTimeoutMilliseconds = DEFAULT_SNAPSHOT_GUARD_TIMEOUT_MILLISECONDS,
+    reconciliationTimeoutMilliseconds = DEFAULT_RECONCILIATION_TIMEOUT_MILLISECONDS,
   }) {
     if (!Number.isSafeInteger(snapshotGuardTimeoutMilliseconds)
       || snapshotGuardTimeoutMilliseconds < 1
       || snapshotGuardTimeoutMilliseconds > MAX_SNAPSHOT_GUARD_TIMEOUT_MILLISECONDS) {
       throw new Error("INVALID_SNAPSHOT_GUARD_TIMEOUT");
+    }
+    if (!Number.isSafeInteger(reconciliationTimeoutMilliseconds)
+      || reconciliationTimeoutMilliseconds < 1
+      || reconciliationTimeoutMilliseconds > MAX_RECONCILIATION_TIMEOUT_MILLISECONDS) {
+      throw new Error("INVALID_RECONCILIATION_TIMEOUT");
     }
     this.baseUrl = baseUrl;
     this.supabaseCredential = resolveSupabaseCredential({ supabaseApiKey, supabaseKeyType, serviceRoleKey });
@@ -25,6 +33,7 @@ export class SupabaseLivePublisher {
     this.audioFanout = audioFanout;
     this.fetchFn = fetchFn;
     this.snapshotGuardTimeoutMilliseconds = snapshotGuardTimeoutMilliseconds;
+    this.reconciliationTimeoutMilliseconds = reconciliationTimeoutMilliseconds;
     this.failedDurableCaptionLanes = new Set();
   }
 
@@ -112,7 +121,6 @@ export class SupabaseLivePublisher {
   /** Max persisted caption seq per language, used to seed pipeline counters
    *  so seq survives host reconnects and process restarts (contract C1). */
   async fetchLastUtteranceSeqs(sessionId, languages) {
-    for (const language of languages) this.failedDurableCaptionLanes.delete(`${sessionId}\u0000${language}`);
     const entries = await Promise.all(languages.map(async (language) => {
       const query = new URLSearchParams({
         session_id: `eq.${sessionId}`,
@@ -126,6 +134,56 @@ export class SupabaseLivePublisher {
       return [language, Number.isSafeInteger(seq) && seq > 0 ? seq : 0];
     }));
     return Object.fromEntries(entries);
+  }
+
+  /** Resolve an ambiguous final only after PostgreSQL has serialized this RPC
+   *  behind the original persistence transaction's live-session row lock.
+   *  The failed final is deliberately not retried: callers rebuild the lane
+   *  from this definitive durable sequence instead. */
+  async reconcileCaptionLane(sessionId, language, { signal } = {}) {
+    const durableLaneKey = `${sessionId}\u0000${language}`;
+    const abortController = new AbortController();
+    const abortFromCaller = () => {
+      abortController.abort(abortReason(signal, "DURABLE_CAPTION_RECONCILIATION_ABORTED"));
+    };
+    if (signal?.aborted) abortFromCaller();
+    else signal?.addEventListener("abort", abortFromCaller, { once: true });
+    const timer = setTimeout(() => {
+      abortController.abort(new Error("DURABLE_CAPTION_RECONCILIATION_TIMEOUT"));
+    }, this.reconciliationTimeoutMilliseconds);
+    let result;
+    try {
+      if (abortController.signal.aborted) throw abortReason(
+        abortController.signal,
+        "DURABLE_CAPTION_RECONCILIATION_ABORTED",
+      );
+      result = await waitForAbort(
+        this.#request("/rest/v1/rpc/reconcile_live_caption_lane", {
+          method: "POST",
+          signal: abortController.signal,
+          body: JSON.stringify({
+            p_session_id: sessionId,
+            p_language: language,
+          }),
+        }),
+        abortController.signal,
+      );
+    } catch (error) {
+      throw new Error("DURABLE_CAPTION_RECONCILIATION_FAILED", { cause: error });
+    } finally {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", abortFromCaller);
+    }
+    const maxSequence = result && typeof result === "object" && !Array.isArray(result)
+      ? result.max_seq
+      : undefined;
+    if (!Number.isSafeInteger(maxSequence) || maxSequence < 0) {
+      throw new Error("DURABLE_CAPTION_RECONCILIATION_FAILED");
+    }
+    // A malformed or failed response leaves the latch intact. Only the row-
+    // locked database result above proves that no late commit can still race.
+    this.failedDurableCaptionLanes.delete(durableLaneKey);
+    return maxSequence;
   }
 
   /** Persisted utterances with seq > afterSeq for viewer replay (contract C2). */

@@ -92,6 +92,195 @@ test("atomic final timeout fails closed and latches the lane without retry", asy
   assert.deepEqual(mirrored, []);
 });
 
+test("locked lane reconciliation distinguishes committed and rolled-back ambiguous finals", async () => {
+  for (const scenario of [
+    { label: "committed", reconciledSeq: 1, nextSeq: 2 },
+    { label: "rolled back", reconciledSeq: 0, nextSeq: 1 },
+  ]) {
+    const durableSequences = [];
+    const reconciliationBodies = [];
+    let shouldFailFirstFinal = true;
+    const publisher = new SupabaseLivePublisher({
+      baseUrl: "https://dev-ref.supabase.co", serviceRoleKey: "secret",
+      async eventFanout() {}, async audioFanout() {},
+      async fetchFn(url, init) {
+        if (String(url).includes("persist_live_final_caption_if_active")) {
+          const body = JSON.parse(String(init.body));
+          durableSequences.push(body.p_seq);
+          if (shouldFailFirstFinal) {
+            shouldFailFirstFinal = false;
+            return new Response("", { status: 503 });
+          }
+          return Response.json(true);
+        }
+        if (String(url).includes("reconcile_live_caption_lane")) {
+          reconciliationBodies.push(JSON.parse(String(init.body)));
+          return Response.json({ max_seq: scenario.reconciledSeq });
+        }
+        throw new Error("UNEXPECTED_REQUEST");
+      },
+    });
+
+    await assert.rejects(
+      publisher.publish("session-1", "ko", { type: "caption", seq: 1, isFinal: true, text: "ambiguous" }),
+      /DURABLE_CAPTION_PERSIST_FAILED/u,
+      scenario.label,
+    );
+    assert.equal(await publisher.reconcileCaptionLane("session-1", "ko"), scenario.reconciledSeq);
+    assert.deepEqual(reconciliationBodies, [{ p_session_id: "session-1", p_language: "ko" }]);
+
+    await publisher.publish(
+      "session-1",
+      "ko",
+      { type: "caption", seq: scenario.nextSeq, isFinal: true, text: "after recovery" },
+    );
+    assert.deepEqual(durableSequences, [1, scenario.nextSeq]);
+  }
+});
+
+test("failed or malformed lane reconciliation keeps the durable lane latched", async () => {
+  for (const reconciliationResponse of [
+    new Response("", { status: 503 }),
+    Response.json({ max_seq: -1 }),
+    Response.json({ max_seq: Number.MAX_SAFE_INTEGER + 1 }),
+    Response.json({ max_seq: "1" }),
+    Response.json([{ max_seq: 1 }]),
+    Response.json({}),
+  ]) {
+    let durableAttempts = 0;
+    const publisher = new SupabaseLivePublisher({
+      baseUrl: "https://dev-ref.supabase.co", serviceRoleKey: "secret",
+      async eventFanout() {}, async audioFanout() {},
+      async fetchFn(url) {
+        if (String(url).includes("persist_live_final_caption_if_active")) {
+          durableAttempts += 1;
+          return new Response("", { status: 503 });
+        }
+        if (String(url).includes("reconcile_live_caption_lane")) return reconciliationResponse;
+        throw new Error("UNEXPECTED_REQUEST");
+      },
+    });
+
+    await assert.rejects(
+      publisher.publish("session-1", "ko", { type: "caption", seq: 1, isFinal: true, text: "ambiguous" }),
+      /DURABLE_CAPTION_PERSIST_FAILED/u,
+    );
+    await assert.rejects(
+      publisher.reconcileCaptionLane("session-1", "ko"),
+      /DURABLE_CAPTION_RECONCILIATION_FAILED/u,
+    );
+    await assert.rejects(
+      publisher.publish("session-1", "ko", { type: "caption", seq: 2, isFinal: true, text: "still blocked" }),
+      /DURABLE_CAPTION_LANE_FAILED/u,
+    );
+    assert.equal(durableAttempts, 1, "reconciliation failure must not reopen the lane");
+  }
+});
+
+test("an ordinary max-sequence read cannot clear an ambiguous durable lane", async () => {
+  let durableAttempts = 0;
+  const publisher = new SupabaseLivePublisher({
+    baseUrl: "https://dev-ref.supabase.co", serviceRoleKey: "secret",
+    async eventFanout() {}, async audioFanout() {},
+    async fetchFn(url) {
+      if (String(url).includes("persist_live_final_caption_if_active")) {
+        durableAttempts += 1;
+        return new Response("", { status: 503 });
+      }
+      if (String(url).includes("/rest/v1/live_utterances?")) return Response.json([]);
+      throw new Error("UNEXPECTED_REQUEST");
+    },
+  });
+
+  await assert.rejects(
+    publisher.publish("session-1", "ko", { type: "caption", seq: 1, isFinal: true, text: "ambiguous" }),
+    /DURABLE_CAPTION_PERSIST_FAILED/u,
+  );
+  assert.deepEqual(await publisher.fetchLastUtteranceSeqs("session-1", ["ko"]), { ko: 0 });
+  await assert.rejects(
+    publisher.publish("session-1", "ko", { type: "caption", seq: 2, isFinal: true, text: "still blocked" }),
+    /DURABLE_CAPTION_LANE_FAILED/u,
+  );
+  assert.equal(durableAttempts, 1);
+});
+
+test("a hung locked reconciliation times out without reopening the durable lane", async () => {
+  let reconciliationSignal;
+  let durableAttempts = 0;
+  const publisher = new SupabaseLivePublisher({
+    baseUrl: "https://dev-ref.supabase.co", serviceRoleKey: "secret",
+    reconciliationTimeoutMilliseconds: 5,
+    async eventFanout() {}, async audioFanout() {},
+    async fetchFn(url, init) {
+      if (String(url).includes("persist_live_final_caption_if_active")) {
+        durableAttempts += 1;
+        return new Response("", { status: 503 });
+      }
+      if (String(url).includes("reconcile_live_caption_lane")) {
+        reconciliationSignal = init.signal;
+        return new Promise(() => {});
+      }
+      throw new Error("UNEXPECTED_REQUEST");
+    },
+  });
+
+  await assert.rejects(
+    publisher.publish("session-1", "ko", { type: "caption", seq: 1, isFinal: true, text: "ambiguous" }),
+    /DURABLE_CAPTION_PERSIST_FAILED/u,
+  );
+  await assert.rejects(
+    publisher.reconcileCaptionLane("session-1", "ko"),
+    /DURABLE_CAPTION_RECONCILIATION_FAILED/u,
+  );
+  assert.equal(reconciliationSignal?.aborted, true);
+  await assert.rejects(
+    publisher.publish("session-1", "ko", { type: "caption", seq: 2, isFinal: true, text: "still blocked" }),
+    /DURABLE_CAPTION_LANE_FAILED/u,
+  );
+  assert.equal(durableAttempts, 1);
+});
+
+test("caller abort stops locked reconciliation promptly and leaves the lane latched", async () => {
+  const caller = new AbortController();
+  let reconciliationSignal;
+  let durableAttempts = 0;
+  const publisher = new SupabaseLivePublisher({
+    baseUrl: "https://dev-ref.supabase.co", serviceRoleKey: "secret",
+    async eventFanout() {}, async audioFanout() {},
+    async fetchFn(url, init) {
+      if (String(url).includes("persist_live_final_caption_if_active")) {
+        durableAttempts += 1;
+        return new Response("", { status: 503 });
+      }
+      if (String(url).includes("reconcile_live_caption_lane")) {
+        reconciliationSignal = init.signal;
+        return new Promise(() => {});
+      }
+      throw new Error("UNEXPECTED_REQUEST");
+    },
+  });
+
+  await assert.rejects(
+    publisher.publish("session-1", "ko", { type: "caption", seq: 1, isFinal: true, text: "ambiguous" }),
+    /DURABLE_CAPTION_PERSIST_FAILED/u,
+  );
+  const reconciliation = publisher.reconcileCaptionLane("session-1", "ko", { signal: caller.signal });
+  caller.abort(new Error("CALLER_ABORTED"));
+  await assert.rejects(
+    Promise.race([
+      reconciliation,
+      new Promise((_, reject) => setTimeout(() => reject(new Error("ABORT_WAS_NOT_PROMPT")), 100)),
+    ]),
+    /DURABLE_CAPTION_RECONCILIATION_FAILED/u,
+  );
+  assert.equal(reconciliationSignal?.aborted, true);
+  await assert.rejects(
+    publisher.publish("session-1", "ko", { type: "caption", seq: 2, isFinal: true, text: "still blocked" }),
+    /DURABLE_CAPTION_LANE_FAILED/u,
+  );
+  assert.equal(durableAttempts, 1);
+});
+
 test("snapshot guard timeout configuration is bounded and fail-closed", () => {
   const makePublisher = (snapshotGuardTimeoutMilliseconds) => new SupabaseLivePublisher({
     baseUrl: "https://dev-ref.supabase.co", serviceRoleKey: "secret",
@@ -103,6 +292,19 @@ test("snapshot guard timeout configuration is bounded and fail-closed", () => {
   }
   assert.doesNotThrow(() => makePublisher(undefined));
   assert.doesNotThrow(() => makePublisher(60_000));
+});
+
+test("lane reconciliation timeout is capped at five seconds", () => {
+  const makePublisher = (reconciliationTimeoutMilliseconds) => new SupabaseLivePublisher({
+    baseUrl: "https://dev-ref.supabase.co", serviceRoleKey: "secret",
+    reconciliationTimeoutMilliseconds,
+    async eventFanout() {}, async audioFanout() {}, async fetchFn() { return Response.json(true); },
+  });
+  for (const invalid of [0, -1, 1.5, Number.NaN, 5_001]) {
+    assert.throws(() => makePublisher(invalid), /INVALID_RECONCILIATION_TIMEOUT/u);
+  }
+  assert.doesNotThrow(() => makePublisher(undefined));
+  assert.doesNotThrow(() => makePublisher(5_000));
 });
 
 test("new Supabase secret keys use apikey only and take precedence over legacy credentials", async () => {

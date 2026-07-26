@@ -397,6 +397,25 @@ test("viewer enables Speak only after gateway authentication and subscription co
   assert.match(connection, /candidate\.addEventListener\("close"[\s\S]*setIsSpeakGatewayReady\(false\)/u);
 });
 
+test("viewer releases an active speaking turn before proactive socket replacement", () => {
+  const source = readFileSync(new URL("./LiveViewer.tsx", import.meta.url), "utf8");
+  const connectStart = source.indexOf("const connectGateway = useCallback");
+  const connectEnd = source.indexOf("const showSpeakerOverlay", connectStart);
+  assert.ok(connectStart >= 0 && connectEnd > connectStart);
+  const connection = source.slice(connectStart, connectEnd);
+  const proactiveStart = connection.indexOf("audioProactiveTimerRef.current = window.setTimeout");
+  const proactiveEnd = connection.indexOf("}, 50 * 60 * 1_000);", proactiveStart);
+  assert.ok(proactiveStart >= 0 && proactiveEnd > proactiveStart);
+  const proactiveRefresh = connection.slice(proactiveStart, proactiveEnd);
+
+  assert.match(proactiveRefresh, /await endSpeaking\(true\)/u,
+    "the old socket must release the floor and mic before it is replaced");
+  assert.ok(proactiveRefresh.indexOf("await endSpeaking(true)") < proactiveRefresh.indexOf("installConnection()"),
+    "floor release must precede opening the replacement connection");
+  assert.match(connection, /\}, \[[^\]]*endSpeaking[^\]]*\]\);/u,
+    "the reconnect callback must retain the current endSpeaking closure");
+});
+
 test("viewer exposes the connecting Speak state without changing its visual component", () => {
   const source = readFileSync(new URL("./LiveViewer.tsx", import.meta.url), "utf8");
   const renderStart = source.indexOf('<div className="live-speak-bar">');

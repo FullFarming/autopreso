@@ -32,6 +32,9 @@ contextBridge.exposeInMainWorld("realtimeNoelDesktop", {
   getLiveHostLoginStatus: () => ipcRenderer.invoke("live-call:get-host-login-status"),
   getOverlayEnabled: () => ipcRenderer.invoke("subtitle-overlay:get-enabled"),
   setOverlayEnabled: (enabled) => ipcRenderer.invoke("subtitle-overlay:set-enabled", Boolean(enabled)),
+  // Momentary caption hide (e.g. while a video plays). Not persisted.
+  setOverlaysMuted: (muted) => ipcRenderer.invoke("subtitle-overlay:set-muted", Boolean(muted)),
+  getOverlaysMuted: () => ipcRenderer.invoke("subtitle-overlay:get-muted"),
   setControllerVisible: (visible) => ipcRenderer.invoke("subtitle-controller:set-visible", Boolean(visible)),
   setOverlayInteractive: (interactive) => ipcRenderer.invoke("subtitle-overlay:set-interactive", Boolean(interactive)),
   showMainWindow: () => ipcRenderer.invoke("app:show-main-window"),

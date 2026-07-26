@@ -516,6 +516,32 @@ test("host disconnect keeps the pipeline, seq, and floor for the grace window an
   assert.equal((await ended).type, "audio-stream-ended");
 });
 
+test("a reattach reuses the pipeline for the same glossary but rebuilds it for an edited one", async (context) => {
+  const { gateway, pipelines } = createLiveGateway({
+    gatewayOptions: { hostReconnectGraceMilliseconds: 45_000 },
+  });
+  await new Promise((resolve) => gateway.server.listen(0, "127.0.0.1", resolve));
+  context.after(async () => gateway.close());
+  const { port } = gateway.server.address();
+
+  // The stored settings must round-trip glossaryText / translationTone / domainText:
+  // when they were dropped, an unchanged reconnect compared undefined against the
+  // validated defaults and rebuilt the pipeline every single time.
+  const started = { ...START_MESSAGE, glossaryText: "CMG = 씨엠지", domainText: "CRE" };
+  const host = await connectHost(port, started);
+  host.close();
+  await once(host, "close");
+  const sameGlossary = await connectHost(port, started);
+  context.after(() => sameGlossary.terminate());
+  assert.equal(pipelines.length, 1, "an unchanged glossary must reattach to the running pipeline");
+
+  sameGlossary.close();
+  await once(sameGlossary, "close");
+  const editedGlossary = await connectHost(port, { ...started, glossaryText: "CMG = 씨엠지\nGFA = 연면적" });
+  context.after(() => editedGlossary.terminate());
+  assert.equal(pipelines.length, 2, "an edited glossary must reach the model, not reuse the old pipeline");
+});
+
 test("grace expiry performs the full teardown including floor release", async (context) => {
   const releaseCalls = [];
   const { gateway, pipelines, timers } = createLiveGateway({

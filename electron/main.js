@@ -38,13 +38,16 @@ const LIVE_COVER_CONTENT_TYPES = new Set(["image/jpeg", "image/png", "image/webp
 const RENDERER_RELOAD_BASE_MS = 1_000;
 const RENDERER_RELOAD_MAX_MS = 15_000;
 const MAX_RENDERER_RELOADS = 5;
-// Live Call gateway reconnect: bounded exponential backoff, mirroring
-// src/subtitle-realtime.js. The old hardcoded 3s retry had no cap, no backoff,
-// and no cancellable timer id, so a dead gateway meant ~60 authenticated HTTPS
-// requests per minute forever while the host watched a running timer over dead air.
+// Live Call gateway reconnect mirrors captions-only for the first five attempts,
+// then slows to 36–42s for as long as the same call remains active. The 36s
+// minimum accounts for the initial burst and keeps EVERY rolling 15-minute
+// window within the host-session token limit of 30 requests.
 const LIVE_BRIDGE_RECONNECT_BASE_MS = 1_000;
-const LIVE_BRIDGE_RECONNECT_MAX_MS = 20_000;
-const MAX_LIVE_BRIDGE_RECONNECTS = 8;
+const LIVE_BRIDGE_SLOW_RETRY_MIN_MS = 36_000;
+const LIVE_BRIDGE_SLOW_RETRY_JITTER_MS = 6_000;
+const LIVE_BRIDGE_SLOW_RETRY_AFTER = 8;
+const LIVE_BRIDGE_CREDENTIAL_REFRESH_MAX_MS = 50 * 60 * 1_000;
+const LIVE_BRIDGE_CREDENTIAL_REFRESH_SKEW_MS = 60_000;
 
 // NOTE: On Electron 42 (Chromium ~140) the macOS system-audio loopback path
 // (the `audio: "loopback"` reply in setDisplayMediaRequestHandler below) is
@@ -68,6 +71,12 @@ let overlayUrl = "";
 let server = null;
 let overlayWatchdog = null;
 let overlayEnabled = true;
+// Momentary caption hide, e.g. while a video plays. Separate from
+// overlayEnabled on purpose: that one is a persisted SETTING that destroys the
+// overlay windows, so reusing it would survive a restart with no indication and
+// would reload the renderer. This is visibility-only and in-memory, so quitting
+// always clears it.
+let overlaysMuted = false;
 let isQuitting = false;
 const singleInstanceLock = app.requestSingleInstanceLock();
 
@@ -927,7 +936,7 @@ function createOverlayWindowForDisplay(display) {
   });
   void Promise.resolve(loadOverlay()).catch(() => { /* did-fail-load drives the retry */ });
   window.once("ready-to-show", () => {
-    if (!overlayEnabled || isQuitting) return;
+    if (!overlayEnabled || overlaysMuted || isQuitting) return;
     window.showInactive();
   });
   window.on("closed", () => {
@@ -968,7 +977,7 @@ function eachOverlayWindow(callback) {
 
 function maintainOverlayWindow() {
   if (isQuitting) return;
-  if (!overlayEnabled) {
+  if (!overlayEnabled || overlaysMuted) {
     eachOverlayWindow((window) => window.hide());
     return;
   }
@@ -988,7 +997,7 @@ function maintainOverlayWindow() {
 // NOT re-called here: re-calling it every tick causes Space-rejoin flicker; it
 // is set once at window creation.
 function reassertOverlayTop() {
-  if (!overlayEnabled || isQuitting) return;
+  if (!overlayEnabled || overlaysMuted || isQuitting) return;
   eachOverlayWindow((window) => {
     window.setAlwaysOnTop(true, OVERLAY_TOP_LEVEL, 1);
     window.moveTop();
@@ -1015,11 +1024,46 @@ let liveGatewayBridge = null; // { socket, ready, session }
 // bridge against a dead session.
 let liveBridgeReconnectTimer = null;
 let liveBridgeReconnectAttempts = 0;
+let liveBridgeCredentialRefreshTimer = null;
 // Last bridge problem, surfaced to the controller via live-call:get-state so the
 // host is never left watching a running timer over dead air.
 let liveBridgeAlert = null;
 let hasNotifiedLiveBridgeFailure = false;
 let hostSpeakInFlight = null;
+
+function getLiveBridgeCredentialRefreshDelay(expiresAt) {
+  const expiresAtMilliseconds = Date.parse(String(expiresAt ?? ""));
+  if (!Number.isFinite(expiresAtMilliseconds)) return null;
+  return Math.min(
+    LIVE_BRIDGE_CREDENTIAL_REFRESH_MAX_MS,
+    Math.max(0, expiresAtMilliseconds - Date.now() - LIVE_BRIDGE_CREDENTIAL_REFRESH_SKEW_MS),
+  );
+}
+
+function clearLiveBridgeCredentialRefresh() {
+  if (liveBridgeCredentialRefreshTimer) clearTimeout(liveBridgeCredentialRefreshTimer);
+  liveBridgeCredentialRefreshTimer = null;
+}
+
+function scheduleLiveGatewayCredentialRefresh(bridge, expiresAt) {
+  clearLiveBridgeCredentialRefresh();
+  const delay = getLiveBridgeCredentialRefreshDelay(expiresAt);
+  if (delay === null || isQuitting || liveGatewayBridge !== bridge
+    || liveCallSession !== bridge.session || bridge.session.status !== "live") return;
+  liveBridgeCredentialRefreshTimer = setTimeout(() => {
+    liveBridgeCredentialRefreshTimer = null;
+    if (isQuitting || liveGatewayBridge !== bridge
+      || liveCallSession !== bridge.session || bridge.session.status !== "live") return;
+    // The gateway cannot re-authenticate an open socket. Rotate one minute before
+    // expiry; the close handler reconnects with a fresh token and the SAME
+    // session object, allowing the gateway's grace reattach to preserve pipeline,
+    // floor, caption sequence, and durable transcript continuity.
+    try { bridge.socket.close(4001, "gateway credential refresh"); } catch {
+      scheduleLiveGatewayReconnect(bridge.session);
+    }
+  }, delay);
+  liveBridgeCredentialRefreshTimer?.unref?.();
+}
 
 function setLiveBridgeAlert(alert) {
   liveBridgeAlert = alert;
@@ -1038,13 +1082,13 @@ function liveBridgeStatus() {
 
 // The controller polls live-call:get-state, but a modal is what actually reaches
 // a host who is mid-presentation with the dashboard hidden.
-function notifyLiveBridgeFailure(title, message) {
+function notifyLiveBridgeFailure(title, message, type = "error") {
   if (hasNotifiedLiveBridgeFailure || isQuitting) return;
   hasNotifiedLiveBridgeFailure = true;
   console.error(`[live-bridge] ${title}: ${message}`);
   showControllerWindow();
   try {
-    void dialog.showMessageBox({ type: "error", title, message, buttons: ["OK"], noLink: true });
+    void dialog.showMessageBox({ type, title, message, buttons: ["OK"], noLink: true });
   } catch { /* dialogs are unavailable in headless test runs */ }
 }
 
@@ -1053,30 +1097,26 @@ function clearLiveBridgeReconnect() {
   liveBridgeReconnectTimer = null;
 }
 
-// Bounded exponential backoff with an attempt ceiling, mirroring
-// RECONNECT_BASE_MS / RECONNECT_MAX_MS / MAX_AUTO_RECONNECTS in
-// src/subtitle-realtime.js. Once the ceiling is hit the loop DISARMS instead of
-// hammering the gateway forever, and the failure is reported to the host.
+function getLiveBridgeReconnectDelay(attempt, random = Math.random) {
+  if (attempt < 5) return LIVE_BRIDGE_RECONNECT_BASE_MS * 2 ** Math.max(0, attempt);
+  const jitterRatio = Math.min(1, Math.max(0, Number(random()) || 0));
+  return LIVE_BRIDGE_SLOW_RETRY_MIN_MS + LIVE_BRIDGE_SLOW_RETRY_JITTER_MS * jitterRatio;
+}
+
+// Fast exponential backoff followed by a rate-safe slow-retry mode. The call ends only
+// at the explicit stop/end/quit boundaries below; a transient outage must never
+// silently turn a still-running two-hour session into dead air forever.
 function scheduleLiveGatewayReconnect(armedSession) {
   if (isQuitting || liveBridgeReconnectTimer) return;
   if (liveCallSession !== armedSession || armedSession.status !== "live") return;
-  if (liveBridgeReconnectAttempts >= MAX_LIVE_BRIDGE_RECONNECTS) {
-    setLiveBridgeAlert({
-      state: "failed",
-      code: "GATEWAY_RECONNECT_EXHAUSTED",
-      attempts: liveBridgeReconnectAttempts,
-      message: "게이트웨이에 다시 연결할 수 없습니다. 참가자에게 오디오와 자막이 전달되지 않습니다.",
-    });
+  if (liveBridgeReconnectAttempts === LIVE_BRIDGE_SLOW_RETRY_AFTER) {
     notifyLiveBridgeFailure(
-      "Live Call audio disconnected",
-      `NOVA could not reconnect to the Live Call gateway after ${liveBridgeReconnectAttempts} attempts. Participants are not receiving your audio or captions. End the Live Call and start it again.`,
+      "Live Call is reconnecting",
+      "NOVA is still automatically reconnecting audio and captions. The meeting and its saved record remain active.",
+      "warning",
     );
-    return;
   }
-  const delay = Math.min(
-    LIVE_BRIDGE_RECONNECT_BASE_MS * 2 ** liveBridgeReconnectAttempts,
-    LIVE_BRIDGE_RECONNECT_MAX_MS,
-  );
+  const delay = getLiveBridgeReconnectDelay(liveBridgeReconnectAttempts);
   liveBridgeReconnectAttempts += 1;
   setLiveBridgeAlert({
     state: "reconnecting",
@@ -1103,10 +1143,19 @@ async function fetchGatewayConnection(armedSession) {
     { body: {} },
   );
   if (!tokenResult.ok) return tokenResult;
+  const credentialRefreshDelay = getLiveBridgeCredentialRefreshDelay(tokenResult.data?.expiresAt);
+  if (credentialRefreshDelay === null || credentialRefreshDelay <= 0) {
+    return { ok: false, code: "GATEWAY_TOKEN_EXPIRY_INVALID" };
+  }
   const configResult = await liveCallApi(armedSession.baseUrl, "/api/live-config", { method: "GET" });
   const gatewayUrl = typeof configResult.data?.gatewayUrl === "string" ? configResult.data.gatewayUrl : "";
   if (!configResult.ok || !gatewayUrl) return { ok: false, code: "GATEWAY_URL_UNAVAILABLE" };
-  return { ok: true, gatewayUrl, token: tokenResult.data?.token ?? "" };
+  return {
+    ok: true,
+    gatewayUrl,
+    token: tokenResult.data?.token ?? "",
+    expiresAt: tokenResult.data?.expiresAt,
+  };
 }
 
 function trustedGatewayHeaders(token) {
@@ -1117,6 +1166,7 @@ function stopLiveGatewayBridge(reason) {
   // Cancel any armed retry FIRST: a pending reconnect used to survive
   // stop/end/quit and reopen the bridge against a session that was already gone.
   clearLiveBridgeReconnect();
+  clearLiveBridgeCredentialRefresh();
   liveBridgeReconnectAttempts = 0;
   const bridge = liveGatewayBridge;
   if (!bridge) return;
@@ -1190,20 +1240,23 @@ async function ensureLiveGatewayBridge() {
       // hours into the call gets the full fast-retry budget again.
       liveBridgeReconnectAttempts = 0;
       clearLiveBridgeAlert();
+      scheduleLiveGatewayCredentialRefresh(bridge, connection.expiresAt);
       console.info("[live-bridge] gateway host pipeline is running");
     } else if (message.type === "caption") {
       // 2026-07-26 fix: the gateway retains both language lanes for web history,
       // while the laptop and extended overlays receive exactly the selected
       // language. Same-language source captions are valid display output.
       if (!shouldDisplayLiveCaption(message, armedSession.displayLanguage)) return;
-      for (const rendererWindow of BrowserWindow.getAllWindows()) {
+      for (const rendererWindow of [dashboardWindow, ...overlayWindows.values()]) {
+        if (!rendererWindow) continue;
         if (!rendererWindow.isDestroyed()) rendererWindow.webContents.send("live-call:caption", message);
       }
     } else if (message.type === "floor") {
       // 2026-07-26 fix: a floor change is an utterance boundary. Forward it to
       // every local caption surface before participant/host audio can produce
       // the next hypothesis, so the previous speaker's final cannot linger.
-      for (const rendererWindow of BrowserWindow.getAllWindows()) {
+      for (const rendererWindow of [dashboardWindow, ...overlayWindows.values()]) {
+        if (!rendererWindow) continue;
         if (!rendererWindow.isDestroyed()) rendererWindow.webContents.send("live-call:floor", message);
       }
     } else if (message.type === "error") {
@@ -1220,9 +1273,9 @@ async function ensureLiveGatewayBridge() {
   });
   socket.on("close", () => {
     if (liveGatewayBridge !== bridge) return;
+    clearLiveBridgeCredentialRefresh();
     liveGatewayBridge = null;
-    // Token expiry or a transient drop mid-call: reconnect while still live,
-    // with backoff and a ceiling (see scheduleLiveGatewayReconnect).
+    // Token rotation or a transient drop mid-call: reconnect while still live.
     if (liveCallSession === armedSession && armedSession.status === "live" && !isQuitting) {
       scheduleLiveGatewayReconnect(armedSession);
     }
@@ -1869,9 +1922,27 @@ function registerOverlayIpc(settingsStore, { localAppOrigin, liveWorkspaceUrl, l
     }
   });
   ipcMain.handle("subtitle-overlay:get-enabled", () => overlayEnabled);
+  ipcMain.handle("subtitle-overlay:set-muted", (event, muted) => {
+    if (!isAllowedOrigin(event.sender.getURL(), new Set([localAppOrigin]))) return overlaysMuted;
+    overlaysMuted = Boolean(muted);
+    if (overlaysMuted) {
+      eachOverlayWindow((window) => window.hide());
+    } else if (overlayEnabled) {
+      // Straight back on screen rather than waiting up to a second for the tick.
+      maintainOverlayWindow();
+    }
+    return overlaysMuted;
+  });
+  ipcMain.handle("subtitle-overlay:get-muted", (event) => {
+    if (!isAllowedOrigin(event.sender.getURL(), new Set([localAppOrigin]))) return false;
+    return overlaysMuted;
+  });
   ipcMain.handle("subtitle-overlay:set-enabled", async (_event, enabled) => {
     overlayEnabled = Boolean(enabled);
     await settingsStore.save({ subtitle: { overlayEnabled } });
+    // A stale mute would keep the overlay invisible right after the user turned
+    // it on, which reads as the setting being broken.
+    if (overlayEnabled) overlaysMuted = false;
     if (overlayEnabled) {
       createOverlayWindow(server.url);
       maintainOverlayWindow();

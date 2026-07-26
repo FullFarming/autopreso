@@ -340,9 +340,9 @@ test("dashboard, controller and overlay windows all get renderer recovery", () =
 
 /**
  * @param {{ displays: { id: number, bounds: { x: number, y: number, width: number, height: number } }[],
- *           overlayEnabled?: boolean, isQuitting?: boolean }} options
+ *           overlayEnabled?: boolean, overlaysMuted?: boolean, isQuitting?: boolean }} options
  */
-function loadOverlayWindows({ displays, overlayEnabled = true, isQuitting = false }) {
+function loadOverlayWindows({ displays, overlayEnabled = true, overlaysMuted = false, isQuitting = false }) {
   const created = [];
   let nextId = 1;
   function FakeOverlayWindow(options) {
@@ -397,6 +397,9 @@ function loadOverlayWindows({ displays, overlayEnabled = true, isQuitting = fals
     overlayWindows: new Map(),
     interactiveOverlayIds: new Set(),
     overlayEnabled,
+    // Momentary caption hide. The watchdog gates on it, so the harness has to
+    // supply it or maintainOverlayWindow throws on a bare reference.
+    overlaysMuted,
     isQuitting,
     overlayUrl: "http://127.0.0.1:3210",
     OVERLAY_TOP_LEVEL: "screen-saver",
@@ -482,4 +485,62 @@ test("a live hover claim is still honoured by the watchdog", () => {
   overlay.context.interactiveOverlayIds.add(window.id);
   overlay.maintainOverlayWindow();
   assert.equal(window.ignoreMouse.at(-1), false);
+});
+
+// Momentary caption hide, for playing a video mid-session. What matters is what
+// it does NOT do: it must not persist, must not destroy the overlay windows, and
+// must not be the overlayEnabled setting wearing a different name.
+test("hiding captions momentarily is visibility-only and never persisted", () => {
+  const source = fs.readFileSync(new URL("../electron/main.js", import.meta.url), "utf8");
+  const start = source.indexOf('ipcMain.handle("subtitle-overlay:set-muted"');
+  assert.notEqual(start, -1, "the mute IPC must exist");
+  const handler = source.slice(start, source.indexOf('ipcMain.handle("subtitle-overlay:get-muted"', start));
+
+  // Persisting it would survive a restart with nothing on screen explaining why.
+  assert.doesNotMatch(handler, /settingsStore\.save/u, "a momentary hide must not be written to settings");
+  // Destroying the windows reloads the renderer and throws away what is on screen;
+  // that is the overlayEnabled setting's job, not this one's.
+  assert.doesNotMatch(handler, /destroyOverlayWindow/u, "a momentary hide must not destroy the overlay windows");
+  assert.match(handler, /isAllowedOrigin/u, "the renderer origin is checked like every other overlay IPC");
+  assert.match(handler, /window\.hide\(\)/u);
+
+  // The 1s watchdog re-shows any hidden overlay, so without this gate the hide is
+  // undone within a second.
+  const watchdog = source.slice(
+    source.indexOf("function maintainOverlayWindow"),
+    source.indexOf("function reassertOverlayTop"),
+  );
+  assert.match(watchdog, /!overlayEnabled \|\| overlaysMuted/u, "the watchdog must respect the mute");
+
+  // Turning the overlay setting back on must clear a stale mute, or the setting
+  // looks broken.
+  const setEnabled = source.slice(
+    source.indexOf('ipcMain.handle("subtitle-overlay:set-enabled"'),
+    source.indexOf('ipcMain.handle("subtitle-overlay:set-interactive"'),
+  );
+  assert.match(setEnabled, /overlaysMuted = false/u);
+
+  // In-memory only: there is no read of a persisted mute anywhere.
+  assert.doesNotMatch(source, /subtitle:\s*\{\s*overlaysMuted/u);
+});
+
+test("the controller surfaces the caption hide with a visible state and no HTML sink", () => {
+  const html = fs.readFileSync(new URL("../public/subtitle-controller.html", import.meta.url), "utf8");
+  const js = fs.readFileSync(new URL("../public/subtitle-controller.js", import.meta.url), "utf8");
+  const preload = fs.readFileSync(new URL("../electron/preload.js", import.meta.url), "utf8");
+
+  assert.match(html, /id="controller-mute-captions"/u);
+  assert.match(preload, /setOverlaysMuted: \(muted\) => ipcRenderer\.invoke\("subtitle-overlay:set-muted"/u);
+  // Both icons ship in the markup and a class picks one: innerHTML is forbidden
+  // in this codebase and pinned by other tests.
+  assert.match(html, /mp-icon-when-visible/u);
+  assert.match(html, /mp-icon-when-muted/u);
+  assert.doesNotMatch(js, /\.innerHTML\s*=/u);
+  // A forgotten mute is indistinguishable from broken captions, so the button
+  // paints its state rather than only firing the IPC.
+  assert.match(js, /classList\.toggle\("is-muted"/u);
+  assert.match(js, /aria-pressed/u);
+  // Paint from what the main process reports: a rejected origin check returns the
+  // unchanged value, and an optimistic paint would then lie.
+  assert.match(js, /await window\.realtimeNoelDesktop\.setOverlaysMuted\(next\)/u);
 });

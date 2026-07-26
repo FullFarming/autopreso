@@ -189,8 +189,13 @@ function isEllipsisPlaceholder(value) {
   return /^\s*(?:\.{2,}|…+)\s*$/.test(String(value ?? ""));
 }
 
-export function createCaptionPolisher({ client, model = "gemini-3.5-flash", timeoutMs = DEFAULT_TIMEOUT_MS } = {}) {
-  async function polish({ translatedText, sourceText = "", targetLanguage, tone, glossary = "", domain = "" } = {}) {
+export function createCaptionPolisher({ client, model = "gemini-3.5-flash", timeoutMs = DEFAULT_TIMEOUT_MS, defaultDomain = "" } = {}) {
+  const fallbackDomain = String(defaultDomain ?? "").trim();
+  async function polish({ translatedText, sourceText = "", targetLanguage, tone, glossary = "", domain: requestedDomain = "" } = {}) {
+    // An unset domain falls back to the configured default (the CRE pack). The
+    // pack used to be selected everywhere and consumed nowhere, so a host that
+    // picked it got no benefit; now it is what the model actually reads.
+    const domain = String(requestedDomain ?? "").trim() || fallbackDomain;
     const text = String(translatedText ?? "").trim();
     const source = String(sourceText ?? "").trim();
     const selectedGlossary = selectRelevantGlossary(glossary, { sourceText: source, translatedText: text });

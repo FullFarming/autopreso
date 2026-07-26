@@ -604,7 +604,7 @@ input:focus-visible {
 .live-speaker-dot { display: inline-block; width: 8px; height: 8px; border-radius: 9999px; flex: none; }
 /* Reference-app reading treatment: past sentences dim to gray; only the two
    most recently completed sentences render at full strength. */
-.live-turn-card p .live-turn-text { opacity: .42; transition: opacity .5s ease; }
+.live-turn-card p .live-turn-text { opacity: .42; transition: none; }
 .live-turn-card p .live-turn-text.is-recent { opacity: 1; }
 /* Reduced motion covers the paragraph entry and sentence contrast transition. */
 @media (prefers-reduced-motion: reduce) {
@@ -656,11 +656,16 @@ input:focus-visible {
 .live-speaking-waves i:nth-child(3) { height: 9px; animation-delay: -.6s; }
 
 /* Meeting minutes (회의록) — shown when the host ends the session */
-.live-minutes { display: flex; flex: 1; min-height: 0; flex-direction: column; gap: 16px; overflow-y: auto; padding: 22px 18px calc(24px + env(safe-area-inset-bottom)); border: 1px solid rgba(255,255,255,.1); border-radius: 24px; background: #0c0a09; color: #fff; }
-.live-minutes-header { display: grid; justify-items: center; gap: 4px; padding: 10px 0 4px; text-align: center; }
-.live-minutes-ended-dot { width: 8px; height: 8px; border-radius: 9999px; background: #8E8E93; }
-.live-minutes-header strong { font-size: 16px; }
-.live-minutes-header p { margin: 0; color: rgba(255,255,255,.55); font-size: 12px; }
+.live-minutes { display: flex; flex: 1; min-height: 0; flex-direction: column; gap: 16px; overflow: hidden; padding: 16px 18px calc(24px + env(safe-area-inset-bottom)); border: 1px solid var(--nova-overlay-200); border-radius: 16px; background: var(--dark); color: var(--brand-white); }
+.live-minutes-tabs { display: grid; flex: none; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 4px; border-radius: var(--nova-r-pill); background: var(--nova-overlay-100); padding: 4px; }
+.live-minutes-tabs button { min-height: 44px; border: 0; border-radius: var(--nova-r-pill); background: transparent; color: var(--nova-text-muted); font: 600 13px/1 var(--font-sans); cursor: pointer; }
+.live-minutes-tabs button.is-selected { background: var(--nova-surface-raised); color: var(--nova-text); }
+.live-minutes-tabs button:focus-visible { outline: 2px solid var(--nova-blue); outline-offset: 2px; }
+.live-minutes-panel { min-height: 0; overflow-y: auto; scrollbar-color: var(--nova-hairline-strong) var(--dark); scrollbar-width: thin; }
+.live-minutes-panel::-webkit-scrollbar { width: 6px; }
+.live-minutes-panel::-webkit-scrollbar-track { background: var(--dark); }
+.live-minutes-panel::-webkit-scrollbar-thumb { border-radius: var(--nova-r-pill); background: var(--nova-hairline-strong); }
+.live-minutes-empty { margin: 0; color: var(--nova-text-muted); font-size: 13px; }
 .live-minutes .live-summary-card { border-color: rgba(255,255,255,.12); background: rgba(255,255,255,.05); color: #fff; }
 .live-minutes .live-summary-card header time,
 .live-minutes .live-summary-section h3 { color: rgba(255,255,255,.5); }
@@ -671,7 +676,6 @@ input:focus-visible {
 .live-minutes-pending p { margin: 0; color: rgba(255,255,255,.6); font-size: 12px; line-height: 1.6; }
 .live-minutes-pending button { min-height: 38px; border: 1px solid rgba(255,255,255,.25); border-radius: 9999px; background: transparent; color: #fff; padding: 0 16px; font: 600 12px/1 var(--font-sans); }
 .live-minutes-record { display: grid; gap: 16px; }
-.live-minutes-record h3 { margin: 6px 0 0; color: rgba(255,255,255,.5); font-size: 11px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; }
 .live-minutes-record article { border-bottom: 1px solid rgba(255,255,255,.07); padding-bottom: 14px; }
 .live-minutes-record article header { display: flex; align-items: baseline; gap: 8px; margin-bottom: 6px; color: rgba(255,255,255,.6); font-size: 11px; font-weight: 600; }
 .live-minutes-record article header time { color: rgba(255,255,255,.35); font-size: 10px; font-variant-numeric: tabular-nums; }
@@ -718,6 +722,7 @@ input:focus-visible {
 .live-viewer-shell.is-compact .live-viewer-toolbar button { min-height: 44px; min-width: 44px; border-color: rgba(255,255,255,.2); background: transparent; color: #fff; padding: 0 8px; font-size: 10px; white-space: nowrap; }
 .live-viewer-shell.is-compact .live-viewer-toolbar button.is-selected { background: rgba(255,255,255,.16); }
 .live-viewer-shell.is-compact .live-viewer-toolbar .live-leave-button { position: absolute; top: calc(2px + env(safe-area-inset-top)); right: 8px; width: 44px; min-width: 44px; border-color: transparent; color: var(--brand-grey-25); padding: 0; }
+.live-viewer-shell.is-compact .live-viewer-toolbar .live-end-label { position: absolute; top: calc(2px + env(safe-area-inset-top)); right: 60px; }
 .live-viewer-shell.is-compact .live-language-switch { flex: none; border-color: rgba(255,255,255,.16); background: rgba(255,255,255,.07); padding: 2px; }
 .live-viewer-shell.is-compact .live-language-switch button { min-width: 44px; min-height: 44px; color: rgba(255,255,255,.55); padding: 0 8px; }
 .live-viewer-shell.is-compact .live-language-switch button.is-selected { background: #fff; color: #000; }
@@ -876,10 +881,8 @@ input:focus-visible {
 .live-session-ended-screen p { margin: 0; color: var(--muted, rgba(255,255,255,.5)); font-size: 13px; line-height: 1.5; }
 .live-session-ended-screen button { min-height: 44px; border: 1px solid var(--hairline-strong, rgba(255,255,255,.24)); border-radius: 9999px; background: transparent; color: inherit; padding: 0 22px; cursor: pointer; }
 .live-ended-view { display: flex; min-height: 0; flex-direction: column; overflow: hidden; }
-.live-session-ended-banner { display: flex; align-items: center; gap: 10px; border-bottom: 1px solid rgba(255,255,255,.12); background: var(--dark); color: var(--brand-white); padding: 12px 18px; }
-.live-session-ended-banner > div { display: grid; min-width: 0; gap: 2px; }
-.live-session-ended-banner strong { font-size: 13px; }
-.live-session-ended-banner p { margin: 0; color: var(--brand-grey-25); font-size: 11px; }
+.live-end-label { display: inline-flex; min-height: 44px; align-items: center; color: var(--brand-red); font-size: 13px; font-weight: 700; letter-spacing: .16em; animation: live-end-pulse 2.8s ease-in-out infinite; }
+@keyframes live-end-pulse { 0%, 100% { opacity: .55; } 50% { opacity: 1; } }
 .live-viewer-shell.is-compact .live-ended-view { grid-row: 4 / 7; }
 
 /* Host: separated destructive area for End session. */
@@ -903,40 +906,70 @@ input:focus-visible {
 .live-summary-actions-list li { display: grid; gap: 2px; }
 .live-summary-actions-list small { color: var(--muted); font-size: 11px; }
 
-/* Stage / countdown view (contract C8): pure black, host-only window. */
-.live-stage-shell { position: fixed; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 20px; background: #000; color: #fff; padding: 40px 24px; text-align: center; overflow-y: auto; }
-.live-stage-title { margin: 0; max-width: 80vw; font-size: clamp(26px, 4.5vw, 52px); line-height: 1.2; color: #fff; }
-.live-stage-countdown { margin: 0; font-variant-numeric: tabular-nums; font-size: clamp(56px, 14vw, 160px); font-weight: 700; letter-spacing: .04em; color: #fff; }
-.live-stage-state { display: inline-flex; align-items: center; gap: 12px; margin: 0; color: rgba(255,255,255,.72); font-size: clamp(22px, 4vw, 40px); font-weight: 600; letter-spacing: .06em; }
-.live-stage-state.is-live { color: #ff4d4d; text-transform: uppercase; }
-.live-stage-hint { margin: 0; color: rgba(255,255,255,.62); font-size: 14px; }
-.live-stage-error { margin: 0; color: #E8A79F; font-size: 15px; }
-.live-stage-access { display: flex; flex-wrap: wrap; align-items: center; justify-content: center; gap: 28px; margin-top: 8px; }
-.live-stage-access .live-invite-qr { background: #fff; border-radius: 14px; padding: 10px; }
+/* Stage B: one 16:9 broadcast frame, session context left and admission right. */
+.live-stage-shell { position: fixed; inset: 0; display: grid; place-items: center; background: var(--dark); color: var(--nova-text); padding: 32px; overflow: auto; }
+.live-stage-frame { position: relative; width: min(calc((100vh - 64px) * 16 / 9), calc(100vw - 64px), 1600px); aspect-ratio: 16 / 9; overflow: hidden; border: 1px solid var(--nova-hairline); border-radius: 16px; background: var(--dark); }
+.live-stage-grid { position: relative; z-index: 2; display: grid; min-height: 100%; grid-template-columns: minmax(0, 1.35fr) minmax(280px, .65fr); align-items: center; gap: 48px; padding: clamp(32px, 5vw, 80px); }
+.live-stage-session { display: grid; min-width: 0; justify-items: start; gap: 16px; text-align: left; }
+.live-stage-eyebrow { color: var(--nova-text-muted); font-size: 13px; font-weight: 700; letter-spacing: .16em; text-transform: uppercase; }
+.live-stage-title { margin: 0; max-width: 18ch; color: var(--nova-text); font-size: clamp(30px, 4vw, 64px); line-height: 1.15; text-wrap: balance; }
+.live-stage-countdown { margin: 0; color: var(--nova-text); font-variant-numeric: tabular-nums; font-size: clamp(34px, 4.8vw, 72px); font-weight: 700; letter-spacing: .04em; }
+.live-stage-state { display: inline-flex; align-items: center; gap: 12px; margin: 0; color: var(--nova-text-body); font-size: clamp(20px, 2.4vw, 36px); font-weight: 600; letter-spacing: .06em; }
+.live-stage-state.is-live { color: var(--nova-text); text-transform: uppercase; }
+.live-stage-state.is-ended { color: var(--brand-red); animation: live-end-pulse 2.8s ease-in-out infinite; }
+.live-stage-hint { margin: 0; color: var(--nova-text-muted); font-size: 14px; }
+.live-stage-error { margin: 0; color: var(--brand-red); font-size: 15px; }
+.live-stage-access { display: grid; min-width: 0; justify-items: center; gap: 16px; border-radius: 16px; background: color-mix(in srgb, var(--dark) 72%, transparent); padding: clamp(20px, 3vw, 36px); }
+.live-stage-access .live-invite-qr { margin: 0; background: var(--brand-white); border-radius: var(--nova-r-md); padding: 10px; }
+.live-stage-access .live-invite-qr svg { display: block; width: clamp(180px, 19vw, 300px); height: auto; aspect-ratio: 1; }
 .live-stage-access .live-invite-qr figcaption { display: none; }
 .live-stage-code { display: grid; gap: 6px; justify-items: center; }
-.live-stage-code span { color: rgba(255,255,255,.62); font-size: 12px; letter-spacing: .1em; text-transform: uppercase; }
-.live-stage-code strong { font-variant-numeric: tabular-nums; color: #fff; font-size: clamp(34px, 6vw, 64px); letter-spacing: .18em; }
-.live-stage-count { margin: 0; color: rgba(255,255,255,.55); font-size: 16px; }
+.live-stage-code span { color: var(--nova-text-muted); font-size: 12px; letter-spacing: .1em; text-transform: uppercase; }
+.live-stage-code strong { color: var(--nova-text); font-variant-numeric: tabular-nums; font-size: clamp(30px, 4vw, 56px); letter-spacing: .18em; }
+.live-stage-attendance { display: flex; min-height: 44px; align-items: center; gap: 14px; }
+.live-stage-avatar-stack { display: flex; align-items: center; padding-left: 4px; }
+.live-stage-avatar { display: grid; width: 40px; height: 40px; place-items: center; margin-left: -8px; border: 2px solid var(--dark); border-radius: var(--nova-r-pill); background: var(--nova-surface-raised); color: var(--nova-text); font-size: 12px; font-weight: 700; }
+.live-stage-avatar:first-child { margin-left: 0; }
+.live-stage-avatar.color-1 { background: var(--nova-blue); }
+.live-stage-avatar.color-2 { background: var(--brand-blue); }
+.live-stage-avatar.color-3 { background: var(--brand-red); }
+.live-stage-avatar.color-4 { background: var(--nova-text-muted); }
+.live-stage-avatar.color-5 { background: var(--nova-blue-strong); }
+.live-stage-avatar.is-overflow { background: var(--nova-surface-raised); }
+.live-stage-count { margin: 0; color: var(--nova-text-muted); font-size: 15px; }
+.live-stage-loader { display: inline-flex; min-width: 44px; min-height: 44px; align-items: center; justify-content: center; gap: 5px; }
+.live-stage-loader i { width: 6px; height: 6px; border-radius: var(--nova-r-pill); background: var(--nova-text); animation: live-stage-load 900ms ease-in-out infinite alternate; }
+.live-stage-loader i:nth-child(2) { animation-delay: 150ms; }
+.live-stage-loader i:nth-child(3) { animation-delay: 300ms; }
+@keyframes live-stage-load { from { opacity: .25; transform: translateY(2px); } to { opacity: 1; transform: translateY(-2px); } }
 /* Contract C10: host-side cover upload block. */
 .live-cover-upload { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; border: 1px solid var(--hairline); border-radius: 14px; padding: 12px 14px; }
 .live-cover-upload > div { flex: 1 1 240px; min-width: 0; }
 .live-cover-upload strong { font-size: 13px; }
 .live-cover-upload p { margin: 2px 0 0; color: var(--muted); font-size: 11px; line-height: 1.5; }
-/* Contract C10: cover image + scrim behind the stage content. The scrim is a
- * radial gradient that keeps the center readable over any photo. */
-.live-stage-cover { position: absolute; inset: 0; z-index: 0; width: 100%; height: 100%; object-fit: cover; opacity: 1; transition: opacity .6s ease; }
-.live-stage-cover.is-dimmed { opacity: .16; }
-.live-stage-scrim { position: absolute; inset: 0; z-index: 1; background: linear-gradient(180deg, rgba(0,0,0,.62) 0%, rgba(0,0,0,.5) 42%, rgba(0,0,0,.84) 100%); }
-.live-stage-content { position: relative; z-index: 2; display: flex; flex-direction: column; align-items: center; gap: 20px; }
+/* Contract C10: cover image + flat scrim behind the stage content. */
+.live-stage-cover { position: absolute; inset: 0; z-index: 0; width: 100%; height: 100%; object-fit: cover; object-position: center; opacity: 0; transition: opacity var(--nova-dur-color) var(--nova-ease-out); }
+.live-stage-cover.is-loaded { opacity: 1; }
+.live-stage-cover.is-loaded.is-dimmed { opacity: .16; }
+.live-stage-cover-loading { position: absolute; inset: 0; z-index: 1; display: grid; place-items: center; background: var(--nova-surface); }
+.live-stage-scrim { position: absolute; inset: 0; z-index: 1; background: color-mix(in srgb, var(--dark) 62%, transparent); }
 /* Countdown wrapped in the shared indeterminate loading ring. */
-.live-stage-ring { position: relative; display: grid; place-items: center; width: clamp(240px, 34vw, 420px); height: clamp(240px, 34vw, 420px); }
-.live-stage-ring .live-stage-countdown { font-size: clamp(44px, 7vw, 92px); }
-.live-stage-ring .live-stage-state { font-size: clamp(17px, 2.4vw, 26px); }
+.live-stage-ring { position: relative; display: grid; width: clamp(220px, 25vw, 360px); height: clamp(220px, 25vw, 360px); place-items: center; }
+.live-stage-ring .live-stage-countdown { font-size: clamp(34px, 4.8vw, 72px); }
 /* Pre-live layers fade out (instead of unmounting) when the host starts. */
-.live-stage-access { transition: opacity .6s ease; }
+.live-stage-access { transition: opacity var(--nova-dur-color) var(--nova-ease-out); }
 .live-stage-access.is-faded-out { opacity: 0; pointer-events: none; position: absolute; }
-@media (prefers-reduced-motion: reduce) { .live-stage-cover, .live-stage-access { transition: none; } }
+@media (max-width: 760px) {
+  .live-stage-shell { align-items: start; padding: 16px; }
+  .live-stage-frame { width: 100%; min-height: calc(100dvh - 32px); aspect-ratio: auto; }
+  .live-stage-grid { grid-template-columns: 1fr; gap: 24px; padding: 24px; }
+  .live-stage-access { width: 100%; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .live-stage-cover, .live-stage-access { transition: none; }
+  .live-end-label, .live-stage-state.is-ended { animation: none; opacity: 1; }
+  .live-stage-loader i { animation: none; opacity: .65; transform: none; }
+}
 
 /* Compact-mode touch targets: every tappable control is at least 44px tall. */
 .live-viewer-shell.is-compact .live-viewer-toolbar { min-height: calc(44px + env(safe-area-inset-top)); }

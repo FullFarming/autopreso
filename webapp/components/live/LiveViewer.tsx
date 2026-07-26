@@ -1243,7 +1243,16 @@ export default function LiveViewer({ compact = false }: { compact?: boolean }) {
         });
         if (audioProactiveTimerRef.current !== null) window.clearTimeout(audioProactiveTimerRef.current);
         audioProactiveTimerRef.current = window.setTimeout(() => {
-          void installConnection().catch((connectionError: unknown) => {
+          void (async () => {
+            // The microphone capture is bound to the socket that received the
+            // floor. Replacing that socket first leaves a dead capture and a
+            // speaking UI that the stale close handler intentionally ignores.
+            // Stop admitting new turns and release the current one before the
+            // same-session connection is refreshed; caption/history cursors stay.
+            setIsSpeakGatewayReady(false);
+            await endSpeaking(true);
+            await installConnection();
+          })().catch((connectionError: unknown) => {
             reportConnectionError(connectionError);
             scheduleReconnect();
           });
@@ -1271,7 +1280,7 @@ export default function LiveViewer({ compact = false }: { compact?: boolean }) {
       reportConnectionError(connectionError);
       scheduleReconnect();
     }
-  }, [enqueueInterpretationAudio, getLastSeq, resolveViewerDisconnect, restartInterpretationAudio, setCaptionSnapshot]);
+  }, [endSpeaking, enqueueInterpretationAudio, getLastSeq, resolveViewerDisconnect, restartInterpretationAudio, setCaptionSnapshot]);
 
   const showSpeakerOverlay = useCallback((holder: LiveFloorHolder) => {
     const name = floorHolderName(holder);
@@ -1823,6 +1832,7 @@ export default function LiveViewer({ compact = false }: { compact?: boolean }) {
           </>
         )}
         <button type="button" className="live-pip-button" onClick={() => void openPip()} aria-label="Open Picture in Picture">PiP</button>
+        {isSessionEnded && <span className="live-end-label" role="status" aria-label="Live session ended">END</span>}
         <button type="button" className="live-leave-button" aria-label="Leave meeting" onClick={() => void leaveMeeting()}>Leave</button>
       </header>
       <ViewerSessionContext title={viewer.session.title} scheduledAt={viewer.session.scheduledAt} />
@@ -1874,13 +1884,6 @@ export default function LiveViewer({ compact = false }: { compact?: boolean }) {
       )}
       {isSessionEnded ? (
         <div className="live-ended-view">
-          <section className="live-session-ended-banner" role="status" aria-live="assertive">
-            <span className="live-minutes-ended-dot" aria-hidden="true" />
-            <div>
-              <strong>Live session ended</strong>
-              <p>The host ended the call. Your meeting record is below.</p>
-            </div>
-          </section>
           <MeetingMinutes summary={summaryRecord?.summary ?? null} summaryCreatedAt={summaryRecord?.createdAt ?? null}
             transcript={transcript} isLoading={isMinutesLoading} onRetry={() => void loadMinutes()} />
         </div>
