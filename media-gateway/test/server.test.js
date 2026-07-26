@@ -1,7 +1,15 @@
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
 import test from "node:test";
 
 import { listenMediaGateway, resolveTextToSpeechV1Client } from "../src/server.js";
+
+test("media gateway gives caption polish the same four-second quality budget as desktop", async () => {
+  const source = await readFile(new URL("../src/server.js", import.meta.url), "utf8");
+
+  assert.match(source, /createCaptionPolisher\(\{[^}]*timeoutMs:\s*4_000/u);
+  assert.doesNotMatch(source, /timeoutMs:\s*1_500/u);
+});
 
 test("media gateway resolves only the explicit Text-to-Speech v1 streaming client", () => {
   class V1TextToSpeechClient {}

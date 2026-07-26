@@ -3,6 +3,7 @@ import test from "node:test";
 
 import { GeminiLiveTranslateAdapter } from "../src/google-provider-adapters.js";
 import { LiveMediaPipeline } from "../src/live-media-pipeline.js";
+import { SupabaseLivePublisher } from "../src/supabase-adapters.js";
 
 // Enough target-script characters to clear the output-language gate's
 // "target language must be PRESENT" threshold (3 chars).
@@ -1679,7 +1680,7 @@ test("participant stop before a late final preserves identity and source provena
   assert.equal(byLanguage.get("en").sourceText, "참가자가 늦게 확정한 문장입니다");
 });
 
-test("actual Gemini path keeps late A final but does not attribute new host speech to released A", async () => {
+test("actual Gemini path fails closed on a post-release A final and does not attribute new host speech to A", async () => {
   const state = makeDependencies();
   const events = [];
   let messageHandler;
@@ -1713,9 +1714,186 @@ test("actual Gemini path keeps late A final but does not attribute new host spee
   } });
   for (let tick = 0; tick < 6; tick += 1) await new Promise((resolve) => setImmediate(resolve));
   const finals = events.filter((event) => event.type === "caption" && event.isFinal);
-  assert.equal(finals[0].speaker?.speakerId, "participant:A");
+  // Gemini supplies no timestamp on this final. Once host capture has begun,
+  // assigning it to either side would be a guess; null is safer than writing
+  // the wrong participant_id. Finals whose input context arrived before the
+  // handoff retain A through the explicit capture metadata tests above.
+  assert.equal(finals[0].speaker, null);
   assert.equal(finals[1].speaker, null);
   await pipeline.close();
+});
+
+test("actual participant KO callback keeps EN partial growth when output languageCode repeats the source", async () => {
+  const state = makeDependencies();
+  const handlers = new Map();
+  state.dependencies.liveTranslate = new GeminiLiveTranslateAdapter({
+    model: "gemini-3.5-live-translate-preview",
+    client: { live: { async connect(options) {
+      handlers.set(options.config.translationConfig.targetLanguageCode, options.callbacks.onmessage);
+      return { sendRealtimeInput() {}, close() {} };
+    } } },
+  });
+  const pipeline = new LiveMediaPipeline({
+    sessionId: "s-participant-ko-en", sessionType: "meeting", outputMode: "captions",
+    languages: ["ko", "en"], dependencies: state.dependencies,
+  });
+  await pipeline.start();
+  pipeline.setFloorSpeaker({ participantId: "participant-ko", displayName: "한국어 참가자" });
+
+  handlers.get("ko")({ serverContent: { inputTranscription: { text: "안녕하세요", languageCode: "ko-KR" } } });
+  handlers.get("en")({ serverContent: {
+    inputTranscription: { text: "안녕하세요", languageCode: "ko-KR" },
+    outputTranscription: { text: "Hello", languageCode: "ko-KR" },
+  } });
+  handlers.get("ko")({ serverContent: { inputTranscription: { text: " 여러분.", languageCode: "ko-KR" }, turnComplete: true } });
+  handlers.get("en")({ serverContent: {
+    inputTranscription: { text: " 여러분.", languageCode: "ko-KR" },
+    outputTranscription: { text: " everyone.", languageCode: "ko-KR" },
+    turnComplete: true,
+  } });
+  for (let tick = 0; tick < 8; tick += 1) await new Promise((resolve) => setImmediate(resolve));
+
+  const english = state.events.filter((event) => event.type === "caption" && event.language === "en");
+  assert.equal(english.some((event) => event.isFinal === false && event.text === "Hello"), true);
+  const final = english.find((event) => event.isFinal === true);
+  assert.equal(final?.text, "Hello everyone.");
+  assert.equal(final?.sourceLanguage, "ko");
+  assert.equal(final?.origin, undefined);
+  assert.equal(final?.speaker?.speakerId, "participant:participant-ko");
+  assert.match(final?.utteranceKey ?? "", /^gemini:/u);
+  await pipeline.close();
+});
+
+test("host and returning participant finals persist both lanes with stable capture identity and no seq gaps", async () => {
+  const state = makeDependencies();
+  const handlers = new Map();
+  const rpcCalls = [];
+  const fanoutEvents = [];
+  let clock = Date.parse("2026-07-26T03:00:00.000Z");
+  state.dependencies.liveTranslate = new GeminiLiveTranslateAdapter({
+    model: "gemini-3.5-live-translate-preview",
+    client: { live: { async connect(options) {
+      handlers.set(options.config.translationConfig.targetLanguageCode, options.callbacks.onmessage);
+      return { sendRealtimeInput() {}, close() {} };
+    } } },
+    now: () => clock,
+  });
+  state.dependencies.publisher = new SupabaseLivePublisher({
+    baseUrl: "https://dev-ref.supabase.co",
+    serviceRoleKey: "secret",
+    async eventFanout(_sessionId, language, event) { fanoutEvents.push({ ...event, language }); },
+    async audioFanout() {},
+    async fetchFn(url, init) {
+      const call = { path: new URL(String(url)).pathname, body: JSON.parse(init.body) };
+      rpcCalls.push(call);
+      return new Response("true", { status: 200, headers: { "Content-Type": "application/json" } });
+    },
+  });
+  const pipeline = new LiveMediaPipeline({
+    sessionId: "s-host-participant-cycle", sessionType: "meeting", outputMode: "captions",
+    languages: ["ko", "en"], dependencies: state.dependencies, now: () => clock,
+  });
+  await pipeline.start();
+  const settle = async () => {
+    for (let tick = 0; tick < 10; tick += 1) await new Promise((resolve) => setImmediate(resolve));
+  };
+  const capture = async (capturedAt) => {
+    clock = capturedAt;
+    await pipeline.acceptAudio(new Uint8Array(1_280), capturedAt);
+    await pipeline.endAudioStream();
+  };
+  const sourceFinal = async (text) => {
+    handlers.get("ko")({ serverContent: {
+      inputTranscription: { text, languageCode: "ko-KR" }, turnComplete: true,
+    } });
+    await settle();
+  };
+  const translatedFinal = async (sourceText, translatedText) => {
+    handlers.get("en")({ serverContent: {
+      inputTranscription: { text: sourceText, languageCode: "ko-KR" },
+      outputTranscription: { text: translatedText, languageCode: "ko-KR" },
+      turnComplete: true,
+    } });
+    await settle();
+  };
+  const base = clock;
+
+  await capture(base);
+  await sourceFinal("호스트 첫 문장");
+  await translatedFinal("호스트 첫 문장", "The host's first sentence.");
+
+  // Reproduce the canary race: a host capture remains without an input final
+  // immediately before the participant takes the floor.
+  await capture(base + 500);
+  const participant = { participantId: "participant-A", displayName: "참가자 A" };
+  pipeline.setFloorSpeaker(participant);
+  await capture(base + 1_000);
+  await sourceFinal("참가자 첫 문장");
+  await capture(base + 1_500);
+  await sourceFinal("참가자 둘째 문장");
+
+  pipeline.setFloorSpeaker(null);
+  await translatedFinal("참가자 첫 문장", "The participant's first sentence.");
+  await translatedFinal("참가자 둘째 문장", "The participant's second sentence.");
+
+  await capture(base + 2_000);
+  await sourceFinal("호스트 복귀 문장");
+  await translatedFinal("호스트 복귀 문장", "The host returns.");
+
+  pipeline.setFloorSpeaker(participant);
+  await capture(base + 3_000);
+  await sourceFinal("참가자 재진입 문장");
+  await translatedFinal("참가자 재진입 문장", "The participant returns.");
+
+  const utteranceCalls = rpcCalls.filter((call) => call.path.endsWith("/persist_live_utterance_if_active"));
+  assert.equal(utteranceCalls.length, 10);
+  for (const language of ["ko", "en"]) {
+    const rows = utteranceCalls.filter((call) => call.body.p_language === language).map((call) => call.body);
+    assert.deepEqual(rows.map((row) => row.p_seq), [1, 2, 3, 4, 5]);
+    assert.deepEqual(rows.map((row) => row.p_participant_id), [null, "participant-A", "participant-A", null, "participant-A"]);
+    assert.deepEqual(rows.map((row) => row.p_speaker_label), [null, "participant:participant-A", "participant:participant-A", null, "participant:participant-A"]);
+    assert.deepEqual(rows.map((row) => row.p_source_started_at), [
+      new Date(base).toISOString(),
+      new Date(base + 1_000).toISOString(),
+      new Date(base + 1_500).toISOString(),
+      new Date(base + 2_000).toISOString(),
+      new Date(base + 3_000).toISOString(),
+    ]);
+  }
+  assert.equal(fanoutEvents.some((event) => event.type === "recording-error"), false);
+  await pipeline.close();
+});
+
+test("floor transition never lets a new participant partial inherit the host source context", async () => {
+  const state = makeDependencies();
+  const pipeline = new LiveMediaPipeline({
+    sessionId: "s-floor-partial-fence", sessionType: "meeting", outputMode: "captions",
+    languages: ["ko", "en"], dependencies: state.dependencies,
+  });
+  await pipeline.start();
+  const source = state.liveSessions.find((session) => typeof session.onInputCaption === "function");
+  const english = state.liveSessions.find((session) => session.language === "en");
+
+  await source.onInputCaption({ text: "호스트 문장", isFinal: false, languageCode: "ko-KR" });
+  await english.onCaption({ text: "Host sentence", isFinal: false });
+  const hostTranslation = state.events.find((event) => event.type === "caption" && event.language === "en");
+  pipeline.setFloorSpeaker({ participantId: "new-speaker", displayName: "새 참가자" });
+
+  await english.onCaption({ text: "New", isFinal: false });
+  assert.equal(
+    state.events.filter((event) => event.type === "caption" && event.language === "en").length,
+    1,
+    "an output partial arriving before its new source must not reuse the host utterance",
+  );
+  await source.onInputCaption({ text: "새 참가자 문장", isFinal: false, languageCode: "ko-KR" });
+  await english.onCaption({ text: "New participant sentence", isFinal: false });
+
+  const participantTranslation = state.events.filter(
+    (event) => event.type === "caption" && event.language === "en",
+  ).at(-1);
+  assert.notEqual(participantTranslation.utteranceKey, hostTranslation.utteranceKey);
+  assert.equal(participantTranslation.sourceLanguage, "ko");
+  assert.equal(participantTranslation.speaker.speakerId, "participant:new-speaker");
 });
 
 test("distinct input identities preserve rapid repeated final captions", async () => {

@@ -1047,6 +1047,37 @@ test("Gemini capture segments do not let retained host audio steal a late partic
   await session.close();
 });
 
+test("an explicit floor transition discards an unfinalized host capture before the participant final", async () => {
+  const captions = [];
+  let messageHandler;
+  const adapter = new GeminiLiveTranslateAdapter({
+    model: "gemini-3.5-live-translate-preview",
+    client: { live: { async connect(options) {
+      messageHandler = options.callbacks.onmessage;
+      return { sendRealtimeInput() {}, close() {} };
+    } } },
+  });
+  const session = await adapter.open({
+    language: "en", correlateInputCaption: true,
+    onCaption: (caption) => captions.push(caption), onAudio: async () => {},
+  });
+
+  await session.sendAudio(Buffer.alloc(3_200), { capturedAt: 100, floorSpeaker: null });
+  const participant = { participantId: "P-42", displayName: "Participant Forty Two" };
+  session.setFloorSpeaker(participant);
+  await session.sendAudio(Buffer.alloc(3_200), { capturedAt: 200, floorSpeaker: participant });
+  messageHandler({ serverContent: {
+    inputTranscription: { text: "참가자 첫 발언", languageCode: "ko-KR" },
+    outputTranscription: { text: "Participant first speech" }, turnComplete: true,
+  } });
+  for (let tick = 0; tick < 4; tick += 1) await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(captions.length, 1);
+  assert.equal(captions[0].floorSpeaker?.participantId, "P-42");
+  assert.equal(captions[0].capturedAt, 200);
+  await session.close();
+});
+
 test("Gemini Live Translate namespaces utterance identities by canonical target lane", async () => {
   const connections = new Map();
   const inputCaptions = new Map();

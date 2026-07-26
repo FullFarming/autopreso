@@ -445,7 +445,7 @@ export class GeminiLiveTranslateAdapter {
           const previous = captureSegments.at(-1);
           const previousParticipantId = previous?.floorSpeaker?.participantId ?? null;
           const participantId = metadata.floorSpeaker?.participantId ?? null;
-          if (!previous || previousParticipantId !== participantId) {
+          if (!previous || previousParticipantId !== participantId || previous.hasInputFinal === true) {
             captureSegments.push({
               capturedAt: metadata.capturedAt,
               floorSpeaker: metadata.floorSpeaker ?? null,
@@ -492,6 +492,27 @@ export class GeminiLiveTranslateAdapter {
             await providerSession.sendRealtimeInput({ audioStreamEnd: true });
           }
         });
+      },
+      setFloorSpeaker() {
+        // 2026-07-26 fix: A provider input final has no timestamp. Once the
+        // gateway declares a producer transition, an unfinalized older capture
+        // cannot safely be attached to the new speaker. Drop only uncommitted
+        // transcript/capture state; finalized inputContexts remain available
+        // for their delayed translated output.
+        inputLane = makeTranscriptLane();
+        outputLane = makeTranscriptLane();
+        inputTranscriptLanguageCode = null;
+        outputTranscriptLanguageCode = null;
+        captureSegments.length = 0;
+        const orphanedOutputFinal = pendingOutputFinal;
+        pendingOutputFinal = null;
+        if (pendingOutputTimer !== null) clearTimeout(pendingOutputTimer);
+        pendingOutputTimer = null;
+        clearFinalFlushTimer();
+        // Keep the record gap-free, but fail closed on identity: an output that
+        // reached us without its source before the boundary is published with
+        // no speaker rather than being attached to the new floor holder.
+        if (orphanedOutputFinal) enqueueCallback(() => deliverOutput(orphanedOutputFinal, null));
       },
       async close() {
         if (isClosed) return;

@@ -10,11 +10,9 @@ const TTS_INACTIVITY_MILLISECONDS = 10_000;
 const TTS_MAX_SYNTHESIS_MILLISECONDS = 120_000;
 const LANGUAGE_FAILURE_LIMIT = 3;
 const LANGUAGE_COOLDOWN_MILLISECONDS = 30_000;
-/** Must exceed the real commit lag or the fence expires before the caption it
- *  exists to catch ever arrives. Budget: the provider's silence flush
- *  (finalFlushMilliseconds 2_500) plus the committed-caption polish ceiling
- *  (1_500), with headroom. At the old 2_000 the fence was already stale by the
- *  time any lagging final landed. */
+/** Must exceed the real provider commit lag or the fallback fence expires
+ *  before a caption can arrive. Capture-time floor metadata is authoritative;
+ *  this grace period covers only callbacks where the provider omitted it. */
 const FLOOR_ATTRIBUTION_GRACE_MILLISECONDS = 6_000;
 /** Identical caption text arriving within this window is the provider
  *  re-emitting a line, not the speaker saying it again. */
@@ -40,6 +38,7 @@ export class LiveMediaPipeline {
   #recentUtteranceKeys = new Map();
   #presentationCaptionState = new Map();
   #meetingInputCaption = null;
+  #requiresFreshMeetingSourceContext = false;
   #meetingInputCaptionCounter = 0;
   #meetingInputFinalQueues = new Map();
   /** Per-lane throttle for caption-emission failure logs. */
@@ -421,6 +420,16 @@ export class LiveMediaPipeline {
         department: typeof speaker.department === "string" ? speaker.department.trim().slice(0, 80) : "",
         jobTitle: typeof speaker.jobTitle === "string" ? speaker.jobTitle.trim().slice(0, 100) : "",
       };
+      if (this.#floorSpeaker?.participantId !== next.participantId) {
+        // 2026-07-26 fix: An output partial can beat the new speaker's input
+        // transcript callback. Never let it reuse the previous speaker's source
+        // identity; wait for one fresh input partial instead. Clearing only the
+        // transient memo preserves queued late finals and their attribution.
+        this.#meetingInputCaption = null;
+        this.#requiresFreshMeetingSourceContext = true;
+        this.#presentationCaptionState.clear();
+        for (const session of this.#liveSessions.values()) session.setFloorSpeaker?.(next);
+      }
       // Speaker→speaker preemption keeps a grace record for the previous
       // holder: their lagging STT finals must not attribute to the new one.
       if (this.#floorSpeaker && this.#floorSpeaker.participantId !== next.participantId) {
@@ -435,7 +444,13 @@ export class LiveMediaPipeline {
       this.#floorSpeaker = next;
       return;
     }
-    if (this.#floorSpeaker) this.#recentFloor = { speaker: this.#floorSpeaker, releasedAt: this.now() };
+    if (this.#floorSpeaker) {
+      this.#recentFloor = { speaker: this.#floorSpeaker, releasedAt: this.now() };
+      this.#meetingInputCaption = null;
+      this.#requiresFreshMeetingSourceContext = true;
+      this.#presentationCaptionState.clear();
+      for (const session of this.#liveSessions.values()) session.setFloorSpeaker?.(null);
+    }
     this.#floorSpeaker = null;
   }
 
@@ -893,6 +908,7 @@ export class LiveMediaPipeline {
     }
     const lane = hinted || this.languages.find((language) => textPlausiblyInLanguage(normalized, language));
     if (!lane) return;
+    this.#requiresFreshMeetingSourceContext = false;
     this.#meetingInputCaption = {
       text: normalized,
       language: lane,
@@ -959,9 +975,16 @@ export class LiveMediaPipeline {
           && sourceLanguage !== "en"
           && sourceLanguage !== "ko")
         || (sourceLanguage && sourceLanguage === language)
-        || (providerOutputLanguage && providerOutputLanguage !== language))) {
+        || (providerOutputLanguage
+          && providerOutputLanguage !== language
+          && !isOutputInTargetLanguage(text, language)))) {
       return;
     }
+    if (this.sessionType === "meeting"
+      && !isFinal
+      && value.origin !== "source"
+      && this.#requiresFreshMeetingSourceContext
+      && !sourceContext) return;
     // Latency was previously observed ONLY on #processFinalUtterance, which no
     // session type reaches — so the live path emitted no metric at all and the
     // p95 2.5s committed-caption target could not be measured. Split polish out
@@ -1023,9 +1046,10 @@ export class LiveMediaPipeline {
     // Meeting captions attribute to the Speak-floor holder while one is
     // active (partials and finals alike); otherwise the shared "presenter"
     // lane, exactly like presentation mode.
+    const capturedAt = Number(value.capturedAt ?? sourceContext?.capturedAt);
     const floor = this.sessionType === "meeting"
       ? (value.floorSpeaker ?? sourceContext?.floorSpeaker
-        ?? this.#floorAttribution(Number(value.capturedAt ?? sourceContext?.capturedAt)))
+        ?? this.#floorAttribution(capturedAt))
       : null;
     const caption = {
       type: "caption",
@@ -1053,6 +1077,9 @@ export class LiveMediaPipeline {
       // unconditional, DISPLAY is filtered client-side.
       ...(value.origin !== "source" && !isOutputInTargetLanguage(text, language)
         ? { translationStatus: "failed" }
+        : {}),
+      ...(Number.isFinite(capturedAt)
+        ? { sourceStartedAt: new Date(capturedAt).toISOString() }
         : {}),
       sourceEndedAt: value.sourceEndedAt ?? new Date(this.now()).toISOString(),
       emittedAt: new Date(this.now()).toISOString(),

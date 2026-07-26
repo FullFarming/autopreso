@@ -422,7 +422,7 @@ test("partial and final echoes stay suppressed while the opposite translation su
   assert.equal(captions.some((caption) => caption.language === "en" && caption.text === "Hello."), true);
 });
 
-test("provider output language metadata rejects a target mismatch before publish", async () => {
+test("target text beats contradictory output language metadata, but wrong-target text is dropped", async () => {
   const state = makeDependencies();
   const { pipeline, sessions } = makeLivePipeline(state);
   await pipeline.start();
@@ -435,7 +435,15 @@ test("provider output language metadata rejects a target mismatch before publish
     sourceLanguage: "en-US",
   });
 
-  assert.equal(state.captions().length, 0);
+  assert.equal(state.captions().length, 1, "output languageCode may repeat the input language on a valid translation");
+  await sessions.get("ko").onCaption({
+    text: "This is still English source output.",
+    isFinal: true,
+    languageCode: "en-US",
+    sourceText: "English source.",
+    sourceLanguage: "en-US",
+  });
+  assert.equal(state.captions().length, 1, "metadata and target-script mismatch together must fail closed");
 });
 
 test("output callbacks drop unsupported explicit languages but allow und to use the target gate", async () => {
