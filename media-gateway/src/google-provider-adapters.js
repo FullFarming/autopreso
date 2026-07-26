@@ -40,8 +40,10 @@ function boundLiveTranscript(value) {
 }
 
 function mergeLiveTranscript(accumulated, incoming) {
-  const prev = String(accumulated ?? "");
-  const text = String(incoming ?? "");
+  const prev = boundLiveTranscript(accumulated);
+  // Bound the external delta before any prefix comparison or concatenation so
+  // one oversized provider event cannot create an avoidable memory spike.
+  const text = boundLiveTranscript(incoming);
   if (!text) return boundLiveTranscript(prev);
   if (!prev) return boundLiveTranscript(text);
   if (text === prev) return boundLiveTranscript(prev);
@@ -75,6 +77,7 @@ const TTS_RESPONSE_LOW_WATER_BYTES = 72_000;
 const MAX_TTS_RESPONSE_BUFFER_BYTES = 480_000;
 const GEMINI_INPUT_CHUNK_BYTES = 3_200;
 const INPUT_CONTEXT_MAX_AGE_MILLISECONDS = 1_000;
+const MAX_GEMINI_LIVE_AUDIO_PART_BYTES = 192_000;
 
 export class GeminiLiveTranslateAdapter {
   constructor({
@@ -82,12 +85,16 @@ export class GeminiLiveTranslateAdapter {
     model,
     reconnectDelay = (attempt) => new Promise((resolve) => setTimeout(resolve, Math.min(500 * 2 ** Math.min(attempt - 1, 6), 30_000))),
     finalFlushMilliseconds = 800,
+    finalDrainTimeoutMilliseconds = 10_000,
+    maxDetachedFinalCallbacks = 64,
     now = Date.now,
   }) {
     this.client = client;
     this.model = model;
     this.reconnectDelay = reconnectDelay;
     this.finalFlushMilliseconds = finalFlushMilliseconds;
+    this.finalDrainTimeoutMilliseconds = Math.max(1, Number(finalDrainTimeoutMilliseconds) || 10_000);
+    this.maxDetachedFinalCallbacks = Math.max(1, Number(maxDetachedFinalCallbacks) || 64);
     this.now = now;
   }
 
@@ -110,6 +117,18 @@ export class GeminiLiveTranslateAdapter {
     let activeConnectionGeneration = 0;
     let callbackTail = Promise.resolve();
     const detachedFinalCallbacks = new Set();
+    let isFinalDrainCancelled = false;
+    let cancelFinalDrain;
+    const finalDrainCancellation = new Promise((resolve) => { cancelFinalDrain = resolve; });
+    const waitForDetachedFinalCapacity = async () => {
+      if (isFinalDrainCancelled) return false;
+      if (detachedFinalCallbacks.size < this.maxDetachedFinalCallbacks) return true;
+      const hasCapacity = await Promise.race([
+        Promise.race(detachedFinalCallbacks).then(() => true),
+        finalDrainCancellation.then(() => false),
+      ]);
+      return hasCapacity && !isFinalDrainCancelled;
+    };
     const dispatchFinalCallback = (task) => {
       let work;
       try {
@@ -129,10 +148,12 @@ export class GeminiLiveTranslateAdapter {
       detachedFinalCallbacks.add(tracked);
     };
     // Live API transcription messages are DELTAS, and during continuous
-    // speech the model never sends turnComplete. Like the desktop pipeline:
+    // speech the model may defer turnComplete. Like the desktop pipeline:
     // accumulate with a prefix-aware merge, commit complete sentences as
-    // finals (append-only), keep the remainder as the live partial, and
-    // flush the tail as final after a short silence.
+    // finals (append-only), and keep the remainder as the live partial.
+    // A content-delta gap is not a speech boundary: natural pauses between
+    // phrases routinely exceed 800 ms. Only a provider turn boundary or the
+    // caller's explicit audio-stream boundary may flush an incomplete tail.
     const makeTranscriptLane = () => ({ accumulated: "", committedLength: 0 });
     let outputLane = makeTranscriptLane();
     let inputLane = makeTranscriptLane();
@@ -216,9 +237,13 @@ export class GeminiLiveTranslateAdapter {
         }
       }
       const callbackCaption = { ...caption, languageCode: inputTranscriptLanguageCode, ...(inputContext ?? {}) };
-      if (caption.isFinal) dispatchFinalCallback(() => onInputCaption?.(callbackCaption));
+      if (caption.isFinal) {
+        if (await waitForDetachedFinalCapacity()) {
+          dispatchFinalCallback(() => onInputCaption?.(callbackCaption));
+        }
+      }
       else await onInputCaption?.(callbackCaption);
-      if (caption.isFinal && pendingOutputFinal) {
+      if (caption.isFinal && pendingOutputFinal && !isFinalDrainCancelled) {
         const pending = pendingOutputFinal;
         pendingOutputFinal = null;
         if (pendingOutputTimer !== null) clearTimeout(pendingOutputTimer);
@@ -250,7 +275,11 @@ export class GeminiLiveTranslateAdapter {
         floorSpeaker: context.floorSpeaker,
       } : {};
       const callbackCaption = { ...caption, ...publicContext };
-      if (caption.isFinal) dispatchFinalCallback(() => onCaption(callbackCaption));
+      if (caption.isFinal) {
+        if (await waitForDetachedFinalCapacity()) {
+          dispatchFinalCallback(() => onCaption(callbackCaption));
+        }
+      }
       else await onCaption(callbackCaption);
       if (caption.isFinal && context) {
         retireCaptureSegment(context);
@@ -278,8 +307,10 @@ export class GeminiLiveTranslateAdapter {
       }
       await deliverOutput(captionWithLanguage, context);
     };
-    // Silence flush: the model sends no turn signal during continuous talk,
-    // so a short pause commits whatever remains as the final segment.
+    // Bounded fallback after an explicit audio boundary. The caller derives
+    // this boundary from accepted-audio/VAD state; transcription delivery gaps
+    // alone never arm it. A resumed stream cancels the fallback before it can
+    // fragment the same utterance.
     const armFinalFlushTimer = (generation) => {
       clearFinalFlushTimer();
       finalFlushTimer = setTimeout(() => {
@@ -360,12 +391,25 @@ export class GeminiLiveTranslateAdapter {
             const inputTranscription = message.serverContent?.inputTranscription;
             const isTurnComplete = Boolean(message.serverContent?.turnComplete || message.serverContent?.generationComplete);
             const isInterrupted = Boolean(message.serverContent?.interrupted);
+            let hasOversizedAudioPart = false;
             const audioParts = (message.serverContent?.modelTurn?.parts ?? []).flatMap((part) => {
               const inlineData = part.inlineData ?? part.inline_data;
               if (typeof inlineData?.data !== "string" || !String(inlineData.mimeType ?? inlineData.mime_type).startsWith("audio/pcm")) return [];
+              const maximumBase64Length = Math.ceil(MAX_GEMINI_LIVE_AUDIO_PART_BYTES / 3) * 4;
+              if (inlineData.data.length > maximumBase64Length) {
+                hasOversizedAudioPart = true;
+                return [];
+              }
               const pcm = Uint8Array.from(Buffer.from(inlineData.data, "base64"));
+              if (pcm.byteLength > MAX_GEMINI_LIVE_AUDIO_PART_BYTES) {
+                hasOversizedAudioPart = true;
+                return [];
+              }
               return pcm.byteLength > 0 ? [pcm] : [];
             });
+            if (hasOversizedAudioPart) {
+              enqueueCallback(async () => { throw new Error("GEMINI_AUDIO_PART_TOO_LARGE"); });
+            }
             // Dispatched before the caption work and on a separate tail, so
             // playout never waits on a caption polish round-trip.
             if (audioParts.length > 0) {
@@ -422,8 +466,6 @@ export class GeminiLiveTranslateAdapter {
                 if (captureSegments.length > 1) captureSegments.splice(0, captureSegments.length - 1);
                 inputTranscriptLanguageCode = null;
                 outputTranscriptLanguageCode = null;
-              } else if (transcription?.text || inputTranscription?.text) {
-                armFinalFlushTimer(connectionGeneration);
               }
             });
           },
@@ -469,6 +511,7 @@ export class GeminiLiveTranslateAdapter {
     await connect();
     return {
       async sendAudio(frame, metadata = null) {
+        clearFinalFlushTimer();
         if (metadata && Number.isFinite(metadata.capturedAt)) {
           const previous = captureSegments.at(-1);
           const previousParticipantId = previous?.floorSpeaker?.participantId ?? null;
@@ -485,6 +528,10 @@ export class GeminiLiveTranslateAdapter {
         }
         const pcm = Buffer.from(frame);
         return enqueueInput(async () => {
+          // `audioStreamEnd()` and resumed audio can be queued back-to-back.
+          // Cancel after reaching the ordered input tail as well as at call
+          // time, otherwise the earlier end task can arm its timer later.
+          clearFinalFlushTimer();
           if (reconnecting) await reconnecting;
           if (isClosed) return;
           if (terminalError) throw terminalError;
@@ -519,6 +566,7 @@ export class GeminiLiveTranslateAdapter {
           }
           if (generation === activeConnectionGeneration && providerSession === session && !isClosed) {
             await providerSession.sendRealtimeInput({ audioStreamEnd: true });
+            armFinalFlushTimer(generation);
           }
         });
       },
@@ -559,8 +607,35 @@ export class GeminiLiveTranslateAdapter {
         clearFinalFlushTimer();
         if (pendingOutputTimer !== null) clearTimeout(pendingOutputTimer);
         pendingOutputTimer = null;
-        await inputQueue;
-        await Promise.allSettled([...detachedFinalCallbacks]);
+        // One deadline covers the ordered callback tail, emergency-capacity
+        // waits, provider input writes, tail finalization, and detached
+        // persistence. Bounding only the final Set still let close hang forever
+        // when callbackTail or inputQueue was stalled.
+        const drainWork = (async () => {
+          await inputQueue;
+          await callbackTail;
+          await emitLane(inputLane, emitInput, { flushAll: true });
+          await emitLane(outputLane, emitOutput, { flushAll: true });
+          if (pendingOutputFinal) {
+            const pending = pendingOutputFinal;
+            pendingOutputFinal = null;
+            await deliverOutput(pending, null);
+          }
+          await Promise.allSettled([...detachedFinalCallbacks]);
+        })();
+        let drainTimer;
+        const didDrain = await Promise.race([
+          drainWork.then(() => true),
+          new Promise((resolve) => {
+            drainTimer = setTimeout(() => {
+              isFinalDrainCancelled = true;
+              cancelFinalDrain();
+              resolve(false);
+            }, this.finalDrainTimeoutMilliseconds);
+          }),
+        ]);
+        if (drainTimer) clearTimeout(drainTimer);
+        if (!didDrain) onCallbackError?.(new Error("GEMINI_FINAL_DRAIN_TIMEOUT"));
         closeSessionOnce(session);
       },
     };

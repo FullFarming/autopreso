@@ -261,7 +261,7 @@ test("append-only word rendering keeps already-shown words stable as a partial g
   assert.match(dom.zoneText("bottom-center"), /expanding rapidly with recovering demand/);
 });
 
-test("Live Call floor and utterance boundaries show only the current speaker's stable line", async () => {
+test("Live Call floor boundaries clear the previous speaker while one speaker rolls completed sentences", async () => {
   const dom = installDom({ withDesktopFloor: true });
   await loadOverlay("live-call-floor-boundary");
   const ws = dom.getWs();
@@ -326,10 +326,14 @@ test("Live Call floor and utterance boundaries show only the current speaker's s
     translatedText: "A new utterance replaces the old final.",
     seq: 5,
   });
-  assert.equal(dom.zoneText("bottom-center"), "A new utterance replaces the old final.");
+  assert.equal(
+    dom.zoneText("bottom-center"),
+    "The participant spoke through the web app. A new utterance replaces the old final.",
+    "the same speaker's next completed sentence rolls up below the previous final",
+  );
 });
 
-test("a new Live Call partial removes the previous final even without a floor transition", async () => {
+test("a new Live Call partial keeps the previous final until the next sentence commits", async () => {
   const dom = installDom();
   await loadOverlay("live-call-new-utterance");
   const ws = dom.getWs();
@@ -339,7 +343,41 @@ test("a new Live Call partial removes the previous final even without a floor tr
   ws.recv({ type: "subtitle:committed", source: "live-call", targetLanguage: "en", sourceLanguage: "ko", translatedText: "Previous final.", seq: 1 });
   ws.recv({ type: "subtitle:partial", source: "live-call", targetLanguage: "en", sourceLanguage: "ko", translatedText: "Current utterance", seq: 2 });
 
-  assert.equal(dom.zoneText("bottom-center"), "Current utterance");
+  assert.equal(
+    dom.zoneText("bottom-center"),
+    "Previous final. Current utterance",
+    "Live Call must use the captions-only final-plus-live-tail layout",
+  );
+});
+
+test("Live Call final roll-up respects the configured line budget and keeps the newest sentence", async () => {
+  const dom = installDom();
+  await loadOverlay("live-call-line-budget");
+  const ws = dom.getWs();
+  ws.open();
+  ws.recv(SETTINGS);
+
+  for (const [seq, translatedText] of [
+    [1, "First completed sentence."],
+    [2, "Second completed sentence."],
+    [3, "Third completed sentence."],
+    [4, "Fourth completed sentence."],
+  ]) {
+    ws.recv({
+      type: "subtitle:committed",
+      source: "live-call",
+      targetLanguage: "en",
+      sourceLanguage: "ko",
+      translatedText,
+      seq,
+    });
+  }
+
+  assert.equal(
+    dom.zoneText("bottom-center"),
+    "Second completed sentence. Third completed sentence. Fourth completed sentence.",
+    "the oldest final rolls off while the newest final remains at the bottom",
+  );
 });
 
 test("a trailing reverse-direction tail after a switch does not re-show the old lane (no ping-pong / 동시 표시)", async () => {

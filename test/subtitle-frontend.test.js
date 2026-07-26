@@ -878,6 +878,10 @@ test("subtitle overlay defaults to the observed two-line rolling-caption layout"
   assert.match(js, /armLinger\(lane, "live"\)/);
   assert.match(js, /armPreviousSentenceTrim/);
   assert.match(js, /lane\.trimTimer/);
+  // Live Call uses the exact captions-only roll-up path: no source-specific
+  // final replacement or first-partial clear may erase a readable sentence.
+  assert.doesNotMatch(extractFunctionBody(js, "function renderCommittedSubtitle"), /message\.source === "live-call"/);
+  assert.doesNotMatch(extractFunctionBody(js, "function renderPredictedSubtitle"), /message\.source === "live-call"/);
   // Movie-style wrapping: each sentence flows and wraps at the box's real
   // max-width — NO fixed-character pre-wrap (that caused premature mid-sentence
   // breaks). The live partial stays provisional; committed text is solid.

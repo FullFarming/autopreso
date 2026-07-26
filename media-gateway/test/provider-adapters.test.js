@@ -304,6 +304,183 @@ test("a slow committed caption never delays interpreted audio", async () => {
   await session.close();
 });
 
+test("Gemini rejects an oversized inline audio part before base64 decoding", async () => {
+  const errors = [];
+  const audio = [];
+  let messageHandler;
+  const adapter = new GeminiLiveTranslateAdapter({
+    model: "gemini-3.5-live-translate-preview",
+    client: { live: { async connect(options) {
+      messageHandler = options.callbacks.onmessage;
+      return { sendRealtimeInput() {}, close() {} };
+    } } },
+  });
+  const session = await adapter.open({
+    language: "en",
+    onCaption: async () => {},
+    onAudio: async (chunk) => { audio.push(chunk); },
+    onCallbackError: (error) => { errors.push(error.message); },
+  });
+  messageHandler({ serverContent: { modelTurn: { parts: [{ inlineData: {
+    mimeType: "audio/pcm;rate=24000",
+    data: "A".repeat(256_004),
+  } }] } } });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(audio, []);
+  assert.deepEqual(errors, ["GEMINI_AUDIO_PART_TOO_LARGE"]);
+  await session.close();
+});
+
+test("Gemini close reports a bounded final-drain timeout instead of hanging", async () => {
+  const errors = [];
+  let messageHandler;
+  const adapter = new GeminiLiveTranslateAdapter({
+    model: "gemini-3.5-live-translate-preview",
+    finalDrainTimeoutMilliseconds: 20,
+    client: { live: { async connect(options) {
+      messageHandler = options.callbacks.onmessage;
+      return { sendRealtimeInput() {}, close() {} };
+    } } },
+  });
+  const session = await adapter.open({
+    language: "en",
+    onCaption: () => new Promise(() => {}),
+    onAudio: async () => {},
+    onCallbackError: (error) => { errors.push(error.message); },
+  });
+  messageHandler({ serverContent: { outputTranscription: { text: "Never resolves." }, turnComplete: true } });
+  await new Promise((resolve) => setImmediate(resolve));
+  const startedAt = Date.now();
+  await session.close();
+  assert.ok(Date.now() - startedAt < 200);
+  assert.deepEqual(errors, ["GEMINI_FINAL_DRAIN_TIMEOUT"]);
+});
+
+test("Gemini close stays bounded when a provider input write stalls", async () => {
+  const errors = [];
+  const adapter = new GeminiLiveTranslateAdapter({
+    model: "gemini-3.5-live-translate-preview",
+    finalDrainTimeoutMilliseconds: 20,
+    client: { live: { async connect() {
+      return {
+        sendRealtimeInput: () => new Promise(() => {}),
+        close() {},
+      };
+    } } },
+  });
+  const session = await adapter.open({
+    language: "en",
+    onCaption: async () => {},
+    onAudio: async () => {},
+    onCallbackError: (error) => { errors.push(error.message); },
+  });
+  void session.sendAudio(Buffer.alloc(3_200));
+  await new Promise((resolve) => setImmediate(resolve));
+  const closeResult = await Promise.race([
+    session.close().then(() => "closed"),
+    new Promise((resolve) => setTimeout(() => resolve("hung"), 200)),
+  ]);
+  assert.equal(closeResult, "closed");
+  assert.deepEqual(errors, ["GEMINI_FINAL_DRAIN_TIMEOUT"]);
+});
+
+test("Gemini bounds detached final work with lossless emergency backpressure", async () => {
+  const seen = [];
+  const releases = [];
+  let messageHandler;
+  const adapter = new GeminiLiveTranslateAdapter({
+    model: "gemini-3.5-live-translate-preview",
+    maxDetachedFinalCallbacks: 2,
+    client: { live: { async connect(options) {
+      messageHandler = options.callbacks.onmessage;
+      return { sendRealtimeInput() {}, close() {} };
+    } } },
+  });
+  const session = await adapter.open({
+    language: "en",
+    onCaption: (caption) => {
+      seen.push(caption.text);
+      return new Promise((resolve) => { releases.push(resolve); });
+    },
+    onAudio: async () => {},
+  });
+  for (const text of ["First", "Second", "Third"]) {
+    messageHandler({ serverContent: { outputTranscription: { text }, turnComplete: true } });
+  }
+  for (let tick = 0; tick < 3; tick += 1) await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(seen, ["First", "Second"]);
+  releases[0]();
+  for (let tick = 0; tick < 3; tick += 1) await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(seen, ["First", "Second", "Third"]);
+  releases.slice(1).forEach((release) => release());
+  await session.close();
+});
+
+test("Gemini close stays bounded when the detached-final capacity is saturated", async () => {
+  const errors = [];
+  let messageHandler;
+  const adapter = new GeminiLiveTranslateAdapter({
+    model: "gemini-3.5-live-translate-preview",
+    maxDetachedFinalCallbacks: 2,
+    finalDrainTimeoutMilliseconds: 20,
+    client: { live: { async connect(options) {
+      messageHandler = options.callbacks.onmessage;
+      return { sendRealtimeInput() {}, close() {} };
+    } } },
+  });
+  const session = await adapter.open({
+    language: "en",
+    onCaption: () => new Promise(() => {}),
+    onAudio: async () => {},
+    onCallbackError: (error) => { errors.push(error.message); },
+  });
+  for (const text of ["First", "Second", "Third"]) {
+    messageHandler({ serverContent: { outputTranscription: { text }, turnComplete: true } });
+  }
+  for (let tick = 0; tick < 3; tick += 1) await new Promise((resolve) => setImmediate(resolve));
+  const closeResult = await Promise.race([
+    session.close().then(() => "closed"),
+    new Promise((resolve) => setTimeout(() => resolve("hung"), 200)),
+  ]);
+  assert.equal(closeResult, "closed");
+  assert.deepEqual(errors, ["GEMINI_FINAL_DRAIN_TIMEOUT"]);
+});
+
+test("a timed-out close fences queued finals from publishing after shutdown", async () => {
+  const seen = [];
+  const errors = [];
+  let releaseFirst;
+  let messageHandler;
+  const adapter = new GeminiLiveTranslateAdapter({
+    model: "gemini-3.5-live-translate-preview",
+    maxDetachedFinalCallbacks: 1,
+    finalDrainTimeoutMilliseconds: 20,
+    client: { live: { async connect(options) {
+      messageHandler = options.callbacks.onmessage;
+      return { sendRealtimeInput() {}, close() {} };
+    } } },
+  });
+  const session = await adapter.open({
+    language: "en",
+    onCaption: (caption) => {
+      seen.push(caption.text);
+      if (caption.text === "First") return new Promise((resolve) => { releaseFirst = resolve; });
+      return Promise.resolve();
+    },
+    onAudio: async () => {},
+    onCallbackError: (error) => { errors.push(error.message); },
+  });
+  messageHandler({ serverContent: { outputTranscription: { text: "First" }, turnComplete: true } });
+  messageHandler({ serverContent: { outputTranscription: { text: "Second" }, turnComplete: true } });
+  for (let tick = 0; tick < 3; tick += 1) await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(seen, ["First"]);
+  await session.close();
+  releaseFirst();
+  for (let tick = 0; tick < 5; tick += 1) await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(seen, ["First"]);
+  assert.deepEqual(errors, ["GEMINI_FINAL_DRAIN_TIMEOUT"]);
+});
+
 test("Gemini forwards output transcription language metadata to caption callbacks", async () => {
   const captions = [];
   let messageHandler;
@@ -960,7 +1137,7 @@ test("Gemini text translation injects only relevant glossary terms into each net
   assert.ok(prompts[0].length < 7_000);
 });
 
-test("Gemini Live Translate uses the captions-only 800 ms idle finalization budget", () => {
+test("Gemini Live Translate uses an 800 ms fallback only after an explicit audio boundary", () => {
   const adapter = new GeminiLiveTranslateAdapter({
     model: "gemini-3.5-live-translate-preview",
     client: { live: { connect() {} } },
@@ -1289,7 +1466,7 @@ test("Gemini Live Translate interruption discards the abandoned utterance text",
   await session.close();
 });
 
-test("continuous speech commits sentences as finals without waiting for turnComplete", async () => {
+test("continuous speech survives content micro-gaps and finalizes only complete sentences", async () => {
   const captions = [];
   let messageHandler;
   const adapter = new GeminiLiveTranslateAdapter({
@@ -1304,17 +1481,177 @@ test("continuous speech commits sentences as finals without waiting for turnComp
     onInterruption: async () => {},
   });
   // The real model's delta pattern for continuous speech — no turn signal.
+  // A content-delivery gap longer than the old timeout is not a speech end.
+  messageHandler({ serverContent: { outputTranscription: { text: "Before we begin" } } });
+  await new Promise((resolve) => setTimeout(resolve, 90));
+  assert.equal(captions.some((caption) => caption.isFinal), false);
+  messageHandler({ serverContent: { outputTranscription: { text: ", I want to explain the plan. " } } });
   messageHandler({ serverContent: { outputTranscription: { text: "Hello everyone." } } });
   messageHandler({ serverContent: { outputTranscription: { text: " Let's start the meeting." } } });
   messageHandler({ serverContent: { outputTranscription: { text: " This quarter's" } } });
   await new Promise((resolve) => setImmediate(resolve));
   const finalsBeforeFlush = captions.filter((caption) => caption.isFinal).map((caption) => caption.text);
-  assert.deepEqual(finalsBeforeFlush, ["Hello everyone.", "Let's start the meeting."]);
+  assert.deepEqual(finalsBeforeFlush, [
+    "Before we begin, I want to explain the plan.",
+    "Hello everyone.",
+    "Let's start the meeting.",
+  ]);
   assert.equal(captions.at(-1).isFinal, false);
   assert.equal(captions.at(-1).text, "This quarter's");
-  // Silence: the tail flushes as a final on its own.
+  // Another long transcription gap still does not finalize the incomplete tail.
+  await new Promise((resolve) => setTimeout(resolve, 90));
+  assert.equal(captions.filter((caption) => caption.isFinal).length, 3);
+  // The accepted-audio/VAD owner explicitly ends the stream. If the provider
+  // never returns turnComplete, the bounded fallback preserves the tail once.
+  await session.audioStreamEnd();
   await new Promise((resolve) => setTimeout(resolve, 90));
   const finals = captions.filter((caption) => caption.isFinal).map((caption) => caption.text);
-  assert.deepEqual(finals, ["Hello everyone.", "Let's start the meeting.", "This quarter's"]);
+  assert.deepEqual(finals, [
+    "Before we begin, I want to explain the plan.",
+    "Hello everyone.",
+    "Let's start the meeting.",
+    "This quarter's",
+  ]);
   await session.close();
+});
+
+test("resumed audio cancels the explicit-boundary tail fallback", async () => {
+  const captions = [];
+  let messageHandler;
+  const adapter = new GeminiLiveTranslateAdapter({
+    model: "gemini-3.5-live-translate-preview",
+    finalFlushMilliseconds: 40,
+    client: { live: { async connect(options) {
+      messageHandler = options.callbacks.onmessage;
+      return { sendRealtimeInput() {}, close() {} };
+    } } },
+  });
+  const session = await adapter.open({
+    language: "en",
+    onCaption: (caption) => { captions.push({ ...caption }); },
+    onAudio: async () => {},
+    onInterruption: async () => {},
+  });
+  messageHandler({ serverContent: { outputTranscription: { text: "A natural pause" } } });
+  await session.audioStreamEnd();
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  await session.sendAudio(Buffer.alloc(3_200));
+  messageHandler({ serverContent: { outputTranscription: { text: " continues into one sentence." }, turnComplete: true } });
+  await new Promise((resolve) => setTimeout(resolve, 80));
+  assert.deepEqual(captions.filter((caption) => caption.isFinal).map((caption) => caption.text), [
+    "A natural pause continues into one sentence.",
+  ]);
+  await session.close();
+});
+
+test("back-to-back audio end and resume cannot leave a stale final timer armed", async () => {
+  const captions = [];
+  let messageHandler;
+  const adapter = new GeminiLiveTranslateAdapter({
+    model: "gemini-3.5-live-translate-preview",
+    finalFlushMilliseconds: 20,
+    client: { live: { async connect(options) {
+      messageHandler = options.callbacks.onmessage;
+      return { sendRealtimeInput: async () => {}, close() {} };
+    } } },
+  });
+  const session = await adapter.open({
+    language: "en",
+    onCaption: (caption) => { captions.push({ ...caption }); },
+    onAudio: async () => {},
+  });
+  messageHandler({ serverContent: { outputTranscription: { text: "The resumed sentence" } } });
+  const ending = session.audioStreamEnd();
+  const resuming = session.sendAudio(Buffer.alloc(3_200));
+  await Promise.all([ending, resuming]);
+  await new Promise((resolve) => setTimeout(resolve, 60));
+  assert.equal(captions.some((caption) => caption.isFinal), false);
+  messageHandler({ serverContent: { outputTranscription: { text: " stays intact" }, turnComplete: true } });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(captions.filter((caption) => caption.isFinal).map((caption) => caption.text), [
+    "The resumed sentence stays intact",
+  ]);
+  await session.close();
+});
+
+test("a 25-second logical turn with repeated micro-gaps stays one correlated source/output final", async () => {
+  const inputCaptions = [];
+  const outputCaptions = [];
+  let messageHandler;
+  const adapter = new GeminiLiveTranslateAdapter({
+    model: "gemini-3.5-live-translate-preview",
+    // Each 12 ms test gap exceeds this former content-idle budget, modelling
+    // repeated ~1 s pauses without making the suite wait 25 wall-clock seconds.
+    finalFlushMilliseconds: 5,
+    client: { live: { async connect(options) {
+      messageHandler = options.callbacks.onmessage;
+      return { sendRealtimeInput() {}, close() {} };
+    } } },
+  });
+  const session = await adapter.open({
+    language: "en",
+    correlateInputCaption: true,
+    onInputCaption: (caption) => { inputCaptions.push({ ...caption }); },
+    onCaption: (caption) => { outputCaptions.push({ ...caption }); },
+    onAudio: async () => {},
+    onInterruption: async () => {},
+  });
+  await session.sendAudio(Buffer.alloc(3_200), {
+    capturedAt: 100,
+    floorSpeaker: { participantId: "participant-25", displayName: "Participant" },
+  });
+  for (let second = 1; second <= 25; second += 1) {
+    messageHandler({ serverContent: {
+      inputTranscription: { text: ` 원문${second}`, languageCode: "ko-KR" },
+      outputTranscription: { text: ` word${second}` },
+      ...(second === 25 ? { turnComplete: true } : {}),
+    } });
+    await new Promise((resolve) => setTimeout(resolve, 12));
+  }
+  const inputFinals = inputCaptions.filter((caption) => caption.isFinal);
+  const outputFinals = outputCaptions.filter((caption) => caption.isFinal);
+  assert.equal(inputFinals.length, 1);
+  assert.equal(outputFinals.length, 1);
+  assert.match(inputFinals[0].text, /원문1.*원문25/u);
+  assert.match(outputFinals[0].text, /word1.*word25/u);
+  assert.equal(outputFinals[0].utteranceKey, inputFinals[0].utteranceKey);
+  assert.equal(outputFinals[0].sourceText, inputFinals[0].text);
+  assert.equal(outputFinals[0].floorSpeaker?.participantId, "participant-25");
+  await session.close();
+});
+
+test("close drains one unfinished source/output pair in order", async () => {
+  const inputCaptions = [];
+  const outputCaptions = [];
+  let messageHandler;
+  const adapter = new GeminiLiveTranslateAdapter({
+    model: "gemini-3.5-live-translate-preview",
+    client: { live: { async connect(options) {
+      messageHandler = options.callbacks.onmessage;
+      return { sendRealtimeInput() {}, close() {} };
+    } } },
+  });
+  const session = await adapter.open({
+    language: "en",
+    correlateInputCaption: true,
+    onInputCaption: (caption) => { inputCaptions.push({ ...caption }); },
+    onCaption: (caption) => { outputCaptions.push({ ...caption }); },
+    onAudio: async () => {},
+    onInterruption: async () => {},
+  });
+  await session.sendAudio(Buffer.alloc(3_200), {
+    capturedAt: 100,
+    floorSpeaker: { participantId: "participant-1", displayName: "Participant" },
+  });
+  messageHandler({ serverContent: {
+    inputTranscription: { text: "마지막 문장은 종료 시에도 보존됩니다", languageCode: "ko-KR" },
+    outputTranscription: { text: "The final sentence is preserved on close" },
+  } });
+  await new Promise((resolve) => setImmediate(resolve));
+  await session.close();
+  assert.equal(inputCaptions.filter((caption) => caption.isFinal).length, 1);
+  assert.equal(outputCaptions.filter((caption) => caption.isFinal).length, 1);
+  assert.equal(outputCaptions.at(-1).sourceText, "마지막 문장은 종료 시에도 보존됩니다");
+  assert.equal(outputCaptions.at(-1).utteranceKey, inputCaptions.at(-1).utteranceKey);
+  assert.equal(outputCaptions.at(-1).floorSpeaker?.participantId, "participant-1");
 });

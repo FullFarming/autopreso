@@ -517,25 +517,19 @@ function renderCommittedSubtitle(message, fromSnapshot = false) {
   const finalParts = parts.length > 0 ? parts : [stripSubtitlePrefix(message.translatedText)].filter(Boolean);
   if (finalParts.length === 0) return;
   lane.predicted = "";
-  if (message.source === "live-call") {
-    // A Live Call overlay represents the current speaker's current utterance,
-    // not a transcript roll-up. Keep its final stable, but replace it atomically
-    // when the next final arrives instead of stacking old and new sentences.
-    if (lane.trimTimer) clearTimeout(lane.trimTimer);
-    lane.trimTimer = null;
-    lane.lines = finalParts.slice(-maxSubtitleLines());
-  } else {
-    const hadCommittedLines = lane.lines.length > 0;
-    for (const part of finalParts) {
-      const prev = lane.lines[lane.lines.length - 1];
-      // Dedup by NORMALIZED text so a sentence re-emitted with only a trailing
-      // punctuation/space difference ("…있으니까" vs "…있으니까.") is not stacked
-      // as a second identical line.
-      if (!prev || normalizeForDedup(prev) !== normalizeForDedup(part)) lane.lines.push(part);
-    }
-    lane.lines = lane.lines.slice(-maxSubtitleLines());
-    if (hadCommittedLines && lane.lines.length > finalParts.length) armPreviousSentenceTrim(lane, finalParts.length);
+  const hadCommittedLines = lane.lines.length > 0;
+  for (const part of finalParts) {
+    const prev = lane.lines[lane.lines.length - 1];
+    // Dedup by NORMALIZED text so a sentence re-emitted with only a trailing
+    // punctuation/space difference ("…있으니까" vs "…있으니까.") is not stacked
+    // as a second identical line.
+    if (!prev || normalizeForDedup(prev) !== normalizeForDedup(part)) lane.lines.push(part);
   }
+  // Live Call and captions-only intentionally share this queue. Both surfaces
+  // retain the previous completed sentence while the next one grows, then roll
+  // the newest text into the configured line budget instead of replacing it.
+  lane.lines = lane.lines.slice(-maxSubtitleLines());
+  if (hadCommittedLines && lane.lines.length > finalParts.length) armPreviousSentenceTrim(lane, finalParts.length);
   lane.partial = false;
   reflowZone(lane.position);
   armLinger(lane, "final");
@@ -547,15 +541,6 @@ function renderPredictedSubtitle(message, fromSnapshot = false) {
   const lane = ensureLane(message.targetLanguage);
   if (!acceptLaneEvent(lane, message, fromSnapshot)) return;
   if (!acceptDirection(message)) return;
-  if (message.source === "live-call" && !lane.partial) {
-    // The first partial after a final starts a new utterance. Remove the old
-    // final before painting the new hypothesis; subsequent partials keep the
-    // same word nodes and revise only their changed tail via reconcileWords.
-    if (lane.trimTimer) clearTimeout(lane.trimTimer);
-    lane.trimTimer = null;
-    lane.lines = [];
-    lane.predicted = "";
-  }
   // A new live hypothesis for direction X→Y means the speaker is currently
   // speaking X, so the reverse Y→X lane is stale and must clear NOW — not wait
   // for the next COMMITTED line. Without this, when the speaker switches
