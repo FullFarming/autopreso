@@ -1129,20 +1129,46 @@ test("Live Call cold standby fences one producer and returns to the gateway afte
     "gateway events must stay fenced while the local fallback owns the overlay");
 });
 
-test("Live Call shutdown finalizes either gateway or local fallback producer state", () => {
+test("Live Call polling leaves a caption-only local producer running", () => {
   const dashboard = readFileSync(path.join(rootDir, "public", "subtitle-dashboard.js"), "utf8");
-  const sync = dashboard.slice(
-    dashboard.indexOf("async function syncLiveCallAudioBridge"),
-    dashboard.indexOf("async function startGatewayCaptionSession"),
+  const start = extractFunctionBody(dashboard, "async function startSubtitles()");
+  const sync = extractFunctionBody(dashboard, "async function syncLiveCallAudioBridge()");
+  const endedCallBranch = sync.slice(
+    sync.indexOf("if (!liveState?.armed || !liveState.live)"),
+    sync.indexOf("if (isLiveBridgeStarting)"),
   );
-  assert.match(sync, /!liveState\?\.armed \|\| !liveState\.live[\s\S]*activeCaptionProducer !== "none"[\s\S]*await stopSubtitles\(\)/u,
-    "an ended call must finalize records even when the local fallback owns captions");
-  assert.match(sync, /stopLiveCallAudioBridge\("live call ended"\)/u);
 
-  const fallback = dashboard.slice(
-    dashboard.indexOf("async function startLocalLiveCallFallback"),
-    dashboard.indexOf("async function restoreGatewayCaptionProducer"),
+  assert.match(dashboard, /let activeCaptionSessionOwner = "none"/u,
+    "caption lifecycle needs ownership separate from the local/gateway producer kind");
+  assert.match(start, /activeCaptionSessionOwner = "caption-only"/u,
+    "the ordinary Start Caption path must mark its session as independent of Live Call");
+  assert.doesNotMatch(endedCallBranch, /activeCaptionProducer !== "none" \|\| state\.sessionId/u,
+    "an idle Live Call poll must not stop every active caption session");
+  assert.match(endedCallBranch, /activeCaptionSessionOwner === "live-call"[\s\S]*await stopSubtitles\(\)/u,
+    "only a session owned by Live Call may be finalized when the call ends");
+});
+
+test("Live Call shutdown finalizes both gateway and local fallback ownership", () => {
+  const dashboard = readFileSync(path.join(rootDir, "public", "subtitle-dashboard.js"), "utf8");
+  const sync = extractFunctionBody(dashboard, "async function syncLiveCallAudioBridge()");
+  const gateway = extractFunctionBody(dashboard, "async function startGatewayCaptionSession(liveState)");
+  const fallback = extractFunctionBody(dashboard, "async function startLocalLiveCallFallback(liveState)");
+  const stop = extractFunctionBody(dashboard, "async function stopSubtitles()");
+  const endedCallBranch = sync.slice(
+    sync.indexOf("if (!liveState?.armed || !liveState.live)"),
+    sync.indexOf("if (isLiveBridgeStarting)"),
   );
+
+  assert.match(gateway, /activeCaptionSessionOwner = "live-call"/u,
+    "the gateway path must establish Live Call ownership before a fallback can inherit it");
+  assert.doesNotMatch(fallback, /activeCaptionSessionOwner = "(?:none|caption-only)"/u,
+    "switching to the local fallback must preserve Live Call ownership");
+  assert.match(endedCallBranch, /activeCaptionSessionOwner === "live-call"[\s\S]*await stopSubtitles\(\)/u,
+    "call end must finalize the session regardless of its current gateway/local producer");
+  assert.match(endedCallBranch, /stopLiveCallAudioBridge\("live call ended"\)/u);
+  assert.match(stop, /activeCaptionSessionOwner = "none"/u,
+    "stopping any caption session must clear stale ownership");
+
   assert.match(fallback, /catch \(error\)[\s\S]*await stopSubtitles\(\)[\s\S]*throw error/u,
     "a failed fallback transition must release capture and finalize its record");
 });

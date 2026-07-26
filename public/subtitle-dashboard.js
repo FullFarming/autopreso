@@ -1510,6 +1510,7 @@ async function startSubtitles() {
     }
     state.running = true;
     activeCaptionProducer = "local";
+    activeCaptionSessionOwner = "caption-only";
     stopButton.disabled = false;
     syncRuntimeOutputVisibility();
     setConnectionStatus(t("status.receivingCaptions"), "active");
@@ -1535,6 +1536,7 @@ async function stopSubtitles() {
   }
   state.running = false;
   activeCaptionProducer = "none";
+  activeCaptionSessionOwner = "none";
   startButton.disabled = false;
   stopButton.disabled = true;
   syncRuntimeOutputVisibility();
@@ -2991,6 +2993,7 @@ async function startLiveCallMicCapture() {
 }
 
 let activeCaptionProducer = "none";
+let activeCaptionSessionOwner = "none";
 
 // Identity for the transcript record. A caption session started while a Live Call
 // is live IS that meeting, so the record is anchored to the call's own start time
@@ -3023,13 +3026,15 @@ async function syncLiveCallAudioBridge() {
   try { liveState = await bridge.getLiveCallState(); } catch { return; }
   if (!liveState?.armed || !liveState.live) {
     if (liveBridgeCapture) stopLiveCallAudioBridge("live call ended");
-    if (activeCaptionProducer !== "none" || state.sessionId) await stopSubtitles();
+    if (activeCaptionSessionOwner === "live-call") await stopSubtitles();
     return;
   }
   if (isLiveBridgeStarting) return;
   isLiveBridgeStarting = true;
   try {
-    if (activeCaptionProducer === "none") await startGatewayCaptionSession(liveState);
+    if (activeCaptionSessionOwner === "caption-only" || activeCaptionProducer === "none") {
+      await startGatewayCaptionSession(liveState);
+    }
     if (["reconnecting", "failed"].includes(liveState.bridge?.state) && activeCaptionProducer !== "local") {
       await startLocalLiveCallFallback(liveState);
     } else if (liveState.bridge?.state === "connected" && activeCaptionProducer === "local") {
@@ -3069,6 +3074,7 @@ async function startGatewayCaptionSession(liveState) {
     },
   }));
   activeCaptionProducer = "gateway";
+  activeCaptionSessionOwner = "live-call";
   state.running = true;
   startButton.disabled = true;
   stopButton.disabled = false;
