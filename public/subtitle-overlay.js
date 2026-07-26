@@ -119,6 +119,13 @@ let activeSocket = null;
 connect();
 initOverlayRestartControls();
 
+// The gateway emits `floor` before accepting the next speaker's audio. Electron
+// forwards that boundary directly to every overlay, which avoids waiting for a
+// translated fragment before removing the previous speaker's final sentence.
+if (window.realtimeNoelDesktop?.onLiveCallFloor) {
+  window.realtimeNoelDesktop.onLiveCallFloor(() => clearSubtitle());
+}
+
 function connect() {
   const proto = location.protocol === "https:" ? "wss" : "ws";
   const ws = new WebSocket(`${proto}://${location.host}/ws`);
@@ -379,6 +386,9 @@ function clearSubtitle() {
       lane.predictedState = "partial";
     lane.sourceLines = [];
       lane.partial = false;
+      lane.lastEventType = "";
+      lane.lastEventText = "";
+      lane.lastCommittedText = "";
       renderLane(lane);
   }
 }
@@ -395,6 +405,9 @@ function clearSubtitleLane(targetLanguage) {
   lane.predictedState = "partial";
   lane.sourceLines = [];
   lane.partial = false;
+  lane.lastEventType = "";
+  lane.lastEventText = "";
+  lane.lastCommittedText = "";
   reflowZone(lane.position);
 }
 
@@ -503,18 +516,27 @@ function renderCommittedSubtitle(message, fromSnapshot = false) {
   const parts = splitSubtitleDisplayParts(message.translatedText);
   const finalParts = parts.length > 0 ? parts : [stripSubtitlePrefix(message.translatedText)].filter(Boolean);
   if (finalParts.length === 0) return;
-  const hadCommittedLines = lane.lines.length > 0;
   lane.predicted = "";
-  for (const part of finalParts) {
-    const prev = lane.lines[lane.lines.length - 1];
-    // Dedup by NORMALIZED text so a sentence re-emitted with only a trailing
-    // punctuation/space difference ("…있으니까" vs "…있으니까.") is not stacked
-    // as a second identical line.
-    if (!prev || normalizeForDedup(prev) !== normalizeForDedup(part)) lane.lines.push(part);
+  if (message.source === "live-call") {
+    // A Live Call overlay represents the current speaker's current utterance,
+    // not a transcript roll-up. Keep its final stable, but replace it atomically
+    // when the next final arrives instead of stacking old and new sentences.
+    if (lane.trimTimer) clearTimeout(lane.trimTimer);
+    lane.trimTimer = null;
+    lane.lines = finalParts.slice(-maxSubtitleLines());
+  } else {
+    const hadCommittedLines = lane.lines.length > 0;
+    for (const part of finalParts) {
+      const prev = lane.lines[lane.lines.length - 1];
+      // Dedup by NORMALIZED text so a sentence re-emitted with only a trailing
+      // punctuation/space difference ("…있으니까" vs "…있으니까.") is not stacked
+      // as a second identical line.
+      if (!prev || normalizeForDedup(prev) !== normalizeForDedup(part)) lane.lines.push(part);
+    }
+    lane.lines = lane.lines.slice(-maxSubtitleLines());
+    if (hadCommittedLines && lane.lines.length > finalParts.length) armPreviousSentenceTrim(lane, finalParts.length);
   }
-  lane.lines = lane.lines.slice(-maxSubtitleLines());
   lane.partial = false;
-  if (hadCommittedLines && lane.lines.length > finalParts.length) armPreviousSentenceTrim(lane, finalParts.length);
   reflowZone(lane.position);
   armLinger(lane, "final");
 }
@@ -525,6 +547,15 @@ function renderPredictedSubtitle(message, fromSnapshot = false) {
   const lane = ensureLane(message.targetLanguage);
   if (!acceptLaneEvent(lane, message, fromSnapshot)) return;
   if (!acceptDirection(message)) return;
+  if (message.source === "live-call" && !lane.partial) {
+    // The first partial after a final starts a new utterance. Remove the old
+    // final before painting the new hypothesis; subsequent partials keep the
+    // same word nodes and revise only their changed tail via reconcileWords.
+    if (lane.trimTimer) clearTimeout(lane.trimTimer);
+    lane.trimTimer = null;
+    lane.lines = [];
+    lane.predicted = "";
+  }
   // A new live hypothesis for direction X→Y means the speaker is currently
   // speaking X, so the reverse Y→X lane is stale and must clear NOW — not wait
   // for the next COMMITTED line. Without this, when the speaker switches

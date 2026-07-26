@@ -754,7 +754,10 @@ input:focus-visible {
 .live-viewer-shell.is-compact .live-viewer-footer { grid-row: 6; min-height: 0; max-height: calc(28px + env(safe-area-inset-bottom)); gap: 10px; overflow: hidden; padding: 5px 16px calc(5px + env(safe-area-inset-bottom)); color: var(--brand-grey-25); white-space: nowrap; }
 .live-viewer-shell.is-compact .live-viewer-footer span { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .live-viewer-shell.is-compact .live-error { position: absolute; top: calc(88px + env(safe-area-inset-top)); right: 12px; left: 12px; z-index: 8; margin: 0; }
-.live-viewer-shell.is-compact .live-minutes { border: none; border-radius: 0; background: #000; }
+.live-viewer-shell.is-compact .live-minutes { border: none; border-radius: 0; background: #000; scrollbar-color: var(--nova-hairline-strong) #000; scrollbar-width: thin; }
+.live-viewer-shell.is-compact .live-minutes::-webkit-scrollbar { width: 6px; }
+.live-viewer-shell.is-compact .live-minutes::-webkit-scrollbar-track { background: #000; }
+.live-viewer-shell.is-compact .live-minutes::-webkit-scrollbar-thumb { border-radius: var(--nova-r-pill); background: var(--nova-hairline-strong); }
 .live-viewer-shell.is-compact .live-jump-latest { bottom: 132px; }
 .live-viewer-shell.is-compact .live-viewer-legend { display: none; }
 .live-viewer-shell.is-compact .live-viewer-delivery-method,

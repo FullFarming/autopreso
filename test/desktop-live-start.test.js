@@ -188,6 +188,17 @@ test("controller Host Speak reuses the running bridge before opening a fallback 
   assert.match(controllerJs, /hostSpeakButton\.hidden = !state\.live/u);
 });
 
+test("gateway floor changes clear every Electron caption surface before the next speaker", () => {
+  const main = read("electron/main.js");
+  const preload = read("electron/preload.js");
+
+  assert.match(main, /message\.type === "floor"/u);
+  assert.match(main, /webContents\.send\("live-call:floor", message\)/u);
+  assert.match(preload, /onLiveCallFloor/u);
+  assert.match(preload, /ipcRenderer\.on\("live-call:floor", handler\)/u);
+  assert.match(preload, /removeListener\("live-call:floor", handler\)/u);
+});
+
 test("Live Call archive preserves a finalized gateway-canonical local record", () => {
   const main = read("electron/main.js");
   const archive = main.slice(

@@ -790,6 +790,11 @@ test("viewer lifecycle never combines waiting and live, and announces the host-e
     "the ended record must not share its final compact grid row with the live footer");
   assert.match(css, /\.live-viewer-shell\.is-compact\s*\{[^}]*grid-template-rows:/s);
   assert.match(css, /\.live-viewer-shell\.is-compact \.live-viewer-footer\s*\{[^}]*min-height:\s*0/s);
+  assert.match(css, /\.live-viewer-shell\.is-compact \.live-minutes\s*\{[^}]*scrollbar-color:\s*var\(--nova-hairline-strong\) #000[^}]*scrollbar-width:\s*thin/s,
+    "a long ended record must not expose the browser's light scrollbar gutter");
+  assert.match(css, /\.live-viewer-shell\.is-compact \.live-minutes::\-webkit-scrollbar-track\s*\{[^}]*background:\s*#000/s);
+  assert.doesNotMatch(css, /\.live-viewer-shell\.is-compact \.live-minutes\s*\{[^}]*scrollbar-width:\s*none/s,
+    "the ended transcript must retain a visible scroll affordance");
 });
 
 test("meeting minutes group by participant identity while preserving the display label", async () => {

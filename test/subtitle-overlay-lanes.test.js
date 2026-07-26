@@ -101,7 +101,7 @@ class FakeElement {
   }
 }
 
-function installDom() {
+function installDom({ withDesktopFloor = false } = {}) {
   const overlay = new FakeElement("main");
   overlay.dataset.id = "subtitle-overlay";
   for (const zone of ["top-center", "middle-center", "bottom-center"]) {
@@ -131,9 +131,19 @@ function installDom() {
   };
   globalThis.document = doc;
   globalThis.window = globalThis;
+  delete globalThis.realtimeNoelDesktop;
+  let floorListener = null;
+  if (withDesktopFloor) {
+    globalThis.realtimeNoelDesktop = {
+      onLiveCallFloor(listener) {
+        floorListener = listener;
+        return () => { floorListener = null; };
+      },
+    };
+  }
   globalThis.location = { protocol: "http:", host: "localhost:3210" };
   globalThis.WebSocket = FakeWebSocket;
-  return { overlay, getWs: () => fakeWs, zoneText };
+  return { overlay, getWs: () => fakeWs, fireFloor: (floor) => floorListener?.(floor), zoneText };
 
   function zoneText(zone) {
     const z = overlay.querySelector(`[data-zone="${zone}"]`);
@@ -249,6 +259,87 @@ test("append-only word rendering keeps already-shown words stable as a partial g
   }
   assert.ok(second.length > first.length, "new words are appended, not replacing the whole block");
   assert.match(dom.zoneText("bottom-center"), /expanding rapidly with recovering demand/);
+});
+
+test("Live Call floor and utterance boundaries show only the current speaker's stable line", async () => {
+  const dom = installDom({ withDesktopFloor: true });
+  await loadOverlay("live-call-floor-boundary");
+  const ws = dom.getWs();
+  ws.open();
+  ws.recv(SETTINGS);
+
+  const wordSpans = () => {
+    const zone = dom.overlay.querySelector('[data-zone="bottom-center"]');
+    return zone?.querySelector(".subtitle-flow")?.children.slice() ?? [];
+  };
+
+  ws.recv({
+    type: "subtitle:committed",
+    source: "live-call",
+    targetLanguage: "en",
+    sourceLanguage: "ko",
+    translatedText: "The host's final sentence remains readable.",
+    seq: 1,
+  });
+  assert.match(dom.zoneText("bottom-center"), /host's final sentence/);
+
+  dom.fireFloor({ holder: { participantId: "participant-1", name: "Participant" } });
+  assert.equal(dom.zoneText("bottom-center"), "", "speaker handoff must clear the host final immediately");
+
+  ws.recv({
+    type: "subtitle:partial",
+    source: "live-call",
+    targetLanguage: "en",
+    sourceLanguage: "ko",
+    translatedText: "The participant is speaking",
+    seq: 2,
+  });
+  const firstPartialWords = wordSpans();
+  ws.recv({
+    type: "subtitle:partial",
+    source: "live-call",
+    targetLanguage: "en",
+    sourceLanguage: "ko",
+    translatedText: "The participant is speaking through the web app",
+    seq: 3,
+  });
+  const grownPartialWords = wordSpans();
+  for (let index = 0; index < firstPartialWords.length; index += 1) {
+    assert.equal(grownPartialWords[index], firstPartialWords[index], "cumulative partials must retain stable word nodes");
+  }
+
+  ws.recv({
+    type: "subtitle:committed",
+    source: "live-call",
+    targetLanguage: "en",
+    sourceLanguage: "ko",
+    translatedText: "The participant spoke through the web app.",
+    seq: 4,
+  });
+  assert.equal(dom.zoneText("bottom-center"), "The participant spoke through the web app.");
+
+  ws.recv({
+    type: "subtitle:committed",
+    source: "live-call",
+    targetLanguage: "en",
+    sourceLanguage: "ko",
+    translatedText: "A new utterance replaces the old final.",
+    seq: 5,
+  });
+  assert.equal(dom.zoneText("bottom-center"), "A new utterance replaces the old final.");
+});
+
+test("a new Live Call partial removes the previous final even without a floor transition", async () => {
+  const dom = installDom();
+  await loadOverlay("live-call-new-utterance");
+  const ws = dom.getWs();
+  ws.open();
+  ws.recv(SETTINGS);
+
+  ws.recv({ type: "subtitle:committed", source: "live-call", targetLanguage: "en", sourceLanguage: "ko", translatedText: "Previous final.", seq: 1 });
+  ws.recv({ type: "subtitle:partial", source: "live-call", targetLanguage: "en", sourceLanguage: "ko", translatedText: "Current utterance", seq: 2 });
+
+  assert.equal(dom.zoneText("bottom-center"), "Current utterance");
 });
 
 test("a trailing reverse-direction tail after a switch does not re-show the old lane (no ping-pong / 동시 표시)", async () => {

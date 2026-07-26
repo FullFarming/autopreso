@@ -1198,6 +1198,13 @@ async function ensureLiveGatewayBridge() {
       for (const rendererWindow of BrowserWindow.getAllWindows()) {
         if (!rendererWindow.isDestroyed()) rendererWindow.webContents.send("live-call:caption", message);
       }
+    } else if (message.type === "floor") {
+      // 2026-07-26 fix: a floor change is an utterance boundary. Forward it to
+      // every local caption surface before participant/host audio can produce
+      // the next hypothesis, so the previous speaker's final cannot linger.
+      for (const rendererWindow of BrowserWindow.getAllWindows()) {
+        if (!rendererWindow.isDestroyed()) rendererWindow.webContents.send("live-call:floor", message);
+      }
     } else if (message.type === "error") {
       console.warn(`[live-bridge] gateway error: ${message.code ?? "unknown"}`);
       // A rejected start leaves the socket open but useless: close it so the

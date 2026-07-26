@@ -22,6 +22,11 @@ contextBridge.exposeInMainWorld("realtimeNoelDesktop", {
     ipcRenderer.on("live-call:caption", handler);
     return () => ipcRenderer.removeListener("live-call:caption", handler);
   },
+  onLiveCallFloor: (listener) => {
+    const handler = (_event, floor) => listener(floor);
+    ipcRenderer.on("live-call:floor", handler);
+    return () => ipcRenderer.removeListener("live-call:floor", handler);
+  },
   endLiveCall: () => ipcRenderer.invoke("live-call:end"),
   saveLiveHostLogin: (config) => ipcRenderer.invoke("live-call:save-host-login", config),
   getLiveHostLoginStatus: () => ipcRenderer.invoke("live-call:get-host-login-status"),
