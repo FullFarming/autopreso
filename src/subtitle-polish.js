@@ -7,6 +7,103 @@
 const DEFAULT_TIMEOUT_MS = 6000;
 const MIN_POLISH_CHARS = 2;
 const MAX_POLISH_CHARS = 2000;
+const MAX_SELECTED_GLOSSARY_CHARS = 6_000;
+const MAX_GLOBAL_GLOSSARY_CHARS = 1_800;
+const MAX_MATCHED_GLOSSARY_LINES = 32;
+
+function normalizeGlossaryMatchText(value) {
+  return String(value ?? "").normalize("NFKC").toLocaleLowerCase().replace(/\s+/gu, " ").trim();
+}
+
+function compactGlossaryMatchText(value) {
+  return normalizeGlossaryMatchText(value).replace(/[^\p{L}\p{N}]+/gu, "");
+}
+
+function glossaryPhraseMatches(candidate, compactQuery, queryTokens) {
+  const normalized = normalizeGlossaryMatchText(candidate)
+    .replace(/^[-*•]\s*/u, "")
+    .replace(/\([^)]*\)/gu, " ")
+    .replace(/["'“”‘’]/gu, "")
+    .trim();
+  if (normalized.length < 2) return false;
+  const compact = compactGlossaryMatchText(normalized);
+  const minimumLength = /^[a-z0-9]+$/u.test(compact) ? 4 : 2;
+  if (compact.length >= minimumLength && compactQuery.includes(compact)) return true;
+  const tokens = normalized.match(/[\p{L}\p{N}]+/gu) ?? [];
+  if (tokens.length < 3) return false;
+  const matched = tokens.filter((token) => queryTokens.has(token)).length;
+  return matched / tokens.length >= 0.75;
+}
+
+function glossaryLineMatches(line, compactQuery, queryTokens) {
+  const fragments = String(line)
+    .split(/\s*(?:=|->|→|↔)\s*|\s+\/\s+|\s*,\s*/u)
+    .flatMap((fragment) => [fragment, fragment.replace(/\([^)]*\)/gu, " ")]);
+  return fragments.some((fragment) => glossaryPhraseMatches(fragment, compactQuery, queryTokens));
+}
+
+function appendGlossaryLine(lines, line, maxChars) {
+  const normalized = String(line ?? "").trim();
+  if (!normalized || lines.includes(normalized)) return;
+  const nextLength = lines.join("\n").length + (lines.length > 0 ? 1 : 0) + normalized.length;
+  if (nextLength <= maxChars) lines.push(normalized);
+}
+
+/**
+ * @param {unknown} glossary
+ * @param {{sourceText?: unknown, translatedText?: unknown}} [context]
+ */
+function selectRelevantGlossary(glossary, { sourceText, translatedText } = {}) {
+  const glossaryText = String(glossary ?? "").normalize("NFC").trim();
+  if (!glossaryText) return "";
+  const query = normalizeGlossaryMatchText(`${sourceText ?? ""}\n${translatedText ?? ""}`);
+  const compactQuery = compactGlossaryMatchText(query);
+  const queryTokens = new Set(query.match(/[\p{L}\p{N}]+/gu) ?? []);
+  const sections = [];
+  let current = { header: "", lines: [] };
+  for (const rawLine of glossaryText.split(/\r?\n/u)) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    if (/^\[[^\]]+\]$/u.test(line)) {
+      if (current.header || current.lines.length > 0) sections.push(current);
+      current = { header: line, lines: [] };
+    } else {
+      current.lines.push(line);
+    }
+  }
+  if (current.header || current.lines.length > 0) sections.push(current);
+
+  const globalLines = [];
+  for (const section of sections) {
+    if (!/(?:규칙|주의|rules?|instructions?|guidelines?)/iu.test(section.header)) continue;
+    appendGlossaryLine(globalLines, section.header, MAX_GLOBAL_GLOSSARY_CHARS);
+    for (const line of section.lines) {
+      appendGlossaryLine(globalLines, line, MAX_GLOBAL_GLOSSARY_CHARS);
+    }
+  }
+
+  const matchedLines = [];
+  let matchCount = 0;
+  for (const section of sections) {
+    const matches = section.lines.filter((line) => glossaryLineMatches(
+      line,
+      compactQuery,
+      queryTokens,
+    ));
+    if (matches.length === 0) continue;
+    appendGlossaryLine(matchedLines, section.header, MAX_SELECTED_GLOSSARY_CHARS);
+    for (const line of matches) {
+      if (matchCount >= MAX_MATCHED_GLOSSARY_LINES) break;
+      appendGlossaryLine(matchedLines, line, MAX_SELECTED_GLOSSARY_CHARS);
+      matchCount += 1;
+    }
+    if (matchCount >= MAX_MATCHED_GLOSSARY_LINES) break;
+  }
+
+  const selected = [...globalLines];
+  for (const line of matchedLines) appendGlossaryLine(selected, line, MAX_SELECTED_GLOSSARY_CHARS);
+  return selected.join("\n");
+}
 
 const LANGUAGE_STYLE = {
   ko: "Write the result in Korean formal business honorifics (격식체 존댓말, 합니다체).",
@@ -15,7 +112,7 @@ const LANGUAGE_STYLE = {
 };
 
 /** @param {string} targetLanguage @param {any} options */
-function buildPolishSystemPrompt(targetLanguage, { tone, glossary, domain } = {}) {
+function buildPolishSystemPrompt(targetLanguage, { tone, glossary, domain, hasConfiguredGlossary } = {}) {
   const domainText = String(domain ?? "").trim();
   const glossaryText = String(glossary ?? "").trim();
 
@@ -29,7 +126,7 @@ function buildPolishSystemPrompt(targetLanguage, { tone, glossary, domain } = {}
     "2. COMPLETION (committed subtitle only): produce one complete, display-ready subtitle cue. If the live draft is an ellipsis, placeholder, or obvious trailing fragment while the original source has enough content, translate from the source and complete the cue. Never output only ellipses. If the source itself is incomplete, stay faithful and do not invent missing content.",
   ];
 
-  if (glossaryText) {
+  if (hasConfiguredGlossary ?? Boolean(glossaryText)) {
     lines.push(
       "3. TERMINOLOGY (mandatory, bidirectional): check the glossary before finalizing; the glossary lists symmetric term pairs.",
       "PROPER-NOUN REPAIR: live speech-to-text garbles company/brand/person names badly — it drops connectors, fuses words, or invents phonetic spellings (e.g. 'Cushman & Wakefield' → 'Kushima is why Field', 'Kushimanend Wakefield', 'K-Field'). When a garbled fragment is clearly meant to be a glossary/registered name, REPLACE it with the exact registered form; never pass a mangled proper noun through.",
@@ -106,6 +203,7 @@ export function createSubtitlePolisher({ generateText, model, timeoutMs = DEFAUL
   async function polish({ translatedText, sourceText = "", targetLanguage, tone, glossary = "", domain = "", signal } = {}) {
     const text = String(translatedText ?? "").trim();
     const source = String(sourceText ?? "").trim();
+    const selectedGlossary = selectRelevantGlossary(glossary, { sourceText: source, translatedText: text });
     const shouldRecoverPlaceholder = isEllipsisPlaceholder(text) && source.length >= MIN_POLISH_CHARS;
     // Polish runs for the business register, or whenever a glossary/domain is
     // set — terminology and domain correctness matter regardless of tone. It
@@ -127,7 +225,12 @@ export function createSubtitlePolisher({ generateText, model, timeoutMs = DEFAUL
     try {
       const result = await generateText({
         model,
-        system: buildPolishSystemPrompt(targetLanguage, { tone, glossary, domain }),
+        system: buildPolishSystemPrompt(targetLanguage, {
+          tone,
+          glossary: selectedGlossary,
+          domain,
+          hasConfiguredGlossary: Boolean(String(glossary ?? "").trim()),
+        }),
         prompt: buildPolishUserPrompt({ text: text.slice(0, MAX_POLISH_CHARS), sourceText, targetLanguage, tone }),
         abortSignal: controller.signal,
       });

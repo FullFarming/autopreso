@@ -104,6 +104,7 @@ test("polish injects the configured glossary into the prompt", async () => {
 
   await polisher.polish({
     translatedText: "수요 공급 균형과 오퍼레이터 선정",
+    sourceText: "The operator will be selected after reviewing supply and demand.",
     targetLanguage: "ko",
     tone: "business",
     glossary: "operator -> 운영사\nMRG, DSCR, RevPAR -> keep verbatim",
@@ -111,7 +112,7 @@ test("polish injects the configured glossary into the prompt", async () => {
 
   const prompt = `${calls[0].system ?? ""}\n${calls[0].prompt ?? ""}`;
   assert.match(prompt, /operator -> 운영사/);
-  assert.match(prompt, /MRG, DSCR, RevPAR/);
+  assert.doesNotMatch(prompt, /MRG, DSCR, RevPAR/);
   // Professional interpreting termbase discipline: the glossary is a list of
   // SYMMETRIC pairs enforced identically in both directions (KO→EN and
   // EN→KO), not two separate directional lists.
@@ -129,6 +130,73 @@ test("polish injects the configured glossary into the prompt", async () => {
   // (옥석 가리기 ↔ separating the wheat from the chaff, 연착륙 ↔ soft landing).
   assert.match(prompt, /idiom-for-idiom/);
   assert.match(prompt, /equivalent idiom/);
+});
+
+test("a relevant late glossary entry survives bounded selection with its section and global rules", async () => {
+  const { fn, calls } = recordingGenerateText("Cushman & Wakefield Korea");
+  const polisher = createSubtitlePolisher({ generateText: fn, model: "m" });
+  const unrelated = Array.from(
+    { length: 700 },
+    (_, index) => `무관용어${index} = irrelevant-term-${index}`,
+  ).join("\n");
+  const glossary = [
+    "[규칙]",
+    "- 아래 용어쌍은 양방향으로 적용한다.",
+    "[일반 용어]",
+    unrelated,
+    "[고유명사 — 회사]",
+    "Kushiman = Cushman & Wakefield",
+  ].join("\n");
+
+  await polisher.polish({
+    translatedText: "Kushimanend Wakefield Korea",
+    sourceText: "쿠시먼앤드웨이크필드 코리아",
+    targetLanguage: "en",
+    tone: "business",
+    glossary,
+  });
+
+  const system = String(calls[0].system);
+  const selectedGlossary = system.split("GLOSSARY:\n")[1] ?? "";
+  assert.match(selectedGlossary, /\[규칙\]/u);
+  assert.match(selectedGlossary, /양방향으로 적용/u);
+  assert.match(selectedGlossary, /\[고유명사 — 회사\]/u);
+  assert.match(selectedGlossary, /Kushiman = Cushman & Wakefield/u);
+  assert.doesNotMatch(selectedGlossary, /irrelevant-term-699/u);
+  assert.ok(selectedGlossary.length <= 6_000, `selected glossary was ${selectedGlossary.length} chars`);
+});
+
+test("no-match glossary keeps bounded global instructions without unrelated entries", async () => {
+  const { fn, calls } = recordingGenerateText("Good morning.");
+  const polisher = createSubtitlePolisher({ generateText: fn, model: "m" });
+  await polisher.polish({
+    translatedText: "Good morning.",
+    sourceText: "좋은 아침입니다.",
+    targetLanguage: "en",
+    tone: "business",
+    glossary: "[규칙]\n- 용어가 실제로 나타날 때만 적용한다.\n[투자]\n캡레이트 = Cap Rate",
+  });
+
+  const system = String(calls[0].system);
+  assert.match(system, /용어가 실제로 나타날 때만 적용/u);
+  assert.doesNotMatch(system, /캡레이트 = Cap Rate/u);
+});
+
+test("full-sentence translation-memory pairs retain their section context", async () => {
+  const { fn, calls } = recordingGenerateText("시장이 회복되고 있습니다.");
+  const polisher = createSubtitlePolisher({ generateText: fn, model: "m" });
+  await polisher.polish({
+    translatedText: "시장이 다시 좋아지고 있습니다.",
+    sourceText: "The market is recovering.",
+    targetLanguage: "ko",
+    tone: "natural",
+    glossary: "[문장 번역 메모리]\nThe market is recovering = 시장이 회복되고 있습니다\nThe hotel is full = 호텔이 만실입니다",
+  });
+
+  const system = String(calls[0].system);
+  assert.match(system, /\[문장 번역 메모리\]/u);
+  assert.match(system, /The market is recovering = 시장이 회복되고 있습니다/u);
+  assert.doesNotMatch(system, /The hotel is full/u);
 });
 
 test("polish applies an explicit hierarchy: glossary where present, plain translation for everyday speech", async () => {

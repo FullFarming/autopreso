@@ -3,6 +3,7 @@ import { readFile } from "node:fs/promises";
 import test from "node:test";
 
 import { createCaptionPolisher } from "../src/caption-polish.js";
+import { createSubtitlePolisher } from "../../src/subtitle-polish.js";
 
 test("gateway polish keeps the desktop six-second budget for full glossary prompts", async () => {
   const source = await readFile(new URL("../src/caption-polish.js", import.meta.url), "utf8");
@@ -27,6 +28,7 @@ test("polish rewrites finals with the desktop finalizer prompt (tone, glossary, 
   const polisher = createCaptionPolisher({ client, model: "gemini-3.5-flash" });
   const polished = await polisher.polish({
     translatedText: "실적이 예상보다 좋았어요",
+    sourceText: "Hilton Garden Inn performed above expectations.",
     targetLanguage: "ko",
     tone: "business",
     glossary: "힐튼 가든 인 = Hilton Garden Inn",
@@ -57,4 +59,38 @@ test("polish fails open on provider errors and timeouts", async () => {
     timeoutMs: 20,
   });
   assert.equal(await hanging.polish({ translatedText: "slow line", targetLanguage: "en", tone: "business" }), "slow line");
+});
+
+test("desktop and gateway build the same bounded glossary prompt", async () => {
+  const irrelevant = Array.from(
+    { length: 800 },
+    (_, index) => `irrelevant-${index} = 무관-${index}`,
+  ).join("\n");
+  const glossary = `[규칙]\n- keep section-level rules\n[Terms]\n${irrelevant}\n[Late Names]\nKushiman = Cushman & Wakefield`;
+  let desktopSystem = "";
+  const desktop = createSubtitlePolisher({
+    model: "m",
+    async generateText(request) {
+      desktopSystem = String(request.system);
+      return { text: "Cushman & Wakefield Korea" };
+    },
+  });
+  const gatewayClient = makeClient(() => ({ text: "Cushman & Wakefield Korea" }));
+  const gateway = createCaptionPolisher({ client: gatewayClient, model: "m" });
+  const input = {
+    translatedText: "Kushimanend Wakefield Korea",
+    sourceText: "쿠시먼앤드웨이크필드 코리아",
+    targetLanguage: "en",
+    tone: "business",
+    glossary,
+    domain: "Commercial real estate",
+  };
+
+  await desktop.polish(input);
+  await gateway.polish(input);
+  const gatewaySystem = String(gatewayClient.requests[0].config.systemInstruction);
+  assert.equal(gatewaySystem, desktopSystem);
+  assert.match(gatewaySystem, /Kushiman = Cushman & Wakefield/u);
+  assert.doesNotMatch(gatewaySystem, /irrelevant-799/u);
+  assert.ok((gatewaySystem.split("GLOSSARY:\n")[1] ?? "").length <= 6_000);
 });

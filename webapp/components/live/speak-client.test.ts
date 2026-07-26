@@ -379,3 +379,31 @@ test("viewer releases UI and gateway floor before starting browser audio cleanup
   assert.ok(body.indexOf('type: "speak-end"') < body.indexOf("stopSpeakCapture();"));
   assert.equal(body.includes("await stopSpeakCapture()"), false);
 });
+
+test("viewer enables Speak only after gateway authentication and subscription complete", () => {
+  const source = readFileSync(new URL("./LiveViewer.tsx", import.meta.url), "utf8");
+  const disconnectStart = source.indexOf("const disconnectGateway = useCallback");
+  const connectStart = source.indexOf("const connectGateway = useCallback", disconnectStart);
+  const renderStart = source.indexOf('<div className="live-speak-bar">', connectStart);
+  assert.ok(disconnectStart >= 0 && connectStart > disconnectStart && renderStart > connectStart);
+
+  const disconnect = source.slice(disconnectStart, connectStart);
+  const connection = source.slice(connectStart, renderStart);
+  const subscribed = connection.indexOf("await subscribed;");
+  const ready = connection.indexOf("setIsSpeakGatewayReady(true)");
+  assert.ok(subscribed >= 0 && ready > subscribed,
+    "Speak readiness must follow the authenticated subscription acknowledgement");
+  assert.match(disconnect, /setIsSpeakGatewayReady\(false\)/u);
+  assert.match(connection, /candidate\.addEventListener\("close"[\s\S]*setIsSpeakGatewayReady\(false\)/u);
+});
+
+test("viewer exposes the connecting Speak state without changing its visual component", () => {
+  const source = readFileSync(new URL("./LiveViewer.tsx", import.meta.url), "utf8");
+  const renderStart = source.indexOf('<div className="live-speak-bar">');
+  const render = source.slice(renderStart, source.indexOf("</main>", renderStart));
+
+  assert.match(render, /disabled=\{!language \|\| !isSpeakGatewayReady \|\| speakState === "starting"\}/u);
+  assert.match(render, /aria-label=\{!language[\s\S]*"Speak unavailable until a language is selected"[\s\S]*!isSpeakGatewayReady[\s\S]*"Speak unavailable while connecting"/u);
+  assert.match(render, /role="status" aria-live="polite"/u);
+  assert.match(render, /aria-describedby="live-speak-connection-status"/u);
+});

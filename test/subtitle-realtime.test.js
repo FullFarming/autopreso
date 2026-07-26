@@ -1,6 +1,7 @@
 // @ts-nocheck - fake WebSocket implements only the event surface used by subtitle manager tests.
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
+import { readFile } from "node:fs/promises";
 import { test } from "node:test";
 import { WebSocket } from "ws";
 
@@ -19,6 +20,12 @@ import {
 } from "../src/subtitle-realtime.js";
 import { handleGeminiLiveMessage } from "../src/gemini-live-translate.js";
 import { GLOSSARY_PRESETS, getDefaultSubtitleGlossaryContext } from "../src/glossary-presets.js";
+
+test("desktop outer polish deadline matches the six-second polisher budget", async () => {
+  const source = await readFile(new URL("../src/subtitle-realtime.js", import.meta.url), "utf8");
+  assert.match(source, /DEFAULT_POLISH_TIMEOUT_MS\s*=\s*6_000/u);
+  assert.doesNotMatch(source, /DEFAULT_POLISH_TIMEOUT_MS\s*=\s*1_500/u);
+});
 
 test("detectSourceLanguage stays English when Hangul only stray-contaminates English speech (EN→KO robustness)", () => {
   // English being spoken: Latin-dominant with a stray Hangul char (Gemini

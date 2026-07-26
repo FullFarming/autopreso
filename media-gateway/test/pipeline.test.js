@@ -1680,7 +1680,7 @@ test("participant stop before a late final preserves identity and source provena
   assert.equal(byLanguage.get("en").sourceText, "참가자가 늦게 확정한 문장입니다");
 });
 
-test("actual Gemini path fails closed on a post-release A final and does not attribute new host speech to A", async () => {
+test("actual Gemini path retains a post-release A final and does not attribute new host speech to A", async () => {
   const state = makeDependencies();
   const events = [];
   let messageHandler;
@@ -1700,6 +1700,10 @@ test("actual Gemini path fails closed on a post-release A final and does not att
   await pipeline.start();
   pipeline.setFloorSpeaker({ participantId: "A", displayName: "발표자A" });
   await pipeline.acceptAudio(new Uint8Array(1_280), 1_000);
+  messageHandler({ serverContent: {
+    inputTranscription: { text: "A의 늦은", languageCode: "ko-KR" },
+  } });
+  for (let tick = 0; tick < 2; tick += 1) await new Promise((resolve) => setImmediate(resolve));
   clock = 2_000;
   pipeline.setFloorSpeaker(null);
   clock = 2_100;
@@ -1714,12 +1718,11 @@ test("actual Gemini path fails closed on a post-release A final and does not att
   } });
   for (let tick = 0; tick < 6; tick += 1) await new Promise((resolve) => setImmediate(resolve));
   const finals = events.filter((event) => event.type === "caption" && event.isFinal);
-  // Gemini supplies no timestamp on this final. Once host capture has begun,
-  // assigning it to either side would be a guess; null is safer than writing
-  // the wrong participant_id. Finals whose input context arrived before the
-  // handoff retain A through the explicit capture metadata tests above.
-  assert.equal(finals[0].speaker, null);
+  assert.equal(finals[0].speaker.speakerId, "participant:A");
+  assert.equal(finals[0].sourceStartedAt, "1970-01-01T00:00:01.000Z");
+  assert.equal(finals[0].sourceText, "A의 늦은 원문");
   assert.equal(finals[1].speaker, null);
+  assert.equal(finals[1].sourceText, "호스트 새 발언");
   await pipeline.close();
 });
 

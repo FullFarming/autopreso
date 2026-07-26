@@ -163,6 +163,10 @@ export class GeminiLiveTranslateAdapter {
     };
     const emitInput = async (caption) => {
       let inputContext = inputContexts.at(-1) ?? null;
+      if (!caption.isFinal) {
+        const capture = captureSegments.at(-1) ?? null;
+        if (capture && capture.hasInputFinal !== true) capture.hasInputPartial = true;
+      }
       if (caption.isFinal) {
         // Segment transitions and input/output final callbacks advance on
         // independent schedules. Indexing by inputContexts.length reused the
@@ -450,6 +454,7 @@ export class GeminiLiveTranslateAdapter {
               capturedAt: metadata.capturedAt,
               floorSpeaker: metadata.floorSpeaker ?? null,
               hasInputFinal: false,
+              hasInputPartial: false,
             });
             if (captureSegments.length > 100) captureSegments.shift();
           }
@@ -493,17 +498,25 @@ export class GeminiLiveTranslateAdapter {
           }
         });
       },
-      setFloorSpeaker() {
-        // 2026-07-26 fix: A provider input final has no timestamp. Once the
-        // gateway declares a producer transition, an unfinalized older capture
-        // cannot safely be attached to the new speaker. Drop only uncommitted
-        // transcript/capture state; finalized inputContexts remain available
-        // for their delayed translated output.
+      setFloorSpeaker(nextFloorSpeaker) {
+        // 2026-07-26 fix: A provider input final can arrive after a participant
+        // releases the floor and carries no timestamp of its own. Preserve the
+        // ordered capture markers on release so that delayed final can still
+        // consume the participant marker before newly captured host audio.
+        // A participant takeover is different: any unfinalized host marker is
+        // ambiguous and must be discarded before participant audio begins.
         inputLane = makeTranscriptLane();
         outputLane = makeTranscriptLane();
         inputTranscriptLanguageCode = null;
         outputTranscriptLanguageCode = null;
-        captureSegments.length = 0;
+        if (nextFloorSpeaker) {
+          captureSegments.length = 0;
+        } else {
+          const releasedPartialCaptures = captureSegments.filter((segment) => (
+            segment.hasInputFinal !== true && segment.hasInputPartial === true
+          ));
+          captureSegments.splice(0, captureSegments.length, ...releasedPartialCaptures);
+        }
         const orphanedOutputFinal = pendingOutputFinal;
         pendingOutputFinal = null;
         if (pendingOutputTimer !== null) clearTimeout(pendingOutputTimer);

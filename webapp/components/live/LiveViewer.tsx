@@ -701,6 +701,7 @@ export default function LiveViewer({ compact = false }: { compact?: boolean }) {
   const isSessionEndedRef = useRef(false);
   const markSessionEndedRef = useRef<() => void>(() => {});
   const [speakState, setSpeakState] = useState<"idle" | "starting" | "speaking">("idle");
+  const [isSpeakGatewayReady, setIsSpeakGatewayReady] = useState(false);
   const speakStateRef = useRef<"idle" | "starting" | "speaking">("idle");
   const speakButtonRef = useRef<HTMLButtonElement>(null);
   const speakSessionRef = useRef<SpeakSession | null>(null);
@@ -1064,6 +1065,7 @@ export default function LiveViewer({ compact = false }: { compact?: boolean }) {
     audioProactiveTimerRef.current = null;
     const socket = audioSocketRef.current;
     audioSocketRef.current = null;
+    setIsSpeakGatewayReady(false);
     const pendingSocket = audioPendingSocketRef.current;
     audioPendingSocketRef.current = null;
     pendingSocket?.close(1000, "language changed");
@@ -1194,6 +1196,9 @@ export default function LiveViewer({ compact = false }: { compact?: boolean }) {
         const previous = audioSocketRef.current;
         if (audioPendingSocketRef.current === candidate) audioPendingSocketRef.current = null;
         audioSocketRef.current = candidate;
+        // OPEN alone is insufficient: Speak is safe only after the viewer token
+        // was authenticated and its language subscription was acknowledged.
+        setIsSpeakGatewayReady(true);
         previous?.close(1000, "connection refreshed");
         setStatus(outputModeRef.current !== "captions"
           ? "Connected · translated audio"
@@ -1204,6 +1209,7 @@ export default function LiveViewer({ compact = false }: { compact?: boolean }) {
         const connectedAt = Date.now();
         candidate.addEventListener("close", (event) => {
           if (generation !== audioConnectionGenerationRef.current || audioSocketRef.current !== candidate) return;
+          setIsSpeakGatewayReady(false);
           // A closed socket ends the turn no matter why it closed — including
           // the 50-minute proactive refresh below, which closes the socket out
           // from under an active speaker. speak-client binds capture to one
@@ -1927,12 +1933,22 @@ export default function LiveViewer({ compact = false }: { compact?: boolean }) {
            as one press target. While speaking only the button animates like a
            recording indicator — the caption feed stays fully visible. */
         <div className="live-speak-bar">
+          <span id="live-speak-connection-status" className="sr-only" role="status" aria-live="polite">
+            {!language
+              ? "Choose a caption language before speaking."
+              : isSpeakGatewayReady ? "Speak is ready." : "Speak is connecting to the live session."}
+          </span>
           <button type="button"
             ref={speakButtonRef}
             className={`live-speak-button ${speakState === "speaking" ? "is-speaking" : ""} ${speakState === "starting" ? "is-starting" : ""}`}
-            disabled={!language || speakState === "starting"}
+            disabled={!language || !isSpeakGatewayReady || speakState === "starting"}
             aria-pressed={speakState === "speaking"}
-            aria-label={speakState === "speaking"
+            aria-describedby="live-speak-connection-status"
+            aria-label={!language
+              ? "Speak unavailable until a language is selected"
+              : !isSpeakGatewayReady
+              ? "Speak unavailable while connecting"
+              : speakState === "speaking"
               ? "Stop speaking"
               : speakState === "starting" ? "Connecting microphone" : "Start speaking"}
             data-level="0"

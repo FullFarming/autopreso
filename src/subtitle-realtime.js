@@ -50,7 +50,7 @@ const MAX_TRANSCRIPT_CHARS = 16_384;
 // base64 payloads: already far behind, so shedding is strictly better.
 const AUDIO_BACKPRESSURE_MAX_BUFFERED_BYTES = 1_000_000;
 const SETUP_ACK_TIMEOUT_MS = 8000;
-const DEFAULT_POLISH_TIMEOUT_MS = 1_500;
+const DEFAULT_POLISH_TIMEOUT_MS = 6_000;
 // Auto-reconnect backoff for server-side drops / the Gemini connection-lifetime
 // cap, so multi-hour sessions survive without a manual restart.
 const RECONNECT_BASE_MS = 500;
