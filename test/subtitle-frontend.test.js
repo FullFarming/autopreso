@@ -1085,11 +1085,12 @@ test("electron main creates always-on-top click-through overlay", () => {
   assert.match(launcher, /spawn\(path\.join\(rootDir, "node_modules", "\.bin", "electron"\)/);
 });
 
-test("live-call captions keep one selected display lane, including same-language source", () => {
+test("live-call captions relay the opposite-language lane selected by main", () => {
   const dashboard = readFileSync(path.join(rootDir, "public", "subtitle-dashboard.js"), "utf8");
-  // Main selects the one display language; a source on that language must
-  // render just like a translation into that language.
-  assert.match(dashboard, /caption\.origin === "source"/);
+  // Main removes source-language events before the dashboard sees them. The
+  // dashboard relays only that canonical opposite-language screen line.
+  assert.match(dashboard, /Main has already removed source-language events/);
+  assert.match(dashboard, /opposite-language translation/);
   assert.doesNotMatch(dashboard, /recordOnly: true/);
   assert.match(dashboard, /speakerDepartment/);
   assert.doesNotMatch(dashboard, /caption\.speaker\?\.isParticipant !== true/u,

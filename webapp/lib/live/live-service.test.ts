@@ -343,11 +343,13 @@ test("getSnapshot rehydrates the full caption history from live_utterances", asy
   const emittedAt = new Date().toISOString();
   const utteranceRows = [3, 2, 1].map((seq) => ({
     seq,
+    participant_id: "participant-1",
     speaker_label: "speaker-1",
     speaker_name: "Noel Kim",
     text: `번역된 문장 ${seq}`,
     source_text: `source sentence ${seq}`,
     source_language: "en",
+    translation_status: seq === 1 ? "failed" : "translated",
     source_ended_at: emittedAt,
     emitted_at: emittedAt,
   }));
@@ -379,7 +381,7 @@ test("getSnapshot rehydrates the full caption history from live_utterances", asy
   // The viewer contract validates every SpeakerAssignment field and silently
   // drops captions whose speaker shape is partial.
   const speaker = snapshot?.captions[0]?.speaker;
-  assert.equal(speaker?.speakerId, "speaker-1");
+  assert.equal(speaker?.speakerId, "participant:participant-1");
   assert.equal(speaker?.label, "Noel Kim");
   assert.equal(typeof speaker?.colorToken, "string");
   assert.equal(speaker?.voiceStatus, "disabled");
@@ -387,7 +389,10 @@ test("getSnapshot rehydrates the full caption history from live_utterances", asy
   assert.equal(typeof speaker?.lastSeenAt, "string");
   // 원문보기 disclosure has to survive rehydration too.
   assert.equal(snapshot?.captions[0]?.sourceText, "source sentence 1");
+  assert.equal(snapshot?.captions[0]?.translationStatus, "failed");
   assert.equal(snapshot?.captions[0]?.isFinal, true);
+  assert.match(utterancesQuery, /participant_id/u);
+  assert.match(utterancesQuery, /translation_status/u);
 });
 
 test("getSnapshot preserves source-lane provenance from live_utterances", async () => {

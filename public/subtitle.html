@@ -313,20 +313,9 @@
                   <h2 id="live-draft-language-title"><i>3</i><span data-i18n="live.language">언어</span></h2>
                 </div>
                 <div id="live-draft-languages" class="live-draft-languages" aria-live="polite"></div>
-                <fieldset class="live-display-language" aria-describedby="live-display-language-help">
-                  <legend data-i18n="live.displayLanguage">화면 자막 언어</legend>
-                  <div class="live-display-language-options seg-toggle">
-                    <label class="seg-option">
-                      <input name="liveDisplayLanguage" type="radio" value="ko" checked />
-                      <span>KO</span>
-                    </label>
-                    <label class="seg-option">
-                      <input name="liveDisplayLanguage" type="radio" value="en" />
-                      <span>EN</span>
-                    </label>
-                  </div>
-                  <p id="live-display-language-help" data-i18n="live.displayLanguageHelp">화면에는 선택한 한 언어만 표시하고, 웹 기록에는 EN·KO를 모두 유지합니다.</p>
-                </fieldset>
+                <div class="live-display-language" role="note">
+                  <p data-i18n="live.captionLanguagePolicy">화면: 말한 언어의 반대 언어 한 줄 · 웹 기록: 영어·한국어 모두</p>
+                </div>
               </section>
 
               <section class="cfg-section" aria-labelledby="live-draft-access-title">

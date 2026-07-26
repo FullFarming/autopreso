@@ -12,6 +12,7 @@ import { resolveSpeakerColor, speakerMetaLine } from "./SpeakerCaption";
 
 export interface MeetingTurn {
   key: string;
+  speakerIdentity: string;
   speakerLabel: string;
   speakerColor: string;
   startedAt: string;
@@ -23,14 +24,16 @@ export function groupCaptionsIntoTurns(captions: CaptionEvent[]): MeetingTurn[] 
   const turns: MeetingTurn[] = [];
   for (const caption of captions) {
     if (!caption.isFinal) continue;
+    const speakerIdentity = caption.speaker?.speakerId ?? "host";
     const speakerLabel = speakerMetaLine(caption.speaker);
     const previous = turns.at(-1);
-    if (previous && previous.speakerLabel === speakerLabel) {
+    if (previous && previous.speakerIdentity === speakerIdentity) {
       previous.texts.push(caption.text);
       continue;
     }
     turns.push({
       key: `turn-${caption.seq}`,
+      speakerIdentity,
       speakerLabel,
       speakerColor: resolveSpeakerColor(caption.speaker),
       startedAt: caption.emittedAt,
@@ -42,7 +45,8 @@ export function groupCaptionsIntoTurns(captions: CaptionEvent[]): MeetingTurn[] 
 
 /** True when two separate groupings produced the same turn, contents included. */
 function isSameTurn(left: MeetingTurn, right: MeetingTurn): boolean {
-  if (left.key !== right.key || left.speakerLabel !== right.speakerLabel
+  if (left.key !== right.key || left.speakerIdentity !== right.speakerIdentity
+    || left.speakerLabel !== right.speakerLabel
     || left.speakerColor !== right.speakerColor || left.startedAt !== right.startedAt
     || left.texts.length !== right.texts.length) return false;
   // Sentence strings come straight off the caption objects, so this is a
@@ -185,7 +189,7 @@ export default function MeetingTurnFeed({ captions, floorHolder, emptyMessage }:
     if (!livePartial) return false;
     const lastTurn = turns.at(-1);
     if (!lastTurn) return false;
-    return lastTurn.speakerLabel === speakerMetaLine(livePartial.speaker);
+    return lastTurn.speakerIdentity === (livePartial.speaker?.speakerId ?? "host");
   }, [livePartial, turns]);
 
   // Writing scrollTop needs scrollHeight read back, and that read is a forced

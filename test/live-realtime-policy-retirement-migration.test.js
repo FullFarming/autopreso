@@ -42,7 +42,7 @@ test("the final convergence migration follows caption provenance and retires all
   assert.doesNotMatch(sql, /drop\s+(?:table|column|function|type)|truncate/iu);
 });
 
-test("fresh-project bootstrap contains no policy resurrection and ends with convergence SQL", async () => {
+test("fresh-project bootstrap contains no policy resurrection and embeds convergence SQL in order", async () => {
   const [bootstrap, convergence] = await Promise.all([
     readFile(bootstrapUrl, "utf8"),
     readFile(convergenceUrl, "utf8"),
@@ -52,5 +52,7 @@ test("fresh-project bootstrap contains no policy resurrection and ends with conv
     assert.doesNotMatch(afterVoiceRetirement, new RegExp(`(?:alter|create) policy ${policyName}`, "iu"));
   }
   const marker = "-- 2026-07-26 security: Converge every database";
-  assert.equal(bootstrap.slice(bootstrap.lastIndexOf(marker)), convergence);
+  const sectionStart = bootstrap.lastIndexOf(marker);
+  const nextSection = bootstrap.indexOf("\n-- ===================================================================", sectionStart);
+  assert.equal(bootstrap.slice(sectionStart, nextSection).trimEnd(), convergence.trimEnd());
 });

@@ -844,7 +844,10 @@ export class LiveMediaPipeline {
     const normalized = String(text ?? "").normalize("NFC").trim();
     if (!normalized) return;
     const hinted = normalizeLiveLanguage(languageCode);
-    const lane = this.languages.includes(hinted) && textPlausiblyInLanguage(normalized, hinted)
+    // 2026-07-26 fix: Provider result metadata is the primary language signal.
+    // Script is only a fallback because names, numbers, and code-switched
+    // sentences can legitimately look unlike their provider-classified lane.
+    const lane = this.languages.includes(hinted)
       ? hinted
       : this.languages.find((language) => textPlausiblyInLanguage(normalized, language));
     if (!lane) return;
@@ -904,6 +907,18 @@ export class LiveMediaPipeline {
       } else {
         sourceContext = isFinal ? (queue.shift() ?? this.#meetingInputCaption) : this.#meetingInputCaption;
       }
+    }
+    const sourceLanguage = normalizeLiveLanguage(sourceContext?.language);
+    const providerOutputLanguage = normalizeLiveLanguage(value.languageCode);
+    // 2026-07-26 fix: Gemini can echo the input on the output callback even
+    // with echoTargetLanguage=false. Drop that callback before polish, seq, and
+    // publisher persistence. Provider output metadata also provides a strict
+    // target-lane boundary when available; script inspection remains a legacy
+    // fallback only when Gemini omits the language code.
+    if (value.origin !== "source"
+      && ((sourceLanguage && sourceLanguage === language)
+        || (providerOutputLanguage && providerOutputLanguage !== language))) {
+      return;
     }
     // Latency was previously observed ONLY on #processFinalUtterance, which no
     // session type reaches — so the live path emitted no metric at all and the

@@ -14,7 +14,7 @@ const mainSource = readFileSync(new URL("../electron/main.js", import.meta.url),
 const preloadSource = readFileSync(new URL("../electron/preload.js", import.meta.url), "utf8");
 const workspaceSource = readFileSync(new URL("../public/subtitle-workspace.js", import.meta.url), "utf8");
 
-test("Live Call desktop renders exactly one selected lane for both inputs and both speakers", () => {
+test("Live Call desktop renders exactly one opposite-language lane for both inputs and both speakers", () => {
   for (const displayLanguage of ["ko", "en"]) {
     for (const sourceLanguage of ["ko", "en"]) {
       for (const isParticipant of [false, true]) {
@@ -28,22 +28,29 @@ test("Live Call desktop renders exactly one selected lane for both inputs and bo
         ];
         const displayed = captions.filter((caption) => shouldDisplayLiveCaption(caption, displayLanguage));
         assert.equal(displayed.length, 1, `${displayLanguage}/${sourceLanguage}/${isParticipant}`);
-        assert.equal(displayed[0].language, displayLanguage);
-        assert.equal(displayed[0].origin === "source", sourceLanguage === displayLanguage);
+        assert.equal(displayed[0].language, translationLanguage);
+        assert.equal(displayed[0].sourceLanguage, sourceLanguage);
+        assert.equal(displayed[0].origin, undefined);
       }
     }
   }
 });
 
-test("Live Call display selection defaults to Korean and rejects failed translations", () => {
+test("Live Call display rejects source, failed, and same-language events while allowing status-less meeting translations", () => {
   assert.equal(sanitizeLiveCaptionDisplayLanguage("en"), "en");
   assert.equal(sanitizeLiveCaptionDisplayLanguage("ko"), "ko");
   for (const invalid of [undefined, null, "EN", "ja", "", {}, []]) {
     assert.equal(sanitizeLiveCaptionDisplayLanguage(invalid), "ko");
   }
-  assert.equal(shouldDisplayLiveCaption({ language: "ko", translationStatus: "failed" }, "ko"), false);
-  assert.equal(shouldDisplayLiveCaption({ language: "ko" }, "ko"), false);
+  assert.equal(shouldDisplayLiveCaption({ language: "en", sourceLanguage: "ko", origin: "source" }, "ko"), false);
+  assert.equal(shouldDisplayLiveCaption({ language: "en", sourceLanguage: "ko", translationStatus: "failed" }, "ko"), false);
   assert.equal(shouldDisplayLiveCaption({ language: "ko", sourceLanguage: "ko" }, "ko"), false);
+  assert.equal(shouldDisplayLiveCaption({ language: "en", sourceLanguage: "ko" }, "ko"), true);
+  assert.equal(shouldDisplayLiveCaption({ language: "en", sourceLanguage: "ko" }, "en"), true,
+    "the old fixed display-language setting must not override utterance direction");
+  assert.equal(shouldDisplayLiveCaption({ language: "ko", sourceLanguage: "en" }, "ko"), true);
+  assert.equal(shouldDisplayLiveCaption({ language: "ja", sourceLanguage: "ko" }, "ko"), false);
+  assert.equal(shouldDisplayLiveCaption({ language: "ko", sourceLanguage: "ja" }, "ko"), false);
 });
 
 function sourceBetween(start, end) {

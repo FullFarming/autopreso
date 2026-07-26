@@ -74,13 +74,27 @@ export function isPinnedToLatest(scrollTop: number, thresholdPx: number = PIN_TH
  * Each language button is a complete reading lane, not a translation-only
  * overlay. Source speech therefore remains visible in its own language lane,
  * while its translated pair occupies the same canonical sequence in the other
- * lane. Only a failed translation is hidden because its text is not trustworthy
- * for the lane it claims to represent. */
+ * lane. A translated entry is visible only when the gateway supplies canonical
+ * cross-language provenance; failed, echoed, and uncorrelated provider output
+ * stays out of the user-facing record. */
 export function isDisplayableCaption(
-  caption: { origin?: string | null; translationStatus?: string | null },
+  caption: {
+    language?: string | null;
+    sourceLanguage?: string | null;
+    origin?: string | null;
+    translationStatus?: string | null;
+  },
 ): boolean {
-  if (caption.origin === "source") return true;
-  return caption.translationStatus !== "failed";
+  if (caption.translationStatus === "failed") return false;
+  const hasCanonicalLanguages = (caption.language === "en" || caption.language === "ko")
+    && (caption.sourceLanguage === "en" || caption.sourceLanguage === "ko");
+  if (!hasCanonicalLanguages) return false;
+  if (caption.origin === "source") return caption.language === caption.sourceLanguage;
+  // 2026-07-26 fix: A translated web lane must have the same cross-language
+  // provenance as the Electron caption it mirrors. Provider echoes and
+  // uncorrelated intermediate output previously slipped into web history
+  // because anything not explicitly marked failed was accepted.
+  return caption.language !== caption.sourceLanguage;
 }
 
 function normalizedCaptionText(text: string): string {

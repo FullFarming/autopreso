@@ -1941,7 +1941,9 @@ export default function LiveViewer({ compact = false }: { compact?: boolean }) {
           </button>
         </div>
       )}
-      <footer className="live-viewer-footer"><span>{viewer.displayName} · {viewer.department} · {viewer.jobTitle}</span><span>{viewer.viewerCount}/{viewer.session.maxViewers} joined · Valid until the host ends this session</span></footer>
+      {!isSessionEnded && (
+        <footer className="live-viewer-footer"><span>{viewer.displayName} · {viewer.department} · {viewer.jobTitle}</span><span>{viewer.viewerCount}/{viewer.session.maxViewers} joined · Valid until the host ends this session</span></footer>
+      )}
       {pipWindow && createPortal(stage, pipWindow.document.body)}
     </main>
   );

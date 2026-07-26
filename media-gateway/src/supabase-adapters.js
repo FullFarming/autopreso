@@ -76,6 +76,8 @@ export class SupabaseLivePublisher {
             p_source_language: event.sourceLanguage ?? null,
             p_origin: event.origin ?? null,
             p_utterance_key: event.utteranceKey ?? null,
+            p_translation_status: event.translationStatus
+              ?? (event.origin === "source" ? "verbatim" : event.sourceText ? "translated" : null),
           }),
         });
         if (utteranceResult !== true) recordingError = createRecordingError(sessionId, language, event.seq);
@@ -137,7 +139,7 @@ export class SupabaseLivePublisher {
       session_id: `eq.${sessionId}`,
       language: `eq.${language}`,
       seq: `gt.${afterSeq}`,
-      select: "seq,speaker_label,speaker_name,text,source_text,source_language,origin,utterance_key,source_ended_at,emitted_at",
+      select: "seq,participant_id,speaker_label,speaker_name,text,source_text,source_language,origin,utterance_key,translation_status,source_ended_at,emitted_at",
       order: "seq.asc",
       limit: String(limit),
     });
@@ -152,9 +154,9 @@ export class SupabaseLivePublisher {
       // every field and silently drops replayed captions whose speaker shape
       // is partial — which would make missed history unrecoverable after a
       // reconnect.
-      speaker: row.speaker_label || row.speaker_name
+      speaker: row.participant_id || row.speaker_label || row.speaker_name
         ? {
-          speakerId: String(row.speaker_label ?? row.speaker_name),
+          speakerId: String(row.participant_id ? `participant:${row.participant_id}` : row.speaker_label ?? row.speaker_name),
           label: row.speaker_name ?? row.speaker_label ?? "",
           name: row.speaker_name ?? "",
           colorToken: "speaker-teal",
@@ -171,7 +173,7 @@ export class SupabaseLivePublisher {
       // simply offers no disclosure for it.
       sourceText: row.source_text ?? null,
       sourceLanguage: row.source_language ?? null,
-      translationStatus: row.source_text ? "translated" : "verbatim",
+      translationStatus: replayTranslationStatus(row),
       ...(row.origin === "source" ? { origin: "source" } : {}),
       ...(typeof row.utterance_key === "string" && row.utterance_key.length > 0
         ? { utteranceKey: row.utterance_key }
@@ -201,6 +203,13 @@ export class SupabaseLivePublisher {
     const text = await response.text();
     return text.length > 0 ? JSON.parse(text) : undefined;
   }
+}
+
+function replayTranslationStatus(row) {
+  if (["verbatim", "translated", "failed"].includes(row.translation_status)) {
+    return row.translation_status;
+  }
+  return row.source_text ? "translated" : "verbatim";
 }
 
 function waitForAbort(promise, signal) {

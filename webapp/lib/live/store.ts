@@ -33,6 +33,7 @@ const SNAPSHOT_HISTORY_LIMIT = 200;
 
 interface UtteranceRow {
   seq: number;
+  participant_id: string | null;
   speaker_label: string | null;
   speaker_name: string | null;
   text: string;
@@ -40,6 +41,7 @@ interface UtteranceRow {
   source_language: string | null;
   origin: string | null;
   utterance_key: string | null;
+  translation_status: "verbatim" | "translated" | "failed" | null;
   source_ended_at: string;
   emitted_at: string;
 }
@@ -54,9 +56,9 @@ function captionFromUtterance(sessionId: string, language: string, row: Utteranc
     seq: Number(row.seq),
     sessionId,
     language,
-    speaker: row.speaker_label || row.speaker_name
+    speaker: row.participant_id || row.speaker_label || row.speaker_name
       ? {
-        speakerId: String(row.speaker_label ?? row.speaker_name),
+        speakerId: String(row.participant_id ? `participant:${row.participant_id}` : row.speaker_label ?? row.speaker_name),
         label: row.speaker_name ?? row.speaker_label ?? "",
         colorToken: "speaker-teal",
         voiceName: null,
@@ -68,7 +70,7 @@ function captionFromUtterance(sessionId: string, language: string, row: Utteranc
     isFinal: true,
     sourceText: row.source_text ?? null,
     sourceLanguage: row.source_language ?? null,
-    translationStatus: row.source_text ? "translated" : "verbatim",
+    translationStatus: row.translation_status ?? (row.source_text ? "translated" : "verbatim"),
     sourceEndedAt: row.source_ended_at,
     emittedAt: row.emitted_at,
   };
@@ -405,7 +407,7 @@ export class SupabaseLiveSessionStore implements LiveSessionStore {
     const query = new URLSearchParams({
       session_id: `eq.${sessionId}`,
       language: `eq.${language}`,
-      select: "seq,speaker_label,speaker_name,text,source_text,source_language,origin,utterance_key,source_ended_at,emitted_at",
+      select: "seq,participant_id,speaker_label,speaker_name,text,source_text,source_language,origin,utterance_key,translation_status,source_ended_at,emitted_at",
       // 2026-07-26 fix: Serve the oldest bounded window, then let the gateway
       // keyset-replay every later page. One giant snapshot exceeded 5 seconds.
       order: "seq.asc",

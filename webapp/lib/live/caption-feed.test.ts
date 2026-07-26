@@ -55,21 +55,28 @@ test("countdownMsUntil returns remaining ms and null for missing or invalid sche
 // event hidden because it cannot be trusted to belong to its claimed lane.
 // ─────────────────────────────────────────────────────────────────────────────
 test("the source-language transcript displays in its selected web history lane", () => {
-  assert.equal(isDisplayableCaption({ origin: "source", translationStatus: "verbatim" }), true);
-  assert.equal(isDisplayableCaption({ origin: "source", translationStatus: "failed" }), true,
-    "translation failure metadata must not hide the canonical source record");
+  assert.equal(isDisplayableCaption({ language: "ko", sourceLanguage: "ko", origin: "source", translationStatus: "verbatim" }), true);
+});
+
+test("malformed source provenance fails closed", () => {
+  assert.equal(isDisplayableCaption({ language: "ko", origin: "source", translationStatus: "verbatim" }), false);
+  assert.equal(isDisplayableCaption({ language: "ko", sourceLanguage: "en", origin: "source", translationStatus: "verbatim" }), false);
+  assert.equal(isDisplayableCaption({ language: "ja", sourceLanguage: "ja", origin: "source", translationStatus: "verbatim" }), false);
+  assert.equal(isDisplayableCaption({ language: "ko", sourceLanguage: "ko", origin: "source", translationStatus: "failed" }), false,
+    "a contradictory failed source event must not bypass the provenance gate");
 });
 
 test("a failed translation is recorded but never displayed", () => {
-  assert.equal(isDisplayableCaption({ translationStatus: "failed" }), false);
+  assert.equal(isDisplayableCaption({ language: "en", sourceLanguage: "ko", translationStatus: "failed" }), false);
 });
 
-test("genuine translations display", () => {
-  assert.equal(isDisplayableCaption({ translationStatus: "translated" }), true);
-  // Captions from a gateway that sends no provenance at all must still render,
-  // or an older deployment would show a blank feed.
-  assert.equal(isDisplayableCaption({}), true);
-  assert.equal(isDisplayableCaption({ translationStatus: "verbatim" }), true);
+test("only cross-language canonical translations display outside the source lane", () => {
+  assert.equal(isDisplayableCaption({ language: "en", sourceLanguage: "ko", translationStatus: "translated" }), true);
+  assert.equal(isDisplayableCaption({ language: "ko", sourceLanguage: "en" }), true,
+    "the meeting provider may omit a success status but must retain provenance");
+  assert.equal(isDisplayableCaption({}), false);
+  assert.equal(isDisplayableCaption({ language: "ko", translationStatus: "verbatim" }), false);
+  assert.equal(isDisplayableCaption({ language: "ko", sourceLanguage: "ko", translationStatus: "verbatim" }), false);
 });
 
 function caption(seq: number, text: string, overrides: Partial<CaptionEvent> = {}): CaptionEvent {

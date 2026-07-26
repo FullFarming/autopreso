@@ -6,12 +6,13 @@ export function sanitizeLiveCaptionDisplayLanguage(value) {
 
 export function shouldDisplayLiveCaption(caption, displayLanguage) {
   if (!caption || caption.translationStatus === "failed") return false;
-  const selectedLanguage = sanitizeLiveCaptionDisplayLanguage(displayLanguage);
-  if (caption.language !== selectedLanguage) return false;
-  if (caption.origin === "source") return true;
-  // A provider can echo the source into its same-language output lane. Without
-  // canonical source identity that echo is indistinguishable from a valid
-  // translation, so the screen fails closed instead of showing two lines.
-  return typeof caption.sourceLanguage === "string"
-    && caption.sourceLanguage !== selectedLanguage;
+  void displayLanguage;
+  if (caption.origin === "source") return false;
+  if (!LIVE_CAPTION_DISPLAY_LANGUAGES.has(caption.language)) return false;
+  if (!LIVE_CAPTION_DISPLAY_LANGUAGES.has(caption.sourceLanguage)) return false;
+  // 2026-07-26 fix: Live Call follows caption-only direction switching. The
+  // screen shows the EN↔KO lane opposite the current utterance, regardless of
+  // the session's historical fixed-language setting; same-language provider
+  // echoes and source events remain record-only.
+  return caption.sourceLanguage !== caption.language;
 }

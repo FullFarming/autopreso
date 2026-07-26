@@ -18,6 +18,11 @@ export interface MeetingUtterance {
   speakerDepartment: string | null;
   speakerJobTitle: string | null;
   text: string;
+  sourceText?: string | null;
+  sourceLanguage?: string | null;
+  origin?: "source" | null;
+  utteranceKey?: string | null;
+  translationStatus?: "verbatim" | "translated" | "failed" | null;
   sourceStartedAt: string | null;
   sourceEndedAt: string;
   emittedAt: string;
@@ -145,7 +150,7 @@ export async function fetchUtterances(sessionId: string, language: string, fetch
     const query = new URLSearchParams({
       session_id: `eq.${sessionId}`,
       language: `eq.${language}`,
-      select: "seq,participant_id,speaker_name,speaker_label,text,source_started_at,source_ended_at,emitted_at",
+      select: "seq,participant_id,speaker_name,speaker_label,text,source_text,source_language,origin,utterance_key,translation_status,source_started_at,source_ended_at,emitted_at",
       order: "seq.asc",
       limit: String(UTTERANCE_PAGE_SIZE),
     });
@@ -171,8 +176,10 @@ export async function fetchUtterances(sessionId: string, language: string, fetch
       if (!isRecord(value)) throw utteranceReadError();
       const utterance = parseUtteranceRow(value);
       if (!utterance || (afterSeq !== null && utterance.seq <= afterSeq)) throw utteranceReadError();
-      utterances.push(utterance);
       afterSeq = utterance.seq;
+      // Failed target-lane rows remain stored for diagnosis, but exposing the
+      // source-text fallback would duplicate or mislabel the meeting record.
+      if (utterance.translationStatus !== "failed") utterances.push(utterance);
     }
     if (page.length < UTTERANCE_PAGE_SIZE) return utterances;
   }
@@ -192,6 +199,15 @@ function parseUtteranceRow(row: Record<string, unknown>): MeetingUtterance | nul
     speakerDepartment: null,
     speakerJobTitle: null,
     text,
+    sourceText: typeof row.source_text === "string" ? row.source_text : null,
+    sourceLanguage: typeof row.source_language === "string" ? row.source_language : null,
+    origin: row.origin === "source" ? "source" : null,
+    utteranceKey: typeof row.utterance_key === "string" ? row.utterance_key : null,
+    translationStatus: row.translation_status === "verbatim"
+      || row.translation_status === "translated"
+      || row.translation_status === "failed"
+      ? row.translation_status
+      : null,
     sourceStartedAt: typeof row.source_started_at === "string" ? row.source_started_at : null,
     sourceEndedAt: String(row.source_ended_at ?? ""),
     emittedAt: String(row.emitted_at ?? ""),

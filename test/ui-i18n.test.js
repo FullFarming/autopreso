@@ -165,11 +165,11 @@ test("the application menu labels are translated for both languages", () => {
   }
 });
 
-test("the Live Call screen-language choice explains its separate web history", () => {
-  assert.match(MESSAGES.en["live.displayLanguage"], /Screen caption language/u);
-  assert.match(MESSAGES.en["live.displayLanguageHelp"], /web history keeps both EN and KO/u);
-  assert.match(MESSAGES.ko["live.displayLanguage"], /화면 자막 언어/u);
-  assert.match(MESSAGES.ko["live.displayLanguageHelp"], /웹 기록에는 EN·KO를 모두 유지/u);
+test("the Live Call language policy explains automatic screen output and bilingual history", () => {
+  assert.match(MESSAGES.en["live.captionLanguagePolicy"], /opposite the speaker/u);
+  assert.match(MESSAGES.en["live.captionLanguagePolicy"], /both English and Korean/u);
+  assert.match(MESSAGES.ko["live.captionLanguagePolicy"], /말한 언어의 반대 언어 한 줄/u);
+  assert.match(MESSAGES.ko["live.captionLanguagePolicy"], /웹 기록: 영어·한국어 모두/u);
 });
 
 test("the i18n module stays free of load-time DOM and storage coupling", async () => {

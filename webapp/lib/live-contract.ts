@@ -106,10 +106,10 @@ export interface CaptionEvent {
    *  original was published on this lane, so `text` is NOT in `language` —
    *  the viewer must present it as the original, not as its chosen language. */
   translationStatus?: CaptionTranslationStatus;
-  /** "source" marks the untranslated INPUT transcript, published on its own
-   *  language lane so the record keeps the original. It is recorded but never
-   *  displayed live — the screen shows only the translated direction, matching
-   *  the Electron overlay. See isDisplayableCaption in lib/live/caption-feed. */
+  /** "source" marks the untranslated INPUT transcript. The web viewer keeps it
+   *  visible in its own language history; Electron rejects this lane and shows
+   *  only the opposite-language translation. See isDisplayableCaption in
+   *  lib/live/caption-feed. */
   origin?: "source";
   /** Stable gateway correlation shared by the source and translated lanes. */
   utteranceKey?: string;

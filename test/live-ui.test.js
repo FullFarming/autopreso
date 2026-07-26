@@ -456,10 +456,10 @@ test("viewer keeps one stable partial row and archives only final captions after
   assert.match(viewer, /key=\{`final-\$\{caption\.seq\}`\}/);
   assert.match(viewer, /key=\{`partial-\$\{captionLaneKey\(caption\)\}`\}/);
   // Finals and partials are split out of displayCaptions, not the raw record.
-  // Web history shows source speech in its own selected language lane and hides
-  // only failed translations.
+  // Web history shows only canonical source/translation pairs and hides failed,
+  // malformed, and same-language echo captions.
   assert.match(viewer, /const displayCaptions = useMemo\(\(\) => captions\.filter\(isDisplayableCaption\), \[captions\]\)/);
-  assert.match(captionFeed, /if \(caption\.origin === "source"\) return true/u);
+  assert.match(captionFeed, /if \(caption\.origin === "source"\) return caption\.language === caption\.sourceLanguage/u);
   assert.match(captionFeed, /incoming\.filter\(\(event\) => event\.language === language\)/u);
   assert.match(viewer, /const finalCaptions = displayCaptions\.filter\(\(caption\) => caption\.isFinal\)/);
   assert.match(viewer, /const partialCaptions = displayCaptions\.filter\(\(caption\) => !caption\.isFinal\)/);
@@ -786,8 +786,69 @@ test("viewer lifecycle never combines waiting and live, and announces the host-e
   assert.match(viewer, />The host ended the call\. Your meeting record is below\.</);
   assert.match(viewer, /function isRecordingStatusEvent/);
   assert.match(viewer, /event\.type === "recording-status"[\s\S]{0,120}setError\(event\.message\)/);
+  assert.match(viewer, /\{!isSessionEnded && \(\s*<footer className="live-viewer-footer"/u,
+    "the ended record must not share its final compact grid row with the live footer");
   assert.match(css, /\.live-viewer-shell\.is-compact\s*\{[^}]*grid-template-rows:/s);
   assert.match(css, /\.live-viewer-shell\.is-compact \.live-viewer-footer\s*\{[^}]*min-height:\s*0/s);
+});
+
+test("meeting minutes group by participant identity while preserving the display label", async () => {
+  const minutes = await read("webapp/components/live/MeetingMinutes.tsx");
+  const start = minutes.indexOf("export function groupTranscript");
+  const end = minutes.indexOf("\n\nexport function formatMinuteTime", start);
+  assert.ok(start >= 0 && end > start, "groupTranscript must remain independently testable");
+  const runnableSource = minutes.slice(start, end)
+    .replace(
+      "export function groupTranscript(entries: TranscriptEntry[]): TranscriptTurn[]",
+      "function groupTranscript(entries)",
+    )
+    .replace("const turns: TranscriptTurn[] = []", "const turns = []");
+  const groupTranscript = new Function(`${runnableSource}; return groupTranscript;`)();
+  const turns = groupTranscript([
+    { seq: 1, participantId: "participant-a", speaker: "Alex", text: "one", emittedAt: "2026-07-26T01:00:00Z" },
+    { seq: 2, participantId: "participant-a", speaker: "Alex rejoined", text: "two", emittedAt: "2026-07-26T01:00:01Z" },
+    { seq: 3, participantId: "participant-b", speaker: "Alex", text: "three", emittedAt: "2026-07-26T01:00:02Z" },
+    { seq: 4, speaker: "Host", text: "four", emittedAt: "2026-07-26T01:00:03Z" },
+    { seq: 5, speaker: "Host", text: "five", emittedAt: "2026-07-26T01:00:04Z" },
+  ]);
+
+  assert.deepEqual(turns.map((turn) => ({ speaker: turn.speaker, text: turn.texts.join(" ") })), [
+    { speaker: "Alex", text: "one two" },
+    { speaker: "Alex", text: "three" },
+    { speaker: "Host", text: "four five" },
+  ]);
+});
+
+test("live meeting turns use speaker IDs rather than colliding display labels", async () => {
+  const feed = await read("webapp/components/live/MeetingTurnFeed.tsx");
+  const start = feed.indexOf("export function groupCaptionsIntoTurns");
+  const end = feed.indexOf("\n\n/** True", start);
+  assert.ok(start >= 0 && end > start, "groupCaptionsIntoTurns must remain independently testable");
+  const runnableSource = feed.slice(start, end)
+    .replace(
+      "export function groupCaptionsIntoTurns(captions: CaptionEvent[]): MeetingTurn[]",
+      "function groupCaptionsIntoTurns(captions)",
+    )
+    .replace("const turns: MeetingTurn[] = []", "const turns = []");
+  const groupCaptionsIntoTurns = new Function(
+    "speakerMetaLine",
+    "resolveSpeakerColor",
+    `${runnableSource}; return groupCaptionsIntoTurns;`,
+  )((speaker) => speaker?.label ?? "Host", () => "#000");
+  const captions = [
+    { seq: 1, isFinal: true, text: "one", emittedAt: "2026-07-26T01:00:00Z", speaker: { speakerId: "a", label: "Alex" } },
+    { seq: 2, isFinal: true, text: "two", emittedAt: "2026-07-26T01:00:01Z", speaker: { speakerId: "a", label: "Alex rejoined" } },
+    { seq: 3, isFinal: true, text: "three", emittedAt: "2026-07-26T01:00:02Z", speaker: { speakerId: "b", label: "Alex" } },
+    { seq: 4, isFinal: true, text: "four", emittedAt: "2026-07-26T01:00:03Z" },
+    { seq: 5, isFinal: true, text: "five", emittedAt: "2026-07-26T01:00:04Z" },
+  ];
+  const turns = groupCaptionsIntoTurns(captions);
+
+  assert.deepEqual(turns.map((turn) => ({ identity: turn.speakerIdentity, label: turn.speakerLabel, text: turn.texts.join(" ") })), [
+    { identity: "a", label: "Alex", text: "one two" },
+    { identity: "b", label: "Alex", text: "three" },
+    { identity: "host", label: "Host", text: "four five" },
+  ]);
 });
 
 test("live web surfaces use English copy without emoji", async () => {
@@ -1021,9 +1082,8 @@ test("desktop Live Call draft always issues QR and code, validates local cover d
   assert.match(workspace, /t\("live\.stageUp", \{ code: result\.admissionCode/);
   assert.match(html, /id="live-draft-cover-rules"/);
   assert.match(html, /id="live-draft-cover-status"[^>]*role="status"[^>]*aria-live="polite"/);
-  assert.match(html, /name="liveDisplayLanguage"[^>]*value="ko"[^>]*checked/);
-  assert.match(html, /name="liveDisplayLanguage"[^>]*value="en"/);
-  assert.match(html, /id="live-display-language-help"[^>]*data-i18n="live\.displayLanguageHelp"/);
+  assert.doesNotMatch(html, /name="liveDisplayLanguage"/);
+  assert.match(html, /data-i18n="live\.captionLanguagePolicy"/);
   assert.match(html, /id="live-host-login-status"[^>]*role="status"[^>]*aria-live="polite"/);
   assert.doesNotMatch(html, /id="open-meeting-mode"|name="liveHostWorkspaceUrl"|Open Live Call/);
   assert.match(css, /\.live-draft-cover-status\.is-error/);
@@ -1038,9 +1098,8 @@ test("desktop Live Call draft always issues QR and code, validates local cover d
   assert.match(workspace, /size: file\.size/);
   assert.match(workspace, /base64: window\.btoa\(binary\)/);
   assert.match(workspace, /coverImage: liveDraftCoverData/);
-  assert.match(workspace, /DRAFT_FIELDS = \[[^\]]*"liveDisplayLanguage"/);
-  assert.match(workspace, /displayLanguage: liveDisplayLanguage\(\)/);
-  assert.match(workspace, /startRegisteredLiveCall\(sessionId, \{ displayLanguage: liveDisplayLanguage\(\) \}\)/);
+  assert.doesNotMatch(workspace, /liveDisplayLanguage|displayLanguage/u);
+  assert.match(workspace, /startRegisteredLiveCall\(sessionId\)/);
   assert.match(workspace, /result\?\.code === "HOST_LOGIN_REQUIRED"/);
   assert.match(workspace, /t\("live\.hostLoginRequired"\)/);
   assertLocalized("live.hostLoginRequired", { en: /Open Settings and save the host authorization/ });

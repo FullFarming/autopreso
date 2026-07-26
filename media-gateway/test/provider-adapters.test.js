@@ -271,6 +271,33 @@ test("a slow committed caption never delays interpreted audio", async () => {
   await session.close();
 });
 
+test("Gemini forwards output transcription language metadata to caption callbacks", async () => {
+  const captions = [];
+  let messageHandler;
+  const adapter = new GeminiLiveTranslateAdapter({
+    model: "gemini-3.5-live-translate-preview",
+    client: { live: { async connect(options) {
+      messageHandler = options.callbacks.onmessage;
+      return { sendRealtimeInput() {}, close() {} };
+    } } },
+  });
+  const session = await adapter.open({
+    language: "ko",
+    async onCaption(value) { captions.push(value); },
+    async onAudio() {},
+  });
+
+  messageHandler({ serverContent: {
+    outputTranscription: { text: "Echoed English.", languageCode: "en-US" },
+    turnComplete: true,
+  } });
+  for (let tick = 0; tick < 4; tick += 1) await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(captions.length, 1);
+  assert.equal(captions[0].languageCode, "en-US");
+  await session.close();
+});
+
 test("Gemini Live Translate uses the official audio-only translation configuration", async () => {
   const connections = [];
   const audio = [];

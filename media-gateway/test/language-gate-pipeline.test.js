@@ -318,6 +318,90 @@ test("the source-language input transcript stays marked origin:source", async ()
   assert.notEqual(captions[0].translationStatus, "failed", "the source lane is not a failed translation");
 });
 
+test("provider input language wins over script heuristics for code-switched source captions", async () => {
+  const state = makeDependencies();
+  const { pipeline, sessions } = makeLivePipeline(state);
+  await pipeline.start();
+
+  await sessions.get("ko").onInputCaption({
+    text: "서울 office market 3천억 원",
+    isFinal: true,
+    languageCode: "en-US",
+  });
+
+  const captions = state.captions();
+  assert.equal(captions.length, 1);
+  assert.equal(captions[0].language, "en");
+  assert.equal(captions[0].sourceLanguage, "en");
+  assert.equal(captions[0].origin, "source");
+});
+
+test("KO and EN same-language output echoes are dropped before durable publish", async () => {
+  const state = makeDependencies();
+  const { pipeline, sessions } = makeLivePipeline(state);
+  await pipeline.start();
+
+  await sessions.get("ko").onInputCaption({ text: "한국어 원문입니다.", isFinal: true, languageCode: "ko-KR" });
+  await sessions.get("ko").onCaption({
+    text: "한국어 원문입니다.",
+    isFinal: true,
+    sourceText: "한국어 원문입니다.",
+    sourceLanguage: "ko-KR",
+  });
+  await sessions.get("ko").onInputCaption({ text: "English source.", isFinal: true, languageCode: "en-US" });
+  await sessions.get("en").onCaption({
+    text: "English source.",
+    isFinal: true,
+    sourceText: "English source.",
+    sourceLanguage: "en-US",
+  });
+
+  const captions = state.captions();
+  assert.deepEqual(captions.map(({ language, origin }) => ({ language, origin })), [
+    { language: "ko", origin: "source" },
+    { language: "en", origin: "source" },
+  ]);
+});
+
+test("partial and final echoes stay suppressed while the opposite translation survives", async () => {
+  const state = makeDependencies();
+  const { pipeline, sessions } = makeLivePipeline(state);
+  await pipeline.start();
+
+  await sessions.get("ko").onInputCaption({ text: "안녕하세요", isFinal: false, languageCode: "ko-KR" });
+  await sessions.get("ko").onCaption({ text: "안녕하세요", isFinal: false, languageCode: "ko-KR" });
+  await sessions.get("ko").onInputCaption({ text: "안녕하세요.", isFinal: true, languageCode: "ko-KR" });
+  await sessions.get("ko").onCaption({ text: "안녕하세요.", isFinal: true, languageCode: "ko-KR" });
+  await sessions.get("en").onCaption({
+    text: "Hello.",
+    isFinal: true,
+    languageCode: "en-US",
+    sourceText: "안녕하세요.",
+    sourceLanguage: "ko-KR",
+  });
+
+  const captions = state.captions();
+  assert.equal(captions.filter((caption) => caption.origin === "source").length, 2);
+  assert.equal(captions.some((caption) => caption.language === "ko" && caption.origin !== "source"), false);
+  assert.equal(captions.some((caption) => caption.language === "en" && caption.text === "Hello."), true);
+});
+
+test("provider output language metadata rejects a target mismatch before publish", async () => {
+  const state = makeDependencies();
+  const { pipeline, sessions } = makeLivePipeline(state);
+  await pipeline.start();
+
+  await sessions.get("ko").onCaption({
+    text: "겉보기에는 한국어지만 provider는 영어로 판정했습니다.",
+    isFinal: true,
+    languageCode: "en-US",
+    sourceText: "English source.",
+    sourceLanguage: "en-US",
+  });
+
+  assert.equal(state.captions().length, 0);
+});
+
 // ─────────────────────────────────────────────────────────────────────────────
 // The caption is the FINAL ARTIFACT: corrections happen inline during
 // generation (glossary + number notation), so what is displayed is already the

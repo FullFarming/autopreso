@@ -3183,8 +3183,8 @@ if (window.realtimeNoelDesktop?.onLiveCallCaption) {
     const speakerName = String(caption.speaker?.name
       ?? caption.speaker?.label
       ?? (caption.speaker?.isParticipant === true ? t("live.participant") : ""));
-    // Main has already selected the one desktop lane. A source caption in that
-    // language is the correct screen line, not record-only metadata.
+    // Main has already removed source-language events and selected the single
+    // opposite-language translation that belongs on the desktop screen.
     if (caption.translationStatus === "failed") return;
     state.ws.send(JSON.stringify({
       type: "subtitle:live-call-caption",

@@ -194,6 +194,8 @@ test("utterance retrieval keyset-pages beyond the former 5,000 row limit without
   assert.equal(result.length, 5_001);
   assert.deepEqual([result[0]?.seq, result.at(-1)?.seq], [1, 5_001]);
   assert.equal(requests.length, 6);
+  assert.match(requests[0]?.searchParams.get("select") ?? "", /participant_id/u);
+  assert.match(requests[0]?.searchParams.get("select") ?? "", /source_text,source_language,origin,utterance_key,translation_status/u);
   assert.deepEqual(
     requests.map((url) => [url.searchParams.get("limit"), url.searchParams.get("seq")]),
     [
@@ -205,6 +207,46 @@ test("utterance retrieval keyset-pages beyond the former 5,000 row limit without
       ["1000", "gt.5000"],
     ],
   );
+});
+
+test("utterance retrieval preserves optional replay provenance", async () => {
+  const row = {
+    ...utteranceRow(1),
+    source_text: "original",
+    source_language: "en",
+    origin: null,
+    utterance_key: "session-1:input:1",
+    translation_status: "translated",
+  };
+  const result = await withSupabaseTestEnvironment(
+    () => fetchUtterances("session-1", "ko", async () => Response.json([row])),
+  );
+  assert.deepEqual({
+    participantId: result[0]?.participantId,
+    sourceText: result[0]?.sourceText,
+    sourceLanguage: result[0]?.sourceLanguage,
+    origin: result[0]?.origin,
+    utteranceKey: result[0]?.utteranceKey,
+    translationStatus: result[0]?.translationStatus,
+  }, {
+    participantId: "participant-1",
+    sourceText: "original",
+    sourceLanguage: "en",
+    origin: null,
+    utteranceKey: "session-1:input:1",
+    translationStatus: "translated",
+  });
+});
+
+test("utterance retrieval excludes failed translation rows from minutes and summaries", async () => {
+  const rows = [
+    { ...utteranceRow(1), translation_status: "failed" },
+    { ...utteranceRow(2), translation_status: "translated" },
+  ];
+  const result = await withSupabaseTestEnvironment(
+    () => fetchUtterances("session-1", "ko", async () => Response.json(rows)),
+  );
+  assert.deepEqual(result.map((utterance) => utterance.seq), [2]);
 });
 
 test("utterance pagination fails closed on a later page error without retrying", async () => {

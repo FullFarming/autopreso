@@ -11,6 +11,7 @@ import MeetingSummaryCard from "./MeetingSummaryCard";
 
 export interface TranscriptEntry {
   seq: number;
+  participantId?: string | null;
   speaker: string;
   text: string;
   emittedAt: string;
@@ -18,20 +19,22 @@ export interface TranscriptEntry {
 
 interface TranscriptTurn {
   key: string;
+  speakerIdentity: string;
   speaker: string;
   startedAt: string;
   texts: string[];
 }
 
-function groupTranscript(entries: TranscriptEntry[]): TranscriptTurn[] {
+export function groupTranscript(entries: TranscriptEntry[]): TranscriptTurn[] {
   const turns: TranscriptTurn[] = [];
   for (const entry of entries) {
+    const speakerIdentity = entry.participantId ?? entry.speaker;
     const previous = turns.at(-1);
-    if (previous && previous.speaker === entry.speaker) {
+    if (previous && previous.speakerIdentity === speakerIdentity) {
       previous.texts.push(entry.text);
       continue;
     }
-    turns.push({ key: `minute-${entry.seq}`, speaker: entry.speaker, startedAt: entry.emittedAt, texts: [entry.text] });
+    turns.push({ key: `minute-${entry.seq}`, speakerIdentity, speaker: entry.speaker, startedAt: entry.emittedAt, texts: [entry.text] });
   }
   return turns;
 }

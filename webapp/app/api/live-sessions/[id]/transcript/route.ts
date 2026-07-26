@@ -36,6 +36,12 @@ export async function GET(request: NextRequest, context: { params: Promise<{ id:
         speaker: utterance.speakerName ?? utterance.speakerLabel ?? "발표자",
         text: utterance.text,
         emittedAt: utterance.emittedAt,
+        ...(utterance.participantId ? { participantId: utterance.participantId } : {}),
+        ...(utterance.sourceText ? { sourceText: utterance.sourceText } : {}),
+        ...(utterance.sourceLanguage ? { sourceLanguage: utterance.sourceLanguage } : {}),
+        ...(utterance.origin ? { origin: utterance.origin } : {}),
+        ...(utterance.utteranceKey ? { utteranceKey: utterance.utteranceKey } : {}),
+        ...(utterance.translationStatus ? { translationStatus: utterance.translationStatus } : {}),
       })),
     });
   } catch (error: unknown) {

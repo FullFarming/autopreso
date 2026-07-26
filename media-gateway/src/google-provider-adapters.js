@@ -117,6 +117,7 @@ export class GeminiLiveTranslateAdapter {
     let outputLane = makeTranscriptLane();
     let inputLane = makeTranscriptLane();
     let inputTranscriptLanguageCode = null;
+    let outputTranscriptLanguageCode = null;
     let nextUtteranceIdentity = 0;
     const utteranceNamespace = encodeURIComponent(String(language));
     const inputContexts = [];
@@ -132,6 +133,7 @@ export class GeminiLiveTranslateAdapter {
       outputLane = makeTranscriptLane();
       inputLane = makeTranscriptLane();
       inputTranscriptLanguageCode = null;
+      outputTranscriptLanguageCode = null;
       inputContexts.length = 0;
       captureSegments.length = 0;
       pendingOutputFinal = null;
@@ -227,10 +229,13 @@ export class GeminiLiveTranslateAdapter {
       }
     }
     const emitOutput = async (caption) => {
+      const captionWithLanguage = outputTranscriptLanguageCode
+        ? { ...caption, languageCode: outputTranscriptLanguageCode }
+        : caption;
       const context = caption.isFinal ? takeInputContext() : (inputContexts[0] ?? null);
       if (caption.isFinal && !context && correlateInputCaption) {
         if (pendingOutputFinal) await deliverOutput(pendingOutputFinal, null);
-        pendingOutputFinal = caption;
+        pendingOutputFinal = captionWithLanguage;
         if (pendingOutputTimer !== null) clearTimeout(pendingOutputTimer);
         pendingOutputTimer = setTimeout(() => {
           pendingOutputTimer = null;
@@ -243,7 +248,7 @@ export class GeminiLiveTranslateAdapter {
         }, 120);
         return;
       }
-      await deliverOutput(caption, context);
+      await deliverOutput(captionWithLanguage, context);
     };
     // Silence flush: the model sends no turn signal during continuous talk,
     // so a short pause commits whatever remains as the final segment.
@@ -367,6 +372,7 @@ export class GeminiLiveTranslateAdapter {
                 }
               }
               if (transcription?.text) {
+                if (transcription.languageCode) outputTranscriptLanguageCode = transcription.languageCode;
                 outputLane.accumulated = mergeLiveTranscript(outputLane.accumulated, transcription.text);
                 if (!isTurnComplete) {
                   await emitLane(outputLane, emitOutput);
@@ -387,6 +393,7 @@ export class GeminiLiveTranslateAdapter {
                 inputContexts.length = 0;
                 if (captureSegments.length > 1) captureSegments.splice(0, captureSegments.length - 1);
                 inputTranscriptLanguageCode = null;
+                outputTranscriptLanguageCode = null;
               } else if (transcription?.text || inputTranscription?.text) {
                 armFinalFlushTimer(connectionGeneration);
               }

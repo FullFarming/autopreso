@@ -257,6 +257,7 @@ test("publisher fans out locally and persists only through active-session RPCs",
     emittedAt: "2026-07-23T00:00:04.100Z",
     sourceText: "private",
     sourceLanguage: "en",
+    translationStatus: "translated",
   };
   await publisher.publish("session-1", "ko", caption);
   await publisher.publish("session-1", "ko", { type: "speaker-legend", speakers: [] });
@@ -276,6 +277,7 @@ test("publisher fans out locally and persists only through active-session RPCs",
   // viewer's 원문보기 disclosure has nothing to reveal after a reconnect.
   assert.equal(calls[1].body.p_source_text, "private");
   assert.equal(calls[1].body.p_source_language, "en");
+  assert.equal(calls[1].body.p_translation_status, "translated");
 });
 
 test("a source-lane caption persists with no duplicated original", async () => {
@@ -299,6 +301,7 @@ test("a source-lane caption persists with no duplicated original", async () => {
   assert.equal(utterance.body.p_source_language, "ko");
   assert.equal(utterance.body.p_origin, "source");
   assert.equal(utterance.body.p_utterance_key, "session-1:input:1");
+  assert.equal(utterance.body.p_translation_status, "verbatim");
   const snapshot = calls.find((call) => call.url.includes("persist_live_snapshot_if_active"));
   assert.equal(snapshot.body.p_event.origin, "source");
   assert.equal(snapshot.body.p_event.utteranceKey, "session-1:input:1");
@@ -502,7 +505,7 @@ test("publisher maps persisted utterances to replayable caption events in ascend
     async fetchFn(url) {
       seen = new URL(url);
       return new Response(JSON.stringify([
-        { seq: 3, speaker_label: "speaker-1", speaker_name: "김노엘", text: "셋", source_text: "three", source_language: "en", source_ended_at: "2026-07-23T00:00:03Z", emitted_at: "2026-07-23T00:00:03.100Z" },
+        { seq: 3, participant_id: "participant-1", speaker_label: "participant:participant-1", speaker_name: "김노엘", text: "셋", source_text: "three", source_language: "en", translation_status: "failed", source_ended_at: "2026-07-23T00:00:03Z", emitted_at: "2026-07-23T00:00:03.100Z" },
         { seq: 4, speaker_label: null, speaker_name: null, text: "원문", source_text: null, source_language: "ko", origin: "source", utterance_key: "session-1:input:4", source_ended_at: "2026-07-23T00:00:04Z", emitted_at: "2026-07-23T00:00:04.100Z" },
         // A row predating the provenance columns: replay must still work and
         // simply offer no original to disclose.
@@ -522,7 +525,7 @@ test("publisher maps persisted utterances to replayable caption events in ascend
   // The full SpeakerAssignment shape: the webapp viewer validates every field
   // and silently drops replayed captions whose speaker is partial.
   assert.deepEqual(events[0].speaker, {
-    speakerId: "speaker-1",
+    speakerId: "participant:participant-1",
     label: "김노엘",
     name: "김노엘",
     colorToken: "speaker-teal",
@@ -534,8 +537,10 @@ test("publisher maps persisted utterances to replayable caption events in ascend
   assert.equal(seen.searchParams.get("select")?.includes("source_text,source_language"), true);
   assert.deepEqual(
     events.map((event) => [event.sourceText, event.sourceLanguage, event.translationStatus, event.origin, event.utteranceKey]),
-    [["three", "en", "translated", undefined, undefined], [null, "ko", "verbatim", "source", "session-1:input:4"], [null, null, "verbatim", undefined, undefined]],
+    [["three", "en", "failed", undefined, undefined], [null, "ko", "verbatim", "source", "session-1:input:4"], [null, null, "verbatim", undefined, undefined]],
   );
+  assert.match(seen.searchParams.get("select"), /participant_id/u);
+  assert.match(seen.searchParams.get("select"), /translation_status/u);
 });
 
 test("floor controller resolves participant identity for floor broadcasts and degrades to null", async () => {
