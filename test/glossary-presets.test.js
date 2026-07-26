@@ -4,6 +4,7 @@ import { test } from "node:test";
 import { readFileSync } from "node:fs";
 
 import { GLOSSARY_PRESETS } from "../src/glossary-presets.js";
+import { buildLiveCallGlossary, liveCallGlossaryPolicy } from "../src/live-call-glossary.js";
 import { MAX_SUBTITLE_GLOSSARY_CHARS } from "../src/settings-store.js";
 
 // A shipped preset that does not fit the configured glossary limit is worse than
@@ -26,19 +27,14 @@ test("every shipped preset fits every glossary size limit in the repo", () => {
     `largest preset is ${largest} chars but webapp/lib/settings.ts slices at ${webappLimit}`,
   );
 
-  // electron/main.js mirrors the saved glossary into the Live Call start
-  // message. This site was missed when the other three ceilings were raised, so
-  // local captions used the full glossary while Live Call silently got one cut
-  // mid-file — the reported "라이브콜 번역 퀄리티가 다르다".
-  const desktopLiveLimit = Number(
-    /subtitle\?\.glossary \?\? ""\)\.trim\(\)\.slice\(0, ([\d_]+)\)/u
-      .exec(readFileSync("electron/main.js", "utf8"))?.[1]
-      ?.replace(/_/gu, ""),
-  );
-  assert.ok(
-    largest <= desktopLiveLimit,
-    `largest preset is ${largest} chars but electron/main.js slices the Live Call glossary at ${desktopLiveLimit}`,
-  );
+  // Live Call intentionally derives a complete, section-aware lean glossary;
+  // it must fit its own transport budget without cutting an arbitrary source
+  // position or mutating the captions-only preset.
+  for (const preset of GLOSSARY_PRESETS) {
+    const liveGlossary = buildLiveCallGlossary(preset.glossary);
+    assert.ok(liveGlossary.length <= liveCallGlossaryPolicy.maxChars);
+    assert.equal(preset.glossary.length <= MAX_SUBTITLE_GLOSSARY_CHARS, true);
+  }
 
   const gatewayLimit = Number(
     /glossaryText \?\? ""\)\.trim\(\)\.slice\(0, ([\d_]+)\)/u

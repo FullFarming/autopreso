@@ -48,7 +48,7 @@ test("floor controller takes and releases the floor through guarded RPCs", async
   assert.equal(await failing.release("session-1", "grant-1"), false);
 });
 
-test("publisher persists final captions as utterances without failing the pipeline", async () => {
+test("publisher persists each final through the atomic durable RPC", async () => {
   const rpcCalls = [];
   const publisher = new SupabaseLivePublisher({
     baseUrl: "https://example.supabase.co",
@@ -58,10 +58,6 @@ test("publisher persists final captions as utterances without failing the pipeli
     audioFanout: async () => {},
     async fetchFn(url, init) {
       rpcCalls.push({ url, init });
-      if (url.endsWith("/rest/v1/rpc/persist_live_utterance_if_active")) {
-        // Cap reached: RPC declines, publish must still succeed.
-        return new Response("false", { status: 200, headers: { "Content-Type": "application/json" } });
-      }
       return new Response("true", { status: 200, headers: { "Content-Type": "application/json" } });
     },
   });
@@ -78,9 +74,10 @@ test("publisher persists final captions as utterances without failing the pipeli
     emittedAt: "2026-07-23T00:00:01Z",
   });
 
-  const utteranceCall = rpcCalls.find((call) => call.url.endsWith("/rest/v1/rpc/persist_live_utterance_if_active"));
-  assert.ok(utteranceCall, "utterance RPC should be called for final captions");
+  const utteranceCall = rpcCalls.find((call) => call.url.endsWith("/rest/v1/rpc/persist_live_final_caption_if_active"));
+  assert.ok(utteranceCall, "atomic durable RPC should be called for final captions");
   const payload = JSON.parse(utteranceCall.init.body);
+  assert.equal(payload.p_event.seq, 7);
   assert.equal(payload.p_seq, 7);
   assert.equal(payload.p_text, "안녕하세요");
   assert.equal(payload.p_speaker_label, "speaker-1");

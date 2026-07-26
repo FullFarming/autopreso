@@ -45,7 +45,7 @@ test("utterance replay forwards and observes its abort signal", async () => {
   assert.equal(observedSignal, abortController.signal);
 });
 
-test("snapshot guard timeout fails closed without poisoning the next publish", async () => {
+test("atomic final timeout fails closed and latches the lane without retry", async () => {
   const delivered = [];
   const mirrored = [];
   const observedSignals = [];
@@ -56,7 +56,7 @@ test("snapshot guard timeout fails closed without poisoning the next publish", a
     async eventFanout(_sessionId, _language, event) { delivered.push(event); },
     async audioFanout() {},
     async fetchFn(url, init) {
-      if (String(url).includes("persist_live_snapshot_if_active")) {
+      if (String(url).includes("persist_live_final_caption_if_active")) {
         snapshotAttempts += 1;
         observedSignals.push(init.signal);
         if (snapshotAttempts === 1) return new Promise(() => {});
@@ -72,21 +72,24 @@ test("snapshot guard timeout fails closed without poisoning the next publish", a
       { type: "caption", seq: 1, isFinal: true, text: "시간 초과" },
       { onLiveEvent: async (event) => mirrored.push(event) },
     ),
-    /SNAPSHOT_GUARD_TIMEOUT/u,
+    /DURABLE_CAPTION_PERSIST_FAILED/u,
   );
   assert.equal(observedSignals[0]?.aborted, true);
   assert.deepEqual(delivered, []);
   assert.deepEqual(mirrored, []);
 
-  await publisher.publish(
-    "session-1",
-    "ko",
-    { type: "caption", seq: 2, isFinal: true, text: "다음 문장" },
-    { onLiveEvent: async (event) => mirrored.push(event) },
+  await assert.rejects(
+    publisher.publish(
+      "session-1",
+      "ko",
+      { type: "caption", seq: 2, isFinal: true, text: "다음 문장" },
+      { onLiveEvent: async (event) => mirrored.push(event) },
+    ),
+    /DURABLE_CAPTION_LANE_FAILED/u,
   );
-  assert.equal(snapshotAttempts, 2);
-  assert.deepEqual(delivered.map((event) => event.text), ["다음 문장"]);
-  assert.deepEqual(mirrored.map((event) => event.text), ["다음 문장"]);
+  assert.equal(snapshotAttempts, 1, "an ambiguous commit must never be retried automatically");
+  assert.deepEqual(delivered, []);
+  assert.deepEqual(mirrored, []);
 });
 
 test("snapshot guard timeout configuration is bounded and fail-closed", () => {
@@ -266,18 +269,17 @@ test("publisher fans out locally and persists only through active-session RPCs",
   assert.deepEqual(events.map((entry) => entry[2].type), ["caption", "speaker-legend"]);
   assert.equal(audio.length, 1);
   assert.deepEqual(calls.map((call) => new URL(call.url).pathname), [
-    "/rest/v1/rpc/persist_live_snapshot_if_active",
-    "/rest/v1/rpc/persist_live_utterance_if_active",
+    "/rest/v1/rpc/persist_live_final_caption_if_active",
     "/rest/v1/rpc/persist_session_speakers_if_active",
   ]);
   assert.equal(calls.some((call) => call.url.includes("/realtime/")), false);
-  assert.equal(calls[1].body.p_participant_id, "grant-1");
-  assert.equal(calls[1].body.p_source_started_at, "2026-07-23T00:00:00.000Z");
+  assert.equal(calls[0].body.p_participant_id, "grant-1");
+  assert.equal(calls[0].body.p_source_started_at, "2026-07-23T00:00:00.000Z");
   // The original must be persisted alongside the translation, otherwise the
   // viewer's 원문보기 disclosure has nothing to reveal after a reconnect.
-  assert.equal(calls[1].body.p_source_text, "private");
-  assert.equal(calls[1].body.p_source_language, "en");
-  assert.equal(calls[1].body.p_translation_status, "translated");
+  assert.equal(calls[0].body.p_source_text, "private");
+  assert.equal(calls[0].body.p_source_language, "en");
+  assert.equal(calls[0].body.p_translation_status, "translated");
 });
 
 test("a source-lane caption persists with no duplicated original", async () => {
@@ -296,15 +298,14 @@ test("a source-lane caption persists with no duplicated original", async () => {
     speaker: null, sourceText: null, sourceLanguage: "ko",
     sourceEndedAt: "2026-07-23T00:00:04.000Z", emittedAt: "2026-07-23T00:00:04.100Z",
   });
-  const utterance = calls.find((call) => call.url.includes("persist_live_utterance_if_active"));
-  assert.equal(utterance.body.p_source_text, null);
-  assert.equal(utterance.body.p_source_language, "ko");
-  assert.equal(utterance.body.p_origin, "source");
-  assert.equal(utterance.body.p_utterance_key, "session-1:input:1");
-  assert.equal(utterance.body.p_translation_status, "verbatim");
-  const snapshot = calls.find((call) => call.url.includes("persist_live_snapshot_if_active"));
-  assert.equal(snapshot.body.p_event.origin, "source");
-  assert.equal(snapshot.body.p_event.utteranceKey, "session-1:input:1");
+  const combined = calls.find((call) => call.url.includes("persist_live_final_caption_if_active"));
+  assert.equal(combined.body.p_source_text, null);
+  assert.equal(combined.body.p_source_language, "ko");
+  assert.equal(combined.body.p_origin, "source");
+  assert.equal(combined.body.p_utterance_key, "session-1:input:1");
+  assert.equal(combined.body.p_translation_status, "verbatim");
+  assert.equal(combined.body.p_event.origin, "source");
+  assert.equal(combined.body.p_event.utteranceKey, "session-1:input:1");
 });
 
 test("publisher treats a guarded RPC false result as a stopped session", async () => {
@@ -341,18 +342,18 @@ test("a transient snapshot guard failure fails closed before caption broadcast",
     async eventFanout(...args) { fanned.push(args); },
     async audioFanout() {},
     async fetchFn(url) {
-      if (String(url).includes("persist_live_snapshot_if_active")) return new Response("", { status: 503 });
+      if (String(url).includes("persist_live_final_caption_if_active")) return new Response("", { status: 503 });
       return new Response("true", { status: 200, headers: { "Content-Type": "application/json" } });
     },
   });
   await assert.rejects(
     publisher.publish("session-1", "ko", { type: "caption", seq: 1, isFinal: true, text: "차단" }),
-    /SUPABASE_PUBLISH_FAILED/u,
+    /DURABLE_CAPTION_PERSIST_FAILED/u,
   );
   assert.equal(fanned.length, 0, "an unverified final must not reach a viewer");
 });
 
-test("live fanout is not delayed by utterance persistence", async () => {
+test("final fanout waits for the atomic durable commit", async () => {
   const delivered = [];
   let releasePersistence;
   const persistenceGate = new Promise((resolve) => { releasePersistence = resolve; });
@@ -361,7 +362,7 @@ test("live fanout is not delayed by utterance persistence", async () => {
     async eventFanout(_sessionId, _language, event) { delivered.push(event); },
     async audioFanout() {},
     async fetchFn(url) {
-      if (String(url).includes("persist_live_utterance_if_active")) await persistenceGate;
+      if (String(url).includes("persist_live_final_caption_if_active")) await persistenceGate;
       return new Response("true", { status: 200, headers: { "Content-Type": "application/json" } });
     },
   });
@@ -370,9 +371,10 @@ test("live fanout is not delayed by utterance persistence", async () => {
     sourceEndedAt: "2026-07-23T00:00:04.000Z", emittedAt: "2026-07-23T00:00:04.100Z",
   });
   await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(delivered[0]?.text, "즉시 표시");
+  assert.deepEqual(delivered, [], "a final must remain invisible until both records commit");
   releasePersistence();
   await publishing;
+  assert.equal(delivered[0]?.text, "즉시 표시");
 });
 
 test("a stopped snapshot guard blocks viewer and host live delivery", async () => {
@@ -383,7 +385,7 @@ test("a stopped snapshot guard blocks viewer and host live delivery", async () =
     async eventFanout(_sessionId, _language, event) { delivered.push(event); },
     async audioFanout() {},
     async fetchFn(url) {
-      const value = String(url).includes("persist_live_snapshot_if_active") ? false : true;
+      const value = String(url).includes("persist_live_final_caption_if_active") ? false : true;
       return Response.json(value);
     },
   });
@@ -400,16 +402,16 @@ test("a stopped snapshot guard blocks viewer and host live delivery", async () =
   assert.deepEqual(mirrored, []);
 });
 
-test("an utterance recording failure remains non-fatal and emits an observable recording error", async () => {
+test("an atomic utterance failure blocks delivery and every later final on that lane", async () => {
   const fanned = [];
-  let utterancePersistAttempts = 0;
+  let durableAttempts = 0;
   const publisher = new SupabaseLivePublisher({
     baseUrl: "https://dev-ref.supabase.co", serviceRoleKey: "secret",
     async eventFanout(...args) { fanned.push(args); },
     async audioFanout() {},
     async fetchFn(url) {
-      if (String(url).includes("persist_live_utterance_if_active")) {
-        utterancePersistAttempts += 1;
+      if (String(url).includes("persist_live_final_caption_if_active")) {
+        durableAttempts += 1;
         return new Response("", { status: 503 });
       }
       return new Response("true", { status: 200, headers: { "Content-Type": "application/json" } });
@@ -424,40 +426,26 @@ test("an utterance recording failure remains non-fatal and emits an observable r
     emittedAt: "2026-07-24T00:00:04.100Z",
   };
 
-  await assert.doesNotReject(publisher.publish("session-1", "ko", caption));
-  assert.equal(utterancePersistAttempts, 1, "recording errors must not be hidden by an automatic retry");
-  assert.deepEqual(fanned.map((entry) => entry[2]), [
-    caption,
-    {
-      type: "recording-status",
-      sessionId: "session-1",
-      language: "ko",
-      status: "error",
-      code: "UTTERANCE_PERSIST_FAILED",
-      seq: 12,
-      message: "자막은 계속 표시되지만 기록 저장에 실패했습니다.",
-    },
-  ]);
+  await assert.rejects(publisher.publish("session-1", "ko", caption), /DURABLE_CAPTION_PERSIST_FAILED/u);
+  await assert.rejects(
+    publisher.publish("session-1", "ko", { ...caption, seq: 13, text: "다음 문장" }),
+    /DURABLE_CAPTION_LANE_FAILED/u,
+  );
+  assert.equal(durableAttempts, 1, "recording errors must not be hidden by an automatic retry");
+  assert.deepEqual(fanned, []);
 });
 
-test("an utterance RPC false result is reported as a recording error without ending captions", async () => {
-  const fanned = [];
+test("a combined RPC false result is treated only as a stopped session", async () => {
   const publisher = new SupabaseLivePublisher({
     baseUrl: "https://dev-ref.supabase.co", serviceRoleKey: "secret",
-    async eventFanout(...args) { fanned.push(args[2]); },
+    async eventFanout() { throw new Error("must not fan out"); },
     async audioFanout() {},
-    async fetchFn(url) {
-      const value = String(url).includes("persist_live_utterance_if_active") ? false : true;
-      return Response.json(value);
-    },
+    async fetchFn() { return Response.json(false); },
   });
-  await publisher.publish("session-1", "en", {
-    type: "caption", seq: 13, isFinal: true, text: "still live",
-  });
-  assert.deepEqual(fanned.map((event) => [event.type, event.code ?? null]), [
-    ["caption", null],
-    ["recording-status", "UTTERANCE_PERSIST_FAILED"],
-  ]);
+  await assert.rejects(
+    publisher.publish("session-1", "en", { type: "caption", seq: 13, isFinal: true, text: "stopped" }),
+    /SESSION_STOPPED/u,
+  );
 });
 
 test("a genuine snapshot RPC decline still stops emission as SESSION_STOPPED", async () => {
@@ -465,7 +453,7 @@ test("a genuine snapshot RPC decline still stops emission as SESSION_STOPPED", a
     baseUrl: "https://dev-ref.supabase.co", serviceRoleKey: "secret",
     async eventFanout() {}, async audioFanout() {},
     async fetchFn(url) {
-      if (String(url).includes("persist_live_snapshot_if_active")) {
+      if (String(url).includes("persist_live_final_caption_if_active")) {
         return new Response("false", { status: 200, headers: { "Content-Type": "application/json" } });
       }
       return new Response("true", { status: 200, headers: { "Content-Type": "application/json" } });
@@ -606,7 +594,7 @@ test("null-speaker meeting finals persist and their replay passes the viewer con
     speaker: null, text: "Hello everyone.", isFinal: true,
     sourceEndedAt: "2026-07-24T00:00:06Z", emittedAt: "2026-07-24T00:00:06.100Z",
   });
-  const utteranceCall = rpcBodies.find((call) => call.url.includes("persist_live_utterance_if_active"));
+  const utteranceCall = rpcBodies.find((call) => call.url.includes("persist_live_final_caption_if_active"));
   assert.equal(utteranceCall.body.p_text, "Hello everyone.");
   assert.equal(utteranceCall.body.p_speaker_label, null);
   assert.equal(utteranceCall.body.p_speaker_name, null);
@@ -646,7 +634,7 @@ test("participant floor captions persist with participant_id and display name", 
     text: "Participant speech.", isFinal: true,
     sourceEndedAt: "2026-07-24T00:00:09Z", emittedAt: "2026-07-24T00:00:09.100Z",
   });
-  const call = rpcBodies.find((entry) => entry.url.includes("persist_live_utterance_if_active"));
+  const call = rpcBodies.find((entry) => entry.url.includes("persist_live_final_caption_if_active"));
   assert.equal(call.body.p_participant_id, "p-77");
   assert.equal(call.body.p_speaker_name, "김참가");
   assert.equal(call.body.p_speaker_label, "participant:p-77");

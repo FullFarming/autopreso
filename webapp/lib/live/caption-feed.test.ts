@@ -110,6 +110,45 @@ test("a growing partial updates in place and its final leaves one committed line
   assert.deepEqual(committed.map((event) => [event.seq, event.text, event.isFinal]), [[3, "안녕하세요", true]]);
 });
 
+test("a transient shorter partial cannot erase already-visible words from the same utterance", () => {
+  let timeline = mergeCaptionTimeline([], caption(3, "The participant is speaking through the web app", { isFinal: false }));
+  timeline = mergeCaptionTimeline(timeline, caption(3, "The participant is speaking", { isFinal: false }));
+
+  assert.deepEqual(timeline.map((event) => [event.seq, event.text, event.isFinal]), [
+    [3, "The participant is speaking through the web app", false],
+  ]);
+});
+
+test("an out-of-order older partial cannot replace the current utterance", () => {
+  let timeline = mergeCaptionTimeline([], caption(8, "Current participant sentence", { isFinal: false }));
+  timeline = mergeCaptionTimeline(timeline, caption(7, "Late host fragment", { isFinal: false }));
+
+  assert.deepEqual(timeline.map((event) => [event.seq, event.text]), [[8, "Current participant sentence"]]);
+});
+
+test("host and participant partials finalize through one append-only feed contract", () => {
+  const participant = {
+    speakerId: "participant-1",
+    label: "Participant",
+    colorToken: "speaker-blue",
+    voiceName: null,
+    voiceStatus: "disabled" as const,
+    lastSeenAt: "2026-07-26T00:00:02.000Z",
+  };
+  let timeline = mergeCaptionTimeline([], caption(1, "Host final"));
+  timeline = mergeCaptionTimeline(timeline, caption(2, "Participant is", { isFinal: false, speaker: participant }));
+  timeline = mergeCaptionTimeline(timeline, caption(2, "Participant is speaking", { isFinal: false, speaker: participant }));
+  timeline = mergeCaptionTimeline(timeline, caption(2, "Participant is speaking.", { speaker: participant }));
+  timeline = mergeCaptionTimeline(timeline, caption(3, "Host returns", { isFinal: false }));
+  timeline = mergeCaptionTimeline(timeline, caption(3, "Host returns."));
+
+  assert.deepEqual(timeline.map((event) => [event.seq, event.speaker?.speakerId ?? "host", event.text, event.isFinal]), [
+    [1, "host", "Host final", true],
+    [2, "participant-1", "Participant is speaking.", true],
+    [3, "host", "Host returns.", true],
+  ]);
+});
+
 test("a late partial cannot resurrect after its sequence is committed", () => {
   const committed = mergeCaptionTimeline([], caption(4, "확정"));
   const withLatePartial = mergeCaptionTimeline(committed, caption(4, "확", { isFinal: false }));

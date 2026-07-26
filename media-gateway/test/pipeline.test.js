@@ -1412,7 +1412,7 @@ test("meeting live-translate captions mirror to the host socket", async () => {
   assert.equal(hostEvents.filter((event) => event.type === "caption").length, 1);
 });
 
-test("desktop host mirror is emitted before durable persistence completes", async () => {
+test("desktop host mirror follows the publisher durable live-event boundary", async () => {
   const state = makeDependencies();
   let releasePersistence;
   const persistenceGate = new Promise((resolve) => { releasePersistence = resolve; });
@@ -1423,14 +1423,15 @@ test("desktop host mirror is emitted before durable persistence completes", asyn
   });
   await pipeline.start();
   state.dependencies.publisher.publish = async (_sessionId, _language, event, { onLiveEvent } = {}) => {
-    await onLiveEvent?.(event);
     await persistenceGate;
+    await onLiveEvent?.(event);
   };
-  const publishing = state.liveSessions[0].onCaption({ text: "지연 없는 미러", isFinal: true, utteranceKey: "turn-1" });
+  const publishing = state.liveSessions[0].onCaption({ text: "내구성 이후 미러", isFinal: true, utteranceKey: "turn-1" });
   await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(hostEvents.some((event) => event.text === "지연 없는 미러"), true);
+  assert.equal(hostEvents.some((event) => event.text === "내구성 이후 미러"), false);
   releasePersistence();
   await publishing;
+  assert.equal(hostEvents.some((event) => event.text === "내구성 이후 미러"), true);
 });
 
 test("floor captions carry participant:<id> speakerId so records attribute to the participant", async () => {
@@ -1726,6 +1727,67 @@ test("actual Gemini path retains a post-release A final and does not attribute n
   await pipeline.close();
 });
 
+test("actual Gemini partials keep flowing while ordered finals wait on caption polish", async () => {
+  const state = makeDependencies();
+  let messageHandler;
+  const pendingPolish = [];
+  state.dependencies.liveTranslate = new GeminiLiveTranslateAdapter({
+    model: "gemini-3.5-live-translate-preview",
+    client: { live: { async connect(options) {
+      messageHandler = options.callbacks.onmessage;
+      return { sendRealtimeInput() {}, close() {} };
+    } } },
+  });
+  state.dependencies.captionPolish = {
+    polish({ translatedText }) {
+      return new Promise((resolve) => pendingPolish.push({ translatedText, resolve }));
+    },
+  };
+  const pipeline = new LiveMediaPipeline({
+    sessionId: "s-polish-does-not-block-partials", sessionType: "meeting", outputMode: "captions",
+    languages: ["en"], dependencies: state.dependencies,
+  });
+  await pipeline.start();
+  const settle = async () => {
+    for (let tick = 0; tick < 6; tick += 1) await new Promise((resolve) => setImmediate(resolve));
+  };
+
+  messageHandler({ serverContent: {
+    inputTranscription: { text: "첫째 원문", languageCode: "ko-KR" },
+    outputTranscription: { text: "First translated sentence" },
+    turnComplete: true,
+  } });
+  await settle();
+  assert.equal(pendingPolish.length, 1);
+
+  messageHandler({ serverContent: {
+    inputTranscription: { text: "둘째 원문", languageCode: "ko-KR" },
+    outputTranscription: { text: "Second translation growing" },
+  } });
+  await settle();
+  assert.equal(
+    state.events.some((event) => event.type === "caption" && !event.isFinal && event.text === "Second translation growing"),
+    true,
+  );
+
+  messageHandler({ serverContent: { turnComplete: true } });
+  await settle();
+  assert.equal(pendingPolish.length, 2);
+  pendingPolish[1].resolve("Second translation finalized.");
+  await settle();
+  assert.equal(state.events.some((event) => event.type === "caption" && event.isFinal), false);
+  pendingPolish[0].resolve("First translation finalized.");
+  await settle();
+
+  const finals = state.events.filter((event) => event.type === "caption" && event.isFinal);
+  assert.deepEqual(finals.map((event) => [event.seq, event.text, event.sourceText]), [
+    [1, "First translation finalized.", "첫째 원문"],
+    [2, "Second translation finalized.", "둘째 원문"],
+  ]);
+  assert.notEqual(finals[0].utteranceKey, finals[1].utteranceKey);
+  await pipeline.close();
+});
+
 test("actual participant KO callback keeps EN partial growth when output languageCode repeats the source", async () => {
   const state = makeDependencies();
   const handlers = new Map();
@@ -1848,7 +1910,7 @@ test("host and returning participant finals persist both lanes with stable captu
   await sourceFinal("참가자 재진입 문장");
   await translatedFinal("참가자 재진입 문장", "The participant returns.");
 
-  const utteranceCalls = rpcCalls.filter((call) => call.path.endsWith("/persist_live_utterance_if_active"));
+  const utteranceCalls = rpcCalls.filter((call) => call.path.endsWith("/persist_live_final_caption_if_active"));
   assert.equal(utteranceCalls.length, 10);
   for (const language of ["ko", "en"]) {
     const rows = utteranceCalls.filter((call) => call.body.p_language === language).map((call) => call.body);

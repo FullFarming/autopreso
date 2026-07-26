@@ -856,6 +856,42 @@ test("live meeting turns use speaker IDs rather than colliding display labels", 
   ]);
 });
 
+test("production meeting feed accumulates sentences by consecutive speaker and ignores partial fragments", async () => {
+  const feed = await read("webapp/components/live/MeetingTurnFeed.tsx");
+  const start = feed.indexOf("export function groupCaptionsIntoTurns");
+  const end = feed.indexOf("/** True when two separate groupings", start);
+  assert.ok(start >= 0 && end > start);
+  const runnableSource = feed.slice(start, end)
+    .replace(
+      "export function groupCaptionsIntoTurns(captions: CaptionEvent[]): MeetingTurn[]",
+      "function groupCaptionsIntoTurns(captions)",
+    )
+    .replace("const turns: MeetingTurn[] = []", "const turns = []");
+  const groupCaptionsIntoTurns = new Function(
+    "speakerMetaLine",
+    "resolveSpeakerColor",
+    `${runnableSource}; return groupCaptionsIntoTurns;`,
+  )((speaker) => speaker?.label ?? "Host", () => "#000");
+  const speaker = (speakerId, label) => ({ speakerId, label });
+  const captions = [
+    { seq: 1, isFinal: true, text: "Host sentence one.", emittedAt: "2026-07-26T01:00:00Z", speaker: null },
+    { seq: 2, isFinal: true, text: "Host sentence two.", emittedAt: "2026-07-26T01:00:01Z", speaker: null },
+    { seq: 3, isFinal: false, text: "Participant frag", emittedAt: "2026-07-26T01:00:02Z", speaker: speaker("p1", "Participant") },
+    { seq: 3, isFinal: true, text: "Participant sentence.", emittedAt: "2026-07-26T01:00:03Z", speaker: speaker("p1", "Participant") },
+    { seq: 4, isFinal: true, text: "Participant sentence two.", emittedAt: "2026-07-26T01:00:04Z", speaker: speaker("p1", "Participant") },
+    { seq: 5, isFinal: true, text: "Host returns.", emittedAt: "2026-07-26T01:00:05Z", speaker: null },
+  ];
+
+  assert.deepEqual(groupCaptionsIntoTurns(captions).map((turn) => ({
+    speaker: turn.speakerIdentity,
+    texts: turn.texts,
+  })), [
+    { speaker: "host", texts: ["Host sentence one.", "Host sentence two."] },
+    { speaker: "p1", texts: ["Participant sentence.", "Participant sentence two."] },
+    { speaker: "host", texts: ["Host returns."] },
+  ]);
+});
+
 test("live web surfaces use English copy without emoji", async () => {
   const sources = await Promise.all([
     "LiveHostDashboard.tsx",

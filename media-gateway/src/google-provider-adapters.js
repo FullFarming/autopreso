@@ -1,4 +1,5 @@
 import { AUDIO_CONFIG, STT_CONFIG, textPlausiblyInLanguage } from "./config.js";
+import { selectRelevantGlossary } from "./caption-polish.js";
 import { Pcm16StreamConditioner } from "./pcm-conditioning.js";
 import { StableTranscriptSegmenter, StableUtteranceSegmenter } from "./stable-utterance-segmenter.js";
 import { segmentTextForStreamingTts } from "./tts-text-segmentation.js";
@@ -80,7 +81,7 @@ export class GeminiLiveTranslateAdapter {
     client,
     model,
     reconnectDelay = (attempt) => new Promise((resolve) => setTimeout(resolve, Math.min(500 * 2 ** Math.min(attempt - 1, 6), 30_000))),
-    finalFlushMilliseconds = 2_500,
+    finalFlushMilliseconds = 800,
     now = Date.now,
   }) {
     this.client = client;
@@ -108,6 +109,25 @@ export class GeminiLiveTranslateAdapter {
     let nextConnectionGeneration = 0;
     let activeConnectionGeneration = 0;
     let callbackTail = Promise.resolve();
+    const detachedFinalCallbacks = new Set();
+    const dispatchFinalCallback = (task) => {
+      let work;
+      try {
+        // Invoke immediately so the pipeline snapshots source/floor correlation
+        // before this provider callback advances, but do not await the slow
+        // polish/persist portion on the partial callback tail.
+        work = Promise.resolve(task());
+      } catch (error) {
+        work = Promise.reject(error);
+      }
+      let tracked;
+      tracked = work
+        .catch((error) => {
+          try { onCallbackError?.(error); } catch { /* error reporting must not reject the drain */ }
+        })
+        .finally(() => detachedFinalCallbacks.delete(tracked));
+      detachedFinalCallbacks.add(tracked);
+    };
     // Live API transcription messages are DELTAS, and during continuous
     // speech the model never sends turnComplete. Like the desktop pipeline:
     // accumulate with a prefix-aware merge, commit complete sentences as
@@ -195,7 +215,9 @@ export class GeminiLiveTranslateAdapter {
           retireCaptureSegment(inputContexts.shift());
         }
       }
-      await onInputCaption?.({ ...caption, languageCode: inputTranscriptLanguageCode, ...(inputContext ?? {}) });
+      const callbackCaption = { ...caption, languageCode: inputTranscriptLanguageCode, ...(inputContext ?? {}) };
+      if (caption.isFinal) dispatchFinalCallback(() => onInputCaption?.(callbackCaption));
+      else await onInputCaption?.(callbackCaption);
       if (caption.isFinal && pendingOutputFinal) {
         const pending = pendingOutputFinal;
         pendingOutputFinal = null;
@@ -227,7 +249,9 @@ export class GeminiLiveTranslateAdapter {
         capturedAt: context.capturedAt,
         floorSpeaker: context.floorSpeaker,
       } : {};
-      await onCaption({ ...caption, ...publicContext });
+      const callbackCaption = { ...caption, ...publicContext };
+      if (caption.isFinal) dispatchFinalCallback(() => onCaption(callbackCaption));
+      else await onCaption(callbackCaption);
       if (caption.isFinal && context) {
         retireCaptureSegment(context);
       }
@@ -536,6 +560,7 @@ export class GeminiLiveTranslateAdapter {
         if (pendingOutputTimer !== null) clearTimeout(pendingOutputTimer);
         pendingOutputTimer = null;
         await inputQueue;
+        await Promise.allSettled([...detachedFinalCallbacks]);
         closeSessionOnce(session);
       },
     };
@@ -1033,8 +1058,9 @@ export class GeminiTextTranslateAdapter {
       const sourceHint = sourceLanguage && textPlausiblyInLanguage(text, sourceLanguage)
         ? ` The utterance is in ${translationLanguageName(sourceLanguage)}.`
         : "";
-      const glossarySection = typeof glossaryText === "string" && glossaryText.trim()
-        ? ["", "Glossary — always use these exact term translations:", glossaryText.trim()]
+      const selectedGlossary = selectRelevantGlossary(glossaryText, { sourceText: text });
+      const glossarySection = selectedGlossary
+        ? ["", "Glossary — always use these exact term translations:", selectedGlossary]
         : [];
       const prompt = [
         `You are a professional simultaneous interpreter for business meetings.${sourceHint}`,

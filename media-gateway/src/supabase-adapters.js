@@ -25,22 +25,49 @@ export class SupabaseLivePublisher {
     this.audioFanout = audioFanout;
     this.fetchFn = fetchFn;
     this.snapshotGuardTimeoutMilliseconds = snapshotGuardTimeoutMilliseconds;
+    this.failedDurableCaptionLanes = new Set();
   }
 
   async publish(sessionId, language, event, { onLiveEvent = null } = {}) {
-    let recordingError = null;
+    const durableLaneKey = `${sessionId}\u0000${language}`;
+    if (event.type === "caption" && this.failedDurableCaptionLanes.has(durableLaneKey)) {
+      throw new Error("DURABLE_CAPTION_LANE_FAILED");
+    }
     if (event.type === "caption" && event.isFinal) {
-      // 2026-07-26 security: Snapshot RPC is the active-session guard. No
-      // viewer or host delivery occurs until it confirms this final is live.
-      const snapshotResult = await this.#requestSnapshotGuard("/rest/v1/rpc/persist_live_snapshot_if_active", {
-        method: "POST",
-        body: JSON.stringify({
-          p_session_id: sessionId,
-          p_language: language,
-          p_event: event,
-        }),
-      });
-      if (snapshotResult === false) throw new Error("SESSION_STOPPED");
+      let durableResult;
+      try {
+        // 2026-07-26 fix: The database commits the active snapshot and complete
+        // utterance row in one transaction. Delivery begins only afterwards,
+        // so every visible final is durable and replayable.
+        durableResult = await this.#requestSnapshotGuard("/rest/v1/rpc/persist_live_final_caption_if_active", {
+          method: "POST",
+          body: JSON.stringify({
+            p_session_id: sessionId,
+            p_language: language,
+            p_event: event,
+            p_seq: event.seq,
+            p_text: event.text,
+            p_speaker_label: event.speaker?.speakerId ?? null,
+            p_speaker_name: event.speaker?.label ?? null,
+            p_source_started_at: event.sourceStartedAt ?? null,
+            p_source_ended_at: event.sourceEndedAt,
+            p_emitted_at: event.emittedAt,
+            p_participant_id: participantIdFromSpeaker(event.speaker),
+            p_source_text: event.sourceText ?? null,
+            p_source_language: event.sourceLanguage ?? null,
+            p_origin: event.origin ?? null,
+            p_utterance_key: event.utteranceKey ?? null,
+            p_translation_status: event.translationStatus
+              ?? (event.origin === "source" ? "verbatim" : event.sourceText ? "translated" : null),
+          }),
+        });
+      } catch (error) {
+        // No automatic retry: the commit outcome may be ambiguous. Latch this
+        // lane closed so a later N+1 can never become a durable seq gap.
+        this.failedDurableCaptionLanes.add(durableLaneKey);
+        throw new Error("DURABLE_CAPTION_PERSIST_FAILED", { cause: error });
+      }
+      if (durableResult === false) throw new Error("SESSION_STOPPED");
     }
     if (event.type === "speaker-legend") {
       await this.#guardedRpc("persist_session_speakers_if_active", {
@@ -53,39 +80,6 @@ export class SupabaseLivePublisher {
       this.eventFanout(sessionId, language, event),
       typeof onLiveEvent === "function" ? onLiveEvent(event) : undefined,
     ]);
-    if (event.type === "caption" && event.isFinal) {
-      // Meeting-record persistence is best-effort: a declined or failing RPC
-      // (row cap, transient network) must not interrupt the live broadcast.
-      try {
-        const utteranceResult = await this.#request("/rest/v1/rpc/persist_live_utterance_if_active", {
-          method: "POST",
-          body: JSON.stringify({
-            p_session_id: sessionId,
-            p_language: language,
-            p_seq: event.seq,
-            p_text: event.text,
-            p_speaker_label: event.speaker?.speakerId ?? null,
-            p_speaker_name: event.speaker?.label ?? null,
-            p_source_started_at: event.sourceStartedAt ?? null,
-            p_source_ended_at: event.sourceEndedAt,
-            p_emitted_at: event.emittedAt,
-            p_participant_id: participantIdFromSpeaker(event.speaker),
-            // Provenance for the viewer's original/translation disclosure.
-            // Null on the source lane, where p_text already IS the original.
-            p_source_text: event.sourceText ?? null,
-            p_source_language: event.sourceLanguage ?? null,
-            p_origin: event.origin ?? null,
-            p_utterance_key: event.utteranceKey ?? null,
-            p_translation_status: event.translationStatus
-              ?? (event.origin === "source" ? "verbatim" : event.sourceText ? "translated" : null),
-          }),
-        });
-        if (utteranceResult !== true) recordingError = createRecordingError(sessionId, language, event.seq);
-      } catch {
-        recordingError = createRecordingError(sessionId, language, event.seq);
-      }
-    }
-    if (recordingError) await this.eventFanout(sessionId, language, recordingError);
   }
 
   async #requestSnapshotGuard(path, init) {
@@ -118,6 +112,7 @@ export class SupabaseLivePublisher {
   /** Max persisted caption seq per language, used to seed pipeline counters
    *  so seq survives host reconnects and process restarts (contract C1). */
   async fetchLastUtteranceSeqs(sessionId, languages) {
+    for (const language of languages) this.failedDurableCaptionLanes.delete(`${sessionId}\u0000${language}`);
     const entries = await Promise.all(languages.map(async (language) => {
       const query = new URLSearchParams({
         session_id: `eq.${sessionId}`,
@@ -232,18 +227,6 @@ function waitForAbort(promise, signal) {
 
 function abortReason(signal, fallbackCode) {
   return signal.reason instanceof Error ? signal.reason : new Error(fallbackCode);
-}
-
-function createRecordingError(sessionId, language, seq) {
-  return {
-    type: "recording-status",
-    sessionId,
-    language,
-    status: "error",
-    code: "UTTERANCE_PERSIST_FAILED",
-    seq,
-    message: "자막은 계속 표시되지만 기록 저장에 실패했습니다.",
-  };
 }
 
 function participantIdFromSpeaker(speaker) {

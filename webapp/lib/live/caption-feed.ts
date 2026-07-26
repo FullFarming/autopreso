@@ -101,6 +101,23 @@ function normalizedCaptionText(text: string): string {
   return text.normalize("NFC").replace(/\s+/gu, " ").trim();
 }
 
+function mergePartialCaption(current: CaptionEvent | null, incoming: CaptionEvent): CaptionEvent {
+  if (!current || incoming.seq !== current.seq) return incoming;
+  const currentText = normalizedCaptionText(current.text);
+  const incomingText = normalizedCaptionText(incoming.text);
+  const currentSpeaker = current.speaker?.speakerId ?? "host";
+  const incomingSpeaker = incoming.speaker?.speakerId ?? "host";
+  if (currentSpeaker !== incomingSpeaker) return incoming;
+  // Realtime recognizers occasionally publish a shorter prefix while revising
+  // the tail of the same utterance. Rendering that snapshot removes words the
+  // participant has already read and makes the line appear to blink. Preserve
+  // the longer prefix until a genuinely revised/grown hypothesis or final lands.
+  if (currentText.length > incomingText.length && currentText.startsWith(incomingText)) {
+    return { ...incoming, text: current.text };
+  }
+  return incoming;
+}
+
 /** 2026-07-26 fix: Merge the canonical event stream into one language's visible record.
  *
  * Sequence is identity. Text is deliberately NOT identity: a speaker saying
@@ -142,7 +159,9 @@ function mergeCaptionEvents(
       if (partial && partial.seq <= event.seq) partial = null;
       continue;
     }
-    if (event.seq > latestFinalSequence) partial = event;
+    if (event.seq > latestFinalSequence && (!partial || event.seq >= partial.seq)) {
+      partial = mergePartialCaption(partial, event);
+    }
   }
 
   const committed = [...finalBySequence.values()]

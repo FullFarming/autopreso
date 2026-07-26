@@ -50,7 +50,7 @@ function appendGlossaryLine(lines, line, maxChars) {
   if (nextLength <= maxChars) lines.push(normalized);
 }
 
-function selectRelevantGlossary(glossary, { sourceText, translatedText } = {}) {
+export function selectRelevantGlossary(glossary, { sourceText, translatedText } = {}) {
   const glossaryText = String(glossary ?? "").normalize("NFC").trim();
   if (!glossaryText) return "";
   const query = normalizeGlossaryMatchText(`${sourceText ?? ""}\n${translatedText ?? ""}`);

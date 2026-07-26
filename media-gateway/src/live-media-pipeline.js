@@ -37,6 +37,9 @@ export class LiveMediaPipeline {
   #languageRecovery = new Map();
   #recentUtteranceKeys = new Map();
   #presentationCaptionState = new Map();
+  /** Final side effects stay ordered per language while provider partials are
+   *  allowed to keep flowing during the slower polish/persist path. */
+  #presentationFinalTails = new Map();
   #meetingInputCaption = null;
   #requiresFreshMeetingSourceContext = false;
   #meetingInputCaptionCounter = 0;
@@ -244,6 +247,14 @@ export class LiveMediaPipeline {
     // Cloud STT rolling-session path was removed with the 2026-07-24 provider
     // split; acceptFinalUtterance stays as the direct-injection entry point.
     throw new Error("UNSUPPORTED_SESSION_TYPE");
+  }
+
+  #reservePresentationFinal(language) {
+    const previous = this.#presentationFinalTails.get(language) ?? Promise.resolve();
+    let release;
+    const current = new Promise((resolve) => { release = resolve; });
+    this.#presentationFinalTails.set(language, previous.then(() => current));
+    return { previous, release };
   }
 
   async acceptAudio(frame, capturedAt = this.now(), capturedFloorSpeaker = undefined) {
@@ -985,6 +996,8 @@ export class LiveMediaPipeline {
       && value.origin !== "source"
       && this.#requiresFreshMeetingSourceContext
       && !sourceContext) return;
+    const finalOrder = isFinal ? this.#reservePresentationFinal(language) : null;
+    try {
     // Latency was previously observed ONLY on #processFinalUtterance, which no
     // session type reaches — so the live path emitted no metric at all and the
     // p95 2.5s committed-caption target could not be measured. Split polish out
@@ -1025,6 +1038,10 @@ export class LiveMediaPipeline {
       targetLanguage: language,
       sourceText: sourceContext?.text ?? "",
     });
+    // Polish can run concurrently across finalized cues, but seq allocation,
+    // fanout, and persistence remain in provider arrival order. Partials never
+    // wait on this gate and therefore keep the live line moving.
+    if (finalOrder) await finalOrder.previous;
     // Dedupe identity is (text, isFinal, TIME) — never text alone. A provider
     // re-emitting the same committed line lands within milliseconds; a speaker
     // genuinely repeating themselves ("네, 맞습니다.", "OK.") does not. Keying
@@ -1090,6 +1107,9 @@ export class LiveMediaPipeline {
     // Only committed captions carry the p95 2.5s target; interim latency is a
     // different (and much looser) question.
     if (isFinal) this.observeLatency?.("caption_publish_latency_ms", Math.max(0, this.now() - startedAt));
+    } finally {
+      finalOrder?.release();
+    }
   }
 
   async #publishPresentationAudio(language, value) {
@@ -1121,6 +1141,7 @@ export class LiveMediaPipeline {
       ...[...this.#voiceSessions.values()].map((session) => session.close()),
       ...[...this.#translationQueues.values()].map((queue) => queue.drain()),
       ...[...this.#ttsQueues.values()].map((queue) => queue.drain()),
+      ...this.#presentationFinalTails.values(),
     ]);
   }
 

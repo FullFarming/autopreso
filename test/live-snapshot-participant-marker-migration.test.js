@@ -35,5 +35,7 @@ test("public wrapper remains service-role-only and fresh bootstrap is exact", as
   const marker = `-- ${migrationName}`;
   const sectionStart = bootstrap.lastIndexOf(marker);
   assert.notEqual(sectionStart, -1);
-  assert.equal(bootstrap.slice(sectionStart + marker.length + 1), sql);
+  const contentStart = sectionStart + marker.length + 1;
+  const nextMigration = bootstrap.indexOf("\n-- 20260726064308_atomic_live_final_caption.sql", contentStart);
+  assert.equal(bootstrap.slice(contentStart, nextMigration === -1 ? undefined : nextMigration), sql);
 });

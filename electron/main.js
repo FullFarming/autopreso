@@ -7,6 +7,7 @@ import { WebSocket } from "ws";
 
 import { startServer } from "../src/server.js";
 import { sanitizeLiveCaptionDisplayLanguage, shouldDisplayLiveCaption } from "../src/live-caption-display-policy.js";
+import { buildLiveCallGlossary } from "../src/live-call-glossary.js";
 import { createSettingsStore, migrateSettingsFile } from "../src/settings-store.js";
 // The renderer owns the UI language choice (localStorage); it pushes the value
 // over IPC so the application menu speaks the same language.
@@ -1553,13 +1554,11 @@ function registerOverlayIpc(settingsStore, { localAppOrigin, liveWorkspaceUrl, l
     let liveDomainText = "";
     try {
       const savedSettings = await settingsStore.load();
-      // 40k, matching MAX_SUBTITLE_GLOSSARY_CHARS and the gateway's own ceiling.
-      // At 16k this silently cut the shipped presets mid-file (the hotel one is
-      // 27.5k), so local captions ran the FULL termbase while Live Call ran a
-      // truncated one missing its trailing sections — proper nouns, place names,
-      // and the 번역 메모리 block. That is why Live Call translation quality did
-      // not match captions-only mode. Pinned by test/glossary-presets.test.js.
-      liveGlossaryText = String(savedSettings?.subtitle?.glossary ?? "").trim().slice(0, 40_000);
+      // Keep the full captions-only glossary in Settings. Live Call sends a
+      // bounded prompt-oriented copy: acronyms, number rules, CRE terminology,
+      // and registered names survive; broad idioms and sentence memory do not
+      // tax every network translation request.
+      liveGlossaryText = buildLiveCallGlossary(savedSettings?.subtitle?.glossary ?? "");
       liveTranslationTone = savedSettings?.subtitle?.tone === "business" ? "business" : "natural";
       liveDomainText = String(savedSettings?.subtitle?.translationDomain ?? "").trim().slice(0, 2_000);
     } catch { /* settings parity is best-effort */ }

@@ -163,7 +163,7 @@ test("one WebSocket meeting keeps host, participant, viewer, and replay captions
     },
     async audioFanout() {},
     async fetchFn(url, init) {
-      if (String(url).includes("persist_live_snapshot_if_active")) {
+      if (String(url).includes("persist_live_final_caption_if_active")) {
         persisted.push(JSON.parse(String(init.body)).p_event);
       }
       return Response.json(true);

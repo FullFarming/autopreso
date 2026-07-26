@@ -218,6 +218,39 @@ test("a throwing caption handler is reported and does not break the callback tai
   assert.ok(delivered.includes("recovered."), `tail died after the throw: ${delivered.join(" | ")}`);
 });
 
+test("Gemini close drains detached finalized caption work", async () => {
+  let messageHandler;
+  let releaseFinal;
+  let didFinishFinal = false;
+  const adapter = new GeminiLiveTranslateAdapter({
+    model: "gemini-3.5-live-translate-preview",
+    client: { live: { async connect(options) {
+      messageHandler = options.callbacks.onmessage;
+      return { sendRealtimeInput() {}, close() {} };
+    } } },
+  });
+  const session = await adapter.open({
+    language: "en",
+    async onCaption(caption) {
+      if (!caption.isFinal) return;
+      await new Promise((resolve) => { releaseFinal = resolve; });
+      didFinishFinal = true;
+    },
+    async onAudio() {},
+  });
+  messageHandler({ serverContent: {
+    outputTranscription: { text: "A finalized sentence." }, turnComplete: true,
+  } });
+  await new Promise((resolve) => setImmediate(resolve));
+  let didClose = false;
+  const closing = session.close().then(() => { didClose = true; });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(didClose, false);
+  releaseFinal();
+  await closing;
+  assert.equal(didFinishFinal, true);
+});
+
 // The committed-caption handler runs an LLM polish pass. Interpreted audio is
 // time-critical playout and must never queue behind it: captions must stay
 // ordered relative to captions, and PCM relative to PCM, but the two are
@@ -901,7 +934,7 @@ test("Gemini text translation rejects output in the wrong script and falls back"
   assert.equal(result, "cloud:안녕하세요 여러분");
 });
 
-test("Gemini text translation injects the desktop subtitle glossary into every prompt", async () => {
+test("Gemini text translation injects only relevant glossary terms into each network prompt", async () => {
   const prompts = [];
   const geminiClient = {
     models: {
@@ -912,15 +945,27 @@ test("Gemini text translation injects the desktop subtitle glossary into every p
     },
   };
   const adapter = new GeminiTextTranslateAdapter({ client: geminiClient });
+  const irrelevant = Array.from({ length: 500 }, (_, index) => `무관용어${index} = irrelevant-${index}`).join("\n");
   await adapter.translate({
     text: "힐튼 가든 인 컨버전은 순항 중입니다",
     language: "en",
     sourceLanguage: "ko-KR",
-    glossaryText: "힐튼 가든 인 = Hilton Garden Inn\n컨버전 = conversion",
+    glossaryText: `[Terms]\n${irrelevant}\n힐튼 가든 인 = Hilton Garden Inn\n컨버전 = conversion`,
     intent: "final",
   });
   assert.match(prompts[0], /Glossary — always use these exact term translations:/);
   assert.match(prompts[0], /힐튼 가든 인 = Hilton Garden Inn/);
+  assert.match(prompts[0], /컨버전 = conversion/);
+  assert.doesNotMatch(prompts[0], /무관용어499/u);
+  assert.ok(prompts[0].length < 7_000);
+});
+
+test("Gemini Live Translate uses the captions-only 800 ms idle finalization budget", () => {
+  const adapter = new GeminiLiveTranslateAdapter({
+    model: "gemini-3.5-live-translate-preview",
+    client: { live: { connect() {} } },
+  });
+  assert.equal(adapter.finalFlushMilliseconds, 800);
 });
 
 test("Gemini Live Translate accumulates transcription deltas like the desktop pipeline", async () => {

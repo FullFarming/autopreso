@@ -60,6 +60,7 @@ test("one-button Live Call start is fail-closed and opens Stage only after auth,
   // that contract exactly or every Start Live Call 400s.
   assert.match(main, /Math\.min\(50, Math\.max\(2, source\.maxViewers\)\)/u);
   assert.match(main, /glossaryPack: "general_cre"/u);
+  assert.match(main, /buildLiveCallGlossary\(savedSettings\?\.subtitle\?\.glossary \?\? ""\)/u);
 });
 
 test("server-rejected host login is distinct from missing credentials and save verifies against the workspace", () => {
