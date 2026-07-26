@@ -163,6 +163,24 @@ test("media capture and invitation clipboard writes are limited to an exact orig
   assert.doesNotMatch(mainSource, /hostname === "127\.0\.0\.1" \|\| url\.hostname === "localhost"/u);
 });
 
+test("display capture denial contains Electron's missing-video callback throw", () => {
+  const warnings = [];
+  const completeDisplayMediaRequest = vm.runInNewContext(
+    `${sourceBetween("function completeDisplayMediaRequest", "function configureSystemAudioCapture")}; completeDisplayMediaRequest`,
+    { console: { warn: (message) => warnings.push(message) } },
+  );
+
+  const completed = completeDisplayMediaRequest(() => {
+    throw new TypeError("Video was requested, but no video stream was provided");
+  }, {});
+
+  assert.equal(completed, false);
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0], /Video was requested, but no video stream was provided/u);
+  const captureHandler = sourceBetween("function configureSystemAudioCapture", "function configureMediaPermissions");
+  assert.doesNotMatch(captureHandler, /(?<!completeDisplayMediaRequest\()callback\(/u);
+});
+
 // ── Renderer death recovery ────────────────────────────────────────────────
 // `isDestroyed()` stays false for a crashed or blank renderer, so the 1s
 // overlay watchdog could not see either failure: an overlay whose loadURL

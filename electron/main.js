@@ -1988,12 +1988,29 @@ function screenCaptureAccessStatus() {
   }
 }
 
+function completeDisplayMediaRequest(callback, response) {
+  try {
+    callback(response);
+    return true;
+  } catch (error) {
+    // 2026-07-26 fix: Electron throws synchronously when getDisplayMedia asked
+    // for video but a denied/cancelled picker has no video source. Because the
+    // request handler is async, allowing that throw to escape becomes an
+    // UnhandledPromiseRejectionWarning in the main process. Electron has
+    // already rejected the renderer request at this boundary; contain only the
+    // native callback throw so the app can keep running and the renderer's
+    // existing capture error path can report the failure to the user.
+    console.warn(`[overlay] display media request could not be completed: ${error?.message ?? error}`);
+    return false;
+  }
+}
+
 function configureSystemAudioCapture(allowedMediaOrigins) {
   session.defaultSession.setDisplayMediaRequestHandler(async (request, callback) => {
     const requestingUrl = request.securityOrigin ?? request.frame?.url ?? "";
     const hasUserGesture = request.userGesture === true;
     if (!hasUserGesture || !isAllowedOrigin(requestingUrl, allowedMediaOrigins)) {
-      callback({});
+      completeDisplayMediaRequest(callback, {});
       return;
     }
     const access = screenCaptureAccessStatus();
@@ -2005,7 +2022,7 @@ function configureSystemAudioCapture(allowedMediaOrigins) {
         `[overlay] system audio capture blocked: screen recording permission is "${access}". ` +
         "Grant NOVA under System Settings > Privacy & Security > Screen & System Audio Recording, then restart.",
       );
-      callback({});
+      completeDisplayMediaRequest(callback, {});
       return;
     }
     try {
@@ -2015,13 +2032,13 @@ function configureSystemAudioCapture(allowedMediaOrigins) {
           "[overlay] system audio capture found no screen sources " +
           `(screen recording permission: "${access}"). The app may need the permission granted and a restart.`,
         );
-        callback({});
+        completeDisplayMediaRequest(callback, {});
         return;
       }
-      callback({ video: sources[0], audio: "loopback" });
+      completeDisplayMediaRequest(callback, { video: sources[0], audio: "loopback" });
     } catch (error) {
       console.warn(`[overlay] system audio capture failed: ${error?.message ?? error}`);
-      callback({});
+      completeDisplayMediaRequest(callback, {});
     }
   }, { useSystemPicker: false });
 }

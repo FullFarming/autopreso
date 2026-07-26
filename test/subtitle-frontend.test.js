@@ -1070,7 +1070,7 @@ test("electron main creates always-on-top click-through overlay", () => {
   assert.match(source, /display-capture/);
   assert.match(source, /DESKTOP_SOURCE_TIMEOUT_MS = 7_000/);
   assert.match(source, /getDesktopSourcesWithTimeout/);
-  assert.match(source, /callback\(\{\}\)/);
+  assert.match(source, /completeDisplayMediaRequest\(callback, \{\}\)/);
   assert.match(source, /overlayEnabled = settings\.subtitle\?\.overlayEnabled !== false/);
   assert.match(source, /settingsStore\.save\(\{ subtitle: \{ overlayEnabled \} \}\)/);
   assert.match(packageJson, /"desktop": "node \.\/scripts\/start-desktop\.js"/);
