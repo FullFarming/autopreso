@@ -5,7 +5,7 @@
 // returned unchanged. Keep the two prompt builders in sync with the desktop
 // copy when either changes.
 
-const DEFAULT_TIMEOUT_MS = 4000;
+const DEFAULT_TIMEOUT_MS = 6000;
 const MIN_POLISH_CHARS = 2;
 const MAX_POLISH_CHARS = 2000;
 

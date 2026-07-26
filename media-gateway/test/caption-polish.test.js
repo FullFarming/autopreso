@@ -1,7 +1,13 @@
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
 import test from "node:test";
 
 import { createCaptionPolisher } from "../src/caption-polish.js";
+
+test("gateway polish keeps the desktop six-second budget for full glossary prompts", async () => {
+  const source = await readFile(new URL("../src/caption-polish.js", import.meta.url), "utf8");
+  assert.match(source, /DEFAULT_TIMEOUT_MS\s*=\s*6000/u);
+});
 
 function makeClient(responder) {
   const requests = [];

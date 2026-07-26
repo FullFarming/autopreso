@@ -4,7 +4,7 @@
 // It rewrites a single already-finalized translation into a professional
 // business register; on any error or timeout it returns the raw text unchanged.
 
-const DEFAULT_TIMEOUT_MS = 4000;
+const DEFAULT_TIMEOUT_MS = 6000;
 const MIN_POLISH_CHARS = 2;
 const MAX_POLISH_CHARS = 2000;
 

@@ -102,10 +102,10 @@ export async function startMediaGateway(config = readGatewayEnvironment()) {
           // Meeting/townhall TTS speaks through OpenAI with Chirp as the
           // never-silent fallback; presentation voice is unaffected (it uses
           // the live-translate audio path above).
-          // 2026-07-26 fix: Match the desktop caption finalizer's four-second
+          // 2026-07-26 fix: Match the desktop caption finalizer's six-second
           // quality budget. Live audio has a separate callback tail, so a slow
           // caption polish cannot delay interpreted audio playback.
-          captionPolish: createCaptionPolisher({ client: geminiClient, model: config.geminiTextModel, timeoutMs: 4_000 }),
+          captionPolish: createCaptionPolisher({ client: geminiClient, model: config.geminiTextModel, timeoutMs: 6_000 }),
           textToSpeech: message.sessionType === "presentation"
             ? new ChirpTextToSpeechAdapter({ client: textToSpeechClient })
             : new OpenAITextToSpeechAdapter({
