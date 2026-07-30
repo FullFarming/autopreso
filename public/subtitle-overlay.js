@@ -95,6 +95,8 @@ const SENTENCE_END_RE = /[.!?。！？…]["'”’)\]]*\s*$/;
 // its own linger timer so each language appears and clears independently.
 const lanes = new Map();
 let snapshotSeqFloor = -1;
+let activeSubtitleStreamId = "";
+const LIVE_FALLBACK_GENERATION_MODULUS = 1_000_000;
 
 function subtitleLingerMs(mode = "final") {
   if (mode === "live") return SUBTITLE_LIVE_STALE_MS;
@@ -115,6 +117,9 @@ function handleInputStatus(message) {
 
 // Live socket reference for overlay-initiated controls (double-click restart).
 let activeSocket = null;
+let activeLiveCallSessionId = "";
+const hasTrustedLiveCallFloorBridge = typeof window.realtimeNoelDesktop?.onLiveCallFloor === "function";
+let allowsLegacySessionlessLiveCallEvents = !hasTrustedLiveCallFloorBridge;
 
 connect();
 initOverlayRestartControls();
@@ -123,7 +128,7 @@ initOverlayRestartControls();
 // forwards that boundary directly to every overlay, which avoids waiting for a
 // translated fragment before removing the previous speaker's final sentence.
 if (window.realtimeNoelDesktop?.onLiveCallFloor) {
-  window.realtimeNoelDesktop.onLiveCallFloor(() => handleLiveCallFloorBoundary());
+  window.realtimeNoelDesktop.onLiveCallFloor((floor) => handleLiveCallFloorBoundary(floor));
 }
 
 function connect() {
@@ -134,11 +139,20 @@ function connect() {
     if (channelLanguages.length) ws.send(JSON.stringify({ type: "subtitle:subscribe", languages: channelLanguages }));
   });
   ws.addEventListener("message", (event) => {
+    if (ws !== activeSocket) return;
     const message = JSON.parse(event.data);
+    adoptSubtitleStream(message);
     if (message.type === "settings" && message.settings?.subtitle) applySettings(message.settings.subtitle);
     if (message.type === "subtitle:snapshot") {
       if (isAudioOnlyOutput()) {
         clearSubtitle();
+        return;
+      }
+      const liveSnapshotResult = replaceLiveCallSubtitleSnapshot(message);
+      if (liveSnapshotResult !== "not-live") {
+        if (liveSnapshotResult === "accepted" && Number.isSafeInteger(message.seq)) {
+          snapshotSeqFloor = Math.max(snapshotSeqFloor, message.seq);
+        }
         return;
       }
       if (Number.isSafeInteger(message.seq)) snapshotSeqFloor = Math.max(snapshotSeqFloor, message.seq);
@@ -152,6 +166,16 @@ function connect() {
     // The server already filters subscribed channels; this client-side gate
     // covers the un-subscribed race right after connect.
     if (message.targetLanguage && !isChannelLanguage(message.targetLanguage)) return;
+    if (message.source === "live-call") {
+      const hasCanonicalSessionId = typeof message.liveSessionId === "string" && message.liveSessionId.length > 0;
+      if (!hasCanonicalSessionId && !activeLiveCallSessionId) allowsLegacySessionlessLiveCallEvents = true;
+      if (activeLiveCallSessionId && message.liveSessionId !== activeLiveCallSessionId) return;
+      if (!allowsLegacySessionlessLiveCallEvents
+        && (!activeLiveCallSessionId || message.liveSessionId !== activeLiveCallSessionId)) return;
+      if (hasCanonicalSessionId
+        && (!activeLiveCallSessionId || message.liveSessionId !== activeLiveCallSessionId)) return;
+      if (!hasCanonicalSessionId && !allowsLegacySessionlessLiveCallEvents && activeLiveCallSessionId) return;
+    }
     if (message.type === "subtitle:clear") clearSubtitleLane(message.targetLanguage);
     if (message.type === "subtitle:partial" && !isAudioOnlyOutput()) renderPredictedSubtitle(message);
     if (message.type === "subtitle:committed" && !isAudioOnlyOutput()) renderCommittedSubtitle(message);
@@ -160,19 +184,89 @@ function connect() {
       return;
     }
     if (message.type === "subtitle:status") {
-      updateStatusIndicator(message.status);
       if (message.status === "hearing") markInputActive();
       if (message.status === "idle") clearSubtitle();
       return;
     }
   });
   ws.addEventListener("close", () => {
+    if (ws !== activeSocket) return;
     clearSubtitle();
     setTimeout(connect, 1500);
   });
   ws.addEventListener("error", () => {
+    if (ws !== activeSocket) return;
     clearSubtitle();
   });
+}
+
+function replaceLiveCallSubtitleSnapshot(message) {
+  const events = Array.isArray(message?.events)
+    ? message.events.filter((event) => event?.source === "live-call")
+    : [];
+  const envelopeSessionId = typeof message?.liveSessionId === "string" ? message.liveSessionId : "";
+  if (events.length === 0 && !envelopeSessionId) return "not-live";
+  const snapshotSessionIds = new Set([envelopeSessionId, ...events.map((event) => event.liveSessionId)].filter(
+    (sessionId) => typeof sessionId === "string" && sessionId.length > 0,
+  ));
+  if (snapshotSessionIds.size !== 1) return "rejected";
+  const [snapshotSessionId] = snapshotSessionIds;
+  if (!events.every((event) => event.liveSessionId === snapshotSessionId)) return "rejected";
+  if (activeLiveCallSessionId && activeLiveCallSessionId !== snapshotSessionId) return "rejected";
+  // A renderer can receive live broadcasts while its async settings snapshot is
+  // still being prepared. Replacing the local model makes that interleaving
+  // converge instead of additively duplicating a different sentence stack on
+  // each monitor.
+  clearSubtitle();
+  activeLiveCallSessionId = snapshotSessionId;
+  events.sort((left, right) => (left.seq ?? 0) - (right.seq ?? 0));
+  for (const event of events) {
+    if (!isChannelLanguage(event.targetLanguage)) continue;
+    if (event.type === "subtitle:committed") renderCommittedSubtitle(event, true);
+    else if (event.type === "subtitle:partial") renderPredictedSubtitle(event, true);
+  }
+  return "accepted";
+}
+
+function adoptSubtitleStream(message) {
+  const streamId = typeof message?.streamId === "string" ? message.streamId.trim().slice(0, 120) : "";
+  if (!streamId || streamId === activeSubtitleStreamId) return;
+  if (!activeSubtitleStreamId) {
+    activeSubtitleStreamId = streamId;
+    return;
+  }
+  activeSubtitleStreamId = streamId;
+  snapshotSeqFloor = -1;
+  activeSourceLanguage = null;
+  previousSourceLanguage = null;
+  lastDirectionSwitchAt = 0;
+  activeDirectionLastAt = 0;
+  activeDirectionSentenceClosed = true;
+  for (const lane of lanes.values()) {
+    if (lane.timer) clearTimeout(lane.timer);
+    if (lane.trimTimer) clearTimeout(lane.trimTimer);
+    lane.timer = null;
+    lane.trimTimer = null;
+    lane.lines = [];
+    lane.predicted = "";
+    lane.predictedState = "partial";
+    lane.sourceLines = [];
+    lane.partial = false;
+    lane.lastSeq = -1;
+    lane.lastEventType = "";
+    lane.lastEventText = "";
+    lane.lastCommittedText = "";
+    lane.pendingLiveFloor = false;
+    lane.liveGenerationKey = "";
+    lane.rollGenerationKey = "";
+    lane.liveFallbackGeneration = 0;
+    lane.liveFallbackOpen = false;
+    lane.liveFallbackSpeaker = "";
+    lane.rollOffset = undefined;
+    lane.rollHeadWord = null;
+    clearLiveLaneRuntime(lane);
+    renderLane(lane);
+  }
 }
 
 // ---- Double-click-to-restart ----------------------------------------------
@@ -238,44 +332,6 @@ function showRestartToast(text) {
     if (restartToastElement) restartToastElement.hidden = true;
   }, RESTART_TOAST_MS);
 }
-// ---- Pipeline status indicator ---------------------------------------------
-// Small badge so a viewer can tell "stalled" apart from "quiet": shown while
-// the pipeline is reconnecting / auto-recovering / shedding audio under
-// network backpressure; hidden the moment it is healthy again.
-const STATUS_INDICATOR_LABELS = {
-  reconnecting: "자막 재연결 중…",
-  recovering: "자막 복구 중…",
-  degraded: "네트워크 지연 — 실시간 유지 중",
-};
-const STATUS_INDICATOR_MAX_MS = 15000;
-let statusIndicatorElement = null;
-let statusIndicatorTimer = null;
-
-function updateStatusIndicator(status) {
-  const label = STATUS_INDICATOR_LABELS[status];
-  if (!label) {
-    // Any non-problem status (listening/api_ready/idle/hearing…) clears it.
-    if (statusIndicatorElement) statusIndicatorElement.hidden = true;
-    if (statusIndicatorTimer) { clearTimeout(statusIndicatorTimer); statusIndicatorTimer = null; }
-    return;
-  }
-  if (!overlay || typeof document.createElement !== "function") return;
-  if (!statusIndicatorElement) {
-    statusIndicatorElement = document.createElement("div");
-    statusIndicatorElement.className = "subtitle-status-indicator";
-    overlay.append(statusIndicatorElement);
-  }
-  statusIndicatorElement.textContent = label;
-  statusIndicatorElement.hidden = false;
-  // Never let a stale badge stick around if the healthy status got lost.
-  if (statusIndicatorTimer) clearTimeout(statusIndicatorTimer);
-  statusIndicatorTimer = setTimeout(() => {
-    statusIndicatorTimer = null;
-    if (statusIndicatorElement) statusIndicatorElement.hidden = true;
-  }, STATUS_INDICATOR_MAX_MS);
-}
-// ---------------------------------------------------------------------------
-
 function laneKey(targetLanguage) {
   return String(targetLanguage || "target");
 }
@@ -313,7 +369,7 @@ function ensureLane(targetLanguage) {
     translation.append(flow);
     box.append(source, translation);
     shell.append(speakerLabel, box);
-    lane = { key, shell, speakerLabel, box, source, translation, flow, lines: [], predicted: "", predictedState: "partial", sourceLines: [], timer: null, trimTimer: null, position: null, partial: false, lastSeq: -1, lastEventType: "", lastEventText: "", lastCommittedText: "" };
+    lane = { key, shell, speakerLabel, box, source, translation, flow, lines: [], predicted: "", predictedState: "partial", sourceLines: [], timer: null, trimTimer: null, position: null, partial: false, lastSeq: -1, lastEventType: "", lastEventText: "", lastCommittedText: "", isLiveCall: false, pendingLiveFloor: false, liveGenerationKey: "", rollGenerationKey: "", liveFallbackGeneration: 0, liveFallbackOpen: false, liveFallbackSpeaker: "" };
     lanes.set(key, lane);
   }
   const position = positionForLanguage(targetLanguage);
@@ -365,31 +421,67 @@ function languagesAssignedToZone(position) {
 function visibleLineLimitFor(lane) {
   const base = maxSubtitleLines();
   const sharing = languagesAssignedToZone(lane.position);
-  if (sharing <= 1) return base;
-  return Math.max(1, Math.ceil(base / sharing));
+  const sharedLimit = sharing <= 1 ? base : Math.max(1, Math.ceil(base / sharing));
+  // Live Call is a broadcast surface, not an unlimited transcript. Reserving
+  // two lines (and at most three) keeps the caption plate stationary while the
+  // sentence grows; Caption-only continues to honour its existing 1–8 setting.
+  return lane.isLiveCall ? Math.min(3, Math.max(2, sharedLimit)) : sharedLimit;
 }
 
-function handleLiveCallFloorBoundary() {
+function handleLiveCallFloorBoundary(floor) {
+  if (floor?.type === "live-call-ended") {
+    if (!activeLiveCallSessionId || floor.sessionId !== activeLiveCallSessionId) return;
+    activeLiveCallSessionId = "";
+    clearSubtitle();
+    return;
+  }
+  const isLegacyBoundary = floor && floor.type === undefined
+    && floor.sessionId === undefined && Object.hasOwn(floor, "holder");
+  if (isLegacyBoundary) allowsLegacySessionlessLiveCallEvents = true;
+  if (floor !== undefined && !isLegacyBoundary) {
+    if (floor?.type !== "floor" || typeof floor.sessionId !== "string" || !floor.sessionId) return;
+    activeLiveCallSessionId = floor.sessionId;
+  }
   activeSourceLanguage = null;
   previousSourceLanguage = null;
   lastDirectionSwitchAt = 0;
   activeDirectionLastAt = 0;
   activeDirectionSentenceClosed = true;
   for (const lane of lanes.values()) {
-    lane.predicted = "";
-    lane.predictedState = "partial";
-    lane.partial = false;
-    if (lane.lastEventType === "subtitle:partial") {
-      lane.lastEventType = "";
-      lane.lastEventText = "";
-    }
-    lane.speakerLabel.hidden = true;
-    lane.speakerLabel.textContent = "";
+    if (!lane.isLiveCall) continue;
+    // A floor notification arrives before the next speaker's first caption.
+    // Keep the currently visible caption and its own metadata until that next
+    // caption can replace both in one render; clearing here creates a blank
+    // frame and makes the label/caption stack collapse between speakers.
+    lane.pendingLiveFloor = true;
+    // The next speaker may say the same short phrase ("Yes", "네") as the
+    // previous speaker. Reset dedupe identity now while leaving the visible
+    // model untouched until the replacement caption arrives.
+    lane.lastEventType = "";
+    lane.lastEventText = "";
+    lane.lastCommittedText = "";
+    lane.liveGenerationKey = "";
+    lane.liveFallbackOpen = false;
+    lane.liveFallbackSpeaker = "";
     if (lane.timer) clearTimeout(lane.timer);
     lane.timer = null;
-    reflowZone(lane.position);
-    if (lane.lines.length > 0) armLinger(lane, "final");
+    armLinger(lane, lane.partial ? "live" : "final");
   }
+}
+
+function prepareLiveFloorReplacement(message, lane) {
+  if (message.source !== "live-call" || !lane.pendingLiveFloor) return;
+  // Mutate the model before the single render below. The old DOM remains on
+  // screen until the new text and its speaker metadata are ready together.
+  lane.pendingLiveFloor = false;
+  if (lane.trimTimer) clearTimeout(lane.trimTimer);
+  lane.trimTimer = null;
+  lane.lines = [];
+  lane.predicted = "";
+  lane.predictedState = "partial";
+  lane.partial = false;
+  lane.rollOffset = undefined;
+  lane.rollGenerationKey = "";
 }
 
 // Re-render every lane in a zone so their line budgets reflect current crowding.
@@ -419,6 +511,7 @@ function clearSubtitle() {
       lane.lastEventType = "";
       lane.lastEventText = "";
       lane.lastCommittedText = "";
+      clearLiveLaneRuntime(lane);
       renderLane(lane);
   }
 }
@@ -438,7 +531,22 @@ function clearSubtitleLane(targetLanguage) {
   lane.lastEventType = "";
   lane.lastEventText = "";
   lane.lastCommittedText = "";
+  clearLiveLaneRuntime(lane);
   reflowZone(lane.position);
+}
+
+function clearLiveLaneRuntime(lane) {
+  if (!lane.isLiveCall) return;
+  lane.pendingLiveFloor = false;
+  lane.liveGenerationKey = "";
+  lane.rollGenerationKey = "";
+  lane.liveFallbackGeneration = 0;
+  lane.liveFallbackOpen = false;
+  lane.liveFallbackSpeaker = "";
+  lane.rollOffset = undefined;
+  lane.rollHeadWord = null;
+  lane.speakerLabel.hidden = true;
+  lane.speakerLabel.textContent = "";
 }
 
 // When the spoken (source) language switches, the lane that translates INTO
@@ -459,7 +567,31 @@ function clearStaleReverseLane(message) {
 function acceptDirection(message) {
   const src = message.sourceLanguage;
   if (!src) return true;                       // no direction info → never gate
-  const now = Date.now();
+  // Live Call direction is decided upstream: the gateway publishes only the
+  // lane opposite the detected source, and electron/main.js forwards just that
+  // lane (shouldDisplayLiveCaption). The hysteresis below is for captions-only,
+  // where this process runs the language arbiter itself and sees its own
+  // smoothed value. Judging a Live Call caption a SECOND time — against an
+  // unsmoothed per-caption sourceLanguage — made the sentence lock withhold
+  // captions mid-utterance, so the host watched the text get rewritten while
+  // the web app, which merges purely on seq, rendered the same stream cleanly.
+  // Track the direction so a later captions-only line still has state, but
+  // never reject.
+  if (message.source === "live-call") {
+    const liveNow = Number.isFinite(message.displayTimestamp) ? message.displayTimestamp : Date.now();
+    if (src !== activeSourceLanguage) {
+      previousSourceLanguage = activeSourceLanguage;
+      activeSourceLanguage = src;
+      lastDirectionSwitchAt = liveNow;
+    }
+    activeDirectionLastAt = liveNow;
+    activeDirectionSentenceClosed = message.type === "subtitle:committed"
+      || SENTENCE_END_RE.test(String(message.translatedText ?? "").trim());
+    return true;
+  }
+  const now = message.source === "live-call" && Number.isFinite(message.displayTimestamp)
+    ? message.displayTimestamp
+    : Date.now();
   const text = String(message.translatedText ?? "");
   const closesSentence = message.type === "subtitle:committed" || SENTENCE_END_RE.test(text.trim());
   if (activeSourceLanguage === null) {
@@ -496,7 +628,10 @@ function acceptDirection(message) {
 // the subtitle lifetime instead of expiring on an unrelated timer.
 function updateLiveCallSpeaker(message, lane) {
   const speaker = message.liveCallSpeaker;
-  if (message.source !== "live-call" || !speaker || typeof speaker !== "object") {
+  const isLiveCall = message.source === "live-call";
+  lane.isLiveCall = isLiveCall;
+  lane.shell.classList.toggle("is-live-call", isLiveCall);
+  if (!isLiveCall || !speaker || typeof speaker !== "object") {
     lane.speakerLabel.hidden = true;
     lane.speakerLabel.textContent = "";
     return;
@@ -515,7 +650,9 @@ function renderCommittedSubtitle(message, fromSnapshot = false) {
   const lane = ensureLane(message.targetLanguage);
   if (!acceptLaneEvent(lane, message, fromSnapshot)) return;
   if (!acceptDirection(message)) return;
+  prepareLiveFloorReplacement(message, lane);
   updateLiveCallSpeaker(message, lane);
+  updateLiveGeneration(message, lane);
   clearStaleReverseLane(message);
   const parts = splitSubtitleDisplayParts(message.translatedText);
   const finalParts = parts.length > 0 ? parts : [stripSubtitlePrefix(message.translatedText)].filter(Boolean);
@@ -532,8 +669,19 @@ function renderCommittedSubtitle(message, fromSnapshot = false) {
   // Live Call and captions-only intentionally share this queue. Both surfaces
   // retain the previous completed sentence while the next one grows, then roll
   // the newest text into the configured line budget instead of replacing it.
-  lane.lines = lane.lines.slice(-maxSubtitleLines());
-  if (hadCommittedLines && lane.lines.length > finalParts.length) armPreviousSentenceTrim(lane, finalParts.length);
+  const lineLimit = lane.isLiveCall ? visibleLineLimitFor(lane) : maxSubtitleLines();
+  const droppedCommittedPrefix = lane.lines.length > lineLimit;
+  lane.lines = lane.lines.slice(-lineLimit);
+  if (lane.isLiveCall && droppedCommittedPrefix) lane.rollOffset = undefined;
+  // Both surfaces keep the finished sentence visible for
+  // SUBTITLE_PREVIOUS_SENTENCE_LINGER_MS while the next one grows, then roll it
+  // off. Live Call used to skip this timer and drop the previous sentence only
+  // when the bounded queue displaced it, so an old sentence either sat there
+  // indefinitely or vanished the instant a new one landed — never the steady
+  // "linger a few seconds, then scroll up and out" cadence captions-only has.
+  if (hadCommittedLines && lane.lines.length > finalParts.length) {
+    armPreviousSentenceTrim(lane, finalParts.length);
+  }
   lane.partial = false;
   reflowZone(lane.position);
   armLinger(lane, "final");
@@ -545,6 +693,7 @@ function renderPredictedSubtitle(message, fromSnapshot = false) {
   const lane = ensureLane(message.targetLanguage);
   if (!acceptLaneEvent(lane, message, fromSnapshot)) return;
   if (!acceptDirection(message)) return;
+  prepareLiveFloorReplacement(message, lane);
   // A new live hypothesis for direction X→Y means the speaker is currently
   // speaking X, so the reverse Y→X lane is stale and must clear NOW — not wait
   // for the next COMMITTED line. Without this, when the speaker switches
@@ -553,11 +702,51 @@ function renderPredictedSubtitle(message, fromSnapshot = false) {
   // sit in different zones so neither replaces the other.
   clearStaleReverseLane(message);
   updateLiveCallSpeaker(message, lane);
+  updateLiveGeneration(message, lane);
   lane.predicted = stripSubtitlePrefix(message.translatedText);
   lane.predictedState = "partial";
   lane.partial = true;
   reflowZone(lane.position);
   armLinger(lane, "live");
+}
+
+function updateLiveGeneration(message, lane) {
+  if (message.source !== "live-call") {
+    lane.liveGenerationKey = "";
+    lane.liveFallbackOpen = false;
+    lane.liveFallbackSpeaker = "";
+    return;
+  }
+  const utteranceKey = typeof message.utteranceKey === "string" ? message.utteranceKey.trim().slice(0, 240) : "";
+  if (utteranceKey) {
+    lane.liveGenerationKey = `key:${utteranceKey}`;
+    lane.liveFallbackOpen = false;
+    lane.liveFallbackSpeaker = "";
+    return;
+  }
+  const speaker = message.liveCallSpeaker && typeof message.liveCallSpeaker === "object"
+    ? message.liveCallSpeaker
+    : {};
+  const role = speaker.role === "participant" ? "participant" : "host";
+  const speakerName = role === "participant"
+    ? String(speaker.name ?? "Participant").replace(/\s+/g, " ").trim().slice(0, 80) || "Participant"
+    : "Host";
+  const sourceSeq = Number.isSafeInteger(message.sourceSeq) && message.sourceSeq >= 0
+    ? message.sourceSeq
+    : null;
+  if (sourceSeq !== null) {
+    lane.liveGenerationKey = `seq:${sourceSeq}:${role}:${speakerName}`;
+    lane.liveFallbackOpen = false;
+    lane.liveFallbackSpeaker = "";
+    return;
+  }
+  const speakerKey = `${role}:${speakerName}`;
+  if (!lane.liveFallbackOpen || lane.liveFallbackSpeaker !== speakerKey) {
+    lane.liveFallbackGeneration = (lane.liveFallbackGeneration % LIVE_FALLBACK_GENERATION_MODULUS) + 1;
+  }
+  lane.liveFallbackSpeaker = speakerKey;
+  lane.liveGenerationKey = `fallback:${lane.liveFallbackGeneration}:${speakerKey}`;
+  lane.liveFallbackOpen = message.type !== "subtitle:committed";
 }
 
 function armLinger(lane, mode = "final") {
@@ -578,6 +767,7 @@ function armLinger(lane, mode = "final") {
       lane.predictedState = "partial";
     lane.sourceLines = [];
     lane.partial = false;
+    clearLiveLaneRuntime(lane);
     // The zone just got less crowded — let any remaining lane reclaim lines.
     reflowZone(lane.position);
   }, subtitleLingerMs(mode));
@@ -587,7 +777,9 @@ function armPreviousSentenceTrim(lane, keepCount) {
   if (lane.trimTimer) clearTimeout(lane.trimTimer);
   lane.trimTimer = setTimeout(() => {
     lane.trimTimer = null;
+    const droppedCommittedPrefix = lane.lines.length > keepCount;
     lane.lines = lane.lines.slice(-keepCount);
+    if (lane.isLiveCall && droppedCommittedPrefix) lane.rollOffset = undefined;
     reflowZone(lane.position);
   }, SUBTITLE_PREVIOUS_SENTENCE_LINGER_MS);
 }
@@ -642,7 +834,8 @@ function renderLane(lane) {
   const limit = visibleLineLimitFor(lane);
   // Match the box's visual line-clamp to its line budget (max lines on screen).
   lane.box.style.setProperty("--subtitle-line-clamp", String(limit));
-  reconcileWords(lane, tokens);
+  const preserveShorterPrefix = !lane.isLiveCall || tokens.some((entry) => entry.state === "partial");
+  reconcileWords(lane, tokens, preserveShorterPrefix);
   // Translation-only: the source ("원문") line was removed — only the translated
   // subtitle is ever rendered, so the source can never appear alongside it.
   lane.source.textContent = "";
@@ -653,13 +846,26 @@ function renderLane(lane) {
   lane.shell.hidden = tokens.length === 0;
   if (tokens.length === 0) lane.speakerLabel.hidden = true;
   lane.box.classList.toggle("partial", tokens.some((entry) => entry.state === "partial"));
-  // Reset the roll-up to the top ONLY when this is a fresh subtitle generation:
-  // the lane went empty, or the leading word changed (a new utterance replaced the
-  // old text). Within one growing/revising generation the head word is stable, so
-  // updateRollUp stays monotonic and never bounces the block back down.
+  // Caption-only keeps its existing head-word generation heuristic. Live Call
+  // is a continuous broadcast lane: provider utterance IDs may advance while
+  // previous text is still visible, so only an explicit empty/clear boundary
+  // may reset its positional history.
   const headWord = tokens.length ? tokens[0].word : null;
-  if (tokens.length === 0 || headWord !== lane.rollHeadWord) lane.rollOffset = 0;
-  lane.rollHeadWord = headWord;
+  if (lane.isLiveCall && lane.liveGenerationKey) {
+    const generationKey = `live:${lane.liveGenerationKey}`;
+    // utteranceKey identifies provider work; it is not a visual reset signal.
+    // While this lane still has content, keep the greatest offset already
+    // reached so metadata churn cannot pull the caption back down. Explicit
+    // lane/floor clears reset rollOffset at their own state boundary.
+    if (tokens.length === 0) lane.rollOffset = undefined;
+    lane.rollGenerationKey = generationKey;
+  } else {
+    // Caption-only stays byte-for-behaviour compatible with its existing
+    // head-word heuristic. Only Live receives the immutable utterance key.
+    if (tokens.length === 0 || headWord !== lane.rollHeadWord) lane.rollOffset = 0;
+    lane.rollHeadWord = headWord;
+    lane.rollGenerationKey = "";
+  }
   updateRollUp(lane);
 }
 
@@ -672,7 +878,7 @@ function tokenizeWords(text) {
 // the new trailing tokens. The browser never re-lays-out stable text, so
 // already-shown words don't move as new ones stream in (broadcast stability),
 // and sentence breaks are inserted as <br> so a finished sentence starts fresh.
-function reconcileWords(lane, tokens) {
+function reconcileWords(lane, tokens, preserveShorterPrefix = true) {
   const flow = lane.flow;
   if (!flow) return;
   const existing = flow.childNodes;
@@ -694,7 +900,7 @@ function reconcileWords(lane, tokens) {
   // tail. CRITICAL: require i > 0 so an EMPTY token list (a lane CLEAR / direction
   // switch) still falls through and removes every node — otherwise the stale text
   // is retained in the DOM and re-appears when the lane is reused ("이전 영어로 점프").
-  if (i > 0 && i === tokens.length && i < flow.childNodes.length) return;
+  if (preserveShorterPrefix && i > 0 && i === tokens.length && i < flow.childNodes.length) return;
   // Drop any trailing tokens that changed (e.g. a revised partial), keeping the
   // common prefix in place.
   while (flow.childNodes.length > i) flow.removeChild(flow.lastChild);
@@ -725,14 +931,20 @@ function updateRollUp(lane) {
   const view = lane.translation;
   if (!flow || !view) return;
   if (typeof view.clientHeight !== "number" || typeof flow.scrollHeight !== "number") return;
-  const overflow = Math.max(0, flow.scrollHeight - view.clientHeight);
-  // MONOTONIC roll-up: once the block has rolled up, it never comes back down within
-  // the same subtitle. A revised partial that briefly shrinks the text (Gemini
+  // A fixed Live viewport needs signed overflow: negative means the flow is
+  // shorter than the reserved stack and must move DOWN to remain bottom
+  // anchored. Caption-only retains its original non-negative calculation.
+  const measuredOverflow = flow.scrollHeight - view.clientHeight;
+  const overflow = lane.isLiveCall ? measuredOverflow : Math.max(0, measuredOverflow);
+  // MONOTONIC roll-up: once the block has rolled up, it never comes back down during
+  // provisional revisions. A revised partial that briefly shrinks the text (Gemini
   // backtracking, a word un-wrapping) would otherwise lower the offset and the whole
   // block would glide DOWN, then UP again on the next word — the "내려왔다 올라갔다"
-  // jitter. We keep the max offset reached and let new words fill the lower line into
-  // any leftover space instead. renderLane resets lane.rollOffset on a fresh generation.
-  const prev = typeof lane.rollOffset === "number" ? lane.rollOffset : 0;
+  // jitter. When the bounded model removes a committed prefix, its caller clears the
+  // historical offset first so this calculation rebases to the current DOM instead of
+  // translating the replacement flow above the clipped viewport. Floor, stream, and
+  // lane boundaries use the same reset semantics.
+  const prev = typeof lane.rollOffset === "number" ? lane.rollOffset : overflow;
   const next = Math.max(prev, overflow);
   lane.rollOffset = next;
   flow.style.transform = `translateY(${-next}px)`;
@@ -787,7 +999,7 @@ function applySettings(next = {}) {
   for (const [key, lane] of lanes) {
     const position = positionForLanguage(key);
     if (lane.position !== position) {
-      zones[position].append(lane.box);
+      zones[position].append(lane.isLiveCall ? lane.shell : lane.box);
       lane.position = position;
     }
     lane.source.hidden = true;

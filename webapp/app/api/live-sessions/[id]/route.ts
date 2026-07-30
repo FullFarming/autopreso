@@ -1,4 +1,4 @@
-import { NextRequest } from "next/server";
+import { after, NextRequest } from "next/server";
 
 import { AuthenticationError, requireHost } from "@/lib/auth/live-auth";
 import { LiveSessionError, toLiveFailure } from "@/lib/live/errors";
@@ -68,10 +68,14 @@ export async function DELETE(request: NextRequest, context: RouteContext) {
     const sessionBeforeEnd = await store.get(id);
     await new LiveSessionService(store).end(hostId, id);
     // Contract C7: auto-generate meeting summaries per active language.
-    // Fire-and-forget with one retry — never blocks or fails the End response.
+    // Next keeps this work inside the request lifecycle without delaying End.
     if (sessionBeforeEnd && sessionBeforeEnd.hostId === hostId) {
-      void generateSessionSummariesAfterEnd(id, hostId, sessionBeforeEnd.languages).catch((summaryError: unknown) => {
-        console.error(`live post-session summary scheduling failed (${id})`, summaryError);
+      after(async () => {
+        try {
+          await generateSessionSummariesAfterEnd(id, hostId, sessionBeforeEnd.languages);
+        } catch (summaryError: unknown) {
+          console.error(`live post-session summary scheduling failed (${id})`, summaryError);
+        }
       });
     }
     return apiSuccess({ id, status: "stopped" as const });

@@ -26,7 +26,11 @@ import {
   withAbortTimeout,
 } from "./connection-resilience";
 import type { MeetingSummary } from "@/lib/live/summary";
-import MeetingMinutes, { type TranscriptEntry } from "./MeetingMinutes";
+import MeetingMinutes, {
+  startSummaryPollLoop,
+  type SummaryPollingState,
+  type TranscriptEntry,
+} from "./MeetingMinutes";
 import {
   getCachedLanguageCaptions,
   isDisplayableCaption,
@@ -127,12 +131,22 @@ interface FallbackPip {
   timer: number;
 }
 
-function takeInviteTokenFromHash(): string | null {
+// 2026-07-27 fix: Keep a valid invite in a canonical fragment so the browser's
+// share action reuses the QR credential. Canonicalization strips every other
+// fragment field before sharing; cookies and per-viewer grants remain local.
+function readInviteTokenFromHash(): string | null {
   const fragment = window.location.hash.startsWith("#") ? window.location.hash.slice(1) : window.location.hash;
   const inviteToken = new URLSearchParams(fragment).get("invite");
   if (inviteToken === null) return null;
-  history.replaceState(null, "", `${window.location.pathname}${window.location.search}`);
-  return inviteTokenPattern.test(inviteToken) ? inviteToken : "";
+  if (!inviteTokenPattern.test(inviteToken)) {
+    window.history.replaceState(null, "", `${window.location.pathname}${window.location.search}`);
+    return "";
+  }
+  const canonicalHash = `#invite=${inviteToken}`;
+  if (window.location.hash !== canonicalHash) {
+    window.history.replaceState(null, "", `${window.location.pathname}${window.location.search}${canonicalHash}`);
+  }
+  return inviteToken;
 }
 
 function drawWrappedText(context: CanvasRenderingContext2D, text: string, x: number, y: number, maxWidth: number, lineHeight: number): void {
@@ -270,12 +284,11 @@ export function SpeakControlIcon({ state }: { state: "idle" | "starting" | "spea
   );
 }
 
-function captionConnectionLabel(status: LiveSessionStatus | "ready" | "unavailable"): string {
+function captionConnectionLabel(status: LiveSessionStatus | "ready"): string {
   if (status === "live" || status === "ready") return "Live";
   if (status === "preparing") return "Preparing captions";
   if (status === "paused") return "Paused by host";
   if (status === "stopped") return "Live ended";
-  if (status === "unavailable") return "Language unavailable";
   return "Check connection";
 }
 
@@ -441,13 +454,13 @@ function getJoinErrorMessage(error: unknown): string {
   return error.message;
 }
 
-function captionLaneKey(caption: CaptionEvent): string {
-  return caption.speaker?.speakerId ?? "presenter";
-}
-
 export function floorHolderName(holder: LiveFloorHolder | null): string | null {
   if (!holder) return null;
   return holder.name?.trim() || holder.displayName?.trim() || null;
+}
+
+export function formatProfileMetadata(...parts: Array<string | null | undefined>): string {
+  return parts.map((part) => part?.trim()).filter((part): part is string => Boolean(part)).join(" · ");
 }
 
 function useLiveInterpretationAudio(onQueueRestart: () => void, onPlaybackBlocked: () => void) {
@@ -572,17 +585,14 @@ export function ViewerStage({ sessionType, outputMode, captions, speakers, statu
   // valid history in its own lane; a failed translation is the only caption
   // hidden because it does not reliably belong to the selected language.
   const displayCaptions = useMemo(() => captions.filter(isDisplayableCaption), [captions]);
-  const finalCaptions = displayCaptions.filter((caption) => caption.isFinal);
-  const partialCaptions = displayCaptions.filter((caption) => !caption.isFinal);
-  const orderedFinalCaptions = newestFirst(finalCaptions);
-  const latestFinalSeq = finalCaptions.at(-1)?.seq ?? 0;
-  const latestPartialText = partialCaptions.at(-1)?.text ?? "";
+  const orderedCaptions = newestFirst(displayCaptions);
+  const latestCaption = displayCaptions.at(-1);
 
   useEffect(() => {
     if (!isPinnedToLatest) return;
     const history = historyRef.current;
     if (history) history.scrollTop = 0;
-  }, [latestFinalSeq, latestPartialText, isPinnedToLatest]);
+  }, [isPinnedToLatest, latestCaption?.seq, latestCaption?.text]);
 
   const handleHistoryScroll = useCallback(() => {
     const history = historyRef.current;
@@ -624,18 +634,13 @@ export function ViewerStage({ sessionType, outputMode, captions, speakers, statu
           emptyMessage="Speaker chapters will appear here when the meeting starts." />
       ) : (
         <div className="live-caption-stack">
-          {finalCaptions.length === 0 && partialCaptions.length === 0
+          {orderedCaptions.length === 0
             ? <p className="live-empty-caption">Waiting for the host to start.</p>
             : null}
-          <div className="live-caption-current" aria-live="off" aria-label="Caption currently updating">
-            {partialCaptions.map((caption) => (
-              <SpeakerCaption key={`partial-${captionLaneKey(caption)}`} caption={caption} active />
-            ))}
-          </div>
           <div ref={historyRef} className="live-caption-history is-scrollable" aria-live="polite"
-            aria-relevant="additions" onScroll={handleHistoryScroll}>
-            {orderedFinalCaptions.map((caption, index) => (
-              <SpeakerCaption key={`final-${caption.seq}`} caption={caption} active={partialCaptions.length === 0 && index === 0} />
+            aria-relevant="additions text" onScroll={handleHistoryScroll}>
+            {orderedCaptions.map((caption, index) => (
+              <SpeakerCaption key={`caption-${caption.seq}`} caption={caption} active={index === 0} />
             ))}
           </div>
           {!isPinnedToLatest && (
@@ -689,7 +694,6 @@ export default function LiveViewer({ compact = false }: { compact?: boolean }) {
   const [department, setDepartment] = useState("");
   const [jobTitle, setJobTitle] = useState("");
   const [admissionCode, setAdmissionCode] = useState("");
-  const [joinMethod, setJoinMethod] = useState<"invite" | "code">("code");
   const [viewer, setViewer] = useState<ViewerState | null>(null);
   const [language, setLanguage] = useState("");
   const languageRef = useRef("");
@@ -698,11 +702,7 @@ export default function LiveViewer({ compact = false }: { compact?: boolean }) {
   const [status, setStatus] = useState("Not connected");
   const [floorHolder, setFloorHolder] = useState<LiveFloorHolder | null>(null);
   const [sessionStatus, setSessionStatus] = useState<LiveSessionStatus>("live");
-  const [speakerOverlay, setSpeakerOverlay] = useState<{ name: string; department: string; jobTitle: string } | null>(null);
   const [isWaitingCoverUnavailable, setIsWaitingCoverUnavailable] = useState(false);
-  const speakerOverlayTimerRef = useRef<number | null>(null);
-  const previousFloorKeyRef = useRef<string | null>(null);
-  const viewerSessionTypeRef = useRef<LiveSessionType>("presentation");
   const [joinEndedNotice, setJoinEndedNotice] = useState(false);
   const [isSessionEnded, setIsSessionEnded] = useState(false);
   const [summaryRecord, setSummaryRecord] = useState<{ summary: MeetingSummary; createdAt: string } | null>(null);
@@ -711,6 +711,9 @@ export default function LiveViewer({ compact = false }: { compact?: boolean }) {
   const [summaryError, setSummaryError] = useState("");
   const [transcriptError, setTranscriptError] = useState("");
   const [isMinutesLoading, setIsMinutesLoading] = useState(false);
+  const [minutesPollingState, setMinutesPollingState] = useState<SummaryPollingState>("idle");
+  const [minutesPollingStartedAt, setMinutesPollingStartedAt] = useState<number | null>(null);
+  const [minutesPollingRound, setMinutesPollingRound] = useState(0);
   const minutesLoadGenerationRef = useRef(0);
   const isSessionEndedRef = useRef(false);
   const markSessionEndedRef = useRef<() => void>(() => {});
@@ -955,8 +958,8 @@ export default function LiveViewer({ compact = false }: { compact?: boolean }) {
   const loadMinutes = useCallback(async (
     requestedLanguage: string = languageRef.current,
     resource: "both" | "summary" | "transcript" = "both",
-  ) => {
-    if (!viewer || !requestedLanguage) return;
+  ): Promise<boolean> => {
+    if (!viewer || !requestedLanguage) return false;
     const generation = minutesLoadGenerationRef.current + 1;
     minutesLoadGenerationRef.current = generation;
     setIsMinutesLoading(true);
@@ -974,7 +977,9 @@ export default function LiveViewer({ compact = false }: { compact?: boolean }) {
       ]);
       // A late EN response must never replace the KO record selected while it
       // was in flight. The same generation guard covers manual retries.
-      if (generation !== minutesLoadGenerationRef.current || requestedLanguage !== languageRef.current) return;
+      if (generation !== minutesLoadGenerationRef.current || requestedLanguage !== languageRef.current) return false;
+      let shouldContinuePolling = false;
+      let hasFatalSummaryError = false;
       if (summaryResult?.ok) {
         setSummaryRecord(summaryResult.value);
         setSummaryError("");
@@ -982,9 +987,12 @@ export default function LiveViewer({ compact = false }: { compact?: boolean }) {
         && summaryResult.error.code === "SUMMARY_NOT_READY") {
         setSummaryRecord(null);
         setSummaryError("");
+        shouldContinuePolling = true;
       } else if (summaryResult) {
         setSummaryRecord(null);
         setSummaryError("Unable to load the AI summary. Check again.");
+        setMinutesPollingState("failed");
+        hasFatalSummaryError = true;
       }
       if (transcriptResult?.ok) {
         setTranscript(transcriptResult.value.utterances);
@@ -994,35 +1002,41 @@ export default function LiveViewer({ compact = false }: { compact?: boolean }) {
         setTranscript([]);
         setIsTranscriptLoaded(false);
         setTranscriptError("Unable to load the transcript. Check again.");
+        if (!hasFatalSummaryError) shouldContinuePolling = true;
       }
+      return shouldContinuePolling;
     } finally {
       if (generation === minutesLoadGenerationRef.current) setIsMinutesLoading(false);
     }
   }, [viewer]);
 
   // Contract C7: summaries are generated automatically after End. While the
-  // record is not ready (SUMMARY_NOT_READY), poll with exponential backoff
-  // (3s → 6s → 12s → … capped at 48s, ~2 minutes total).
+  // record is not ready (SUMMARY_NOT_READY), share the host's bounded polling
+  // cadence (2s → 20s plus up to 25% jitter, capped at 25s).
   useEffect(() => {
-    if (!isSessionEnded || (summaryRecord && isTranscriptLoaded)) return;
-    let attempt = 0;
-    let timer: number | null = null;
-    let isDisposed = false;
-    const scheduleNext = () => {
-      if (isDisposed || attempt >= 6) return;
-      const delay = Math.min(3_000 * 2 ** attempt, 48_000);
-      timer = window.setTimeout(() => {
-        attempt += 1;
+    if (!isSessionEnded) return;
+    if (summaryRecord && isTranscriptLoaded) {
+      setMinutesPollingState("idle");
+      return;
+    }
+    if (summaryError) {
+      setMinutesPollingState("failed");
+      return;
+    }
+    setMinutesPollingState("polling");
+    setMinutesPollingStartedAt((startedAt) => startedAt ?? Date.now());
+    return startSummaryPollLoop({
+      poll: () => {
         const missingResource = summaryRecord ? "transcript" : isTranscriptLoaded ? "summary" : "both";
-        void loadMinutes(languageRef.current, missingResource).finally(() => { if (!isDisposed) scheduleNext(); });
-      }, delay);
-    };
-    scheduleNext();
-    return () => {
-      isDisposed = true;
-      if (timer !== null) window.clearTimeout(timer);
-    };
-  }, [isSessionEnded, isTranscriptLoaded, loadMinutes, summaryRecord]);
+        return loadMinutes(languageRef.current, missingResource);
+      },
+      onExhausted: () => setMinutesPollingState("exhausted"),
+      onError: () => {
+        setMinutesPollingState("failed");
+        setSummaryError("Unable to load the AI summary. Check again.");
+      },
+    });
+  }, [isSessionEnded, isTranscriptLoaded, loadMinutes, minutesPollingRound, summaryError, summaryRecord]);
 
   // 호스트가 라이브를 종료하면 뷰어는 에러가 아니라 회의록 화면으로 전환합니다.
   markSessionEndedRef.current = () => {
@@ -1032,6 +1046,8 @@ export default function LiveViewer({ compact = false }: { compact?: boolean }) {
     setFloorHolder(null);
     setError("");
     setStatus("Live ended");
+    setMinutesPollingState("polling");
+    setMinutesPollingStartedAt(Date.now());
     void endSpeaking(false);
     disconnectGateway();
     void loadMinutes(languageRef.current);
@@ -1091,7 +1107,6 @@ export default function LiveViewer({ compact = false }: { compact?: boolean }) {
   }, [viewer, sessionStatus, isSessionEnded]);
 
   const sessionType = viewer?.session.sessionType ?? "presentation";
-  viewerSessionTypeRef.current = sessionType;
   const outputMode = viewer?.session.outputMode ?? "captions";
   const hasAudio = outputMode !== "captions";
   const deliveryMethod = getDeliveryMethod(sessionType, outputMode);
@@ -1324,25 +1339,6 @@ export default function LiveViewer({ compact = false }: { compact?: boolean }) {
     }
   }, [endSpeaking, enqueueInterpretationAudio, getLastSeq, resolveViewerDisconnect, restartInterpretationAudio, setCaptionSnapshot]);
 
-  const showSpeakerOverlay = useCallback((holder: LiveFloorHolder) => {
-    const name = floorHolderName(holder);
-    if (!name) return;
-    if (speakerOverlayTimerRef.current !== null) window.clearTimeout(speakerOverlayTimerRef.current);
-    setSpeakerOverlay({
-      name,
-      department: holder.department?.trim() ?? "",
-      jobTitle: holder.jobTitle?.trim() ?? "",
-    });
-    speakerOverlayTimerRef.current = window.setTimeout(() => {
-      speakerOverlayTimerRef.current = null;
-      setSpeakerOverlay(null);
-    }, 4_000);
-  }, []);
-
-  useEffect(() => () => {
-    if (speakerOverlayTimerRef.current !== null) window.clearTimeout(speakerOverlayTimerRef.current);
-  }, []);
-
   const handleEvent = useCallback((event: LiveBroadcastEvent) => {
     if (event.type === "caption") {
       // A caption can only come from a running host pipeline: if the viewer
@@ -1371,15 +1367,7 @@ export default function LiveViewer({ compact = false }: { compact?: boolean }) {
     }
     if (event.type === "speaker-legend") setSpeakers(event.speakers);
     if (event.type === "floor") {
-      const holder = event.holder;
-      setFloorHolder(holder);
-      const holderKey = holder ? `${holder.participantId ?? ""}:${floorHolderName(holder) ?? ""}` : null;
-      // Speaker-change overlay is a live-call (meeting/floor) feature only.
-      if (holder && holderKey !== previousFloorKeyRef.current
-        && viewerSessionTypeRef.current === "meeting") {
-        showSpeakerOverlay(holder);
-      }
-      previousFloorKeyRef.current = holderKey;
+      setFloorHolder(event.holder);
     }
     if (event.type === "session-status") {
       setSessionStatus(event.status);
@@ -1388,7 +1376,12 @@ export default function LiveViewer({ compact = false }: { compact?: boolean }) {
       if (event.status === "live") setError("");
       if (event.status === "stopped") markSessionEndedRef.current();
     }
-    if (event.type === "language-status" && event.language === languageRef.current) setStatus(captionConnectionLabel(event.status));
+    // Translation failures are operator health, not participant-facing copy.
+    // Keep the viewer's last Live/Preparing state while the controller handles
+    // recovery; a later ready/preparing event may update this status normally.
+    if (event.type === "language-status"
+      && event.language === languageRef.current
+      && event.status !== "unavailable") setStatus(captionConnectionLabel(event.status));
     if (event.type === "language-removed" && event.language === languageRef.current) setError("The host stopped this language. Choose another language.");
     if (event.type === "audio-control" && event.language === languageRef.current) {
       if (event.seq <= minimumAudioSeqRef.current) return;
@@ -1397,7 +1390,7 @@ export default function LiveViewer({ compact = false }: { compact?: boolean }) {
       if (event.action === "restart") setStatus("Audio restored · receiving live");
     }
     if (event.type === "error") setError(event.message);
-  }, [endSpeaking, getLastSeq, restartInterpretationAudio, setLastSeq, showSpeakerOverlay]);
+  }, [endSpeaking, getLastSeq, restartInterpretationAudio, setLastSeq]);
   handleEventRef.current = handleEvent;
 
   const subscribe = useCallback(async (
@@ -1503,20 +1496,17 @@ export default function LiveViewer({ compact = false }: { compact?: boolean }) {
       setError("Enter a name between 1 and 40 characters.");
       return;
     }
-    if (normalizedDepartment.length < 1 || normalizedDepartment.length > 80) {
-      setError("Enter a department between 1 and 80 characters.");
+    if (normalizedDepartment.length > 80) {
+      setError("Department must be 80 characters or fewer.");
       return;
     }
-    if (normalizedJobTitle.length < 1 || normalizedJobTitle.length > 100) {
-      setError("Enter a job title between 1 and 100 characters.");
+    if (normalizedJobTitle.length > 100) {
+      setError("Job title must be 100 characters or fewer.");
       return;
     }
-    if (joinMethod === "code" && normalizedAdmissionCode.length !== 6) {
+    const isInviteJoin = Boolean(pendingInviteToken);
+    if (!isInviteJoin && normalizedAdmissionCode.length !== 6) {
       setError("Enter the 6-digit access code shown by the host.");
-      return;
-    }
-    if (joinMethod === "invite" && !pendingInviteToken) {
-      setError("This invite link is invalid. Use the 6-digit access code instead.");
       return;
     }
     if (!SUPABASE_URL || !SUPABASE_ANON_KEY) {
@@ -1542,7 +1532,7 @@ export default function LiveViewer({ compact = false }: { compact?: boolean }) {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
-          ...(joinMethod === "invite" ? { inviteToken: pendingInviteToken } : { admissionCode: normalizedAdmissionCode }),
+          ...(isInviteJoin ? { inviteToken: pendingInviteToken } : { admissionCode: normalizedAdmissionCode }),
           displayName: normalizedDisplayName,
           department: normalizedDepartment,
           jobTitle: normalizedJobTitle,
@@ -1588,7 +1578,7 @@ export default function LiveViewer({ compact = false }: { compact?: boolean }) {
     } finally {
       setIsBusy(false);
     }
-  }, [admissionCode, department, displayName, jobTitle, joinMethod, pendingInviteToken, subscribe]);
+  }, [admissionCode, department, displayName, jobTitle, pendingInviteToken, subscribe]);
 
   useEffect(() => {
     if (getViewerSurfaceRedirect(
@@ -1598,14 +1588,13 @@ export default function LiveViewer({ compact = false }: { compact?: boolean }) {
     )) return;
     const params = new URLSearchParams(window.location.search);
     requestedLanguageRef.current = params.get("language") ?? "";
-    const inviteToken = takeInviteTokenFromHash();
+    const inviteToken = readInviteTokenFromHash();
     if (inviteToken === null) return;
     if (!inviteToken) {
       setError("This QR invite is invalid or has expired.");
       return;
     }
     setPendingInviteToken(inviteToken);
-    setJoinMethod("invite");
   }, []);
 
   const changeLanguage = useCallback(async (nextLanguage: string) => {
@@ -1619,6 +1608,9 @@ export default function LiveViewer({ compact = false }: { compact?: boolean }) {
       setIsTranscriptLoaded(false);
       setSummaryError("");
       setTranscriptError("");
+      setMinutesPollingState("polling");
+      setMinutesPollingStartedAt(Date.now());
+      setMinutesPollingRound((round) => round + 1);
       void loadMinutes(nextLanguage);
       return;
     }
@@ -1786,12 +1778,9 @@ export default function LiveViewer({ compact = false }: { compact?: boolean }) {
   }
 
   if (!viewer) {
-    const hasValidProfile = normalizeDisplayName(displayName).length > 0
-      && normalizeProfileField(department).length > 0
-      && normalizeProfileField(jobTitle).length > 0;
-    const canJoin = hasValidProfile && (joinMethod === "invite"
-      ? Boolean(pendingInviteToken)
-      : admissionCode.replace(/\D/gu, "").length === 6);
+    const hasValidProfile = normalizeDisplayName(displayName).length > 0;
+    const isInviteJoin = Boolean(pendingInviteToken);
+    const canJoin = hasValidProfile && (isInviteJoin || admissionCode.replace(/\D/gu, "").length === 6);
     return (
       <main className={`live-viewer-shell is-join ${compact ? "is-compact" : ""}`}>
         {/* The wordmark belongs to the SCREEN, not the card: the card is centred,
@@ -1800,40 +1789,26 @@ export default function LiveViewer({ compact = false }: { compact?: boolean }) {
         <section className="live-join-card">
             <h1 className="live-join-heading">Live Call</h1>
             <p className="live-join-lede">
-              {joinMethod === "invite"
+              {isInviteJoin
                 ? "You scanned the session QR — no access code needed. Enter your profile to join."
-                : "Joining by link — enter your profile and the 6-digit access code from the host."}
+                : "Enter your name and the 6-digit access code from the host."}
             </p>
-            <div className="live-join-methods" role="group" aria-label="Join method">
-              {pendingInviteToken && (
-                <button type="button" aria-pressed={joinMethod === "invite"}
-                  className={joinMethod === "invite" ? "is-selected" : ""}
-                  onClick={() => { setJoinMethod("invite"); setError(""); }}>
-                  Invite link
-                </button>
-              )}
-              <button type="button" aria-pressed={joinMethod === "code"}
-                className={joinMethod === "code" ? "is-selected" : ""}
-                onClick={() => { setJoinMethod("code"); setError(""); }}>
-                Access code
-              </button>
-            </div>
             <label htmlFor="live-display-name">Your name</label>
             <input id="live-display-name" className="live-name-input" autoComplete="name" maxLength={40} value={displayName}
               onChange={(event) => { setDisplayName(event.target.value); setError(""); }}
               onKeyDown={(event) => { if (event.key === "Enter") void join(); }}
               placeholder="Enter your name" required />
-            <label htmlFor="live-department">Department</label>
+            <label htmlFor="live-department">Department (Optional)</label>
             <input id="live-department" className="live-name-input" autoComplete="organization-title" maxLength={80} value={department}
               onChange={(event) => { setDepartment(event.target.value); setError(""); }}
               onKeyDown={(event) => { if (event.key === "Enter") void join(); }}
-              placeholder="Enter your department" required />
-            <label htmlFor="live-job-title">Job title</label>
+              placeholder="Enter your department" />
+            <label htmlFor="live-job-title">Job title (Optional)</label>
             <input id="live-job-title" className="live-name-input" autoComplete="organization-title" maxLength={100} value={jobTitle}
               onChange={(event) => { setJobTitle(event.target.value); setError(""); }}
               onKeyDown={(event) => { if (event.key === "Enter") void join(); }}
-              placeholder="Enter your job title" required />
-            {joinMethod === "code" && (
+              placeholder="Enter your job title" />
+            {!isInviteJoin && (
               <>
                 <label htmlFor="live-admission-code">6-digit access code</label>
                 <input id="live-admission-code" className="live-code-input" autoComplete="one-time-code" inputMode="numeric"
@@ -1925,20 +1900,18 @@ export default function LiveViewer({ compact = false }: { compact?: boolean }) {
         </span>
       </div>
       {error && <div className="live-error" role="alert">{error}</div>}
-      {speakerOverlay && !isSessionEnded && sessionStatus !== "preparing" && (
-        <div className="live-speaker-change-overlay" role="status" aria-live="polite">
-          <strong>{speakerOverlay.name}</strong>
-          {(speakerOverlay.department || speakerOverlay.jobTitle) && (
-            <span>{[speakerOverlay.department, speakerOverlay.jobTitle].filter(Boolean).join(" · ")}</span>
-          )}
-        </div>
-      )}
       {isSessionEnded ? (
         <div className="live-ended-view">
           <MeetingMinutes summary={summaryRecord?.summary ?? null} summaryCreatedAt={summaryRecord?.createdAt ?? null}
             transcript={transcript} isTranscriptLoaded={isTranscriptLoaded}
             summaryError={summaryError} transcriptError={transcriptError}
-            isLoading={isMinutesLoading} onRetry={() => {
+            isLoading={isMinutesLoading} minutesPollingState={minutesPollingState}
+            minutesPollingStartedAt={minutesPollingStartedAt} onRetry={() => {
+              setSummaryError("");
+              setTranscriptError("");
+              setMinutesPollingState("polling");
+              setMinutesPollingStartedAt(Date.now());
+              setMinutesPollingRound((round) => round + 1);
               const missingResource = summaryRecord ? "transcript" : isTranscriptLoaded ? "summary" : "both";
               void loadMinutes(languageRef.current, missingResource);
             }} />
@@ -2017,7 +1990,7 @@ export default function LiveViewer({ compact = false }: { compact?: boolean }) {
         </div>
       )}
       {!isSessionEnded && (
-        <footer className="live-viewer-footer"><span>{viewer.displayName} · {viewer.department} · {viewer.jobTitle}</span><span>{viewer.viewerCount}/{viewer.session.maxViewers} joined · Valid until the host ends this session</span></footer>
+        <footer className="live-viewer-footer"><span>{formatProfileMetadata(viewer.displayName, viewer.department, viewer.jobTitle)}</span><span>{viewer.viewerCount}/{viewer.session.maxViewers} joined · Valid until the host ends this session</span></footer>
       )}
       {pipWindow && createPortal(stage, pipWindow.document.body)}
     </main>

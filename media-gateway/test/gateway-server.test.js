@@ -25,6 +25,18 @@ async function nextJson(webSocket) {
   return JSON.parse(data.toString("utf8"));
 }
 
+function nextJsonMatching(webSocket, predicate) {
+  return new Promise((resolve) => {
+    const onMessage = (data) => {
+      const message = JSON.parse(data.toString("utf8"));
+      if (!predicate(message)) return;
+      webSocket.off("message", onMessage);
+      resolve(message);
+    };
+    webSocket.on("message", onMessage);
+  });
+}
+
 async function connectHost(url) {
   const webSocket = new WebSocket(url);
   await once(webSocket, "open");
@@ -92,7 +104,8 @@ test("host can hot-swap a prepared pipeline and explicitly end an audio turn", a
   webSocket.send(JSON.stringify({ type: "authenticate", token: signHostToken("gateway-secret") }));
   assert.equal((await received).type, "authenticated");
 
-  received = nextJson(webSocket);
+  const startedMessage = nextJsonMatching(webSocket, (message) => message.type === "started");
+  const startedFloor = nextJsonMatching(webSocket, (message) => message.type === "floor");
   webSocket.send(JSON.stringify({
     type: "start",
     sessionId: "session-1",
@@ -103,14 +116,16 @@ test("host can hot-swap a prepared pipeline and explicitly end an audio turn", a
     version: 1,
     languages: ["en"],
   }));
-  const started = await received;
+  const started = await startedMessage;
   assert.equal(started.type, "started");
   assert.equal(started.sessionType, "presentation");
   assert.equal(started.outputMode, "captions_audio");
   assert.equal(started.maxViewers, 24);
   assert.equal(started.glossaryPack, "hotel");
+  assert.equal((await startedFloor).holder, null);
 
-  received = nextJson(webSocket);
+  const updatedMessage = nextJsonMatching(webSocket, (message) => message.type === "updated");
+  const updatedFloor = nextJsonMatching(webSocket, (message) => message.type === "floor");
   webSocket.send(JSON.stringify({
     type: "update",
     sessionId: "session-1",
@@ -121,12 +136,13 @@ test("host can hot-swap a prepared pipeline and explicitly end an audio turn", a
     version: 1,
     languages: ["ko", "en"],
   }));
-  const updated = await received;
+  const updated = await updatedMessage;
   assert.equal(updated.type, "updated");
   assert.equal(updated.outputMode, "audio");
+  assert.equal((await updatedFloor).holder, null);
   assert.equal(pipelines[0].closed, 1);
 
-  received = nextJson(webSocket);
+  received = nextJsonMatching(webSocket, (message) => message.type === "audio-stream-ended");
   webSocket.send(JSON.stringify({ type: "audioStreamEnd" }));
   assert.equal((await received).type, "audio-stream-ended");
   assert.equal(pipelines[1].ended, 1);
@@ -168,7 +184,8 @@ test("host translation restart rebuilds the pipeline without ending the live cal
   const host = await connectHost(`ws://127.0.0.1:${gateway.server.address().port}/live`);
   context.after(() => host.terminate());
 
-  let received = nextJson(host);
+  const started = nextJsonMatching(host, (message) => message.type === "started");
+  const startedFloor = nextJsonMatching(host, (message) => message.type === "floor");
   host.send(JSON.stringify({
     type: "start",
     sessionId: "session-1",
@@ -177,9 +194,11 @@ test("host translation restart rebuilds the pipeline without ending the live cal
     version: 2,
     languages: ["ko", "en"],
   }));
-  assert.equal((await received).type, "started");
+  assert.equal((await started).type, "started");
+  assert.equal((await startedFloor).holder, null);
 
-  received = nextJson(host);
+  const restartedMessage = nextJsonMatching(host, (message) => message.type === "restarted");
+  const restartedFloor = nextJsonMatching(host, (message) => message.type === "floor");
   host.send(JSON.stringify({
     type: "restart",
     sessionId: "session-1",
@@ -188,9 +207,10 @@ test("host translation restart rebuilds the pipeline without ending the live cal
     version: 2,
     languages: ["ko", "en"],
   }));
-  const restarted = await received;
+  const restarted = await restartedMessage;
   assert.equal(restarted.type, "restarted");
   assert.equal(restarted.sessionId, "session-1");
+  assert.equal((await restartedFloor).holder, null);
   assert.equal(pipelines.length, 2);
   assert.equal(pipelines[0].closed, 1);
   assert.equal(pipelines[1].closed, 0);
@@ -291,7 +311,7 @@ test("a reconnecting host replaces ownership without closing the old pipeline tw
   assert.equal(pipelines[1].closed, 0);
 });
 
-test("a grace-reattached host receives canonical captions from the preserved pipeline", async (context) => {
+test("a grace-reattached host flushes canonical buffered captions from the preserved pipeline", { timeout: 5_000 }, async (context) => {
   let emitHostEvent;
   const gateway = createGatewayServer({
     gatewaySecret: "gateway-secret",
@@ -318,19 +338,99 @@ test("a grace-reattached host receives canonical captions from the preserved pip
   assert.equal((await received).type, "started");
   first.terminate();
   await once(first, "close");
+  await new Promise((resolve) => setImmediate(resolve));
+
+  emitHostEvent({ type: "caption", seq: 3, language: "ko", utteranceKey: "u-3", text: "초안", isFinal: false });
+  emitHostEvent({ type: "caption", seq: 1, language: "ko", utteranceKey: "u-1", text: "첫 확정", isFinal: true });
+  emitHostEvent({ type: "caption", seq: 3, language: "ko", utteranceKey: "u-3", text: "최신 초안", isFinal: false });
+  emitHostEvent({ type: "caption", seq: 2, language: "ko", utteranceKey: "u-2", text: "둘째 확정", isFinal: true });
+  emitHostEvent({ type: "caption", seq: 2, language: "ko", utteranceKey: "u-2", text: "늦은 초안", isFinal: false });
 
   const second = await connectHost(url);
   context.after(() => second.terminate());
-  received = nextJson(second);
+  const flushedCaptions = new Promise((resolve) => {
+    const captions = [];
+    const onMessage = (data) => {
+      const message = JSON.parse(data.toString("utf8"));
+      if (message.type !== "caption") return;
+      captions.push(message);
+      if (captions.length === 3) {
+        second.off("message", onMessage);
+        resolve(captions);
+      }
+    };
+    second.on("message", onMessage);
+  });
+  const reattachedStarted = nextJsonMatching(second, (message) => message.type === "started");
+  const reattachedFloor = nextJsonMatching(second, (message) => message.type === "floor");
   second.send(JSON.stringify({
     type: "start", sessionId: "session-1", version: 2,
     sessionType: "meeting", outputMode: "captions", languages: ["ko"],
   }));
-  assert.equal((await received).type, "started");
+  assert.equal((await reattachedStarted).type, "started");
+  assert.equal((await reattachedFloor).holder, null);
 
-  received = nextJson(second);
-  emitHostEvent({ type: "caption", seq: 1, language: "ko", text: "재연결 후 자막", isFinal: true });
-  assert.equal((await received).text, "재연결 후 자막");
+  const buffered = await flushedCaptions;
+  assert.deepEqual(buffered.map(({ seq, text, isFinal }) => ({ seq, text, isFinal })), [
+    { seq: 1, text: "첫 확정", isFinal: true },
+    { seq: 2, text: "둘째 확정", isFinal: true },
+    { seq: 3, text: "최신 초안", isFinal: false },
+  ]);
+
+  const liveCaption = nextJsonMatching(second, (message) => message.type === "caption" && message.seq === 4);
+  emitHostEvent({ type: "caption", seq: 4, language: "ko", text: "재연결 후 자막", isFinal: true });
+  assert.equal((await liveCaption).text, "재연결 후 자막");
+});
+
+test("a replacement pipeline never inherits a detached pipeline's caption buffer", { timeout: 5_000 }, async (context) => {
+  const emitters = [];
+  const gateway = createGatewayServer({
+    gatewaySecret: "gateway-secret",
+    viewerSecret: "viewer-secret",
+    viewerAuthorizer: { async authorize() { return true; } },
+    hostAuthorizer: { async authorize() { return true; } },
+    hostReconnectGraceMilliseconds: 45_000,
+    async pipelineFactory(_settings, _previous, onHostEvent) {
+      emitters.push(onHostEvent);
+      return {
+        async start() {}, async tick() {}, async acceptAudio() {}, async endAudioStream() {}, async close() {},
+      };
+    },
+  });
+  await new Promise((resolve) => gateway.server.listen(0, "127.0.0.1", resolve));
+  context.after(async () => gateway.close());
+  const url = `ws://127.0.0.1:${gateway.server.address().port}/live`;
+  const first = await connectHost(url);
+  const firstStarted = nextJsonMatching(first, (message) => message.type === "started");
+  const firstFloor = nextJsonMatching(first, (message) => message.type === "floor");
+  first.send(JSON.stringify({
+    type: "start", sessionId: "session-1", version: 1,
+    sessionType: "meeting", outputMode: "captions", languages: ["ko"],
+  }));
+  assert.equal((await firstStarted).type, "started");
+  assert.equal((await firstFloor).holder, null);
+  first.terminate();
+  await once(first, "close");
+  await new Promise((resolve) => setImmediate(resolve));
+  emitters[0]({ type: "caption", seq: 1, language: "ko", text: "폐기할 이전 자막", isFinal: true });
+
+  const replacement = await connectHost(url);
+  context.after(() => replacement.terminate());
+  const replacementStarted = nextJsonMatching(replacement, (message) => message.type === "started");
+  const replacementFloor = nextJsonMatching(replacement, (message) => message.type === "floor");
+  replacement.send(JSON.stringify({
+    type: "start", sessionId: "session-1", version: 2,
+    sessionType: "presentation", outputMode: "captions", languages: ["en"],
+  }));
+  assert.equal((await replacementStarted).type, "started");
+  assert.equal((await replacementFloor).holder, null);
+  assert.equal(emitters.length, 2);
+
+  const received = nextJsonMatching(replacement, (message) => message.type === "caption");
+  emitters[1]({ type: "caption", seq: 1, language: "en", text: "new pipeline", isFinal: true });
+  const caption = await received;
+  assert.equal(caption.text, "new pipeline");
+  assert.equal(caption.language, "en");
 });
 
 test("a failed replacement candidate is closed while the active host remains owned", async (context) => {
@@ -966,16 +1066,18 @@ test("HOST lease closes the pipeline within the five-second audit interval", asy
   context.after(async () => gateway.close());
   const host = await connectHost(`ws://127.0.0.1:${gateway.server.address().port}/live`);
   context.after(() => host.terminate());
-  let received = nextJson(host);
+  const started = nextJsonMatching(host, (message) => message.type === "started");
+  const floorSnapshot = nextJsonMatching(host, (message) => message.type === "floor");
   host.send(JSON.stringify({
     type: "start", sessionId: "session-1", version: 1,
     mode: "presentation", voiceOutputMode: "captions", languages: ["en"],
   }));
-  assert.equal((await received).type, "started");
+  assert.equal((await started).type, "started");
+  assert.equal((await floorSnapshot).holder, null);
   assert.equal(typeof leaseCallback, "function");
-  received = nextJson(host);
+  const revoked = nextJsonMatching(host, (message) => message.code === "SESSION_REVOKED");
   leaseCallback();
-  assert.equal((await received).code, "SESSION_REVOKED");
+  assert.equal((await revoked).code, "SESSION_REVOKED");
   await once(host, "close");
   assert.equal(authorizeCalls, 3);
   // The client close event and the server's async close handler are independent
@@ -1020,19 +1122,21 @@ test("a hung HOST lease is aborted within the remaining half of the five-second 
   context.after(async () => gateway.close());
   const host = await connectHost(`ws://127.0.0.1:${gateway.server.address().port}/live`);
   context.after(() => host.terminate());
-  let received = nextJson(host);
+  const started = nextJsonMatching(host, (message) => message.type === "started");
+  const floorSnapshot = nextJsonMatching(host, (message) => message.type === "floor");
   host.send(JSON.stringify({
     type: "start", sessionId: "session-1", version: 1,
     mode: "presentation", voiceOutputMode: "captions", languages: ["en"],
   }));
-  assert.equal((await received).type, "started");
+  assert.equal((await started).type, "started");
+  assert.equal((await floorSnapshot).holder, null);
   leaseCallback();
   while (authorizeCalls < 3) await new Promise((resolve) => setImmediate(resolve));
   const leaseTimeout = timers.find((timer) => timer.delay === 2_500 && !timer.cancelled);
   assert.ok(leaseTimeout, "2.5초 주기와 2.5초 제한의 합이 최대 5초여야 합니다.");
-  received = nextJson(host);
+  const revoked = nextJsonMatching(host, (message) => message.code === "SESSION_REVOKED");
   leaseTimeout.callback();
-  assert.equal((await received).code, "SESSION_REVOKED");
+  assert.equal((await revoked).code, "SESSION_REVOKED");
 });
 
 test("an aborted old HOST lease cannot close a successfully swapped pipeline", async (context) => {
@@ -1069,21 +1173,23 @@ test("an aborted old HOST lease cannot close a successfully swapped pipeline", a
   context.after(async () => gateway.close());
   const host = await connectHost(`ws://127.0.0.1:${gateway.server.address().port}/live`);
   context.after(() => host.terminate());
-  let received = nextJson(host);
+  const started = nextJsonMatching(host, (message) => message.type === "started");
+  const initialFloor = nextJsonMatching(host, (message) => message.type === "floor");
   host.send(JSON.stringify({
     type: "start", sessionId: "session-1", version: 1,
     mode: "presentation", voiceOutputMode: "captions", languages: ["en"],
   }));
-  assert.equal((await received).type, "started");
+  assert.equal((await started).type, "started");
+  assert.equal((await initialFloor).holder, null);
   leaseCallbacks[0]();
   while (authorizationCalls < 3) await new Promise((resolve) => setImmediate(resolve));
 
-  received = nextJson(host);
+  const updated = nextJsonMatching(host, (message) => message.type === "updated");
   host.send(JSON.stringify({
     type: "update", sessionId: "session-1", version: 2,
     mode: "meeting", voiceOutputMode: "captions", languages: ["ko"],
   }));
-  assert.equal((await received).type, "updated");
+  assert.equal((await updated).type, "updated");
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(host.readyState, WebSocket.OPEN);
   assert.deepEqual(pipelines.map((pipeline) => pipeline.closed), [1, 0]);

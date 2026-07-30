@@ -123,6 +123,31 @@ export async function enforceGatewayTokenRateLimit(
   }
 }
 
+export async function enforceCoverUploadRateLimit(
+  hostId: string,
+  sessionId: string,
+  store: RateLimitStore,
+): Promise<void> {
+  const keyHash = await opaqueIdentifier(
+    LIVE_ADMISSION_PEPPER,
+    "cover-upload-host-session",
+    `${hostId}\u0000${sessionId}`,
+  );
+  const allowed = await store.consumeRateLimit({
+    scope: "cover-upload-host-session",
+    keyHash,
+    limit: 12,
+    windowSeconds: 60 * 60,
+  });
+  if (!allowed) {
+    throw new LiveAdmissionError(
+      "커버 업로드 요청이 너무 많습니다. 잠시 후 다시 시도해 주세요.",
+      "COVER_UPLOAD_RATE_LIMITED",
+      429,
+    );
+  }
+}
+
 export async function enforceSummaryGenerationRateLimit(
   hostId: string,
   sessionId: string,

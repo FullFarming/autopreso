@@ -117,3 +117,55 @@ test("participant duration rejects invalid or implausibly long timestamp ranges"
   assert.equal(activity.participants[0]?.speakingSeconds, 0);
   assert.equal(activity.participants[0]?.isPresent, false);
 });
+
+test("participant activity accepts nullable optional identity and a 100 character job title", async () => {
+  const longJobTitle = "D".repeat(100);
+  const fetchFn: typeof fetch = async (input) => {
+    const url = String(input);
+    if (url.includes("/rpc/read_live_participant_roster")) {
+      return Response.json([
+        {
+          participant_id: "grant-1",
+          display_name: "Noel Kim",
+          department: null,
+          job_title: null,
+          joined_at: "2026-07-23T00:00:00.000Z",
+          last_seen_at: "2026-07-23T00:10:00.000Z",
+          left_at: null,
+          utterance_count: 0,
+          speaking_seconds: 0,
+          last_spoke_at: null,
+        },
+        {
+          participant_id: "grant-2",
+          display_name: "Mina Lee",
+          department: "Strategy",
+          job_title: longJobTitle,
+          joined_at: "2026-07-23T00:00:00.000Z",
+          last_seen_at: "2026-07-23T00:10:00.000Z",
+          left_at: null,
+          utterance_count: 0,
+          speaking_seconds: 0,
+          last_spoke_at: null,
+        },
+      ]);
+    }
+    return Response.json([]);
+  };
+
+  const activity = await buildParticipantActivity(
+    "0192d0f4-9f72-7a36-91f5-6a76ef736f41",
+    "host-1",
+    "en",
+    fetchFn,
+    {
+      baseUrl: "https://dev-ref.supabase.co",
+      credential: { key: `sb_secret_${"a".repeat(24)}`, kind: "secret" },
+    },
+  );
+
+  assert.equal(activity.participants.length, 2);
+  assert.equal(activity.participants[0]?.department, "");
+  assert.equal(activity.participants[0]?.jobTitle, "");
+  assert.equal(activity.participants[1]?.jobTitle, longJobTitle);
+});

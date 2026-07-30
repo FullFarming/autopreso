@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { test } from "node:test";
@@ -11,7 +11,6 @@ import { WebSocket } from "ws";
 import { startServer } from "../src/server.js";
 
 const CHROME_BIN = process.env.CHROME_BIN ?? "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
-const CHROME_DEBUG_PORT = Number(process.env.CHROME_DEBUG_PORT ?? 9333 + (process.pid % 1000));
 
 test("browser renders the app shell", async (t) => {
   if (!existsSync(CHROME_BIN)) {
@@ -37,13 +36,14 @@ test("browser renders the app shell", async (t) => {
   });
 
   const userDataDir = await mkdtemp(path.join(tmpdir(), "realtime-noel-chrome-"));
+  const configuredDebugPort = Number(process.env.CHROME_DEBUG_PORT ?? 0);
   const chrome = spawn(
     CHROME_BIN,
     [
       "--headless=new",
       "--disable-gpu",
       "--no-sandbox",
-      `--remote-debugging-port=${CHROME_DEBUG_PORT}`,
+      `--remote-debugging-port=${configuredDebugPort}`,
       `--user-data-dir=${userDataDir}`,
       url,
     ],
@@ -58,7 +58,8 @@ test("browser renders the app shell", async (t) => {
     await rm(userDataDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   });
 
-  const tab = await waitForChromeTab(url);
+  const chromeDebugPort = configuredDebugPort || await waitForChromeDebugPort(userDataDir);
+  const tab = await waitForChromeTab(url, chromeDebugPort);
   const text = await waitForRenderedText(tab.webSocketDebuggerUrl, "Start Realtime Noel", url);
 
   assert.match(text, /Start Realtime Noel/);
@@ -69,11 +70,11 @@ test("browser renders the app shell", async (t) => {
   assert.ok(controls.some((label) => label.includes("Reset Staging")), `expected a Reset Staging button, got ${JSON.stringify(controls)}`);
 });
 
-async function waitForChromeTab(url) {
+async function waitForChromeTab(url, chromeDebugPort) {
   const deadline = Date.now() + 15000;
   while (Date.now() < deadline) {
     try {
-      const tabs = await fetch(`http://127.0.0.1:${CHROME_DEBUG_PORT}/json`).then((res) => res.json());
+      const tabs = await fetch(`http://127.0.0.1:${chromeDebugPort}/json`).then((res) => res.json());
       const tab = tabs.find((item) => item.url === url || item.url === `${url}/`);
       if (tab) return tab;
     } catch {
@@ -82,6 +83,21 @@ async function waitForChromeTab(url) {
     await sleep(250);
   }
   throw new Error("Timed out waiting for Chrome debug tab.");
+}
+
+async function waitForChromeDebugPort(userDataDir) {
+  const deadline = Date.now() + 15000;
+  const activePortPath = path.join(userDataDir, "DevToolsActivePort");
+  while (Date.now() < deadline) {
+    try {
+      const port = Number((await readFile(activePortPath, "utf8")).split("\n", 1)[0]);
+      if (Number.isInteger(port) && port > 0) return port;
+    } catch {
+      // Chrome writes DevToolsActivePort after the debugging endpoint binds.
+    }
+    await sleep(100);
+  }
+  throw new Error("Timed out waiting for Chrome debug port.");
 }
 
 function waitForRenderedText(webSocketDebuggerUrl, expectedText, targetUrl) {

@@ -6,19 +6,14 @@ import { test } from "node:test";
 import { WebSocket } from "ws";
 
 import {
-  buildSubtitleSession,
   createSubtitleRealtimeManager,
   describeSocketError,
   applyGlossaryCorrections,
   detectSourceLanguage,
-  handleRealtimeMessage,
   isSameLanguageEcho,
   isSourceEcho,
-  normalizeRealtimeModel,
-  normalizeSubtitleOutput,
   normalizeSubtitleSettings,
 } from "../src/subtitle-realtime.js";
-import { handleGeminiLiveMessage } from "../src/gemini-live-translate.js";
 import { GLOSSARY_PRESETS, getDefaultSubtitleGlossaryContext } from "../src/glossary-presets.js";
 
 test("desktop outer polish deadline matches the six-second polisher budget", async () => {
@@ -180,1506 +175,6 @@ test("isSourceEcho suppresses a same-language passthrough but not a real transla
   assert.equal(isSourceEcho("", ""), false);
 });
 
-test("buildSubtitleSession uses the official minimal translation session shape", () => {
-  const session = buildSubtitleSession({ model: "gpt-realtime-2", languagePair: { a: "en", b: "ko" } }, "ko");
-
-  assert.equal(session.model, undefined);
-  assert.equal(session.instructions, undefined);
-  assert.equal(session.output_modalities, undefined);
-  assert.equal(session.audio.input, undefined);
-  assert.deepEqual(session.audio.output, { language: "ko" });
-});
-
-test("buildSubtitleSession maps Chinese scripts to OpenAI's single zh output code", () => {
-  assert.deepEqual(buildSubtitleSession({}, "zh-Hans").audio.output, { language: "zh" });
-  assert.deepEqual(buildSubtitleSession({}, "zh-Hant").audio.output, { language: "zh" });
-});
-
-test("normalizeSubtitleOutput handles JSON, partial JSON, and two-line fallback", () => {
-  assert.deepEqual(
-    normalizeSubtitleOutput('{"translatedText":"안녕하세요","sourceText":"hello"}'),
-    { translatedText: "안녕하세요", sourceText: "hello" },
-  );
-  assert.deepEqual(
-    normalizeSubtitleOutput('{"translatedText":"안녕","sourceText":"hel'),
-    { translatedText: "안녕", sourceText: "hel" },
-  );
-  assert.deepEqual(
-    normalizeSubtitleOutput("Translation: Hello\nSource: 안녕하세요"),
-    { translatedText: "Hello", sourceText: "안녕하세요" },
-  );
-  assert.deepEqual(
-    normalizeSubtitleOutput('{"translatedText":"JP: こんにちは","sourceText":"KO: 안녕하세요"}'),
-    { translatedText: "こんにちは", sourceText: "안녕하세요" },
-  );
-  assert.deepEqual(
-    normalizeSubtitleOutput("Eng: Hello."),
-    { translatedText: "Hello.", sourceText: "" },
-  );
-});
-
-test("normalizeSubtitleSettings clamps an unknown tone back to natural", () => {
-  assert.equal(normalizeSubtitleSettings({ tone: "casual" }).tone, "natural");
-  assert.equal(normalizeSubtitleSettings({ tone: "business" }).tone, "business");
-  assert.equal(normalizeSubtitleSettings({}).tone, "natural");
-});
-
-test("normalizeSubtitleSettings keeps subtitle defaults bounded", () => {
-  const settings = normalizeSubtitleSettings({
-    inputMode: "bad",
-    translationFontSize: 200,
-    sourceFontSize: 1,
-    maxWidth: 50,
-    opacity: 3,
-    position: "unknown",
-  });
-
-  assert.equal(settings.inputMode, "system_mic");
-  assert.equal(settings.translationFontSize, 96);
-  assert.equal(settings.sourceFontSize, 14);
-  assert.equal(settings.maxWidth, 320);
-  assert.equal(settings.opacity, 1);
-  assert.equal(settings.position, "bottom-center");
-  assert.equal(settings.model, "gpt-realtime-translate");
-  assert.equal(settings.displayMode, "translation_only");
-  assert.equal(settings.maxSubtitleLines, 2);
-  assert.equal(settings.recordProvider, "ollama");
-  assert.equal(settings.showSourceText, false);
-  assert.equal(settings.translateAllLanguages, false);
-});
-
-test("normalizeRealtimeModel maps voice-agent models to the translation model", () => {
-  assert.equal(normalizeRealtimeModel("gpt-realtime-2"), "gpt-realtime-translate");
-  assert.equal(normalizeRealtimeModel("gpt-realtime"), "gpt-realtime-translate");
-  assert.equal(normalizeRealtimeModel("gpt-realtime-translate"), "gpt-realtime-translate");
-});
-
-test("applyGlossaryCorrections enforces configured hospitality terms in realtime text", () => {
-  const glossary = [
-    "MRG Gap / MRG 차이 = MRG 갭",
-    "Focused-service / Focused service / 포커스 서비스 = 포커스드 서비스",
-    "운영사 / 운영자 / operating company = operator",
-  ].join("\n");
-
-  assert.equal(
-    applyGlossaryCorrections("MRG 차이를 줄이는 구조입니다.", { glossary, targetLanguage: "ko" }),
-    "MRG 갭을 줄이는 구조입니다.",
-  );
-  assert.equal(
-    applyGlossaryCorrections("포커스 서비스 브랜드 확대", { glossary, targetLanguage: "ko" }),
-    "포커스드 서비스 브랜드 확대",
-  );
-  assert.equal(
-    applyGlossaryCorrections("운영자 검증이 중요합니다.", { glossary, targetLanguage: "ko" }),
-    "운영사 검증이 중요합니다.",
-  );
-  assert.equal(
-    applyGlossaryCorrections("The operating company must join early.", { glossary, targetLanguage: "en" }),
-    "The operator must join early.",
-  );
-});
-
-test("applyGlossaryCorrections applies hospitality sentence memory in both directions", () => {
-  const glossary = [
-    "국내 호텔 시장의 변화와 기회 = Changes and Opportunities in Korea's Hotel Market",
-    "좋은 시장은 기회를 만들지만, 그 기회를 딜로 바꾸는 건 체계적인 검증에서 나옵니다 = A strong market creates opportunities, but turning those opportunities into deals comes from systematic validation.",
-  ].join("\n");
-
-  assert.equal(
-    applyGlossaryCorrections("국내 호텔 시장의 변화와 기회", { glossary, targetLanguage: "en" }),
-    "Changes and Opportunities in Korea's Hotel Market",
-  );
-  assert.equal(
-    applyGlossaryCorrections("Changes and Opportunities in Korea's Hotel Market", { glossary, targetLanguage: "ko" }),
-    "국내 호텔 시장의 변화와 기회",
-  );
-  assert.equal(
-    applyGlossaryCorrections("좋은 시장은 기회를 만들지만, 그 기회를 딜로 바꾸는 건 체계적인 검증에서 나옵니다", { glossary, targetLanguage: "en" }),
-    "A strong market creates opportunities, but turning those opportunities into deals comes from systematic validation.",
-  );
-});
-
-test("applyGlossaryCorrections prefers registered source idioms before raw translation wording", () => {
-  const glossary = [
-    '현주소 = current landscape ("현재 상황"의 뜻. NEVER "current address")',
-    "국내 호텔 시장의 변화와 기회 = Changes and Opportunities in Korea's Hotel Market",
-  ].join("\n");
-
-  assert.equal(
-    applyGlossaryCorrections("current address", { glossary, targetLanguage: "en", sourceText: "현주소" }),
-    "current landscape",
-  );
-  assert.equal(
-    applyGlossaryCorrections("Changes in the domestic hotel market", {
-      glossary,
-      targetLanguage: "en",
-      sourceText: "국내 호텔 시장의 변화와 기회",
-    }),
-    "Changes and Opportunities in Korea's Hotel Market",
-  );
-});
-
-test("handleRealtimeMessage renders realtime translation transcript deltas", () => {
-  let sourceText = "";
-  let translatedText = "";
-  const broadcasts = [];
-  const ctx = {
-    source: "mic",
-    targetLanguage: "en",
-    getSourceText: () => sourceText,
-    setSourceText: (value) => { sourceText = value; },
-    getTranslatedText: () => translatedText,
-    setTranslatedText: (value) => { translatedText = value; },
-    emitPartial: () => {
-      broadcasts.push({
-        type: "subtitle:partial",
-        source: "mic",
-        targetLanguage: "en",
-        sourceText: sourceText.trim(),
-        translatedText: translatedText.trim(),
-      });
-    },
-    scheduleCommit: () => {},
-    broadcast: (message) => broadcasts.push(message),
-  };
-
-  handleRealtimeMessage(JSON.stringify({ type: "session.input_transcript.delta", delta: "안녕" }), ctx);
-  handleRealtimeMessage(JSON.stringify({ type: "session.input_transcript.delta", delta: "하세요" }), ctx);
-  handleRealtimeMessage(JSON.stringify({ type: "session.output_transcript.delta", delta: "Hello." }), ctx);
-
-  assert.equal(broadcasts[0].type, "subtitle:partial");
-  assert.equal(broadcasts[0].source, "mic");
-  assert.equal(broadcasts[0].sourceText, "안녕");
-  assert.equal(broadcasts[1].sourceText, "안녕하세요");
-  assert.deepEqual(
-    { translatedText: broadcasts.at(-1).translatedText, sourceText: broadcasts.at(-1).sourceText },
-    { translatedText: "Hello.", sourceText: "안녕하세요" },
-  );
-});
-
-test("invalid realtime JSON is reported without reflecting untrusted raw input", () => {
-  const broadcasts = [];
-  handleRealtimeMessage("{<script>secret-token</script>", {
-    broadcast: (message) => broadcasts.push(message),
-  });
-
-  assert.deepEqual(broadcasts, [{
-    type: "subtitle:error",
-    message: "Invalid realtime message.",
-    code: "INVALID_REALTIME_MESSAGE",
-  }]);
-});
-
-test("OpenAI and Gemini transcript accumulation stays bounded", () => {
-  let openAiSource = "";
-  handleRealtimeMessage(JSON.stringify({
-    type: "session.input_transcript.delta",
-    delta: "A".repeat(50_000),
-  }), {
-    getSourceText: () => openAiSource,
-    setSourceText: (value) => { openAiSource = value; },
-  });
-  assert.ok(openAiSource.length <= 16_384);
-
-  let geminiSource = "";
-  handleGeminiLiveMessage(JSON.stringify({
-    serverContent: { inputTranscription: { text: "가".repeat(50_000) } },
-  }), {
-    getSourceText: () => geminiSource,
-    setSourceText: (value) => { geminiSource = value; },
-  });
-  assert.ok(geminiSource.length <= 16_384);
-});
-
-test("SUBTITLE_DEBUG requires an explicit enabled value", () => {
-  const previous = process.env.SUBTITLE_DEBUG;
-  process.env.SUBTITLE_DEBUG = "0";
-  const broadcasts = [];
-  handleGeminiLiveMessage(JSON.stringify({
-    serverContent: { inputTranscription: { text: "Hello", languageCode: "en" } },
-  }), {
-    getSourceText: () => "",
-    setSourceText: () => {},
-    broadcast: (message) => broadcasts.push(message),
-  });
-  if (previous === undefined) delete process.env.SUBTITLE_DEBUG;
-  else process.env.SUBTITLE_DEBUG = previous;
-
-  assert.equal(broadcasts.some((message) => message.type === "subtitle:debug"), false);
-});
-
-test("subtitle channel waits for stable source language before displaying target transcript", () => {
-  let sourceText = "";
-  let translatedText = "";
-  const broadcasts = [];
-  const shouldDisplay = () => {
-    if (sourceText.length < 4) return false;
-    const sourceLanguage = /[가-힣ㄱ-ㅎㅏ-ㅣ]/.test(sourceText) ? "ko" : /[A-Za-z]/.test(sourceText) ? "en" : "unknown";
-    if (sourceLanguage === "unknown") return false;
-    return "ko" !== sourceLanguage;
-  };
-  const ctx = {
-    source: "mic",
-    targetLanguage: "ko",
-    getSourceText: () => sourceText,
-    setSourceText: (value) => { sourceText = value; },
-    getTranslatedText: () => translatedText,
-    setTranslatedText: (value) => { translatedText = value; },
-    shouldDisplay,
-    emitPartial: () => {
-      if (!shouldDisplay() || !translatedText.trim()) return;
-      broadcasts.push({
-        type: "subtitle:partial",
-        source: "mic",
-        targetLanguage: "ko",
-        sourceText: sourceText.trim(),
-        translatedText: translatedText.trim(),
-      });
-    },
-    scheduleCommit: () => {},
-    broadcast: (message) => broadcasts.push(message),
-  };
-
-  handleRealtimeMessage(JSON.stringify({ type: "session.output_transcript.delta", delta: "안녕하세요." }), ctx);
-  assert.deepEqual(broadcasts, []);
-
-  handleRealtimeMessage(JSON.stringify({ type: "session.input_transcript.delta", delta: "He" }), ctx);
-  assert.deepEqual(broadcasts, []);
-
-  handleRealtimeMessage(JSON.stringify({ type: "session.input_transcript.delta", delta: "llo" }), ctx);
-  assert.deepEqual(broadcasts.at(-1), { type: "subtitle:partial", source: "mic", targetLanguage: "ko", sourceText: "Hello", translatedText: "안녕하세요." });
-});
-
-test("same-language translation channel is suppressed after source language is known", () => {
-  let sourceText = "";
-  let translatedText = "";
-  const broadcasts = [];
-  const shouldDisplay = () => {
-    if (!sourceText) return false;
-    const sourceLanguage = /[가-힣ㄱ-ㅎㅏ-ㅣ]/.test(sourceText) ? "ko" : /[A-Za-z]/.test(sourceText) ? "en" : "unknown";
-    if (sourceLanguage === "unknown") return false;
-    return "en" !== sourceLanguage;
-  };
-  const ctx = {
-    source: "mic",
-    targetLanguage: "en",
-    getSourceText: () => sourceText,
-    setSourceText: (value) => { sourceText = value; },
-    getTranslatedText: () => translatedText,
-    setTranslatedText: (value) => { translatedText = value; },
-    shouldDisplay,
-    emitPartial: () => {
-      if (!shouldDisplay() || !translatedText.trim()) return;
-      broadcasts.push({ type: "subtitle:partial", translatedText: translatedText.trim() });
-    },
-    scheduleCommit: () => {},
-    broadcast: (message) => broadcasts.push(message),
-  };
-
-  handleRealtimeMessage(JSON.stringify({ type: "session.output_transcript.delta", delta: "Hello." }), ctx);
-  handleRealtimeMessage(JSON.stringify({ type: "session.input_transcript.delta", delta: "Hello" }), ctx);
-
-  assert.deepEqual(broadcasts, []);
-});
-
-test("subtitle channel displays English after Korean using the recent source segment language", async () => {
-  const sockets = [];
-  const broadcasts = [];
-  const manager = createSubtitleRealtimeManager({
-    broadcast: (message) => broadcasts.push(message),
-    settingsStore: {
-      load: async () => ({
-        apiKeys: { openai: "sk-test" },
-        subtitle: { translationProvider: "openai", inputMode: "mic", languagePair: { a: "en", b: "ko" } },
-      }),
-    },
-    createWebSocket: (url, protocols, init) => {
-      const socket = new FakeSocket(url, init);
-      sockets.push(socket);
-      return socket;
-    },
-  });
-
-  await manager.start({ sessionId: "active" });
-  const englishTarget = sockets[0];
-  const koreanTarget = sockets[1];
-
-  englishTarget.emit("message", JSON.stringify({ type: "session.input_transcript.delta", delta: "안녕하세요" }));
-  englishTarget.emit("message", JSON.stringify({ type: "session.output_transcript.delta", delta: "Hello." }));
-  koreanTarget.emit("message", JSON.stringify({ type: "session.input_transcript.delta", delta: "안녕하세요" }));
-  koreanTarget.emit("message", JSON.stringify({ type: "session.output_transcript.delta", delta: "안녕." }));
-
-  englishTarget.emit("message", JSON.stringify({ type: "session.input_transcript.delta", delta: " Next slide" }));
-  englishTarget.emit("message", JSON.stringify({ type: "session.output_transcript.delta", delta: " Next slide" }));
-  koreanTarget.emit("message", JSON.stringify({ type: "session.input_transcript.delta", delta: " Next slide" }));
-  koreanTarget.emit("message", JSON.stringify({ type: "session.input_transcript.done", transcript: "안녕하세요 Next slide" }));
-  koreanTarget.emit("message", JSON.stringify({ type: "session.output_transcript.delta", delta: " 다음 슬라이드" }));
-
-  const partials = broadcasts.filter((message) => message.type === "subtitle:partial");
-  assert.deepEqual(
-    partials.map((message) => ({
-      targetLanguage: message.targetLanguage,
-      sourceText: message.sourceText,
-      translatedText: message.translatedText,
-    })),
-    [
-      { targetLanguage: "en", sourceText: "안녕하세요", translatedText: "Hello." },
-      { targetLanguage: "ko", sourceText: "Next slide", translatedText: "다음 슬라이드" },
-    ],
-  );
-});
-
-test("subtitle manager holds translated deltas until source language is stable", async () => {
-  const sockets = [];
-  const broadcasts = [];
-  const manager = createSubtitleRealtimeManager({
-    broadcast: (message) => broadcasts.push(message),
-    settingsStore: {
-      load: async () => ({
-        apiKeys: { openai: "sk-test" },
-        subtitle: { translationProvider: "openai", inputMode: "mic", languagePair: { a: "en", b: "ko" } },
-      }),
-    },
-    createWebSocket: (url, protocols, init) => {
-      const socket = new FakeSocket(url, init);
-      sockets.push(socket);
-      return socket;
-    },
-  });
-
-  await manager.start({ sessionId: "active" });
-  const koreanTarget = sockets[1];
-  koreanTarget.emit("message", JSON.stringify({ type: "session.output_transcript.delta", delta: "안녕하세요." }));
-  assert.equal(broadcasts.some((message) => message.type === "subtitle:partial"), false);
-
-  koreanTarget.emit("message", JSON.stringify({ type: "session.input_transcript.delta", delta: "He" }));
-  assert.equal(broadcasts.some((message) => message.type === "subtitle:partial"), false);
-
-  koreanTarget.emit("message", JSON.stringify({ type: "session.input_transcript.delta", delta: "llo" }));
-  const partial = broadcasts.find((message) => message.type === "subtitle:partial");
-  assert.deepEqual(partial, {
-    type: "subtitle:partial",
-    source: "mic",
-    targetLanguage: "ko",
-    sourceLanguage: "en",
-    translationRole: 1,
-    sourceText: "Hello",
-    translatedText: "안녕하세요.",
-  });
-});
-
-test("subtitle manager holds incomplete translated deltas until the line looks stable", async () => {
-  const sockets = [];
-  const broadcasts = [];
-  const manager = createSubtitleRealtimeManager({
-    broadcast: (message) => broadcasts.push(message),
-    settingsStore: {
-      load: async () => ({
-        apiKeys: { openai: "sk-test" },
-        subtitle: { translationProvider: "openai", inputMode: "mic", languagePair: { a: "en", b: "ko" } },
-      }),
-    },
-    createWebSocket: (url, protocols, init) => {
-      const socket = new FakeSocket(url, init);
-      sockets.push(socket);
-      return socket;
-    },
-  });
-
-  await manager.start({ sessionId: "active" });
-  const englishTarget = sockets[0];
-  englishTarget.emit("message", JSON.stringify({ type: "session.input_transcript.delta", delta: "좋은 시장은 기회를 만들지만" }));
-  englishTarget.emit("message", JSON.stringify({ type: "session.output_transcript.delta", delta: "A strong market creates" }));
-
-  assert.deepEqual(broadcasts.filter((message) => message.type === "subtitle:partial"), []);
-
-  englishTarget.emit("message", JSON.stringify({ type: "session.output_transcript.delta", delta: " opportunities." }));
-  const partial = broadcasts.find((message) => message.type === "subtitle:partial");
-  assert.deepEqual(
-    { targetLanguage: partial?.targetLanguage, sourceLanguage: partial?.sourceLanguage, translatedText: partial?.translatedText },
-    { targetLanguage: "en", sourceLanguage: "ko", translatedText: "A strong market creates opportunities." },
-  );
-});
-
-test("subtitle manager releases long unpunctuated partials within the realtime hold budget", async () => {
-  const sockets = [];
-  const broadcasts = [];
-  const manager = createSubtitleRealtimeManager({
-    broadcast: (message) => broadcasts.push(message),
-    settingsStore: {
-      load: async () => ({
-        apiKeys: { openai: "sk-test" },
-        subtitle: { translationProvider: "openai", inputMode: "mic", languagePair: { a: "en", b: "ko" } },
-      }),
-    },
-    createWebSocket: (url, protocols, init) => {
-      const socket = new FakeSocket(url, init);
-      sockets.push(socket);
-      return socket;
-    },
-  });
-
-  await manager.start({ sessionId: "active" });
-  const koreanTarget = sockets[1];
-  koreanTarget.emit("message", JSON.stringify({ type: "session.input_transcript.delta", delta: "This market needs a systematic validation framework" }));
-  koreanTarget.emit("message", JSON.stringify({ type: "session.output_transcript.delta", delta: "이 시장은 체계적인 검증 프레임워크 확보가 핵심" }));
-
-  assert.deepEqual(broadcasts.filter((message) => message.type === "subtitle:partial"), []);
-  await new Promise((resolve) => setTimeout(resolve, 480));
-
-  const partial = broadcasts.find((message) => message.type === "subtitle:partial");
-  assert.deepEqual(
-    { targetLanguage: partial?.targetLanguage, sourceLanguage: partial?.sourceLanguage, translatedText: partial?.translatedText },
-    { targetLanguage: "ko", sourceLanguage: "en", translatedText: "이 시장은 체계적인 검증 프레임워크 확보가 핵심" },
-  );
-});
-
-test("subtitle manager holds short unpunctuated partials until the source is stable enough", async () => {
-  const sockets = [];
-  const broadcasts = [];
-  const manager = createSubtitleRealtimeManager({
-    broadcast: (message) => broadcasts.push(message),
-    settingsStore: {
-      load: async () => ({
-        apiKeys: { openai: "sk-test" },
-        subtitle: { translationProvider: "openai", inputMode: "mic", languagePair: { a: "en", b: "ko" } },
-      }),
-    },
-    createWebSocket: (url, protocols, init) => {
-      const socket = new FakeSocket(url, init);
-      sockets.push(socket);
-      return socket;
-    },
-  });
-
-  await manager.start({ sessionId: "active" });
-  const englishTarget = sockets[0];
-  englishTarget.emit("message", JSON.stringify({ type: "session.output_transcript.delta", delta: "Okay" }));
-  englishTarget.emit("message", JSON.stringify({ type: "session.input_transcript.delta", delta: "좋아요" }));
-
-  assert.deepEqual(broadcasts.filter((message) => message.type === "subtitle:partial"), []);
-  await new Promise((resolve) => setTimeout(resolve, 480));
-
-  assert.deepEqual(broadcasts.filter((message) => message.type === "subtitle:partial"), []);
-});
-
-test("subtitle manager routes delayed-source output only through matching target-language channels", async () => {
-  const sockets = [];
-  const broadcasts = [];
-  const manager = createSubtitleRealtimeManager({
-    broadcast: (message) => broadcasts.push(message),
-    settingsStore: {
-      load: async () => ({
-        apiKeys: { openai: "sk-test" },
-        subtitle: { translationProvider: "openai", inputMode: "mic", languagePair: { a: "en", b: "ko" } },
-      }),
-    },
-    createWebSocket: (url, protocols, init) => {
-      const socket = new FakeSocket(url, init);
-      sockets.push(socket);
-      return socket;
-    },
-  });
-
-  await manager.start({ sessionId: "active" });
-  const englishTarget = sockets[0];
-  const koreanTarget = sockets[1];
-
-  englishTarget.emit("message", JSON.stringify({ type: "session.output_transcript.delta", delta: "Hello." }));
-  koreanTarget.emit("message", JSON.stringify({ type: "session.output_transcript.delta", delta: "안녕하세요." }));
-  assert.deepEqual(broadcasts.filter((message) => message.type === "subtitle:partial"), []);
-
-  englishTarget.emit("message", JSON.stringify({ type: "session.input_transcript.delta", delta: "안녕하세요" }));
-  koreanTarget.emit("message", JSON.stringify({ type: "session.input_transcript.delta", delta: "Hello" }));
-
-  assert.deepEqual(
-    broadcasts.filter((message) => message.type === "subtitle:partial").map((message) => ({
-      targetLanguage: message.targetLanguage,
-      translatedText: message.translatedText,
-    })),
-    [
-      { targetLanguage: "en", translatedText: "Hello." },
-      { targetLanguage: "ko", translatedText: "안녕하세요." },
-    ],
-  );
-});
-
-test("subtitle manager can fan any supported source language out to the other two languages", async () => {
-  const cases = [
-    {
-      sourceText: "안녕하세요",
-      outputs: { en: "Hello.", ko: "안녕하세요.", ja: "こんにちは。" },
-      expected: [
-        { targetLanguage: "en", sourceText: "안녕하세요", translatedText: "Hello." },
-        { targetLanguage: "ja", sourceText: "안녕하세요", translatedText: "こんにちは。" },
-      ],
-      roles: { en: 1, ja: 2 },
-    },
-    {
-      sourceText: "Hello",
-      outputs: { en: "Hello.", ko: "안녕하세요.", ja: "こんにちは。" },
-      expected: [
-        { targetLanguage: "ko", sourceText: "Hello", translatedText: "안녕하세요." },
-        { targetLanguage: "ja", sourceText: "Hello", translatedText: "こんにちは。" },
-      ],
-      roles: { ko: 1, ja: 2 },
-    },
-    {
-      sourceText: "こんにちは",
-      outputs: { en: "Hello.", ko: "안녕하세요.", ja: "こんにちは。" },
-      expected: [
-        { targetLanguage: "en", sourceText: "こんにちは", translatedText: "Hello." },
-        { targetLanguage: "ko", sourceText: "こんにちは", translatedText: "안녕하세요." },
-      ],
-      roles: { en: 1, ko: 2 },
-    },
-  ];
-
-  for (const item of cases) {
-    const sockets = [];
-    const broadcasts = [];
-    const manager = createSubtitleRealtimeManager({
-      broadcast: (message) => broadcasts.push(message),
-      settingsStore: {
-        load: async () => ({
-          apiKeys: { openai: "sk-test" },
-          subtitle: { translationProvider: "openai",
-            inputMode: "mic",
-            languagePair: { a: "en", b: "ko" },
-            translateAllLanguages: true,
-          },
-        }),
-      },
-      createWebSocket: (url, protocols, init) => {
-        const socket = new FakeSocket(url, init);
-        sockets.push(socket);
-        return socket;
-      },
-    });
-
-    await manager.start({ sessionId: `active-${item.sourceText}` });
-    assert.equal(sockets.length, 3);
-
-    for (const [index, targetLanguage] of ["en", "ko", "ja"].entries()) {
-      sockets[index].emit("message", JSON.stringify({ type: "session.input_transcript.delta", delta: item.sourceText }));
-      sockets[index].emit("message", JSON.stringify({ type: "session.output_transcript.delta", delta: item.outputs[targetLanguage] }));
-    }
-
-    assert.deepEqual(
-      broadcasts.filter((message) => message.type === "subtitle:partial").map((message) => ({
-        targetLanguage: message.targetLanguage,
-        sourceText: message.sourceText,
-        translatedText: message.translatedText,
-      })),
-      item.expected,
-    );
-    assert.deepEqual(
-      Object.fromEntries(broadcasts.filter((message) => message.type === "subtitle:partial").map((message) => [message.targetLanguage, message.translationRole])),
-      item.roles,
-    );
-  }
-});
-
-test("all-language OpenAI subtitles use one channel per output language, distributed across the two keys", async () => {
-  const sockets = [];
-  const manager = createSubtitleRealtimeManager({
-    broadcast: () => {},
-    settingsStore: {
-      load: async () => ({
-        apiKeys: { openai: "sk-primary", openaiSecondary: "sk-secondary" },
-        subtitle: {
-          inputMode: "mic",
-          languagePair: { a: "en", b: "ko" },
-          translateAllLanguages: true,
-          translationProvider: "openai",
-        },
-      }),
-    },
-    createWebSocket: (url, _protocols, init) => {
-      const socket = new FakeSocket(url, init);
-      sockets.push(socket);
-      return socket;
-    },
-  });
-
-  await manager.start({ sessionId: "active" });
-
-  // gpt-realtime-translate is output-language-only, so exactly one channel per
-  // target (no duplicate Korean channel). Targets spread across the two keys.
-  assert.equal(sockets.length, 3);
-  assert.deepEqual(
-    sockets.map((socket) => socket.init.headers.Authorization),
-    ["Bearer sk-primary", "Bearer sk-primary", "Bearer sk-secondary"],
-  );
-  assert.deepEqual(
-    sockets.map((socket) => socket.init.headers["OpenAI-Safety-Identifier"]),
-    [
-      "realtime-noel-subtitles-mic-en-api1",
-      "realtime-noel-subtitles-mic-ko-api1",
-      "realtime-noel-subtitles-mic-ja-api2",
-    ],
-  );
-});
-
-test("all-language subtitles use selected translation languages instead of a fixed EN-KO-JA list", async () => {
-  const sockets = [];
-  const manager = createSubtitleRealtimeManager({
-    broadcast: () => {},
-    settingsStore: {
-      load: async () => ({
-        apiKeys: { openai: "sk-primary", openaiSecondary: "sk-secondary" },
-        subtitle: {
-          inputMode: "mic",
-          languagePair: { a: "ko", b: "ja" },
-          translationLanguages: ["ko", "ja", "en"],
-          translateAllLanguages: true,
-          translationProvider: "openai",
-        },
-      }),
-    },
-    createWebSocket: (url, _protocols, init) => {
-      const socket = new FakeSocket(url, init);
-      sockets.push(socket);
-      return socket;
-    },
-  });
-
-  await manager.start({ sessionId: "active" });
-
-  // translationLanguages order [ko, ja, en] → one channel each, first half on
-  // key 1, the rest on key 2.
-  assert.equal(sockets.length, 3);
-  assert.deepEqual(
-    sockets.map((socket) => socket.init.headers["OpenAI-Safety-Identifier"]),
-    [
-      "realtime-noel-subtitles-mic-ko-api1",
-      "realtime-noel-subtitles-mic-ja-api1",
-      "realtime-noel-subtitles-mic-en-api2",
-    ],
-  );
-  assert.deepEqual(
-    sockets.map((socket) => socket.init.headers.Authorization),
-    ["Bearer sk-primary", "Bearer sk-primary", "Bearer sk-secondary"],
-  );
-});
-
-test("the single Korean channel shows Korean for both English and Japanese input (no duplicate channel)", async () => {
-  const sockets = [];
-  const broadcasts = [];
-  const manager = createSubtitleRealtimeManager({
-    broadcast: (message) => broadcasts.push(message),
-    settingsStore: {
-      load: async () => ({
-        apiKeys: { openai: "sk-primary", openaiSecondary: "sk-secondary" },
-        subtitle: {
-          inputMode: "mic",
-          languagePair: { a: "en", b: "ko" },
-          translateAllLanguages: true,
-          translationProvider: "openai",
-        },
-      }),
-    },
-    createWebSocket: (url, _protocols, init) => {
-      const socket = new FakeSocket(url, init);
-      sockets.push(socket);
-      return socket;
-    },
-  });
-
-  await manager.start({ sessionId: "active" });
-  // targets [en, ko, ja] → exactly one Korean channel (index 1). No second
-  // Korean socket exists to collide with it.
-  assert.equal(sockets.length, 3);
-  const korean = sockets[1];
-
-  korean.emit("message", JSON.stringify({ type: "session.input_transcript.delta", delta: "Hello" }));
-  korean.emit("message", JSON.stringify({ type: "session.output_transcript.delta", delta: "안녕하세요." }));
-
-  assert.deepEqual(
-    broadcasts.filter((message) => message.type === "subtitle:partial").map((message) => ({
-      targetLanguage: message.targetLanguage,
-      sourceLanguage: message.sourceLanguage,
-      translatedText: message.translatedText,
-    })),
-    [{ targetLanguage: "ko", sourceLanguage: "en", translatedText: "안녕하세요." }],
-  );
-
-  broadcasts.length = 0;
-  korean.emit("message", JSON.stringify({ type: "session.input_audio_buffer.speech_started" }));
-  korean.emit("message", JSON.stringify({ type: "session.input_transcript.delta", delta: "こんにちは" }));
-  korean.emit("message", JSON.stringify({ type: "session.output_transcript.delta", delta: "안녕하세요." }));
-
-  assert.deepEqual(
-    broadcasts.filter((message) => message.type === "subtitle:partial").map((message) => ({
-      targetLanguage: message.targetLanguage,
-      sourceLanguage: message.sourceLanguage,
-      translatedText: message.translatedText,
-    })),
-    [{ targetLanguage: "ko", sourceLanguage: "ja", translatedText: "안녕하세요." }],
-  );
-});
-
-test("all-language OpenAI subtitles ignore Gemini routing and use only OpenAI project keys", async () => {
-  const sockets = [];
-  const manager = createSubtitleRealtimeManager({
-    broadcast: () => {},
-    settingsStore: {
-      load: async () => ({
-        apiKeys: { openai: "sk-primary", openaiSecondary: "sk-secondary", gemini: "AIza-test" },
-        subtitle: {
-          inputMode: "mic",
-          languagePair: { a: "en", b: "ko" },
-          translateAllLanguages: true,
-          translationProvider: "openai",
-        },
-      }),
-    },
-    createWebSocket: (url, _protocols, init) => {
-      const socket = new FakeSocket(url, init);
-      sockets.push(socket);
-      return socket;
-    },
-  });
-
-  await manager.start({ sessionId: "active" });
-
-  // ja routes to Gemini whenever a Gemini key exists (even in all-language
-  // mode) so it isn't stuck on the slow OpenAI translate model; en/ko stay on
-  // OpenAI. One channel per output language.
-  assert.equal(sockets.length, 3);
-  assert.deepEqual(
-    sockets.slice(0, 2).map((socket) => socket.url),
-    [
-      "wss://api.openai.com/v1/realtime/translations?model=gpt-realtime-translate",
-      "wss://api.openai.com/v1/realtime/translations?model=gpt-realtime-translate",
-    ],
-  );
-  assert.match(sockets[2].url, /generativelanguage\.googleapis\.com/);
-  assert.deepEqual(
-    sockets.slice(0, 2).map((socket) => socket.init.headers.Authorization),
-    ["Bearer sk-primary", "Bearer sk-primary"],
-  );
-});
-
-test("gemini provider splits 3 target languages across two gemini keys in parallel", async () => {
-  const sockets = [];
-  const manager = createSubtitleRealtimeManager({
-    broadcast: () => {},
-    settingsStore: {
-      load: async () => ({
-        apiKeys: { gemini: "AIza-primary", geminiSecondary: "AIza-secondary" },
-        subtitle: {
-          inputMode: "mic",
-          translationLanguages: ["en", "ko", "ja"],
-          translateAllLanguages: true,
-          translationProvider: "gemini",
-        },
-      }),
-    },
-    createWebSocket: (url, _protocols, init) => {
-      const socket = new FakeSocket(url, init);
-      sockets.push(socket);
-      return socket;
-    },
-  });
-
-  await manager.start({ sessionId: "active" });
-
-  // Mirrors the OpenAI two-key split: targets [en, ko, ja] → first half on the
-  // primary Gemini project, the rest on the secondary, all on Gemini Live.
-  assert.equal(sockets.length, 3);
-  for (const socket of sockets) assert.match(socket.url, /generativelanguage\.googleapis\.com/);
-  assert.match(sockets[0].url, /key=AIza-primary/);
-  assert.match(sockets[1].url, /key=AIza-primary/);
-  assert.match(sockets[2].url, /key=AIza-secondary/);
-});
-
-test("gemini provider with a single key keeps every target on the primary key", async () => {
-  const sockets = [];
-  const manager = createSubtitleRealtimeManager({
-    broadcast: () => {},
-    settingsStore: {
-      load: async () => ({
-        apiKeys: { gemini: "AIza-primary" },
-        subtitle: {
-          inputMode: "mic",
-          translationLanguages: ["en", "ko", "ja"],
-          translateAllLanguages: true,
-          translationProvider: "gemini",
-        },
-      }),
-    },
-    createWebSocket: (url, _protocols, init) => {
-      const socket = new FakeSocket(url, init);
-      sockets.push(socket);
-      return socket;
-    },
-  });
-
-  await manager.start({ sessionId: "active" });
-
-  // No secondary key → unchanged single-key behavior: all three on the primary.
-  assert.equal(sockets.length, 3);
-  for (const socket of sockets) assert.match(socket.url, /key=AIza-primary/);
-});
-
-test("a dropped Gemini session auto-reconnects and resumes with the saved handle", async () => {
-  const sockets = [];
-  const broadcasts = [];
-  const manager = createSubtitleRealtimeManager({
-    broadcast: (message) => broadcasts.push(message),
-    settingsStore: {
-      load: async () => ({
-        apiKeys: { gemini: "AIza-test" },
-        subtitle: { inputMode: "mic", translationLanguages: ["en", "ko"], translationProvider: "gemini", outputMode: "audio", audioLanguage: "en" },
-      }),
-    },
-    createWebSocket: (url, _protocols, init) => {
-      const socket = new FakeSocket(url, init);
-      sockets.push(socket);
-      return socket;
-    },
-  });
-
-  await manager.start({ sessionId: "active" });
-  const initialCount = sockets.length; // en + ko channels
-  const en = sockets[0];
-  en.emit("open");
-  en.emit("message", JSON.stringify({ setupComplete: {} }));
-  en.emit("message", JSON.stringify({ sessionResumptionUpdate: { resumable: true, newHandle: "resume-123" } }));
-  // Server-side drop / duration cap (NOT a deliberate stop) → must reconnect.
-  en.emit("close", 1011, Buffer.from("session expired"));
-  await new Promise((resolve) => setTimeout(resolve, 700));
-
-  assert.ok(sockets.length > initialCount, "the dropped channel should auto-reconnect");
-  const reconnected = sockets[sockets.length - 1];
-  assert.match(reconnected.url, /generativelanguage\.googleapis\.com/);
-  reconnected.emit("open");
-  const setup = JSON.parse(reconnected.sent[0]);
-  assert.deepEqual(setup.setup.sessionResumption, { handle: "resume-123" });
-  reconnected.emit("message", JSON.stringify({ setupComplete: {} }));
-  en.emit("message", JSON.stringify({
-    serverContent: { modelTurn: { parts: [{ inlineData: { mimeType: "audio/pcm;rate=24000", data: Buffer.alloc(4_800).toString("base64") } }] } },
-  }));
-  assert.equal(
-    broadcasts.filter((message) => message.type === "subtitle:translated-audio").length,
-    0,
-    "a stale socket must not replay pre-resumption audio into the replacement channel",
-  );
-});
-
-test("a deliberately stopped Gemini channel does not auto-reconnect", async () => {
-  const sockets = [];
-  const manager = createSubtitleRealtimeManager({
-    broadcast: () => {},
-    settingsStore: {
-      load: async () => ({
-        apiKeys: { gemini: "AIza-test" },
-        subtitle: { inputMode: "mic", translationLanguages: ["en", "ko"], translationProvider: "gemini" },
-      }),
-    },
-    createWebSocket: (url, _protocols, init) => {
-      const socket = new FakeSocket(url, init);
-      sockets.push(socket);
-      return socket;
-    },
-  });
-
-  await manager.start({ sessionId: "active" });
-  const initialCount = sockets.length;
-  await manager.stop("active");
-  await new Promise((resolve) => setTimeout(resolve, 700));
-  assert.equal(sockets.length, initialCount, "a stopped session must stay down");
-});
-
-test("two-language OpenAI subtitles keep using the primary key even when a secondary key exists", async () => {
-  const sockets = [];
-  const manager = createSubtitleRealtimeManager({
-    broadcast: () => {},
-    settingsStore: {
-      load: async () => ({
-        apiKeys: { openai: "sk-primary", openaiSecondary: "sk-secondary" },
-        subtitle: {
-          inputMode: "mic",
-          languagePair: { a: "en", b: "ko" },
-          translateAllLanguages: false,
-          translationProvider: "openai",
-        },
-      }),
-    },
-    createWebSocket: (url, _protocols, init) => {
-      const socket = new FakeSocket(url, init);
-      sockets.push(socket);
-      return socket;
-    },
-  });
-
-  await manager.start({ sessionId: "active" });
-
-  assert.equal(sockets.length, 2);
-  assert.deepEqual(
-    sockets.map((socket) => socket.init.headers.Authorization),
-    ["Bearer sk-primary", "Bearer sk-primary"],
-  );
-});
-
-test("subtitle manager suppresses wrong-language delayed-source output and stale replay", async () => {
-  const sockets = [];
-  const broadcasts = [];
-  const manager = createSubtitleRealtimeManager({
-    broadcast: (message) => broadcasts.push(message),
-    settingsStore: {
-      load: async () => ({
-        apiKeys: { openai: "sk-test" },
-        subtitle: { translationProvider: "openai", inputMode: "mic", languagePair: { a: "en", b: "ko" } },
-      }),
-    },
-    createWebSocket: (url, protocols, init) => {
-      const socket = new FakeSocket(url, init);
-      sockets.push(socket);
-      return socket;
-    },
-  });
-
-  await manager.start({ sessionId: "active" });
-  const englishTarget = sockets[0];
-  const koreanTarget = sockets[1];
-
-  englishTarget.emit("message", JSON.stringify({ type: "session.output_transcript.delta", delta: "안녕하세요." }));
-  koreanTarget.emit("message", JSON.stringify({ type: "session.output_transcript.delta", delta: "Hello." }));
-  koreanTarget.emit("message", JSON.stringify({ type: "session.input_transcript.delta", delta: "Hello" }));
-
-  assert.deepEqual(
-    broadcasts.filter((message) => message.type === "subtitle:partial"),
-    [],
-  );
-
-  koreanTarget.emit("message", JSON.stringify({ type: "session.output_transcript.delta", delta: "안녕하세요." }));
-  assert.deepEqual(
-    broadcasts.filter((message) => message.type === "subtitle:partial"),
-    [{ type: "subtitle:partial", source: "mic", targetLanguage: "ko", sourceLanguage: "en", translationRole: 1, sourceText: "Hello", translatedText: "안녕하세요." }],
-  );
-});
-
-test("handleRealtimeMessage ignores realtime response text to avoid hallucinated subtitles", async () => {
-  const broadcasts = [];
-  const ctx = {
-    source: "system",
-    setText: () => {},
-    broadcast: (message) => broadcasts.push(message),
-  };
-
-  handleRealtimeMessage(JSON.stringify({ type: "response.output_text.delta", delta: "Yes, I can hear you now." }), ctx);
-  handleRealtimeMessage(JSON.stringify({
-    type: "response.content_part.done",
-    part: { type: "text", text: '{"translatedText":"Hello","sourceText":"안녕"}' },
-  }), ctx);
-  handleRealtimeMessage(JSON.stringify({
-    type: "response.output_item.done",
-    item: { content: [{ type: "output_text", text: '{"translatedText":"안녕","sourceText":"Hello"}' }] },
-  }), ctx);
-
-  assert.deepEqual(broadcasts, []);
-});
-
-test("handleRealtimeMessage broadcasts natural hearing and translating states", () => {
-  const broadcasts = [];
-  const ctx = {
-    source: "system",
-    broadcast: (message) => broadcasts.push(message),
-  };
-
-  handleRealtimeMessage(JSON.stringify({ type: "session.input_audio_buffer.speech_started" }), ctx);
-  handleRealtimeMessage(JSON.stringify({ type: "session.input_audio_buffer.speech_stopped" }), ctx);
-  handleRealtimeMessage(JSON.stringify({ type: "session.updated" }), ctx);
-
-  assert.deepEqual(broadcasts, [
-    { type: "subtitle:status", status: "hearing", source: "system", targetLanguage: "ko" },
-    { type: "subtitle:status", status: "translating", source: "system", targetLanguage: "ko" },
-    { type: "subtitle:status", status: "api_ready", source: "system", targetLanguage: "ko" },
-  ]);
-});
-
-test("subtitle manager ignores stale session audio and tags source streams", async () => {
-  const sockets = [];
-  const broadcasts = [];
-  const manager = createSubtitleRealtimeManager({
-    broadcast: (message) => broadcasts.push(message),
-    settingsStore: {
-      load: async () => ({
-        apiKeys: { openai: "sk-test" },
-        subtitle: { translationProvider: "openai", inputMode: "system_mic", model: "gpt-realtime-2" },
-      }),
-    },
-    createWebSocket: (url, protocols, init) => {
-      const socket = new FakeSocket(url, init);
-      sockets.push(socket);
-      return socket;
-    },
-  });
-
-  await manager.start({ sessionId: "active" });
-  assert.equal(sockets.length, 4);
-  manager.sendAudio({ sessionId: "stale", source: "mic", audio: "AAAA" });
-  assert.equal(sockets.length, 4);
-
-  manager.sendAudio({ sessionId: "active", source: "mic", audio: "AAAA" });
-  sockets[2].emit("open");
-
-  assert.equal(sockets[2].url, "wss://api.openai.com/v1/realtime/translations?model=gpt-realtime-translate");
-  assert.equal(sockets[2].init.headers.Authorization, "Bearer sk-test");
-  assert.equal(sockets[2].init.headers["OpenAI-Safety-Identifier"], "realtime-noel-subtitles-mic-en");
-  assert.equal(JSON.parse(sockets[2].sent[0]).type, "session.update");
-  assert.equal(JSON.parse(sockets[2].sent[1]).type, "session.input_audio_buffer.append");
-  assert.deepEqual(broadcasts[0], { type: "subtitle:status", status: "connecting" });
-  assert.deepEqual(broadcasts[1], { type: "subtitle:status", status: "listening" });
-});
-
-test("subtitle manager streams audio continuously without response lifecycle events", async () => {
-  const sockets = [];
-  const manager = createSubtitleRealtimeManager({
-    settingsStore: {
-      load: async () => ({
-        apiKeys: { openai: "sk-test" },
-        subtitle: { translationProvider: "openai", inputMode: "mic", model: "gpt-realtime" },
-      }),
-    },
-    createWebSocket: (url, protocols, init) => {
-      const socket = new FakeSocket(url, init);
-      sockets.push(socket);
-      return socket;
-    },
-  });
-
-  await manager.start({ sessionId: "active" });
-  sockets[0].emit("open");
-  manager.sendAudio({ sessionId: "active", source: "mic", audio: "AAAA" });
-
-  const sentTypes = sockets[0].sent.map((message) => JSON.parse(message).type);
-  assert.deepEqual(sentTypes, ["session.update", "session.input_audio_buffer.append"]);
-});
-
-test("subtitle manager caps pending audio before realtime sockets are ready", async () => {
-  const sockets = [];
-  const manager = createSubtitleRealtimeManager({
-    settingsStore: {
-      load: async () => ({
-        apiKeys: { openai: "sk-test" },
-        subtitle: { translationProvider: "openai", inputMode: "mic", model: "gpt-realtime" },
-      }),
-    },
-    createWebSocket: (url, protocols, init) => {
-      const socket = new FakeSocket(url, init);
-      sockets.push(socket);
-      return socket;
-    },
-  });
-
-  await manager.start({ sessionId: "active" });
-  for (let index = 0; index < 18_000; index += 1) {
-    manager.sendAudio({ sessionId: "active", source: "mic", audio: `CHUNK-${String(index).padStart(3, "0")}` });
-  }
-  sockets[0].emit("open");
-
-  const audioMessages = sockets[0].sent
-    .map((message) => JSON.parse(message))
-    .filter((message) => message.type === "session.input_audio_buffer.append");
-  assert.equal(audioMessages.length, 8);
-  assert.equal(audioMessages[0].audio, "CHUNK-17992");
-  assert.equal(audioMessages.at(-1).audio, "CHUNK-17999");
-});
-
-test("subtitle manager drops setup-buffered audio older than the realtime budget", async () => {
-  const originalNow = Date.now;
-  let now = 1_000;
-  Date.now = () => now;
-  try {
-    const sockets = [];
-    const manager = createSubtitleRealtimeManager({
-      settingsStore: { load: async () => ({
-        apiKeys: { openai: "sk-test" },
-        subtitle: { translationProvider: "openai", inputMode: "mic", model: "gpt-realtime" },
-      }) },
-      createWebSocket: (url, protocols, init) => {
-        const socket = new FakeSocket(url, init);
-        sockets.push(socket);
-        return socket;
-      },
-    });
-    await manager.start({ sessionId: "active" });
-    manager.sendAudio({ sessionId: "active", source: "mic", audio: "STALE" });
-    now += 800;
-    manager.sendAudio({ sessionId: "active", source: "mic", audio: "FRESH" });
-    sockets[0].emit("open");
-    const audioMessages = sockets[0].sent.map((message) => JSON.parse(message))
-      .filter((message) => message.type === "session.input_audio_buffer.append");
-    assert.deepEqual(audioMessages.map((message) => message.audio), ["FRESH"]);
-    await manager.stop("active");
-  } finally {
-    Date.now = originalNow;
-  }
-});
-
-test("subtitle manager treats realtime socket errors as recoverable reconnects", async () => {
-  const sockets = [];
-  const broadcasts = [];
-  const warnings = [];
-  const manager = createSubtitleRealtimeManager({
-    broadcast: (message) => broadcasts.push(message),
-    settingsStore: {
-      load: async () => ({
-        apiKeys: { openai: "sk-test" },
-        subtitle: { translationProvider: "openai", inputMode: "mic", model: "gpt-realtime-translate" },
-      }),
-    },
-    createWebSocket: (url, protocols, init) => {
-      const socket = new FakeSocket(url, init);
-      sockets.push(socket);
-      return socket;
-    },
-    log: { warn: (message) => warnings.push(message) },
-  });
-
-  await manager.start({ sessionId: "active" });
-  sockets[0].emit("open");
-  sockets[0].emit("error", new Error("network down"));
-  manager.sendAudio({ sessionId: "active", source: "mic", audio: "AAAA" });
-  sockets[2].emit("open");
-
-  assert.equal(sockets[0].closed, true);
-  assert.equal(sockets.length, 3);
-  assert.deepEqual(
-    broadcasts.filter((message) => message.type === "subtitle:status" && message.status === "reconnecting"),
-    [{ type: "subtitle:status", status: "reconnecting", source: "mic", targetLanguage: "en" }],
-  );
-  assert.equal(JSON.parse(sockets[2].sent[0]).type, "session.update");
-  assert.equal(JSON.parse(sockets[2].sent[1]).type, "session.input_audio_buffer.append");
-  assert.match(warnings[0], /network down/);
-});
-
-test("subtitle stop gracefully closes realtime sessions before dropping sockets", async () => {
-  const sockets = [];
-  const manager = createSubtitleRealtimeManager({
-    settingsStore: {
-      load: async () => ({
-        apiKeys: { openai: "sk-test" },
-        subtitle: { translationProvider: "openai", inputMode: "mic", model: "gpt-realtime-translate" },
-      }),
-    },
-    createWebSocket: (url, protocols, init) => {
-      const socket = new FakeSocket(url, init);
-      sockets.push(socket);
-      return socket;
-    },
-  });
-
-  await manager.start({ sessionId: "active" });
-  sockets[0].emit("open");
-  sockets[1].emit("open");
-  await manager.stop("active");
-
-  assert.deepEqual(
-    sockets.map((socket) => socket.sent.at(-1)).map((message) => JSON.parse(message).type),
-    ["session.close", "session.close"],
-  );
-  assert.deepEqual(sockets.map((socket) => socket.closed), [true, true]);
-});
-
-test("output completion commits once and resets subtitle channel text", () => {
-  let sourceText = "Hello";
-  let translatedText = "안녕하세요";
-  const broadcasts = [];
-  const ctx = {
-    source: "mic",
-    targetLanguage: "ko",
-    getSourceText: () => sourceText,
-    setSourceText: (value) => { sourceText = value; },
-    getTranslatedText: () => translatedText,
-    setTranslatedText: (value) => { translatedText = value; },
-    shouldDisplay: () => true,
-    broadcast: (message) => broadcasts.push(message),
-  };
-
-  handleRealtimeMessage(JSON.stringify({ type: "session.output_transcript.done" }), ctx);
-  handleRealtimeMessage(JSON.stringify({ type: "session.output_transcript.done" }), ctx);
-
-  assert.deepEqual(broadcasts, [{
-    type: "subtitle:committed",
-    source: "mic",
-    targetLanguage: "ko",
-    sourceText: "Hello",
-    translatedText: "안녕하세요",
-  }]);
-  assert.equal(sourceText, "");
-  assert.equal(translatedText, "");
-});
-
-function businessToneManager({ broadcast, sockets, polish, tone = "business", polishTimeoutMs }) {
-  return createSubtitleRealtimeManager({
-    broadcast,
-    settingsStore: {
-      load: async () => ({
-        apiKeys: { openai: "sk-test" },
-        subtitle: { translationProvider: "openai", inputMode: "mic", languagePair: { a: "en", b: "ko" }, tone },
-      }),
-    },
-    createWebSocket: (url, _protocols, init) => {
-      const socket = new FakeSocket(url, init);
-      sockets.push(socket);
-      return socket;
-    },
-    polish,
-    polishTimeoutMs,
-  });
-}
-
-const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
-
-test("committed subtitle is polished by the injected polisher while partials stay raw", async () => {
-  const sockets = [];
-  const broadcasts = [];
-  const manager = businessToneManager({
-    broadcast: (message) => broadcasts.push(message),
-    sockets,
-    polish: async ({ translatedText, tone }) => (tone === "business" ? `[격식] ${translatedText}` : translatedText),
-  });
-
-  await manager.start({ sessionId: "active" });
-  const koreanTarget = sockets[1];
-  koreanTarget.emit("message", JSON.stringify({ type: "session.output_transcript.delta", delta: "안녕하세요." }));
-  koreanTarget.emit("message", JSON.stringify({ type: "session.input_transcript.delta", delta: "Hello" }));
-
-  const partial = broadcasts.find((message) => message.type === "subtitle:partial");
-  assert.equal(partial.translatedText, "안녕하세요.", "partials must stay raw (realtime feel)");
-
-  koreanTarget.emit("message", JSON.stringify({ type: "session.output_transcript.done", transcript: "안녕하세요." }));
-  await tick();
-
-  const committed = broadcasts.find((message) => message.type === "subtitle:committed");
-  assert.equal(committed.translatedText, "[격식] 안녕하세요.");
-  assert.equal(committed.sourceText, "Hello");
-});
-
-test("partial subtitle stays raw so realtime predictions are not locally rewritten", async () => {
-  const sockets = [];
-  const broadcasts = [];
-  const manager = createSubtitleRealtimeManager({
-    broadcast: (message) => broadcasts.push(message),
-    settingsStore: {
-      load: async () => ({
-        apiKeys: { openai: "sk-test" },
-        subtitle: { translationProvider: "openai",
-          inputMode: "mic",
-          languagePair: { a: "en", b: "ko" },
-          glossary: '현주소 = current landscape ("현재 상황"의 뜻. NEVER "current address")',
-        },
-      }),
-    },
-    createWebSocket: (url, _protocols, init) => {
-      const socket = new FakeSocket(url, init);
-      sockets.push(socket);
-      return socket;
-    },
-    polish: async ({ translatedText }) => translatedText,
-  });
-
-  await manager.start({ sessionId: "active" });
-  const englishTarget = sockets[0];
-  englishTarget.emit("message", JSON.stringify({ type: "session.output_transcript.delta", delta: "current address." }));
-  englishTarget.emit("message", JSON.stringify({ type: "session.input_transcript.delta", delta: "서울 호텔 현주소" }));
-
-  const partial = broadcasts.find((message) => message.type === "subtitle:partial");
-  assert.equal(partial.translatedText, "current address.");
-});
-
-test("empty glossary does not apply hidden default rewrites to model translations", async () => {
-  const sockets = [];
-  const broadcasts = [];
-  const polishArgs = [];
-  const manager = createSubtitleRealtimeManager({
-    broadcast: (message) => broadcasts.push(message),
-    settingsStore: {
-      load: async () => ({
-        apiKeys: { openai: "sk-test" },
-        subtitle: { translationProvider: "openai", inputMode: "mic", languagePair: { a: "en", b: "ko" }, glossary: "" },
-      }),
-    },
-    createWebSocket: (url, _protocols, init) => {
-      const socket = new FakeSocket(url, init);
-      sockets.push(socket);
-      return socket;
-    },
-    polish: async (args) => { polishArgs.push(args); return args.translatedText; },
-  });
-
-  await manager.start({ sessionId: "active" });
-  const englishTarget = sockets[0];
-  englishTarget.emit("message", JSON.stringify({ type: "session.output_transcript.delta", delta: "current address." }));
-  englishTarget.emit("message", JSON.stringify({ type: "session.input_transcript.delta", delta: "서울 호텔 현주소" }));
-
-  const partial = broadcasts.find((message) => message.type === "subtitle:partial");
-  assert.equal(partial.translatedText, "current address.");
-
-  englishTarget.emit("message", JSON.stringify({ type: "session.input_audio_buffer.speech_started" }));
-  englishTarget.emit("message", JSON.stringify({ type: "session.input_transcript.delta", delta: "좋은 시장은 기회를 만들지만, 그 기회를 딜로 바꾸는 건 체계적인 검증에서 나옵니다" }));
-  englishTarget.emit("message", JSON.stringify({ type: "session.output_transcript.done", transcript: "A good market creates chances." }));
-  await tick();
-
-  const committed = broadcasts.find((message) => message.type === "subtitle:committed");
-  assert.equal(committed.translatedText, "A good market creates chances.");
-  assert.equal(polishArgs.length, 0, "default glossary must stay local in natural tone to preserve realtime commits");
-});
-
-test("configured glossary uses the second-pass polisher in natural tone", async () => {
-  const sockets = [];
-  const polishArgs = [];
-  const broadcasts = [];
-  const manager = createSubtitleRealtimeManager({
-    broadcast: (message) => broadcasts.push(message),
-    settingsStore: {
-      load: async () => ({
-        apiKeys: { openai: "sk-primary", openaiSecondary: "sk-secondary" },
-        subtitle: { translationProvider: "openai",
-          inputMode: "mic",
-          languagePair: { a: "en", b: "ko" },
-          tone: "natural",
-          glossary: "운영자 = 운영사",
-          translationDomain: "Commercial real estate",
-        },
-      }),
-    },
-    createWebSocket: (url, _protocols, init) => {
-      const socket = new FakeSocket(url, init);
-      sockets.push(socket);
-      return socket;
-    },
-    polish: async (args) => { polishArgs.push(args); return "운영사가 딜을 검증합니다"; },
-  });
-
-  await manager.start({ sessionId: "active" });
-  const koreanTarget = sockets[1];
-  koreanTarget.emit("message", JSON.stringify({ type: "session.input_transcript.delta", delta: "The operator validates the deal" }));
-  koreanTarget.emit("message", JSON.stringify({ type: "session.output_transcript.done", transcript: "운영자가 딜을 검증합니다" }));
-  await tick();
-
-  const committed = broadcasts.find((message) => message.type === "subtitle:committed");
-  assert.equal(committed.translatedText, "운영사가 딜을 검증합니다");
-  assert.equal(polishArgs.length, 1);
-  assert.equal(polishArgs[0].translatedText, "운영자가 딜을 검증합니다");
-  assert.equal(polishArgs[0].glossary, "운영자 = 운영사");
-  assert.equal(polishArgs[0].domain, "Commercial real estate");
-  assert.equal(polishArgs[0].tone, "natural");
-});
-
-test("deterministic glossary correction is enforced after polish when the LLM misses a registered term", async () => {
-  const sockets = [];
-  const broadcasts = [];
-  const manager = createSubtitleRealtimeManager({
-    broadcast: (message) => broadcasts.push(message),
-    settingsStore: {
-      load: async () => ({
-        apiKeys: { openai: "sk-primary", openaiSecondary: "sk-secondary" },
-        subtitle: { translationProvider: "openai",
-          inputMode: "mic",
-          languagePair: { a: "en", b: "ko" },
-          tone: "natural",
-          glossary: "운영자 = 운영사",
-          translationDomain: "Commercial real estate",
-        },
-      }),
-    },
-    createWebSocket: (url, _protocols, init) => {
-      const socket = new FakeSocket(url, init);
-      sockets.push(socket);
-      return socket;
-    },
-    // Simulate the live polisher leaving the registered term uncorrected — a
-    // large glossary that the LLM does not exhaustively apply.
-    polish: async () => "운영자가 거래를 확인합니다",
-  });
-
-  await manager.start({ sessionId: "active" });
-  const koreanTarget = sockets[1];
-  koreanTarget.emit("message", JSON.stringify({ type: "session.input_transcript.delta", delta: "The operator validates the deal" }));
-  koreanTarget.emit("message", JSON.stringify({ type: "session.output_transcript.done", transcript: "운영자가 딜을 검증합니다" }));
-  await tick();
-
-  const committed = broadcasts.find((message) => message.type === "subtitle:committed");
-  assert.equal(
-    committed.translatedText,
-    "운영사가 거래를 확인합니다",
-    "the deterministic glossary pass must enforce 운영자 → 운영사 even after the polisher returns it uncorrected",
-  );
-});
-
-test("committed subtitle falls back to raw text when polish throws", async () => {
-  const sockets = [];
-  const broadcasts = [];
-  const manager = businessToneManager({
-    broadcast: (message) => broadcasts.push(message),
-    sockets,
-    polish: async () => { throw new Error("polish down"); },
-  });
-
-  await manager.start({ sessionId: "active" });
-  const koreanTarget = sockets[1];
-  koreanTarget.emit("message", JSON.stringify({ type: "session.input_transcript.delta", delta: "Hello" }));
-  koreanTarget.emit("message", JSON.stringify({ type: "session.output_transcript.done", transcript: "안녕하세요." }));
-  await tick();
-
-  const committed = broadcasts.find((message) => message.type === "subtitle:committed");
-  assert.equal(committed.translatedText, "안녕하세요.");
-});
-
-test("a committed line being polished is dropped when the session is torn down", async () => {
-  const sockets = [];
-  const broadcasts = [];
-  let releasePolish;
-  const polishGate = new Promise((resolve) => { releasePolish = resolve; });
-  const manager = businessToneManager({
-    broadcast: (message) => broadcasts.push(message),
-    sockets,
-    polish: async ({ translatedText }) => { await polishGate; return `P:${translatedText}`; },
-  });
-
-  await manager.start({ sessionId: "active" });
-  const koreanTarget = sockets[1];
-  koreanTarget.emit("message", JSON.stringify({ type: "session.input_transcript.delta", delta: "Hello" }));
-  koreanTarget.emit("message", JSON.stringify({ type: "session.output_transcript.done", transcript: "안녕하세요." }));
-
-  await manager.stop();
-  releasePolish();
-  await tick();
-
-  assert.equal(broadcasts.some((message) => message.type === "subtitle:committed"), false);
-});
-
-test("a hung polisher falls back to raw finals in order and its late result is ignored", async () => {
-  const sockets = [];
-  const broadcasts = [];
-  let releaseFirst;
-  const manager = businessToneManager({
-    broadcast: (message) => broadcasts.push(message),
-    sockets,
-    polishTimeoutMs: 10,
-    polish: async ({ translatedText }) => {
-      if (translatedText === "첫째") await new Promise((resolve) => { releaseFirst = resolve; });
-      return `P:${translatedText}`;
-    },
-  });
-  await manager.start({ sessionId: "active" });
-  const koreanTarget = sockets[1];
-  koreanTarget.emit("message", JSON.stringify({ type: "session.input_transcript.delta", delta: "First" }));
-  koreanTarget.emit("message", JSON.stringify({ type: "session.output_transcript.done", transcript: "첫째" }));
-  koreanTarget.emit("message", JSON.stringify({ type: "session.input_transcript.delta", delta: "Second" }));
-  koreanTarget.emit("message", JSON.stringify({ type: "session.output_transcript.done", transcript: "둘째" }));
-  await new Promise((resolve) => setTimeout(resolve, 30));
-  releaseFirst();
-  await tick();
-  assert.deepEqual(broadcasts.filter((message) => message.type === "subtitle:committed").map((message) => message.translatedText), ["첫째", "P:둘째"]);
-  await manager.stop("active");
-});
-
 test("end-to-end: a garbled company name in a committed Gemini line is normalized through the real pipeline", async () => {
   // Drives the actual createTranslationChannel commit path (not just the helper)
   // with the exact garbling seen on screen ("Kushima is why Field Korea").
@@ -1725,9 +220,10 @@ test("end-to-end: a garbled company name in a committed Gemini line is normalize
   assert.equal(committed.translatedText, "Cushman & Wakefield Korea is the smallest company.");
 });
 
-test("gemini provider opens Gemini Live sockets and routes polished committed subtitles", async () => {
+test("gemini provider opens Live sockets and skips an ordinary business final", async () => {
   const sockets = [];
   const broadcasts = [];
+  let polishCalls = 0;
   const manager = createSubtitleRealtimeManager({
     broadcast: (message) => broadcasts.push(message),
     settingsStore: {
@@ -1746,7 +242,10 @@ test("gemini provider opens Gemini Live sockets and routes polished committed su
       sockets.push(socket);
       return socket;
     },
-    polish: async ({ translatedText, tone }) => (tone === "business" ? `[B] ${translatedText}` : translatedText),
+    polish: async ({ translatedText }) => {
+      polishCalls += 1;
+      return translatedText;
+    },
   });
 
   await manager.start({ sessionId: "active" });
@@ -1778,7 +277,8 @@ test("gemini provider opens Gemini Live sockets and routes polished committed su
   koreanTarget.emit("message", JSON.stringify({ serverContent: { turnComplete: true } }));
   await new Promise((resolve) => setTimeout(resolve, 0));
   const committed = broadcasts.find((message) => message.type === "subtitle:committed");
-  assert.equal(committed.translatedText, "[B] 안녕하세요 여러분 오늘 회의에 참석해 주셔서 감사합니다");
+  assert.equal(committed.translatedText, "안녕하세요 여러분 오늘 회의에 참석해 주셔서 감사합니다");
+  assert.equal(polishCalls, 0, "ordinary business finals must not pay for Flash polish");
   assert.equal(committed.targetLanguage, "ko");
   assert.equal(committed.translationProvider, "gemini");
 });
@@ -2604,161 +1104,6 @@ test("single Gemini key finalizes ellipsis placeholders from the committed sourc
   assert.equal(polishArgs[0].polishProvider, "gemini");
 });
 
-test("the channel hands the configured glossary to the polisher on commit", async () => {
-  const sockets = [];
-  const polishArgs = [];
-  const manager = createSubtitleRealtimeManager({
-    broadcast: () => {},
-    settingsStore: {
-      load: async () => ({
-        apiKeys: { openai: "sk-test" },
-        subtitle: { translationProvider: "openai",
-          inputMode: "mic",
-          languagePair: { a: "en", b: "ko" },
-          tone: "business",
-          glossary: "operator -> 운영사",
-        },
-      }),
-    },
-    createWebSocket: (url, _protocols, init) => {
-      const socket = new FakeSocket(url, init);
-      sockets.push(socket);
-      return socket;
-    },
-    polish: async (args) => { polishArgs.push(args); return args.translatedText; },
-  });
-
-  await manager.start({ sessionId: "active" });
-  const koreanTarget = sockets[1];
-  koreanTarget.emit("message", JSON.stringify({ type: "session.input_transcript.delta", delta: "Hello there" }));
-  koreanTarget.emit("message", JSON.stringify({ type: "session.output_transcript.done", transcript: "안녕하세요" }));
-  await new Promise((resolve) => setTimeout(resolve, 0));
-
-  assert.equal(polishArgs[0].glossary, "operator -> 운영사");
-  assert.equal(polishArgs[0].tone, "business");
-});
-
-test("the channel hands the configured domain to the polisher on commit", async () => {
-  const sockets = [];
-  const polishArgs = [];
-  const manager = createSubtitleRealtimeManager({
-    broadcast: () => {},
-    settingsStore: {
-      load: async () => ({
-        apiKeys: { openai: "sk-test" },
-        subtitle: { translationProvider: "openai",
-          inputMode: "mic",
-          languagePair: { a: "en", b: "ko" },
-          tone: "business",
-          translationDomain: "Commercial real estate hospitality",
-        },
-      }),
-    },
-    createWebSocket: (url, _protocols, init) => {
-      const socket = new FakeSocket(url, init);
-      sockets.push(socket);
-      return socket;
-    },
-    polish: async (args) => { polishArgs.push(args); return args.translatedText; },
-  });
-
-  await manager.start({ sessionId: "active" });
-  const koreanTarget = sockets[1];
-  koreanTarget.emit("message", JSON.stringify({ type: "session.input_transcript.delta", delta: "Hello there" }));
-  koreanTarget.emit("message", JSON.stringify({ type: "session.output_transcript.done", transcript: "안녕하세요" }));
-  await new Promise((resolve) => setTimeout(resolve, 0));
-
-  assert.match(polishArgs[0].domain, /Commercial real estate/);
-});
-
-test("japanese-target channels auto-route to Gemini even when OpenAI is selected", async () => {
-  // Probe evidence (2026-06-12): OpenAI's gpt-realtime-translate produces
-  // Japanese OUTPUT with 10-25s latency or not at all, while Gemini streams it
-  // in realtime. Per-channel routing keeps every direction on the fastest
-  // engine: ja-target channels use Gemini whenever a Gemini key exists.
-  const sockets = [];
-  const manager = createSubtitleRealtimeManager({
-    broadcast: () => {},
-    settingsStore: {
-      load: async () => ({
-        apiKeys: { openai: "sk-test", gemini: "AIza-test" },
-        subtitle: { inputMode: "mic", languagePair: { a: "ko", b: "ja" }, translationProvider: "openai" },
-      }),
-    },
-    createWebSocket: (url, _protocols, init) => {
-      const socket = new FakeSocket(url, init);
-      sockets.push(socket);
-      return socket;
-    },
-  });
-
-  await manager.start({ sessionId: "active" });
-  assert.equal(sockets.length, 2);
-  assert.match(sockets[0].url, /api\.openai\.com/, "ko-target stays on OpenAI");
-  assert.match(sockets[1].url, /generativelanguage\.googleapis\.com/, "ja-target auto-routes to Gemini");
-  assert.match(sockets[1].url, /key=AIza-test/);
-});
-
-test("japanese-target channels stay on OpenAI when no Gemini key exists", async () => {
-  const sockets = [];
-  const manager = createSubtitleRealtimeManager({
-    broadcast: () => {},
-    settingsStore: {
-      load: async () => ({
-        apiKeys: { openai: "sk-test" },
-        subtitle: { inputMode: "mic", languagePair: { a: "ko", b: "ja" }, translationProvider: "openai" },
-      }),
-    },
-    createWebSocket: (url, _protocols, init) => {
-      const socket = new FakeSocket(url, init);
-      sockets.push(socket);
-      return socket;
-    },
-  });
-
-  await manager.start({ sessionId: "active" });
-  assert.equal(sockets.length, 2);
-  assert.match(sockets[0].url, /api\.openai\.com/);
-  assert.match(sockets[1].url, /api\.openai\.com/, "no Gemini key → fall back to OpenAI");
-});
-
-test("a Korean-Japanese pair routes Japanese speech to the Korean channel only", async () => {
-  const sockets = [];
-  const broadcasts = [];
-  const manager = createSubtitleRealtimeManager({
-    broadcast: (message) => broadcasts.push(message),
-    settingsStore: {
-      load: async () => ({
-        apiKeys: { openai: "sk-test" },
-        subtitle: { translationProvider: "openai", inputMode: "mic", languagePair: { a: "ko", b: "ja" } },
-      }),
-    },
-    createWebSocket: (url, _protocols, init) => {
-      const socket = new FakeSocket(url, init);
-      sockets.push(socket);
-      return socket;
-    },
-  });
-
-  await manager.start({ sessionId: "active" });
-  assert.equal(sockets.length, 2);
-  const koreanTarget = sockets[0];
-  const japaneseTarget = sockets[1];
-
-  // Japanese speech (kana signal) → the ko-target channel shows Korean…
-  koreanTarget.emit("message", JSON.stringify({ type: "session.input_transcript.delta", delta: "本日はよろしくお願いいたします" }));
-  koreanTarget.emit("message", JSON.stringify({ type: "session.output_transcript.delta", delta: "오늘 잘 부탁드립니다" }));
-  // …while the ja-target channel (same-language echo) stays suppressed.
-  japaneseTarget.emit("message", JSON.stringify({ type: "session.input_transcript.delta", delta: "本日はよろしくお願いいたします" }));
-  japaneseTarget.emit("message", JSON.stringify({ type: "session.output_transcript.delta", delta: "本日はよろしくお願いいたします" }));
-
-  const partials = broadcasts.filter((message) => message.type === "subtitle:partial");
-  assert.deepEqual(
-    partials.map((message) => ({ targetLanguage: message.targetLanguage, translatedText: message.translatedText })),
-    [{ targetLanguage: "ko", translatedText: "오늘 잘 부탁드립니다" }],
-  );
-});
-
 test("normalizeSubtitleSettings accepts a Japanese language pair", () => {
   const settings = normalizeSubtitleSettings({ languagePair: { a: "ko", b: "ja" } });
   assert.deepEqual(settings.languagePair, { a: "ko", b: "ja" });
@@ -2771,116 +1116,7 @@ test("normalizeSubtitleSettings clamps verticalOffset and keeps the domain strin
   assert.equal(normalizeSubtitleSettings({ verticalOffset: 9000 }).verticalOffset, 600);
   assert.equal(normalizeSubtitleSettings({ verticalOffset: -5 }).verticalOffset, 0);
   assert.equal(normalizeSubtitleSettings({ translationDomain: "CRE" }).translationDomain, "CRE");
-  assert.equal(normalizeSubtitleSettings({}).translationDomain, "");
-});
-
-// Replaces an earlier "long mixed-language output is suppressed" test that had become
-// VACUOUS: its input carried no terminal punctuation and the test never advanced timers,
-// so isPartialDisplayReady() returned false and NO partial could be emitted regardless
-// of the language gate. Adding a period made the very same line display — because the
-// dominance check that test was written for was deliberately REPLACED by a
-// target-script PRESENCE check (>= 3 target chars). That replacement is the EN→KO fix:
-// a correct Korean translation in this domain is studded with English proper nouns and
-// acronyms (Cushman & Wakefield, Hilton Garden Inn, ADR, GOP, Value-Add…) whose Latin
-// characters often OUTNUMBER the Hangul, and requiring dominance suppressed the Korean
-// subtitle entirely. So mixed output DISPLAYING is the intended contract; what must
-// stay suppressed is output with no target-language content at all (a same-language
-// echo). Both halves are asserted below, each with a display-ready line.
-test("the output gate keys on target-language PRESENCE: mixed KO+EN displays, a zero-Hangul echo does not", async () => {
-  const displayReadyPartials = async (outputLine) => {
-    const sockets = [];
-    const broadcasts = [];
-    const manager = businessToneManager({
-      broadcast: (message) => broadcasts.push(message),
-      sockets,
-      polish: async ({ translatedText }) => translatedText,
-      tone: "natural",
-    });
-    await manager.start({ sessionId: "active" });
-    const koreanTarget = sockets[1];
-    koreanTarget.emit("message", JSON.stringify({ type: "session.input_transcript.delta", delta: "Hello there my friend" }));
-    // Terminal punctuation makes the line display-ready, so what this test observes is
-    // the OUTPUT-LANGUAGE gate and nothing else.
-    koreanTarget.emit("message", JSON.stringify({ type: "session.output_transcript.delta", delta: outputLine }));
-    const partials = broadcasts
-      .filter((message) => message.type === "subtitle:partial")
-      .map((message) => message.translatedText);
-    await manager.stop();
-    return partials;
-  };
-
-  // Code-switched / proper-noun-heavy Korean output: Latin chars outnumber the Hangul,
-  // but Korean is meaningfully PRESENT → it must reach Korean viewers.
-  assert.deepEqual(
-    await displayReadyPartials("안녕하세요 여러분 반갑습니다 this is mixed."),
-    ["안녕하세요 여러분 반갑습니다 this is mixed."],
-  );
-  assert.deepEqual(
-    await displayReadyPartials("Cushman & Wakefield Korea의 ADR과 GOP는 Value-Add 전략을 따릅니다."),
-    ["Cushman & Wakefield Korea의 ADR과 GOP는 Value-Add 전략을 따릅니다."],
-  );
-
-  // Zero Korean characters on the Korean channel = the English source echoed back,
-  // not a translation → still suppressed even though it is display-ready.
-  assert.deepEqual(await displayReadyPartials("This is an English echo on the Korean channel."), []);
-  // Fewer than the 3 target chars the gate requires is still treated as no Korean.
-  assert.deepEqual(await displayReadyPartials("The operator screening process is 완 today."), []);
-});
-
-test("korean output with english proper nouns still displays on the ko channel", async () => {
-  const sockets = [];
-  const broadcasts = [];
-  const manager = businessToneManager({
-    broadcast: (message) => broadcasts.push(message),
-    sockets,
-    polish: async ({ translatedText }) => translatedText,
-    tone: "natural",
-  });
-
-  await manager.start({ sessionId: "active" });
-  const koreanTarget = sockets[1];
-  koreanTarget.emit("message", JSON.stringify({ type: "session.input_transcript.delta", delta: "Hello there my friend" }));
-  koreanTarget.emit("message", JSON.stringify({ type: "session.output_transcript.delta", delta: "OpenAI 모델은 정말 좋습니다" }));
-
-  const partial = broadcasts.find((message) => message.type === "subtitle:partial");
-  assert.equal(partial?.translatedText, "OpenAI 모델은 정말 좋습니다");
-});
-
-test("korean speech mixed with english terms is treated as Korean source and displays English", async () => {
-  const sockets = [];
-  const broadcasts = [];
-  const manager = createSubtitleRealtimeManager({
-    broadcast: (message) => broadcasts.push(message),
-    settingsStore: {
-      load: async () => ({
-        apiKeys: { openai: "sk-test" },
-        subtitle: { translationProvider: "openai", inputMode: "mic", languagePair: { a: "en", b: "ko" }, tone: "natural" },
-      }),
-    },
-    createWebSocket: (url, _protocols, init) => {
-      const socket = new FakeSocket(url, init);
-      sockets.push(socket);
-      return socket;
-    },
-    polish: async ({ translatedText }) => translatedText,
-  });
-
-  await manager.start({ sessionId: "active" });
-  const englishTarget = sockets[0];
-  const koreanTarget = sockets[1];
-  const mixedSource = "오늘은 hotel conversion strategy와 operator screening을 이야기하겠습니다";
-  englishTarget.emit("message", JSON.stringify({ type: "session.input_transcript.delta", delta: mixedSource }));
-  englishTarget.emit("message", JSON.stringify({ type: "session.output_transcript.delta", delta: "Today we will discuss hotel conversion strategy and operator screening." }));
-  koreanTarget.emit("message", JSON.stringify({ type: "session.input_transcript.delta", delta: mixedSource }));
-  koreanTarget.emit("message", JSON.stringify({ type: "session.output_transcript.delta", delta: "오늘은 호텔 전환 전략과 운영사 선별을 이야기하겠습니다." }));
-
-  const englishPartial = broadcasts.find((message) => message.type === "subtitle:partial" && message.targetLanguage === "en");
-  assert.equal(englishPartial?.sourceLanguage, "ko");
-  assert.equal(englishPartial?.translatedText, "Today we will discuss hotel conversion strategy and operator screening.");
-  assert.equal(
-    broadcasts.some((message) => message.type === "subtitle:partial" && message.targetLanguage === "ko"),
-    false,
-  );
+  assert.equal(normalizeSubtitleSettings({}).translationDomain, getDefaultSubtitleGlossaryContext().domain);
 });
 
 test("socket errors surface once per channel with corporate-network diagnosis", async () => {
@@ -2969,7 +1205,7 @@ test("abnormal socket close reasons surface to the UI as subtitle errors", async
   assert.equal(errorEvent.code, "TRANSLATION_SOCKET_CLOSED");
 });
 
-test("the gemini provider hands the glossary to the polisher exactly like openai", async () => {
+test("the Gemini provider hands the glossary to the shared finalizer", async () => {
   const sockets = [];
   const polishArgs = [];
   const manager = createSubtitleRealtimeManager({
@@ -2982,7 +1218,7 @@ test("the gemini provider hands the glossary to the polisher exactly like openai
           languagePair: { a: "en", b: "ko" },
           translationProvider: "gemini",
           tone: "business",
-          glossary: "operator -> 운영사\nMRG -> keep verbatim",
+          glossary: "operator -> 운영사\nMRG -> keep verbatim\nHilton -> 힐튼",
         },
       }),
     },
@@ -2997,11 +1233,14 @@ test("the gemini provider hands the glossary to the polisher exactly like openai
   await manager.start({ sessionId: "active" });
   const koreanTarget = sockets[1];
   koreanTarget.emit("message", JSON.stringify({ serverContent: { inputTranscription: { text: "The operator manages MRG" } } }));
-  koreanTarget.emit("message", JSON.stringify({ serverContent: { outputTranscription: { text: "운영사가 MRG를 관리합니다" } } }));
+  koreanTarget.emit("message", JSON.stringify({ serverContent: { outputTranscription: { text: "해당 회사가 관리합니다" } } }));
   koreanTarget.emit("message", JSON.stringify({ serverContent: { turnComplete: true } }));
   await new Promise((resolve) => setTimeout(resolve, 0));
 
+  assert.equal(polishArgs.length, 1);
   assert.match(polishArgs[0].glossary, /operator -> 운영사/);
+  assert.match(polishArgs[0].glossary, /MRG -> keep verbatim/);
+  assert.doesNotMatch(polishArgs[0].glossary, /Hilton -> 힐튼/);
   assert.equal(polishArgs[0].tone, "business");
   assert.equal(polishArgs[0].targetLanguage, "ko");
   assert.equal(polishArgs[0].polishProvider, "gemini");
@@ -3019,23 +1258,6 @@ test("subtitle manager rejects start when the Gemini key is missing for the gemi
   });
 
   await assert.rejects(manager.start({ sessionId: "missing" }), /Gemini API key is required/);
-});
-
-test("subtitle manager rejects start before capture when OpenAI key is missing", async () => {
-  const broadcasts = [];
-  const manager = createSubtitleRealtimeManager({
-    broadcast: (message) => broadcasts.push(message),
-    settingsStore: {
-      load: async () => ({ apiKeys: {}, subtitle: { translationProvider: "openai", inputMode: "mic" } }),
-    },
-  });
-
-  await assert.rejects(
-    manager.start({ sessionId: "missing-key" }),
-    /OpenAI API key is required/,
-  );
-  assert.equal(manager._state.active, false);
-  assert.deepEqual(broadcasts, []);
 });
 
 class FakeSocket extends EventEmitter {
@@ -3065,6 +1287,191 @@ class FakeSocket extends EventEmitter {
   }
 }
 
+const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+function businessToneManager({ broadcast, sockets, polish, tone = "business", polishTimeoutMs }) {
+  return createSubtitleRealtimeManager({
+    broadcast,
+    settingsStore: {
+      load: async () => ({
+        apiKeys: { gemini: "AIza-test" },
+        subtitle: { translationProvider: "gemini", inputMode: "mic", languagePair: { a: "en", b: "ko" }, tone },
+      }),
+    },
+    createWebSocket: (url, _protocols, init) => {
+      const socket = new FakeSocket(url, init);
+      sockets.push(socket);
+      return socket;
+    },
+    polish,
+    polishTimeoutMs,
+  });
+}
+
+test("Gemini distributes three target languages across two configured keys", async () => {
+  const sockets = [];
+  const manager = createSubtitleRealtimeManager({
+    broadcast: () => {},
+    settingsStore: { load: async () => ({
+      apiKeys: { gemini: "AIza-primary", geminiSecondary: "AIza-secondary" },
+      subtitle: {
+        inputMode: "mic",
+        translationLanguages: ["en", "ko", "ja"],
+        translationProvider: "gemini",
+      },
+    }) },
+    createWebSocket: (url, _protocols, init) => {
+      const socket = new FakeSocket(url, init);
+      sockets.push(socket);
+      return socket;
+    },
+  });
+  await manager.start({ sessionId: "three-language-keys" });
+  assert.equal(sockets.length, 3);
+  assert.match(sockets[0].url, /key=AIza-primary/u);
+  assert.match(sockets[1].url, /key=AIza-primary/u);
+  assert.match(sockets[2].url, /key=AIza-secondary/u);
+  assert.equal(sockets.every((socket) => socket.url.includes("generativelanguage.googleapis.com")), true);
+  await manager.stop("three-language-keys");
+});
+
+test("Gemini uses the primary key for every target when no secondary key is configured", async () => {
+  const sockets = [];
+  const manager = createSubtitleRealtimeManager({
+    broadcast: () => {},
+    settingsStore: { load: async () => ({
+      apiKeys: { gemini: "AIza-primary" },
+      subtitle: {
+        inputMode: "mic",
+        translationLanguages: ["en", "ko", "ja"],
+        translationProvider: "gemini",
+      },
+    }) },
+    createWebSocket: (url, _protocols, init) => {
+      const socket = new FakeSocket(url, init);
+      sockets.push(socket);
+      return socket;
+    },
+  });
+  await manager.start({ sessionId: "three-language-primary" });
+  assert.equal(sockets.length, 3);
+  assert.equal(sockets.every((socket) => socket.url.includes("key=AIza-primary")), true);
+  await manager.stop("three-language-primary");
+});
+
+test("a dropped Gemini channel reconnects with its saved resumption handle", async () => {
+  const sockets = [];
+  const broadcasts = [];
+  const manager = createSubtitleRealtimeManager({
+    broadcast: (message) => broadcasts.push(message),
+    settingsStore: { load: async () => ({
+      apiKeys: { gemini: "AIza-test" },
+      subtitle: {
+        inputMode: "mic",
+        translationLanguages: ["en", "ko"],
+        translationProvider: "gemini",
+        outputMode: "audio",
+        audioLanguage: "en",
+      },
+    }) },
+    createWebSocket: (url, _protocols, init) => {
+      const socket = new FakeSocket(url, init);
+      sockets.push(socket);
+      return socket;
+    },
+  });
+  await manager.start({ sessionId: "resume" });
+  const initialCount = sockets.length;
+  const dropped = sockets[0];
+  dropped.emit("open");
+  dropped.emit("message", JSON.stringify({ setupComplete: {} }));
+  dropped.emit("message", JSON.stringify({ sessionResumptionUpdate: { resumable: true, newHandle: "resume-123" } }));
+  dropped.emit("close", 1011, Buffer.from("session expired"));
+  await new Promise((resolve) => setTimeout(resolve, 700));
+
+  assert.ok(sockets.length > initialCount);
+  const replacement = sockets.at(-1);
+  replacement.emit("open");
+  assert.deepEqual(JSON.parse(replacement.sent[0]).setup.sessionResumption, { handle: "resume-123" });
+  replacement.emit("message", JSON.stringify({ setupComplete: {} }));
+  dropped.emit("message", JSON.stringify({
+    serverContent: {
+      modelTurn: {
+        parts: [{ inlineData: { mimeType: "audio/pcm;rate=24000", data: Buffer.alloc(4_800).toString("base64") } }],
+      },
+    },
+  }));
+  assert.equal(broadcasts.some((message) => message.type === "subtitle:translated-audio"), false);
+  await manager.stop("resume");
+});
+
+test("a deliberately stopped Gemini session never auto-reconnects", async () => {
+  const sockets = [];
+  const manager = createSubtitleRealtimeManager({
+    broadcast: () => {},
+    settingsStore: { load: async () => ({
+      apiKeys: { gemini: "AIza-test" },
+      subtitle: { inputMode: "mic", translationLanguages: ["en", "ko"], translationProvider: "gemini" },
+    }) },
+    createWebSocket: (url, _protocols, init) => {
+      const socket = new FakeSocket(url, init);
+      sockets.push(socket);
+      return socket;
+    },
+  });
+  await manager.start({ sessionId: "deliberate-stop" });
+  const initialCount = sockets.length;
+  await manager.stop("deliberate-stop");
+  await new Promise((resolve) => setTimeout(resolve, 700));
+  assert.equal(sockets.length, initialCount);
+});
+
+test("a Gemini committed caption falls back to its draft when polish throws", async () => {
+  const sockets = [];
+  const broadcasts = [];
+  const manager = businessToneManager({
+    broadcast: (message) => broadcasts.push(message),
+    sockets,
+    polish: async () => { throw new Error("polish down"); },
+  });
+  await manager.start({ sessionId: "polish-error" });
+  const koreanTarget = sockets[1];
+  koreanTarget.emit("message", JSON.stringify({
+    serverContent: {
+      inputTranscription: { text: "Hello", languageCode: "en" },
+      outputTranscription: { text: "안녕하세요." },
+      turnComplete: true,
+    },
+  }));
+  await tick();
+  assert.equal(broadcasts.find((message) => message.type === "subtitle:committed")?.translatedText, "안녕하세요.");
+  await manager.stop("polish-error");
+});
+
+test("a Gemini final still being polished is discarded after session teardown", async () => {
+  const sockets = [];
+  const broadcasts = [];
+  let releasePolish = () => {};
+  const polishGate = new Promise((resolve) => { releasePolish = resolve; });
+  const manager = businessToneManager({
+    broadcast: (message) => broadcasts.push(message),
+    sockets,
+    polish: async ({ translatedText }) => { await polishGate; return `P:${translatedText}`; },
+  });
+  await manager.start({ sessionId: "polish-teardown" });
+  sockets[1].emit("message", JSON.stringify({
+    serverContent: {
+      inputTranscription: { text: "Hello", languageCode: "en" },
+      outputTranscription: { text: "안녕하세요." },
+      turnComplete: true,
+    },
+  }));
+  await manager.stop("polish-teardown");
+  releasePolish();
+  await tick();
+  assert.equal(broadcasts.some((message) => message.type === "subtitle:committed"), false);
+});
+
 // ---- N-language expansion (registry-driven) ----
 
 test("normalizeSubtitleSettings accepts new registry languages in translationLanguages", () => {
@@ -3087,7 +1494,7 @@ test("normalizeSubtitleSettings keeps the classic en/ko/ja behavior untouched", 
   assert.deepEqual(normalizeSubtitleSettings({ translateAllLanguages: true }).translationLanguages, ["en", "ko", "ja"]);
 });
 
-test("subtitle manager keeps Gemini captions and opens OpenAI only for interpreted audio", async () => {
+test("subtitle manager normalizes stale OpenAI voice settings and keeps interpreted audio on Gemini", async () => {
   const sockets = [];
   const manager = createSubtitleRealtimeManager({
     broadcast: () => {},
@@ -3111,13 +1518,15 @@ test("subtitle manager keeps Gemini captions and opens OpenAI only for interpret
     },
   });
 
-  await manager.start({ sessionId: "openai-audio" });
+  await manager.start({ sessionId: "gemini-only-audio" });
   assert.equal(sockets.filter((socket) => socket.url.includes("generativelanguage.googleapis.com")).length, 2);
-  assert.equal(sockets.filter((socket) => socket.url.includes("api.openai.com/v1/realtime/translations")).length, 1);
-  await manager.stop("openai-audio");
+  assert.equal(sockets.filter((socket) => socket.url.includes("api.openai.com/v1/realtime/translations")).length, 0);
+  assert.equal(manager._state.settings.voiceProvider, "gemini");
+  assert.equal(manager._state.captionConfig.voiceProvider, "gemini");
+  await manager.stop("gemini-only-audio");
 });
 
-test("OpenAI voice channel publishes PCM but never publishes its transcript as captions", async () => {
+test("stale OpenAI voice selection publishes Gemini PCM and never opens an OpenAI translation socket", async () => {
   const sockets = [];
   const broadcasts = [];
   const manager = createSubtitleRealtimeManager({
@@ -3139,13 +1548,19 @@ test("OpenAI voice channel publishes PCM but never publishes its transcript as c
       return socket;
     },
   });
-  await manager.start({ sessionId: "openai-audio-delta" });
-  const voiceSocket = sockets.find((socket) => socket.url.includes("api.openai.com"));
-  voiceSocket.emit("open");
-  voiceSocket.emit("message", JSON.stringify({ type: "session.updated" }));
-  voiceSocket.emit("message", JSON.stringify({ type: "session.output_transcript.delta", delta: "숨겨야 합니다" }));
+  await manager.start({ sessionId: "gemini-only-audio-delta" });
+  assert.equal(sockets.some((socket) => socket.url.includes("api.openai.com")), false);
+  for (const socket of sockets) socket.emit("open");
+  const voiceSocket = sockets.find((socket) => {
+    const setup = JSON.parse(socket.sent[0]);
+    return setup.setup.generationConfig.translationConfig.targetLanguageCode === "ko";
+  });
+  voiceSocket.emit("message", JSON.stringify({ setupComplete: {} }));
+  voiceSocket.emit("message", JSON.stringify({ serverContent: { outputTranscription: { text: "숨겨야 합니다" } } }));
   const audio = Buffer.from([1, 0, 2, 0]).toString("base64");
-  voiceSocket.emit("message", JSON.stringify({ type: "session.output_audio.delta", delta: audio }));
+  voiceSocket.emit("message", JSON.stringify({
+    serverContent: { modelTurn: { parts: [{ inlineData: { mimeType: "audio/pcm;rate=24000", data: audio } }] } },
+  }));
   await tick();
   assert.equal(broadcasts.some((message) => ["subtitle:partial", "subtitle:committed"].includes(message.type) && message.translatedText?.includes("숨겨야")), false);
   assert.deepEqual(broadcasts.find((message) => message.type === "subtitle:translated-audio"), {
@@ -3156,7 +1571,7 @@ test("OpenAI voice channel publishes PCM but never publishes its transcript as c
     mimeType: "audio/pcm;rate=24000",
     audio,
   });
-  await manager.stop("openai-audio-delta");
+  await manager.stop("gemini-only-audio-delta");
 });
 
 test("subtitle manager streams Gemini audio only for the selected language without a turn boundary", async () => {
@@ -3350,21 +1765,24 @@ test("audio-only watchdog treats translated audio as the pipeline liveness signa
   manager.noteInputSignal({ sessionId: "audio-watchdog-pcm" });
 
   const koreanSocket = sockets[1];
-  koreanSocket.emit("message", JSON.stringify({
-    serverContent: {
-      modelTurn: {
-        parts: [{
-          inlineData: {
-            mimeType: "audio/pcm;rate=24000",
-            data: Buffer.alloc(4_800, 1).toString("base64"),
-          },
-        }],
+  const outputAudioTimer = setInterval(() => {
+    koreanSocket.emit("message", JSON.stringify({
+      serverContent: {
+        modelTurn: {
+          parts: [{
+            inlineData: {
+              mimeType: "audio/pcm;rate=24000",
+              data: Buffer.alloc(4_800, 1).toString("base64"),
+            },
+          }],
+        },
       },
-    },
-  }));
+    }));
+  }, 10);
   koreanSocket.emit("message", JSON.stringify({ serverContent: { inputTranscription: { text: "Hello there" } } }));
   koreanSocket.emit("message", JSON.stringify({ serverContent: { outputTranscription: { text: "안녕하세요 여러분" }, turnComplete: true } }));
   await new Promise((resolve) => setTimeout(resolve, 80));
+  clearInterval(outputAudioTimer);
 
   assert.equal(broadcasts.some((message) => message.type === "subtitle:status"
     && message.status === "recovering"

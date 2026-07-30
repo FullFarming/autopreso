@@ -104,15 +104,16 @@ function parseParticipantRow(value: unknown): ParticipantRow | null {
   if (!isRecord(value)) return null;
   const participantId = asBoundedString(value.participant_id, 128);
   const displayName = asBoundedString(value.display_name, 40);
-  const department = asBoundedString(value.department, 80);
-  const jobTitle = asBoundedString(value.job_title, 80);
+  const department = asOptionalBoundedString(value.department, 80);
+  const jobTitle = asOptionalBoundedString(value.job_title, 100);
   const joinedAt = asTimestamp(value.joined_at);
   const lastSeenAt = asTimestamp(value.last_seen_at);
   const leftAt = value.left_at === null ? null : asTimestamp(value.left_at);
   const utteranceCount = Number(value.utterance_count);
   const speakingSeconds = Number(value.speaking_seconds);
   const lastSpokeAt = value.last_spoke_at === null ? null : asTimestamp(value.last_spoke_at);
-  if (!participantId || !displayName || !department || !jobTitle || !joinedAt || !lastSeenAt || value.left_at !== null && !leftAt) {
+  if (!participantId || !displayName || department === null || jobTitle === null
+    || !joinedAt || !lastSeenAt || value.left_at !== null && !leftAt) {
     return null;
   }
   if (!Number.isSafeInteger(utteranceCount)
@@ -165,6 +166,13 @@ function asBoundedString(value: unknown, maxLength: number): string | null {
   if (typeof value !== "string") return null;
   const normalized = value.normalize("NFC").trim();
   return normalized.length >= 1 && Array.from(normalized).length <= maxLength ? normalized : null;
+}
+
+function asOptionalBoundedString(value: unknown, maxLength: number): string | null {
+  if (value === null || value === undefined) return "";
+  if (typeof value !== "string") return null;
+  const normalized = value.normalize("NFC").trim();
+  return Array.from(normalized).length <= maxLength ? normalized : null;
 }
 
 function asTimestamp(value: unknown): string | null {

@@ -9,7 +9,7 @@
     "typecheck": "tsc --noEmit",
     "test": "npm run test:live && npm run test:core",
     "test:live": "node --experimental-strip-types --experimental-loader ./lib/security/test-typescript-loader.mjs --test components/live/foreground-recovery.test.ts components/live/live-audio-client.test.ts components/live/live-session-schedule.test.ts components/live/viewer-surface-routing.test.ts lib/live/caption-feed.test.ts lib/live/cover-image.test.ts lib/live/live-service.test.ts lib/live/summary.test.ts lib/live/post-session-summary.test.ts lib/live/feature-flag.test.ts lib/live/admission-code.test.ts lib/live/activity.test.ts lib/security/live-admission-store.test.ts lib/security/live-security.test.ts",
-    "test:core": "node --experimental-strip-types --experimental-loader ./lib/security/test-typescript-loader.mjs --test app/api/openai-token/route.test.ts components/live/speak-client.test.ts lib/audio.test.ts lib/channelCore.test.ts lib/engine.test.ts lib/geminiChannel.test.ts lib/languageDetect.test.ts lib/live-contract.test.ts lib/openaiChannel.test.ts lib/openaiTranslationWebRtc.test.ts"
+    "test:core": "node --experimental-strip-types --experimental-loader ./lib/security/test-typescript-loader.mjs --test components/live/speak-client.test.ts lib/audio.test.ts lib/channelCore.test.ts lib/geminiChannel.test.ts lib/languageDetect.test.ts lib/live-contract.test.ts"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.108.1",

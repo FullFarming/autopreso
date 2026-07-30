@@ -523,10 +523,6 @@ input:focus-visible {
 .live-viewer-shell { display: flex; min-height: 100dvh; flex-direction: column; gap: 12px; }
 .live-join-card { display: grid; width: min(390px, calc(100% - 40px)); gap: 14px; margin: auto; padding: 0; color: #fff; }
 .live-join-wordmark { margin: 0; color: #fff; font-size: 12px; font-weight: 600; letter-spacing: .22em; text-transform: uppercase; }
-.live-join-methods { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 3px; margin-bottom: 8px; padding: 3px; border: 1px solid rgba(255,255,255,.15); border-radius: 8px; background: rgba(255,255,255,.06); }
-.live-join-methods button { min-height: 38px; border: 0; border-radius: 6px; background: transparent; color: rgba(255,255,255,.55); font: 600 12px/1 var(--font-sans); }
-.live-join-methods button:only-child { grid-column: 1 / -1; }
-.live-join-methods button.is-selected { background: #fff; color: #000; }
 .live-join-card h1 { margin: 6px 0 10px; font-size: clamp(2.3rem, 8vw, 3.4rem); }
 .live-join-card > p { margin: 0 0 24px; color: var(--body); font-size: 13px; line-height: 1.6; }
 .live-join-card label { display: block; margin-bottom: 0; color: rgba(255,255,255,.58); font-size: 12px; font-weight: 600; }
@@ -546,7 +542,6 @@ input:focus-visible {
 .live-viewer-shell.is-join .live-join-card > .live-join-lede,
 .live-viewer-shell.is-join .live-join-card > .live-join-mic-note,
 .live-viewer-shell.is-join .live-join-card label { color: var(--brand-grey-25); }
-.live-viewer-shell.is-join .live-join-methods button { min-height: 44px; }
 .live-viewer-shell.is-join button:focus-visible { outline: 2px solid var(--brand-blue); outline-offset: 2px; }
 .live-qr-required,
 .live-viewer-closed { display: grid; place-items: center; color: rgba(255,255,255,.5); font-size: 13px; }
@@ -563,8 +558,8 @@ input:focus-visible {
 .live-viewer-stage .live-eyebrow { color: var(--on-dark-soft); }
 .live-viewer-stage .live-connection-state { color: var(--on-dark-soft); }
 .live-caption-stack { display: flex; flex: 1; flex-direction: column; justify-content: flex-start; gap: 9px; min-height: 300px; overflow: hidden; }
-.live-caption-card { padding: 11px 14px; border: 1px solid rgba(255,255,255,.1); border-radius: 12px; background: rgba(255,255,255,.06); opacity: .62; transition: opacity .18s, background .18s, transform .18s; }
-.live-caption-card.is-active { background: rgba(255,255,255,.12); opacity: 1; transform: translateX(3px); }
+.live-caption-card { padding: 11px 14px; border: 1px solid rgba(255,255,255,.1); border-radius: 12px; background: rgba(255,255,255,.06); opacity: .62; transition: opacity var(--nova-dur-color) var(--nova-ease-out), background var(--nova-dur-color) var(--nova-ease-out); }
+.live-caption-card.is-active { background: rgba(255,255,255,.12); opacity: 1; }
 .live-caption-card.is-partial { opacity: .78; }
 .live-caption-speaker { display: flex; align-items: center; gap: 7px; color: var(--on-dark-soft); font-size: 10px; font-weight: 600; }
 .live-speaker-line { height: 1px; min-width: 24px; flex: 1; opacity: .7; }
@@ -592,11 +587,7 @@ input:focus-visible {
    partials, new paragraphs, Aa text-size reflow) and keep the newest line
    pinned into view. */
 .live-turn-scroll-content { display: flex; flex-direction: column; gap: 14px; }
-/* New paragraphs ease in instead of popping — the moment a new speaker
-   starts, their name · department · title header appears with this motion. */
-.live-turn-card { animation: live-turn-in .28s ease-out; }
 .live-turn-card.is-live header .live-speaking-waves { color: var(--brand-blue); }
-@keyframes live-turn-in { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
 .live-turn-card { border-bottom: 1px solid rgba(255,255,255,.07); padding: 2px 2px 14px; }
 .live-turn-card header { display: flex; align-items: center; gap: 8px; margin-bottom: 7px; color: var(--on-dark-soft); font-size: 11px; font-weight: 600; }
 .live-turn-card header time { margin-left: 2px; color: rgba(255,255,255,.38); font-size: 10px; font-weight: 400; font-variant-numeric: tabular-nums; }
@@ -606,11 +597,6 @@ input:focus-visible {
    most recently completed sentences render at full strength. */
 .live-turn-card p .live-turn-text { opacity: .42; transition: none; }
 .live-turn-card p .live-turn-text.is-recent { opacity: 1; }
-/* Reduced motion covers the paragraph entry and sentence contrast transition. */
-@media (prefers-reduced-motion: reduce) {
-  .live-turn-card { animation: none; }
-  .live-turn-card p .live-turn-text { transition: none; }
-}
 .live-jump-latest { position: absolute; bottom: 118px; left: 50%; transform: translateX(-50%); z-index: 2; border: 1px solid rgba(255,255,255,.2); border-radius: 9999px; background: rgba(20,18,16,.92); color: var(--on-dark); padding: 8px 16px; font-size: 11px; font-weight: 600; backdrop-filter: blur(8px); }
 .live-now-sheet { position: relative; margin-top: 10px; border: 1px solid rgba(255,255,255,.12); border-radius: 18px; background: rgba(255,255,255,.07); padding: 18px 16px 14px; backdrop-filter: blur(14px); }
 /* Grab handle: tap to collapse the sheet to a slim speaker strip (broadcast
@@ -674,7 +660,15 @@ input:focus-visible {
 .live-minutes .live-summary-overview { color: rgba(255,255,255,.82); }
 .live-minutes-pending { display: grid; gap: 10px; justify-items: start; border: 1px solid rgba(255,255,255,.12); border-radius: 18px; background: rgba(255,255,255,.05); padding: 16px; }
 .live-minutes-pending p { margin: 0; color: rgba(255,255,255,.6); font-size: 12px; line-height: 1.6; }
-.live-minutes-pending button { min-height: 38px; border: 1px solid rgba(255,255,255,.25); border-radius: 9999px; background: transparent; color: #fff; padding: 0 16px; font: 600 12px/1 var(--font-sans); }
+.live-minutes-pending button { min-height: 44px; border: 1px solid var(--nova-hairline-strong); border-radius: var(--nova-r-pill); background: transparent; color: var(--nova-text); padding: 0 16px; font: 600 13px/1 var(--font-sans); }
+.live-minutes-loading { display: grid; grid-template-columns: auto 1fr; align-items: center; gap: 5px 12px; min-height: 52px; }
+.live-minutes-loading strong { color: var(--nova-text); font-size: 15px; font-weight: 600; }
+.live-minutes-loading-dots { display: inline-flex; grid-row: 1 / span 2; width: 44px; height: 44px; align-items: center; justify-content: center; gap: 4px; }
+.live-minutes-loading-dots i { width: 5px; height: 5px; border-radius: var(--nova-r-pill); background: var(--nova-text); animation: live-minutes-dot 900ms ease-in-out infinite alternate; }
+.live-minutes-loading-dots i:nth-child(2) { animation-delay: 150ms; }
+.live-minutes-loading-dots i:nth-child(3) { animation-delay: 300ms; }
+.live-minutes-elapsed { color: var(--nova-text-muted); font-size: 13px; font-variant-numeric: tabular-nums; }
+@keyframes live-minutes-dot { from { opacity: .3; transform: translateY(2px); } to { opacity: 1; transform: translateY(-2px); } }
 .live-minutes-record { display: grid; gap: 16px; }
 .live-minutes-record article { border-bottom: 1px solid rgba(255,255,255,.07); padding-bottom: 14px; }
 .live-minutes-record article header { display: flex; align-items: baseline; gap: 8px; margin-bottom: 6px; color: rgba(255,255,255,.6); font-size: 11px; font-weight: 600; }
@@ -844,13 +838,6 @@ input:focus-visible {
 .live-caption-history.is-scrollable { display: flex; flex-direction: column; gap: 9px; max-height: 100%; overflow-y: auto; overscroll-behavior: contain; scrollbar-width: thin; }
 .live-caption-stack .live-jump-latest { bottom: 96px; }
 
-/* Speaker-change overlay (contract C5): transient identity card above the
-   captions when the floor holder changes. Gray/white on black. */
-.live-speaker-change-overlay { position: fixed; top: max(96px, calc(72px + env(safe-area-inset-top))); left: 50%; transform: translateX(-50%); z-index: 6; display: grid; gap: 2px; justify-items: center; min-width: 200px; max-width: min(86vw, 460px); border: 1px solid rgba(255,255,255,.16); border-radius: 14px; background: rgba(10,10,10,.94); padding: 12px 22px; text-align: center; backdrop-filter: blur(10px); animation: live-overlay-in .22s ease-out; }
-.live-speaker-change-overlay strong { color: #fff; font-size: 17px; line-height: 1.3; }
-.live-speaker-change-overlay span { color: rgba(255,255,255,.55); font-size: 12px; }
-@keyframes live-overlay-in { from { opacity: 0; transform: translate(-50%, -6px); } to { opacity: 1; transform: translate(-50%, 0); } }
-
 /* Viewer waiting screen (session preparing): pure black holding view. */
 .live-waiting-screen { position: relative; display: flex; flex: 1; flex-direction: column; align-items: center; justify-content: center; gap: 10px; min-height: 50dvh; background: #000; border-radius: 18px; padding: 32px 20px; text-align: center; overflow: hidden; isolation: isolate; }
 .live-waiting-cover { position: absolute; inset: 0; z-index: -2; width: 100%; height: 100%; object-fit: cover; }
@@ -869,7 +856,7 @@ input:focus-visible {
 .live-loading-ring { position: absolute; inset: 0; border: 3px solid rgba(255,255,255,.14); border-top-color: rgba(255,255,255,.82); border-radius: 9999px; animation: live-loading-ring-spin 1.1s linear infinite; }
 @keyframes live-loading-ring-spin { to { transform: rotate(360deg); } }
 .live-waiting-countdown { margin: 0; color: #fff; font-size: 30px; font-variant-numeric: tabular-nums; font-weight: 700; letter-spacing: .04em; }
-@media (prefers-reduced-motion: reduce) { .live-waiting-pulse { animation: none; } .live-speaker-change-overlay { animation: none; } .live-loading-ring { animation: none; opacity: .35; } }
+@media (prefers-reduced-motion: reduce) { .live-waiting-pulse { animation: none; } .live-loading-ring { animation: none; opacity: .35; } }
 
 /* Paused banner for viewers (contract C4). */
 .live-paused-banner { display: flex; align-items: center; justify-content: center; gap: 8px; margin: 8px 12px 0; border: 1px solid rgba(255,255,255,.14); border-radius: 12px; background: rgba(255,255,255,.06); color: rgba(255,255,255,.75); padding: 10px 14px; font-size: 12px; }
@@ -926,6 +913,10 @@ input:focus-visible {
 .live-stage-code { display: grid; gap: 6px; justify-items: center; }
 .live-stage-code span { color: var(--nova-text-muted); font-size: 12px; letter-spacing: .1em; text-transform: uppercase; }
 .live-stage-code strong { color: var(--nova-text); font-variant-numeric: tabular-nums; font-size: clamp(30px, 4vw, 56px); letter-spacing: .18em; }
+.live-stage-manual-url { display: grid; width: 100%; min-height: 44px; align-content: center; justify-items: center; gap: 4px; border-top: 1px solid var(--nova-hairline); color: var(--nova-text); padding-top: 14px; text-align: center; text-decoration: none; }
+.live-stage-manual-url span { color: var(--nova-text-muted); font-size: 12px; }
+.live-stage-manual-url strong { max-width: 100%; color: var(--nova-text-body); font-size: 13px; font-weight: 500; overflow-wrap: anywhere; }
+.live-stage-manual-url:focus-visible { outline: 2px solid var(--nova-blue); outline-offset: 3px; }
 .live-stage-attendance { display: flex; min-height: 44px; align-items: center; gap: 14px; }
 .live-stage-avatar-stack { display: flex; align-items: center; padding-left: 4px; }
 .live-stage-avatar { display: grid; width: 40px; height: 40px; place-items: center; margin-left: -8px; border: 2px solid var(--dark); border-radius: var(--nova-r-pill); background: var(--nova-surface-raised); color: var(--nova-text); font-size: 12px; font-weight: 700; }
@@ -958,7 +949,7 @@ input:focus-visible {
 .live-stage-ring .live-stage-countdown { font-size: clamp(34px, 4.8vw, 72px); }
 /* Pre-live layers fade out (instead of unmounting) when the host starts. */
 .live-stage-access { transition: opacity var(--nova-dur-color) var(--nova-ease-out); }
-.live-stage-access.is-faded-out { opacity: 0; pointer-events: none; position: absolute; }
+.live-stage-access.is-faded-out { visibility: hidden; opacity: 0; pointer-events: none; }
 @media (max-width: 760px) {
   .live-stage-shell { align-items: start; padding: 16px; }
   .live-stage-frame { width: 100%; min-height: calc(100dvh - 32px); aspect-ratio: auto; }
@@ -968,7 +959,7 @@ input:focus-visible {
 @media (prefers-reduced-motion: reduce) {
   .live-stage-cover, .live-stage-access { transition: none; }
   .live-end-label, .live-stage-state.is-ended { animation: none; opacity: 1; }
-  .live-stage-loader i { animation: none; opacity: .65; transform: none; }
+  .live-stage-loader i, .live-minutes-loading-dots i { animation: none; opacity: .65; transform: none; }
 }
 
 /* Compact-mode touch targets: every tappable control is at least 44px tall. */
@@ -1087,26 +1078,6 @@ input:focus-visible {
   transition-duration: var(--nova-dur-press-in);
 }
 .live-viewer-shell .live-primary-action:disabled { background: var(--nova-overlay-200); color: var(--nova-text-subtle); opacity: 1; }
-
-/* Segmented control: TDS group radius 15, item radius 12, and the selected item
-   is a RAISED SURFACE rather than a pure-white slab. */
-.live-viewer-shell .live-join-methods {
-  border: 0;
-  border-radius: 15px;
-  background: var(--nova-overlay-100);
-  gap: 2px;
-  padding: 2px;
-}
-.live-viewer-shell .live-join-methods button {
-  border-radius: var(--nova-r-row);
-  color: var(--nova-text-muted);
-  font-weight: 600;
-  transition: background var(--nova-dur-color) var(--nova-ease-out), color var(--nova-dur-color) var(--nova-ease-out);
-}
-.live-viewer-shell .live-join-methods button.is-selected {
-  background: var(--nova-surface-raised);
-  color: var(--nova-text);
-}
 
 /* TextField: TDS box radius 14 on a layered surface, with a real focus ring. */
 .live-viewer-shell .live-join-card input,

@@ -3,6 +3,11 @@ import fs from "node:fs";
 import test from "node:test";
 import vm from "node:vm";
 
+import {
+  resolveOverlayDisplays,
+  resolveSelectedOverlayDisplay,
+} from "../src/live-caption-ipc-relay.js";
+
 const mainSource = fs.readFileSync(new URL("../electron/main.js", import.meta.url), "utf8");
 const preloadSource = fs.readFileSync(new URL("../electron/preload.js", import.meta.url), "utf8");
 
@@ -320,7 +325,7 @@ test("dashboard, controller and overlay windows all get renderer recovery", () =
   assert.match(dashboard, /stopLiveGatewayBridge\("dashboard renderer lost"\)/u);
   assert.match(dashboard, /HOST_AUDIO_RENDERER_LOST/u);
   assert.match(dashboard, /notifyLiveBridgeFailure\(/u);
-  const overlay = sourceBetween("function createOverlayWindowForDisplay", "// Reconcile one overlay window");
+  const overlay = sourceBetween("function createOverlayWindowForDisplay", "function isCurrentOverlayWindow");
   assert.match(overlay, /attachRendererRecovery\(window/u);
   assert.match(overlay, /did-finish-load/u, "a recovered overlay must be shown; ready-to-show fires only once");
   const controller = sourceBetween("function createControllerWindow", "function createOverlayWindowForDisplay");
@@ -393,7 +398,17 @@ function loadOverlayWindows({ displays, overlayEnabled = true, overlaysMuted = f
   }
   const context = {
     BrowserWindow: FakeOverlayWindow,
-    screen: { getAllDisplays: () => displays },
+    screen: {
+      getAllDisplays: () => displays,
+      getPrimaryDisplay: () => displays[0],
+    },
+    // The overlay window set is derived from the shared pure resolvers, so the
+    // sandbox gets the real ones rather than a second copy of the rule.
+    resolveOverlayDisplays,
+    resolveSelectedOverlayDisplay,
+    overlayAllDisplays: false,
+    preferredOverlayDisplayId: "",
+    selectedOverlayDisplayId: "",
     overlayWindows: new Map(),
     interactiveOverlayIds: new Set(),
     overlayEnabled,

@@ -289,12 +289,10 @@ test("host session parsing rejects a malformed admission timestamp", async () =>
   );
 });
 
-test("host session parsing fails closed on missing or impossible voice provider contracts", async () => {
+test("host session parsing fails closed on missing or unknown voice provider contracts", async () => {
   for (const override of [
     {},
     { voice_provider: "unknown" },
-    { voice_provider: "openai", session_type: "meeting" },
-    { voice_provider: "openai", session_type: "presentation", output_mode: "captions" },
   ]) {
     const store = new SupabaseLiveAdmissionStore({
       getServerAccess: () => ({
@@ -316,7 +314,7 @@ test("host session parsing fails closed on missing or impossible voice provider 
   }
 });
 
-test("admission redemption includes voice provider and rejects malformed language cost boundaries", async () => {
+test("admission redemption normalizes a legacy OpenAI row to Gemini and rejects malformed boundaries", async () => {
   const baseRow = {
     grant_id: "grant-1", session_id: "session-1", user_id: "user-1", display_name: "Viewer",
     department: "Strategy", job_title: "Director", participant_id: "participant-1",
@@ -338,13 +336,12 @@ test("admission redemption includes voice provider and rejects malformed languag
     displayName: "Viewer", department: "Strategy", jobTitle: "Director",
     expiresAt: new Date(now + 60_000).toISOString(),
   };
-  assert.equal((await store.redeemAdmission(input)).session.voiceProvider, "openai");
+  assert.equal((await store.redeemAdmission(input)).session.voiceProvider, "gemini");
   assert.equal((await store.redeemAdmission(input)).grant.participantId, "participant-1");
 
   for (const malformed of [
     { ...baseRow, voice_provider: undefined },
-    { ...baseRow, voice_provider: "openai", session_type: "meeting" },
-    { ...baseRow, voice_provider: "openai", output_mode: "captions" },
+    { ...baseRow, voice_provider: "unknown" },
     { ...baseRow, languages: [] },
     { ...baseRow, languages: ["ko", "ko"] },
     { ...baseRow, languages: ["ko", "en", "ja", "fr"] },
@@ -419,6 +416,78 @@ test("participant identity redemption uses v3 RPCs and parses stable participant
   assert.equal(calls[1].body.p_job_title, "Director");
 });
 
+test("QR and code redemption store omitted participant profile fields as null", async () => {
+  const calls: Array<{ path: string; body: Record<string, unknown> }> = [];
+  const responseRow = {
+    grant_id: "grant-1", participant_id: "participant-1", session_id: "session-1",
+    user_id: "user-1", display_name: "Viewer", department: null, job_title: null,
+    grant_expires_at: new Date(now + 60_000).toISOString(),
+    session_expires_at: new Date(now + 60_000).toISOString(),
+    session_type: "meeting", output_mode: "captions", voice_provider: "gemini",
+    glossary_pack: "general_cre", languages: ["ko"], viewer_count: 1, max_viewers: 50,
+  };
+  const store = new SupabaseLiveAdmissionStore({
+    getServerAccess: () => ({
+      url: "https://approved-dev-ref.supabase.co",
+      credential: { key: `sb_secret_${"s".repeat(24)}`, kind: "secret" },
+    }),
+    fetchFn: async (url, init) => {
+      calls.push({
+        path: new URL(String(url)).pathname,
+        body: JSON.parse(String(init?.body)) as Record<string, unknown>,
+      });
+      return Response.json(responseRow);
+    },
+  });
+  const identity = {
+    userId: "user-1",
+    deviceHash: "b".repeat(64),
+    displayName: "Viewer",
+    department: "",
+    jobTitle: "",
+    expiresAt: new Date(now + 60_000).toISOString(),
+  };
+
+  const admission = await store.redeemAdmission({ ...identity, codeHmac: "a".repeat(64) });
+  const invite = await store.redeemInvite({ ...identity, tokenHmac: "c".repeat(64) });
+
+  assert.equal(admission.grant.department, "");
+  assert.equal(admission.grant.jobTitle, "");
+  assert.equal(invite.grant.department, "");
+  assert.equal(invite.grant.jobTitle, "");
+  assert.deepEqual(calls.map((call) => [call.path, call.body.p_department, call.body.p_job_title]), [
+    ["/rest/v1/rpc/redeem_live_admission_v3", null, null],
+    ["/rest/v1/rpc/redeem_live_invite_v3", null, null],
+  ]);
+});
+
+test("invalid optional participant identity maps to a bounded 400 response", async () => {
+  const store = new SupabaseLiveAdmissionStore({
+    getServerAccess: () => ({
+      url: "https://approved-dev-ref.supabase.co",
+      credential: { key: `sb_secret_${"s".repeat(24)}`, kind: "secret" },
+    }),
+    fetchFn: async () => Response.json(
+      { code: "P0001", message: "INVALID_PARTICIPANT_IDENTITY" },
+      { status: 400 },
+    ),
+  });
+  await assert.rejects(
+    store.redeemAdmission({
+      codeHmac: "a".repeat(64),
+      userId: "user-1",
+      deviceHash: "b".repeat(64),
+      displayName: "Viewer",
+      department: "Strategy",
+      jobTitle: "D".repeat(101),
+      expiresAt: new Date(now + 60_000).toISOString(),
+    }),
+    (error: unknown) => error instanceof LiveAdmissionError
+      && error.code === "INVALID_JOIN_REQUEST"
+      && error.status === 400,
+  );
+});
+
 test("host roster RPC validates retained participant activity", async () => {
   const store = new SupabaseLiveAdmissionStore({
     getServerAccess: () => ({
@@ -450,4 +519,31 @@ test("host roster RPC validates retained participant activity", async () => {
   const roster = await store.readParticipantRoster("session-1", "host-1");
   assert.equal(roster[0].participantId, "participant-1");
   assert.equal(roster[0].speakingSeconds, 12.5);
+});
+
+test("host roster maps nullable participant profile fields to response-safe empty strings", async () => {
+  const store = new SupabaseLiveAdmissionStore({
+    getServerAccess: () => ({
+      url: "https://approved-dev-ref.supabase.co",
+      credential: { key: `sb_secret_${"s".repeat(24)}`, kind: "secret" },
+    }),
+    fetchFn: async () => Response.json([{
+      participant_id: "participant-1",
+      grant_id: "grant-1",
+      user_id: "user-1",
+      display_name: "Viewer",
+      department: null,
+      job_title: null,
+      joined_at: new Date(now).toISOString(),
+      last_seen_at: new Date(now + 1_000).toISOString(),
+      left_at: null,
+      last_spoke_at: null,
+      utterance_count: 0,
+      speaking_seconds: "0",
+      retention_expires_at: null,
+    }]),
+  });
+  const roster = await store.readParticipantRoster("session-1", "host-1");
+  assert.equal(roster[0].department, "");
+  assert.equal(roster[0].jobTitle, "");
 });

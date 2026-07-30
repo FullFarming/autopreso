@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { createSpokenLanguageState, detectSourceLanguage, isTargetLanguageText, normalizeLanguageCode, resolveLanguageEvidence, toGeminiLanguageCode, toOpenAITranslationLanguageCode } from "./languageDetect";
+import { createSpokenLanguageState, detectSourceLanguage, isTargetLanguageText, normalizeLanguageCode, resolveLanguageEvidence, toGeminiLanguageCode } from "./languageDetect";
 
 test("source detection keeps English speech English when it contains a Korean name", () => {
   assert.equal(detectSourceLanguage("We met 김민수 at the Seoul office yesterday"), "en");
@@ -84,7 +84,6 @@ test("web language contract exposes fourteen canonical choices and provider mapp
   }
   assert.equal(toGeminiLanguageCode("ko"), "ko-KR");
   assert.equal(toGeminiLanguageCode("zh-Hant"), "zh-Hant");
-  assert.equal(toOpenAITranslationLanguageCode("zh-Hans"), "zh");
 });
 
 test("speaker boundary clears ambiguous fragments before the next speaker language", () => {

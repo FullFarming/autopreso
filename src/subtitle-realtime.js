@@ -7,11 +7,15 @@ import { DEFAULT_SUBTITLE_SETTINGS } from "./settings-store.js";
 import { createSubtitleLanguageState } from "./subtitle-language-state.js";
 import {
   countLanguageSignalChars,
+  applyGlossaryCorrections,
+  createCommittedCaptionFinalizer,
   createCrossChannelEchoDeduper,
+  createGeminiCaptionConfig,
   createSourceLanguageConsensus,
   detectLanguage as detectCaptionLanguage,
   detectSourceLanguage as detectCaptionSourceLanguage,
   isOutputInTargetLanguage,
+  normalizeCommittedCreCaption,
   sourceConsensusContract,
 } from "../packages/caption-core/index.js";
 import {
@@ -21,13 +25,15 @@ import {
   resolveConfiguredLanguageForScript,
   subtitleLanguageLabel,
   subtitleLanguagePrefixTokens,
-  toOpenAITranslationLanguageCode,
 } from "./subtitle-languages.js";
 
-const REALTIME_TRANSLATION_URL = "wss://api.openai.com/v1/realtime/translations?model=gpt-realtime-translate";
 const VALID_AUDIO_SOURCES = new Set(["system", "mic"]);
-const DEFAULT_TRANSLATION_MODEL = "gpt-realtime-translate";
 const SUBTITLE_COMMIT_MS = 800;
+// Gemini finals normally follow provider turnComplete/generationComplete. This
+// longer fallback starts only after PCM energy shows a real speech-to-silence
+// transition; output-fragment timing must never manufacture a sentence boundary.
+const GEMINI_AUDIO_SILENCE_COMMIT_MS = 1200;
+const PCM_SPEECH_RMS_THRESHOLD = 192;
 // A live partial that stops growing for this long without ever finalizing
 // (Gemini sent no turnComplete) is treated as an abandoned turn and cleared, so
 // a frozen translation can't linger/flicker through a language switch.
@@ -39,8 +45,6 @@ const PARTIAL_STALE_CLEAR_MS = 1200;
 // 끝날 때까지 자막이 계속 떠 있음"). User spec: no input for 3s → subtitle ends.
 const SILENCE_CLEAR_MS = 3000;
 const PARTIAL_STABILITY_MS = 140;
-const PARTIAL_MAX_HOLD_MS = 420;
-const PARTIAL_MIN_SIGNAL_CHARS = 8;
 // Lowered 2026-06-21: the high thresholds were defensive against Gemini's noisy
 // early transcript revisions, but the robust transcript merge now keeps text
 // growing cleanly — so the FIRST translation can paint much sooner (it no longer
@@ -79,7 +83,21 @@ function boundTranscript(value) {
   return text.length <= MAX_TRANSCRIPT_CHARS ? text : text.slice(-MAX_TRANSCRIPT_CHARS);
 }
 
-/** @param {any} options */
+function pcm16HasSpeechSignal(base64Audio) {
+  if (typeof base64Audio !== "string" || !base64Audio) return true;
+  const pcm = Buffer.from(base64Audio, "base64");
+  if (pcm.length < 2 || pcm.length % 2 !== 0) return true;
+  let squaredSum = 0;
+  let samples = 0;
+  for (let offset = 0; offset < pcm.length; offset += 2) {
+    const sample = pcm.readInt16LE(offset);
+    squaredSum += sample * sample;
+    samples += 1;
+  }
+  return Math.sqrt(squaredSum / samples) >= PCM_SPEECH_RMS_THRESHOLD;
+}
+
+/** @param {Record<string, unknown>} options */
 export function createSubtitleRealtimeManager(options = {}) {
   const {
     broadcast,
@@ -105,31 +123,50 @@ export function createSubtitleRealtimeManager(options = {}) {
       handshakeTimeout: 10_000,
       ...(proxyAgent ? { agent: proxyAgent } : {}),
     }));
+  const readNow = typeof options.now === "function" ? options.now : Date.now;
   // Stall watchdog: speech signal present but zero subtitle output for stallMs
   // → the pipeline is wedged (dead upstream session, silent provider failure)
   // → rebuild the channels automatically. Timings injectable for tests.
   const watchdogConfig = {
-    intervalMs: 5_000,
-    stallMs: 20_000,
+    intervalMs: 100,
+    stallMs: 2_000,
     cooldownMs: 45_000,
     ...(options.stallWatchdog ?? {}),
   };
   const state = {
     sessionId: null,
     settings: { ...DEFAULT_SUBTITLE_SETTINGS },
+    captionConfig: null,
     clients: new Map(),
     active: false,
-    apiKeys: { openai: "", openaiSecondary: "", gemini: "", geminiSecondary: "" },
+    apiKeys: { gemini: "", geminiSecondary: "" },
   };
   let watchdogTimer = null;
-  // Start of the current continuous-speech window (input-status "signal"
-  // messages from the capture page), and the last time ANY subtitle content
-  // (partial or committed) was broadcast.
-  let signalSince = 0;
-  let lastSignalAt = 0;
-  let lastOutputAt = 0;
+  // Each capture source owns its liveness clock. A healthy system-audio lane
+  // must never conceal a stalled microphone lane in system_mic mode.
+  const livenessBySource = new Map();
   let lastStallRestartAt = 0;
   let restartInFlight = false;
+  let producerGeneration = 0;
+
+  function resetSourceLiveness(timestamp = readNow()) {
+    livenessBySource.clear();
+    for (const source of sourcesForInputMode(state.settings.inputMode)) {
+      livenessBySource.set(source, { signalSince: 0, lastSignalAt: 0, lastOutputAt: timestamp });
+    }
+  }
+
+  function noteOutput(source) {
+    const timestamp = readNow();
+    const outputSources = VALID_AUDIO_SOURCES.has(source)
+      ? [source]
+      : sourcesForInputMode(state.settings.inputMode);
+    for (const outputSource of outputSources) {
+      const current = livenessBySource.get(outputSource)
+        ?? { signalSince: 0, lastSignalAt: 0, lastOutputAt: timestamp };
+      livenessBySource.set(outputSource, { ...current, lastOutputAt: timestamp });
+    }
+  }
 
   // Manager-level broadcast tap: caption modes use visible text as liveness;
   // audio-only mode uses playable PCM and keeps hidden captions out of the
@@ -137,10 +174,10 @@ export function createSubtitleRealtimeManager(options = {}) {
   function broadcastTapped(message) {
     const isCaption = message?.type === "subtitle:partial" || message?.type === "subtitle:committed";
     if (state.settings.outputMode === "audio") {
-      if (message?.type === "subtitle:translated-audio") lastOutputAt = Date.now();
+      if (message?.type === "subtitle:translated-audio") noteOutput(message?.source);
       if (isCaption) return;
     } else if (isCaption) {
-      lastOutputAt = Date.now();
+      noteOutput(message?.source);
     }
     broadcast?.(message);
   }
@@ -150,37 +187,36 @@ export function createSubtitleRealtimeManager(options = {}) {
     broadcast?.({ type: "subtitle:audio-control", action: "clear", reason });
   }
 
-  /** @param {any} args */
+  /** @param {{ sessionId?: string, settings?: Record<string, unknown> }} args */
   async function start({ sessionId, settings = {} } = {}) {
     if (typeof sessionId !== "string" || sessionId.length === 0) {
       throw new Error("subtitle:start requires a sessionId.");
     }
     await stop();
     const saved = settingsStore ? await settingsStore.load() : {};
-    const nextSettings = normalizeSubtitleSettings({
+    const normalizedSettings = normalizeSubtitleSettings({
       ...(saved.subtitle ?? {}),
       ...(settings ?? {}),
     });
+    const captionConfig = createGeminiCaptionConfig(normalizedSettings);
+    const nextSettings = {
+      ...normalizedSettings,
+      translationProvider: "gemini",
+      voiceProvider: "gemini",
+      _captionConfig: captionConfig,
+    };
     const apiKeys = {
-      openai: (saved.apiKeys?.openai || env.OPENAI_API_KEY || "").trim(),
-      openaiSecondary: (saved.apiKeys?.openaiSecondary || env.OPENAI_SECONDARY_API_KEY || "").trim(),
       gemini: (saved.apiKeys?.gemini || env.GEMINI_API_KEY || "").trim(),
       geminiSecondary: (saved.apiKeys?.geminiSecondary || env.GEMINI_SECONDARY_API_KEY || "").trim(),
     };
-    const captionKey = nextSettings.translationProvider === "gemini" ? apiKeys.gemini : apiKeys.openai;
-    if (!captionKey) throw new Error(nextSettings.translationProvider === "gemini"
-      ? "Gemini API key is required for realtime subtitles."
-      : "OpenAI API key is required for realtime subtitles.");
-    if (AUDIO_OUTPUT_MODES.has(nextSettings.outputMode) && nextSettings.voiceProvider === "openai" && !apiKeys.openai) {
-      throw new Error("OpenAI API key is required for realtime translated audio.");
-    }
+    if (!apiKeys.gemini) throw new Error("Gemini API key is required for realtime subtitles.");
     state.sessionId = sessionId;
     state.settings = nextSettings;
+    state.captionConfig = captionConfig;
     state.apiKeys = apiKeys;
     state.active = true;
-    signalSince = 0;
-    lastSignalAt = 0;
-    lastOutputAt = Date.now();
+    producerGeneration += 1;
+    resetSourceLiveness();
     lastStallRestartAt = 0;
     startWatchdog();
     broadcast?.({ type: "subtitle:status", status: "connecting" });
@@ -196,37 +232,40 @@ export function createSubtitleRealtimeManager(options = {}) {
   // stall watchdog) and works headless — no dashboard page required.
   async function restartChannels({ reason = "restart" } = {}) {
     if (!state.active || !state.sessionId || restartInFlight) return false;
+    const ownerSessionId = state.sessionId;
+    const ownerGeneration = producerGeneration;
     restartInFlight = true;
     try {
-      clearTranslatedAudio(reason);
-      log.warn?.(`[subtitle] rebuilding translation channels (${reason})`);
       const saved = settingsStore ? await settingsStore.load() : {};
-      if (!state.active) return false;
+      if (!state.active || state.sessionId !== ownerSessionId || producerGeneration !== ownerGeneration) return false;
       // Saved settings win (a glossary/preset change is a common reason to
       // rebuild); the running session's settings fill anything not persisted.
-      state.settings = normalizeSubtitleSettings({ ...(state.settings ?? {}), ...(saved.subtitle ?? {}) });
+      const normalizedSettings = normalizeSubtitleSettings({ ...(state.settings ?? {}), ...(saved.subtitle ?? {}) });
+      state.captionConfig = createGeminiCaptionConfig(normalizedSettings);
+      state.settings = {
+        ...normalizedSettings,
+        translationProvider: "gemini",
+        voiceProvider: "gemini",
+        _captionConfig: state.captionConfig,
+      };
       state.apiKeys = {
-        openai: (saved.apiKeys?.openai || env.OPENAI_API_KEY || "").trim(),
-        openaiSecondary: (saved.apiKeys?.openaiSecondary || env.OPENAI_SECONDARY_API_KEY || "").trim(),
         gemini: (saved.apiKeys?.gemini || env.GEMINI_API_KEY || "").trim(),
         geminiSecondary: (saved.apiKeys?.geminiSecondary || env.GEMINI_SECONDARY_API_KEY || "").trim(),
       };
-      const captionKey = state.settings.translationProvider === "gemini" ? state.apiKeys.gemini : state.apiKeys.openai;
-      if (!captionKey) throw new Error(state.settings.translationProvider === "gemini"
-        ? "Gemini API key is required for realtime subtitles."
-        : "OpenAI API key is required for realtime subtitles.");
-      if (AUDIO_OUTPUT_MODES.has(state.settings.outputMode) && state.settings.voiceProvider === "openai" && !state.apiKeys.openai) {
-        throw new Error("OpenAI API key is required for realtime translated audio.");
-      }
+      if (!state.apiKeys.gemini) throw new Error("Gemini API key is required for realtime subtitles.");
+      clearTranslatedAudio(reason);
+      log.warn?.(`[subtitle] rebuilding translation channels (${reason})`);
       broadcast?.({ type: "subtitle:status", status: "recovering", reason });
       const oldClients = [...state.clients.values()];
       state.clients.clear();
+      producerGeneration += 1;
+      const replacementGeneration = producerGeneration;
       await Promise.all(oldClients.map((client) => client.close({ graceful: false })));
-      if (!state.active || !state.sessionId) return false;
+      if (!state.active || state.sessionId !== ownerSessionId || producerGeneration !== replacementGeneration) return false;
       for (const source of sourcesForInputMode(state.settings.inputMode)) {
         ensureClient(source).open();
       }
-      lastOutputAt = Date.now();
+      resetSourceLiveness();
       broadcast?.({ type: "subtitle:status", status: "listening" });
       return true;
     } finally {
@@ -236,11 +275,20 @@ export function createSubtitleRealtimeManager(options = {}) {
 
   // Capture-page speech signal (subtitle:input-status "signal"). Tracks the
   // start of the current continuous-speech window for the stall watchdog.
-  function noteInputSignal({ sessionId } = {}) {
+  function noteInputSignal({ sessionId, source } = {}) {
     if (!state.active || (sessionId && sessionId !== state.sessionId)) return;
-    const now = Date.now();
-    if (now - lastSignalAt > Math.max(5_000, watchdogConfig.intervalMs)) signalSince = now;
-    lastSignalAt = now;
+    const now = readNow();
+    const inputSources = VALID_AUDIO_SOURCES.has(source)
+      ? [source]
+      : sourcesForInputMode(state.settings.inputMode);
+    for (const inputSource of inputSources) {
+      const current = livenessBySource.get(inputSource)
+        ?? { signalSince: 0, lastSignalAt: 0, lastOutputAt: now };
+      const signalSince = now - current.lastSignalAt > Math.max(5_000, watchdogConfig.intervalMs)
+        ? now
+        : current.signalSince;
+      livenessBySource.set(inputSource, { ...current, signalSince, lastSignalAt: now });
+    }
   }
 
   function startWatchdog() {
@@ -256,23 +304,28 @@ export function createSubtitleRealtimeManager(options = {}) {
 
   function checkForStall() {
     if (!state.active || restartInFlight) return;
-    const now = Date.now();
-    // Nobody is speaking → nothing to expect from the pipeline.
-    if (!signalSince || now - lastSignalAt > Math.max(5_000, watchdogConfig.intervalMs)) return;
-    // Continuous speech for stallMs with ZERO subtitle output in that window.
-    if (now - signalSince < watchdogConfig.stallMs) return;
-    if (lastOutputAt >= signalSince) return;
-    if (now - lastStallRestartAt < watchdogConfig.cooldownMs) return;
+    const now = readNow();
+    const staleSignalAfterMs = Math.max(5_000, watchdogConfig.intervalMs);
+    const stalledEntry = [...livenessBySource.entries()].find(([, liveness]) => {
+      if (!liveness.signalSince || now - liveness.lastSignalAt > staleSignalAfterMs) return false;
+      // Output re-arms the deadline even during one continuous utterance. Using
+      // only signalSince would permanently disable recovery after the first
+      // successful caption if the provider froze later in the same speech run.
+      return now - Math.max(liveness.signalSince, liveness.lastOutputAt) >= watchdogConfig.stallMs;
+    });
+    if (!stalledEntry) return;
+    if (lastStallRestartAt > 0 && now - lastStallRestartAt < watchdogConfig.cooldownMs) return;
     lastStallRestartAt = now;
-    signalSince = now;
-    log.warn?.(`[subtitle] no subtitle output for ${watchdogConfig.stallMs}ms of continuous speech; auto-restarting channels`);
+    const [stalledSource, stalledLiveness] = stalledEntry;
+    livenessBySource.set(stalledSource, { ...stalledLiveness, signalSince: now });
+    log.warn?.(`[subtitle] no ${stalledSource} subtitle output for ${watchdogConfig.stallMs}ms of continuous speech; auto-restarting channels`);
     void restartChannels({ reason: "stall_watchdog" }).catch((error) => {
       const safeDetail = redactTransportDiagnostic(error?.message ?? error);
       log.warn?.(`[subtitle] stall watchdog restart failed: ${safeDetail}`);
     });
   }
 
-  /** @param {any} args */
+  /** @param {{ sessionId?: string, source?: string, audio?: string }} args */
   function sendAudio({ sessionId, source, audio } = {}) {
     if (!state.active || sessionId !== state.sessionId) return;
     if (!VALID_AUDIO_SOURCES.has(source)) return;
@@ -281,15 +334,23 @@ export function createSubtitleRealtimeManager(options = {}) {
   }
 
   async function stop(sessionId = state.sessionId) {
-    if (sessionId !== state.sessionId && state.sessionId !== null) return;
+    if (sessionId !== state.sessionId && state.sessionId !== null) return false;
     stopWatchdog();
     const wasActive = state.active || state.sessionId !== null || state.clients.size > 0;
     if (wasActive) clearTranslatedAudio("stop");
-    await Promise.all([...state.clients.values()].map((client) => client.close({ graceful: true })));
+    const closingClients = [...state.clients.values()];
     state.clients.clear();
+    // 2026-07-27 fix: revoke the producer before graceful provider shutdown.
+    // Provider close may finalize a last turn; the active guard must reject it
+    // after the user has already ended the caption session.
     state.active = false;
     state.sessionId = null;
+    state.captionConfig = null;
+    producerGeneration += 1;
+    livenessBySource.clear();
     if (wasActive) broadcast?.({ type: "subtitle:status", status: "idle" });
+    await Promise.all(closingClients.map((client) => client.close({ graceful: true })));
+    return wasActive;
   }
 
   function close() {
@@ -299,18 +360,23 @@ export function createSubtitleRealtimeManager(options = {}) {
     state.clients.clear();
     state.active = false;
     state.sessionId = null;
+    state.captionConfig = null;
+    producerGeneration += 1;
+    livenessBySource.clear();
   }
 
   function ensureClient(source) {
     const existing = state.clients.get(source);
     if (existing) return existing;
+    const ownerSessionId = state.sessionId;
+    const ownerGeneration = producerGeneration;
     const client = createRealtimeSubtitleClient({
       source,
       settings: state.settings,
       apiKeys: state.apiKeys,
       createWebSocket,
       broadcast: (message) => {
-        if (!state.active) return;
+        if (!state.active || state.sessionId !== ownerSessionId || producerGeneration !== ownerGeneration) return;
         broadcastTapped(message);
       },
       log,
@@ -326,11 +392,11 @@ export function createSubtitleRealtimeManager(options = {}) {
 }
 
 function createRealtimeSubtitleClient({ source, settings, apiKeys, createWebSocket, broadcast, log, polish, polishTimeoutMs, setupAckTimeoutMs }) {
-  const usesOpenAIVoice = AUDIO_OUTPUT_MODES.has(settings.outputMode) && settings.voiceProvider === "openai";
   const captionSettings = {
     ...settings,
-    translationProvider: usesOpenAIVoice ? "gemini" : settings.translationProvider,
-    ...(usesOpenAIVoice ? { outputMode: "captions" } : {}),
+    translationProvider: "gemini",
+    voiceProvider: "gemini",
+    geminiModel: settings._captionConfig?.models?.live ?? settings.geminiModel,
   };
   const channelConfigs = translationChannelConfigs(captionSettings, apiKeys);
   // Echo registry is SHARED across the sibling channels (cross-channel echo
@@ -351,28 +417,6 @@ function createRealtimeSubtitleClient({ source, settings, apiKeys, createWebSock
     echoRegistry,
     setupAckTimeoutMs,
   }));
-  if (usesOpenAIVoice) {
-    channels.push(createTranslationChannel({
-      source,
-      targetLanguage: settings.audioLanguage,
-      settings: {
-        ...settings,
-        translationProvider: "openai",
-        translationLanguages: [settings.audioLanguage],
-        outputMode: "audio",
-      },
-      apiKeys,
-      createWebSocket,
-      broadcast,
-      log,
-      polish,
-      polishTimeoutMs,
-      echoRegistry: null,
-      setupAckTimeoutMs,
-      isVoiceOnly: true,
-    }));
-  }
-
   return {
     open() {
       for (const channel of channels) channel.open();
@@ -390,57 +434,34 @@ function createRealtimeSubtitleClient({ source, settings, apiKeys, createWebSock
 // Provider transport contract: connect(), setupPayloads(), audioPayload(),
 // handleMessage(raw, ctx), closePayload(). The channel core (language lock,
 // wrong-direction suppression, commit + tone polish) is provider-agnostic.
-function createOpenAITransport({ settings, targetLanguage, apiKey, source, apiKeyRole }) {
-  return {
-    connect({ createWebSocket }) {
-      return createWebSocket(REALTIME_TRANSLATION_URL, undefined, {
-        headers: {
-          Authorization: `Bearer ${apiKey}`,
-          "OpenAI-Safety-Identifier": safetyIdentifierForSubtitleSession(source, targetLanguage, apiKeyRole),
-        },
-      });
-    },
-    setupPayloads() {
-      return [JSON.stringify({ type: "session.update", session: buildSubtitleSession(settings, targetLanguage) })];
-    },
-    audioPayload(audio) {
-      return JSON.stringify({ type: "session.input_audio_buffer.append", audio });
-    },
-    handleMessage(raw, ctx) {
-      handleRealtimeMessage(raw, ctx);
-    },
-    closePayload() {
-      return JSON.stringify({ type: "session.close" });
-    },
-  };
-}
-
-function createTranslationChannel({ source, targetLanguage, apiKeyRole, settings, apiKeys = {}, createWebSocket, broadcast, log, polish, polishTimeoutMs = DEFAULT_POLISH_TIMEOUT_MS, echoRegistry, setupAckTimeoutMs = SETUP_ACK_TIMEOUT_MS, isVoiceOnly = false }) {
+function createTranslationChannel({ source, targetLanguage, apiKeyRole, settings, apiKeys = {}, createWebSocket, broadcast, log, polish, polishTimeoutMs = DEFAULT_POLISH_TIMEOUT_MS, echoRegistry, setupAckTimeoutMs = SETUP_ACK_TIMEOUT_MS }) {
   // Per-channel source-language tracker (not shared — see the coordinator/registry
   // split). The shared `echoRegistry` handles cross-channel echo detection only.
-  const sourceLanguageCoordinator = createSubtitleLanguageState();
+  const sourceLanguageCoordinator = createSubtitleLanguageState({
+    allowedLanguages: settings.translationLanguages,
+  });
   // Per-direction engine routing (probe-verified 2026-06-12): OpenAI's
-  // translate model emits Japanese OUTPUT with 10-25s latency or not at all,
-  // while Gemini streams it in realtime. Japanese-target channels therefore
-  // auto-route to Gemini whenever a Gemini key exists; every other direction
-  // keeps the user's selected engine. ja INPUT on OpenAI is fast — only the
-  // output direction needs the override.
-  // Japanese on the OpenAI translate model lags badly (10-25s) and arrives long
-  // after the English line. Route ja → Gemini whenever a Gemini key exists —
-  // including all-language mode — so ja appears alongside en, not seconds late.
-  const useGemini = !isVoiceOnly && (settings.translationProvider === "gemini"
-    ? true
-    : targetLanguage === "ja" && Boolean(apiKeys.gemini));
-  const apiKey = useGemini
-    ? selectGeminiApiKey({ settings, apiKeys, apiKeyRole })
-    : selectOpenAIApiKey({ settings, targetLanguage, apiKeys, apiKeyRole });
+  // Every caption and interpreted-audio lane uses Gemini Live. A second
+  // provider would make terminology and failure behavior diverge by mode.
+  const apiKey = selectGeminiApiKey({ settings, apiKeys, apiKeyRole });
   const translationContext = resolveSubtitleTranslationContext(settings);
-  const transport = useGemini
-    ? createGeminiTransport({ settings, targetLanguage, apiKey })
-    : createOpenAITransport({ settings, targetLanguage, apiKey, source, apiKeyRole });
-  if (!useGemini && targetLanguage === "ja") {
-    log.warn?.("[subtitle] ja-target channel is using OpenAI (no Gemini key) — Japanese output may lag significantly. Add a Gemini key for realtime Japanese subtitles.");
-  }
+  const captionConfig = settings._captionConfig ?? createGeminiCaptionConfig(settings);
+  const finalizer = createCommittedCaptionFinalizer({
+    config: captionConfig,
+    polish: async (request) => {
+      let timer = null;
+      try {
+        return await Promise.race([
+          Promise.resolve(polish(request)),
+          new Promise((resolve) => { timer = setTimeout(() => resolve(request.translatedText), polishTimeoutMs); }),
+        ]);
+      } finally {
+        if (timer !== null) clearTimeout(timer);
+      }
+    },
+  });
+  const termRetriever = finalizer.termRetriever;
+  const transport = createGeminiTransport({ settings, targetLanguage, apiKey });
   let socket = null;
   let configured = false;
   let pendingAudio = [];
@@ -486,6 +507,10 @@ function createTranslationChannel({ source, targetLanguage, apiKeyRole, settings
   let reconnectTimer = null;
   let reconnectAttempts = 0;
   let reconnectErrorSurfaced = false;
+  let consecutiveTargetLanguageViolations = 0;
+  let languageDriftRestartPending = false;
+  let providerOutputLanguageViolationRecorded = false;
+  let hasObservedSpeechAudio = false;
   let commitTail = Promise.resolve();
 
   // Commit pipeline: refine the finalized line into the configured tone, then
@@ -503,6 +528,7 @@ function createTranslationChannel({ source, targetLanguage, apiKeyRole, settings
     const finalSource = String(committedSource ?? "").trim();
     const rawTranslation = String(committedTranslation ?? "").trim();
     if (!rawTranslation) return;
+    const rawMatchesTargetLanguage = isOutputInTargetLanguage(rawTranslation, targetLanguage);
     // Same-language echo guard, judged from THIS channel's OWN source text. A
     // real translation's source is never already in the target language. The
     // shared source-language coordinator can lag a language switch and keep
@@ -525,51 +551,27 @@ function createTranslationChannel({ source, targetLanguage, apiKeyRole, settings
     // only as the same-language / membership suppressor (null = don't show).
     const translationRole = translationRoleForSource(sourceLanguage, targetLanguage, settings);
     if (!translationRole) return;
-    const shouldPolish = shouldPolishCommittedSubtitle(settings, translationContext, apiKeys, {
-      rawTranslation,
+    const finalized = await finalizer.finalize({
+      translatedText: rawTranslation,
       sourceText: finalSource,
-      useGemini,
+      sourceLanguage,
+      targetLanguage,
     });
-    // The LLM polisher (when configured) produces the natural, business-register
-    // phrasing; on failure it falls back to the raw model line.
-    let finalTranslation = rawTranslation;
-    if (shouldPolish) {
-      try {
-        const polishing = Promise.resolve(polish({
-          translatedText: rawTranslation,
-          sourceText: finalSource,
-          targetLanguage,
-          tone: settings.tone,
-          glossary: translationContext.glossary,
-          domain: translationContext.domain,
-          polishProvider: useGemini ? "gemini" : "openai",
-        }));
-        const safePolishing = polishing.catch(() => rawTranslation);
-        let timer = null;
-        const timeout = new Promise((resolve) => {
-          timer = setTimeout(() => resolve(rawTranslation), polishTimeoutMs);
-        });
-        finalTranslation = (await Promise.race([safePolishing, timeout])) || rawTranslation;
-        clearTimeout(timer);
-      } catch {
-        finalTranslation = rawTranslation;
-      }
-    }
+    if (!finalized) return;
     if (channelClosed) return;
     // Deterministic glossary enforcement is the guaranteed safety net and runs
     // on EVERY committed line — polished or raw. A large glossary is not reliably
     // applied in full by the LLM polisher (it nails common words but drops rarer
     // registered terms / acronyms), so this pass enforces the exact term pairs
-    // and translation-memory matches afterward. It also keeps the committed line
-    // consistent with the live partials, which already pass through
-    // applyGlossaryCorrections — without it the partial shows the corrected term
-    // and the final line can revert to the uncorrected one.
-    finalTranslation = applyGlossaryCorrections(finalTranslation, {
-      glossary: translationContext.glossary,
-      targetLanguage,
-      sourceText: finalSource,
-    });
-    finalTranslation = stripSubtitlePrefix(finalTranslation);
+    // and translation-memory matches afterward. Partials intentionally use only
+    // exact registered-alias repair; fuzzy/context retrieval is final-only so an
+    // unstable partial cannot rewrite an ordinary sentence.
+    const repairedSource = finalized.sourceText;
+    const finalTranslation = stripSubtitlePrefix(finalized.text);
+    if (!isOutputInTargetLanguage(finalTranslation, targetLanguage)) {
+      noteTargetLanguageViolation();
+      return;
+    }
     // Echo guard: a real translation is never identical to its own source. If
     // the model passed the input through unchanged — e.g. English spoken on the
     // EN channel after the speaker switches ko→en, so the "translation" is just
@@ -582,17 +584,54 @@ function createTranslationChannel({ source, targetLanguage, apiKeyRole, settings
       targetLanguage,
       sourceLanguage,
       translationRole,
-      ...(useGemini ? { translationProvider: "gemini" } : {}),
-      sourceText: finalSource,
+      translationProvider: "gemini",
+      sourceText: repairedSource,
+      ...(repairedSource !== finalSource ? { rawSourceText: finalSource } : {}),
       translatedText: finalTranslation,
+    });
+    if (rawMatchesTargetLanguage) consecutiveTargetLanguageViolations = 0;
+    else noteTargetLanguageViolation();
+  }
+
+  function noteTargetLanguageViolation() {
+    consecutiveTargetLanguageViolations += 1;
+    if (consecutiveTargetLanguageViolations < 2 || languageDriftRestartPending) return;
+    languageDriftRestartPending = true;
+    consecutiveTargetLanguageViolations = 0;
+    // A resumption handle preserves the contaminated model context. Drop it so
+    // the reconnect starts a genuinely fresh translation session.
+    resumptionHandle = null;
+    broadcast({
+      type: "subtitle:error",
+      message: `번역 모델이 ${targetLanguage} 이외의 언어를 반복 출력하여 새 세션으로 재연결합니다.`,
+      code: "TRANSLATION_LANGUAGE_DRIFT",
+      source,
+      targetLanguage,
+    });
+    broadcast({ type: "subtitle:status", status: "reconnecting", source, targetLanguage });
+    queueMicrotask(() => {
+      if (intentionalClose || !socket) return;
+      socket.close();
     });
   }
 
-  function resetUtterance() {
+  function isProviderOutputLanguageAllowed(languageCode) {
+    const rawLanguageCode = String(languageCode ?? "").trim().toLowerCase();
+    if (!rawLanguageCode || rawLanguageCode === "und") return true;
+    return normalizeProviderLanguageCode(rawLanguageCode) === targetLanguage;
+  }
+
+  function noteProviderOutputLanguageViolation() {
+    if (providerOutputLanguageViolationRecorded) return;
+    providerOutputLanguageViolationRecorded = true;
+    noteTargetLanguageViolation();
+  }
+
+  function resetUtterance({ preserveSilenceClear = false } = {}) {
     clearCommitTimer();
     clearPartialTimer();
     if (partialStaleTimer) { clearTimeout(partialStaleTimer); partialStaleTimer = null; }
-    if (silenceClearTimer) { clearTimeout(silenceClearTimer); silenceClearTimer = null; }
+    if (!preserveSilenceClear && silenceClearTimer) { clearTimeout(silenceClearTimer); silenceClearTimer = null; }
     sourceLanguageCoordinator?.reset?.();
     echoRegistry?.resetSource?.(targetLanguage);
     sourceText = "";
@@ -603,6 +642,8 @@ function createTranslationChannel({ source, targetLanguage, apiKeyRole, settings
     partialHoldStartedAt = 0;
     sourceTranscriptFinalized = false;
     sourceLanguageIsStrong = false;
+    providerOutputLanguageViolationRecorded = false;
+    hasObservedSpeechAudio = false;
     lastClearReason = "";
   }
 
@@ -704,18 +745,18 @@ function createTranslationChannel({ source, targetLanguage, apiKeyRole, settings
     resolve?.();
   }
 
-  function scheduleCommit() {
+  function scheduleCommit(delayMilliseconds = SUBTITLE_COMMIT_MS) {
     clearCommitTimer();
     commitTimer = setTimeout(() => {
       const subtitle = normalizedSubtitle();
-      if (subtitle.translatedText && shouldDisplay()) {
+      if (subtitle.translatedText && shouldCommit()) {
         void commitSubtitle(subtitle);
-        resetUtterance();
+        resetUtterance({ preserveSilenceClear: true });
       } else if (resolvedSourceLanguage() !== "unknown") {
         resetUtterance();
       }
       commitTimer = null;
-    }, SUBTITLE_COMMIT_MS);
+    }, delayMilliseconds);
   }
 
   function normalizedSubtitle() {
@@ -731,6 +772,12 @@ function createTranslationChannel({ source, targetLanguage, apiKeyRole, settings
     const translationRole = translationRoleForSource(sourceLanguage, targetLanguage, settings);
     if (!translationRole) return false;
     return isOutputInTargetLanguage(translatedText, targetLanguage);
+  }
+
+  function shouldCommit() {
+    const sourceLanguage = resolvedSourceLanguage({ allowShortSource: true });
+    if (sourceLanguage === "unknown") return false;
+    return Boolean(translationRoleForSource(sourceLanguage, targetLanguage, settings));
   }
 
   function resolvedSourceLanguage(options = {}) {
@@ -815,10 +862,19 @@ function createTranslationChannel({ source, targetLanguage, apiKeyRole, settings
     const translationRole = translationRoleForSource(previousSourceLanguage, targetLanguage, settings);
     if (!translationRole) return;
     lastEmittedPartial = "";
-    const finalTranslation = stripSubtitlePrefix(applyGlossaryCorrections(emitted, {
+    const repairedSource = termRetriever.repair(sourceText.trim(), {
+      language: previousSourceLanguage,
+      isFinal: true,
+    });
+    const terminologyCorrected = applyGlossaryCorrections(emitted, {
       glossary: translationContext.glossary,
       targetLanguage,
-      sourceText,
+      sourceText: repairedSource,
+    });
+    const finalTranslation = stripSubtitlePrefix(normalizeCommittedCreCaption({
+      text: terminologyCorrected,
+      targetLanguage,
+      isFinal: true,
     }));
     broadcast({
       type: "subtitle:committed",
@@ -826,8 +882,9 @@ function createTranslationChannel({ source, targetLanguage, apiKeyRole, settings
       targetLanguage,
       sourceLanguage: previousSourceLanguage,
       translationRole,
-      ...(useGemini ? { translationProvider: "gemini" } : {}),
-      sourceText: sourceText.trim(),
+      translationProvider: "gemini",
+      sourceText: repairedSource,
+      ...(repairedSource !== sourceText.trim() ? { rawSourceText: sourceText.trim() } : {}),
       translatedText: finalTranslation,
     });
   }
@@ -860,7 +917,7 @@ function createTranslationChannel({ source, targetLanguage, apiKeyRole, settings
     }
     const hasDirectionSwitch = sourceLanguageHint !== "unknown" && sourceLanguageHint !== sourceLanguage;
     if (hasDirectionSwitch) {
-      if (useGemini && settings.audioLanguage === targetLanguage && AUDIO_OUTPUT_MODES.has(settings.outputMode)) {
+      if (settings.audioLanguage === targetLanguage && AUDIO_OUTPUT_MODES.has(settings.outputMode)) {
         broadcast({
           type: "subtitle:audio-control",
           action: "clear",
@@ -910,7 +967,7 @@ function createTranslationChannel({ source, targetLanguage, apiKeyRole, settings
       source,
       targetLanguage,
       reason,
-      ...(useGemini ? { translationProvider: "gemini" } : {}),
+      translationProvider: "gemini",
     });
   }
 
@@ -933,10 +990,7 @@ function createTranslationChannel({ source, targetLanguage, apiKeyRole, settings
     if (!translated) return false;
     if (sourceTranscriptFinalized && countLanguageSignalChars(translated) >= 4) return true;
     if (/[.!?。！？…]$/.test(translated)) return true;
-    if (!useGemini && targetLanguage === "ko" && /[다요죠니다습니다]$/.test(translated)) return true;
-    if (!useGemini && targetLanguage === "ja" && /[。！？ますです]$/.test(translated)) return true;
-    const minimumSignalChars = useGemini ? GEMINI_PARTIAL_MIN_SIGNAL_CHARS : PARTIAL_MIN_SIGNAL_CHARS;
-    return countLanguageSignalChars(translated) >= minimumSignalChars
+    return countLanguageSignalChars(translated) >= GEMINI_PARTIAL_MIN_SIGNAL_CHARS
       && partialHoldStartedAt > 0
       && Date.now() - partialHoldStartedAt >= partialMaxHoldMs();
   }
@@ -964,7 +1018,7 @@ function createTranslationChannel({ source, targetLanguage, apiKeyRole, settings
   }
 
   function partialMaxHoldMs() {
-    return useGemini ? GEMINI_PARTIAL_MAX_HOLD_MS : PARTIAL_MAX_HOLD_MS;
+    return GEMINI_PARTIAL_MAX_HOLD_MS;
   }
 
   function emitPartial({ force = false } = {}) {
@@ -1010,6 +1064,17 @@ function createTranslationChannel({ source, targetLanguage, apiKeyRole, settings
     const sourceLanguage = resolvedSourceLanguage();
     const translationRole = translationRoleForSource(sourceLanguage, targetLanguage, settings);
     if (!translationRole) return;
+    // Partials stay on the O(registered aliases) fast path. Fuzzy/context
+    // retrieval is final-only so a large local glossary cannot add frame-time
+    // work or rewrite a still-growing ordinary phrase.
+    const repairedSource = termRetriever.repair(subtitle.sourceText, {
+      language: sourceLanguage,
+      isFinal: false,
+    });
+    const correctedTranslation = stripSubtitlePrefix(termRetriever.repair(subtitle.translatedText, {
+      language: targetLanguage,
+      isFinal: false,
+    }));
     lastEmittedPartial = subtitle.translatedText;
     clearPartialTimer();
     armPartialStaleClear(subtitle.translatedText);
@@ -1019,12 +1084,10 @@ function createTranslationChannel({ source, targetLanguage, apiKeyRole, settings
       targetLanguage,
       sourceLanguage,
       translationRole,
-      ...(useGemini ? { translationProvider: "gemini" } : {}),
+      translationProvider: "gemini",
       ...subtitle,
-      translatedText: stripSubtitlePrefix(useGemini ? applyGlossaryCorrections(subtitle.translatedText, {
-        glossary: translationContext.glossary,
-        targetLanguage,
-      }) : subtitle.translatedText),
+      sourceText: repairedSource,
+      translatedText: correctedTranslation,
     });
     partialHoldStartedAt = 0;
   }
@@ -1036,6 +1099,7 @@ function createTranslationChannel({ source, targetLanguage, apiKeyRole, settings
     // A live (re)connection succeeded — reset the auto-reconnect backoff.
     reconnectAttempts = 0;
     reconnectErrorSurfaced = false;
+    languageDriftRestartPending = false;
     const cutoff = Date.now() - MAX_PENDING_AUDIO_AGE_MS;
     for (const pending of pendingAudio) {
       if (pending.enqueuedAt >= cutoff) socket.send(transport.audioPayload(pending.audio));
@@ -1082,8 +1146,8 @@ function createTranslationChannel({ source, targetLanguage, apiKeyRole, settings
   function ensureSocket() {
     if (socket) return socket;
     if (!String(apiKey ?? "").trim()) {
-      broadcast({ type: "subtitle:error", message: "Translation API key is required for realtime subtitles.", code: "OPENAI_KEY_REQUIRED" });
-      throw new Error("A translation API key is required for realtime subtitles.");
+      broadcast({ type: "subtitle:error", message: "실시간 자막에는 Gemini API 키가 필요합니다.", code: "GEMINI_KEY_REQUIRED" });
+      throw new Error("Gemini API key is required for realtime subtitles.");
     }
 
     socket = transport.connect({ createWebSocket });
@@ -1093,10 +1157,11 @@ function createTranslationChannel({ source, targetLanguage, apiKeyRole, settings
     channelClosed = false;
 
     const openedSocket = socket;
+    const ownsOpenedSocket = () => socket === openedSocket && !channelClosed;
     socket.on("open", () => {
       // A late "open" from a socket the channel already tore down (close()
       // raced the connect) must not touch the channel's current state.
-      if (socket !== openedSocket || channelClosed) return;
+      if (!ownsOpenedSocket()) return;
       for (const payload of transport.setupPayloads({ resumptionHandle })) socket.send(payload);
       // Providers with a setup handshake (Gemini Live) reject input sent
       // before the server acks setup; hold audio until onTransportReady.
@@ -1110,12 +1175,11 @@ function createTranslationChannel({ source, targetLanguage, apiKeyRole, settings
     socket.on("message", (raw) => {
       // A replaced/resumed Gemini socket can still flush queued callbacks.
       // Only the currently-owned generation may publish captions or audio.
-      if (socket !== openedSocket || channelClosed) return;
+      if (!ownsOpenedSocket()) return;
       transport.handleMessage(raw.toString("utf8"), {
         source,
         targetLanguage,
-        outputMode: useGemini
-          && settings.audioLanguage === targetLanguage
+        outputMode: settings.audioLanguage === targetLanguage
           && AUDIO_OUTPUT_MODES.has(settings.outputMode)
           ? settings.outputMode
           : "captions",
@@ -1127,6 +1191,9 @@ function createTranslationChannel({ source, targetLanguage, apiKeyRole, settings
         getTranslatedText: () => translatedText,
         setTranslatedText: (value) => { if (String(value ?? "").trim()) bumpContentActivity(); translatedText = value; },
         shouldDisplay,
+        shouldCommit,
+        isProviderOutputLanguageAllowed,
+        noteProviderOutputLanguageViolation,
         shouldEmitAudio: () => {
           const language = resolvedSourceLanguage({ allowShortSource: true });
           return language === "unknown" || language !== targetLanguage;
@@ -1139,8 +1206,9 @@ function createTranslationChannel({ source, targetLanguage, apiKeyRole, settings
         commitSubtitle,
         resetUtterance,
         onSessionClosed: finishClose,
-        suppressTranscripts: isVoiceOnly,
-        onOutputAudio: isVoiceOnly
+        suppressTranscripts: false,
+        onOutputAudio: settings.audioLanguage === targetLanguage
+          && AUDIO_OUTPUT_MODES.has(settings.outputMode)
           ? (audio) => broadcast({
             type: "subtitle:translated-audio",
             source,
@@ -1159,6 +1227,7 @@ function createTranslationChannel({ source, targetLanguage, apiKeyRole, settings
     });
 
     socket.on("error", (error) => {
+      if (!ownsOpenedSocket()) return;
       const detail = redactTransportDiagnostic(error?.message ?? error);
       log.warn?.(`[subtitle] realtime translation socket error for ${source}/${targetLanguage}: ${detail}`);
       // "reconnecting" alone hides the real cause from the user (console logs
@@ -1185,11 +1254,12 @@ function createTranslationChannel({ source, targetLanguage, apiKeyRole, settings
     // (403/407/302) instead of 101 — ws reports that via "unexpected-response"
     // and otherwise stalls silently. Surface the HTTP status as the diagnosis.
     socket.on("unexpected-response", (_request, response) => {
+      if (!ownsOpenedSocket()) return;
       const detail = `HTTP ${response?.statusCode ?? "?"} ${response?.statusMessage ?? ""}`.trim();
       log.warn?.(`[subtitle] websocket upgrade blocked for ${source}/${targetLanguage}: ${detail}`);
       broadcast({
         type: "subtitle:error",
-        message: `연결이 차단되었습니다 (${source}/${targetLanguage}): ${detail} — 네트워크 프록시/보안 장비가 WebSocket 연결을 차단했습니다. IT에 api.openai.com·generativelanguage.googleapis.com 허용을 요청하거나 휴대폰 핫스팟으로 확인해 보세요.`,
+        message: `연결이 차단되었습니다 (${source}/${targetLanguage}): ${detail} — 네트워크 프록시/보안 장비가 WebSocket 연결을 차단했습니다. IT에 generativelanguage.googleapis.com 허용을 요청하거나 휴대폰 핫스팟으로 확인해 보세요.`,
         code: "TRANSLATION_SOCKET_BLOCKED",
       });
       broadcast({ type: "subtitle:status", status: "reconnecting", source, targetLanguage });
@@ -1197,7 +1267,8 @@ function createTranslationChannel({ source, targetLanguage, apiKeyRole, settings
     });
 
     socket.on("close", (code, reason) => {
-      if ((useGemini || isVoiceOnly) && settings.audioLanguage === targetLanguage && AUDIO_OUTPUT_MODES.has(settings.outputMode)) {
+      if (!ownsOpenedSocket()) return;
+      if (settings.audioLanguage === targetLanguage && AUDIO_OUTPUT_MODES.has(settings.outputMode)) {
         broadcast({
           type: "subtitle:audio-control",
           action: "clear",
@@ -1252,7 +1323,14 @@ function createTranslationChannel({ source, targetLanguage, apiKeyRole, settings
       }
     },
     sendAudio(audio) {
-      lastAudioAt = Date.now();
+      const hasSpeechSignal = pcm16HasSpeechSignal(audio);
+      if (hasSpeechSignal) {
+        lastAudioAt = Date.now();
+        hasObservedSpeechAudio = true;
+        clearCommitTimer();
+      } else if (hasObservedSpeechAudio && !commitTimer && translatedText.trim()) {
+        scheduleCommit(GEMINI_AUDIO_SILENCE_COMMIT_MS);
+      }
       let connection;
       try {
         connection = ensureSocket();
@@ -1300,9 +1378,8 @@ function createTranslationChannel({ source, targetLanguage, apiKeyRole, settings
       clearSetupAckTimer();
       if (silenceClearTimer) { clearTimeout(silenceClearTimer); silenceClearTimer = null; }
       const closeMessage = transport.closePayload?.();
-      // Graceful close only when the provider has a close handshake (OpenAI
-      // session.close → session.closed); Gemini Live has none, so fall through
-      // to an immediate socket close.
+      // Gemini Live has no explicit close handshake, so the socket closes
+      // immediately after the committed-caption tail drains.
       if (graceful && socket && configured && closeMessage) {
         if (closeResolve) return new Promise((resolve) => {
           const previousResolve = closeResolve;
@@ -1386,18 +1463,9 @@ function translationRoleForSource(sourceLanguage, targetLanguage, settings = {})
 
 function translationChannelConfigs(settings, apiKeys = {}) {
   const targets = languageTargets(settings);
-  // gpt-realtime-translate is OUTPUT-language-only: it auto-detects the source
-  // and translates ANY source into the configured target language (official
-  // docs — you only specify the output language). So there is exactly ONE
-  // channel per output language. A second channel for the same target would
-  // translate the same audio again and collide (two Korean subtitles for one
-  // utterance). When a secondary key for the ACTIVE provider exists we spread
-  // the *distinct* target channels across the two keys for parallel load —
-  // never the same target twice. Gemini mirrors OpenAI: the second Gemini key
-  // takes the back half of the targets so each engine project runs in parallel.
-  const secondaryKey = settings.translationProvider === "gemini"
-    ? apiKeys.geminiSecondary
-    : apiKeys.openaiSecondary;
+  // One Gemini channel owns each target. A secondary Gemini key takes the back
+  // half without duplicating a target lane.
+  const secondaryKey = apiKeys.geminiSecondary;
   if (secondaryKey && targets.length >= 3) {
     const half = Math.ceil(targets.length / 2);
     return targets.map((targetLanguage, index) => ({ targetLanguage, apiKeyRole: index < half ? 1 : 2 }));
@@ -1405,202 +1473,13 @@ function translationChannelConfigs(settings, apiKeys = {}) {
   return targets.map((targetLanguage) => ({ targetLanguage }));
 }
 
-function selectOpenAIApiKey({ apiKeys = {}, apiKeyRole }) {
-  if (apiKeyRole === 2 && apiKeys.openaiSecondary) return apiKeys.openaiSecondary;
-  return apiKeys.openai;
-}
-
-// Gemini key selection mirrors OpenAI's, but the secondary key is only used
-// when Gemini is the SELECTED provider. In OpenAI mode a ja-target channel
-// auto-routes to Gemini and must always use the primary Gemini key (the role
-// numbers there belong to the OpenAI key split, not Gemini's).
-function selectGeminiApiKey({ settings = {}, apiKeys = {}, apiKeyRole }) {
-  const geminiIsSelectedProvider = settings.translationProvider === "gemini";
-  if (geminiIsSelectedProvider && apiKeyRole === 2 && apiKeys.geminiSecondary) return apiKeys.geminiSecondary;
+function selectGeminiApiKey({ apiKeys = {}, apiKeyRole }) {
+  if (apiKeyRole === 2 && apiKeys.geminiSecondary) return apiKeys.geminiSecondary;
   return apiKeys.gemini;
 }
 
 function languageTargets(settings) {
   return normalizeTranslationLanguages(settings);
-}
-
-export function buildSubtitleSession(settings = DEFAULT_SUBTITLE_SETTINGS, targetLanguage = "ko") {
-  // Per-provider official language codes: OpenAI's translate model takes bare
-  // ISO codes with a single "zh" for Chinese; the Gemini transport keeps its
-  // own map (toGeminiLanguageCode). Never share one map across providers.
-  return {
-    audio: {
-      output: { language: toOpenAITranslationLanguageCode(targetLanguage) },
-    },
-  };
-}
-
-export function buildSubtitleInstructions(settings = DEFAULT_SUBTITLE_SETTINGS) {
-  const targets = normalizeTranslationLanguages(settings);
-  if (targets.length >= 3) {
-    const labels = targets.map((language) => subtitleLanguageLabel(language)).join(", ");
-    return `Use realtime translation across ${labels}. For each detected source language, display translations for the other selected languages.`;
-  }
-  const [a, b] = targets;
-  return `Use realtime translation between ${a} and ${b}. Display translated transcript above source transcript.`;
-}
-
-/** @param {string} line @param {any} context */
-export function handleRealtimeMessage(line, {
-  source = "system",
-  targetLanguage = "ko",
-  getSourceText,
-  setSourceText,
-  getTranslatedText,
-  setTranslatedText,
-  shouldDisplay,
-  rememberSourceTranscriptDelta,
-  rememberSourceTranscriptSnapshot,
-  emitPartial,
-  schedulePartialFlush,
-  scheduleCommit,
-  commitSubtitle,
-  resetUtterance,
-  onSessionClosed,
-  suppressTranscripts = false,
-  onOutputAudio,
-  broadcast,
-} = {}) {
-  if (!line.trim()) return;
-  let message;
-  try {
-    message = JSON.parse(line);
-  } catch {
-    broadcast?.({ type: "subtitle:error", message: "Invalid realtime message.", code: "INVALID_REALTIME_MESSAGE" });
-    return;
-  }
-
-  if (message.type === "session.output_audio.delta") {
-    if (typeof message.delta === "string" && message.delta && Buffer.from(message.delta, "base64").byteLength % 2 === 0) {
-      onOutputAudio?.(message.delta);
-    }
-    return;
-  }
-
-  if (suppressTranscripts && [
-    "session.input_transcript.delta",
-    "session.output_transcript.delta",
-    "session.input_transcript.done",
-    "session.input_transcript.completed",
-    "session.output_transcript.done",
-    "session.output_transcript.completed",
-  ].includes(message.type)) return;
-
-  if (message.type === "session.input_transcript.delta") {
-    if (String(message.delta ?? "").length > MAX_TRANSCRIPT_CHARS) return;
-    setSourceText?.(boundTranscript(`${getSourceText?.() ?? ""}${message.delta ?? ""}`));
-    rememberSourceTranscriptDelta?.(message.delta ?? "");
-    emitPartial?.();
-    return;
-  }
-
-  if (message.type === "session.output_transcript.delta") {
-    if (String(message.delta ?? "").length > MAX_TRANSCRIPT_CHARS) return;
-    setTranslatedText?.(boundTranscript(`${getTranslatedText?.() ?? ""}${message.delta ?? ""}`));
-    if (typeof schedulePartialFlush === "function") schedulePartialFlush();
-    else emitPartial?.();
-    scheduleCommit?.();
-    return;
-  }
-
-  if (message.type === "session.input_transcript.done" || message.type === "session.input_transcript.completed") {
-    if (String(message.transcript ?? "").length > MAX_TRANSCRIPT_CHARS) return;
-    const previousSourceText = String(getSourceText?.() ?? "");
-    const nextSourceText = boundTranscript(message.transcript ?? previousSourceText);
-    setSourceText?.(nextSourceText);
-    rememberSourceTranscriptSnapshot?.(nextSourceText, previousSourceText);
-    emitPartial?.();
-    return;
-  }
-
-  if (message.type === "session.output_transcript.done" || message.type === "session.output_transcript.completed") {
-    if (String(message.transcript ?? "").length > MAX_TRANSCRIPT_CHARS) return;
-    setTranslatedText?.(boundTranscript(message.transcript ?? getTranslatedText?.() ?? ""));
-    const sourceText = String(getSourceText?.() ?? "").trim();
-    const translatedText = String(getTranslatedText?.() ?? "").trim();
-    if (translatedText && shouldDisplay?.() !== false) {
-      if (typeof commitSubtitle === "function") {
-        void commitSubtitle({ sourceText, translatedText });
-      } else {
-        broadcast?.({
-          type: "subtitle:committed",
-          source,
-          targetLanguage,
-          sourceText,
-          translatedText,
-        });
-      }
-      setSourceText?.("");
-      setTranslatedText?.("");
-    } else if (typeof shouldDisplay === "function" && shouldDisplay() === false) {
-      if (sourceText) {
-        const sourceLanguage = detectSourceLanguage(sourceText);
-        if (sourceLanguage !== "unknown") {
-          setSourceText?.("");
-          setTranslatedText?.("");
-        }
-      }
-    }
-    return;
-  }
-
-  if (message.type === "session.updated" || message.type === "session.created") {
-    broadcast?.({ type: "subtitle:status", status: "api_ready", source, targetLanguage });
-    return;
-  }
-
-  if (message.type === "session.input_audio_buffer.speech_started") {
-    resetUtterance?.();
-    broadcast?.({ type: "subtitle:status", status: "hearing", source, targetLanguage });
-    return;
-  }
-
-  if (message.type === "session.input_audio_buffer.speech_stopped") {
-    broadcast?.({ type: "subtitle:status", status: "translating", source, targetLanguage });
-    return;
-  }
-
-  if (message.type === "session.closed") {
-    onSessionClosed?.();
-    return;
-  }
-
-  if (message.type === "error") {
-    broadcast?.({
-      type: "subtitle:error",
-      message: redactTransportDiagnostic(message.error?.message) || "Realtime translation error",
-      code: message.error?.code ?? "REALTIME_TRANSLATION_ERROR",
-    });
-  }
-}
-
-export function normalizeSubtitleOutput(text) {
-  const raw = String(text ?? "").trim();
-  if (!raw) return { sourceText: "", translatedText: "" };
-
-  const json = parseSubtitleJson(raw);
-  if (json) return json;
-
-  const translatedFromPartial = extractJsonStringField(raw, "translatedText") || extractJsonStringField(raw, "translation");
-  const sourceFromPartial = extractJsonStringField(raw, "sourceText") || extractJsonStringField(raw, "source");
-  if (translatedFromPartial || sourceFromPartial) {
-    return { sourceText: stripSubtitlePrefix(sourceFromPartial), translatedText: stripSubtitlePrefix(translatedFromPartial) };
-  }
-
-  const lines = raw.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
-  if (lines.length >= 2) {
-    return {
-      translatedText: stripSubtitlePrefix(lines[0]),
-      sourceText: stripSubtitlePrefix(lines.slice(1).join(" ")),
-    };
-  }
-
-  return { sourceText: "", translatedText: stripSubtitlePrefix(raw) };
 }
 
 export function normalizeSubtitleSettings(settings = {}) {
@@ -1637,8 +1516,8 @@ export function normalizeSubtitleSettings(settings = {}) {
     languagePair: normalizedPair,
     translationLanguages,
     outputMode,
-    translationProvider: ["gemini", "openai"].includes(merged.translationProvider) ? merged.translationProvider : "gemini",
-    voiceProvider: ["gemini", "openai"].includes(merged.voiceProvider) ? merged.voiceProvider : DEFAULT_SUBTITLE_SETTINGS.voiceProvider,
+    translationProvider: "gemini",
+    voiceProvider: "gemini",
     audioLanguage,
     audioVolume: clampNumber(merged.audioVolume, 0, 1, DEFAULT_SUBTITLE_SETTINGS.audioVolume),
     displayMode: ["translation_only", "translation_source"].includes(merged.displayMode)
@@ -1688,8 +1567,7 @@ function normalizeTranslationLanguages(settings = {}) {
 
 export function normalizeRealtimeModel(model) {
   const value = String(model || "").trim();
-  if (!value) return DEFAULT_TRANSLATION_MODEL;
-  if (value === "gpt-realtime-2" || value === "gpt-realtime") return DEFAULT_TRANSLATION_MODEL;
+  if (!value || value.startsWith("gpt-")) return DEFAULT_SUBTITLE_SETTINGS.geminiModel;
   return value;
 }
 
@@ -1715,305 +1593,15 @@ export function isSourceEcho(sourceText, translatedText) {
   return countLanguageSignalChars(String(translatedText ?? "")) >= 2;
 }
 
-export function applyGlossaryCorrections(text, { glossary = "", targetLanguage = "ko", sourceText = "" } = {}) {
-  const raw = String(text ?? "");
-  if (!raw) return raw;
-  const normalizedTargetLanguage = normalizeLanguageCode(targetLanguage);
-  if (!normalizedTargetLanguage) return raw;
-  // Number notation is arithmetic, not terminology — it applies to every
-  // committed line whether or not the session picked a glossary preset.
-  if (!String(glossary ?? "").trim()) {
-    return normalizeBusinessNumberNotation(raw, normalizedTargetLanguage);
-  }
-
-  let corrected = applySourceGlossaryMemory(raw, {
-    glossary,
-    targetLanguage: normalizedTargetLanguage,
-    sourceText,
-  });
-  const replacements = cachedGlossaryReplacementRules(glossary, normalizedTargetLanguage);
-  for (const { from, to } of replacements) {
-    if (!from || !to || from === to) continue;
-    corrected = replaceGlossaryTerm(corrected, from, to);
-  }
-  corrected = normalizeCushmanWakefield(corrected, normalizedTargetLanguage, glossary);
-  corrected = normalizeBusinessNumberNotation(corrected, normalizedTargetLanguage);
-  return fixKoreanObjectParticles(corrected);
-}
-
-// Pattern-based normalization for the "Cushman & Wakefield" company name, which
-// the live model mangles in endless ways the glossary cannot enumerate
-// term-by-term: it drops the "&", fuses "and" into the first token
-// ("Kushimanend Wakefield"), or invents phonetic spellings ("Kushiman",
-// "Kusiman", "K-Field"). A single fuzzy matcher catches the whole family at once
-// and is robust to NEW mistranscriptions. Scoped to glossaries that actually
-// reference the company so it never touches unrelated sessions.
-// <first-token> [& / and / fused "end"] Wakefield [Korea] — the full spoken form
-const CW_FULL_PATTERN =
-  /\b(?:cushmann?|kushmann?|kushiman|kusiman|kushi)\s*(?:&|and|end|n|앤드)?\s*wakefield(\s+korea)?/gi;
-// Severe garbling: an INVENTED first token (kushima / kushiman / kusiman / kushman
-// / kushi — none are real English words) followed within a few junk words by a
-// "Field"/"Wakefield" tail, e.g. "Kushima is why Field Korea". Anchoring on the
-// non-word garble token keeps this safe from real phrases. NOT applied to the
-// real-ish "cushman" token (which would false-match "Cushman ... in the field").
-const CW_GARBLE_PATTERN =
-  /\b(?:kushiman|kushima|kushmann?|kusiman|kushi)\w*(?:\s+\w+){0,3}?\s+(?:wake\s*)?field(\s+korea)?/gi;
-// Standalone English abbreviation the model invents: "K-Field" / "KField"
-const CW_KFIELD_PATTERN = /\bk-?field(\s+korea)?/gi;
-// Korean phonetic forms: 쿠시먼/쿠시만/쿠쉬먼 [앤드/앤/엔드/언드] 웨이크 필드 [코리아]
-const CW_KO_PATTERN = /쿠[시쉬][먼만]?(?:앤드|앤|엔드|언드|드)?\s*웨이크\s*필드(\s*코리아)?/g;
-
-function glossaryReferencesCushmanWakefield(glossary) {
-  return /cushman|wakefield|쿠시먼|쿠쉬먼|c&w|k-?field|웨이크\s*필드/i.test(String(glossary ?? ""));
-}
-
-function normalizeCushmanWakefield(text, targetLanguage, glossary) {
-  const value = String(text ?? "");
-  if (!value || !glossaryReferencesCushmanWakefield(glossary)) return value;
-  const isKorean = targetLanguage === "ko";
-  const canonical = isKorean ? "쿠시먼앤드웨이크필드" : "Cushman & Wakefield";
-  const koreaSuffix = isKorean ? " 코리아" : " Korea";
-  const withKorea = (korea) => `${canonical}${korea ? koreaSuffix : ""}`;
-  return value
-    .replace(CW_FULL_PATTERN, (_match, korea) => withKorea(korea))
-    .replace(CW_GARBLE_PATTERN, (_match, korea) => withKorea(korea))
-    .replace(CW_KFIELD_PATTERN, (_match, korea) => withKorea(korea))
-    .replace(CW_KO_PATTERN, (_match, korea) => withKorea(korea));
-}
-
-// Parsing + sorting the glossary into replacement rules is pure for a given
-// (glossary, targetLanguage) but ran on EVERY committed line. Cache the
-// compiled, length-sorted rules so term lookup is fast even with a large
-// glossary — the glossary text rarely changes within a session.
-const glossaryRuleCache = new Map();
-const GLOSSARY_RULE_CACHE_MAX = 16;
-function cachedGlossaryReplacementRules(glossary, targetLanguage) {
-  const key = `${targetLanguage}\u0000${glossary}`;
-  const cached = glossaryRuleCache.get(key);
-  if (cached) return cached;
-  const rules = parseGlossaryReplacementRules(glossary, targetLanguage)
-    .sort((a, b) => b.from.length - a.from.length);
-  glossaryRuleCache.set(key, rules);
-  if (glossaryRuleCache.size > GLOSSARY_RULE_CACHE_MAX) {
-    glossaryRuleCache.delete(glossaryRuleCache.keys().next().value);
-  }
-  return rules;
-}
+export { applyGlossaryCorrections };
 
 function resolveSubtitleTranslationContext(settings) {
-  const configuredGlossary = String(settings.glossary ?? "").trim();
-  const configuredDomain = String(settings.translationDomain ?? "").trim();
+  const config = settings._captionConfig ?? createGeminiCaptionConfig(settings);
   return {
-    glossary: configuredGlossary,
-    domain: configuredDomain,
-    hasConfiguredGlossary: Boolean(configuredGlossary),
-    hasConfiguredDomain: Boolean(configuredDomain),
+    glossary: config.glossary,
+    domain: config.domain,
   };
 }
-
-function shouldPolishCommittedSubtitle(settings, translationContext, apiKeys = {}, options = {}) {
-  if (settings.tone === "business") return true;
-  const polishKey = options.useGemini ? (apiKeys.geminiSecondary || apiKeys.gemini) : apiKeys.openaiSecondary;
-  if (!polishKey) return false;
-  const shouldRecoverPlaceholder = isEllipsisPlaceholder(options.rawTranslation)
-    && String(options.sourceText ?? "").trim().length >= 2;
-  return translationContext.hasConfiguredGlossary
-    || translationContext.hasConfiguredDomain
-    || shouldRecoverPlaceholder;
-}
-
-function isEllipsisPlaceholder(value) {
-  return /^\s*(?:\.{2,}|…+)\s*$/.test(String(value ?? ""));
-}
-
-function parseGlossaryReplacementRules(glossary, targetLanguage) {
-  const rules = [];
-  for (const line of String(glossary ?? "").split(/\r?\n/)) {
-    const trimmed = line.trim();
-    if (!trimmed || trimmed.startsWith("[") || trimmed.startsWith("-") || trimmed.startsWith("※")) continue;
-    if (!trimmed.includes("=")) continue;
-    const [leftRaw, ...rightParts] = trimmed.split("=");
-    const rightRaw = rightParts.join("=").trim();
-    const leftTerms = [...splitGlossaryAlternatives(leftRaw), ...extractNeverTerms(leftRaw)];
-    const rightTerms = [...splitGlossaryAlternatives(rightRaw), ...extractNeverTerms(rightRaw)];
-    if (!leftTerms.length || !rightTerms.length) continue;
-    const alignedRules = buildAlignedGlossaryRules(leftTerms, rightTerms, targetLanguage);
-    if (alignedRules.length) {
-      rules.push(...alignedRules);
-      continue;
-    }
-
-    const rightTarget = rightTerms.find((term) => detectTermLanguage(term) === targetLanguage);
-    const leftTarget = leftTerms.find((term) => detectTermLanguage(term) === targetLanguage);
-    const canonical = rightTarget || leftTarget;
-    if (!canonical) continue;
-    for (const term of [...leftTerms, ...rightTerms]) {
-      if (term !== canonical) rules.push({ from: term, to: canonical });
-    }
-  }
-  return dedupeReplacementRules(rules);
-}
-
-function applySourceGlossaryMemory(text, { glossary, targetLanguage, sourceText }) {
-  const source = normalizeMemoryText(sourceText);
-  if (!source) return text;
-  const matches = parseGlossarySourceMemoryRules(glossary, targetLanguage)
-    .filter((rule) => sourceContainsMemoryTerm(source, rule))
-    .sort((a, b) => b.from.length - a.from.length);
-  return matches[0]?.to ?? text;
-}
-
-function parseGlossarySourceMemoryRules(glossary, targetLanguage) {
-  const rules = [];
-  let isTranslationMemorySection = false;
-  for (const line of String(glossary ?? "").split(/\r?\n/)) {
-    const trimmed = line.trim();
-    if (trimmed.startsWith("[")) {
-      isTranslationMemorySection = /번역 메모리|translation memory|문장 매칭/i.test(trimmed);
-      continue;
-    }
-    if (!trimmed || trimmed.startsWith("-") || trimmed.startsWith("※")) continue;
-    if (!trimmed.includes("=")) continue;
-    const [leftRaw, ...rightParts] = trimmed.split("=");
-    const rightRaw = rightParts.join("=").trim();
-    const leftTerms = splitGlossaryAlternatives(leftRaw);
-    const rightTerms = splitGlossaryAlternatives(rightRaw);
-    if (!leftTerms.length || !rightTerms.length) continue;
-    const alignedRules = buildAlignedGlossaryRules(leftTerms, rightTerms, targetLanguage, { allowEmbedded: isTranslationMemorySection });
-    if (alignedRules.length) {
-      rules.push(...alignedRules);
-      continue;
-    }
-
-    const rightTarget = rightTerms.find((term) => detectTermLanguage(term) === targetLanguage);
-    const leftTarget = leftTerms.find((term) => detectTermLanguage(term) === targetLanguage);
-    const canonical = rightTarget || leftTarget;
-    if (!canonical) continue;
-
-    for (const term of [...leftTerms, ...rightTerms]) {
-      if (term === canonical) continue;
-      if (detectTermLanguage(term) === targetLanguage) continue;
-      rules.push({ from: term, to: canonical, allowEmbedded: isTranslationMemorySection });
-    }
-  }
-  return dedupeReplacementRules(rules);
-}
-
-function buildAlignedGlossaryRules(leftTerms, rightTerms, targetLanguage, options = {}) {
-  if (leftTerms.length < 2 || leftTerms.length !== rightTerms.length) return [];
-  const rules = [];
-  for (let index = 0; index < leftTerms.length; index += 1) {
-    const left = leftTerms[index];
-    const right = rightTerms[index];
-    const leftLanguage = detectTermLanguage(left);
-    const rightLanguage = detectTermLanguage(right);
-    if (leftLanguage === rightLanguage) return [];
-    const target = leftLanguage === targetLanguage ? left : rightLanguage === targetLanguage ? right : "";
-    const source = leftLanguage === targetLanguage ? right : rightLanguage === targetLanguage ? left : "";
-    if (!target || !source || target === source) return [];
-    rules.push({ from: source, to: target, ...(options.allowEmbedded ? { allowEmbedded: true } : {}) });
-  }
-  return rules;
-}
-
-function sourceContainsMemoryTerm(source, rule) {
-  const normalizedTerm = normalizeMemoryText(rule.from);
-  if (!normalizedTerm) return false;
-  if (source === normalizedTerm) return true;
-  if (!rule.allowEmbedded) return false;
-  if (!source.includes(normalizedTerm)) return false;
-  const sourceChars = source.replace(/\s/g, "").length;
-  const termChars = normalizedTerm.replace(/\s/g, "").length;
-  return termChars >= 8 && termChars / Math.max(sourceChars, 1) >= 0.72;
-}
-
-function splitGlossaryAlternatives(value) {
-  return String(value ?? "")
-    .split(/\s+\/\s+/)
-    .map((term) => normalizeGlossaryTerm(term))
-    .filter((term) => term.length >= 2);
-}
-
-function normalizeGlossaryTerm(value) {
-  return String(value ?? "")
-    .replace(/\s*\([^)]*(?:NEVER|never|호텔 객실 수 단위|현재 상황|브랜드|고유명사)[^)]*\)\s*/g, "")
-    .trim();
-}
-
-function extractNeverTerms(value) {
-  return [...String(value ?? "").matchAll(/NEVER\s+"([^"]+)"/gi)]
-    .map((match) => normalizeGlossaryTerm(match[1]))
-    .filter((term) => term.length >= 2);
-}
-
-function normalizeMemoryText(value) {
-  return String(value ?? "")
-    .toLowerCase()
-    .replace(/[“”"'.:,;!?()[\]{}]/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-function detectTermLanguage(term) {
-  const text = String(term ?? "");
-  if (KOREAN_CHAR.test(text)) return "ko";
-  if (JAPANESE_CHAR.test(text)) return "ja";
-  if (ENGLISH_CHAR.test(text)) return "en";
-  return "unknown";
-}
-
-function dedupeReplacementRules(rules) {
-  const seen = new Set();
-  const result = [];
-  for (const rule of rules) {
-    const key = `${rule.from}\u0000${rule.to}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
-    result.push(rule);
-  }
-  return result;
-}
-
-function replaceGlossaryTerm(text, from, to) {
-  const escaped = from.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const hasLatinEdge = /^[A-Za-z0-9&+.-]/.test(from) || /[A-Za-z0-9&+.-]$/.test(from);
-  const pattern = hasLatinEdge
-    ? new RegExp(`(?<![A-Za-z0-9])${escaped}(?![A-Za-z0-9])`, "gi")
-    : new RegExp(escaped, "g");
-  return text.replace(pattern, to);
-}
-
-function fixKoreanObjectParticles(text) {
-  return String(text ?? "")
-    .replace(/([가-힣])를/g, (_match, char) => `${char}${hasKoreanFinalConsonant(char) ? "을" : "를"}`)
-    .replace(/([가-힣])을/g, (_match, char) => `${char}${hasKoreanFinalConsonant(char) ? "을" : "를"}`);
-}
-
-function hasKoreanFinalConsonant(char) {
-  const code = char.charCodeAt(0);
-  if (code < 0xac00 || code > 0xd7a3) return false;
-  return (code - 0xac00) % 28 !== 0;
-}
-
-function parseSubtitleJson(raw) {
-  try {
-    const parsed = JSON.parse(raw);
-    if (!parsed || typeof parsed !== "object") return null;
-    return {
-      sourceText: stripSubtitlePrefix(parsed.sourceText ?? parsed.source ?? ""),
-      translatedText: stripSubtitlePrefix(parsed.translatedText ?? parsed.translation ?? ""),
-    };
-  } catch {
-    return null;
-  }
-}
-
-function extractJsonStringField(raw, key) {
-  const escapedKey = key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const match = raw.match(new RegExp(`"${escapedKey}"\\s*:\\s*"([^"]*)`));
-  return match ? match[1].replace(/\\"/g, "\"").trim() : "";
-}
-
 // Script signals: Hangul → ko, kana → ja, Latin → en. CJK ideographs count
 // toward Japanese — modern Korean rarely uses hanja, and in a KO↔JA session
 // kanji-bearing text is Japanese.
@@ -2028,7 +1616,7 @@ const ENGLISH_CHAR = /[A-Za-z]/;
 export function describeSocketError(message) {
   const text = String(message ?? "");
   if (/certificat|self.signed|CERT_|UNABLE_TO_VERIFY/i.test(text)) {
-    return "회사 보안 프록시(SSL 검사)가 연결을 가로채는 것으로 보입니다. IT에 api.openai.com / generativelanguage.googleapis.com 허용(SSL 검사 제외)을 요청하거나, NODE_EXTRA_CA_CERTS 환경변수로 사내 루트 인증서를 지정하세요. 휴대폰 핫스팟으로 실행해 보면 원인을 확인할 수 있습니다.";
+    return "회사 보안 프록시(SSL 검사)가 연결을 가로채는 것으로 보입니다. IT에 generativelanguage.googleapis.com 허용(SSL 검사 제외)을 요청하거나, NODE_EXTRA_CA_CERTS 환경변수로 사내 루트 인증서를 지정하세요. 휴대폰 핫스팟으로 실행해 보면 원인을 확인할 수 있습니다.";
   }
   if (/ENOTFOUND|EAI_AGAIN/i.test(text)) {
     return "API 서버 주소를 찾을 수 없습니다. 네트워크의 DNS 설정 또는 도메인 차단 여부를 확인하세요.";
@@ -2097,10 +1685,6 @@ function normalizeProviderLanguageCode(value) {
   return "";
 }
 
-function safetyIdentifierForSubtitleSession(source, targetLanguage, apiKeyRole) {
-  return `realtime-noel-subtitles-${source}-${targetLanguage}${apiKeyRole ? `-api${apiKeyRole}` : ""}`;
-}
-
 const SUBTITLE_PREFIX_RE = new RegExp(
   `^(translatedText|translation|sourceText|source|번역|원문|${subtitleLanguagePrefixTokens().join("|")})\\s*[:：]\\s*`,
   "i",
@@ -2114,206 +1698,4 @@ function clampNumber(value, min, max, fallback) {
   const number = Number(value);
   if (!Number.isFinite(number)) return fallback;
   return Math.min(max, Math.max(min, number));
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Business number notation — deterministic, because it is arithmetic.
-//
-// Korean counts in myriads (만 10^4 / 억 10^8 / 조 10^12); English business
-// speech counts in million/billion/trillion. A live model asked to "translate"
-// 3,000억 원 will happily emit "3,000 hundred million won" or leave the 억
-// glyph in English output, so the scale is converted here instead: 3,000억 원 →
-// KRW 300 billion, and 300 billion won → 3,000억 원. This runs on every
-// committed caption and therefore on every recorded transcript line.
-//
-// Safety rules: a figure is only rewritten when a scale word is attached to a
-// number, the conversion is applied at the SAME magnitude (no FX, ever), and a
-// value that cannot be expressed exactly in the target scale falls back to
-// comma-grouped digits rather than inventing precision.
-// ─────────────────────────────────────────────────────────────────────────────
-
-const NUMBER = "\\d[\\d,]*(?:\\.\\d+)?";
-const MYRIAD_UNIT_VALUES = { 조: 1e12, 兆: 1e12, 억: 1e8, 億: 1e8, 만: 1e4, 万: 1e4 };
-const MYRIAD_PREFIX_VALUES = { 천: 1e3, 千: 1e3, 백: 1e2, 百: 1e2 };
-const MYRIAD_GROUP = `${NUMBER}\\s*[천백千百]?\\s*[조억만兆億万]`;
-const WESTERN_SCALE_VALUES = { "hundred million": 1e8, trillion: 1e12, billion: 1e9, million: 1e6 };
-const WESTERN_SCALE = "hundred\\s+million|trillion|billion|million";
-const CURRENCY_BEFORE = "KRW|USD|JPY|EUR|₩|\\$|¥|€";
-const CURRENCY_AFTER =
-  "원화|원|달러|엔|円|유로|ウォン|ドル|ユーロ|won|dollars?|yen|euros?|KRW|USD|JPY|EUR";
-
-// A myriad amount, optionally compound (1조 5,000억), optionally with a sub-만
-// remainder that only counts when a currency token closes the figure, plus a
-// currency on either side.
-const MYRIAD_AMOUNT_PATTERN = new RegExp(
-  `(?:(${CURRENCY_BEFORE})\\s*)?(${MYRIAD_GROUP}(?:\\s*${MYRIAD_GROUP})*)` +
-    `(?:\\s*(${NUMBER})(?=\\s*(?:${CURRENCY_AFTER})(?![A-Za-z])))?` +
-    `(?:\\s*(${CURRENCY_AFTER})(?![A-Za-z]))?`,
-  "gi",
-);
-
-const WESTERN_AMOUNT_PATTERN = new RegExp(
-  `(?:(${CURRENCY_BEFORE})\\s*)?(${NUMBER})\\s*(${WESTERN_SCALE})(?![A-Za-z-])` +
-    `(?:\\s*(${CURRENCY_AFTER})(?![A-Za-z]))?`,
-  "gi",
-);
-
-// "667K USD" / "USD 641K" — the thousands shorthand these decks quote fees in.
-// A bare K is NOT a money scale (K-Pop, K-Beauty, 4K video), so a currency has
-// to sit on one side of it before this fires.
-const THOUSANDS_SHORTHAND_PATTERN = new RegExp(
-  `(?:(${CURRENCY_BEFORE})\\s*)?(${NUMBER})\\s*K(?![A-Za-z0-9-])` +
-    `(?:\\s*(${CURRENCY_AFTER})(?![A-Za-z]))?`,
-  "gi",
-);
-
-// "hundred million" is the literal shadow of 억 and shows up in English output
-// even when the rest of the line is clean English.
-const LITERAL_HUNDRED_MILLION_PATTERN = new RegExp(
-  `(?:(${CURRENCY_BEFORE})\\s*)?(${NUMBER})\\s*hundred\\s+million(?![A-Za-z-])` +
-    `(?:\\s*(${CURRENCY_AFTER})(?![A-Za-z]))?`,
-  "gi",
-);
-
-const CURRENCY_IDS = new Map([
-  ["원", "KRW"], ["원화", "KRW"], ["won", "KRW"], ["krw", "KRW"], ["₩", "KRW"], ["ウォン", "KRW"],
-  ["달러", "USD"], ["dollar", "USD"], ["dollars", "USD"], ["usd", "USD"], ["$", "USD"], ["ドル", "USD"],
-  ["엔", "JPY"], ["円", "JPY"], ["yen", "JPY"], ["jpy", "JPY"], ["¥", "JPY"],
-  ["유로", "EUR"], ["euro", "EUR"], ["euros", "EUR"], ["eur", "EUR"], ["€", "EUR"], ["ユーロ", "EUR"],
-]);
-
-const CURRENCY_OUTPUT = {
-  en: { KRW: "KRW", USD: "USD", JPY: "JPY", EUR: "EUR" },
-  ko: { KRW: "원", USD: "달러", JPY: "엔", EUR: "유로" },
-  ja: { KRW: "ウォン", USD: "ドル", JPY: "円", EUR: "ユーロ" },
-};
-
-/** @type {Record<string, Array<[number, string]>>} */
-const MYRIAD_OUTPUT_UNITS = {
-  ko: [[1e12, "조"], [1e8, "억"], [1e4, "만"]],
-  ja: [[1e12, "兆"], [1e8, "億"], [1e4, "万"]],
-};
-
-/** @type {Array<[number, string]>} */
-const WESTERN_OUTPUT_SCALES = [[1e12, "trillion"], [1e9, "billion"], [1e6, "million"]];
-
-// Units that follow a figure but are not money: the number is still fixed, the
-// unit is left exactly as spoken (33,000㎡, never "33 thousand㎡").
-const NON_CURRENCY_UNIT_START = /^[㎡평명개실동층%°]/u;
-
-/**
- * Rewrites monetary/quantity scales into the notation the target language's
- * business register uses. Never converts currencies, only scale words.
- * @param {string} text @param {string} targetLanguage
- */
-export function normalizeBusinessNumberNotation(text, targetLanguage) {
-  const raw = String(text ?? "");
-  if (!raw) return raw;
-  const language = String(targetLanguage ?? "").toLowerCase();
-  if (language === "en") return toWesternNotation(raw);
-  if (language === "ko" || language === "ja") return toMyriadNotation(raw, language);
-  return raw;
-}
-
-function toWesternNotation(text) {
-  return text
-    .replace(MYRIAD_AMOUNT_PATTERN, (match, before, groups, remainder, after, offset, whole) => {
-      const value = parseMyriadAmount(groups, remainder);
-      if (value === null) return match;
-      return renderWestern(value, resolveCurrency(before, after), followedByNonCurrencyUnit(whole, offset + match.length));
-    })
-    .replace(LITERAL_HUNDRED_MILLION_PATTERN, (match, before, number, after, offset, whole) => {
-      const value = parseNumber(number);
-      if (value === null) return match;
-      return renderWestern(value * 1e8, resolveCurrency(before, after), followedByNonCurrencyUnit(whole, offset + match.length));
-    });
-}
-
-function toMyriadNotation(text, language) {
-  return text
-    .replace(WESTERN_AMOUNT_PATTERN, (match, before, number, scale, after) => {
-      const parsed = parseNumber(number);
-      const unit = WESTERN_SCALE_VALUES[scale.replace(/\s+/gu, " ").toLowerCase()];
-      if (parsed === null || !unit) return match;
-      return renderMyriad(parsed * unit, resolveCurrency(before, after), language);
-    })
-    .replace(THOUSANDS_SHORTHAND_PATTERN, (match, before, number, after) => {
-      const currency = resolveCurrency(before, after);
-      const parsed = parseNumber(number);
-      if (!currency || parsed === null) return match;
-      return renderMyriad(parsed * 1e3, currency, language);
-    });
-}
-
-/** Sums a compound myriad expression such as "1조 5,000억" plus any sub-만 tail. */
-function parseMyriadAmount(groups, remainder) {
-  let total = 0;
-  let matched = false;
-  const pattern = new RegExp(`(${NUMBER})\\s*([천백千百]?)\\s*([조억만兆億万])`, "gu");
-  for (const group of String(groups ?? "").matchAll(pattern)) {
-    const parsed = parseNumber(group[1]);
-    if (parsed === null) return null;
-    const prefix = group[2] ? MYRIAD_PREFIX_VALUES[group[2]] : 1;
-    total += parsed * prefix * MYRIAD_UNIT_VALUES[group[3]];
-    matched = true;
-  }
-  if (!matched) return null;
-  if (remainder) {
-    const tail = parseNumber(remainder);
-    if (tail === null) return null;
-    total += tail;
-  }
-  return total;
-}
-
-function parseNumber(value) {
-  const cleaned = String(value ?? "").replace(/,/gu, "").trim();
-  if (!cleaned || !/^\d+(?:\.\d+)?$/u.test(cleaned)) return null;
-  const parsed = Number(cleaned);
-  return Number.isFinite(parsed) ? parsed : null;
-}
-
-function resolveCurrency(before, after) {
-  const token = String(after ?? before ?? "").trim().toLowerCase();
-  return CURRENCY_IDS.get(token) ?? "";
-}
-
-function followedByNonCurrencyUnit(whole, index) {
-  return NON_CURRENCY_UNIT_START.test(String(whole ?? "").slice(index, index + 1));
-}
-
-function renderWestern(value, currency, plainDigitsOnly) {
-  const prefix = currency ? `${CURRENCY_OUTPUT.en[currency]} ` : "";
-  if (plainDigitsOnly) return `${prefix}${formatDigits(value)}`;
-  for (const [scaleValue, scaleName] of WESTERN_OUTPUT_SCALES) {
-    if (value < scaleValue) continue;
-    const scaled = Number((value / scaleValue).toFixed(4));
-    // Refuse to invent precision: an amount that does not land cleanly on the
-    // scale is reported as digits instead of a rounded-off approximation.
-    if (Math.abs(scaled * scaleValue - value) >= 0.5) break;
-    return `${prefix}${formatDigits(scaled)} ${scaleName}`;
-  }
-  return `${prefix}${formatDigits(value)}`;
-}
-
-function renderMyriad(value, currency, language) {
-  const suffix = currency ? ` ${CURRENCY_OUTPUT[language][currency]}` : "";
-  const parts = [];
-  let remaining = value;
-  for (const [unitValue, unitName] of MYRIAD_OUTPUT_UNITS[language]) {
-    const count = Math.floor(remaining / unitValue);
-    if (count <= 0) continue;
-    parts.push(`${formatDigits(count)}${unitName}`);
-    remaining -= count * unitValue;
-  }
-  // Sub-만 remainders (and amounts below 만) stay plain digits.
-  if (remaining >= 0.5 || !parts.length) parts.push(formatDigits(remaining || value));
-  return `${parts.join(" ")}${suffix}`;
-}
-
-function formatDigits(value) {
-  const rounded = Number(Number(value).toFixed(4));
-  const [integerPart, decimalPart] = String(rounded).split(".");
-  const grouped = integerPart.replace(/\B(?=(?:\d{3})+(?!\d))/gu, ",");
-  return decimalPart ? `${grouped}.${decimalPart}` : grouped;
 }

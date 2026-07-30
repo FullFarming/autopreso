@@ -1,3 +1,5 @@
+import { createGeminiCaptionConfig, geminiCaptionConfigFingerprint } from "../../packages/caption-core/index.js";
+
 export const AUDIO_CONFIG = Object.freeze({
   inputSampleRate: 16_000,
   outputSampleRate: 24_000,
@@ -18,11 +20,10 @@ export const STT_CONFIG = Object.freeze({
 
 export const SESSION_TYPES = Object.freeze(["presentation", "meeting"]);
 export const OUTPUT_MODES = Object.freeze(["captions", "captions_audio", "audio"]);
-export const VOICE_PROVIDERS = Object.freeze(["gemini", "openai"]);
+const ACCEPTED_VOICE_PROVIDER_INPUTS = Object.freeze(["gemini", "openai"]);
 export const LIVE_TRANSLATION_LANGUAGES = Object.freeze([
   "en", "ko", "ja", "zh-Hans", "zh-Hant", "es", "pt", "fr", "de", "ru", "hi", "id", "vi", "it",
 ]);
-export const OPENAI_REALTIME_TRANSLATION_LANGUAGES = Object.freeze(["en", "es", "pt", "fr", "ja", "ru", "zh", "de", "ko", "hi", "id", "vi", "it"]);
 export const GLOSSARY_PACKS = Object.freeze(["general_cre", "hotel", "fnb"]);
 
 /** @type {Array<[string, string]>} */
@@ -43,10 +44,6 @@ export function normalizeLiveLanguage(value) {
   return LIVE_LANGUAGE_ALIASES.get(String(value ?? "").trim().toLowerCase()) ?? "";
 }
 
-function toOpenAiLanguage(language) {
-  return language === "zh-Hans" || language === "zh-Hant" ? "zh" : language;
-}
-
 export function validateLiveSettings(value) {
   if (!value || typeof value !== "object") throw new Error("라이브 설정이 필요합니다.");
   const isLegacyTownhall = value.mode === "townhall";
@@ -63,16 +60,13 @@ export function validateLiveSettings(value) {
     else outputMode = "captions";
   }
   if (!OUTPUT_MODES.includes(outputMode)) throw new Error("지원하지 않는 음성 출력 모드입니다.");
-  const requestedVoiceProvider = value.voiceProvider ?? "gemini";
-  if (!VOICE_PROVIDERS.includes(requestedVoiceProvider)) throw new Error("지원하지 않는 음성 공급자입니다.");
-  if (requestedVoiceProvider === "openai" && (sessionType !== "presentation" || !hasAudioOutput(outputMode))) {
-    throw new Error("OpenAI 음성은 프레젠테이션 음성 출력 모드에서만 사용할 수 있습니다.");
+  if (value.voiceProvider !== undefined && !ACCEPTED_VOICE_PROVIDER_INPUTS.includes(value.voiceProvider)) {
+    throw new Error("지원하지 않는 음성 공급자입니다.");
   }
-  const voiceProvider = requestedVoiceProvider;
-  if (voiceProvider === "openai") {
-    const unsupported = languages.find((language) => !OPENAI_REALTIME_TRANSLATION_LANGUAGES.includes(toOpenAiLanguage(language)));
-    if (unsupported) throw new Error(`OpenAI 실시간 음성이 지원하지 않는 언어입니다: ${unsupported}`);
-  }
+  // Existing snapshots may still say "openai". Runtime normalization keeps
+  // them loadable while guaranteeing that caption translation and interpreted
+  // audio share the same Gemini Live session in every mode.
+  const voiceProvider = "gemini";
   const maxViewers = value.maxViewers ?? 50;
   if (!Number.isSafeInteger(maxViewers) || maxViewers < 1 || maxViewers > 50) throw new Error("최대 시청자는 1명 이상 50명 이하여야 합니다.");
   const glossaryPack = value.glossaryPack ?? "general_cre";
@@ -94,13 +88,46 @@ export function validateLiveSettings(value) {
     throw new Error("도메인 텍스트가 올바르지 않습니다.");
   }
   const domainText = String(value.domainText ?? "").trim().slice(0, 2_000);
-  return { sessionType, languages, outputMode, voiceProvider, maxViewers, glossaryPack, glossaryText, translationTone, domainText };
+  const captionConfig = createGeminiCaptionConfig(value.captionConfig ?? {
+    glossaryText,
+    glossaryPack,
+    domainText,
+    translationTone,
+    languages,
+    outputMode,
+    audioLanguage: value.audioLanguage ?? languages[0],
+    geminiModel: value.geminiModel,
+    geminiPolishModel: value.geminiPolishModel,
+    captionPolishPolicy: value.captionPolishPolicy,
+  });
+  const captionConfigFingerprint = geminiCaptionConfigFingerprint(captionConfig);
+  if (value.captionConfigFingerprint !== undefined
+    && value.captionConfigFingerprint !== captionConfigFingerprint) {
+    throw new Error("자막 설정 지문이 일치하지 않습니다.");
+  }
+  if (captionConfig.outputMode !== outputMode
+    || captionConfig.languages.length !== languages.length
+    || captionConfig.languages.some((language, index) => language !== languages[index])) {
+    throw new Error("자막 설정과 라이브 설정이 일치하지 않습니다.");
+  }
+  return {
+    sessionType,
+    languages,
+    outputMode,
+    voiceProvider,
+    maxViewers,
+    glossaryPack,
+    glossaryText: captionConfig.glossary,
+    translationTone: captionConfig.tone,
+    domainText: captionConfig.domain,
+    captionConfig,
+    captionConfigFingerprint,
+  };
 }
 
 export function readGatewayEnvironment(environment = process.env) {
   const required = [
     "GEMINI_API_KEY",
-    "OPENAI_API_KEY",
     "GEMINI_LIVE_MODEL",
     "GOOGLE_CLOUD_PROJECT",
     "SUPABASE_URL",
@@ -186,9 +213,7 @@ export function readGatewayEnvironment(environment = process.env) {
     host: isExactLocalSupabase && canUseLocalSupabase ? "127.0.0.1" : "0.0.0.0",
     geminiApiKey: environment.GEMINI_API_KEY,
     geminiLiveModel: environment.GEMINI_LIVE_MODEL,
-    geminiTextModel: String(environment.GEMINI_TEXT_MODEL ?? "gemini-3.5-flash").trim() || "gemini-3.5-flash",
-    openaiRealtimeTranslateModel: String(environment.OPENAI_REALTIME_TRANSLATE_MODEL ?? "gpt-realtime-translate").trim() || "gpt-realtime-translate",
-    openaiApiKey: environment.OPENAI_API_KEY.trim(),
+    geminiTextModel: String(environment.GEMINI_TEXT_MODEL ?? "gemini-3.6-flash").trim() || "gemini-3.6-flash",
     projectId: environment.GOOGLE_CLOUD_PROJECT,
     baseUrl: supabaseUrl.origin,
     supabaseApiKey: supabaseSecretKey || legacyServiceRoleKey,
@@ -200,10 +225,6 @@ export function readGatewayEnvironment(environment = process.env) {
     captionPolishPolicyWeights,
     externalEnvironment: "development",
   };
-}
-
-function hasAudioOutput(outputMode) {
-  return outputMode === "captions_audio" || outputMode === "audio";
 }
 
 /** Script-level plausibility check: does this text look like it is written in

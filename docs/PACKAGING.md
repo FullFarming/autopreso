@@ -1,9 +1,9 @@
-# Realtime Noel Subtitles Packaging
+# NOVA Packaging
 
 ## Targets
 
-- macOS: `Realtime Noel Subtitles-<version>-mac-<arch>.dmg`
-- Windows: `Realtime Noel Subtitles-<version>-win-portable.exe`
+- macOS: `NOVA-<version>-<arch>.dmg`
+- Windows: `NOVA-<version>-win-portable.exe`
 
 ## Commands
 
@@ -18,7 +18,7 @@ npm run dist:win
 - The Windows target is portable, not an installer.
 - `dist:win` builds the common Windows x64 portable executable.
 - `dist:mac` builds Apple Silicon DMG. Use `dist:mac:x64` for Intel Mac DMG.
-- Unsigned macOS builds can show a Gatekeeper warning on first launch.
+- The current macOS build uses ad-hoc signing and can show a Gatekeeper warning on first launch.
 - Unsigned Windows builds can show a SmartScreen warning on first launch.
 - Microphone and system audio permissions are still requested by the operating system at runtime.
 - Building Windows artifacts on macOS may require Wine depending on the local Electron Builder toolchain.

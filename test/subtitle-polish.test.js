@@ -62,6 +62,8 @@ test("business prompt encodes the register rules per target language", async () 
   await polisher.polish({ translatedText: "Start the meeting", targetLanguage: "en", tone: "business" });
   const enPrompt = `${calls[1].system ?? ""}\n${calls[1].prompt ?? ""}`;
   assert.match(enPrompt, /professional business English/i);
+  assert.match(enPrompt, /KRW 300 billion/u);
+  assert.doesNotMatch(enPrompt, /KRW 300bn/u, "compact CRE notation is a Live Call finalizer concern");
 });
 
 test("polish never drops a subtitle: generateText throwing falls back to raw text", async () => {
@@ -120,15 +122,11 @@ test("polish injects the configured glossary into the prompt", async () => {
   assert.match(prompt, /TRANSLATION MEMORY/);
   assert.match(prompt, /full-sentence|clause-level/);
   assert.match(prompt, /close variant/);
-  // Figurative source expressions (현주소, 발목을 잡다, 옥석 가리기 …) must be
-  // rendered by meaning, never word-for-word.
-  assert.match(prompt, /sense-for-sense/);
-  assert.match(prompt, /never word-for-word/);
-  // And when the TARGET language has an equivalent idiom, prefer it
-  // (idiom-for-idiom) over a flat paraphrase — in both directions
-  // (옥석 가리기 ↔ separating the wheat from the chaff, 연착륙 ↔ soft landing).
-  assert.match(prompt, /idiom-for-idiom/);
-  assert.match(prompt, /equivalent idiom/);
+  // The global prompt carries one restraint, not a broad idiom dictionary that
+  // biases ordinary speech or makes every committed line expensive.
+  assert.match(prompt, /intended meaning rather than its literal words/);
+  assert.match(prompt, /Do not introduce an idiom/);
+  assert.doesNotMatch(prompt, /soft landing|separating the wheat|현주소/u);
 });
 
 test("a relevant late glossary entry survives bounded selection with its section and global rules", async () => {
@@ -156,7 +154,9 @@ test("a relevant late glossary entry survives bounded selection with its section
   });
 
   const system = String(calls[0].system);
-  const selectedGlossary = system.split("GLOSSARY:\n")[1] ?? "";
+  const dataBlock = system.match(/^BEGIN_UNTRUSTED_DATA\n([^\n]+)\nEND_UNTRUSTED_DATA$/mu);
+  assert.ok(dataBlock, "bounded glossary JSON must be carried inside the untrusted-data block");
+  const selectedGlossary = JSON.parse(dataBlock[1]).glossary;
   assert.match(selectedGlossary, /\[규칙\]/u);
   assert.match(selectedGlossary, /양방향으로 적용/u);
   assert.match(selectedGlossary, /\[고유명사 — 회사\]/u);

@@ -9,10 +9,9 @@ import type {
   LiveOutputMode,
   LiveSession,
   LiveSessionType,
-  LiveVoiceProvider,
   SpeakerAssignment,
 } from "@/lib/live-contract";
-import { LANGUAGE_CODES, LANGUAGE_LABELS, toOpenAITranslationLanguageCode } from "@/lib/languageDetect";
+import { LANGUAGE_CODES, LANGUAGE_LABELS } from "@/lib/languageDetect";
 import { LIVE_CALL_ENABLED } from "@/lib/live/feature-flag";
 import type { MeetingSummary } from "@/lib/live/summary";
 import {
@@ -20,6 +19,11 @@ import {
   type LiveAudioClient,
   type LiveInputSource,
 } from "./live-audio-client";
+import {
+  formatElapsedTime,
+  startSummaryPollLoop,
+  type SummaryPollingState,
+} from "./MeetingMinutes";
 import MeetingSummaryCard from "./MeetingSummaryCard";
 import { resolveSpeakerColor } from "./SpeakerCaption";
 import { getDefaultLiveSchedule, validateLiveSchedule } from "./live-session-schedule";
@@ -40,23 +44,13 @@ const SESSION_TYPE_OPTIONS: Array<{ value: LiveSessionType; title: string; descr
 const OUTPUT_OPTIONS: Array<{ value: LiveOutputMode; title: string; description: string }> = [
   { value: "captions", title: "Captions", description: "Show translated captions." },
 ];
+const GEMINI_VOICE_PROVIDER = "gemini" as const;
 
-const OPENAI_REALTIME_TRANSLATION_LANGUAGES = new Set([
-  "en", "es", "pt", "fr", "ja", "ru", "zh", "de", "ko", "hi", "id", "vi", "it",
-]);
-
-function isOpenAIVoiceTarget(language: string): boolean {
-  const normalized = toOpenAITranslationLanguageCode(language);
-  return OPENAI_REALTIME_TRANSLATION_LANGUAGES.has(normalized);
-}
-
-function getDeliveryMethod(sessionType: LiveSessionType, outputMode: LiveOutputMode, voiceProvider: LiveVoiceProvider): { title: string; status: string; description: string } {
+function getDeliveryMethod(sessionType: LiveSessionType, outputMode: LiveOutputMode): { title: string; status: string; description: string } {
   if (sessionType === "presentation") {
     return outputMode === "captions"
       ? { title: "Fast live captions", status: "Optimized for one presenter", description: "Display captions in each selected language while the presenter speaks." }
-      : voiceProvider === "openai"
-        ? { title: "OpenAI Realtime audio", status: "Optimized for continuous speech", description: "Keep Gemini captions while OpenAI provides low-latency translated audio." }
-        : { title: "Gemini translated audio", status: "Optimized for one presenter", description: "Deliver Gemini captions and translated audio together." };
+      : { title: "Gemini translated audio", status: "Optimized for one presenter", description: "Deliver Gemini captions and translated audio together." };
   }
   return outputMode === "captions"
     ? { title: "Speaker-aware captions", status: "Shown after each turn", description: "Identify each speaker and display translated captions after the turn." }
@@ -226,7 +220,6 @@ export default function LiveHostDashboard() {
   const [scheduleNow, setScheduleNow] = useState<number | null>(null);
   const [sessionType, setSessionType] = useState<LiveSessionType>("presentation");
   const [outputMode, setOutputMode] = useState<LiveOutputMode>("captions");
-  const [voiceProvider, setVoiceProvider] = useState<LiveVoiceProvider>("gemini");
   const [maxViewers, setMaxViewers] = useState(50);
   const [glossaryPack, setGlossaryPack] = useState<GlossaryPack>("general_cre");
   const [wizardStep, setWizardStep] = useState<1 | 2 | 3 | 4>(1);
@@ -237,8 +230,13 @@ export default function LiveHostDashboard() {
   const [speakers, setSpeakers] = useState<SpeakerAssignment[]>([]);
   const [endedSession, setEndedSession] = useState<{ id: string; languages: string[] } | null>(null);
   const [hostSummary, setHostSummary] = useState<{ summary: MeetingSummary; createdAt: string } | null>(null);
-  const [isSummaryBusy, setIsSummaryBusy] = useState(false);
-  const [summaryMessage, setSummaryMessage] = useState("");
+  const [hostSummaryError, setHostSummaryError] = useState("");
+  const [hostSummaryFailureCode, setHostSummaryFailureCode] = useState("");
+  const [hostSummaryPollingState, setHostSummaryPollingState] = useState<SummaryPollingState>("idle");
+  const [hostSummaryPollingStartedAt, setHostSummaryPollingStartedAt] = useState<number | null>(null);
+  const [hostSummaryPollingRound, setHostSummaryPollingRound] = useState(0);
+  const [hostSummaryClockMilliseconds, setHostSummaryClockMilliseconds] = useState(() => Date.now());
+  const [isHostSummaryRetrying, setIsHostSummaryRetrying] = useState(false);
   const [admission, setAdmission] = useState<AdmissionState | null>(null);
   const [invite, setInvite] = useState<InviteState | null>(null);
   const [inviteFeedback, setInviteFeedback] = useState("");
@@ -254,10 +252,10 @@ export default function LiveHostDashboard() {
   const [isRecoveryDismissed, setIsRecoveryDismissed] = useState(false);
   const [isEndConfirmVisible, setIsEndConfirmVisible] = useState(false);
   const audioClientRef = useRef<LiveAudioClient | null>(null);
+  const hostSummaryRetryRef = useRef(false);
   const sessionId = session?.id ?? null;
 
   const languageLabel = useMemo<Map<string, string>>(() => new Map(LANGUAGE_OPTIONS.map((item) => [item.code, item.label])), []);
-  const isOpenAIVoiceLanguageSupported = useMemo(() => languages.every(isOpenAIVoiceTarget), [languages]);
   const scheduleValidation = useMemo(() => scheduleNow === null
     ? { scheduledAt: "", error: "" }
     : validateLiveSchedule(sessionDate, startTime, scheduleNow), [scheduleNow, sessionDate, startTime]);
@@ -275,12 +273,6 @@ export default function LiveHostDashboard() {
     const timer = window.setInterval(() => setScheduleNow(Date.now()), 30_000);
     return () => window.clearInterval(timer);
   }, []);
-
-  useEffect(() => {
-    if (voiceProvider === "openai" && (sessionType === "meeting" || !isOpenAIVoiceLanguageSupported)) {
-      setVoiceProvider("gemini");
-    }
-  }, [isOpenAIVoiceLanguageSupported, sessionType, voiceProvider]);
 
   const toggleLanguage = useCallback((language: string) => {
     setLanguages((current) => {
@@ -302,11 +294,10 @@ export default function LiveHostDashboard() {
       const next = await readResponse<LiveSession>(await fetch("/api/live-sessions", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ title, scheduledAt: currentSchedule.scheduledAt, sessionType, languages, outputMode, voiceProvider, maxViewers, glossaryPack }),
+        body: JSON.stringify({ title, scheduledAt: currentSchedule.scheduledAt, sessionType, languages, outputMode, voiceProvider: GEMINI_VOICE_PROVIDER, maxViewers, glossaryPack }),
       }));
       setSessionType(next.sessionType);
       setOutputMode(next.outputMode);
-      setVoiceProvider(next.voiceProvider);
       setMaxViewers(next.maxViewers);
       setGlossaryPack(next.glossaryPack);
       setIsEditingSession(false);
@@ -336,7 +327,7 @@ export default function LiveHostDashboard() {
     } finally {
       setIsBusy(false);
     }
-  }, [glossaryPack, languages, maxViewers, outputMode, sessionDate, sessionType, startTime, title, voiceProvider]);
+  }, [glossaryPack, languages, maxViewers, outputMode, sessionDate, sessionType, startTime, title]);
 
   const stopBroadcast = useCallback(async () => {
     const client = audioClientRef.current;
@@ -374,7 +365,7 @@ export default function LiveHostDashboard() {
       const next = await readResponse<LiveSession>(await fetch(`/api/live-sessions/${session.id}`, {
         method: "PATCH",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ version: session.version, sessionType, languages, outputMode, voiceProvider, maxViewers, glossaryPack }),
+        body: JSON.stringify({ version: session.version, sessionType, languages, outputMode, voiceProvider: GEMINI_VOICE_PROVIDER, maxViewers, glossaryPack }),
       }));
       if (isBroadcasting && audioClientRef.current) {
         try {
@@ -383,7 +374,7 @@ export default function LiveHostDashboard() {
             sessionType,
             languages,
             outputMode,
-            voiceProvider,
+            voiceProvider: GEMINI_VOICE_PROVIDER,
             maxViewers,
             glossaryPack,
           });
@@ -398,7 +389,7 @@ export default function LiveHostDashboard() {
                 sessionType: previousSession.sessionType,
                 languages: previousSession.languages,
                 outputMode: previousSession.outputMode,
-                voiceProvider: previousSession.voiceProvider,
+                voiceProvider: GEMINI_VOICE_PROVIDER,
                 maxViewers: previousSession.maxViewers,
                 glossaryPack: previousSession.glossaryPack,
               }),
@@ -408,14 +399,13 @@ export default function LiveHostDashboard() {
               sessionType: previousSession.sessionType,
               languages: previousSession.languages,
               outputMode: previousSession.outputMode,
-              voiceProvider: previousSession.voiceProvider,
+              voiceProvider: GEMINI_VOICE_PROVIDER,
               maxViewers: previousSession.maxViewers,
               glossaryPack: previousSession.glossaryPack,
             });
             setSession(restoredSession);
             setSessionType(previousSession.sessionType);
             setOutputMode(previousSession.outputMode);
-            setVoiceProvider(previousSession.voiceProvider);
             setMaxViewers(previousSession.maxViewers);
             setGlossaryPack(previousSession.glossaryPack);
             setLanguages([...previousSession.languages]);
@@ -429,7 +419,6 @@ export default function LiveHostDashboard() {
             setSession(failedSession);
             setSessionType(failedSession.sessionType);
             setOutputMode(failedSession.outputMode);
-            setVoiceProvider(failedSession.voiceProvider);
             setMaxViewers(failedSession.maxViewers);
             setGlossaryPack(failedSession.glossaryPack);
             setLanguages([...failedSession.languages]);
@@ -441,7 +430,6 @@ export default function LiveHostDashboard() {
       setSession(next);
       setSessionType(next.sessionType);
       setOutputMode(next.outputMode);
-      setVoiceProvider(next.voiceProvider);
       setMaxViewers(next.maxViewers);
       setGlossaryPack(next.glossaryPack);
       setIsEditingSession(false);
@@ -452,7 +440,7 @@ export default function LiveHostDashboard() {
     } finally {
       setIsBusy(false);
     }
-  }, [glossaryPack, isBroadcasting, languageStatuses, languages, maxViewers, outputMode, session, sessionType, stopBroadcast, voiceProvider]);
+  }, [glossaryPack, isBroadcasting, languageStatuses, languages, maxViewers, outputMode, session, sessionType, stopBroadcast]);
 
   const openAdmission = useCallback(async () => {
     if (!session) return;
@@ -582,7 +570,7 @@ export default function LiveHostDashboard() {
       sessionType,
       languages,
       outputMode,
-      voiceProvider,
+      voiceProvider: GEMINI_VOICE_PROVIDER,
       maxViewers,
       glossaryPack,
       inputSource,
@@ -597,7 +585,7 @@ export default function LiveHostDashboard() {
     });
     audioClientRef.current = client;
     setIsBroadcasting(true);
-  }, [glossaryPack, inputSource, languages, maxViewers, outputMode, sessionType, voiceProvider]);
+  }, [glossaryPack, inputSource, languages, maxViewers, outputMode, sessionType]);
 
   const startBroadcast = useCallback(async () => {
     if (!session || isBroadcasting) return;
@@ -706,7 +694,6 @@ export default function LiveHostDashboard() {
       setTitle(existing.title);
       setSessionType(existing.sessionType);
       setOutputMode(existing.outputMode);
-      setVoiceProvider(existing.voiceProvider);
       setMaxViewers(existing.maxViewers);
       setGlossaryPack(existing.glossaryPack);
       setLanguages([...existing.languages]);
@@ -759,7 +746,10 @@ export default function LiveHostDashboard() {
       setIsEndConfirmVisible(false);
       setEndedSession({ id: session.id, languages: [...session.languages] });
       setHostSummary(null);
-      setSummaryMessage("");
+      setHostSummaryError("");
+      setHostSummaryFailureCode("");
+      setHostSummaryPollingState("polling");
+      setHostSummaryPollingStartedAt(Date.now());
       setSession(null);
       setAdmission(null);
       setInvite(null);
@@ -773,36 +763,109 @@ export default function LiveHostDashboard() {
     }
   }, [session, stopBroadcast]);
 
-  const generateSummaries = useCallback(async () => {
-    if (!endedSession) return;
-    setIsSummaryBusy(true);
-    setSummaryMessage("");
-    setError("");
+  const loadHostSummary = useCallback(async (): Promise<boolean> => {
+    const language = endedSession?.languages[0];
+    if (!endedSession || !language) return false;
     try {
-      let firstSummary: MeetingSummary | null = null;
-      let savedCount = 0;
-      for (const language of endedSession.languages) {
-        try {
-          const result = await readResponse<{ summary: MeetingSummary }>(await fetch(
-            `/api/live-sessions/${endedSession.id}/summary`,
-            { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ language }) },
-          ));
-          savedCount += 1;
-          if (!firstSummary) firstSummary = result.summary;
-        } catch (languageError) {
-          // 한 언어의 실패(예: 발언 기록 없음)가 다른 언어 요약을 막지 않습니다.
-          if (endedSession.languages.length === 1) throw languageError;
-        }
+      const response = await fetch(
+        `/api/live-sessions/${endedSession.id}/summary?language=${encodeURIComponent(language)}`,
+        { method: "GET", cache: "no-store" },
+      );
+      const payload = await response.json() as ApiResponse<{ summary: MeetingSummary; createdAt: string }>;
+      if (payload.ok) {
+        setHostSummary(payload.data);
+        setHostSummaryError("");
+        setHostSummaryFailureCode("");
+        setHostSummaryPollingState("idle");
+        return false;
       }
-      if (savedCount === 0) throw new Error("There is no transcript to summarize.");
-      if (firstSummary) setHostSummary({ summary: firstSummary, createdAt: new Date().toISOString() });
-      setSummaryMessage(`Saved summaries in ${savedCount} language${savedCount === 1 ? "" : "s"}. Guests can view their selected language.`);
-    } catch (summaryError) {
-      setError(summaryError instanceof Error ? summaryError.message : "Unable to create the summary.");
-    } finally {
-      setIsSummaryBusy(false);
+      if (payload.code === "SUMMARY_NOT_READY" || payload.code === "SUMMARY_GENERATION_RUNNING") {
+        setHostSummaryFailureCode("");
+        setHostSummaryPollingState("polling");
+        return true;
+      }
+      setHostSummaryError(payload.error || "Unable to load the AI summary. Try again.");
+      setHostSummaryFailureCode(payload.code ?? "");
+      setHostSummaryPollingState(payload.code === "SUMMARY_GENERATION_EXHAUSTED" ? "exhausted" : "failed");
+      return false;
+    } catch {
+      setHostSummaryError("Unable to load the AI summary. Check your connection and retry.");
+      setHostSummaryFailureCode("");
+      setHostSummaryPollingState("failed");
+      return false;
     }
   }, [endedSession]);
+
+  const retryHostSummary = useCallback(async () => {
+    const language = endedSession?.languages[0];
+    if (hostSummaryRetryRef.current || !endedSession || !language
+      || hostSummaryFailureCode !== "SUMMARY_GENERATION_RETRYABLE_FAILED") return;
+    hostSummaryRetryRef.current = true;
+    setIsHostSummaryRetrying(true);
+    setHostSummaryError("");
+    try {
+      const response = await fetch(`/api/live-sessions/${endedSession.id}/summary`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ language }),
+      });
+      const payload = await response.json() as ApiResponse<unknown>;
+      if (!payload.ok) {
+        setHostSummaryFailureCode(payload.code ?? "");
+        setHostSummaryPollingState(payload.code === "SUMMARY_GENERATION_EXHAUSTED" ? "exhausted" : "failed");
+        setHostSummaryError(payload.error || "Unable to retry the AI summary. Check your connection and retry.");
+        return;
+      }
+      setHostSummaryFailureCode("");
+      setHostSummaryPollingState("polling");
+      setHostSummaryPollingStartedAt(Date.now());
+      setHostSummaryPollingRound((round) => round + 1);
+    } catch (requestError) {
+      setHostSummaryFailureCode("");
+      setHostSummaryPollingState("failed");
+      setHostSummaryError(requestError instanceof Error
+        ? requestError.message
+        : "Unable to retry the AI summary. Check your connection and retry.");
+    } finally {
+      hostSummaryRetryRef.current = false;
+      setIsHostSummaryRetrying(false);
+    }
+  }, [endedSession, hostSummaryFailureCode]);
+
+  useEffect(() => {
+    if (!endedSession || hostSummary) return;
+    let isDisposed = false;
+    let stopPolling = () => {};
+    setHostSummaryPollingState("polling");
+    setHostSummaryPollingStartedAt((startedAt) => startedAt ?? Date.now());
+    void loadHostSummary().then((shouldContinue) => {
+      if (isDisposed || !shouldContinue) return;
+      stopPolling = startSummaryPollLoop({
+        poll: loadHostSummary,
+        onExhausted: () => {
+          setHostSummaryPollingState("exhausted");
+          setHostSummaryFailureCode("SUMMARY_GENERATION_EXHAUSTED");
+          setHostSummaryError("");
+        },
+        onError: () => {
+          setHostSummaryPollingState("failed");
+          setHostSummaryFailureCode("");
+          setHostSummaryError("Unable to load the AI summary. Check your connection and retry.");
+        },
+      });
+    });
+    return () => {
+      isDisposed = true;
+      stopPolling();
+    };
+  }, [endedSession, hostSummary, hostSummaryPollingRound, loadHostSummary]);
+
+  useEffect(() => {
+    if (hostSummaryPollingState !== "polling") return;
+    setHostSummaryClockMilliseconds(Date.now());
+    const ticker = window.setInterval(() => setHostSummaryClockMilliseconds(Date.now()), 1_000);
+    return () => window.clearInterval(ticker);
+  }, [hostSummaryPollingState]);
 
   // Host session recovery: on mount, look for active sessions this host
   // still owns (e.g. after a page refresh) and offer to resume them.
@@ -878,7 +941,7 @@ export default function LiveHostDashboard() {
 
   const isConfiguring = !session || isEditingSession;
   const selectedOutputLabel = OUTPUT_OPTIONS.find((option) => option.value === outputMode)?.title ?? outputMode;
-  const deliveryMethod = getDeliveryMethod(sessionType, outputMode, voiceProvider);
+  const deliveryMethod = getDeliveryMethod(sessionType, outputMode);
   const selectedGlossaryLabel = GLOSSARY_PACK_OPTIONS.find((option) => option.value === glossaryPack)?.title ?? glossaryPack;
 
   if (!LIVE_CALL_ENABLED) {
@@ -949,16 +1012,43 @@ export default function LiveHostDashboard() {
         <section className="glass live-summary-panel" aria-labelledby="summary-heading">
           <div className="live-section-heading">
             <div><span>RECAP</span><h2 id="summary-heading">Meeting summary</h2></div>
-            {summaryMessage ? <small role="status">{summaryMessage}</small> : null}
           </div>
           {hostSummary
             ? <MeetingSummaryCard summary={hostSummary.summary} createdAt={hostSummary.createdAt} />
-            : <p className="live-summary-hint">Create an AI summary from the completed meeting transcript. Guests receive it in their selected language.</p>}
+            : (
+              <div className="live-minutes-pending" aria-busy={hostSummaryPollingState === "polling"}>
+                {hostSummaryPollingState === "polling" ? (
+                  <div className="live-minutes-loading" role="status" aria-live="polite">
+                    <span className="live-minutes-loading-dots" aria-hidden="true"><i /><i /><i /></span>
+                    <strong>Creating AI summary</strong>
+                    <span className="live-minutes-elapsed">Elapsed {formatElapsedTime(hostSummaryPollingStartedAt === null
+                      ? 0
+                      : hostSummaryClockMilliseconds - hostSummaryPollingStartedAt)}</span>
+                  </div>
+                ) : (
+                  <>
+                    <p role={hostSummaryPollingState === "failed" ? "alert" : "status"}>
+                      {hostSummaryError || "Summary is taking longer than expected."}
+                    </p>
+                    {hostSummaryFailureCode === "SUMMARY_GENERATION_RETRYABLE_FAILED" ? (
+                      <button type="button" disabled={isHostSummaryRetrying}
+                        onClick={() => void retryHostSummary()}>
+                        {isHostSummaryRetrying ? "Retrying…" : "Retry"}
+                      </button>
+                    ) : null}
+                  </>
+                )}
+              </div>
+            )}
           <div className="live-summary-actions">
-            <button type="button" className="accent-btn" disabled={isSummaryBusy} onClick={() => void generateSummaries()}>
-              {isSummaryBusy ? "Creating summary…" : hostSummary ? "Create summary again" : "Create AI summary"}
-            </button>
-            <button type="button" onClick={() => { setEndedSession(null); setHostSummary(null); setSummaryMessage(""); }}>
+            <button type="button" onClick={() => {
+              setEndedSession(null);
+              setHostSummary(null);
+              setHostSummaryError("");
+              setHostSummaryFailureCode("");
+              setHostSummaryPollingState("idle");
+              setHostSummaryPollingStartedAt(null);
+            }}>
               Close
             </button>
           </div>
@@ -1068,31 +1158,8 @@ export default function LiveHostDashboard() {
                   <strong id="live-caption-provider-title">Gemini fixed</strong>
                   <small>All output modes</small>
                 </div>
-                <p>Gemini continues to create live translated captions when the audio engine changes.</p>
+                <p>Gemini creates live translated captions and translated audio with the same session settings.</p>
               </section>
-              {outputMode !== "captions" && (
-                <div className="live-field-group">
-                  <div className="live-field-label"><strong>Translated audio engine</strong><small>Audio output only</small></div>
-                  <div className="live-mode-grid live-mode-grid-two" role="radiogroup" aria-label="Translated audio engine" aria-describedby="live-voice-provider-help">
-                    <button type="button" role="radio" aria-checked={voiceProvider === "gemini"}
-                      className={`live-mode-card ${voiceProvider === "gemini" ? "is-selected" : ""}`}
-                      onClick={() => setVoiceProvider("gemini")}>
-                      <strong>Gemini audio</strong><span>Current method · deliver translated audio with Gemini captions.</span>
-                    </button>
-                    <button type="button" role="radio" aria-checked={voiceProvider === "openai"}
-                      aria-describedby="live-voice-provider-help" disabled={sessionType === "meeting" || !isOpenAIVoiceLanguageSupported}
-                      className={`live-mode-card ${voiceProvider === "openai" ? "is-selected" : ""}`}
-                      onClick={() => setVoiceProvider("openai")}>
-                      <strong>OpenAI Realtime</strong><span>Low-latency continuous translated audio for presentations.</span>
-                    </button>
-                  </div>
-                  <p id="live-voice-provider-help" className="live-help">{sessionType === "meeting"
-                    ? "Meeting uses Gemini audio to keep one stable voice for each speaker."
-                    : !isOpenAIVoiceLanguageSupported
-                      ? "One or more selected languages are not supported by OpenAI Realtime audio, so Gemini audio will be used."
-                      : "OpenAI Realtime is available for 13 supported target languages. Captions remain on Gemini."}</p>
-                </div>
-              )}
               {outputMode !== "captions" &&
                 <p className="live-consent-note" role="note"><strong>Translated audio</strong> starts only after each guest chooses to play it.</p>
               }
@@ -1145,14 +1212,14 @@ export default function LiveHostDashboard() {
                 <div><dt>Session</dt><dd>{sessionType === "presentation" ? "Presentation" : "Meeting"}</dd></div>
                 <div><dt>Output</dt><dd>{selectedOutputLabel}</dd></div>
                 <div><dt>Caption engine</dt><dd>Gemini fixed</dd></div>
-                {outputMode !== "captions" && <div><dt>Audio engine</dt><dd>{voiceProvider === "openai" ? "OpenAI Realtime" : "Gemini"}</dd></div>}
+                {outputMode !== "captions" && <div><dt>Audio engine</dt><dd>Gemini</dd></div>}
                 <div><dt>Capacity</dt><dd>{maxViewers}</dd></div>
                 <div><dt>Languages</dt><dd>{languages.map((language) => languageLabel.get(language) ?? language).join(" · ")}</dd></div>
                 <div><dt>Glossary</dt><dd>{sessionType === "meeting" ? `Base phrases + ${selectedGlossaryLabel}` : "Not applied · Meeting only"}</dd></div>
               </dl>
               <div className="live-wizard-actions">
                 {session && <button type="button" className="glass-btn" onClick={() => {
-                  setSessionType(session.sessionType); setOutputMode(session.outputMode); setVoiceProvider(session.voiceProvider); setMaxViewers(session.maxViewers);
+                  setSessionType(session.sessionType); setOutputMode(session.outputMode); setMaxViewers(session.maxViewers);
                   setGlossaryPack(session.glossaryPack); setLanguages([...session.languages]); setIsEditingSession(false);
                 }}>Cancel</button>}
                 <button type="button" className="accent-btn live-primary-action" disabled={isBusy || !title.trim() || (!session && !scheduledAt)}

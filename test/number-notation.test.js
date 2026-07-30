@@ -2,166 +2,127 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
-  applyGlossaryCorrections as gatewayApply,
-  normalizeBusinessNumberNotation as gatewayNormalize,
-} from "../media-gateway/src/glossary-corrections.js";
+  normalizeCommittedCreCaption,
+} from "../packages/caption-core/index.js";
 import {
-  applyGlossaryCorrections as desktopApply,
-  normalizeBusinessNumberNotation as desktopNormalize,
-} from "../src/subtitle-realtime.js";
+  applyGlossaryCorrections as gatewayApplyGlossaryCorrections,
+  normalizeCommittedCreCaption as gatewayNormalizeCommittedCreCaption,
+} from "../media-gateway/src/glossary-corrections.js";
 
-// Business number notation is arithmetic, so it cannot be left to the live
-// model: Korean counts in myriads (만/억/조) and English business speech counts
-// in million/billion/trillion. Both live pipelines (desktop local engine and
-// the media gateway) carry an identical deterministic pass so every committed
-// caption AND every recorded transcript line lands in the right notation.
-//
-// The desktop and gateway copies are asserted identical at the bottom of this
-// file — the gateway is a separate npm package and cannot import from the repo
-// root, so the implementation is duplicated on purpose.
-/** @type {Array<{ label: string, normalize: Function, apply: Function }>} */
-const IMPLEMENTATIONS = [
-  { label: "desktop", normalize: desktopNormalize, apply: desktopApply },
-  { label: "gateway", normalize: gatewayNormalize, apply: gatewayApply },
-];
-
-/** @param {string} name @param {Array<[string, string, string]>} cases */
-function bothPipelines(name, cases) {
-  for (const { label, normalize } of IMPLEMENTATIONS) {
-    test(`${name} (${label})`, () => {
-      for (const [input, targetLanguage, expected] of cases) {
-        assert.equal(
-          normalize(input, targetLanguage),
-          expected,
-          `${label}: "${input}" (${targetLanguage})`,
-        );
-      }
-    });
-  }
+function normalize(text, targetLanguage, isFinal = true) {
+  return normalizeCommittedCreCaption({ text, targetLanguage, isFinal });
 }
 
-bothPipelines("Korean myriad scales become English business notation", [
-  // The headline case: 3,000억 is 300 billion, not "3,000 hundred million".
-  ["We are targeting 3,000억 원 this year.", "en", "We are targeting KRW 300 billion this year."],
-  ["We are targeting 3000억원 this year.", "en", "We are targeting KRW 300 billion this year."],
-  ["The deal closed at 300억 원.", "en", "The deal closed at KRW 30 billion."],
-  ["Total AUM is 1조 5,000억 원.", "en", "Total AUM is KRW 1.5 trillion."],
-  ["Total AUM is 1조원.", "en", "Total AUM is KRW 1 trillion."],
-  ["CapEx of 5,000만 원 per key.", "en", "CapEx of KRW 50 million per key."],
-  ["The fund raised 3천억 원.", "en", "The fund raised KRW 300 billion."],
-  // Bare scale words with no currency keep the currency unstated.
-  ["Revenue grew to 3,000억.", "en", "Revenue grew to 300 billion."],
-  // Non-KRW currencies keep their own currency.
-  ["A 3억 달러 commitment.", "en", "A USD 300 million commitment."],
-  // Compound Korean amounts decompose into a single English unit.
-  ["Book value is 12억 5,000만 원.", "en", "Book value is KRW 1.25 billion."],
-]);
-
-bothPipelines("English business scales become Korean myriad notation", [
-  ["거래 규모는 300 billion won 입니다.", "ko", "거래 규모는 3,000억 원 입니다."],
-  ["거래 규모는 KRW 300 billion 입니다.", "ko", "거래 규모는 3,000억 원 입니다."],
-  ["총 AUM은 1.5 trillion won 입니다.", "ko", "총 AUM은 1조 5,000억 원 입니다."],
-  ["USD 30 million 규모의 투자입니다.", "ko", "3,000만 달러 규모의 투자입니다."],
-  ["$500 million 규모의 딜입니다.", "ko", "5억 달러 규모의 딜입니다."],
-  ["매출은 30 billion 입니다.", "ko", "매출은 300억 입니다."],
-  // "hundred million" is a literal artifact of 억 — fold it into the myriad form.
-  ["평가액은 3 hundred million won 입니다.", "ko", "평가액은 3억 원 입니다."],
-]);
-
-bothPipelines("the 'K' thousands shorthand converts only next to a currency", [
-  // The decks quote fee revenue as "667K USD" / "USD 641K" throughout.
-  ["수수료는 667K USD 였습니다.", "ko", "수수료는 66만 7,000 달러 였습니다."],
-  ["수수료는 USD 641K 였습니다.", "ko", "수수료는 64만 1,000 달러 였습니다."],
-  ["Project fee: 40K USD.", "ko", "Project fee: 4만 달러."],
-  // Without an adjacent currency, a bare K is not a money scale — K-Pop, K-Beauty,
-  // 4K video and "OK" must all survive untouched.
-  ["K-Pop and K-Beauty drive 4K video demand.", "ko", "K-Pop and K-Beauty drive 4K video demand."],
-  ["The room count is 100K units.", "ko", "The room count is 100K units."],
-]);
-
-bothPipelines("Japanese output uses Japanese myriad characters", [
-  ["取引規模は 300 billion won です。", "ja", "取引規模は 3,000億 ウォン です。"],
-  ["AUMは 1.5 trillion yen です。", "ja", "AUMは 1兆 5,000億 円 です。"],
-]);
-
-bothPipelines("literal 'hundred million' artifacts collapse in English output", [
-  ["The deal closed at 300 hundred million won.", "en", "The deal closed at KRW 30 billion."],
-  ["Revenue of 3 hundred million won.", "en", "Revenue of KRW 300 million."],
-]);
-
-bothPipelines("figures that are not money scales are left alone", [
-  // Years, quarters, percentages, and counts carry no myriad scale word.
-  ["In 2026년 we grew 10% in Q3.", "en", "In 2026년 we grew 10% in Q3."],
-  ["2026년 3분기 매출은 10% 증가했습니다.", "ko", "2026년 3분기 매출은 10% 증가했습니다."],
-  ["The floor plate is 1,200평.", "en", "The floor plate is 1,200평."],
-  ["Occupancy reached 95 percent.", "ko", "Occupancy reached 95 percent."],
-  // Already-correct notation must survive untouched (idempotence).
-  ["We are targeting KRW 300 billion this year.", "en", "We are targeting KRW 300 billion this year."],
-  ["거래 규모는 3,000억 원 입니다.", "ko", "거래 규모는 3,000억 원 입니다."],
-  // A scale word with no number attached is prose, not a figure.
-  ["billion-dollar question", "ko", "billion-dollar question"],
-  ["", "en", ""],
-]);
-
-bothPipelines("area and count units keep their unit but fix the number", [
-  ["GFA is 3.3만㎡ in total.", "en", "GFA is 33,000㎡ in total."],
-  ["The portfolio covers 12만㎡.", "en", "The portfolio covers 120,000㎡."],
-]);
-
-bothPipelines("amounts that cannot be expressed exactly fall back to digits", [
-  // 1,234,567,890 is not a clean multiple of a million — comma digits are the
-  // honest business rendering, and inventing decimals would misstate the figure.
-  ["Net proceeds were 12억 3,456만 7,890원.", "en", "Net proceeds were KRW 1,234,567,890."],
-]);
-
-test("normalization is idempotent in both directions", () => {
-  for (const { label, normalize } of IMPLEMENTATIONS) {
-    const cases = [
-      ["We are targeting 3,000억 원 this year.", "en"],
-      ["거래 규모는 300 billion won 입니다.", "ko"],
-      ["Total AUM is 1조 5,000억 원.", "en"],
-    ];
-    for (const [input, targetLanguage] of cases) {
-      const once = normalize(input, targetLanguage);
-      assert.equal(normalize(once, targetLanguage), once, `${label}: not idempotent for "${input}"`);
+function cases(name, targetLanguage, examples) {
+  test(name, () => {
+    for (const [input, expected] of examples) {
+      assert.equal(normalize(input, targetLanguage), expected, input);
     }
+  });
+}
+
+cases("committed Korean money becomes exact compact English CRE notation", "en", [
+  ["3,000억원", "KRW 300bn"],
+  ["The fund raised 3천억 원.", "The fund raised KRW 300bn."],
+  ["AUM은 1조 2,000억원입니다.", "AUM은 KRW 1.2tn입니다."],
+  ["AUM은 1조 5,000억 원입니다.", "AUM은 KRW 1.5tn입니다."],
+  ["투자금은 500만 달러입니다.", "투자금은 USD 5m입니다."],
+  ["Book value is 12억 5,000만 원.", "Book value is KRW 1.25bn."],
+  ["A 3억 달러 commitment.", "A USD 300m commitment."],
+  ["Revenue grew to 3,000억.", "Revenue grew to 300bn."],
+]);
+
+cases("full English scale words canonicalize without changing magnitude", "en", [
+  ["KRW 300 billion", "KRW 300bn"],
+  ["USD 5 million", "USD 5m"],
+  ["1.2 trillion won", "KRW 1.2tn"],
+  ["300 billion", "300bn"],
+  ["3 hundred million won", "KRW 300m"],
+  ["KRW 300bn", "KRW 300bn"],
+]);
+
+cases("English CRE money becomes exact Korean myriad notation", "ko", [
+  ["KRW 300 billion", "3,000억 원"],
+  ["KRW 300bn", "3,000억 원"],
+  ["1.5 trillion won", "1조 5,000억 원"],
+  ["USD 30 million", "3,000만 달러"],
+  ["$500 million", "5억 달러"],
+  ["300 billion", "3,000억"],
+  ["3 hundred million won", "3억 원"],
+]);
+
+cases("currency-bound K and M shorthand remains exact", "ko", [
+  ["USD 641K", "64만 1,000 달러"],
+  ["USD 7.41M", "741만 달러"],
+  ["40K USD", "4만 달러"],
+  ["667K USD", "66만 7,000 달러"],
+]);
+
+cases("area, yield, CRE acronyms, and registered names normalize conservatively", "en", [
+  ["GFA is 3.3만㎡.", "GFA is 33,000㎡."],
+  ["The portfolio covers 12만㎡.", "The portfolio covers 120,000㎡."],
+  ["capex와 noi, cap rate 5.2 percent", "CAPEX와 NOI, Cap Rate 5.2%"],
+  ["revpar, dscr, ltv and irr", "RevPAR, DSCR, LTV and IRR"],
+  ["Cushman and Wakefield Korea", "Cushman & Wakefield Korea"],
+]);
+
+test("partials remain byte-for-byte stable even when a number is incomplete", () => {
+  for (const text of [
+    "3,000억원",
+    "거래 규모는 1조 5,",
+    "거래 규모는 1조 5,0",
+    "거래 규모는 1조 5,000",
+    "USD 641K",
+  ]) {
+    assert.equal(normalize(text, "en", false), text);
   }
 });
 
-test("committed lines get business notation even with no glossary configured", () => {
-  // Number notation is arithmetic, not terminology: it must not depend on a
-  // session having picked a glossary preset.
-  for (const { label, apply } of IMPLEMENTATIONS) {
-    assert.equal(
-      apply("We are targeting 3,000억 원 this year.", { glossary: "", targetLanguage: "en" }),
-      "We are targeting KRW 300 billion this year.",
-      `${label}: empty glossary skipped number notation`,
-    );
-    assert.equal(
-      apply("거래 규모는 300 billion won 입니다.", { glossary: "컨버전 = conversion", targetLanguage: "ko" }),
-      "거래 규모는 3,000억 원 입니다.",
-      `${label}: glossary path skipped number notation`,
-    );
+test("malformed, ambiguous, and oversized numeric tokens fail closed", () => {
+  const oversized = `${"9".repeat(40)}억 원`;
+  for (const text of [
+    "1.2.3조 원",
+    "1e309억 원",
+    "1,2억 원",
+    "1.23456억 원",
+    "+1억 원",
+    oversized,
+    "K-Pop and K-Beauty drive 4K video demand.",
+    "The room count is 100K units.",
+    "5m of frontage",
+    "12만명",
+  ]) {
+    assert.equal(normalize(text, "en"), text);
   }
 });
 
-test("desktop and gateway number notation implementations do not drift", () => {
-  const battery = [
-    ["3,000억 원", "en"],
-    ["1조 5,000억 원", "en"],
-    ["300 billion won", "ko"],
-    ["USD 30 million", "ko"],
-    ["3.3만㎡", "en"],
-    ["2026년 10% Q3", "en"],
-    ["12억 3,456만 7,890원", "en"],
-    ["1.5 trillion yen", "ja"],
-    ["", "ko"],
-  ];
-  for (const [text, targetLanguage] of battery) {
-    assert.equal(
-      gatewayNormalize(text, targetLanguage),
-      desktopNormalize(text, targetLanguage),
-      `divergence on: "${text}" (${targetLanguage})`,
-    );
+test("negative money keeps its sign and exact magnitude", () => {
+  assert.equal(normalize("-1억 원", "en"), "-KRW 100m");
+  assert.equal(normalize("-KRW 100m", "ko"), "-1억 원");
+});
+
+test("normalization is idempotent after full forms become compact", () => {
+  for (const [text, targetLanguage] of [
+    ["3,000억원", "en"],
+    ["KRW 300 billion", "en"],
+    ["USD 7.41M", "ko"],
+    ["1.5 trillion won", "ko"],
+  ]) {
+    const once = normalize(text, targetLanguage);
+    assert.equal(normalize(once, targetLanguage), once);
   }
+});
+
+test("gateway re-exports the same shared final-only normalizer", () => {
+  assert.equal(gatewayNormalizeCommittedCreCaption, normalizeCommittedCreCaption);
+});
+
+test("partial glossary correction keeps terminology but does not rewrite numbers", () => {
+  assert.equal(
+    gatewayApplyGlossaryCorrections("3,000억원 운영자", {
+      glossary: "운영자 = 운영사",
+      targetLanguage: "ko",
+    }),
+    "3,000억원 운영사",
+  );
 });

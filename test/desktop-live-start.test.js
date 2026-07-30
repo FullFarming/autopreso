@@ -60,7 +60,9 @@ test("one-button Live Call start is fail-closed and opens Stage only after auth,
   // that contract exactly or every Start Live Call 400s.
   assert.match(main, /Math\.min\(50, Math\.max\(2, source\.maxViewers\)\)/u);
   assert.match(main, /glossaryPack: "general_cre"/u);
-  assert.match(main, /buildLiveCallGlossary\(savedSettings\?\.subtitle\?\.glossary \?\? ""\)/u);
+  assert.match(main, /liveCaptionConfig = createGeminiCaptionConfig\(/u);
+  assert.match(main, /glossaryText: liveCaptionConfig\?\.glossary \?\? ""/u);
+  assert.doesNotMatch(main, /buildLiveCallGlossary\(savedSettings/u);
 });
 
 test("server-rejected host login is distinct from missing credentials and save verifies against the workspace", () => {
@@ -152,17 +154,22 @@ test("Host End clears the armed session and Stage only after a successful optimi
   assert.match(preload, /endLiveCall: \(\) => ipcRenderer\.invoke\("live-call:end"\)/u);
 });
 
-test("cover upload validates bounded image bytes and uses a raw request body", () => {
+test("cover upload validates 20 MiB locally and bypasses Vercel with a signed Supabase PUT", () => {
   const main = read("electron/main.js");
-  assert.match(main, /MAX_LIVE_COVER_BYTES = 5 \* 1024 \* 1024/u);
+  assert.match(main, /MAX_LIVE_COVER_BYTES = 20 \* 1024 \* 1024/u);
   assert.match(main, /image\/jpeg/u);
   assert.match(main, /image\/png/u);
   assert.match(main, /image\/webp/u);
   assert.match(main, /function validateLiveCoverImage/u);
   assert.match(main, /function matchesLiveCoverMagicBytes/u);
-  assert.match(main, /body: bytes/u);
-  assert.match(main, /"content-type": contentType/u);
-  assert.match(main, /"content-length": String\(bytes\.byteLength\)/u);
+  assert.match(main, /function validateLiveCoverSignedUpload/u);
+  assert.match(main, /protocol !== "https:"/u);
+  assert.match(main, /\\\.supabase\\\.co/u);
+  assert.match(main, /method: "PUT"/u);
+  assert.match(main, /credentials: "omit"/u);
+  assert.match(main, /action: "prepare"/u);
+  assert.match(main, /action: "finalize"/u);
+  assert.doesNotMatch(main, /async function liveCallRawApi/u);
   assert.doesNotMatch(main, /JSON\.stringify\(bytes\)/u);
 });
 
@@ -193,12 +200,46 @@ test("controller Host Speak reuses the running bridge before opening a fallback 
 test("gateway floor changes clear every Electron caption surface before the next speaker", () => {
   const main = read("electron/main.js");
   const preload = read("electron/preload.js");
+  const dashboard = read("public/subtitle-dashboard.js");
 
   assert.match(main, /message\.type === "floor"/u);
+  assert.match(main, /function shouldBlockLiveHostAudioForFloor/u);
+  assert.match(main, /floorKnown: false/u);
+  assert.match(main, /isHostAudioBlocked: true/u);
+  assert.match(main, /bridge\.isHostAudioBlocked = shouldBlockLiveHostAudioForFloor/u);
   assert.match(main, /webContents\.send\("live-call:floor", message\)/u);
   assert.match(preload, /onLiveCallFloor/u);
   assert.match(preload, /ipcRenderer\.on\("live-call:floor", handler\)/u);
   assert.match(preload, /removeListener\("live-call:floor", handler\)/u);
+  assert.match(dashboard, /let isLiveHostAudioBlocked = true/u);
+  assert.match(dashboard, /function applyLiveCallFloorGate/u);
+  assert.match(dashboard, /onLiveCallFloor\?\.\(applyLiveCallFloorGate\)/u);
+  assert.match(dashboard, /if \(isLiveHostAudioBlocked\) return/u);
+});
+
+test("participant floor blocks the single Live Call PCM producer before adaptation", () => {
+  const main = read("electron/main.js");
+  const dashboard = read("public/subtitle-dashboard.js");
+  const audioHandler = main.slice(
+    main.indexOf('ipcMain.on("live-call:audio-frame"'),
+    main.indexOf('ipcMain.handle("live-call:end"'),
+  );
+  assert.ok(audioHandler.indexOf("if (bridge.isHostAudioBlocked) return") < audioHandler.indexOf("adaptCaptionPcmForGateway"));
+  assert.match(main, /message\.holder !== null/u);
+  assert.match(main, /message\.sessionId !== sessionId/u);
+
+  const bridgeCapture = dashboard.slice(
+    dashboard.indexOf("async function startLiveCallMicCapture"),
+    dashboard.indexOf("function requestLocalSubtitlePreflight"),
+  );
+  const floorGate = dashboard.slice(
+    dashboard.indexOf("function applyLiveCallFloorGate"),
+    dashboard.indexOf("function stopLiveCallAudioBridge"),
+  );
+  assert.match(bridgeCapture, /if \(isLiveHostAudioBlocked\) return/u);
+  assert.doesNotMatch(floorGate, /startLocalLiveCallFallback|restoreGatewayCaptionProducer|subtitle:audio/u);
+  assert.doesNotMatch(dashboard, /async function startLocalLiveCallFallback|async function restoreGatewayCaptionProducer/u);
+  assert.match(dashboard, /stopLiveCallAudioBridge\("live call ended"\)[\s\S]{0,300}isLiveHostAudioBlocked = true/u);
 });
 
 test("Live host IPC accepts only source-tagged Caption-only PCM and writes the versioned gateway envelope", () => {
@@ -241,7 +282,7 @@ test("Live host capture failure stops the bridge and becomes visible instead of 
     "a rejected permission must not trigger a hidden retry loop every second");
   assert.match(preload, /reportLiveCallAudioFailure: \(detail\) => ipcRenderer\.invoke\("live-call:audio-failed", detail\)/u);
   assert.match(failureHandler, /isAllowedOrigin/u);
-  assert.match(failureHandler, /stopLiveGatewayBridge\("host audio capture failed"\)/u);
+  assert.match(failureHandler, /await stopLiveGatewayBridge\("host audio capture failed", \{ terminateRemote: true \}\)/u);
   assert.match(failureHandler, /HOST_AUDIO_CAPTURE_FAILED/u);
   assert.match(failureHandler, /notifyLiveBridgeFailure/u);
 });
@@ -287,6 +328,18 @@ test("desktop go-live refreshes the version and the dashboard bridges host audio
     main.indexOf('ipcMain.handle("live-call:end"'),
   );
   assert.match(goLive, /method: "GET"/u);
+  assert.match(goLive, /preflightLiveCallCaptionSession\(settingsStore, armedSession\)/u,
+    "local settings and renderer readiness must pass before the paid remote session starts");
+  assert.match(goLive, /requestRendererLiveCaptionPreflight\(armedSession\)/u,
+    "the dashboard must prove audio capture and local relay readiness before the paid remote session starts");
+  assert.ok(
+    goLive.indexOf("requestRendererLiveCaptionPreflight(armedSession)") < goLive.indexOf("preflightLiveCallCaptionSession(settingsStore, armedSession)"),
+    "renderer preflight must persist the current form before main reloads caption settings",
+  );
+  assert.ok(
+    goLive.indexOf("requestRendererLiveCaptionPreflight(armedSession)") < goLive.indexOf("/start"),
+    "renderer preflight must precede the remote start request",
+  );
   assert.match(goLive, /armedSession\.version = current\.data\.version/u);
   // Cloud Run rejects renderer WebSockets by Origin, so the MAIN process owns
   // the gateway host socket via the trusted non-browser path, and the
@@ -295,7 +348,7 @@ test("desktop go-live refreshes the version and the dashboard bridges host audio
   assert.match(main, /ipcMain\.on\("live-call:audio-frame"/u);
   assert.match(main, /"x-realtime-noel-client": "desktop-main"/u);
   assert.match(main, /function ensureLiveGatewayBridge/u);
-  assert.match(main, /stopLiveGatewayBridge\("live call ended"\)/u);
+  assert.match(main, /await stopLiveGatewayBridge\("live call ended", \{ terminateRemote: true \}\)/u);
   assert.match(main, /gatewaySettings: \{/u);
   assert.match(main, /inputSource: "mic"/u);
   assert.match(main, /displayLanguage: sanitizeLiveCaptionDisplayLanguage\(config\.displayLanguage\)/u);
@@ -307,6 +360,10 @@ test("desktop go-live refreshes the version and the dashboard bridges host audio
 
   const preload = read("electron/preload.js");
   assert.match(preload, /ensureLiveCallBridge: \(\) => ipcRenderer\.invoke\("live-call:bridge-ensure"\)/u);
+  assert.match(preload, /reconnectLiveCallTranslation: \(\) => ipcRenderer\.invoke\("live-call:translation-reconnect"\)/u);
+  assert.match(preload, /onLiveCallPreflight/u);
+  assert.match(preload, /completeLiveCallPreflight/u);
+  assert.match(preload, /onLiveCallPreflightCancel/u);
   assert.match(preload, /sendLiveCallAudioFrame: \(packet\) => ipcRenderer\.send\("live-call:audio-frame", packet\)/u);
 
   // The dashboard uses the exact Caption-only capture contract; main adapts it

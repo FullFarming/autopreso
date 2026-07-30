@@ -4,7 +4,7 @@ import { LANGUAGE_CODES, normalizeLanguageCode } from "../languageDetect";
 
 const SESSION_TYPES = ["presentation", "meeting"] as const;
 const OUTPUT_MODES = ["captions", "captions_audio", "audio"] as const;
-const VOICE_PROVIDERS = ["gemini", "openai"] as const;
+const VOICE_PROVIDERS = ["gemini"] as const;
 const GLOSSARY_PACKS = ["general_cre", "hotel", "fnb"] as const;
 
 const languageSchema = z.preprocess(
@@ -41,15 +41,7 @@ export const createLiveSessionInputSchema = z
     languages: languagesInputSchema,
     maxViewers: z.number().int().min(1).max(50).default(50),
   })
-  .strict()
-  .superRefine((input, context) => {
-    if (input.voiceProvider === "openai" && input.sessionType !== "presentation") {
-      context.addIssue({ code: "custom", path: ["voiceProvider"], message: "OpenAI 음성은 프레젠테이션 모드에서만 사용할 수 있습니다." });
-    }
-    if (input.voiceProvider === "openai" && input.outputMode === "captions") {
-      context.addIssue({ code: "custom", path: ["voiceProvider"], message: "음성 출력 모드에서만 OpenAI 음성을 선택할 수 있습니다." });
-    }
-  });
+  .strict();
 
 export const updateLiveSessionInputSchema = z
   .object({
@@ -64,14 +56,6 @@ export const updateLiveSessionInputSchema = z
     maxViewers: z.number().int().min(1).max(50).optional(),
   })
   .strict()
-  .superRefine((input, context) => {
-    if (input.voiceProvider === "openai" && input.sessionType === "meeting") {
-      context.addIssue({ code: "custom", path: ["voiceProvider"], message: "OpenAI 음성은 프레젠테이션 모드에서만 사용할 수 있습니다." });
-    }
-    if (input.voiceProvider === "openai" && input.outputMode === "captions") {
-      context.addIssue({ code: "custom", path: ["voiceProvider"], message: "음성 출력 모드에서만 OpenAI 음성을 선택할 수 있습니다." });
-    }
-  })
   .refine(
     (input) => input.sessionType !== undefined
       || input.title !== undefined
@@ -126,13 +110,15 @@ const viewerDisplayNameSchema = z
 
 const participantDepartmentSchema = z
   .string()
+  .default("")
   .transform(sanitizeParticipantIdentity)
-  .refine((value) => Array.from(value).length >= 1 && Array.from(value).length <= 80);
+  .refine((value) => Array.from(value).length <= 80);
 
 const participantJobTitleSchema = z
   .string()
+  .default("")
   .transform(sanitizeParticipantIdentity)
-  .refine((value) => Array.from(value).length >= 1 && Array.from(value).length <= 100);
+  .refine((value) => Array.from(value).length <= 100);
 
 export const hostLoginInputSchema = z
   .object({

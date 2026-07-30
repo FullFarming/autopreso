@@ -8,7 +8,6 @@ import {
   normalizeSubtitleLanguageCode,
   resolveConfiguredLanguageForScript,
   toGeminiLanguageCode,
-  toOpenAITranslationLanguageCode,
   subtitleLanguageCharPattern,
   subtitleLanguageLabel,
 } from "../src/subtitle-languages.js";
@@ -77,11 +76,8 @@ test("translation language cap is exactly three", () => {
   assert.equal(MAX_TRANSLATION_LANGUAGES, 3);
 });
 
-test("provider mappings preserve both Chinese writing systems", () => {
+test("Gemini provider mappings preserve both Chinese writing systems", () => {
   assert.equal(toGeminiLanguageCode("zh-Hans"), "zh-Hans");
   assert.equal(toGeminiLanguageCode("zh-Hant"), "zh-Hant");
   assert.equal(toGeminiLanguageCode("ko"), "ko");
-  assert.equal(toOpenAITranslationLanguageCode("zh-Hans"), "zh");
-  assert.equal(toOpenAITranslationLanguageCode("zh-Hant"), "zh");
-  assert.equal(toOpenAITranslationLanguageCode("it"), "it");
 });

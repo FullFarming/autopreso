@@ -7,6 +7,7 @@ import { WebSocket } from "ws";
 
 import { AUDIO_CONFIG } from "../src/config.js";
 import { createGatewayServer } from "../src/gateway-server.js";
+import { evaluateCaptionPolish, LiveMediaPipeline } from "../src/live-media-pipeline.js";
 import { SupabaseLivePublisher } from "../src/supabase-adapters.js";
 
 const INPUT_FRAME_BYTES = AUDIO_CONFIG.inputSampleRate * 2 * AUDIO_CONFIG.chunkMilliseconds / 1_000;
@@ -125,15 +126,68 @@ function createLiveGateway({ gatewayOptions = {}, pipelineHooks = {} } = {}) {
   return { gateway, pipelines, timers };
 }
 
+function createSelectivePolishHarness() {
+  const events = [];
+  const observations = [];
+  const polishCalls = [];
+  let captionSession;
+  let clock = 0;
+  const pipeline = new LiveMediaPipeline({
+    sessionId: "selective-polish-session",
+    sessionType: "meeting",
+    outputMode: "captions",
+    languages: ["ko"],
+    translationTone: "business",
+    domainText: "Commercial real estate",
+    captionPolishPolicy: "selective",
+    now: () => clock,
+    observeLatency: (name, value) => observations.push([name, value]),
+    dependencies: {
+      liveTranslate: {
+        async open(options) {
+          captionSession = {
+            ...options,
+            async sendAudio() {},
+            async audioStreamEnd() {},
+            async close() {},
+          };
+          return captionSession;
+        },
+      },
+      openaiLiveTranslate: { async open() { throw new Error("UNUSED"); } },
+      textTranslate: { async translate({ text }) { return text; } },
+      textToSpeech: { async *synthesizeStream() {} },
+      captionPolish: {
+        async polish(input) {
+          polishCalls.push(input);
+          clock += 500;
+          return input.translatedText;
+        },
+      },
+      publisher: {
+        async markLive() {},
+        async publish(_sessionId, _language, event, { onLiveEvent } = {}) {
+          await onLiveEvent?.(event);
+          events.push(event);
+        },
+        async publishAudio() {},
+      },
+    },
+  });
+  return { pipeline, events, observations, polishCalls, get captionSession() { return captionSession; } };
+}
+
 async function connectHost(port, startMessage = START_MESSAGE) {
   const host = new WebSocket(`ws://127.0.0.1:${port}/live`);
   await once(host, "open");
-  let received = nextJson(host);
+  const next = bufferJson(host);
   host.send(JSON.stringify({ type: "authenticate", token: signHostToken("gateway-secret") }));
-  assert.equal((await received).type, "authenticated");
-  received = nextJson(host);
+  assert.equal((await next((message) => message.type === "authenticated")).type, "authenticated");
   host.send(JSON.stringify(startMessage));
-  assert.equal((await received).type, "started");
+  assert.equal((await next((message) => message.type === "started")).type, "started");
+  host.initialFloorSnapshot = await next((message) => message.type === "floor");
+  assert.equal(host.initialFloorSnapshot.sessionId, "session-1");
+  assert.equal(Object.hasOwn(host.initialFloorSnapshot, "holder"), true);
   return host;
 }
 
@@ -148,6 +202,47 @@ async function joinViewer(port, grantId, { language = "ko", lastSeq } = {}) {
   assert.equal((await received).type, "subscribed");
   return viewer;
 }
+
+test("selective policy polishes evidence-backed risks and skips ordinary configured context", () => {
+  assert.deepEqual(evaluateCaptionPolish("selective", {
+    text: "일반 번역 문장입니다.",
+    sourceText: "This is an ordinary translated sentence.",
+    targetLanguage: "ko",
+    tone: "business",
+    domain: "Commercial real estate",
+  }), { shouldPolish: false, reason: "ordinary" });
+  assert.deepEqual(evaluateCaptionPolish("selective", {
+    text: "…", sourceText: "This sentence has enough content.", targetLanguage: "ko",
+  }), { shouldPolish: true, reason: "placeholder" });
+  assert.deepEqual(evaluateCaptionPolish("selective", {
+    text: "3,000억 원", sourceText: "3,000억 원", targetLanguage: "en",
+  }), { shouldPolish: false, reason: "ordinary" });
+  assert.deepEqual(evaluateCaptionPolish("selective", {
+    text: "A new hotel opened.",
+    sourceText: "Hilton opened a new hotel.",
+    targetLanguage: "en",
+    hasUnresolvedTerm: true,
+  }), { shouldPolish: true, reason: "term_unresolved" });
+  assert.deepEqual(evaluateCaptionPolish("selective", {
+    text: "�", sourceText: "This translation was corrupted.", targetLanguage: "en",
+  }), { shouldPolish: true, reason: "translation_anomaly" });
+});
+
+test("ordinary business captions skip selective provider polish and publish immediately", async () => {
+  const harness = createSelectivePolishHarness();
+  await harness.pipeline.start();
+  await harness.captionSession.onCaption({
+    text: "일반 번역 문장입니다.",
+    sourceText: "This is an ordinary translated sentence.",
+    sourceLanguage: "en-US",
+    isFinal: true,
+  });
+  assert.equal(harness.polishCalls.length, 0);
+  assert.equal(harness.events.find((event) => event.type === "caption" && event.isFinal)?.text, "일반 번역 문장입니다.");
+  assert.deepEqual(harness.observations.find(([name]) => name === "caption_publish_latency_ms"), ["caption_publish_latency_ms", 0]);
+  assert.ok(harness.observations.some(([name]) => name === "caption_polish_reason_ordinary_total"));
+  await harness.pipeline.close();
+});
 
 test("one WebSocket meeting keeps host, participant, viewer, and replay captions in parity", async (context) => {
   const persisted = [];
@@ -501,6 +596,12 @@ test("host disconnect keeps the pipeline, seq, and floor for the grace window an
   // Same host reconnects with the same session settings: reattach, no new pipeline.
   const reconnected = await connectHost(port);
   context.after(() => reconnected.terminate());
+  assert.deepEqual(reconnected.initialFloorSnapshot.holder, {
+    participantId: "participant-1",
+    name: "김노엘",
+    department: "",
+    jobTitle: "",
+  }, "the replacement HOST receives the authoritative participant floor before sending audio");
   assert.equal(pipelines.length, 1, "reattach must not build a fresh pipeline");
   assert.equal(pipelines[0].closed, 0);
   assert.deepEqual(releaseCalls, [], "the speaking floor survives the reconnect");
@@ -514,6 +615,57 @@ test("host disconnect keeps the pipeline, seq, and floor for the grace window an
   const ended = nextJson(reconnected);
   reconnected.send(JSON.stringify({ type: "audioStreamEnd" }));
   assert.equal((await ended).type, "audio-stream-ended");
+});
+
+test("authenticated host stop closes the provider immediately and stays idempotent without a grace detach", async (context) => {
+  const { gateway, pipelines, timers } = createLiveGateway({
+    gatewayOptions: { hostReconnectGraceMilliseconds: 45_000 },
+  });
+  await new Promise((resolve) => gateway.server.listen(0, "127.0.0.1", resolve));
+  context.after(async () => gateway.close());
+  const port = gateway.server.address().port;
+  const host = await connectHost(port);
+  context.after(() => host.terminate());
+
+  let reply = nextJson(host);
+  host.send(JSON.stringify({ type: "stop" }));
+  assert.deepEqual(await reply, { type: "stopped", sessionId: "session-1" });
+  await waitFor(() => pipelines[0].closed === 1);
+  assert.equal(timers.some((timer) => timer.delay === 45_000 && !timer.cancelled), false);
+
+  reply = nextJson(host);
+  host.send(JSON.stringify({ type: "stop" }));
+  assert.deepEqual(await reply, { type: "stopped", sessionId: "session-1" });
+  assert.equal(pipelines[0].closed, 1, "duplicate stop must not close one provider twice");
+
+  host.close();
+  await once(host, "close");
+  assert.equal(timers.some((timer) => timer.delay === 45_000 && !timer.cancelled), false);
+  const metrics = gateway.metrics.render();
+  assert.match(metrics, /realtime_noel_host_intentional_stops_total 1/u);
+  assert.match(metrics, /realtime_noel_host_stop_idempotent_total 1/u);
+
+  const restarted = await connectHost(port);
+  context.after(() => restarted.terminate());
+  assert.equal(pipelines.length, 2);
+  assert.equal(pipelines[0].closed, 1, "a new provider starts only after the stopped provider is closed");
+});
+
+test("an authenticated viewer cannot stop the host provider", async (context) => {
+  const { gateway, pipelines } = createLiveGateway();
+  await new Promise((resolve) => gateway.server.listen(0, "127.0.0.1", resolve));
+  context.after(async () => gateway.close());
+  const port = gateway.server.address().port;
+  const host = await connectHost(port);
+  context.after(() => host.terminate());
+  const viewer = await joinViewer(port, "viewer-stop-attempt");
+  context.after(() => viewer.terminate());
+
+  const reply = nextJson(viewer);
+  viewer.send(JSON.stringify({ type: "stop" }));
+  assert.equal((await reply).code, "INVALID_SUBSCRIPTION");
+  await once(viewer, "close");
+  assert.equal(pipelines[0].closed, 0);
 });
 
 test("a reattach reuses the pipeline for the same glossary but rebuilds it for an edited one", async (context) => {
@@ -610,6 +762,37 @@ test("a lease revocation still tears the pipeline down immediately, bypassing th
   await once(host, "close");
   await waitFor(() => pipelines[0].closed === 1);
   assert.ok(authorizeCalls >= 3);
+});
+
+test("a detached host lease observes REST termination before the 90-second grace expires", async (context) => {
+  let leaseCallback;
+  const { gateway, pipelines, timers } = createLiveGateway({
+    gatewayOptions: {
+      hostReconnectGraceMilliseconds: 90_000,
+      hostAuthorizer: {
+        async authorize(_claims, _settings, options) {
+          return options.compareVersion;
+        },
+      },
+      setHostLeaseIntervalFn(callback) { leaseCallback = callback; return { lease: true }; },
+      clearHostLeaseIntervalFn() {},
+    },
+  });
+  await new Promise((resolve) => gateway.server.listen(0, "127.0.0.1", resolve));
+  context.after(async () => gateway.close());
+  const host = await connectHost(gateway.server.address().port);
+
+  host.close();
+  await once(host, "close");
+  await waitFor(() => timers.some((timer) => timer.delay === 90_000 && !timer.cancelled));
+  leaseCallback();
+
+  await waitFor(() => pipelines[0].closed === 1);
+  assert.equal(
+    timers.some((timer) => timer.delay === 90_000 && !timer.cancelled),
+    false,
+    "REST termination must cancel detached reconnect grace",
+  );
 });
 
 test("host pause/resume gates the pipeline and broadcasts session-status to viewers", async (context) => {

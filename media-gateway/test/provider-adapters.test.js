@@ -2,7 +2,8 @@ import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import test from "node:test";
 
-import { ChirpTextToSpeechAdapter, CloudSpeechToTextAdapter, CloudTranslationAdvancedAdapter, GeminiLiveTranslateAdapter, GeminiTextTranslateAdapter, SourceOutputCorrelationPolicy } from "../src/google-provider-adapters.js";
+import { localTermRetrievalContract } from "../../packages/caption-core/index.js";
+import { CloudSpeechToTextAdapter, GeminiLiveTranslateAdapter, GeminiTextTranslateAdapter, SourceOutputCorrelationPolicy } from "../src/google-provider-adapters.js";
 import { SupabaseViewerAuthorizer } from "../src/supabase-adapters.js";
 
 test("source/output correlation policy learns rolling p99 within hard bounds", () => {
@@ -13,185 +14,6 @@ test("source/output correlation policy learns rolling p99 within hard bounds", (
   assert.equal(policy.outputWaitMs(), 600);
   assert.equal(policy.contextMaxAgeMs(), 5_000);
 });
-
-test("Chirp uses v1 bidirectional PCM streaming and yields audio before ending input", async () => {
-  const streams = [];
-  const adapter = new ChirpTextToSpeechAdapter({
-    client: {
-      streamingSynthesize() {
-        const stream = new EventEmitter();
-        stream.requests = [];
-        stream.ended = false;
-        stream.write = (request) => {
-          stream.requests.push(request);
-          if (request.input) stream.emit("data", { audioContent: pcmChunk(1_000, 240) });
-          return true;
-        };
-        stream.end = () => {
-          stream.ended = true;
-          stream.emit("end");
-        };
-        stream.destroy = () => {};
-        streams.push(stream);
-        return stream;
-      },
-    },
-  });
-  const iterator = adapter.synthesizeStream({ language: "ko", voiceName: "Achernar", text: "안녕하세요", sampleRate: 24_000 });
-  const first = await iterator.next();
-  assert.equal(first.done, false);
-  assert.equal(streams[0].ended, false, "first audio must be consumable before the request stream ends");
-  assert.deepEqual(streams[0].requests[0], {
-    streamingConfig: {
-      voice: { languageCode: "ko-KR", name: "ko-KR-Chirp3-HD-Achernar" },
-      streamingAudioConfig: { audioEncoding: "PCM", sampleRateHertz: 24_000, speakingRate: 1.08 },
-    },
-  });
-  assert.deepEqual(streams[0].requests[1], { input: { text: "안녕하세요" } });
-  await iterator.return();
-});
-
-test("Chirp streaming sends byte-bounded text segments and preserves response order", async () => {
-  const requests = [];
-  const streams = [];
-  let responseIndex = 0;
-  const adapter = new ChirpTextToSpeechAdapter({ client: { streamingSynthesize() {
-    const stream = new EventEmitter();
-    stream.write = (request) => {
-      requests.push(request);
-      if (request.input) {
-        responseIndex += 1;
-        stream.emit("data", { audioContent: pcmChunk(responseIndex * 1_000, 240) });
-      }
-      return true;
-    };
-    stream.end = () => stream.emit("end");
-    stream.destroy = () => {};
-    streams.push(stream);
-    return stream;
-  } } });
-  const outputs = [];
-  for await (const chunk of adapter.synthesizeStream({
-    language: "ja",
-    voiceName: "Achernar",
-    text: "文です。".repeat(500),
-    sampleRate: 24_000,
-  })) outputs.push(chunk);
-  const textRequests = requests.filter((request) => request.input).map((request) => request.input.text);
-  assert.equal(textRequests.join(""), "文です。".repeat(500));
-  assert.equal(textRequests.every((text) => Buffer.byteLength(text, "utf8") < 5_000), true);
-  assert.equal(streams.length, 1, "one utterance keeps a single provider stream and stable voice");
-  assert.equal(readLastSample(outputs[0]) < readLastSample(outputs[1]), true);
-});
-
-test("Chirp abort destroys a request stalled on drain", async () => {
-  const stream = new EventEmitter();
-  let writes = 0;
-  let destroyed = 0;
-  stream.write = () => {
-    writes += 1;
-    return writes < 2;
-  };
-  stream.end = () => stream.emit("end");
-  stream.destroy = () => { destroyed += 1; };
-  const abortController = new AbortController();
-  const adapter = new ChirpTextToSpeechAdapter({ client: { streamingSynthesize: () => stream } });
-  const iterator = adapter.synthesizeStream({
-    language: "ko",
-    voiceName: "Achernar",
-    text: "멈춘 요청",
-    sampleRate: 24_000,
-    signal: abortController.signal,
-  });
-  const next = iterator.next();
-  const rejected = assert.rejects(() => next, /QUEUE_LATENCY_EXCEEDED/u);
-  await new Promise((resolve) => setImmediate(resolve));
-  const deadlineError = new Error("QUEUE_LATENCY_EXCEEDED");
-  abortController.abort(deadlineError);
-  await new Promise((resolve) => setImmediate(resolve));
-  const destroyedAfterAbort = destroyed;
-  if (destroyedAfterAbort === 0) stream.emit("error", deadlineError);
-  await rejected;
-  assert.equal(destroyedAfterAbort, 1);
-});
-
-test("Chirp response buffering fails closed and destroys a flooding provider", async () => {
-  const stream = new EventEmitter();
-  let destroyed = 0;
-  stream.write = (request) => {
-    if (request.input) {
-      for (let index = 0; index < 60; index += 1) {
-        stream.emit("data", { audioContent: new Uint8Array(10_000) });
-      }
-    }
-    return true;
-  };
-  stream.end = () => stream.emit("end");
-  stream.destroy = () => { destroyed += 1; };
-  const adapter = new ChirpTextToSpeechAdapter({ client: { streamingSynthesize: () => stream } });
-  const iterator = adapter.synthesizeStream({ language: "ko", voiceName: "Achernar", text: "범람", sampleRate: 24_000 });
-
-  await assert.rejects(() => iterator.next(), /TTS_RESPONSE_BUFFER_EXCEEDED/u);
-  assert.equal(destroyed, 1);
-});
-
-test("Chirp pauses and resumes a fast provider instead of failing at three seconds of buffered audio", async () => {
-  const stream = new EventEmitter();
-  let paused = 0;
-  let resumed = 0;
-  stream.pause = () => { paused += 1; };
-  stream.resume = () => { resumed += 1; };
-  stream.write = (request) => {
-    if (request.input) {
-      for (let index = 0; index < 18; index += 1) stream.emit("data", { audioContent: new Uint8Array(10_000) });
-    }
-    return true;
-  };
-  stream.end = () => stream.emit("end");
-  stream.destroy = () => {};
-  const adapter = new ChirpTextToSpeechAdapter({ client: { streamingSynthesize: () => stream } });
-  let outputBytes = 0;
-  for await (const chunk of adapter.synthesizeStream({ language: "ko", voiceName: "Achernar", text: "긴 응답", sampleRate: 24_000 })) {
-    outputBytes += chunk.byteLength;
-  }
-  assert.equal(outputBytes, 180_000);
-  assert.equal(paused, 1);
-  assert.equal(resumed, 1);
-});
-
-test("Chirp rejects one oversized response even when a consumer is already waiting", async () => {
-  const stream = new EventEmitter();
-  let destroyed = 0;
-  stream.write = (request) => {
-    if (request.input) setImmediate(() => stream.emit("data", { audioContent: new Uint8Array(480_002) }));
-    return true;
-  };
-  stream.end = () => stream.emit("end");
-  stream.destroy = () => { destroyed += 1; };
-  const adapter = new ChirpTextToSpeechAdapter({ client: { streamingSynthesize: () => stream } });
-  const iterator = adapter.synthesizeStream({ language: "ko", voiceName: "Achernar", text: "큰 응답", sampleRate: 24_000 });
-
-  await assert.rejects(() => iterator.next(), /TTS_RESPONSE_BUFFER_EXCEEDED/u);
-  assert.equal(destroyed, 1);
-});
-
-function pcmChunk(sample, count) {
-  const bytes = new Uint8Array(count * 2);
-  const view = new DataView(bytes.buffer);
-  for (let index = 0; index < count; index += 1) view.setInt16(index * 2, sample, true);
-  return bytes;
-}
-
-function readLastSample(bytes) {
-  return new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getInt16(bytes.byteLength - 2, true);
-}
-
-// A throwing caption handler used to be swallowed by `.catch(() => undefined)`
-// on the callback tail: no log, no counter, nothing. If the caption path failed
-// on every message — a snapshot allowlist rejection escalating to
-// SESSION_STOPPED, a Supabase 5xx, a polish adapter throwing — then every
-// caption for the rest of the session vanished while /health stayed ok and the
-// audio frame counter kept climbing. The failure has to be observable.
 test("a throwing caption handler is reported and does not break the callback tail", async () => {
   const errors = [];
   const delivered = [];
@@ -250,7 +72,10 @@ test("Gemini close drains detached finalized caption work", async () => {
   messageHandler({ serverContent: {
     outputTranscription: { text: "A finalized sentence." }, turnComplete: true,
   } });
-  await new Promise((resolve) => setImmediate(resolve));
+  for (let tick = 0; tick < 20 && typeof releaseFinal !== "function"; tick += 1) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  assert.equal(typeof releaseFinal, "function", "the final must be accepted before close begins");
   let didClose = false;
   const closing = session.close().then(() => { didClose = true; });
   await new Promise((resolve) => setImmediate(resolve));
@@ -753,27 +578,6 @@ test("Gemini reconnect keeps retrying transient failures beyond three attempts",
   await session.close();
 });
 
-test("Meeting translation uses deterministic Cloud Translation Advanced request fields", async () => {
-  let request;
-  const adapter = new CloudTranslationAdvancedAdapter({
-    projectId: "dev-project",
-    client: {
-      async translateText(value) {
-        request = value;
-        return [{ translations: [{ translatedText: "번역" }] }];
-      },
-    },
-  });
-  assert.equal(await adapter.translate({ text: "market rent", language: "ko-KR", sourceLanguage: "en-US" }), "번역");
-  assert.deepEqual(request, {
-    parent: "projects/dev-project/locations/global",
-    contents: ["market rent"],
-    mimeType: "text/plain",
-    targetLanguageCode: "ko",
-    sourceLanguageCode: "en",
-  });
-});
-
 test("Gemini reconnect swaps only after connect succeeds and closes every provider session once", async () => {
   const callbacks = [];
   const sessions = [];
@@ -923,7 +727,14 @@ test("Cloud STT exposes only safe gRPC status and reason on provider failure", a
   stream.end = () => {};
   const adapter = new CloudSpeechToTextAdapter({ client: { streamingRecognize: () => stream }, projectId: "dev-project", languageCodes: ["ko-KR"] });
   const session = await adapter.open({ async onFinalUtterance() {} });
-  stream.emit("error", { code: 3, details: "private recognizer name and diarization are invalid" });
+  const errors = [];
+  const originalError = console.error;
+  console.error = (...values) => errors.push(values.join(" "));
+  try {
+    stream.emit("error", { code: 3, details: "private recognizer https://speech.example?key=AIza-secret and diarization are invalid" });
+  } finally {
+    console.error = originalError;
+  }
   await assert.rejects(() => session.sendAudio(new Uint8Array(1_280)), (error) => {
     assert.equal(error.message, "STT_PROVIDER_INVALID_ARGUMENT");
     assert.equal(error.providerStatusCode, 3);
@@ -931,6 +742,8 @@ test("Cloud STT exposes only safe gRPC status and reason on provider failure", a
     assert.equal(error.message.includes("private"), false);
     return true;
   });
+  assert.match(errors.join("\n"), /STT_PROVIDER_INVALID_ARGUMENT.*DIARIZATION_CONFIGURATION_REJECTED/u);
+  assert.doesNotMatch(errors.join("\n"), /AIza|speech\.example|key=|private recognizer/u);
 });
 
 test("Cloud STT dispatches later utterances before an earlier downstream task finishes", async () => {
@@ -1071,7 +884,7 @@ test("Cloud STT surfaces interim transcripts through onPartialTranscript", async
   await session.close();
 });
 
-test("Gemini text translation serves BOTH partials and finals; Cloud Translate is failure-only", async () => {
+test("Gemini text translation serves BOTH partials and finals without an alternate provider", async () => {
   const calls = [];
   const geminiClient = {
     models: {
@@ -1082,19 +895,17 @@ test("Gemini text translation serves BOTH partials and finals; Cloud Translate i
       },
     },
   };
-  const fallbackCalls = [];
-  const fallback = {
-    async translate(input) {
-      fallbackCalls.push(input);
-      return `cloud:${input.text}`;
-    },
-  };
-  const adapter = new GeminiTextTranslateAdapter({ client: geminiClient, model: "gemini-3.5-flash", fallback });
+  const adapter = new GeminiTextTranslateAdapter({ client: geminiClient });
 
   // Finals go through Gemini for desktop-parity quality.
   const finalText = await adapter.translate({ text: "안녕하세요 여러분 시작하겠습니다", language: "en", sourceLanguage: "ko-KR", intent: "final" });
   assert.equal(finalText, "Hello everyone, let us begin.");
   assert.equal(calls.length, 1);
+  assert.equal(calls[0].model, "gemini-3.6-flash");
+  assert.deepEqual(calls[0].config.thinkingConfig, { thinkingLevel: "minimal" });
+  assert.equal("temperature" in calls[0].config, false);
+  assert.equal("topP" in calls[0].config, false);
+  assert.equal("topK" in calls[0].config, false);
   assert.match(String(calls[0].contents[0].parts[0].text), /안녕하세요 여러분 시작하겠습니다/);
 
   // Partials also go through Gemini — captions are locked to Gemini 3.5.
@@ -1102,30 +913,57 @@ test("Gemini text translation serves BOTH partials and finals; Cloud Translate i
   assert.equal(partialText, "Hello everyone, let us begin.");
   assert.equal(calls.length, 2);
 
-  // A Gemini failure falls back to Cloud Translate instead of failing the lane.
-  const recovered = await adapter.translate({ text: "실패해줘", language: "en", sourceLanguage: "ko-KR", intent: "final" });
-  assert.equal(recovered, "cloud:실패해줘");
+  // A Gemini failure is explicit instead of silently changing translation engines.
+  await assert.rejects(
+    adapter.translate({ text: "실패해줘", language: "en", sourceLanguage: "ko-KR", intent: "final" }),
+    /GEMINI_DOWN/u,
+  );
 });
 
-test("Gemini text translation rejects output in the wrong script and falls back", async () => {
+test("Gemini text failure logs only a safe failure code and propagates", async () => {
+  const secret = ["test", "gemini", "marker"].join("-");
+  const providerError = new Error(`request https://generativelanguage.googleapis.com?key=${secret}`);
+  providerError.code = `Bearer ${secret}`;
+  const adapter = new GeminiTextTranslateAdapter({
+    client: { models: { async generateContent() { throw providerError; } } },
+  });
+  const warnings = [];
+  const originalWarn = console.warn;
+  console.warn = (...values) => warnings.push(values.join(" "));
+  try {
+    await assert.rejects(
+      adapter.translate({ text: "안녕하세요", language: "en", sourceLanguage: "ko-KR", intent: "final" }),
+      (error) => error === providerError,
+    );
+  } finally {
+    console.warn = originalWarn;
+  }
+  assert.match(warnings.join("\n"), /GEMINI_TRANSLATE_FAILED/u);
+  assert.doesNotMatch(warnings.join("\n"), /AIza|Bearer|googleapis\.com|key=/u);
+});
+
+test("Gemini text translation rejects output in the wrong script without fallback", async () => {
   const geminiClient = {
     models: {
       // Model echoes Korean back instead of translating: must not surface.
       async generateContent() { return { text: "안녕하세요 여러분" }; },
     },
   };
-  const fallback = { async translate(input) { return `cloud:${input.text}`; } };
-  const adapter = new GeminiTextTranslateAdapter({ client: geminiClient, fallback });
-  const result = await adapter.translate({ text: "안녕하세요 여러분", language: "en", sourceLanguage: "ko-KR", intent: "final" });
-  assert.equal(result, "cloud:안녕하세요 여러분");
+  const adapter = new GeminiTextTranslateAdapter({ client: geminiClient });
+  await assert.rejects(
+    adapter.translate({ text: "안녕하세요 여러분", language: "en", sourceLanguage: "ko-KR", intent: "final" }),
+    /TRANSLATION_WRONG_SCRIPT/u,
+  );
 });
 
 test("Gemini text translation injects only relevant glossary terms into each network prompt", async () => {
   const prompts = [];
+  const systemInstructions = [];
   const geminiClient = {
     models: {
       async generateContent(request) {
         prompts.push(String(request.contents?.[0]?.parts?.[0]?.text ?? ""));
+        systemInstructions.push(String(request.config?.systemInstruction ?? ""));
         return { text: "Hilton Garden Inn conversion is on track." };
       },
     },
@@ -1139,11 +977,13 @@ test("Gemini text translation injects only relevant glossary terms into each net
     glossaryText: `[Terms]\n${irrelevant}\n힐튼 가든 인 = Hilton Garden Inn\n컨버전 = conversion`,
     intent: "final",
   });
-  assert.match(prompts[0], /Glossary — always use these exact term translations:/);
-  assert.match(prompts[0], /힐튼 가든 인 = Hilton Garden Inn/);
-  assert.match(prompts[0], /컨버전 = conversion/);
-  assert.doesNotMatch(prompts[0], /무관용어499/u);
-  assert.ok(prompts[0].length < 7_000);
+  assert.match(systemInstructions[0], /SECURITY BOUNDARY/u);
+  const promptLines = prompts[0].split("\n");
+  const payload = JSON.parse(promptLines[2]);
+  assert.match(payload.glossary, /힐튼 가든 인 = Hilton Garden Inn/);
+  assert.match(payload.glossary, /컨버전 = conversion/);
+  assert.doesNotMatch(payload.glossary, /무관용어499/u);
+  assert.ok(payload.glossary.length <= localTermRetrievalContract.maximumPromptCharacters);
 });
 
 test("Gemini Live Translate uses an 800 ms fallback only after an explicit audio boundary", () => {

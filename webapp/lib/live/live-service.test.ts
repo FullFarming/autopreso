@@ -8,6 +8,178 @@ import { getLiveStoreConfig } from "./config";
 import { toLiveFailure } from "./errors";
 import { MemoryLiveSessionStore, SupabaseLiveSessionStore } from "./store";
 import { parseLanguages, parseScheduledAt, parseSessionId, parseTitle } from "./validation";
+import { coverImagePath } from "./cover-image";
+import { enforceCoverUploadRateLimit, type RateLimitStore } from "../security/live-rate-limit";
+import { createCoverSignedDownloadUrl, createCoverSignedUploadUrl } from "./cover-storage";
+import {
+  createGlossaryPresetInputSchema,
+  deleteGlossaryPresetBodySchema,
+  glossaryPresetIdSchema,
+  updateGlossaryPresetBodySchema,
+} from "../glossary-presets/schema";
+import { GlossaryPresetService } from "../glossary-presets/service";
+import {
+  SupabaseGlossaryPresetStore,
+  type GlossaryPresetStore,
+} from "../glossary-presets/store";
+import type { CreateGlossaryPresetInput } from "../glossary-presets/schema";
+import type { GlossaryPreset } from "../glossary-presets/types";
+
+test("cover storage consumes the documented signed-upload response shape and returns the exact project origin", async () => {
+  const environmentKeys = [
+    "LIVE_EXTERNAL_ENV",
+    "LIVE_ALLOWED_SUPABASE_REF",
+    "SUPABASE_URL",
+    "SUPABASE_SECRET_KEY",
+    "SUPABASE_SERVICE_ROLE_KEY",
+  ] as const;
+  const previous = Object.fromEntries(environmentKeys.map((key) => [key, process.env[key]]));
+  process.env.LIVE_EXTERNAL_ENV = "development";
+  process.env.LIVE_ALLOWED_SUPABASE_REF = "approved-dev-ref";
+  process.env.SUPABASE_URL = "https://approved-dev-ref.supabase.co";
+  process.env.SUPABASE_SECRET_KEY = `sb_secret_${"a".repeat(24)}`;
+  delete process.env.SUPABASE_SERVICE_ROLE_KEY;
+  const objectPath = `${crypto.randomUUID()}/pending/${"a".repeat(32)}.jpg`;
+  try {
+    const fetchFn = (async (input: string | URL | Request, init?: RequestInit) => {
+      assert.equal(String(input), `https://approved-dev-ref.supabase.co/storage/v1/object/upload/sign/live-covers/${objectPath}`);
+      assert.equal(init?.method, "POST");
+      assert.equal(init?.body, "{}");
+      return Response.json({
+        url: `/object/upload/sign/live-covers/${objectPath}?token=signed-token`,
+      });
+    }) as typeof fetch;
+    assert.deepEqual(await createCoverSignedUploadUrl(objectPath, fetchFn), {
+      uploadUrl: `https://approved-dev-ref.supabase.co/storage/v1/object/upload/sign/live-covers/${objectPath}?token=signed-token`,
+      storageOrigin: "https://approved-dev-ref.supabase.co",
+    });
+  } finally {
+    for (const key of environmentKeys) {
+      const value = previous[key];
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+});
+
+test("private cover download expands the documented relative signedURL without proxying bytes", async () => {
+  const environmentKeys = [
+    "LIVE_EXTERNAL_ENV",
+    "LIVE_ALLOWED_SUPABASE_REF",
+    "SUPABASE_URL",
+    "SUPABASE_SECRET_KEY",
+    "SUPABASE_SERVICE_ROLE_KEY",
+  ] as const;
+  const previous = Object.fromEntries(environmentKeys.map((key) => [key, process.env[key]]));
+  process.env.LIVE_EXTERNAL_ENV = "development";
+  process.env.LIVE_ALLOWED_SUPABASE_REF = "approved-dev-ref";
+  process.env.SUPABASE_URL = "https://approved-dev-ref.supabase.co";
+  process.env.SUPABASE_SECRET_KEY = `sb_secret_${"a".repeat(24)}`;
+  delete process.env.SUPABASE_SERVICE_ROLE_KEY;
+  const objectPath = `${crypto.randomUUID()}/cover-${"a".repeat(32)}`;
+  try {
+    const fetchFn = (async (input: string | URL | Request, init?: RequestInit) => {
+      assert.equal(String(input), `https://approved-dev-ref.supabase.co/storage/v1/object/sign/live-covers/${objectPath}`);
+      assert.equal(init?.body, JSON.stringify({ expiresIn: 300 }));
+      return Response.json({
+        signedURL: `/object/sign/live-covers/${objectPath}?token=download-token`,
+      });
+    }) as typeof fetch;
+    assert.equal(
+      await createCoverSignedDownloadUrl(objectPath, 300, fetchFn),
+      `https://approved-dev-ref.supabase.co/storage/v1/object/sign/live-covers/${objectPath}?token=download-token`,
+    );
+  } finally {
+    for (const key of environmentKeys) {
+      const value = previous[key];
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+});
+
+test("cover prepare limiter uses one opaque host-session bucket and returns 429", async () => {
+  const calls: Array<{ scope: string; keyHash: string; limit: number; windowSeconds: number }> = [];
+  const store: RateLimitStore = {
+    async consumeRateLimit(input) {
+      calls.push(input);
+      return calls.length === 1;
+    },
+  };
+  await enforceCoverUploadRateLimit("host-1", "session-1", store);
+  assert.deepEqual({ ...calls[0], keyHash: "<hashed>" }, {
+    scope: "cover-upload-host-session",
+    keyHash: "<hashed>",
+    limit: 12,
+    windowSeconds: 3600,
+  });
+  assert.match(calls[0].keyHash, /^[0-9a-f]{64}$/u);
+  assert.equal(calls[0].keyHash.includes("host-1"), false);
+  assert.equal(calls[0].keyHash.includes("session-1"), false);
+  await assert.rejects(
+    enforceCoverUploadRateLimit("host-1", "session-1", store),
+    (error: unknown) => error instanceof Error
+      && "code" in error
+      && error.code === "COVER_UPLOAD_RATE_LIMITED"
+      && "status" in error
+      && error.status === 429,
+  );
+});
+
+test("cover compare-and-set permits one concurrent replacement and rejects failed sessions", async () => {
+  const now = Date.UTC(2026, 6, 27);
+  const store = new MemoryLiveSessionStore(() => now);
+  const service = new LiveSessionService(store, () => now);
+  const session = await service.create("host-1", { sessionType: "meeting", languages: ["ko", "en"] });
+  const firstPath = coverImagePath(session.id, "a".repeat(32));
+  assert.equal(await store.setCoverImageOwned(session.id, "host-1", firstPath, null), true);
+
+  const contenders = [
+    coverImagePath(session.id, "b".repeat(32)),
+    coverImagePath(session.id, "c".repeat(32)),
+  ];
+  const results = await Promise.all(contenders.map((path) => (
+    store.setCoverImageOwned(session.id, "host-1", path, firstPath)
+  )));
+  assert.deepEqual(results.sort(), [false, true]);
+  await assert.rejects(
+    service.setCoverImage("host-1", session.id, coverImagePath(session.id, "e".repeat(32)), firstPath),
+    (error: unknown) => error instanceof Error && "code" in error && error.code === "COVER_FINALIZE_CONFLICT",
+  );
+
+  const failedId = crypto.randomUUID();
+  await store.create({ ...session, id: failedId, status: "failed", hasCoverImage: false, coverImageVersion: null });
+  assert.equal(await store.setCoverImageOwned(failedId, "host-1", coverImagePath(failedId, "d".repeat(32)), null), false);
+  await assert.rejects(
+    service.setCoverImage("host-1", failedId, coverImagePath(failedId, "e".repeat(32)), null),
+    (error: unknown) => error instanceof Error && "code" in error && error.code === "SESSION_ENDED",
+  );
+  await assert.rejects(
+    service.setCoverImage("host-1", crypto.randomUUID(), coverImagePath(failedId, "f".repeat(32)), null),
+    (error: unknown) => error instanceof Error && "code" in error && error.code === "SESSION_NOT_FOUND",
+  );
+});
+
+test("Supabase cover compare-and-set filters active status and the exact previous path", async () => {
+  const requestUrls: string[] = [];
+  const store = new SupabaseLiveSessionStore(
+    "https://dev-ref.supabase.co",
+    { key: `sb_secret_${"a".repeat(24)}`, kind: "secret" },
+    async (input) => {
+      requestUrls.push(String(input));
+      return Response.json([]);
+    },
+  );
+  const sessionId = crypto.randomUUID();
+  const oldPath = coverImagePath(sessionId, "a".repeat(32));
+  await store.setCoverImageOwned(sessionId, "host-1", coverImagePath(sessionId, "b".repeat(32)), null);
+  await store.setCoverImageOwned(sessionId, "host-1", coverImagePath(sessionId, "c".repeat(32)), oldPath);
+  const first = new URL(requestUrls[0]);
+  const second = new URL(requestUrls[1]);
+  assert.equal(first.searchParams.get("status"), "in.(preparing,live,paused)");
+  assert.equal(first.searchParams.get("cover_image_path"), "is.null");
+  assert.equal(second.searchParams.get("cover_image_path"), `eq.${oldPath}`);
+});
 
 test("session ids reject malformed external path input", () => {
   assert.equal(parseSessionId("0192d0f4-9f72-7a36-91f5-6a76ef736f41"), "0192d0f4-9f72-7a36-91f5-6a76ef736f41");
@@ -71,7 +243,7 @@ test("scheduled session expires six hours after schedule and rejects more than 3
   );
 });
 
-test("OpenAI voice is presentation-only and remains independent from Gemini captions", async () => {
+test("stale OpenAI voice inputs normalize to Gemini in every output mode", async () => {
   const service = new LiveSessionService(new MemoryLiveSessionStore());
   const presentation = await service.create("host-1", {
     sessionType: "presentation",
@@ -79,16 +251,14 @@ test("OpenAI voice is presentation-only and remains independent from Gemini capt
     voiceProvider: "openai",
     languages: ["ko"],
   });
-  assert.equal(presentation.voiceProvider, "openai");
-  await assert.rejects(
-    service.create("host-1", {
-      sessionType: "meeting",
-      outputMode: "captions_audio",
-      voiceProvider: "openai",
-      languages: ["ko"],
-    }),
-    (error: unknown) => error instanceof Error && "code" in error && error.code === "OPENAI_VOICE_OUTPUT_ONLY",
-  );
+  assert.equal(presentation.voiceProvider, "gemini");
+  const meeting = await service.create("host-1", {
+    sessionType: "meeting",
+    outputMode: "captions_audio",
+    voiceProvider: "openai",
+    languages: ["ko"],
+  });
+  assert.equal(meeting.voiceProvider, "gemini");
   await assert.rejects(
     service.create("host-1", {
       sessionType: "presentation",
@@ -98,15 +268,13 @@ test("OpenAI voice is presentation-only and remains independent from Gemini capt
     }),
     (error: unknown) => error instanceof Error && "code" in error && error.code === "INVALID_LANGUAGES",
   );
-  await assert.rejects(
-    service.create("host-1", {
-      sessionType: "presentation",
-      outputMode: "captions",
-      voiceProvider: "openai",
-      languages: ["ko"],
-    }),
-    (error: unknown) => error instanceof Error && "code" in error && error.code === "OPENAI_VOICE_OUTPUT_ONLY",
-  );
+  const captions = await service.create("host-1", {
+    sessionType: "presentation",
+    outputMode: "captions",
+    voiceProvider: "openai",
+    languages: ["ko"],
+  });
+  assert.equal(captions.voiceProvider, "gemini");
 });
 
 test("changing an OpenAI presentation to meeting resets voice output provider to Gemini", async () => {
@@ -458,7 +626,7 @@ test("getSnapshot serves a bounded oldest window whose lastSeq resumes gateway p
   assert.match(utteranceQueries[0], /order=seq\.asc/u);
 });
 
-test("Supabase rows reject unknown or meeting-scoped OpenAI voice providers", async () => {
+test("Supabase rows reject invalid providers and normalize stale OpenAI rows to Gemini", async () => {
   const expiresAt = new Date(Date.now() + 60_000).toISOString();
   const baseRow = {
     id: crypto.randomUUID(), host_id: "host-1", session_type: "presentation", output_mode: "audio",
@@ -468,8 +636,6 @@ test("Supabase rows reject unknown or meeting-scoped OpenAI voice providers", as
   for (const row of [
     { ...baseRow, voice_provider: undefined },
     { ...baseRow, voice_provider: "unknown" },
-    { ...baseRow, session_type: "meeting", voice_provider: "openai" },
-    { ...baseRow, output_mode: "captions", voice_provider: "openai" },
   ]) {
     const store = new SupabaseLiveSessionStore(
       "https://dev-ref.supabase.co",
@@ -480,6 +646,17 @@ test("Supabase rows reject unknown or meeting-scoped OpenAI voice providers", as
       store.get(baseRow.id),
       (error: unknown) => error instanceof Error && "code" in error && error.code === "INVALID_STORED_SESSION",
     );
+  }
+  for (const row of [
+    { ...baseRow, session_type: "meeting", voice_provider: "openai" },
+    { ...baseRow, output_mode: "captions", voice_provider: "openai" },
+  ]) {
+    const store = new SupabaseLiveSessionStore(
+      "https://dev-ref.supabase.co",
+      { key: `sb_secret_${"a".repeat(24)}`, kind: "secret" },
+      async () => Response.json([row]),
+    );
+    assert.equal((await store.get(baseRow.id))?.voiceProvider, "gemini");
   }
 });
 
@@ -517,7 +694,7 @@ test("Supabase session writes use atomic canonical RPC contracts", async () => {
     max_viewers: 24,
     version: 1,
     glossary_pack: "hotel",
-    voice_provider: "openai",
+    voice_provider: "gemini",
     admission_open_until: null,
     expires_at: expiresAt,
   };
@@ -542,7 +719,7 @@ test("Supabase session writes use atomic canonical RPC contracts", async () => {
     maxViewers: 24,
     version: 1,
     glossaryPack: "hotel",
-    voiceProvider: "openai",
+    voiceProvider: "gemini",
     admissionOpenUntil: null,
     expiresAt,
   });
@@ -567,7 +744,7 @@ test("Supabase session writes use atomic canonical RPC contracts", async () => {
     p_languages: ["ko"],
     p_max_viewers: 24,
     p_glossary_pack: "hotel",
-    p_voice_provider: "openai",
+    p_voice_provider: "gemini",
     p_expires_at: expiresAt,
   });
   assert.match(requests[1]?.url ?? "", /\/rpc\/update_live_session$/u);
@@ -656,4 +833,173 @@ test("host session GET validates authentication, id, ownership, and safe error m
   assert.match(getHandler, /return apiSuccess\(session\)/u);
   assert.match(getHandler, /error instanceof AuthenticationError/u);
   assert.match(getHandler, /const failure = toLiveFailure\(error\)/u);
+});
+
+test("custom glossary preset inputs enforce all product ceilings and canonical language pairs", () => {
+  const valid = {
+    name: "CRE Board",
+    domain: "Commercial real estate",
+    glossary: "공실률 = vacancy rate",
+    languagePair: { a: "en", b: "ko" },
+  };
+  assert.equal(createGlossaryPresetInputSchema.safeParse(valid).success, true);
+  assert.equal(createGlossaryPresetInputSchema.safeParse({ ...valid, name: "x".repeat(81) }).success, false);
+  assert.equal(createGlossaryPresetInputSchema.safeParse({ ...valid, domain: "x".repeat(601) }).success, false);
+  assert.equal(createGlossaryPresetInputSchema.safeParse({ ...valid, glossary: "x".repeat(16_001) }).success, false);
+  assert.equal(createGlossaryPresetInputSchema.safeParse({ ...valid, languagePair: { a: "en", b: "en" } }).success, false);
+  assert.equal(createGlossaryPresetInputSchema.safeParse({ ...valid, languagePair: { a: "en", b: "xx" } }).success, false);
+  assert.equal(glossaryPresetIdSchema.safeParse(crypto.randomUUID()).success, true);
+  assert.equal(updateGlossaryPresetBodySchema.safeParse({ version: 1, ...valid }).success, true);
+  assert.equal(deleteGlossaryPresetBodySchema.safeParse({ version: 1 }).success, true);
+});
+
+test("Supabase glossary store uses only the four owner-bound RPC contracts", async () => {
+  const id = crypto.randomUUID();
+  const row = {
+    id,
+    name: "CRE Board",
+    domain: "Commercial real estate",
+    glossary: "공실률 = vacancy rate",
+    language_a: "en",
+    language_b: "ko",
+    version: 1,
+    updated_at: "2026-07-27T01:00:00.000Z",
+  };
+  const calls: Array<{ url: string; body: Record<string, unknown> }> = [];
+  const replies: unknown[] = [[row], row, { ...row, version: 2 }, true];
+  const store = new SupabaseGlossaryPresetStore({
+    baseUrl: "https://approved-dev-ref.supabase.co",
+    credential: { key: `sb_secret_${"a".repeat(24)}`, kind: "secret" },
+    fetchFn: (async (input: string | URL | Request, init?: RequestInit) => {
+      calls.push({ url: String(input), body: JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown> });
+      return Response.json(replies.shift());
+    }) as typeof fetch,
+  });
+  const input: CreateGlossaryPresetInput = {
+    name: row.name,
+    domain: row.domain,
+    glossary: row.glossary,
+    languagePair: { a: "en", b: "ko" },
+  };
+
+  assert.equal((await store.list("host-1"))[0]?.id, id);
+  assert.equal((await store.create("host-1", input)).id, id);
+  assert.equal((await store.update(id, "host-1", 1, input))?.version, 2);
+  assert.equal(await store.delete(id, "host-1", 2), true);
+
+  assert.deepEqual(calls.map((call) => new URL(call.url).pathname), [
+    "/rest/v1/rpc/list_host_glossary_presets",
+    "/rest/v1/rpc/create_host_glossary_preset",
+    "/rest/v1/rpc/update_host_glossary_preset",
+    "/rest/v1/rpc/delete_host_glossary_preset",
+  ]);
+  assert.deepEqual(calls[1]?.body, {
+    p_host_id: "host-1",
+    p_name: row.name,
+    p_domain: row.domain,
+    p_glossary: row.glossary,
+    p_language_a: "en",
+    p_language_b: "ko",
+  });
+  assert.equal(calls[2]?.body.p_expected_version, 1);
+  assert.equal(calls[3]?.body.p_expected_version, 2);
+});
+
+test("Supabase glossary store fails closed on noncanonical or empty persisted rows", async () => {
+  const validRow = {
+    id: crypto.randomUUID(),
+    name: "CRE Board",
+    domain: "Commercial real estate",
+    glossary: "공실률 = vacancy rate",
+    language_a: "en",
+    language_b: "ko",
+    version: 1,
+    updated_at: "2026-07-27T01:00:00.000Z",
+  };
+  for (const invalidRow of [
+    { ...validRow, language_a: "en-US" },
+    { ...validRow, glossary: "" },
+  ]) {
+    const store = new SupabaseGlossaryPresetStore({
+      baseUrl: "https://approved-dev-ref.supabase.co",
+      credential: { key: `sb_secret_${"a".repeat(24)}`, kind: "secret" },
+      fetchFn: (async () => Response.json([invalidRow])) as typeof fetch,
+    });
+    await assert.rejects(
+      store.list("host-1"),
+      (error: unknown) => error instanceof Error && "code" in error && error.code === "NETWORK_UNAVAILABLE",
+    );
+  }
+});
+
+test("Supabase glossary store preserves every database conflict code", async () => {
+  for (const code of [
+    "GLOSSARY_PRESET_LIMIT_REACHED",
+    "GLOSSARY_PRESET_NAME_CONFLICT",
+    "GLOSSARY_PRESET_VERSION_CONFLICT",
+    "GLOSSARY_PRESET_NOT_FOUND",
+  ] as const) {
+    const store = new SupabaseGlossaryPresetStore({
+      baseUrl: "https://approved-dev-ref.supabase.co",
+      credential: { key: `sb_secret_${"a".repeat(24)}`, kind: "secret" },
+      fetchFn: (async () => new Response(JSON.stringify({ message: code }), { status: 409 })) as typeof fetch,
+    });
+    await assert.rejects(
+      store.list("host-1"),
+      (error: unknown) => error instanceof Error && "code" in error && error.code === code,
+    );
+  }
+});
+
+test("glossary service distinguishes missing, stale, duplicate, and full collections", async () => {
+  const id = crypto.randomUUID();
+  const preset: GlossaryPreset = {
+    id,
+    name: "Existing",
+    domain: "",
+    glossary: "",
+    languagePair: { a: "en", b: "ko" },
+    version: 2,
+    updatedAt: "2026-07-27T01:00:00.000Z",
+  };
+  const input: CreateGlossaryPresetInput = { name: "Updated", domain: "", glossary: "x", languagePair: { a: "en", b: "ko" } };
+  const store: GlossaryPresetStore = {
+    list: async () => [preset],
+    create: async () => preset,
+    update: async () => null,
+    delete: async () => false,
+  };
+  const service = new GlossaryPresetService(store);
+  await assert.rejects(
+    service.update("host-1", id, 1, input),
+    (error: unknown) => error instanceof Error && "code" in error && error.code === "GLOSSARY_PRESET_VERSION_CONFLICT",
+  );
+  await assert.rejects(
+    service.update("host-1", crypto.randomUUID(), 1, input),
+    (error: unknown) => error instanceof Error && "code" in error && error.code === "GLOSSARY_PRESET_NOT_FOUND",
+  );
+  await assert.rejects(
+    service.create("host-1", { ...input, name: "existing" }),
+    (error: unknown) => error instanceof Error && "code" in error && error.code === "GLOSSARY_PRESET_NAME_CONFLICT",
+  );
+  const fullStore: GlossaryPresetStore = { ...store, list: async () => Array.from({ length: 50 }, (_, index) => ({ ...preset, id: crypto.randomUUID(), name: `P${index}` })) };
+  await assert.rejects(
+    new GlossaryPresetService(fullStore).create("host-1", input),
+    (error: unknown) => error instanceof Error && "code" in error && error.code === "GLOSSARY_PRESET_LIMIT_REACHED",
+  );
+});
+
+test("custom glossary routes authenticate before owner-bound service access and keep the response envelope", () => {
+  const collection = readFileSync(new URL("../../app/api/glossary-presets/route.ts", import.meta.url), "utf8");
+  const item = readFileSync(new URL("../../app/api/glossary-presets/[id]/route.ts", import.meta.url), "utf8");
+  assert.ok(collection.indexOf("requireHost(request)") < collection.indexOf("getGlossaryPresetService().list(hostId)"));
+  assert.ok(collection.indexOf("requireHost(request)") < collection.indexOf("getGlossaryPresetService().create(hostId"));
+  assert.ok(item.indexOf("requireHost(request)") < item.indexOf("getGlossaryPresetService().update(hostId"));
+  assert.ok(item.indexOf("requireHost(request)") < item.indexOf("getGlossaryPresetService().delete(hostId"));
+  for (const source of [collection, item]) {
+    assert.match(source, /apiSuccess/u);
+    assert.match(source, /apiError/u);
+    assert.match(source, /AuthenticationError/u);
+    assert.doesNotMatch(source, /console\.(?:log|info|warn|error)/u);
+  }
 });

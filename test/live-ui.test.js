@@ -49,7 +49,7 @@ test("host wizard offers canonical output modes and Meeting audio consent", asyn
   assert.match(dashboard, /Speaker-aware translated audio/);
 });
 
-test("live UI separates fixed Gemini captions from a real Presentation audio provider toggle", async () => {
+test("live UI keeps captions and translated audio on one fixed Gemini provider", async () => {
   const [dashboard, viewer, extensionHtml, extensionJs] = await Promise.all([
     read("webapp/components/live/LiveHostDashboard.tsx"),
     read("webapp/components/live/LiveViewer.tsx"),
@@ -58,17 +58,15 @@ test("live UI separates fixed Gemini captions from a real Presentation audio pro
   ]);
 
   assert.match(dashboard, /Fast live captions/);
-  assert.match(dashboard, /OpenAI Realtime audio/);
+  assert.match(dashboard, /Gemini translated audio/);
   assert.match(dashboard, /Optimized for one presenter/);
   assert.match(dashboard, /Speaker-aware translated audio/);
   assert.match(dashboard, /Long uninterrupted speech may add delay/);
-  assert.match(dashboard, /role="radiogroup" aria-label="Translated audio engine"/);
-  assert.match(dashboard, /Gemini audio/);
-  assert.match(dashboard, /OpenAI Realtime/);
   assert.match(dashboard, /Caption engine/);
   assert.match(dashboard, /Gemini fixed/);
-  assert.match(dashboard, /disabled=\{sessionType === "meeting" \|\| !isOpenAIVoiceLanguageSupported\}/);
-  assert.match(dashboard, /Meeting uses Gemini audio to keep one stable voice for each speaker/);
+  assert.match(dashboard, /Gemini creates live translated captions and translated audio with the same session settings/);
+  assert.match(dashboard, /GEMINI_VOICE_PROVIDER = "gemini" as const/);
+  assert.doesNotMatch(dashboard, /Translated audio engine|OpenAI Realtime|isOpenAIVoiceLanguageSupported|setVoiceProvider/);
   assert.match(viewer, /live-viewer-delivery-method/);
   assert.match(viewer, /Current delivery/);
   assert.match(extensionHtml, /id="viewer-output-state"/);
@@ -97,10 +95,11 @@ test("host sends canonical session settings through REST and gateway", async () 
     read("webapp/components/live/live-audio-client.ts"),
   ]);
 
-  assert.match(dashboard, /body: JSON\.stringify\(\{ title, scheduledAt: currentSchedule\.scheduledAt, sessionType, languages, outputMode, voiceProvider, maxViewers, glossaryPack \}\)/);
+  assert.match(dashboard, /body: JSON\.stringify\(\{ title, scheduledAt: currentSchedule\.scheduledAt, sessionType, languages, outputMode, voiceProvider: GEMINI_VOICE_PROVIDER, maxViewers, glossaryPack \}\)/);
   assert.match(dashboard, /sessionType: previousSession\.sessionType/);
   assert.match(dashboard, /outputMode: previousSession\.outputMode/);
-  assert.match(dashboard, /voiceProvider: previousSession\.voiceProvider/);
+  assert.doesNotMatch(dashboard, /voiceProvider: previousSession\.voiceProvider/);
+  assert.match(dashboard, /voiceProvider: GEMINI_VOICE_PROVIDER/);
   assert.match(dashboard, /maxViewers: previousSession\.maxViewers/);
   assert.match(dashboard, /glossaryPack: previousSession\.glossaryPack/);
   assert.match(dashboard, /version: restoredSession\.version/);
@@ -110,7 +109,7 @@ test("host sends canonical session settings through REST and gateway", async () 
   assert.match(audioClient, /maxViewers: number/);
   assert.match(audioClient, /glossaryPack: GlossaryPack/);
   const createSessionBlock = dashboard.match(/const createSession = useCallback[\s\S]*?const stopBroadcast/u)?.[0] ?? "";
-  assert.match(createSessionBlock, /JSON\.stringify\(\{ title, scheduledAt: currentSchedule\.scheduledAt, sessionType, languages, outputMode, voiceProvider, maxViewers, glossaryPack \}\)/);
+  assert.match(createSessionBlock, /JSON\.stringify\(\{ title, scheduledAt: currentSchedule\.scheduledAt, sessionType, languages, outputMode, voiceProvider: GEMINI_VOICE_PROVIDER, maxViewers, glossaryPack \}\)/);
   assert.doesNotMatch(createSessionBlock, /JSON\.stringify\([\s\S]*inputSource/u,
     "capture-only inputSource must not be sent to the strict persisted-session API");
 });
@@ -268,7 +267,7 @@ test("desktop and mobile watch routes share the same viewer component", async ()
   assert.match(mobile, /compact/);
 });
 
-test("viewer routes preserve QR fragments while correcting iPhone and iPad surfaces", async () => {
+test("viewer routes preserve reusable QR fragments while correcting iPhone and iPad surfaces", async () => {
   const [viewer, routing, routingTest] = await Promise.all([
     read("webapp/components/live/LiveViewer.tsx"),
     read("webapp/components/live/viewer-surface-routing.ts"),
@@ -280,10 +279,12 @@ test("viewer routes preserve QR fragments while correcting iPhone and iPad surfa
   assert.match(routing, /`\$\{target\}\$\{search\}\$\{hash\}`/u);
   assert.match(routingTest, /opaque%2Btoken%3D/u);
   const redirectIndex = viewer.indexOf("window.location.replace(buildViewerSurfaceUrl");
-  const consumeIndex = viewer.indexOf("const inviteToken = takeInviteTokenFromHash()");
-  assert.ok(redirectIndex >= 0 && consumeIndex > redirectIndex,
-    "surface correction must run before the QR fragment is consumed");
-  assert.match(viewer, /if \(getViewerSurfaceRedirect\([\s\S]*?\)\) return;[\s\S]*?takeInviteTokenFromHash\(\)/u);
+  const readIndex = viewer.indexOf("const inviteToken = readInviteTokenFromHash()");
+  assert.ok(redirectIndex >= 0 && readIndex > redirectIndex,
+    "surface correction must run before the reusable QR fragment is read");
+  assert.match(viewer, /if \(getViewerSurfaceRedirect\([\s\S]*?\)\) return;[\s\S]*?readInviteTokenFromHash\(\)/u);
+  assert.match(viewer, /const canonicalHash = `#invite=\$\{inviteToken\}`/u);
+  assert.match(viewer, /window\.location\.search\}\$\{canonicalHash\}/u);
 });
 
 test("mobile viewer reconnects once on foreground and keeps full history accessible", async () => {
@@ -311,7 +312,8 @@ test("speaker captions never identify a speaker by color alone", async () => {
   const component = await read("webapp/components/live/SpeakerCaption.tsx");
   const css = await read("webapp/app/globals.css");
 
-  assert.match(component, /speaker\.label/);
+  assert.match(component, /speaker\.name\?\.trim\(\)/);
+  assert.doesNotMatch(component, /speaker\.name\?\.trim\(\) \|\| speaker\.label/);
   assert.match(component, /aria-label/);
   assert.match(component, /live-speaker-dot/);
   assert.match(component, /live-speaker-line/);
@@ -441,11 +443,12 @@ test("gateway slow-consumer close automatically reconnects without clearing the 
   assert.match(viewer, /className="live-connection-state" role="status" aria-live="polite"/);
 });
 
-test("viewer keeps one stable partial row and archives only final captions after the snapshot floor", async () => {
-  const [viewer, speaker, captionFeed] = await Promise.all([
+test("viewer keeps one seq-keyed caption article from partial through final", async () => {
+  const [viewer, speaker, captionFeed, css] = await Promise.all([
     read("webapp/components/live/LiveViewer.tsx"),
     read("webapp/components/live/SpeakerCaption.tsx"),
     read("webapp/lib/live/caption-feed.ts"),
+    read("webapp/app/globals.css"),
   ]);
 
   // 2026-07-26 fix: Timeline identity and ordering are shared by snapshot,
@@ -453,24 +456,27 @@ test("viewer keeps one stable partial row and archives only final captions after
   // the feed module rather than as a private Viewer implementation detail.
   assert.match(captionFeed, /export function mergeCaptionTimeline/);
   assert.match(viewer, /mergeLanguageCaptionCache/);
-  assert.match(viewer, /key=\{`final-\$\{caption\.seq\}`\}/);
-  assert.match(viewer, /key=\{`partial-\$\{captionLaneKey\(caption\)\}`\}/);
-  // Finals and partials are split out of displayCaptions, not the raw record.
+  assert.match(viewer, /const orderedCaptions = newestFirst\(displayCaptions\)/);
+  assert.match(viewer, /key=\{`caption-\$\{caption\.seq\}`\}/);
+  assert.doesNotMatch(viewer, /key=\{`final-|key=\{`partial-|live-caption-current/u);
+  // Source and translated lanes are filtered before the one canonical list.
   // Web history shows only canonical source/translation pairs and hides failed,
   // malformed, and same-language echo captions.
   assert.match(viewer, /const displayCaptions = useMemo\(\(\) => captions\.filter\(isDisplayableCaption\), \[captions\]\)/);
-  assert.match(captionFeed, /if \(caption\.origin === "source"\) return caption\.language === caption\.sourceLanguage/u);
+  assert.match(
+    captionFeed,
+    /caption\.origin === "source" \|\| caption\.translationStatus === "verbatim"/u,
+  );
   assert.match(captionFeed, /incoming\.filter\(\(event\) => event\.language === language\)/u);
-  assert.match(viewer, /const finalCaptions = displayCaptions\.filter\(\(caption\) => caption\.isFinal\)/);
-  assert.match(viewer, /const partialCaptions = displayCaptions\.filter\(\(caption\) => !caption\.isFinal\)/);
+  assert.doesNotMatch(viewer, /const finalCaptions|const partialCaptions/u);
   assert.match(viewer, /<MeetingTurnFeed captions=\{displayCaptions\}/);
   assert.match(viewer, /event\.seq <= getLastSeq\(event\.language\)/);
   assert.match(viewer, /if \(event\.language === languageRef\.current\) setCaptions/u);
   assert.match(viewer, /setCaptionSnapshot\(snapshot\)/);
-  assert.match(viewer, /aria-relevant="additions"/);
-  assert.match(viewer, /aria-live="off"/);
+  assert.match(viewer, /aria-relevant="additions text"/);
   assert.match(speaker, />Listening</);
   assert.doesNotMatch(speaker, /인식 중/);
+  assert.doesNotMatch(css, /\.live-caption-card\.is-active\s*\{[^}]*transform:/su);
 });
 
 test("the live UI consumes the lossless language cache and append-only partial tail", async () => {
@@ -481,16 +487,16 @@ test("the live UI consumes the lossless language cache and append-only partial t
     read("webapp/app/globals.css"),
   ]);
 
-  // 2026-07-26 fix: These checks bind the tested 5,000-event data contract to
+  // 2026-07-27 fix: These checks bind the tested 12,000-event data contract to
   // the actual screen path. A green cache-only test is insufficient if the
   // language selector clears that cache or the feed remounts partial text.
-  assert.match(captionFeed, /const COMMITTED_CAPTION_LIMIT = 5_000/u);
+  assert.match(captionFeed, /const COMMITTED_CAPTION_LIMIT = 12_000/u);
   assert.doesNotMatch(captionFeed, /CAPTION_WINDOW_SIZE|slice\(-200\)/u);
   assert.match(viewer, /const captionsByLanguageRef = useRef<Record<string, CaptionEvent\[\]>>\(\{\}\)/u);
   assert.match(viewer, /setCaptions\(getCachedLanguageCaptions\(captionsByLanguageRef\.current, nextLanguage\)\)/u);
   assert.match(viewer, /mergeLanguageCaptionCache\(captionsByLanguageRef\.current, event\.language, \[event\]\)/u);
-  assert.match(feed, /pendingText=\{livePartialBelongsToLastTurn/u);
-  assert.match(feed, /className="live-turn-text is-recent is-pending" data-caption-state="updating"/u);
+  assert.match(feed, /key=\{`caption-\$\{caption\.seq\}`\}/u);
+  assert.match(feed, /caption\.isFinal \? "" : "is-pending"/u);
   assert.doesNotMatch(feed, /live-turn-card\.is-collapsed|collapsedTurnKeys/u);
 
   // DESIGN.md §8.2: pending text keeps its layout and uses the semantic system
@@ -564,8 +570,8 @@ test("approved mobile live design supports profile identity and QR or access-cod
   ]);
 
   assert.match(viewer, />Your name</);
-  assert.match(viewer, />Department</);
-  assert.match(viewer, />Job title</);
+  assert.match(viewer, />Department \(Optional\)</);
+  assert.match(viewer, />Job title \(Optional\)</);
   assert.match(viewer, />6-digit access code</);
   assert.match(viewer, /"Join live"/);
   assert.match(viewer, /id="live-admission-code"/);
@@ -578,6 +584,7 @@ test("approved mobile live design supports profile identity and QR or access-cod
   assert.match(viewer, />Leave</);
   assert.match(viewer, /\/leave`/);
   assert.doesNotMatch(viewer, /🎙/u);
+  assert.doesNotMatch(viewer, /live-join-methods|Invite link/u);
   assert.match(dashboard, /Session title/);
   assert.match(dashboard, /Date/);
   assert.match(dashboard, /Start time/);
@@ -638,7 +645,7 @@ test("participant Speak is a copy-free full-width bar button that records in pla
   assert.match(css, /\.live-speak-button\.is-speaking\s*\{[^}]*animation:\s*live-speak-recording/s);
 });
 
-test("meeting captions keep a speaker-attributed live sheet and append final turns", async () => {
+test("meeting captions keep one seq-keyed speaker article through partial and final", async () => {
   const [feed, css] = await Promise.all([
     read("webapp/components/live/MeetingTurnFeed.tsx"),
     read("webapp/app/globals.css"),
@@ -647,8 +654,9 @@ test("meeting captions keep a speaker-attributed live sheet and append final tur
   // Caption text lives ONLY in the main record: the in-progress utterance is
   // the newest speaker-attributed paragraph, and the mic-button sheet is a
   // floor indicator with no caption text (no duplication).
-  assert.match(feed, /className="live-turn-card is-live" data-caption-state="updating"/);
-  assert.match(feed, /speakerMetaLine\(livePartial\.speaker\)/);
+  assert.match(feed, /key=\{`caption-\$\{caption\.seq\}`\}/);
+  assert.match(feed, /turn\.captions\.map/);
+  assert.doesNotMatch(feed, /livePartial|pendingText/u);
   assert.doesNotMatch(feed, /live-now-text/);
   assert.match(feed, /turns\.map/);
   assert.match(feed, /floorHolder[\s\S]{0,400}is speaking/);
@@ -658,7 +666,7 @@ test("meeting captions keep a speaker-attributed live sheet and append final tur
   assert.match(feed, /new ResizeObserver/);
   assert.match(feed, /live-turn-scroll-content/);
   assert.match(css, /\.live-turn-scroll\s*\{[^}]*padding-bottom:\s*calc\(84px \+ env\(safe-area-inset-bottom\)\)/s);
-  assert.match(css, /@keyframes live-turn-in/);
+  assert.doesNotMatch(css, /@keyframes live-turn-in|animation:\s*live-turn-in/u);
   // Reference-app reading treatment: only the two most recently completed
   // sentences render at full strength; older sentences dim.
   assert.match(feed, /globalIndex >= turnOffsets\.total - 2/);
@@ -702,7 +710,7 @@ test("caption controls sit below the title and no audio control is surfaced", as
   assert.match(css, /\.live-text-size-slider\.is-open \{ display: inline-flex/u);
 });
 
-test("the in-progress sentence extends the current paragraph instead of standing alone", async () => {
+test("the in-progress sentence finalizes in the same keyed paragraph node", async () => {
   const feed = await read("webapp/components/live/MeetingTurnFeed.tsx");
 
   // The partial used to render as its own <article class="live-turn-card is-live">
@@ -710,12 +718,10 @@ test("the in-progress sentence extends the current paragraph instead of standing
   // the paragraph above, so the reader watched text get written separately and
   // then jump into the record — the reported "따로 적혔다가 다시 기록에 붙여지는"
   // behaviour. A live transcript must only ever grow at its tail.
-  assert.match(feed, /pendingText/u, "the live text must be handed to the current paragraph");
-  // Same speaker -> the partial is the tail of that speaker's existing paragraph.
-  assert.match(feed, /livePartialBelongsToLastTurn|belongsToLastTurn/u);
-  // A partial from a DIFFERENT speaker still opens its own paragraph, which is
-  // correct: that is a new turn, not a continuation.
-  assert.match(feed, /<article className="live-turn-card is-live"/u);
+  assert.match(feed, /key=\{`caption-\$\{caption\.seq\}`\}/u);
+  assert.match(feed, /caption\.isFinal \? "" : "is-pending"/u);
+  assert.match(feed, /data-caption-state=\{hasPartial \? "updating" : "final"\}/u);
+  assert.doesNotMatch(feed, /pendingText|livePartialBelongsToLastTurn/u);
 });
 
 test("the LIVE feed never folds a speaker paragraph", async () => {
@@ -742,9 +748,8 @@ test("the LIVE feed never folds a speaker paragraph", async () => {
   assert.match(feed, /<p className="live-turn-body">/u);
   assert.match(feed, /<strong>\{turn\.speakerLabel\}<\/strong>/u);
 
-  // The in-progress paragraph is still rendered inside the record.
-  const liveCard = feed.match(/<article className="live-turn-card is-live"[\s\S]*?<\/article>/u);
-  assert.ok(liveCard, "the live partial card must remain present");
+  // The in-progress paragraph stays in the same canonical record.
+  assert.match(feed, /className=\{`live-turn-card \$\{hasPartial \? "is-live" : ""\}`\}/u);
 });
 
 test("meeting timestamps use a deterministic fixed KST clock", async () => {
@@ -809,6 +814,53 @@ test("viewer lifecycle never combines waiting and live, and announces the host-e
     "the ended transcript must retain a visible scroll affordance");
 });
 
+test("ended minutes keep one accessible loading state across polling gaps and stop with retry", async () => {
+  const [viewer, minutes, css] = await Promise.all([
+    read("webapp/components/live/LiveViewer.tsx"),
+    read("webapp/components/live/MeetingMinutes.tsx"),
+    read("webapp/app/globals.css"),
+  ]);
+
+  assert.match(viewer, /type SummaryPollingState/u);
+  assert.doesNotMatch(viewer, /type MinutesPollingState/u);
+  assert.match(viewer, /setMinutesPollingState\("polling"\)/u);
+  assert.match(viewer, /setMinutesPollingState\("exhausted"\)/u);
+  assert.match(viewer, /minutesPollingState=\{minutesPollingState\}/u);
+  assert.match(viewer, /minutesPollingStartedAt=\{minutesPollingStartedAt\}/u);
+  assert.match(minutes, /aria-busy=\{isSummaryPolling\}/u);
+  assert.match(minutes, /role="status" aria-live="polite"/u);
+  assert.match(minutes, /className="live-minutes-loading-dots"/u);
+  assert.match(minutes, /formatElapsedTime/u);
+  assert.doesNotMatch(minutes, /ETA|remaining|about \d/u);
+  assert.match(minutes, /Summary is taking longer than expected\./u);
+  assert.match(minutes, /"Retry"/u);
+  assert.match(css, /\.live-minutes-elapsed \{[^}]*font-variant-numeric:\s*tabular-nums/s);
+  assert.match(css, /@keyframes live-minutes-dot/u);
+  assert.match(css, /prefers-reduced-motion: reduce[\s\S]*\.live-minutes-loading-dots i[\s\S]*animation: none/u);
+});
+
+test("host and shared viewer minutes expose the same automatic summary states without regeneration UI", async () => {
+  const [dashboard, viewer, minutes] = await Promise.all([
+    read("webapp/components/live/LiveHostDashboard.tsx"),
+    read("webapp/components/live/LiveViewer.tsx"),
+    read("webapp/components/live/MeetingMinutes.tsx"),
+  ]);
+
+  assert.match(dashboard, /startSummaryPollLoop/u);
+  assert.match(dashboard, /method: "GET"[\s\S]{0,120}cache: "no-store"/u);
+  assert.match(dashboard, /aria-busy=\{hostSummaryPollingState === "polling"\}/u);
+  assert.match(dashboard, /role="status" aria-live="polite"/u);
+  assert.match(dashboard, /Summary is taking longer than expected\./u);
+  assert.match(dashboard, /hostSummaryFailureCode === "SUMMARY_GENERATION_RETRYABLE_FAILED"[\s\S]*<button/u);
+  assert.match(dashboard, /isHostSummaryRetrying \? "Retrying…"\s*:\s*"Retry"/u);
+  assert.doesNotMatch(dashboard, /Create summary again|Create AI summary|generateSummaries|method: "POST"[\s\S]{0,160}\/summary/u);
+
+  assert.match(viewer, /startSummaryPollLoop/u);
+  assert.match(minutes, /type SummaryPollingState = "idle" \| "polling" \| "exhausted" \| "failed"/u);
+  assert.match(minutes, /getSummaryPollDelayMilliseconds/u);
+  assert.match(minutes, /onError/u);
+});
+
 test("approved Stage B keeps a 16:9 cover, left session context, right QR, and bounded attendance", async () => {
   const [stage, css] = await Promise.all([
     read("webapp/components/live/LiveStageView.tsx"),
@@ -822,10 +874,16 @@ test("approved Stage B keeps a 16:9 cover, left session context, right QR, and b
   assert.doesNotMatch(stage, /className="live-stage-ring"[\s\S]{0,220}Waiting for host/);
   assert.match(stage, /function StageLoader/);
   assert.match(stage, /coverState === "loading"/);
+  assert.match(stage, /className="live-stage-manual-url"/);
+  assert.match(stage, /new URL\("\/watch", window\.location\.origin\)/);
+  assert.doesNotMatch(stage, /live-stage-manual-url[\s\S]{0,180}invite\.url/u,
+    "the manual URL must never disclose the opaque QR invite token");
   assert.match(css, /\.live-stage-frame \{[^}]*aspect-ratio: 16 \/ 9/s);
   assert.match(css, /\.live-stage-grid \{[^}]*grid-template-columns:/s);
   assert.match(css, /\.live-stage-cover \{[^}]*object-fit: cover[^}]*object-position: center/s);
   assert.match(css, /\.live-stage-loader i \{[^}]*animation: live-stage-load/s);
+  assert.match(css, /\.live-stage-access\.is-faded-out \{[^}]*visibility: hidden/s);
+  assert.doesNotMatch(css, /\.live-stage-access\.is-faded-out \{[^}]*position:\s*absolute/s);
 });
 
 test("meeting minutes group by participant identity while preserving the display label", async () => {
@@ -880,14 +938,18 @@ test("live meeting turns use speaker IDs rather than colliding display labels", 
   ];
   const turns = groupCaptionsIntoTurns(captions);
 
-  assert.deepEqual(turns.map((turn) => ({ identity: turn.speakerIdentity, label: turn.speakerLabel, text: turn.texts.join(" ") })), [
+  assert.deepEqual(turns.map((turn) => ({
+    identity: turn.speakerIdentity,
+    label: turn.speakerLabel,
+    text: turn.captions.map((caption) => caption.text).join(" "),
+  })), [
     { identity: "a", label: "Alex", text: "one two" },
     { identity: "b", label: "Alex", text: "three" },
     { identity: "host", label: "Host", text: "four five" },
   ]);
 });
 
-test("production meeting feed accumulates sentences by consecutive speaker and ignores partial fragments", async () => {
+test("production meeting feed accumulates canonical seq captions by consecutive speaker", async () => {
   const feed = await read("webapp/components/live/MeetingTurnFeed.tsx");
   const start = feed.indexOf("export function groupCaptionsIntoTurns");
   const end = feed.indexOf("/** True when two separate groupings", start);
@@ -915,11 +977,17 @@ test("production meeting feed accumulates sentences by consecutive speaker and i
 
   assert.deepEqual(groupCaptionsIntoTurns(captions).map((turn) => ({
     speaker: turn.speakerIdentity,
-    texts: turn.texts,
+    captions: turn.captions,
   })), [
-    { speaker: "host", texts: ["Host sentence one.", "Host sentence two."] },
-    { speaker: "p1", texts: ["Participant sentence.", "Participant sentence two."] },
-    { speaker: "host", texts: ["Host returns."] },
+    { speaker: "host", captions: [
+      { seq: 1, text: "Host sentence one.", isFinal: true },
+      { seq: 2, text: "Host sentence two.", isFinal: true },
+    ] },
+    { speaker: "p1", captions: [
+      { seq: 3, text: "Participant sentence.", isFinal: true },
+      { seq: 4, text: "Participant sentence two.", isFinal: true },
+    ] },
+    { speaker: "host", captions: [{ seq: 5, text: "Host returns.", isFinal: true }] },
   ]);
 });
 
@@ -1026,7 +1094,7 @@ test("host polls viewer count and status without overlapping or overwriting edit
   assert.doesNotMatch(dashboard, /setSession\(latest\)/);
 });
 
-test("viewer requires identity fields and accepts exactly one opaque invite or 6-digit access code", async () => {
+test("viewer requires a name and derives invite versus code entry from the URL", async () => {
   const viewer = await read("webapp/components/live/LiveViewer.tsx");
 
   assert.match(viewer, /window\.location\.hash/);
@@ -1043,6 +1111,15 @@ test("viewer requires identity fields and accepts exactly one opaque invite or 6
   assert.match(viewer, /id="live-job-title"/);
   assert.match(viewer, /id="live-admission-code"/);
   assert.match(viewer, /Your name/);
+  assert.match(viewer, /const hasValidProfile = normalizeDisplayName\(displayName\)\.length > 0/);
+  assert.doesNotMatch(viewer, /hasValidProfile[\s\S]{0,180}normalizeProfileField\(department\)/u);
+  assert.match(viewer, /const isInviteJoin = Boolean\(pendingInviteToken\)/);
+  assert.doesNotMatch(viewer, /joinMethod|live-join-methods/u);
+  assert.match(viewer, /Department \(Optional\)/);
+  assert.match(viewer, /Job title \(Optional\)/);
+  assert.doesNotMatch(viewer, /id="live-department"[\s\S]{0,350}required/u);
+  assert.doesNotMatch(viewer, /id="live-job-title"[\s\S]{0,350}required/u);
+  assert.match(viewer, /formatProfileMetadata\(viewer\.displayName, viewer\.department, viewer\.jobTitle\)/u);
   assert.match(viewer, /Join live/);
   assert.match(viewer, /CAPACITY_REACHED/);
   assert.match(viewer, /INVITE_EXPIRED/);
@@ -1090,7 +1167,7 @@ test("Chrome viewer passes the required normalized display name without credenti
   assert.match(panel, /아이디와 비밀번호 없이 이름과 인증번호로 참여합니다/);
 });
 
-test("desktop local PT output separates fixed Gemini captions from conditional audio providers", async () => {
+test("desktop local PT output keeps captions and interpreted audio on one fixed Gemini provider", async () => {
   const [html, css, dashboard] = await Promise.all([
     read("public/subtitle.html"),
     read("public/subtitle.css"),
@@ -1107,9 +1184,8 @@ test("desktop local PT output separates fixed Gemini captions from conditional a
   assert.doesNotMatch(html, /value="captions_audio"/);
   assert.match(html, /name="audioLanguage"/);
   assert.match(html, /name="audioVolume"[^>]+type="range"/);
-  assert.match(html, /name="voiceProvider"[^>]+value="gemini"[^>]+checked/);
-  assert.match(html, /name="voiceProvider"[^>]+value="openai"/);
-  assert.match(html, /OpenAI Realtime/);
+  assert.match(html, /<input name="voiceProvider" type="hidden" value="gemini"\s*\/>/);
+  assert.doesNotMatch(html, /name="voiceProvider"[^>]+value="openai"/);
   // 2026-07-25 declutter, extended by the NOVA i18n pass: every explanatory
   // helper sentence is gone. The Gemini-fixed fact survives as a compact note
   // (label + value), not as a sentence.
@@ -1127,14 +1203,13 @@ test("desktop local PT output separates fixed Gemini captions from conditional a
   assert.match(dashboard, /audioLanguage: "en"/);
   assert.match(dashboard, /audioVolume: 0\.8/);
   assert.match(dashboard, /voiceProvider: "gemini"/);
-  assert.match(dashboard, /OPENAI_REALTIME_TRANSLATION_LANGUAGES/);
-  assert.match(dashboard, /openAIInput\.disabled = !isOpenAISupported/);
+  assert.doesNotMatch(dashboard, /OPENAI_REALTIME_TRANSLATION_LANGUAGES/);
+  assert.doesNotMatch(dashboard, /openAIInput\.disabled|selectedVoiceProvider/);
   assert.match(dashboard, /createSubtitleAudioPlayer/);
   assert.match(dashboard, /subtitle:translated-audio/);
   assert.match(dashboard, /subtitle:audio-control/);
   assert.match(dashboard, /message\.targetLanguage !== state\.settings\.audioLanguage/);
-  assert.match(dashboard, /state\.settings\.voiceProvider === "openai"/);
-  assert.match(dashboard, /Gemini Live:[\s\S]*OpenAI voice/);
+  assert.doesNotMatch(dashboard, /state\.settings\.voiceProvider === "openai"|OpenAI voice/);
   assert.match(dashboard, /"start\.audio"/);
   assertLocalized("start.audio", { ko: /통역 음성만 시작/ });
 });
@@ -1161,7 +1236,7 @@ test("desktop Live Call draft always issues QR and code, validates local cover d
   assert.match(css, /\.live-draft-cover-status\.is-error/);
 
   assert.doesNotMatch(workspace, /liveDraftAccess|liveHostWorkspaceUrl|openLiveWorkspace/);
-  assert.match(workspace, /const MAX_COVER_IMAGE_BYTES = 5 \* 1024 \* 1024/);
+  assert.match(workspace, /const MAX_COVER_IMAGE_BYTES = 20 \* 1024 \* 1024/);
   assert.match(workspace, /new Set\(\["image\/jpeg", "image\/png", "image\/webp"\]\)/);
   assert.match(workspace, /await file\.arrayBuffer\(\)/);
   assert.match(workspace, /function hasValidCoverImageSignature\(bytes, contentType\)/);
@@ -1170,6 +1245,11 @@ test("desktop Live Call draft always issues QR and code, validates local cover d
   assert.match(workspace, /size: file\.size/);
   assert.match(workspace, /base64: window\.btoa\(binary\)/);
   assert.match(workspace, /coverImage: liveDraftCoverData/);
+  assert.match(html, /최대 20MB/);
+  assertLocalized("live.coverTooLarge", { en: /20MB/, ko: /20MB/ });
+  assertLocalized("live.err.COVER_UPLOAD_NETWORK_FAILED", { en: /network connection/, ko: /네트워크 연결/ });
+  assertLocalized("live.err.COVER_UPLOAD_RATE_LIMITED", { en: /Too many cover uploads/, ko: /요청이 너무 많습니다/ });
+  assertLocalized("live.err.COVER_FINALIZE_CONFLICT", { en: /Another cover was saved first/, ko: /다른 커버가 먼저 저장/ });
   assert.doesNotMatch(workspace, /liveDisplayLanguage|displayLanguage/u);
   assert.match(workspace, /startRegisteredLiveCall\(sessionId\)/);
   assert.match(workspace, /result\?\.code === "HOST_LOGIN_REQUIRED"/);
@@ -1295,6 +1375,80 @@ test("controller window hugs its content and shows live signal + elapsed time", 
   assert.match(controllerJs, /state\.liveStartedAt/);
 });
 
+test("floating controller announces operator-only translation health without overlay error copy", async () => {
+  const [html, controllerJs, css, overlay] = await Promise.all([
+    read("public/subtitle-controller.html"),
+    read("public/subtitle-controller.js"),
+    read("public/subtitle.css"),
+    read("public/subtitle-overlay.js"),
+  ]);
+
+  assert.match(html, /id="controller-live-call-status"[^>]*role="status"[^>]*aria-live="polite"[^>]*aria-atomic="true"/u);
+  assert.match(html, /id="controller-health-detail"[^>]*aria-hidden="true"/u,
+    "the one-second elapsed counter must not cause repeated screen-reader announcements");
+  assert.match(controllerJs, /function syncLiveBridgeStatus\(state\)/u);
+  assert.match(controllerJs, /TRANSLATION_EVENT_STALE_MS = 5_000/u);
+  assert.match(controllerJs, /message\.type === "subtitle:input-status"/u);
+  assert.match(controllerJs, /message\.type === "subtitle:partial" \|\| message\.type === "subtitle:committed"/u);
+  assert.match(controllerJs, /translationHealth\.socketState !== "open"/u);
+  assert.match(controllerJs, /\["connecting", "reconnecting"\]\.includes\(translationHealth\.bridgeState\)/u);
+  assert.match(controllerJs, /now - translationHealth\.lastEventAt > TRANSLATION_EVENT_STALE_MS/u);
+  assert.match(controllerJs, /window\.setInterval\(\(\) => renderTranslationHealth\(\), 1_000\)/u);
+  assert.match(controllerJs, /if \(isLiveActionStatusLocked\) return/u,
+    "polling must not overwrite an in-progress Go-Live, Host Speak, or End status");
+  assert.match(controllerJs, /goLiveButton\.setAttribute\("aria-busy", "true"\)/u);
+  assert.match(controllerJs, /goLiveButton\.removeAttribute\("aria-busy"\)/u);
+  assertLocalized("controller.health.healthy", { en: /^Translation healthy$/, ko: /^번역 정상$/ });
+  assertLocalized("controller.health.waiting", { en: /^Translation waiting$/, ko: /^번역 대기$/ });
+  assertLocalized("controller.health.recovering", { en: /^Recovering translation$/, ko: /^복구 중$/ });
+  assertLocalized("controller.health.disconnected", { en: /^Translation disconnected$/, ko: /^연결 끊김$/ });
+  assert.match(css, /\.mp-status\[data-connection-state="healthy"\][^}]*var\(--nova-status-ok\)/u);
+  assert.match(css, /\.mp-status\[data-connection-state="disconnected"\][^}]*var\(--nova-status-error\)/u);
+  assert.match(css, /\.mp-status-detail[^}]*font-variant-numeric: tabular-nums/u);
+  assert.doesNotMatch(overlay, /controller\.health|Translation healthy|번역 정상|자막 다시 시작/u,
+    "operational health belongs to the controller, never the audience overlay");
+  assert.match(css, /transition: color var\(--nova-dur-rapid\) var\(--nova-ease-out\)/u);
+  assert.match(css, /@media \(prefers-reduced-motion: reduce\)[\s\S]*--nova-dur-rapid: 1ms/u);
+});
+
+test("controller health distinguishes healthy, waiting, stale recovery, and disconnection", async () => {
+  const controllerJs = await read("public/subtitle-controller.js");
+  const healthStateSource = controllerJs.slice(
+    controllerJs.indexOf("function translationHealthState"),
+    controllerJs.indexOf("function translationHealthDetail"),
+  );
+  const evaluate = new Function(
+    "translationHealth",
+    "now",
+    "TRANSLATION_EVENT_STALE_MS",
+    "TRANSLATION_ACTIVE_CAPTION_MS",
+    `${healthStateSource}; return translationHealthState(now);`,
+  );
+  const now = 20_000;
+  const base = {
+    socketState: "open",
+    bridgeState: "connected",
+    lastEventAt: now - 1_000,
+    lastCaptionAt: now - 1_000,
+    signalSinceAt: now - 2_000,
+    lastInputStatus: "signal",
+    pipelineStatus: "listening",
+  };
+
+  assert.equal(evaluate(base, now, 5_000, 3_000), "healthy");
+  assert.equal(evaluate({ ...base, lastCaptionAt: null, signalSinceAt: now - 1_000 }, now, 5_000, 3_000), "waiting",
+    "the first signal gets a grace window instead of an immediate failure");
+  assert.equal(evaluate({ ...base, lastCaptionAt: null, signalSinceAt: now - 3_001 }, now, 5_000, 3_000), "recovering",
+    "continuous signal without any translated output becomes a recovery state");
+  assert.equal(evaluate({ ...base, lastCaptionAt: now - 3_001, signalSinceAt: now - 5_000 }, now, 5_000, 3_000), "recovering",
+    "a prior caption cannot mask a later output stall during continuous speech");
+  assert.equal(evaluate({ ...base, lastInputStatus: "silent" }, now, 5_000, 3_000), "waiting");
+  assert.equal(evaluate({ ...base, lastEventAt: now - 5_001 }, now, 5_000, 3_000), "recovering");
+  assert.equal(evaluate({ ...base, bridgeState: "reconnecting" }, now, 5_000, 3_000), "recovering");
+  assert.equal(evaluate({ ...base, socketState: "closed" }, now, 5_000, 3_000), "disconnected");
+  assert.equal(evaluate({ ...base, bridgeState: "failed" }, now, 5_000, 3_000), "disconnected");
+});
+
 test("subtitle vertical-gap control is wired controller → server → dashboard", async () => {
   const [controllerJs, serverJs, dashboardJs] = await Promise.all([
     read("public/subtitle-controller.js"),
@@ -1311,19 +1465,293 @@ test("subtitle vertical-gap control is wired controller → server → dashboard
   assert.match(dashboardJs, /form\.elements\.verticalOffset/);
 });
 
-test("desktop floating controller exposes audio provider only for audio output", async () => {
+test("desktop floating controller cannot switch the fixed Gemini provider", async () => {
   const [html, js] = await Promise.all([
     read("public/subtitle-controller.html"),
     read("public/subtitle-controller.js"),
   ]);
 
-  assert.match(html, /id="controller-voice-provider"[^>]+hidden/);
-  assert.match(html, /role="radiogroup"[^>]+aria-label="통역 음성 엔진"/);
-  assert.match(html, /data-controller-voice-provider="gemini"/);
-  assert.match(html, /data-controller-voice-provider="openai"/);
-  assert.match(js, /settings\.outputMode === "captions"/);
-  assert.match(js, /command: "voice-provider"/);
-  assert.match(js, /ariaChecked/);
+  assert.doesNotMatch(html, /controller-voice-provider|data-controller-voice-provider|통역 음성 엔진/);
+  assert.doesNotMatch(js, /command: "voice-provider"|data-controller-voice-provider/);
+});
+
+test("participant floor silently gates every Electron host-audio path until Host Speak reclaims it", async () => {
+  const [main, dashboard, controllerHtml, controllerJs, overlayHtml] = await Promise.all([
+    read("electron/main.js"),
+    read("public/subtitle-dashboard.js"),
+    read("public/subtitle-controller.html"),
+    read("public/subtitle-controller.js"),
+    read("public/subtitle-overlay.html"),
+  ]);
+
+  const floorHandler = main.slice(
+    main.indexOf('message.type === "floor"'),
+    main.indexOf('message.type === "error"'),
+  );
+  const floorRendererRelay = main.slice(
+    main.indexOf("function relayLiveCallFloorToRenderers"),
+    main.indexOf("// The controller polls live-call:get-state"),
+  );
+  const hostFrameHandler = main.slice(
+    main.indexOf('ipcMain.on("live-call:audio-frame"'),
+    main.indexOf('ipcMain.handle("live-call:end"'),
+  );
+  const liveBridgeCapture = dashboard.slice(
+    dashboard.indexOf("async function startLiveCallMicCapture"),
+    dashboard.indexOf("function requestLocalSubtitlePreflight"),
+  );
+  const floorGate = dashboard.slice(
+    dashboard.indexOf("function applyLiveCallFloorGate"),
+    dashboard.indexOf("function stopLiveCallAudioBridge"),
+  );
+
+  // A participant floor is an audio boundary, not merely an overlay repaint:
+  // main must close the gateway path before relaying the event to renderers.
+  assert.match(floorHandler, /shouldBlockLiveHostAudioForFloor/u);
+  assert.match(floorHandler, /isHostAudioBlocked/u);
+  assert.ok(
+    floorHandler.search(/isHostAudioBlocked/u) < floorHandler.indexOf("relayLiveCallFloorToRenderers"),
+    "the host gate must close before any renderer can process the participant floor",
+  );
+  assert.match(floorRendererRelay, /\[dashboardWindow,\s*\.\.\.overlayWindows\.values\(\)\]/u);
+  assert.match(floorRendererRelay, /webContents\.send\("live-call:floor", message\)/u);
+  assert.doesNotMatch(floorRendererRelay, /controllerWindow/u);
+  assert.match(hostFrameHandler, /bridge\.isHostAudioBlocked/u);
+  assert.match(hostFrameHandler, /if \(bridge\.isHostAudioBlocked\) return/u);
+
+  // The renderer has one Live Call capture path. The floor signal gates it
+  // before IPC, and cannot start a second local subtitle producer.
+  assert.match(dashboard, /onLiveCallFloor/u);
+  assert.match(dashboard, /applyLiveCallFloorGate/u);
+  assert.match(dashboard, /isLiveHostAudioBlocked/u);
+  assert.match(liveBridgeCapture, /if \(isLiveHostAudioBlocked\) return/u);
+  assert.ok(
+    liveBridgeCapture.search(/isLiveHostAudioBlocked/u) < liveBridgeCapture.indexOf("sendLiveCallAudioFrame"),
+    "normal bridge capture must be rejected before renderer IPC",
+  );
+  assert.doesNotMatch(floorGate, /startLocalLiveCallFallback|restoreGatewayCaptionProducer|requestSubtitleStart|subtitle:audio/u);
+  assert.doesNotMatch(dashboard, /async function startLocalLiveCallFallback|async function restoreGatewayCaptionProducer/u);
+
+  // No new floor UI competes with captions. The existing explicit Host Speak
+  // button remains the sole host override and the overlay stays caption-only.
+  assert.match(controllerHtml, /id="controller-host-speak"/u);
+  assert.match(controllerJs, /window\.realtimeNoelDesktop\.hostSpeak\(\)/u);
+  assert.doesNotMatch(controllerHtml, /participant-floor|floor-warning|floor-modal/u);
+  assert.doesNotMatch(overlayHtml, /button|participant-floor|floor-warning/u);
+});
+
+test("explicit caption stop and Live Call end clear every visible subtitle surface without erasing records", async () => {
+  const [main, dashboard, overlay, server] = await Promise.all([
+    read("electron/main.js"),
+    read("public/subtitle-dashboard.js"),
+    read("public/subtitle-overlay.js"),
+    read("src/server.js"),
+  ]);
+
+  const stopSubtitles = dashboard.slice(
+    dashboard.indexOf("async function stopSubtitles"),
+    dashboard.indexOf("// Rebuild the running session's translation channels"),
+  );
+  const clearActiveSurface = dashboard.slice(
+    dashboard.indexOf("function clearActiveSubtitleSurface"),
+    dashboard.indexOf("async function reconnectLiveCallTranslation"),
+  );
+  const liveFloorListener = dashboard.slice(
+    dashboard.indexOf("function applyLiveCallFloorGate"),
+    dashboard.indexOf("function stopLiveCallAudioBridge"),
+  );
+  const rendererRelay = main.slice(
+    main.indexOf("function relayLiveCallFloorToRenderers"),
+    main.indexOf("// The controller polls live-call:get-state"),
+  );
+  const endLiveCall = main.slice(
+    main.indexOf('ipcMain.handle("live-call:end"'),
+    main.indexOf('ipcMain.handle("subtitle-overlay:get-enabled"'),
+  );
+  const serverStop = server.slice(
+    server.indexOf('if (message.type === "subtitle:stop")'),
+    server.indexOf("await transcriptRecordTail"),
+  );
+  const overlayTerminalListener = overlay.slice(
+    overlay.indexOf("function handleLiveCallFloorBoundary"),
+    overlay.indexOf("// Re-render every lane in a zone"),
+  );
+  const clearOverlay = overlay.slice(
+    overlay.indexOf("function clearSubtitle()"),
+    overlay.indexOf("function clearSubtitleLane"),
+  );
+  const clearSpeakerMetadata = overlay.slice(
+    overlay.indexOf("function clearLiveLaneRuntime"),
+    overlay.indexOf("// When the spoken (source) language switches"),
+  );
+
+  // Stop is a visible terminal boundary, regardless of whether the server is
+  // available to echo an idle status. It clears both committed and partial
+  // preview text but deliberately leaves the Records model untouched.
+  assert.match(stopSubtitles, /clearActiveSubtitleSurface\(\)/u);
+  assert.match(clearActiveSurface, /previewStatusTimer/u);
+  assert.match(clearActiveSurface, /translation-line[^\n]*\.textContent = ""/u);
+  assert.match(clearActiveSurface, /source-line[^\n]*\.textContent = ""/u);
+  assert.match(clearActiveSurface, /classList\.remove\("partial"\)/u);
+  assert.doesNotMatch(clearActiveSurface, /state\.history|renderHistory|sessionRecords/u);
+
+  // Gateway-backed Live Calls keep the local realtime manager cold, so the
+  // accepted stop itself must still publish the same idle boundary used by
+  // Caption-only. That gives every overlay one shared terminal clear path.
+  assert.match(serverStop, /broadcastSubtitleMessage\(\{\s*type: "subtitle:status",\s*status: "idle"/u);
+  assert.match(dashboard, /message\.type === "subtitle:status"[\s\S]{0,800}message\.status === "idle"[\s\S]{0,200}clearActiveSubtitleSurface\(\)/u);
+
+  // Live End cannot wait for the dashboard's polling interval. Main sends an
+  // exact-session terminal signal through the existing floor channel; the
+  // dashboard stops its caption session and the overlay clears immediately.
+  assert.match(endLiveCall, /type: "live-call-ended"/u);
+  assert.match(endLiveCall, /relayLiveCallFloorToRenderers/u);
+  assert.match(rendererRelay, /webContents\.send\("live-call:floor", message\)/u);
+  assert.match(liveFloorListener, /floor\?\.type === "live-call-ended"/u);
+  assert.match(liveFloorListener, /floor\.sessionId/u);
+  assert.match(liveFloorListener, /activeLiveFloorSessionId/u);
+  assert.match(liveFloorListener, /stopSubtitles\(\)/u);
+  assert.match(overlayTerminalListener, /floor\?\.type === "live-call-ended"/u);
+  assert.match(overlayTerminalListener, /floor\.sessionId !== activeLiveCallSessionId/u);
+  assert.match(overlayTerminalListener, /clearSubtitle\(\)/u);
+
+  // A full overlay clear also clears the Live speaker row; hiding text alone
+  // would leave stale accessibility/metadata state behind.
+  assert.match(clearOverlay, /clearLiveLaneRuntime\(lane\)/u);
+  assert.match(clearSpeakerMetadata, /speakerLabel\.hidden = true/u);
+  assert.match(clearSpeakerMetadata, /speakerLabel\.textContent = ""/u);
+
+  // Reconnect is not termination. Existing captions stay visible while the
+  // transport recovers instead of flashing an empty overlay.
+  const reconnect = dashboard.slice(
+    dashboard.indexOf("async function recoverLiveCaptionSocket"),
+    dashboard.indexOf("function requestSubtitleStart"),
+  );
+  assert.doesNotMatch(reconnect, /clearActiveSubtitleSurface|live-call-ended|stopSubtitles/u);
+});
+
+test("the selected desktop overlay recovers Live Call captions from one canonical visible timeline", async () => {
+  const [main, overlay, channels, css] = await Promise.all([
+    read("electron/main.js"),
+    read("public/subtitle-overlay.js"),
+    read("src/subtitle-channels.js"),
+    read("public/subtitle.css"),
+  ]);
+
+  const gatewayCaptionHandler = main.slice(
+    main.indexOf("bridge.captionRelay = createLiveCaptionIpcRelay"),
+    main.indexOf('socket.on("open"'),
+  );
+  const snapshotHandler = overlay.slice(
+    overlay.indexOf('if (message.type === "subtitle:snapshot")'),
+    overlay.indexOf("// The server already filters subscribed channels"),
+  );
+
+  // Gateway captions enter the dashboard once and then the local subtitle hub
+  // fans out one ordered stream. The selected overlay never gets a second raw
+  // Gateway path that could disagree with the web transcript.
+  assert.match(gatewayCaptionHandler, /dashboardWindow\.webContents\.send\("live-call:caption", caption\)/u);
+  assert.doesNotMatch(gatewayCaptionHandler, /overlayWindows|eachOverlayWindow/u);
+
+  // A connected overlay retains a short roll-up (N + N+1). Therefore a newly
+  // selected or recovered display cannot receive only the latest event (N+1):
+  // the snapshot must carry the same bounded, seq-ordered visible Live Call
+  // timeline and the renderer must replace its Live model from that snapshot.
+  assert.match(channels, /LIVE_CALL_DISPLAY_HISTORY_LIMIT/u);
+  assert.match(channels, /liveCallDisplayTimeline/u);
+  assert.match(channels, /source === "live-call"/u);
+  assert.match(channels, /sort\(\(left, right\) => left\.seq - right\.seq\)/u);
+  assert.match(snapshotHandler, /replaceLiveCallSubtitleSnapshot\(message\)/u);
+
+  // Live Call direction time is stamped once in the canonical hub so selecting
+  // another display cannot re-evaluate the same language switch differently.
+  // Caption-only keeps its existing local timing fallback and visual behaviour.
+  assert.match(channels, /now = Date\.now/u);
+  assert.match(channels, /displayTimestamp: now\(\)/u);
+  const directionGate = overlay.slice(
+    overlay.indexOf("function acceptDirection"),
+    overlay.indexOf("// ── Live Call speaker identity"),
+  );
+  assert.match(directionGate, /message\.source === "live-call"/u);
+  assert.match(directionGate, /message\.displayTimestamp/u);
+  assert.match(directionGate, /Date\.now\(\)/u);
+
+  // This is a state-consistency fix only. The overlay remains caption-only and
+  // Caption-only keeps its existing line budget and styling path.
+  assert.match(overlay, /lane\.isLiveCall \? Math\.min\(3, Math\.max\(2, sharedLimit\)\) : sharedLimit/u);
+  assert.match(overlay, /setProperty\("--subtitle-max-width", `\$\{settings\.maxWidth\}px`\)/u);
+  assert.match(css, /\.subtitle-box\s*\{[^}]*88vw/su);
+});
+
+test("floating controller selects one connected caption display with an accessible live dropdown", async () => {
+  const [html, controller, css, preload, main, relay] = await Promise.all([
+    read("public/subtitle-controller.html"),
+    read("public/subtitle-controller.js"),
+    read("public/subtitle.css"),
+    read("electron/preload.js"),
+    read("electron/main.js"),
+    read("src/live-caption-ipc-relay.js"),
+  ]);
+
+  const windowCluster = html.slice(
+    html.indexOf('class="controller-cluster mp-window"'),
+    html.indexOf("</div>\n      </div>\n    </main>"),
+  );
+  const quitIndex = windowCluster.indexOf('id="controller-quit"');
+  const selectIndex = windowCluster.indexOf('id="controller-display"');
+  assert.ok(quitIndex >= 0 && selectIndex > quitIndex, "display selector must be the rightmost controller control");
+  assert.match(windowCluster, /<label[^>]*for="controller-display"[^>]*class="sr-only"/u);
+  assert.match(windowCluster, /<select id="controller-display"[^>]*aria-label=/u);
+  assert.doesNotMatch(windowCluster, /emoji|gradient|style=/iu);
+  assertLocalized("controller.displaySelect", { en: /Caption display/, ko: /자막 표시 화면/ });
+  assertLocalized("controller.displayLoading", { en: /Checking displays/, ko: /화면 확인 중/ });
+  assertLocalized("controller.displayUnavailable", { en: /No display available/, ko: /사용 가능한 화면 없음/ });
+  assertLocalized("controller.primaryDisplay", { en: /^Main$/, ko: /^메인$/ });
+
+  assert.match(preload, /listOverlayDisplays: \(\) => ipcRenderer\.invoke\("subtitle-overlay:list-displays"\)/u);
+  assert.match(preload, /selectOverlayDisplay: \(displayId\) => ipcRenderer\.invoke\("subtitle-overlay:select-display", displayId\)/u);
+  assert.match(preload, /onOverlayDisplaysChanged/u);
+  assert.match(preload, /return \(\) => ipcRenderer\.removeListener\("subtitle-overlay:displays-changed", handler\)/u);
+
+  assert.match(controller, /const displaySelect = document\.getElementById\("controller-display"\)/u);
+  assert.match(controller, /window\.realtimeNoelDesktop\.listOverlayDisplays\(\)/u);
+  assert.match(controller, /window\.realtimeNoelDesktop\.selectOverlayDisplay\(display\.id\)/u);
+  assert.match(controller, /window\.realtimeNoelDesktop\.onOverlayDisplaysChanged/u);
+  assert.match(controller, /option\.textContent = display\.label/u);
+  assert.match(controller, /displaySelect\.value = String\(state\.selectedDisplayId\)/u);
+  assert.match(controller, /displaySelect\.disabled =/u);
+  const displayController = controller.slice(
+    controller.indexOf("// ── Caption display selection"),
+    controller.indexOf('document.getElementById("controller-font-down")'),
+  );
+  assert.doesNotMatch(displayController, /innerHTML/u);
+
+  // Main owns bounds. The renderer sends only the opaque display id and never
+  // receives or echoes coordinates/URLs through the selection call.
+  const selectionCall = controller.slice(
+    controller.indexOf('displaySelect.addEventListener("change"'),
+    controller.indexOf("// ── VU meter"),
+  );
+  assert.doesNotMatch(selectionCall, /bounds|workArea|url|loadURL/iu);
+
+  assert.match(css, /\.controller-display-select\s*\{[^}]*border-radius:\s*var\(--nova-r-pill\)/su);
+  assert.match(css, /\.controller-display-select:focus-visible\s*\{[^}]*2px solid var\(--nova-blue\)/su);
+  assert.match(css, /\.sr-only\s*\{/u);
+
+  // Selection is persisted and controller placement is the opposite screen;
+  // one connected display remains a valid selectable state where both coexist.
+  assert.match(main, /overlayDisplayId/u);
+  assert.match(main, /controllerWindow/u);
+  assert.match(main, /selectedDisplayId/u);
+  assert.match(main, /resolveControllerDisplay/u);
+  assert.match(relay, /return connected\.find\([^\n]+\) \?\? overlayDisplay \?\? primary/u);
+
+  // The existing ResizeObserver fit-size path remains active, so a longer
+  // monitor label widens the pill/window instead of clipping or adding a row.
+  assert.match(controller, /new ResizeObserver\(requestFit\)\.observe\(consoleRoot\)/u);
+  assert.match(controller, /fitControllerHeight\(height, width\)/u);
+  assert.match(css, /\.caption-controller-window \{[^}]*width: max-content/u);
+  assert.match(css, /\.caption-controller-window \{[^}]*max-width: none/u);
 });
 
 // ---- Meeting feed rendering cost over a multi-hour call (2026-07-25) ----
@@ -1354,20 +1782,14 @@ test("meeting turn cards are memoised on identity-stable turns", async () => {
   // index in the parent; passing the global counters into each card would
   // change a prop on all of them and defeat the memo.
   assert.match(feed, /recentFromIndex=\{turnRecentFrom\[turnIndex\]\}/u);
-  assert.match(feed, /textIndex >= recentFromIndex/u);
+  assert.match(feed, /captionIndex >= recentFromIndex/u);
   // The card now takes only primitives and identity-stable objects — no
   // callback prop at all — which is the strongest possible form of the
   // stability the fold's useCallback used to provide.
   assert.doesNotMatch(feed, /onToggle/u);
-  // pendingText is a string, so the card still takes only primitives and
-  // identity-stable objects — no callback prop — and memo can bail out on every
-  // paragraph except the newest one.
-  assert.match(feed, /const MeetingTurnCard = memo\(function MeetingTurnCard\(\{ turn, recentFromIndex, pendingText = "" \}/u);
-
-  // Scanning back for the in-progress line beats filtering thousands of
-  // captions on every streaming update.
-  assert.doesNotMatch(feed, /captions\.filter/u);
-  assert.match(feed, /for \(let index = captions\.length - 1; index >= 0; index -= 1\)/u);
+  assert.match(feed, /const MeetingTurnCard = memo\(function MeetingTurnCard\(\{ turn, recentFromIndex \}/u);
+  assert.match(feed, /turn\.captions\.some\(\(caption\) => !caption\.isFinal\)/u);
+  assert.doesNotMatch(feed, /pendingText|livePartial/u);
 });
 
 test("scroll pinning keeps its forced layout off the per-caption path", async () => {
@@ -1391,23 +1813,11 @@ test("scroll pinning keeps its forced layout off the per-caption path", async ()
   assert.match(feed, /const scrollToLatest = useCallback[\s\S]{0,240}feed\.scrollTop = feed\.scrollHeight/u);
 });
 
-test("meeting feed animations are compositor-only and respect reduced motion", async () => {
+test("streaming meeting captions do not replay entry animations", async () => {
   const css = await read("webapp/app/globals.css");
 
-  // Nothing in the feed may animate a layout property; height/top/margin/width
-  // in a keyframe block would relayout the whole record every frame.
-  for (const name of ["live-turn-in", "live-audio-bar", "live-overlay-in"]) {
-    const block = css.match(new RegExp(`@keyframes ${name} \\{[\\s\\S]*?\\n?\\}\\s*\\n`, "u"));
-    assert.ok(block, `@keyframes ${name} must stay present`);
-    assert.doesNotMatch(block[0], /(?:^|[;{\s])(?:height|width|top|left|bottom|right|margin|padding|font-size)\s*:/u);
-    assert.match(block[0], /transform|opacity/u);
-  }
-
-  // Reduced motion has to cover the paragraph entry animation, not only the
-  // fold chevron: the entry animation is the one that fires on every new turn.
-  const reduced = css.match(/@media \(prefers-reduced-motion: reduce\) \{\s*\n\s*\.live-turn-card \{[\s\S]*?\n\}/u);
-  assert.ok(reduced, "the feed needs a reduced-motion block");
-  assert.match(reduced[0], /\.live-turn-card \{ animation: none; \}/u);
+  assert.doesNotMatch(css, /@keyframes live-turn-in|animation:\s*live-turn-in/u);
+  assert.doesNotMatch(css, /@keyframes live-overlay-in|live-speaker-change-overlay/u);
 
   // will-change measured no benefit here (959 vs 960 frames over 8s, worse p95)
   // and hundreds of permanently promoted cards is a compositor-memory leak, so

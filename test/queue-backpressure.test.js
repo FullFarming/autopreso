@@ -51,8 +51,8 @@ async function startManagerWithSockets() {
     broadcast: () => {},
     settingsStore: {
       load: async () => ({
-        apiKeys: { openai: "sk-test" },
-        subtitle: { translationProvider: "openai", inputMode: "mic", languagePair: { a: "en", b: "ko" } },
+        apiKeys: { gemini: "AIza-test" },
+        subtitle: { translationProvider: "gemini", inputMode: "mic", languagePair: { a: "en", b: "ko" } },
       }),
     },
     createWebSocket: (url, protocols, init) => {
@@ -64,6 +64,7 @@ async function startManagerWithSockets() {
   });
   await manager.start({ sessionId: "active" });
   await new Promise((resolve) => setImmediate(resolve));
+  for (const socket of sockets) socket.emit("message", JSON.stringify({ setupComplete: {} }));
   return { manager, sockets };
 }
 

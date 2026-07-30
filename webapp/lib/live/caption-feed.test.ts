@@ -76,7 +76,25 @@ test("only cross-language canonical translations display outside the source lane
     "the meeting provider may omit a success status but must retain provenance");
   assert.equal(isDisplayableCaption({}), false);
   assert.equal(isDisplayableCaption({ language: "ko", translationStatus: "verbatim" }), false);
-  assert.equal(isDisplayableCaption({ language: "ko", sourceLanguage: "ko", translationStatus: "verbatim" }), false);
+  assert.equal(isDisplayableCaption({ language: "ko", sourceLanguage: "ko", translationStatus: "translated" }), false);
+});
+
+test("a canonical source final stays visible when the provider omits the optional origin marker", () => {
+  const visiblePartial = {
+    language: "ko",
+    sourceLanguage: "ko",
+    origin: "source",
+    translationStatus: "verbatim",
+  };
+  const canonicalFinal = {
+    language: "ko",
+    sourceLanguage: "ko",
+    translationStatus: "verbatim",
+  };
+
+  assert.equal(isDisplayableCaption(visiblePartial), true);
+  assert.equal(isDisplayableCaption(canonicalFinal), true,
+    "partial -> final must not make a valid participant source sentence disappear");
 });
 
 function caption(seq: number, text: string, overrides: Partial<CaptionEvent> = {}): CaptionEvent {
@@ -197,6 +215,85 @@ test("source and late translation form one canonical utterance in separate langu
   assert.deepEqual([cache.ko[0]?.seq, cache.ko[0]?.speaker?.speakerId], [1, "host"]);
   assert.equal(cache.en.length, 1);
   assert.equal(cache.ko.length, 1);
+});
+
+test("the production participant source and translation finals survive partial replacement in both lanes", () => {
+  const participant = {
+    speakerId: "participant:viewer-7",
+    label: "Sunny",
+    name: "Sunny",
+    department: "CRE",
+    jobTitle: "Manager",
+    colorToken: "speaker-teal",
+    voiceName: null,
+    voiceStatus: "disabled" as const,
+    lastSeenAt: "2026-07-26T22:43:10.000Z",
+  };
+  let cache: Record<string, CaptionEvent[]> = {};
+  cache = mergeLanguageCaptionCache(cache, "ko", [caption(19, "접속이 잘 안 되시는", {
+    language: "ko", sourceLanguage: "ko", origin: "source", translationStatus: "verbatim",
+    isFinal: false, speaker: participant,
+  })]);
+  cache = mergeLanguageCaptionCache(cache, "ko", [caption(19, "접속이 잘 안 되시는 것 같아요.", {
+    language: "ko", sourceLanguage: "ko", translationStatus: "verbatim", speaker: participant,
+  })]);
+  cache = mergeLanguageCaptionCache(cache, "en", [caption(15, "You're having trouble connecting.", {
+    language: "en", sourceLanguage: "ko", translationStatus: "translated", speaker: participant,
+  })]);
+
+  assert.deepEqual(cache.ko.map((event) => [event.seq, event.isFinal, event.speaker?.speakerId]), [
+    [19, true, "participant:viewer-7"],
+  ]);
+  assert.deepEqual(cache.en.map((event) => [event.seq, event.isFinal, event.speaker?.speakerId]), [
+    [15, true, "participant:viewer-7"],
+  ]);
+  assert.deepEqual(cache.ko[0]?.speaker && {
+    name: cache.ko[0].speaker.name,
+    department: cache.ko[0].speaker.department,
+    jobTitle: cache.ko[0].speaker.jobTitle,
+  }, { name: "Sunny", department: "CRE", jobTitle: "Manager" });
+  assert.equal(isDisplayableCaption(cache.ko[0] ?? {}), true);
+  assert.equal(isDisplayableCaption(cache.en[0] ?? {}), true);
+});
+
+test("a late reconnect snapshot cannot erase participant metadata from an already-rendered final", () => {
+  const liveSpeaker = {
+    speakerId: "participant:viewer-7",
+    label: "Sunny",
+    name: "Sunny",
+    department: "CRE",
+    jobTitle: "Manager",
+    colorToken: "speaker-teal",
+    voiceName: null,
+    voiceStatus: "disabled" as const,
+    lastSeenAt: "2026-07-26T22:43:10.000Z",
+  };
+  const snapshotSpeaker = {
+    speakerId: "participant:viewer-7",
+    label: "Sunny",
+    colorToken: "speaker-teal",
+    voiceName: null,
+    voiceStatus: "disabled" as const,
+    lastSeenAt: "2026-07-26T22:43:10.000Z",
+  };
+  let cache = mergeLanguageCaptionCache({}, "ko", [caption(19, "접속이 잘 안 되시는 것 같아요.", {
+    language: "ko", sourceLanguage: "ko", translationStatus: "verbatim", speaker: liveSpeaker,
+  })]);
+  cache = mergeLanguageCaptionCache(cache, "ko", [caption(19, "접속이 잘 안 되시는 것 같아요.", {
+    language: "ko", sourceLanguage: "ko", translationStatus: "verbatim", speaker: snapshotSpeaker,
+  })]);
+
+  assert.deepEqual(cache.ko[0]?.speaker && {
+    speakerId: cache.ko[0].speaker.speakerId,
+    name: cache.ko[0].speaker.name,
+    department: cache.ko[0].speaker.department,
+    jobTitle: cache.ko[0].speaker.jobTitle,
+  }, {
+    speakerId: "participant:viewer-7",
+    name: "Sunny",
+    department: "CRE",
+    jobTitle: "Manager",
+  });
 });
 
 test("repeating one utterance preserves two finals in both source and translated lanes", () => {
@@ -372,6 +469,31 @@ test("one partial is retained in addition to 5,000 committed captions and replac
 
   assert.equal(cache.ko.filter((event) => event.isFinal).length, 5_000);
   assert.deepEqual(cache.ko.filter((event) => !event.isFinal).map((event) => event.text), ["진행 중"]);
+});
+
+test("two hours at one final per second plus reconnect headroom remain available in both language lanes", () => {
+  const twoHoursWithHeadroom = 7_500;
+  const ko = Array.from({ length: twoHoursWithHeadroom }, (_value, index) => caption(index + 1, `ko-${index + 1}`, {
+    language: "ko", sourceLanguage: "ko", translationStatus: "verbatim",
+  }));
+  const en = Array.from({ length: twoHoursWithHeadroom }, (_value, index) => caption(index + 1, `en-${index + 1}`, {
+    language: "en", sourceLanguage: "ko", translationStatus: "translated",
+  }));
+  let cache = mergeLanguageCaptionCache({}, "ko", ko);
+  cache = mergeLanguageCaptionCache(cache, "en", en);
+
+  assert.equal(cache.ko.length, twoHoursWithHeadroom);
+  assert.equal(cache.en.length, twoHoursWithHeadroom);
+  assert.deepEqual([cache.ko[0]?.seq, cache.ko.at(-1)?.seq], [1, twoHoursWithHeadroom]);
+  assert.deepEqual([cache.en[0]?.seq, cache.en.at(-1)?.seq], [1, twoHoursWithHeadroom]);
+});
+
+test("the two-hour record remains memory-bounded after the 12,000-final safety window", () => {
+  const record = Array.from({ length: 12_001 }, (_value, index) => caption(index + 1, `record-${index + 1}`));
+  const cache = mergeLanguageCaptionCache({}, "ko", record);
+
+  assert.equal(cache.ko.length, 12_000);
+  assert.deepEqual([cache.ko[0]?.seq, cache.ko.at(-1)?.seq], [2, 12_001]);
 });
 
 test("an older snapshot final cannot erase a newer live partial", () => {

@@ -46,8 +46,8 @@ test("a source-language switch finalizes the on-screen partial as a committed li
     broadcast: (message) => broadcasts.push(message),
     settingsStore: {
       load: async () => ({
-        apiKeys: { openai: "sk-test" },
-        subtitle: { translationProvider: "openai", inputMode: "mic", languagePair: { a: "en", b: "ko" } },
+        apiKeys: { gemini: "AIza-test" },
+        subtitle: { translationProvider: "gemini", inputMode: "mic", languagePair: { a: "en", b: "ko" } },
       }),
     },
     createWebSocket: (url, protocols, init) => {
@@ -61,9 +61,12 @@ test("a source-language switch finalizes the on-screen partial as a committed li
   const koreanTarget = sockets[1];
 
   // English speech translated into Korean; the partial is on screen.
-  koreanTarget.emit("message", JSON.stringify({ type: "session.input_transcript.delta", delta: "We will now discuss the market outlook for this year." }));
-  koreanTarget.emit("message", JSON.stringify({ type: "session.input_transcript.done", transcript: "We will now discuss the market outlook for this year." }));
-  koreanTarget.emit("message", JSON.stringify({ type: "session.output_transcript.delta", delta: "올해 시장 전망에 대해 말씀드리겠습니다" }));
+  koreanTarget.emit("message", JSON.stringify({
+    serverContent: {
+      inputTranscription: { text: "We will now discuss the market outlook for this year.", languageCode: "en" },
+      outputTranscription: { text: "올해 시장 전망에 대해 말씀드리겠습니다." },
+    },
+  }));
 
   const partials = broadcasts.filter((message) => message.type === "subtitle:partial" && message.targetLanguage === "ko");
   assert.equal(partials.length >= 1, true, "the Korean translation partial must be on screen first");
@@ -71,11 +74,15 @@ test("a source-language switch finalizes the on-screen partial as a committed li
   // The speaker switches to Korean mid-flow. The Korean channel's source is now
   // its own target language — the old behavior wiped the on-screen sentence.
   // It must instead be finalized as a committed line before the lane clears.
-  koreanTarget.emit("message", JSON.stringify({ type: "session.input_transcript.delta", delta: "안녕하세요 여러분 오늘 발표를 시작하겠습니다" }));
+  koreanTarget.emit("message", JSON.stringify({
+    serverContent: {
+      inputTranscription: { text: "안녕하세요 여러분 오늘 발표를 시작하겠습니다", languageCode: "ko" },
+    },
+  }));
 
   const committed = broadcasts.filter((message) => message.type === "subtitle:committed" && message.targetLanguage === "ko");
   assert.equal(committed.length, 1, "the on-screen sentence is committed at the switch");
-  assert.equal(committed[0].translatedText, "올해 시장 전망에 대해 말씀드리겠습니다");
+  assert.equal(committed[0].translatedText, "올해 시장 전망에 대해 말씀드리겠습니다.");
   assert.equal(committed[0].sourceLanguage, "en", "the committed line keeps the direction it was translated in");
 
   await manager.stop();

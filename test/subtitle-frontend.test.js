@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { test } from "node:test";
+import vm from "node:vm";
 
 import { MESSAGES } from "../public/subtitle-i18n.js";
 
@@ -31,12 +32,106 @@ function extractFunctionBody(source, signature) {
   assert.fail(`${signature} must have a closing brace`);
 }
 
+function extractBalancedStatement(source, signature) {
+  const signatureIndex = source.indexOf(signature);
+  assert.ok(signatureIndex >= 0, `${signature} must exist`);
+  const openingBraceIndex = source.indexOf("{", signatureIndex);
+  let depth = 0;
+  for (let index = openingBraceIndex; index < source.length; index += 1) {
+    if (source[index] === "{") depth += 1;
+    if (source[index] !== "}") continue;
+    depth -= 1;
+    if (depth === 0) return source.slice(signatureIndex, index + 1);
+  }
+  assert.fail(`${signature} must have a closing brace`);
+}
+
 // There used to be a root-vs-public sync test here, plus three more like it in
 // other files. The root-level subtitle-* duplicates they policed have been
 // deleted: nothing referenced them, src/server.js serves public/ only, and npm
 // `files` / electron-builder `build.files` ship public/ only -- so editing a root
 // copy changed nothing in the running app while looking like real work. public/
 // is now the single copy, and there is nothing left to keep in sync.
+
+test("public is the only shipped subtitle frontend source", () => {
+  for (const file of [
+    "subtitle.html",
+    "subtitle-dashboard.js",
+    "subtitle-controller.html",
+    "subtitle-controller.js",
+  ]) {
+    assert.equal(existsSync(path.join(rootDir, file)), false, `${file} must not regain a stale root duplicate`);
+    assert.equal(existsSync(path.join(rootDir, "public", file)), true, `public/${file} is the runtime source`);
+  }
+});
+
+test("glossary presets restore exactly and expose accessible synced-preset controls", () => {
+  const html = readFileSync(path.join(rootDir, "public", "subtitle.html"), "utf8");
+  const css = readFileSync(path.join(rootDir, "public", "subtitle.css"), "utf8");
+  const js = readFileSync(path.join(rootDir, "public", "subtitle-dashboard.js"), "utf8");
+
+  assert.match(html, /<label[^>]*for="glossary-preset"/);
+  assert.match(html, /<select id="glossary-preset" name="glossaryPreset"[^>]*aria-describedby="glossary-preset-help glossary-preset-status"/);
+  assert.match(html, /id="glossary-preset-builtins"/);
+  assert.match(html, /id="glossary-preset-users"/);
+  assert.match(html, /id="create-glossary-preset"[^>]*data-i18n="glossary\.create"/);
+  assert.match(html, /<label[^>]*for="glossary-preset-name"/);
+  assert.match(html, /id="glossary-preset-name"[^>]*required/);
+  assert.match(html, /id="save-glossary-preset"/);
+  assert.match(html, /id="update-glossary-preset"/);
+  assert.match(html, /id="delete-glossary-preset"/);
+  assert.match(html, /id="confirm-delete-glossary-preset"/);
+  assert.match(html, /id="cancel-delete-glossary-preset"/);
+  assert.match(html, /id="glossary-preset-status"[^>]*role="status"[^>]*aria-live="polite"/);
+  assert.match(html, /<textarea name="glossary"[^>]*maxlength="40000"/,
+    "the editor must accept every full built-in corpus allowed by local settings");
+
+  assert.match(js, /DEFAULT_GLOSSARY_PRESET_ID = "default-cre-ai-en-ko"/);
+  assert.match(js, /glossaryPresetId: selectedGlossaryPresetId\(\)/,
+    "the selected preset id must travel with the persisted subtitle settings");
+  assert.match(js, /glossaryPresetName: selectedGlossaryPresetName\(\)/,
+    "a synced preset name must be cached with its id for offline restart labels");
+  assert.match(js, /restoreGlossaryPresetSelection\(settings\.glossaryPresetId/,
+    "form hydration must restore the persisted id after restart");
+  assert.match(js, /appendCachedGlossaryPresetOption/);
+  assert.match(js, /editingCustomPreset = selectedUserPreset/,
+    "manual edits switch to Custom without losing the version needed by Save changes");
+  assert.match(js, /window\.realtimeNoelDesktop\?\.listGlossaryPresets/);
+  assert.match(js, /invokeGlossaryPresetBridge\(\s*"createGlossaryPreset"/);
+  assert.match(js, /invokeGlossaryPresetBridge\("updateGlossaryPreset"/);
+  assert.match(js, /invokeGlossaryPresetBridge\("deleteGlossaryPreset"/);
+  assert.match(js, /GLOSSARY_PRESET_VERSION_CONFLICT/);
+  assert.match(js, /version < 1/);
+  assert.match(js, /NETWORK_UNAVAILABLE/);
+  assert.match(js, /HOST_LOGIN_REQUIRED/);
+  assert.match(js, /markGlossaryPresetCustom/);
+  assert.match(js, /event\.target === form\.elements\.glossary[\s\S]*?event\.target === form\.elements\.translationDomain/,
+    "manual glossary or domain edits must leave the old preset id behind");
+  assert.match(js, /function markGlossaryPresetCustom\(\)[\s\S]*?glossaryPresetId: "", glossaryPresetName: ""/);
+  const manualCustomIndex = js.indexOf("markGlossaryPresetCustom();");
+  const genericReadIndex = js.indexOf("state.settings = readSettingsFromForm();", manualCustomIndex);
+  const genericSaveIndex = js.indexOf("saveSettings({ subtitle: state.settings })", genericReadIndex);
+  assert.ok(manualCustomIndex >= 0 && genericReadIndex > manualCustomIndex && genericSaveIndex > genericReadIndex,
+    "the generic form path must persist cleared preset id/name after a manual edit");
+
+  assert.match(css, /\.glossary-preset-actions[\s\S]*?min-height: 44px/,
+    "preset actions must keep a 44px touch target even when compact buttons are used");
+  assert.match(css, /\.glossary-preset-editor[\s\S]*?display: grid/);
+  assert.match(css, /@media \(prefers-reduced-motion: reduce\)[\s\S]*?\.glossary-preset-editor/);
+  assert.match(js, /openGlossaryPresetDeleteConfirmation/);
+  assert.match(js, /confirmDeleteGlossaryPresetButton\?\.focus\(\)/);
+  assert.match(js, /event\.key !== "Escape"/);
+  assert.match(js, /deleteGlossaryPresetButton\.focus\(\)/);
+  assert.doesNotMatch(html + js, /<dialog|showModal\(|HTMLDialogElement|popover=|window\.confirm/,
+    "the editor must not depend on Dialog or Popover APIs");
+
+  assertLocalized("glossary.presetCustomHelp", { ko: /직접 수정했거나.*일치하지 않는/ });
+  assertLocalized("glossary.groupBuiltIn", { ko: /내장/ });
+  assertLocalized("glossary.groupSynced", { ko: /동기화/ });
+  assertLocalized("glossary.error.GLOSSARY_PRESET_VERSION_CONFLICT", { ko: /다른 기기.*변경/ });
+  assertLocalized("glossary.error.NETWORK_UNAVAILABLE", { ko: /네트워크/ });
+  assertLocalized("glossary.error.HOST_LOGIN_REQUIRED", { ko: /로그인/ });
+});
 
 test("subtitle dashboard exposes main controls, Gemma recording, and settings drawer", () => {
   const html = readFileSync(path.join(rootDir, "public", "subtitle.html"), "utf8");
@@ -49,7 +144,7 @@ test("subtitle dashboard exposes main controls, Gemma recording, and settings dr
   assert.match(html, /<title>NOVA<\/title>/);
   assert.match(html, /value="system_mic"/);
   assert.match(html, /name="openaiKey"/);
-  assert.match(html, /name="openaiSecondaryKey"/);
+  assert.doesNotMatch(html, /name="openaiSecondaryKey"/);
   assert.match(html, /value="system"/);
   assert.match(html, /value="mic"/);
   // Language selection has a single source of truth: the translation-language
@@ -124,10 +219,9 @@ test("subtitle dashboard exposes main controls, Gemma recording, and settings dr
   assert.match(workspaceJs, /t\("live\.hostLoginRequired"\)/);
   assertLocalized("live.hostLoginRequired", { en: /Open Settings and save the host authorization/ });
   assert.doesNotMatch(workspaceJs, /Sign in once in the Live workspace window|login page|login screen/i);
-  assert.match(html, /id="pt-voice-method-title"/);
-  assert.match(html, /data-i18n="output\.geminiVoice"/);
-  assertLocalized("output.geminiVoice", { ko: /Gemini 음성/ });
-  assert.match(html, /OpenAI Realtime/);
+  assert.doesNotMatch(html, /id="pt-voice-method-title"|data-i18n="output\.geminiVoice"/);
+  assert.doesNotMatch(html, /name="voiceProvider"[^>]+value="openai"/);
+  assert.match(html, /<input name="voiceProvider" type="hidden" value="gemini"\s*\/>/);
   // The Gemini-fixed explanation sentence was deleted; the fact remains as a
   // compact label + value note.
   assert.doesNotMatch(html, /자막 엔진은 Gemini 고정이며|pt-voice-method-help/);
@@ -171,7 +265,8 @@ test("subtitle dashboard exposes main controls, Gemma recording, and settings dr
   assert.match(js, /reconfigureRunningSession/);
   assert.match(js, /CHANNEL_REBUILD_CONTROLS/);
   assert.match(js, /type: "subtitle:start", sessionId: state\.sessionId/);
-  // Captions stay on Gemini. OpenAI is exposed only as an audio provider.
+  // Captions and translated audio stay on one Gemini contract. OpenAI key
+  // settings remain for unrelated whiteboard/agent/transcription features.
   assert.match(html, /name="translationProvider"/);
   assert.match(html, /value="gemini"/);
   assert.doesNotMatch(html, /<select name="translationProvider">/);
@@ -179,6 +274,8 @@ test("subtitle dashboard exposes main controls, Gemma recording, and settings dr
   assertLocalized("output.engineNote", { ko: /자막 엔진/ });
   assertLocalized("output.engineNoteValue", { ko: /Gemini 고정/ });
   assert.match(js, /translationProvider: "gemini"/);
+  assert.match(js, /voiceProvider: "gemini"/);
+  assert.doesNotMatch(js, /selectedVoiceProvider|OPENAI_REALTIME_TRANSLATION_LANGUAGES/);
   // Gemini API key entry with its own save button and status badge.
   assert.match(html, /<details class="settings-drawer">\s*<summary data-i18n="settings\.drawerAdvanced">/);
   assert.doesNotMatch(html, /<details class="settings-drawer"[^>]*\sopen(?:\s|>)/);
@@ -198,10 +295,7 @@ test("subtitle dashboard exposes main controls, Gemma recording, and settings dr
   assert.match(js, /hasGeminiSecondaryKey/);
   assert.match(js, /apiKeys: \{ geminiSecondary: geminiSecondaryKey \}/);
   assert.match(js, /saveGeminiSecondaryKey/);
-  assert.match(js, /hasOpenAISecondaryKey/);
-  assert.match(js, /apiKeysPatch\.openaiSecondary = openaiSecondaryKeyInput\.value\.trim\(\)/);
-  assert.match(js, /saveOpenAISecondaryKey/);
-  assert.match(js, /apiKeys: \{ openaiSecondary: openaiSecondaryKey \}/);
+  assert.doesNotMatch(html + js, /openaiSecondary|OpenAISecondary|openaiKey2|save-openai-secondary-key|openai-secondary-key-status/);
   assert.match(captureJs, /CAPTION_AUDIO_PROCESSOR_BUFFER_SIZE = 1_024/);
   // Key registration must be explicit for BOTH providers: a clear
   // registered/unregistered badge, not a vague placeholder.
@@ -233,8 +327,7 @@ test("subtitle dashboard exposes main controls, Gemma recording, and settings dr
   assert.doesNotMatch(html, /Only translated subtitles are shown/);
   assert.match(html, /id="save-openai-key"/);
   assert.match(html, /id="openai-key-status"/);
-  assert.match(html, /id="save-openai-secondary-key"/);
-  assert.match(html, /id="openai-secondary-key-status"/);
+  assert.doesNotMatch(html, /id="save-openai-secondary-key"|id="openai-secondary-key-status"/);
   assert.match(html, /id="file-protocol-warning"/);
   assert.match(html, /href="subtitle\.css"/);
   assert.match(html, /src="subtitle-dashboard\.js"/);
@@ -270,12 +363,13 @@ test("subtitle dashboard exposes main controls, Gemma recording, and settings dr
   // Outside Electron every desktop-only control is hidden, Main included.
   assert.match(controllerJs, /if \(mainWindowButton\) mainWindowButton\.hidden = true;/);
   assert.doesNotMatch(controllerHtml, /id="controller-language-preset"/);
-  assert.doesNotMatch(controllerHtml, /<select/);
-  // The floating controller no longer carries a language preset row — languages
-  // are chosen ahead of time in the workspace. The only .controller-language-set
-  // left is the audio voice-provider group.
+  assert.match(controllerHtml, /<select id="controller-display"/u);
+  assert.equal((controllerHtml.match(/<select\b/gu) ?? []).length, 1,
+    "the display selector is the controller's only dropdown");
+  // Languages and the fixed Gemini provider are chosen ahead of time in the workspace.
   assert.doesNotMatch(controllerHtml, /data-controller-languages=/);
-  assert.match(controllerHtml, /class="controller-language-set"[^>]*aria-label="통역 음성 엔진"/);
+  assert.doesNotMatch(controllerHtml, /class="controller-language-set"/);
+  assert.doesNotMatch(controllerHtml, /통역 음성 엔진/u);
   // Vertical-gap stepper lives beside the opacity control.
   assert.match(controllerHtml, /id="controller-gap-down"/);
   assert.match(controllerHtml, /id="controller-gap-up"/);
@@ -301,7 +395,7 @@ test("subtitle dashboard exposes main controls, Gemma recording, and settings dr
   assert.match(js, /persistControllerSubtitleSettings/);
   assert.match(js, /const isVisible = state\.running && state\.settings\.outputMode !== "audio"/);
   assert.match(js, /captionPlayerController\.hidden = !isVisible/);
-  assert.match(js, /controllerRestartButton\?\.addEventListener\("click", restartSubtitles\)/);
+  assert.match(js, /controllerRestartButton\?\.addEventListener\("click", restartCaptionsFromController\)/);
   assert.match(js, /controllerStopButton\?\.addEventListener\("click", stopSubtitles\)/);
   assert.match(js, /controllerLanguagePreset\?\.addEventListener\("change", \(\) => applyControllerLanguagePreset\(\)\)/);
   assert.match(js, /controllerOpacity\?\.addEventListener\("input", \(\) => previewControllerOpacity\(\)\)/);
@@ -314,7 +408,9 @@ test("subtitle dashboard exposes main controls, Gemma recording, and settings dr
   assert.match(js, /syncControllerOpacity/);
   assert.match(js, /handleSubtitleControllerCommand/);
   assert.match(js, /setControllerWindowVisible\(state\.running && !isAudioOnly\)/);
-  assert.match(js, /setControllerWindowVisible\(false\)/);
+  const stopSubtitlesBody = extractFunctionBody(js, "async function stopSubtitles()");
+  assert.match(stopSubtitlesBody, /state\.running = false[\s\S]*syncRuntimeOutputVisibility\(\)/,
+    "the stop path must hide the controller through the single runtime visibility rule");
   assert.match(controllerJs, /type: "subtitle:control"/);
   assert.doesNotMatch(controllerJs, /data-controller-languages/);
   assert.match(controllerJs, /command: "restart"/);
@@ -331,7 +427,7 @@ test("subtitle dashboard exposes main controls, Gemma recording, and settings dr
   assert.match(js, /displayMode: "translation_only"/);
   assert.match(js, /maxSubtitleLines: 2/);
   assert.match(js, /ollamaModel: "gemma3n:e2b"/);
-  assert.match(js, /OpenAI Realtime: ready/);
+  assert.match(js, /Gemini Live: ready/);
   assert.match(js, /t\("status\.realtimeConnected"\)/);
   assertLocalized("status.realtimeConnected", { ko: /실시간 자막 연결됨/ });
   assert.match(js, /t\("history\.recorderFallback"\)/);
@@ -352,11 +448,16 @@ test("subtitle dashboard exposes main controls, Gemma recording, and settings dr
   assert.match(js, /validateOpenAIKey/);
   assert.match(js, /\/api\/subtitles\/openai\/validate/);
   assert.match(js, /t\("key\.validatingOpenAI"\)/);
-  assertLocalized("key.validatingOpenAI", { en: /Validating OpenAI Realtime/ });
+  assertLocalized("settings.openaiKey", { en: /OpenAI speech recognition API key/, ko: /OpenAI 음성 인식 API key/ });
+  assertLocalized("key.validatingOpenAI", { en: /Validating OpenAI speech recognition/, ko: /OpenAI 음성 인식 확인 중/ });
   assert.match(js, /apiKeys: \{ openai: openaiKey \}/);
   assert.match(js, /renderKeyStatus/);
   assert.match(js, /t\("key\.openaiSaved"\)/);
-  assertLocalized("key.openaiSaved", { ko: /OpenAI Realtime 연결을 확인했고 API key를 저장했습니다/ });
+  assertLocalized("key.openaiSaved", { en: /OpenAI speech recognition verified/, ko: /OpenAI 음성 인식을 확인했고 API key를 저장했습니다/ });
+  assert.doesNotMatch(
+    Object.values(MESSAGES.en).join("\n") + Object.values(MESSAGES.ko).join("\n"),
+    /OpenAI Realtime|OpenAI API key 2|OpenAI Realtime 번역 검증/,
+  );
   assert.match(js, /source: capture\.source/);
   assert.match(js, /label: getAudioTrackLabel/);
   assert.match(js, /startAudioLevelMeter/);
@@ -367,7 +468,7 @@ test("subtitle dashboard exposes main controls, Gemma recording, and settings dr
   assert.match(js, /INPUT_SILENCE_WARNING_MS/);
   assert.match(js, /subtitle:input-status/);
   assert.match(js, /broadcastInputStatus/);
-  assert.match(js, /message\.type === "subtitle:partial"[\s\S]{0,180}setPreviewText/);
+  assert.match(js, /message\.type === "subtitle:partial"[\s\S]{0,420}setPreviewText/);
   assert.match(js, /micDeviceId/);
   assert.match(js, /replaceChildren\(new Option\(t\("settings\.systemDefault"\), ""\)\)/);
   assertLocalized("settings.systemDefault", { en: /System default/ });
@@ -426,7 +527,7 @@ test("subtitle dashboard exposes main controls, Gemma recording, and settings dr
     assert.match(js, new RegExp(`t\\("${key.replace(".", "\\.")}"\\)`));
     assertLocalized(key, { ko: korean });
   }
-  assert.match(js, /void stopSubtitles\(\)/);
+  assert.match(js, /await stopSubtitles\(\)/);
   assert.match(js, /t\("notice\.settingsSaved"\)/);
   assertLocalized("notice.settingsSaved", { ko: /설정을 저장했습니다/ });
   assert.match(js, /window\.location\.href = "\/api\/settings\/export"/);
@@ -496,8 +597,9 @@ test("desktop dashboard explains the optional Live handoff without a web launche
 
 test("subtitle dashboard captures audio before opening realtime subtitle sessions", () => {
   const js = readFileSync(path.join(rootDir, "public", "subtitle-dashboard.js"), "utf8");
-  const captureIndex = js.indexOf("captures = await captureSelectedAudio(state.settings)");
-  const startIndex = js.indexOf('type: "subtitle:start"');
+  const startSubtitlesBody = extractFunctionBody(js, "async function startSubtitles()");
+  const captureIndex = startSubtitlesBody.indexOf("captures = await captureSelectedAudio(state.settings)");
+  const startIndex = startSubtitlesBody.indexOf("await requestSubtitleStart(");
 
   assert.ok(captureIndex > 0, "dashboard should capture selected audio before starting subtitles");
   assert.ok(startIndex > captureIndex, "subtitle:start should be sent only after local capture succeeds");
@@ -557,7 +659,8 @@ test("the captions output mode survives settings persistence, and audio playback
     "readSubtitlePositionsFromForm",
     "deriveLanguagePairFromTargets",
     "selectedOutputMode",
-    "selectedVoiceProvider",
+    "selectedGlossaryPresetId",
+    "selectedGlossaryPresetName",
     extractFunctionBody(js, "function readSettingsFromForm()"),
   );
   const settings = readSettingsFromForm(
@@ -581,6 +684,8 @@ test("the captions output mode survives settings persistence, and audio playback
     () => ({ a: "en", b: "ko" }),
     () => selectedOutputMode(form),
     () => "gemini",
+    () => "default-cre-ai-en-ko",
+    () => "",
   );
   assert.equal(settings.outputMode, "captions");
 
@@ -592,9 +697,7 @@ test("the captions output mode survives settings persistence, and audio playback
     "fetch",
     "state",
     "updateOpenAIKeyPlaceholder",
-    "updateOpenAISecondaryKeyPlaceholder",
     "updateOpenAIKeyStatus",
-    "updateOpenAISecondaryKeyStatus",
     "updateGeminiKeyStatus",
     "updateGeminiSecondaryKeyStatus",
     extractFunctionBody(js, "async function saveSettings(patch)"),
@@ -606,8 +709,6 @@ test("the captions output mode survives settings persistence, and audio playback
       return { ok: true, json: async () => ({ ok: true }) };
     },
     {},
-    () => {},
-    () => {},
     () => {},
     () => {},
     () => {},
@@ -754,7 +855,7 @@ test("subtitle dashboard renders grouped translation history without flat-only r
   assert.doesNotMatch(js, /translationLog\.replaceChildren\(\.\.\.state\.history\.records\.slice\(0, 12\)\.map/);
   assert.match(js, /dedupeFinalHistoryRecords/);
   assert.match(js, /record\.isFinal === false/);
-  assert.match(js, /message\.type === "subtitle:partial"[\s\S]{0,180}setPreviewText\(message\.translatedText, message\.sourceText, true\)/);
+  assert.match(js, /message\.type === "subtitle:partial"[\s\S]{0,420}setPreviewText\(message\.translatedText, message\.sourceText, true\)/);
   assert.doesNotMatch(js, /\.innerHTML\s*=/);
   assert.match(css, /\.translation-day/);
   assert.match(css, /\.translation-day summary/);
@@ -842,10 +943,9 @@ test("subtitle overlay defaults to the observed two-line rolling-caption layout"
   assert.match(js, /dblclick/);
   assert.match(js, /"subtitle:control"/);
   assert.match(js, /setOverlayInteractive/);
-  // Pipeline status badge: reconnecting / recovering / degraded are visible.
-  assert.match(js, /subtitle-status-indicator/);
   // Overlay is for subtitles only. Operational status belongs in the
-  // dashboard, so these strings must never appear over the presentation.
+  // controller, so recovery copy must never appear over the presentation.
+  assert.doesNotMatch(js, /subtitle-status-indicator|updateStatusIndicator|자막 재연결 중|자막 복구 중|오디오 처리 지연/);
   assert.doesNotMatch(js, /API 연결 중/);
   assert.doesNotMatch(js, /자막 대기 중/);
   assert.doesNotMatch(js, /준비됨/);
@@ -873,6 +973,14 @@ test("subtitle overlay defaults to the observed two-line rolling-caption layout"
   // The queue can retain one extra line internally while the product default
   // mirrors the 5fps reference: two visible lines with only the live tail changing.
   assert.match(js, /MAX_SUBTITLE_QUEUE_LINES = 3/);
+  assert.match(css, /\.subtitle-lane\.is-live-call \.translation-line[\s\S]*?height: calc\(var\(--subtitle-line-clamp, 3\) \* 1\.18em\)/u,
+    "Live Call reserves its complete line stack so text growth cannot move the outer block");
+  assert.match(css, /\.subtitle-lane\.is-live-call \.live-call-speaker-label\[hidden\][\s\S]*?visibility: hidden/u,
+    "Live Call reserves the speaker row between floor and caption events");
+  assert.match(css, /\.subtitle-lane\.is-live-call \.live-call-speaker-label[\s\S]*?height: 44px/u,
+    "visible and hidden speaker metadata use the same reserved row height");
+  assert.match(css, /\.subtitle-lane\.is-live-call \.subtitle-word[\s\S]*?animation: none/u,
+    "frequent Live revisions must not re-run word entry fades");
   // One independent lane per target language, positioned per language.
   assert.match(js, /const lanes = new Map/);
   assert.match(js, /ensureLane/);
@@ -984,6 +1092,20 @@ test("subtitle overlay defaults to the observed two-line rolling-caption layout"
   assert.doesNotMatch(css, /opacity: var\(--subtitle-opacity\)/);
 });
 
+test("Live Call partial and final plates keep the same configured opacity", () => {
+  const css = readFileSync(path.join(rootDir, "public", "subtitle.css"), "utf8");
+  assert.match(
+    css,
+    /\.subtitle-box\.partial\s*\{[^}]*\/ 0\.78[^}]*\}/s,
+    "Caption-only keeps its existing partial treatment",
+  );
+  assert.match(
+    css,
+    /\.subtitle-lane\.is-live-call \.subtitle-box\.partial\s*\{[^}]*\/ var\(--subtitle-opacity\)[^}]*\}/s,
+    "Live Call must not replace the user's opacity during partial/final transitions",
+  );
+});
+
 test("subtitle styles use the editorial palette and carry no legacy brand colors", () => {
   const css = readFileSync(path.join(rootDir, "public", "subtitle.css"), "utf8");
   // De-branding guarantee: the retired Cushman brand hexes must never reappear.
@@ -1023,10 +1145,11 @@ test("electron main creates always-on-top click-through overlay", () => {
   // on the 1s polling watchdog.
   assert.match(source, /browser-window-focus/);
   assert.match(source, /did-become-active/);
-  // Multi-display: one overlay window per connected display, reconciled when
-  // displays are added/removed, so extended screens also show subtitles.
+  // Multi-display: exactly one overlay follows the persisted selected display;
+  // hot-plug events reconcile its bounds without cloning caption state.
   assert.match(source, /screen\.getAllDisplays\(\)/);
-  assert.match(source, /overlayWindows/);
+  assert.match(source, /const overlayWindows = new Map\(\)/u);
+  assert.match(source, /preferredOverlayDisplayId/u);
   assert.match(source, /display-added/);
   assert.match(source, /display-removed/);
   assert.match(source, /showInactive/);
@@ -1115,32 +1238,34 @@ test("live-call captions relay the opposite-language lane selected by main", () 
   assert.match(overlay, /live-call-speaker-label/);
   assert.match(overlay, /updateLiveCallSpeaker\(message, lane\)/);
   assert.match(dashboard, /sessionId: String\(caption\.sessionId/);
+  assert.match(dashboard, /sourceSeq: Number\.isSafeInteger\(caption\.seq\)/,
+    "the gateway sequence must reach the overlay as fallback utterance identity");
   assert.match(dashboard, /speakerRole,/);
 
   const server = readFileSync(path.join(rootDir, "src", "server.js"), "utf8");
   assert.match(server, /liveCallSpeaker/);
   assert.match(server, /message\.recordOnly === true/);
   assert.match(server, /sourceText: translatedText/);
+  assert.match(server, /MAX_PENDING_UNKEYED_LIVE_CALL_SOURCES/,
+    "unkeyed source pairing must use a bounded FIFO rather than unbounded Symbol keys");
 });
 
-test("Live Call cold standby fences one producer and returns to the gateway after recovery", () => {
+test("Live Call uses one gateway translation producer across every floor state", () => {
   const dashboard = readFileSync(path.join(rootDir, "public", "subtitle-dashboard.js"), "utf8");
-  const sync = dashboard.slice(
-    dashboard.indexOf("async function syncLiveCallAudioBridge"),
-    dashboard.indexOf("if (window.realtimeNoelDesktop?.ensureLiveCallBridge)"),
-  );
-  const initialize = sync.indexOf('activeCaptionProducer === "none"');
-  const fallback = sync.indexOf('["reconnecting", "failed"].includes');
-  assert.ok(initialize >= 0 && fallback > initialize,
-    "the transcript session must exist before a first-poll reconnect fallback starts");
-  assert.match(sync, /\["reconnecting", "failed"\]\.includes\(liveState\.bridge\?\.state\)[\s\S]*startLocalLiveCallFallback/u);
-  assert.match(sync, /bridge\?\.state === "connected"[\s\S]*restoreGatewayCaptionProducer/u);
-  assert.match(dashboard, /subtitle:producer-stop/u);
-  assert.match(dashboard, /subtitle:producer-stopped/u);
-  assert.match(dashboard, /if \(!isProducerStopped\)[\s\S]*return;[\s\S]*activeCaptionProducer = "gateway"/u,
-    "an unacknowledged local stop must not promote the gateway producer");
-  assert.match(dashboard, /activeCaptionProducer !== "gateway"/u,
-    "gateway events must stay fenced while the local fallback owns the overlay");
+  const syncBody = extractFunctionBody(dashboard, "async function syncLiveCallAudioBridge()");
+  const floorGate = extractFunctionBody(dashboard, "function applyLiveCallFloorGate(floor)");
+  const reconnect = extractFunctionBody(dashboard, "async function reconnectLiveCallTranslation()");
+
+  assert.match(syncBody, /await startGatewayCaptionSession\(liveState\)/u);
+  assert.match(syncBody, /await bridge\.ensureLiveCallBridge\(\)/u);
+  assert.match(syncBody, /await startLiveCallMicCapture\(\)/u);
+  assert.doesNotMatch(syncBody, /startLocalLiveCallFallback|createAudioStreamer|subtitle:audio/u,
+    "Live Call must not send the host audio to a second local Gemini session");
+  assert.doesNotMatch(floorGate, /startLocalLiveCallFallback|restoreGatewayCaptionProducer|requestSubtitleStart|subtitle:audio/u,
+    "floor changes may gate host PCM but must never swap translation producers");
+  assert.doesNotMatch(reconnect, /activeCaptionProducer === "local"|restoreGatewayCaptionProducer/u,
+    "2-second recovery reconnects the gateway instead of promoting another producer");
+  assert.doesNotMatch(dashboard, /async function startLocalLiveCallFallback|async function restoreGatewayCaptionProducer|subtitle:producer-stop|subtitle:producer-stopped/u);
 });
 
 test("Live Call polling leaves a caption-only local producer running", () => {
@@ -1162,11 +1287,10 @@ test("Live Call polling leaves a caption-only local producer running", () => {
     "only a session owned by Live Call may be finalized when the call ends");
 });
 
-test("Live Call shutdown finalizes both gateway and local fallback ownership", () => {
+test("Live Call shutdown finalizes its gateway-only ownership", () => {
   const dashboard = readFileSync(path.join(rootDir, "public", "subtitle-dashboard.js"), "utf8");
   const sync = extractFunctionBody(dashboard, "async function syncLiveCallAudioBridge()");
   const gateway = extractFunctionBody(dashboard, "async function startGatewayCaptionSession(liveState)");
-  const fallback = extractFunctionBody(dashboard, "async function startLocalLiveCallFallback(liveState)");
   const stop = extractFunctionBody(dashboard, "async function stopSubtitles()");
   const endedCallBranch = sync.slice(
     sync.indexOf("if (!liveState?.armed || !liveState.live)"),
@@ -1174,17 +1298,502 @@ test("Live Call shutdown finalizes both gateway and local fallback ownership", (
   );
 
   assert.match(gateway, /activeCaptionSessionOwner = "live-call"/u,
-    "the gateway path must establish Live Call ownership before a fallback can inherit it");
-  assert.doesNotMatch(fallback, /activeCaptionSessionOwner = "(?:none|caption-only)"/u,
-    "switching to the local fallback must preserve Live Call ownership");
+    "the gateway path must establish Live Call ownership");
   assert.match(endedCallBranch, /activeCaptionSessionOwner === "live-call"[\s\S]*await stopSubtitles\(\)/u,
-    "call end must finalize the session regardless of its current gateway/local producer");
+    "call end must finalize the gateway-owned session");
   assert.match(endedCallBranch, /stopLiveCallAudioBridge\("live call ended"\)/u);
   assert.match(stop, /activeCaptionSessionOwner = "none"/u,
     "stopping any caption session must clear stale ownership");
+  assert.doesNotMatch(dashboard, /startLocalLiveCallFallback|restoreGatewayCaptionProducer/u);
+});
 
-  assert.match(fallback, /catch \(error\)[\s\S]*await stopSubtitles\(\)[\s\S]*throw error/u,
-    "a failed fallback transition must release capture and finalize its record");
+test("caption runtime waits for the matching start acknowledgement before exposing controls", () => {
+  const dashboard = readFileSync(path.join(rootDir, "public", "subtitle-dashboard.js"), "utf8");
+  const start = extractFunctionBody(dashboard, "async function startSubtitles()");
+  const request = extractFunctionBody(dashboard, "function requestSubtitleStart(payload)");
+
+  assert.match(dashboard, /const CAPTION_RUNTIME_TRANSITIONS = Object\.freeze/u,
+    "caption lifecycle must be represented by one explicit state machine");
+  assert.match(request, /message\.type === "subtitle:started"/u);
+  assert.match(request, /message\.sessionId !== payload\.sessionId/u,
+    "a stale acknowledgement from an older start must not open the controller");
+  assert.match(request, /message\.captionProducer !== expectedProducer/u);
+  assert.match(request, /message\.type === "subtitle:error" && message\.code === "SUBTITLE_START_FAILED"/u);
+  assert.match(request, /message\.sessionId && message\.sessionId !== payload\.sessionId/u);
+  assert.match(request, /message\.captionProducer && message\.captionProducer !== expectedProducer/u);
+  const acknowledgementIndex = start.indexOf("await requestSubtitleStart(");
+  const runningIndex = start.indexOf("state.running = true");
+  const controllerIndex = start.indexOf("syncRuntimeOutputVisibility()");
+  assert.ok(acknowledgementIndex >= 0 && runningIndex > acknowledgementIndex,
+    "running must stay false until subtitle:started is received");
+  assert.ok(controllerIndex > runningIndex,
+    "the controller must become visible only after the acknowledged running state");
+});
+
+test("Live Call recovery keeps its controller and record while caption-only errors still stop", () => {
+  const dashboard = readFileSync(path.join(rootDir, "public", "subtitle-dashboard.js"), "utf8");
+  const errorHandler = extractFunctionBody(dashboard, "async function handleSubtitleRuntimeError(message)");
+  const reconnect = extractFunctionBody(dashboard, "async function reconnectLiveCallTranslation()");
+  const stop = extractFunctionBody(dashboard, "async function stopSubtitles()");
+
+  assert.match(dashboard, /message\.type === "subtitle:error"[\s\S]*handleSubtitleRuntimeError\(message\)/u);
+  assert.match(errorHandler, /activeCaptionSessionOwner === "live-call"/u);
+  assert.match(errorHandler, /transitionCaptionRuntime\("reconnecting"\)/u);
+  assert.match(errorHandler, /await reconnectLiveCallTranslation\(\)/u);
+  const liveRecoveryBranch = errorHandler.slice(0, errorHandler.indexOf("await stopSubtitles()"));
+  assert.doesNotMatch(liveRecoveryBranch, /setControllerWindowVisible\(false\)|await stopSubtitles\(\)/u,
+    "recoverable Live errors must not hide the controller or end the record");
+  assert.match(errorHandler, /await stopSubtitles\(\)/u,
+    "the non-Live branch must preserve Caption-only's stop-on-error behaviour");
+
+  assert.match(reconnect, /bridge\?\.reconnectLiveCallTranslation/u);
+  assert.match(reconnect, /await bridge\.reconnectLiveCallTranslation\(\)/u);
+  assert.match(reconnect, /const sessionId = state\.sessionId/u);
+  assert.doesNotMatch(reconnect, /state\.sessionId = null|type: "subtitle:stop"|await stopSubtitles\(\)/u,
+    "Live translation recovery must preserve the app session and committed transcript");
+  assert.match(reconnect, /clearTranslatedAudioQueue\(\)/u);
+  assert.doesNotMatch(reconnect, /clearUncommittedPreview\(\)/u,
+    "recovery must retain the latest partial until a snapshot or newer canonical event replaces it");
+  assert.match(stop, /state\.sessionId = null/u,
+    "the explicit stop path remains the only path that finalizes the session");
+});
+
+test("Live Call requests one immediate recovery after two seconds of signalled input without captions", () => {
+  const dashboard = readFileSync(path.join(rootDir, "public", "subtitle-dashboard.js"), "utf8");
+  const factorySource = extractBalancedStatement(dashboard, "function createLiveTranslationStallMonitor");
+  const createMonitor = new Function(`${factorySource}; return createLiveTranslationStallMonitor;`)();
+  const recoveries = [];
+  const monitor = createMonitor(() => recoveries.push("recover"), 2_000, 250);
+
+  assert.equal(monitor.noteInput("mic", true, 0, true), false);
+  for (let now = 200; now < 2_000; now += 200) monitor.noteInput("mic", true, now, true);
+  assert.equal(monitor.noteInput("mic", true, 2_000, true), true);
+  assert.deepEqual(recoveries, ["recover"]);
+  monitor.noteInput("mic", true, 4_500, true);
+  assert.deepEqual(recoveries, ["recover"], "one stall window must never request duplicate reconnects");
+
+  monitor.noteOutput(5_000);
+  for (let now = 5_200; now < 7_000; now += 200) monitor.noteInput("mic", true, now, true);
+  assert.equal(monitor.noteInput("mic", true, 7_000, true), true, "caption output rearms the two-second deadline");
+  assert.deepEqual(recoveries, ["recover", "recover"]);
+
+  monitor.reset();
+  monitor.noteInput("mic", true, 10_000, true);
+  monitor.noteInput("mic", false, 10_100, true);
+  monitor.noteInput("mic", false, 13_000, true);
+  assert.deepEqual(recoveries, ["recover", "recover"], "silence must not trigger recovery");
+  monitor.noteInput("mic", true, 14_000, false);
+  monitor.noteInput("mic", true, 17_000, false);
+  assert.deepEqual(recoveries, ["recover", "recover"], "participant floor or audio suppression must suspend recovery");
+
+  assert.match(dashboard, /LIVE_TRANSLATION_STALL_MILLISECONDS = 2_000/u);
+  assert.match(dashboard, /noteInput\(\s*sourceName,\s*hasSignal,\s*now,[\s\S]{0,180}!isLiveHostAudioBlocked/u);
+  assert.match(dashboard, /noteOutput\(performance\.now\(\)\)/u);
+  assert.match(dashboard, /String\(message\.translatedText \?\? ""\)\.trim\(\)/u);
+  assert.match(dashboard, /void reconnectLiveCallTranslation\(\)/u);
+});
+
+test("Gemini-only subtitle settings never write the retired OpenAI realtime translation model", () => {
+  const dashboard = readFileSync(path.join(rootDir, "public", "subtitle-dashboard.js"), "utf8");
+  assert.doesNotMatch(dashboard, /gpt-realtime-translate/u);
+  assert.match(dashboard, /translationProvider: "gemini"/u);
+});
+
+test("a local socket drop re-registers the same Live session without controller flicker", () => {
+  const dashboard = readFileSync(path.join(rootDir, "public", "subtitle-dashboard.js"), "utf8");
+  const connect = extractFunctionBody(dashboard, "function connectWebSocket()");
+  const recover = extractFunctionBody(dashboard, "async function recoverLiveCaptionSocket()");
+
+  assert.match(connect, /activeCaptionSessionOwner === "live-call" && state\.running/u);
+  assert.match(connect, /transitionCaptionRuntime\("reconnecting"\)/u);
+  assert.match(connect, /captionWebSocketReconnectTimer = window\.setTimeout\(connectWebSocket, 1_000\)/u);
+  assert.match(connect, /void recoverLiveCaptionSocket\(\)/u);
+  const liveCloseBranch = connect.slice(
+    connect.indexOf('if (activeCaptionSessionOwner === "live-call" && state.running)'),
+    connect.indexOf('setConnectionStatus(t("status.disconnected")'),
+  );
+  assert.doesNotMatch(liveCloseBranch, /stopSubtitles\(|setControllerWindowVisible\(false\)/u);
+  assert.match(recover, /const sessionId = state\.sessionId/u);
+  assert.match(recover, /await requestSubtitleStart/u);
+  assert.match(recover, /sessionId,/u);
+  assert.match(recover, /captionProducer: "gateway"/u);
+  assert.doesNotMatch(recover, /state\.sessionId = null|stopSubtitles\(|subtitle:stop/u);
+});
+
+test("Live Call relay survives renderer socket stalls without losing finals or replaying stale partials", () => {
+  const dashboard = readFileSync(path.join(rootDir, "public", "subtitle-dashboard.js"), "utf8");
+  const relayStart = dashboard.indexOf("// 2026-07-27 fix: The hidden dashboard can reconnect independently");
+  const relayEnd = dashboard.indexOf("// subtitle-workspace.js repaints", relayStart);
+  assert.ok(relayStart >= 0 && relayEnd > relayStart, "the relay section must remain independently testable");
+  const relaySource = dashboard.slice(relayStart, relayEnd);
+  const registration = extractBalancedStatement(
+    dashboard,
+    "if (window.realtimeNoelDesktop?.onLiveCallCaption)",
+  );
+  const received = [];
+  const socket = {
+    readyState: 0,
+    send(payload) { received.push(JSON.parse(payload)); },
+  };
+  /** @type {(caption: Record<string, unknown>) => void} */
+  let onCaption = () => { throw new Error("Live Call caption callback was not registered"); };
+  const missingCaptionCallback = onCaption;
+  const context = {
+    activeCaptionProducer: "gateway",
+    activeCaptionSessionOwner: "live-call",
+    captionRuntimeState: "running",
+    liveCallCaptionRelayFlushTimer: null,
+    liveCallCaptionRelayQueue: [],
+    liveCallFinalizedCaptionKeys: new Map(),
+    MAX_LIVE_CALL_PENDING_PARTIALS: 32,
+    MAX_LIVE_CALL_FINALIZED_KEYS: 512,
+    LIVE_CALL_CAPTION_RELAY_BUFFER_LIMIT: 1_000_000,
+    state: { ws: socket, running: true, sessionId: "live-stall" },
+    WebSocket: { CONNECTING: 0, OPEN: 1, CLOSED: 3 },
+    window: {
+      setTimeout,
+      clearTimeout,
+      realtimeNoelDesktop: {
+        onLiveCallCaption(callback) { onCaption = callback; },
+      },
+    },
+    t: () => "Participant",
+    JSON,
+    Number,
+    String,
+    Map,
+    Set,
+  };
+  const relay = vm.runInNewContext(
+    `${relaySource}\n${registration}\n({ enqueueLiveCallCaptionRelay, flushLiveCallCaptionRelayQueue })`,
+    context,
+  );
+  assert.notEqual(onCaption, missingCaptionCallback, "the desktop bridge must register its caption callback");
+
+  const caption = (overrides = {}) => ({
+    type: "caption",
+    sessionId: "live-stall",
+    language: "en",
+    sourceLanguage: "ko",
+    utteranceKey: "turn-a",
+    seq: 1,
+    text: "draft",
+    isFinal: false,
+    translationStatus: "translated",
+    ...overrides,
+  });
+
+  // Renderer IPC keeps arriving while its local WS is CONNECTING. A rapid
+  // provider burst may replace only the partial for the same canonical key.
+  for (let seq = 1; seq <= 1_000; seq += 1) {
+    onCaption(caption({ seq, text: `draft-${seq}` }));
+  }
+  onCaption(caption({ seq: 1_001, text: "First final", isFinal: true }));
+  onCaption(caption({
+    utteranceKey: "turn-b",
+    seq: 1_002,
+    text: "Second final",
+    isFinal: true,
+  }));
+  onCaption(caption({ seq: 999, text: "stale after final", isFinal: false }));
+  assert.deepEqual(received, [], "CONNECTING must enqueue instead of dropping or sending");
+
+  socket.readyState = context.WebSocket.OPEN;
+  relay.flushLiveCallCaptionRelayQueue();
+  const finals = received.filter((message) => message.partial === false);
+  assert.deepEqual(
+    finals.map((message) => [message.sourceSeq, message.utteranceKey, message.translatedText]),
+    [
+      [1_001, "turn-a", "First final"],
+      [1_002, "turn-b", "Second final"],
+    ],
+    "every final survives and flushes in canonical sequence order",
+  );
+  assert.equal(
+    received.some((message) => message.translatedText === "stale after final"),
+    false,
+    "a late partial below the final sequence floor must be discarded",
+  );
+
+  // A temporarily blocked renderer send is not an acknowledgement. The final
+  // stays pending and is delivered exactly once after the next flush.
+  socket.readyState = context.WebSocket.CLOSED;
+  onCaption(caption({ utteranceKey: "turn-c", seq: 1_003, text: "Third final", isFinal: true }));
+  socket.readyState = context.WebSocket.OPEN;
+  const originalSend = socket.send;
+  socket.send = () => { throw new Error("renderer stalled"); };
+  assert.doesNotThrow(() => relay.flushLiveCallCaptionRelayQueue());
+  socket.send = originalSend;
+  relay.flushLiveCallCaptionRelayQueue();
+  assert.equal(received.filter((message) => message.sourceSeq === 1_003).length, 1);
+});
+
+test("Live Call reconnect flushes queued captions only after producer recovery is acknowledged", () => {
+  const dashboard = readFileSync(path.join(rootDir, "public", "subtitle-dashboard.js"), "utf8");
+  const recover = extractFunctionBody(dashboard, "async function recoverLiveCaptionSocket()");
+  const acknowledgement = recover.indexOf("await requestSubtitleStart(");
+  const snapshot = recover.indexOf("liveState.captionSnapshot");
+  const flush = recover.indexOf("flushLiveCallCaptionRelayQueue()");
+  assert.ok(acknowledgement >= 0, "gateway producer recovery must await its matching start acknowledgement");
+  assert.ok(snapshot > acknowledgement, "the acknowledged recovery must consume the producer snapshot");
+  assert.ok(flush > snapshot, "snapshot captions must enter the relay before queued events flush");
+  assert.ok(flush > acknowledgement, "queued captions may flush only after producer recovery succeeds");
+});
+
+test("Live Call relay bounds partial memory without discarding finals during a long renderer outage", () => {
+  const dashboard = readFileSync(path.join(rootDir, "public", "subtitle-dashboard.js"), "utf8");
+  const relayStart = dashboard.indexOf("// 2026-07-27 fix: The hidden dashboard can reconnect independently");
+  const relayEnd = dashboard.indexOf("// subtitle-workspace.js repaints", relayStart);
+  assert.ok(relayStart >= 0 && relayEnd > relayStart, "the relay section must remain independently testable");
+  const received = [];
+  const socket = {
+    readyState: 3,
+    bufferedAmount: 0,
+    send(payload) { received.push(JSON.parse(payload)); },
+  };
+  const context = {
+    activeCaptionProducer: "gateway",
+    activeCaptionSessionOwner: "live-call",
+    captionRuntimeState: "running",
+    liveCallCaptionRelayFlushTimer: null,
+    liveCallCaptionRelayQueue: [],
+    liveCallFinalizedCaptionKeys: new Map(),
+    MAX_LIVE_CALL_PENDING_PARTIALS: 32,
+    MAX_LIVE_CALL_FINALIZED_KEYS: 512,
+    LIVE_CALL_CAPTION_RELAY_BUFFER_LIMIT: 1_000_000,
+    state: { ws: socket, running: true, sessionId: "live-long-outage" },
+    WebSocket: { CONNECTING: 0, OPEN: 1, CLOSED: 3 },
+    window: { setTimeout, clearTimeout },
+    t: () => "Participant",
+    console,
+    JSON,
+    Number,
+    String,
+    Map,
+    Set,
+  };
+  const relay = vm.runInNewContext(
+    `${dashboard.slice(relayStart, relayEnd)}\n({ enqueueLiveCallCaptionRelay, flushLiveCallCaptionRelayQueue, liveCallCaptionRelayQueue })`,
+    context,
+  );
+  const caption = (seq, isFinal) => ({
+    sessionId: "live-long-outage",
+    language: "en",
+    sourceLanguage: "ko",
+    utteranceKey: `turn-${seq}`,
+    seq,
+    text: isFinal ? `final-${seq}` : `partial-${seq}`,
+    isFinal,
+    translationStatus: "translated",
+  });
+
+  for (let seq = 1; seq <= 100; seq += 1) relay.enqueueLiveCallCaptionRelay(caption(seq, false));
+  assert.ok(
+    relay.liveCallCaptionRelayQueue.filter((entry) => !entry.isFinal).length <= 32,
+    "only the replaceable partial backlog may be bounded",
+  );
+  for (let seq = 101; seq <= 700; seq += 1) relay.enqueueLiveCallCaptionRelay(caption(seq, true));
+  assert.equal(
+    relay.liveCallCaptionRelayQueue.filter((entry) => entry.isFinal).length,
+    600,
+    "a prolonged outage must never evict finalized captions",
+  );
+  relay.enqueueLiveCallCaptionRelay(caption(101, false));
+  assert.equal(
+    relay.liveCallCaptionRelayQueue.some(
+      (entry) => !entry.isFinal && entry.payload.sourceSeq === 101,
+    ),
+    false,
+    "the finalized-key memory cap must not allow a very late partial to replay after its final",
+  );
+
+  socket.readyState = context.WebSocket.OPEN;
+  relay.flushLiveCallCaptionRelayQueue();
+  assert.deepEqual(
+    received.filter((message) => message.partial === false).map((message) => message.sourceSeq),
+    Array.from({ length: 600 }, (_, index) => index + 101),
+    "all finals flush once and in source order",
+  );
+});
+
+test("Live Call relay refuses captions when gateway ownership is inactive", () => {
+  const dashboard = readFileSync(path.join(rootDir, "public", "subtitle-dashboard.js"), "utf8");
+  const relayStart = dashboard.indexOf("// 2026-07-27 fix: The hidden dashboard can reconnect independently");
+  const relayEnd = dashboard.indexOf("// subtitle-workspace.js repaints", relayStart);
+  const registration = extractBalancedStatement(
+    dashboard,
+    "if (window.realtimeNoelDesktop?.onLiveCallCaption)",
+  );
+  const received = [];
+  const socket = {
+    readyState: 1,
+    bufferedAmount: 0,
+    send(payload) { received.push(JSON.parse(payload)); },
+  };
+  /** @type {(caption: Record<string, unknown>) => void} */
+  let onCaption = () => { throw new Error("Live Call caption callback was not registered"); };
+  const missingCaptionCallback = onCaption;
+  const context = {
+    activeCaptionProducer: "local",
+    activeCaptionSessionOwner: "live-call",
+    captionRuntimeState: "running",
+    liveCallCaptionRelayFlushTimer: null,
+    liveCallCaptionRelayQueue: [],
+    liveCallFinalizedCaptionKeys: new Map(),
+    MAX_LIVE_CALL_PENDING_PARTIALS: 32,
+    MAX_LIVE_CALL_FINALIZED_KEYS: 512,
+    LIVE_CALL_CAPTION_RELAY_BUFFER_LIMIT: 1_000_000,
+    state: { ws: socket, running: true, sessionId: "live-inactive" },
+    WebSocket: { CONNECTING: 0, OPEN: 1, CLOSED: 3 },
+    window: {
+      setTimeout,
+      clearTimeout,
+      realtimeNoelDesktop: { onLiveCallCaption(callback) { onCaption = callback; } },
+    },
+    t: () => "Participant",
+    console,
+    JSON,
+    Number,
+    String,
+    Map,
+    Set,
+  };
+  const relay = vm.runInNewContext(
+    `${dashboard.slice(relayStart, relayEnd)}\n${registration}\n({ flushLiveCallCaptionRelayQueue })`,
+    context,
+  );
+  assert.notEqual(onCaption, missingCaptionCallback, "the desktop bridge must register its caption callback");
+  onCaption({
+    sessionId: "live-inactive",
+    language: "en",
+    sourceLanguage: "ko",
+    utteranceKey: "duplicate-turn",
+    seq: 77,
+    text: "caption received outside gateway ownership",
+    isFinal: true,
+    translationStatus: "translated",
+  });
+  context.activeCaptionProducer = "gateway";
+  relay.flushLiveCallCaptionRelayQueue();
+  assert.deepEqual(received, [], "inactive gateway ownership must not leak delayed captions");
+});
+
+test("Live Call recovery merges an older snapshot before newer queued IPC captions", () => {
+  const dashboard = readFileSync(path.join(rootDir, "public", "subtitle-dashboard.js"), "utf8");
+  const relayStart = dashboard.indexOf("// 2026-07-27 fix: The hidden dashboard can reconnect independently");
+  const relayEnd = dashboard.indexOf("// subtitle-workspace.js repaints", relayStart);
+  const received = [];
+  const socket = {
+    readyState: 3,
+    bufferedAmount: 0,
+    send(payload) { received.push(JSON.parse(payload)); },
+  };
+  const context = {
+    activeCaptionProducer: "gateway",
+    activeCaptionSessionOwner: "live-call",
+    captionRuntimeState: "reconnecting",
+    liveCallCaptionRelayFlushTimer: null,
+    liveCallCaptionRelayQueue: [],
+    liveCallFinalizedCaptionKeys: new Map(),
+    MAX_LIVE_CALL_PENDING_PARTIALS: 32,
+    MAX_LIVE_CALL_FINALIZED_KEYS: 512,
+    LIVE_CALL_CAPTION_RELAY_BUFFER_LIMIT: 1_000_000,
+    state: { ws: socket, running: true, sessionId: "live-snapshot-merge" },
+    WebSocket: { CONNECTING: 0, OPEN: 1, CLOSED: 3 },
+    window: { setTimeout, clearTimeout },
+    t: () => "Participant",
+    console,
+    JSON,
+    Number,
+    String,
+    Map,
+    Set,
+  };
+  const relay = vm.runInNewContext(
+    `${dashboard.slice(relayStart, relayEnd)}\n({ enqueueLiveCallCaptionRelay, flushLiveCallCaptionRelayQueue })`,
+    context,
+  );
+  const caption = (seq, utteranceKey, text, isFinal = true) => ({
+    sessionId: "live-snapshot-merge",
+    language: "en",
+    sourceLanguage: "ko",
+    utteranceKey,
+    seq,
+    text,
+    isFinal,
+    translationStatus: "translated",
+  });
+
+  // IPC can advance while the renderer is waiting for its local start ACK.
+  relay.enqueueLiveCallCaptionRelay(caption(101, "turn-101", "newer IPC final"));
+  // The recovery snapshot is read only after that ACK, so its older event is
+  // appended later in wall-clock time but must commit first in source order.
+  relay.enqueueLiveCallCaptionRelay(caption(100, "turn-100", "snapshot partial", false));
+  relay.enqueueLiveCallCaptionRelay(caption(100, "turn-100", "snapshot final"));
+
+  socket.readyState = context.WebSocket.OPEN;
+  context.captionRuntimeState = "running";
+  relay.flushLiveCallCaptionRelayQueue();
+  assert.deepEqual(
+    received.map((message) => [message.sourceSeq, message.partial, message.translatedText]),
+    [
+      [100, false, "snapshot final"],
+      [101, false, "newer IPC final"],
+    ],
+    "snapshot merge must sort by source sequence and replace its same-turn partial",
+  );
+});
+
+test("controller restart dispatches by owner without changing Caption-only restart semantics", () => {
+  const dashboard = readFileSync(path.join(rootDir, "public", "subtitle-dashboard.js"), "utf8");
+  const dispatch = extractFunctionBody(dashboard, "async function restartCaptionsFromController()");
+  const ordinaryRestart = extractFunctionBody(dashboard, "async function restartSubtitles()");
+
+  assert.match(dispatch, /activeCaptionSessionOwner === "live-call"/u);
+  assert.match(dispatch, /await reconnectLiveCallTranslation\(\)/u);
+  assert.match(dispatch, /await restartSubtitles\(\)/u);
+  assert.match(dashboard, /controllerRestartButton\?\.addEventListener\("click", restartCaptionsFromController\)/u);
+  assert.match(dashboard, /message\.command === "restart"[\s\S]*await restartCaptionsFromController\(\)/u);
+  assert.match(ordinaryRestart, /await stopSubtitles\(\);[\s\S]*await startSubtitles\(\)/u,
+    "Caption-only keeps the established full stop/start restart");
+});
+
+test("Live Call preflight proves renderer capture and local subtitle readiness before paid start", () => {
+  const dashboard = readFileSync(path.join(rootDir, "public", "subtitle-dashboard.js"), "utf8");
+  const preflight = extractFunctionBody(dashboard, "async function handleLiveCallPreflight(request)");
+  const requestReady = extractFunctionBody(dashboard, "function requestLocalSubtitlePreflight(requestId, request)");
+  const cancel = extractFunctionBody(dashboard, "async function cancelLiveCallPreflight(request)");
+  const sync = extractFunctionBody(dashboard, "async function syncLiveCallAudioBridge()");
+
+  assert.match(dashboard, /window\.realtimeNoelDesktop\?\.onLiveCallPreflight\?\.\(handleLiveCallPreflight\)/u);
+  assert.match(dashboard, /window\.realtimeNoelDesktop\?\.onLiveCallPreflightCancel\?\.\(cancelLiveCallPreflight\)/u);
+  assert.match(preflight, /await startLiveCallMicCapture\(\{ requestId \}\)/u,
+    "preflight must use the same capture path as the running Live bridge");
+  assert.match(dashboard, /if \(liveBridgeCaptureStartPromise\) return liveBridgeCaptureStartPromise/u,
+    "concurrent preflights must await the real capture result instead of observing an unfinished capture as ready");
+  assert.match(dashboard, /if \(liveBridgeCapture !== capture\) \{[\s\S]*streamer\.close\?\.\(\)[\s\S]*cancelled: true/u,
+    "a cancellation racing streamer creation must close the late streamer instead of leaking capture");
+  assert.match(preflight, /await requestLocalSubtitlePreflight\(requestId, request\)/u);
+  assert.match(preflight, /completeLiveCallPreflight\(requestId, \{ ok: true \}\)/u);
+  assert.match(preflight, /LIVE_CALL_AUDIO_CAPTURE_FAILED/u);
+  assert.match(preflight, /LIVE_CALL_SUBTITLE_PREFLIGHT_FAILED/u);
+  assert.match(requestReady, /type: "subtitle:preflight"/u);
+  assert.match(requestReady, /kind: "live-call"/u);
+  assert.match(requestReady, /liveSessionId: String\(request\?\.liveSessionId/u);
+  assert.match(requestReady, /message\.type !== "subtitle:preflight-ready"/u);
+  assert.match(requestReady, /message\.type === "subtitle:preflight-failed"/u);
+  assert.match(requestReady, /message\.requestId !== requestId/u);
+  assert.doesNotMatch(preflight, /stopSubtitles\(|setControllerWindowVisible\(false\)/u,
+    "preflight must not affect the controller or transcript lifecycle");
+  const connect = extractFunctionBody(dashboard, "function connectWebSocket()");
+  assert.match(connect, /if \(liveBridgePreflightRequestId\)[\s\S]*return;/u,
+    "a socket drop during preflight must fail the handshake without stopping or hiding an existing controller");
+  assert.match(cancel, /requestId !== liveBridgePreflightRequestId/u);
+  assert.match(cancel, /if \(liveState\?\.live\) return/u);
+  assert.match(cancel, /stopLiveCallAudioBridge\("preflight cancelled"\)/u);
+  assert.doesNotMatch(cancel, /stopSubtitles\(|state\.sessionId = null/u);
+  assert.match(sync, /if \(!liveBridgeCapture\)/u,
+    "the running bridge must reuse a capture held by successful preflight");
 });
 
 // ── Settings import must reject non-object sections ────────────────────────

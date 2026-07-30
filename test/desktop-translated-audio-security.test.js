@@ -11,7 +11,6 @@ import {
 import { createSubtitleChannelHub } from "../src/subtitle-channels.js";
 import { handleGeminiLiveMessage } from "../src/gemini-live-translate.js";
 import { normalizeSubtitleLanguageCode } from "../src/subtitle-languages.js";
-import { handleRealtimeMessage } from "../src/subtitle-realtime.js";
 import { validateSubtitleSettings } from "../src/settings-store.js";
 
 const geminiSource = readFileSync(new URL("../src/gemini-live-translate.js", import.meta.url), "utf8");
@@ -259,24 +258,13 @@ test("subtitle transcript diagnostics are opt-in and remain broadcast-only", () 
 
 test("malformed provider messages never reflect raw transcript payloads to clients", () => {
   const sensitive = "private-transcript-and-provider-payload";
-  const events = [];
-  handleRealtimeMessage(`not-json-${sensitive}`, { broadcast: (event) => events.push(event) });
+  const { events } = collectGeminiEvents(`not-json-${sensitive}`);
   assert.ok(events.some((event) => event.type === "subtitle:error"));
   assert.equal(JSON.stringify(events).includes(sensitive), false);
 });
 
 test("oversized provider transcripts cannot grow subtitle language state", () => {
   const oversized = "A".repeat(100_000);
-  let openAiSource = "unchanged";
-  const openAiEvents = [];
-  handleRealtimeMessage(JSON.stringify({ type: "session.input_transcript.delta", delta: oversized }), {
-    getSourceText: () => openAiSource,
-    setSourceText: (value) => { openAiSource = value; },
-    broadcast: (event) => openAiEvents.push(event),
-  });
-  assert.equal(openAiSource, "unchanged");
-  assert.equal(JSON.stringify(openAiEvents).includes(oversized.slice(0, 1_000)), false);
-
   let geminiSource = "unchanged";
   const geminiEvents = [];
   handleGeminiLiveMessage(JSON.stringify({

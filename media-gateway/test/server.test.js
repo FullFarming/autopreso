@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 
-import { createCaptionPolishPolicyResolver, listenMediaGateway, resolveTextToSpeechV1Client } from "../src/server.js";
+import { createCaptionPolishPolicyResolver, listenMediaGateway } from "../src/server.js";
 
 test("caption polish canary assignment is stable across all three policy buckets without caption text", () => {
   const resolvePolicy = createCaptionPolishPolicyResolver({
@@ -26,14 +26,12 @@ test("media gateway gives caption polish the same six-second quality budget as d
   assert.doesNotMatch(source, /timeoutMs:\s*1_500/u);
 });
 
-test("media gateway resolves only the explicit Text-to-Speech v1 streaming client", () => {
-  class V1TextToSpeechClient {}
-  assert.equal(resolveTextToSpeechV1Client({ v1: { TextToSpeechClient: V1TextToSpeechClient } }), V1TextToSpeechClient);
-  assert.equal(resolveTextToSpeechV1Client({ default: { v1: { TextToSpeechClient: V1TextToSpeechClient } } }), V1TextToSpeechClient);
-  assert.throws(
-    () => resolveTextToSpeechV1Client({ TextToSpeechClient: class LegacyClient {} }),
-    /TTS_V1_CLIENT_UNAVAILABLE/u,
-  );
+test("media gateway uses the session policy resolver instead of forcing full polish", async () => {
+  const source = await readFile(new URL("../src/server.js", import.meta.url), "utf8");
+
+  assert.match(source, /captionPolishPolicy\s*=\s*resolveCaptionPolishPolicy\(message\.sessionId\)/u);
+  assert.match(source, /captionPolishPolicy,/u);
+  assert.doesNotMatch(source, /captionPolishPolicy:\s*["']full["']/u);
 });
 
 test("media gateway listens on the host selected by the validated environment", async () => {

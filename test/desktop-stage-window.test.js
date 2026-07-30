@@ -4,6 +4,7 @@ import test from "node:test";
 import vm from "node:vm";
 
 import { MESSAGES } from "../public/subtitle-i18n.js";
+import { resolveSelectedOverlayDisplay } from "../src/live-caption-ipc-relay.js";
 
 const mainSource = fs.readFileSync(new URL("../electron/main.js", import.meta.url), "utf8");
 const preloadSource = fs.readFileSync(new URL("../electron/preload.js", import.meta.url), "utf8");
@@ -44,25 +45,47 @@ test("stage is opened only by the direct main-process route", () => {
   assert.doesNotMatch(openStage, /window\.open|frameName/u);
 });
 
-test("stage placement prefers a fullscreen extended display and falls back to primary", () => {
+test("stage placement follows the caption overlay's selected display", () => {
   const resolveStageDisplayPlacement = vm.runInNewContext(
     `${sourceBetween("function resolveStageDisplayPlacement", "function stageWindowPlacement")}; resolveStageDisplayPlacement`,
-    {},
+    { resolveSelectedOverlayDisplay },
   );
   const primary = { id: 1, bounds: { x: 0, y: 0, width: 1512, height: 982 } };
   const extended = { id: 2, bounds: { x: 1512, y: 0, width: 1920, height: 1080 } };
   // Placement objects are created inside the vm context, so compare plain
   // JSON snapshots rather than prototypes.
-  const placement = (displays, primaryId) => JSON.parse(JSON.stringify(resolveStageDisplayPlacement(displays, primaryId)));
+  const placement = (displays, primaryId, preferredId) =>
+    JSON.parse(JSON.stringify(resolveStageDisplayPlacement(displays, primaryId, preferredId)));
 
-  // Extended display present: fullscreen on the extended display.
-  assert.deepEqual(placement([primary, extended], primary.id), { bounds: extended.bounds, fullscreen: true });
+  // The QR stage sits on the SAME monitor as the caption overlay: the
+  // selected overlay display wins, fullscreen while another display remains
+  // for the controller/dashboard.
+  assert.deepEqual(placement([primary, extended], primary.id, String(extended.id)), { bounds: extended.bounds, fullscreen: true });
+  assert.deepEqual(placement([primary, extended], primary.id, String(primary.id)), { bounds: primary.bounds, fullscreen: true });
   // Display order must not matter.
-  assert.deepEqual(placement([extended, primary], primary.id), { bounds: extended.bounds, fullscreen: true });
-  // No extended display: mirror-like large window on the primary display.
-  assert.deepEqual(placement([primary], primary.id), { bounds: primary.bounds, fullscreen: false });
+  assert.deepEqual(placement([extended, primary], primary.id, String(extended.id)), { bounds: extended.bounds, fullscreen: true });
+  // No explicit selection: reserve the primary display for the controller and
+  // put captions/stage on the first connected non-primary display.
+  assert.deepEqual(placement([primary, extended], primary.id, ""), { bounds: extended.bounds, fullscreen: true });
+  // Selected display unplugged: fall back to the primary display.
+  assert.deepEqual(placement([primary], primary.id, String(extended.id)), { bounds: primary.bounds, fullscreen: false });
+  // Single display: mirror-like large window instead of fullscreen takeover.
+  assert.deepEqual(placement([primary], primary.id, ""), { bounds: primary.bounds, fullscreen: false });
   // Defensive: empty display list yields no placement.
-  assert.equal(resolveStageDisplayPlacement([], primary.id), null);
+  assert.equal(resolveStageDisplayPlacement([], primary.id, ""), null);
+});
+
+test("stage window repositions when the overlay display selection changes", () => {
+  // The select-display IPC moves the caption overlay; the QR stage must move
+  // with it ("자막 위치를 설정할때 같이 움직여야 해").
+  const selectHandler = sourceBetween(
+    'ipcMain.handle("subtitle-overlay:select-display"',
+    'ipcMain.handle("subtitle-overlay:get-enabled"',
+  );
+  assert.match(selectHandler, /repositionStageWindow\(\)/u);
+  // stageWindowPlacement resolves against the persisted overlay selection.
+  const stagePlacementSource = sourceBetween("function stageWindowPlacement", "function applyStagePlacement");
+  assert.match(stagePlacementSource, /preferredOverlayDisplayId/u);
 });
 
 test("direct stage window is positioned and keeps hardened renderer settings", () => {
@@ -143,7 +166,7 @@ test("showing the subtitle overlays re-asserts them without rewriting the persis
   const context = {
     overlayEnabled: true,
     isQuitting: false,
-    overlayWindows: new Map([[1, {}]]),
+    overlayWindows: new Map([["11", { isDestroyed: () => false }]]),
     maintainOverlayWindow: () => calls.push("maintain"),
     dashboardWindow: null,
   };

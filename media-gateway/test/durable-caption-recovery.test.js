@@ -211,6 +211,73 @@ test("durable failure swaps one pipeline while preserving socket, session, and s
   assert.equal(pipelines[1].hostEvents.at(-1)?.text, "복구 후 자막");
 });
 
+test("audio arriving while the failed provider closes is drained before recovery returns to direct routing", async (context) => {
+  const pipelines = [];
+  let releaseFailedClose;
+  let markFailedCloseStarted;
+  const failedCloseStarted = new Promise((resolve) => { markFailedCloseStarted = resolve; });
+  const failedCloseGate = new Promise((resolve) => { releaseFailedClose = resolve; });
+  const gateway = createGatewayServer({
+    gatewaySecret: "gateway-secret",
+    viewerSecret: "viewer-secret",
+    hostAuthorizer: { async authorize() { return true; } },
+    viewerAuthorizer: { async authorize() { return true; } },
+    audioBurstMilliseconds: 30_000,
+    durableRecoveryRetryDelaysMilliseconds: [0],
+    durableRecoveryAttemptTimeoutMilliseconds: 1_000,
+    recoveryAudioSpoolMilliseconds: 2_000,
+    async pipelineFactory(_settings, _previous, _onHostEvent, options = {}) {
+      const isFailedPipeline = pipelines.length === 0;
+      const pipeline = {
+        options,
+        frames: [],
+        async start() {}, async tick() {}, async endAudioStream() {},
+        async acceptAudio(frame) { this.frames.push(frame[0]); },
+        pause() {},
+        async close() {
+          if (!isFailedPipeline) return;
+          markFailedCloseStarted();
+          await failedCloseGate;
+        },
+      };
+      pipelines.push(pipeline);
+      return pipeline;
+    },
+  });
+  await new Promise((resolve) => gateway.server.listen(0, "127.0.0.1", resolve));
+  context.after(async () => gateway.close());
+  const host = new WebSocket(`ws://127.0.0.1:${gateway.server.address().port}/live`);
+  context.after(() => host.terminate());
+  await once(host, "open");
+  let received = nextJson(host);
+  host.send(JSON.stringify({ type: "authenticate", token: hostToken("gateway-secret") }));
+  assert.equal((await received).type, "authenticated");
+  received = nextJson(host);
+  host.send(JSON.stringify({
+    type: "start", sessionId: "session-1", version: 1,
+    sessionType: "meeting", outputMode: "captions", languages: ["ko", "en"],
+  }));
+  assert.equal((await received).type, "started");
+
+  pipelines[0].options.onFatalError(new Error("AUDIO_LANE_TIMEOUT"));
+  const beforeClose = Buffer.alloc(INPUT_FRAME_BYTES);
+  beforeClose[0] = 1;
+  host.send(beforeClose);
+  await failedCloseStarted;
+  const duringClose = Buffer.alloc(INPUT_FRAME_BYTES);
+  duringClose[0] = 2;
+  host.send(duringClose);
+  await waitFor(() => /durable_recovery_audio_frames_spooled_total 2/u.test(gateway.metrics.render()));
+  releaseFailedClose();
+
+  await waitFor(() => pipelines[1].frames.length === 2);
+  const afterRecovery = Buffer.alloc(INPUT_FRAME_BYTES);
+  afterRecovery[0] = 3;
+  host.send(afterRecovery);
+  await waitFor(() => pipelines[1].frames.length === 3);
+  assert.deepEqual(pipelines[1].frames, [1, 2, 3]);
+});
+
 test("removing the host session cancels a pending durable recovery retry", async () => {
   let recoveryAttempts = 0;
   let firstPipeline = null;

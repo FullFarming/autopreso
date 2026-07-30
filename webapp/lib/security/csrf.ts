@@ -14,9 +14,17 @@ const PUBLIC_UNAUTHENTICATED_PATHS = new Set([
   "/api/pair-keys",
   "/api/live-sessions/join",
 ]);
+const PUBLIC_LIVE_AUDIO_WORKLET_PATH = "/live-audio-worklet.js";
+const PUBLIC_STATIC_METHODS = new Set(["GET", "HEAD"]);
 
 export function isPublicUnauthenticatedPath(pathname: string): boolean {
   return PUBLIC_UNAUTHENTICATED_PATHS.has(pathname);
+}
+
+export function isPublicLiveAudioWorkletRequest(pathname: string, search: string, method: string): boolean {
+  return pathname === PUBLIC_LIVE_AUDIO_WORKLET_PATH
+    && search === ""
+    && PUBLIC_STATIC_METHODS.has(method);
 }
 
 export function isViewerSnapshotPath(pathname: string): boolean {

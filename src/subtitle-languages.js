@@ -125,10 +125,3 @@ export function toGeminiLanguageCode(value) {
   const canonical = normalizeSubtitleLanguageCode(value);
   return GEMINI_LANGUAGE_CODES[canonical] ?? "";
 }
-
-/** OpenAI Realtime currently exposes one Mandarin/Chinese output code. */
-export function toOpenAITranslationLanguageCode(value) {
-  const canonical = normalizeSubtitleLanguageCode(value);
-  if (canonical === "zh-Hans" || canonical === "zh-Hant") return "zh";
-  return canonical;
-}

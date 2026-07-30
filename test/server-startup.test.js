@@ -271,18 +271,6 @@ test("settings export downloads subtitle settings as a portable JSON file", asyn
 });
 
 test("subtitle second-pass polish uses separated provider keys", () => {
-  assert.deepEqual(
-    selectSubtitlePolishOptions({
-      args: { tone: "natural", glossary: "operator = 운영사", domain: "Commercial real estate" },
-      saved: {
-        apiKeys: { openai: "sk-primary", openaiSecondary: "sk-secondary" },
-        subtitle: { tonePolishModel: "gpt-5.5" },
-      },
-      env: {},
-    }),
-    { provider: "openai", apiKey: "sk-secondary", modelId: "gpt-5.5" },
-  );
-
   assert.equal(
     selectSubtitlePolishOptions({
       args: { tone: "natural", glossary: "operator = 운영사" },
@@ -290,24 +278,6 @@ test("subtitle second-pass polish uses separated provider keys", () => {
       env: {},
     }),
     null,
-  );
-
-  assert.equal(
-    selectSubtitlePolishOptions({
-      args: { tone: "business", glossary: "" },
-      saved: { apiKeys: { openai: "sk-primary" }, subtitle: {} },
-      env: {},
-    }),
-    null,
-  );
-
-  assert.deepEqual(
-    selectSubtitlePolishOptions({
-      args: { tone: "business", glossary: "" },
-      saved: { apiKeys: { openai: "sk-primary", openaiSecondary: "sk-secondary" }, subtitle: {} },
-      env: {},
-    }),
-    { provider: "openai", apiKey: "sk-secondary", modelId: "gpt-5.5" },
   );
 
   assert.deepEqual(
@@ -360,6 +330,15 @@ test("subtitle second-pass polish uses separated provider keys", () => {
     }),
     null,
   );
+
+  assert.deepEqual(
+    selectSubtitlePolishOptions({
+      args: { tone: "business", glossary: "", polishProvider: "gemini" },
+      saved: { apiKeys: { gemini: "AIza-live" }, subtitle: {} },
+      env: {},
+    }),
+    { provider: "gemini", apiKey: "AIza-live", modelId: "gemini-3.6-flash" },
+  );
 });
 
 test("subtitle:start validates runtime subtitle settings before opening providers", async () => {
@@ -378,7 +357,7 @@ test("subtitle:start validates runtime subtitle settings before opening provider
 
   let ws;
   try {
-    ws = new WebSocket(url.replace("http:", "ws:") + "/ws");
+    ws = new WebSocket(url.replace("http:", "ws:") + "/ws", { headers: { Origin: url } });
     await new Promise((resolve, reject) => {
       ws.once("open", resolve);
       ws.once("error", reject);
@@ -432,7 +411,7 @@ test("subtitle:stop without a sessionId cannot stop the active subtitle session"
 
   let ws;
   try {
-    ws = new WebSocket(url.replace("http:", "ws:") + "/ws");
+    ws = new WebSocket(url.replace("http:", "ws:") + "/ws", { headers: { Origin: url } });
     await new Promise((resolve, reject) => {
       ws.once("open", resolve);
       ws.once("error", reject);
@@ -459,6 +438,60 @@ test("subtitle:stop without a sessionId cannot stop the active subtitle session"
     );
   } finally {
     ws?.close();
+    await new Promise((resolve) => httpServer.close(resolve));
+  }
+});
+
+test("subtitle:input-status preserves the microphone source for the stall watchdog", { timeout: 2_000 }, async () => {
+  let resolveSignal;
+  const signalPromise = new Promise((resolve) => {
+    resolveSignal = resolve;
+  });
+  const { httpServer, url } = await startServer({
+    host: "127.0.0.1",
+    port: 0,
+    moonshineModel: "medium",
+    openaiApiKey: "test",
+    createTranscription: () => ({
+      ready: async () => {},
+      sendAudio: () => {},
+      stop: () => {},
+      close: () => {},
+    }),
+    createSubtitleRealtimeManager: () => ({
+      start: async () => {},
+      stop: async () => {},
+      sendAudio: () => {},
+      restartChannels: async () => {},
+      noteInputSignal: (signal) => resolveSignal(signal),
+      close: () => {},
+    }),
+  });
+
+  const ws = new WebSocket(url.replace("http:", "ws:") + "/ws", { headers: { Origin: url } });
+  try {
+    await new Promise((resolve, reject) => {
+      ws.once("open", resolve);
+      ws.once("error", reject);
+    });
+    const started = new Promise((resolve) => {
+      ws.on("message", (raw) => {
+        const message = JSON.parse(raw.toString("utf8"));
+        if (message.type === "subtitle:started") resolve();
+      });
+    });
+    ws.send(JSON.stringify({ type: "subtitle:start", sessionId: "mic-session", settings: {} }));
+    await started;
+    ws.send(JSON.stringify({
+      type: "subtitle:input-status",
+      sessionId: "mic-session",
+      source: "mic",
+      status: "signal",
+    }));
+
+    assert.deepEqual(await signalPromise, { sessionId: "mic-session", source: "mic" });
+  } finally {
+    ws.close();
     await new Promise((resolve) => httpServer.close(resolve));
   }
 });
@@ -535,7 +568,7 @@ test("server rejects cross-origin mutating HTTP and websocket requests", async (
   }
 });
 
-test("server validates OpenAI Realtime translation keys before saving", async () => {
+test("server validates OpenAI Realtime transcription keys before saving", async () => {
   const sockets = [];
   const { httpServer, url } = await startServer({
     host: "127.0.0.1",
@@ -550,6 +583,7 @@ test("server validates OpenAI Realtime translation keys before saving", async ()
     }),
     createSubtitleWebSocket: (socketUrl, protocols, init) => {
       const socket = new FakeRealtimeSocket(socketUrl, init);
+      socket.responseType = "transcription_session.updated";
       sockets.push(socket);
       return socket;
     },
@@ -563,9 +597,20 @@ test("server validates OpenAI Realtime translation keys before saving", async ()
     });
     assert.equal(response.status, 200);
     assert.deepEqual(await response.json(), { ok: true, data: { status: "valid" } });
-    assert.equal(sockets[0].url, "wss://api.openai.com/v1/realtime/translations?model=gpt-realtime-translate");
+    assert.equal(sockets[0].url, "wss://api.openai.com/v1/realtime?intent=transcription");
     assert.equal(sockets[0].init.headers.Authorization, "Bearer sk-test");
-    assert.equal(JSON.parse(sockets[0].sent[0]).type, "session.update");
+    assert.deepEqual(JSON.parse(sockets[0].sent[0]), {
+      type: "session.update",
+      session: {
+        type: "transcription",
+        audio: {
+          input: {
+            format: { type: "audio/pcm", rate: 24_000 },
+            transcription: { model: "gpt-realtime-whisper" },
+          },
+        },
+      },
+    });
     assert.equal(sockets[0].closed, true);
   } finally {
     await new Promise((resolve) => httpServer.close(resolve));
@@ -639,6 +684,7 @@ test("server validates Gemini keys through text generation before saving", async
     assert.equal(response.status, 200);
     assert.deepEqual(await response.json(), { ok: true, data: { status: "valid" } });
     assert.match(fetchCalls[0].url, /generativelanguage\.googleapis\.com/);
+    assert.match(fetchCalls[0].url, /gemini-3\.6-flash/u);
     assert.equal(fetchCalls[0].init.headers["x-goog-api-key"], "AIza-test");
     assert.match(JSON.parse(fetchCalls[0].init.body).contents[0].parts[0].text, /ok/);
   } finally {
@@ -745,7 +791,9 @@ class FakeRealtimeSocket extends EventEmitter {
       return;
     }
     const value = JSON.parse(message);
-    queueMicrotask(() => this.emit("message", JSON.stringify(value.setup ? { setupComplete: {} } : { type: "session.updated" })));
+    queueMicrotask(() => this.emit("message", JSON.stringify(
+      value.setup ? { setupComplete: {} } : { type: this.responseType ?? "session.updated" },
+    )));
   }
 
   close() {

@@ -126,24 +126,7 @@
                     </label>
                   </div>
                   <div id="pt-playback-options" class="pt-playback-options" hidden>
-                    <section class="pt-voice-methods" aria-labelledby="pt-voice-method-title">
-                      <div class="pt-voice-method-heading">
-                        <h3 id="pt-voice-method-title" data-i18n="output.voiceEngine">통역 음성 엔진</h3>
-                      </div>
-                      <div class="pt-output-options seg-toggle" role="radiogroup" data-i18n-aria="output.voiceEngine" aria-label="통역 음성 엔진">
-                        <label class="seg-option">
-                          <input name="voiceProvider" type="radio" value="gemini" checked />
-                          <span data-i18n="output.geminiVoice">Gemini 음성</span>
-                        </label>
-                        <label class="seg-option">
-                          <input name="voiceProvider" type="radio" value="openai" aria-describedby="pt-openai-voice-help" />
-                          <span data-i18n="output.openaiRealtime">OpenAI Realtime</span>
-                        </label>
-                      </div>
-                      <!-- Only populated when the chosen voice language has no
-                           OpenAI Realtime voice (a state message, not a blurb). -->
-                      <p id="pt-openai-voice-help" class="pt-output-help"></p>
-                    </section>
+                    <input name="voiceProvider" type="hidden" value="gemini" />
                     <label>
                       <span data-i18n="output.audioLanguage">통역 음성 언어</span>
                       <select name="audioLanguage" data-i18n-aria="output.audioLanguageLabel" aria-label="재생할 통역 음성 언어">
@@ -163,13 +146,34 @@
                 <div class="cfg-heading">
                   <h2 id="cfg-glossary-title"><i data-cfg-ordinal></i><span data-i18n="cfg.glossary">용어집</span></h2>
                 </div>
-                <label class="control-field">
-                  <span data-i18n="glossary.preset">용어집 프리셋</span>
-                  <select name="glossaryPreset">
-                    <option value="" data-i18n="glossary.presetCustom">직접 입력</option>
+                <div class="control-field glossary-preset-field">
+                  <label for="glossary-preset" data-i18n="glossary.preset">용어집 프리셋</label>
+                  <select id="glossary-preset" name="glossaryPreset" aria-describedby="glossary-preset-help glossary-preset-status">
+                    <option value="custom" data-i18n="glossary.presetCustom">직접 입력</option>
+                    <optgroup id="glossary-preset-builtins" label="내장 프리셋"></optgroup>
+                    <optgroup id="glossary-preset-users" label="동기화 프리셋"></optgroup>
                   </select>
-                </label>
-                <button id="manage-glossaries" type="button" class="secondary compact" data-workspace-nav="settings" data-i18n="glossary.manage">용어집 관리</button>
+                  <p id="glossary-preset-help" class="field-help" data-i18n="glossary.presetCustomHelp">직접 수정했거나 저장된 프리셋과 일치하지 않으면 직접 입력으로 표시됩니다.</p>
+                </div>
+                <div class="glossary-preset-actions">
+                  <button id="create-glossary-preset" type="button" class="secondary compact" aria-expanded="false" aria-controls="glossary-preset-editor" data-i18n="glossary.create">프리셋 등록</button>
+                  <button id="update-glossary-preset" type="button" class="secondary compact" data-i18n="glossary.update" hidden>변경 저장</button>
+                  <button id="delete-glossary-preset" type="button" class="secondary compact" data-i18n="glossary.delete" hidden>삭제</button>
+                  <button id="confirm-delete-glossary-preset" type="button" class="accent compact" data-i18n="glossary.deleteConfirmAction" hidden>삭제 확인</button>
+                  <button id="cancel-delete-glossary-preset" type="button" class="secondary compact" data-i18n="common.cancel" hidden>취소</button>
+                  <button id="manage-glossaries" type="button" class="secondary compact" data-workspace-nav="settings" data-i18n="glossary.manage">용어집 편집</button>
+                </div>
+                <section id="glossary-preset-editor" class="glossary-preset-editor" aria-labelledby="glossary-preset-editor-title" hidden>
+                  <h3 id="glossary-preset-editor-title" data-i18n="glossary.createTitle">현재 용어집을 프리셋으로 등록</h3>
+                  <label for="glossary-preset-name" data-i18n="glossary.name">프리셋 이름</label>
+                  <input id="glossary-preset-name" name="glossaryPresetName" type="text" maxlength="80" autocomplete="off" required data-i18n-placeholder="glossary.namePlaceholder" placeholder="예) 한국 CRE 주간 회의" />
+                  <p class="field-help" data-i18n="glossary.createHelp">현재 번역 도메인, 전문용어집, 언어쌍을 함께 저장합니다.</p>
+                  <div class="glossary-preset-editor-actions">
+                    <button id="save-glossary-preset" type="button" class="accent" data-i18n="glossary.save">등록</button>
+                    <button id="cancel-glossary-preset" type="button" class="secondary" data-i18n="common.cancel">취소</button>
+                  </div>
+                </section>
+                <p id="glossary-preset-status" class="glossary-preset-status" role="status" aria-live="polite"></p>
               </section>
 
               <section class="cfg-section" aria-labelledby="cfg-appearance-title">
@@ -282,7 +286,7 @@
                   <input name="liveDraftTitle" type="text" maxlength="100" data-i18n-placeholder="live.titlePlaceholder" placeholder="타운홀 Q&amp;A" autocomplete="off" />
                 </label>
                 <div class="live-draft-cover">
-                  <span id="live-draft-cover-rules">커버 이미지 (선택) · 16:9 · JPEG, PNG, WebP · 최대 5MB</span>
+                  <span id="live-draft-cover-rules">커버 이미지 (선택) · 16:9 · JPEG, PNG, WebP · 최대 20MB</span>
                   <div class="live-draft-cover-row">
                     <button id="live-draft-cover-button" type="button" class="secondary compact" aria-describedby="live-draft-cover-rules live-draft-cover-status" data-i18n="live.coverUpload">이미지 업로드</button>
                     <input id="live-draft-cover" type="file" accept="image/jpeg,image/png,image/webp" data-i18n-aria="live.coverChoose" aria-label="Live Call 커버 이미지 선택" hidden />
@@ -518,21 +522,12 @@
                   <summary data-i18n="settings.drawerAdvanced">고급</summary>
                   <div class="settings-panel">
                     <label>
-                      <span data-i18n="settings.openaiKey">OpenAI API key</span>
+                      <span data-i18n="settings.openaiKey">OpenAI 음성 인식 API key</span>
                       <div class="key-row">
                         <input name="openaiKey" type="password" autocomplete="off" placeholder="sk-..." />
                         <button id="save-openai-key" type="button" class="secondary compact" data-i18n="settings.saveKey">키 저장</button>
                       </div>
                       <span id="openai-key-status" class="field-status" data-i18n="key.unregistered">미등록</span>
-                    </label>
-
-                    <label>
-                      <span data-i18n="settings.openaiKey2">OpenAI API key 2</span>
-                      <div class="key-row">
-                        <input name="openaiSecondaryKey" type="password" autocomplete="off" placeholder="sk-... (separate Project)" />
-                        <button id="save-openai-secondary-key" type="button" class="secondary compact" data-i18n="settings.saveKey2">키 2 저장</button>
-                      </div>
-                      <span id="openai-secondary-key-status" class="field-status" data-i18n="key.unregistered">미등록</span>
                     </label>
 
                     <label>
@@ -567,7 +562,7 @@
 
                     <label class="glossary-field">
                       <span data-i18n="glossary.terms">전문용어집</span>
-                      <textarea name="glossary" rows="6" maxlength="16000"
+                      <textarea name="glossary" rows="6" maxlength="40000"
                         data-i18n-placeholder="glossary.termsPlaceholder"
                         placeholder="예) operator -> 운영사"></textarea>
                     </label>

@@ -124,13 +124,15 @@ export function buildGeminiSetupMessage(settings = {}, targetLanguage = "ko", re
 // are "sent independently of the other server messages" with NO guaranteed
 // ordering, and the client ACCUMULATES the fragments. Some model versions send
 // incremental fragments, others a growing cumulative snapshot. This merge
-// handles both WITHOUT ever shrinking or duplicating — which is what made
+// handles both WITHOUT duplicating — which is what made
 // Korean output (agglutinative, frequently revised) churn and read garbled
 // while English (rarely revised) looked clean:
 //   - exact duplicate                  → ignore
 //   - cumulative superset (grows)      → replace (snapshot)
 //   - out-of-order earlier prefix      → ignore (never shrink back)
 //   - duplicate trailing fragment      → ignore
+//   - overlapping increment            → append only the unseen suffix
+//   - conservative in-place revision   → replace the mutable snapshot
 //   - genuine new increment            → append
 const MAX_TRANSCRIPT_CHARS = 16_384;
 
@@ -143,6 +145,52 @@ function isSubtitleDebugEnabled(ctx = {}) {
   return ctx.debug === true || process.env.SUBTITLE_DEBUG === "1" || process.env.SUBTITLE_DEBUG === "true";
 }
 
+function sharedPrefixLength(left, right) {
+  const maximum = Math.min(left.length, right.length);
+  let index = 0;
+  while (index < maximum && left[index] === right[index]) index += 1;
+  return index;
+}
+
+function trailingOverlapLength(left, right) {
+  const maximum = Math.min(left.length, right.length);
+  if (maximum === 0) return 0;
+  const pattern = right.slice(0, maximum);
+  const prefixLengths = new Int32Array(pattern.length);
+  for (let index = 1, matched = 0; index < pattern.length; index += 1) {
+    while (matched > 0 && pattern[index] !== pattern[matched]) matched = prefixLengths[matched - 1];
+    if (pattern[index] === pattern[matched]) matched += 1;
+    prefixLengths[index] = matched;
+  }
+  const suffix = left.slice(-maximum);
+  let overlapLength = 0;
+  for (let index = 0; index < suffix.length; index += 1) {
+    while (overlapLength > 0 && suffix[index] !== pattern[overlapLength]) {
+      overlapLength = prefixLengths[overlapLength - 1];
+    }
+    if (suffix[index] === pattern[overlapLength]) overlapLength += 1;
+    if (overlapLength === pattern.length && index < suffix.length - 1) {
+      overlapLength = prefixLengths[overlapLength - 1];
+    }
+  }
+  if (overlapLength > 1) return overlapLength;
+  const before = left[left.length - 2] ?? "";
+  const after = right[1] ?? "";
+  return overlapLength === 1
+    && /[^\p{L}\p{N}]/u.test(before)
+    && /[^\p{L}\p{N}]/u.test(after)
+    ? 1
+    : 0;
+}
+
+function isConservativeRevision(previous, incoming) {
+  if (previous.length < 8 || incoming.length < 8) return false;
+  const shared = sharedPrefixLength(previous, incoming);
+  return shared >= 4
+    && shared / Math.min(previous.length, incoming.length) >= 0.3
+    && incoming.length >= previous.length * 0.6;
+}
+
 function mergeTranscript(accumulated, incoming) {
   const prev = String(accumulated ?? "");
   const text = String(incoming ?? "");
@@ -152,6 +200,12 @@ function mergeTranscript(accumulated, incoming) {
   if (text.startsWith(prev)) return boundTranscript(text);
   if (prev.startsWith(text)) return boundTranscript(prev);
   if (prev.endsWith(text)) return boundTranscript(prev);
+  const overlapLength = trailingOverlapLength(prev, text);
+  if (overlapLength > 0) return boundTranscript(`${prev}${text.slice(overlapLength)}`);
+  // Gemini occasionally reissues the current mutable phrase with a small
+  // correction instead of a prefix-growing snapshot. Replace only when a
+  // substantial beginning is shared; unrelated long deltas remain append-only.
+  if (isConservativeRevision(prev, text)) return boundTranscript(text);
   return boundTranscript(`${prev}${text}`);
 }
 
@@ -260,21 +314,31 @@ export function handleGeminiLiveMessage(raw, ctx = {}) {
 
   const outputText = content.outputTranscription?.text;
   if (outputText && String(outputText).length <= MAX_TRANSCRIPT_CHARS) {
-    if (isSubtitleDebugEnabled(ctx)) ctx.broadcast?.({ type: "subtitle:debug", channel: ctx.targetLanguage, kind: "output", text: boundTranscript(outputText) });
-    ctx.setTranslatedText?.(mergeTranscript(String(ctx.getTranslatedText?.() ?? ""), outputText));
-    if (typeof ctx.schedulePartialFlush === "function") ctx.schedulePartialFlush();
-    else ctx.emitPartial?.();
+    const outputLanguageCode = content.outputTranscription?.languageCode;
+    if (ctx.isProviderOutputLanguageAllowed?.(outputLanguageCode) === false) {
+      ctx.noteProviderOutputLanguageViolation?.(outputLanguageCode);
+    } else {
+      if (isSubtitleDebugEnabled(ctx)) ctx.broadcast?.({ type: "subtitle:debug", channel: ctx.targetLanguage, kind: "output", text: boundTranscript(outputText) });
+      ctx.setTranslatedText?.(mergeTranscript(String(ctx.getTranslatedText?.() ?? ""), outputText));
+      if (typeof ctx.schedulePartialFlush === "function") ctx.schedulePartialFlush();
+      else ctx.emitPartial?.();
+    }
   }
 
   if (content.turnComplete || content.generationComplete) {
     const sourceText = String(ctx.getSourceText?.() ?? "").trim();
     const translatedText = String(ctx.getTranslatedText?.() ?? "").trim();
-    const willCommit = Boolean(translatedText) && ctx.shouldDisplay?.() !== false;
+    // Partials stay behind the strict output-language display gate, but a final
+    // wrong-language draft must still reach the commit pipeline: its second pass
+    // can recover from the source, or reject it and recycle a contaminated Live
+    // session. Dropping it here made provider drift invisible and permanent.
+    const willCommit = Boolean(translatedText)
+      && (typeof ctx.shouldCommit === "function" ? ctx.shouldCommit() : ctx.shouldDisplay?.() !== false);
     if (isSubtitleDebugEnabled(ctx)) ctx.broadcast?.({ type: "subtitle:debug", channel: ctx.targetLanguage, kind: "turnEnd", text: `commit=${willCommit} :: ${translatedText.slice(-40)}` });
     if (willCommit) {
       ctx.commitSubtitle?.({ sourceText, translatedText });
     }
-    ctx.resetUtterance?.();
+    ctx.resetUtterance?.({ preserveSilenceClear: true });
   }
 }
 

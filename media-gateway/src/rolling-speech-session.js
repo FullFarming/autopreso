@@ -1,4 +1,5 @@
 import { AUDIO_CONFIG, STT_CONFIG } from "./config.js";
+import { safeProviderErrorIdentifier } from "./caption-polish.js";
 import { PcmTimelineRing } from "./pcm-timeline-ring.js";
 import { remapRolloverSpeakers } from "./speaker-registry.js";
 
@@ -38,7 +39,7 @@ export class RollingSpeechSession {
     } catch (error) {
       // A broken provider stream must not end the session: swap in a fresh
       // stream (losing only the in-flight window) and keep audio flowing.
-      console.warn("[stt] stream send failed, restarting stream:", error instanceof Error ? error.message : error);
+      console.warn("[stt] stream send failed, restarting stream:", safeProviderErrorIdentifier(error, "STT_STREAM_SEND_FAILED"));
       await this.#restart();
       await this.#stream.sendAudio(frame);
     }
@@ -113,7 +114,7 @@ export class RollingSpeechSession {
       // room makes that impossible (STT_ROLLOVER_WORDS_UNAVAILABLE). That is a
       // normal condition, not a fault — restart fresh instead of poisoning
       // every future frame.
-      console.warn("[stt] rollover failed, restarting stream:", error instanceof Error ? error.message : error);
+      console.warn("[stt] rollover failed, restarting stream:", safeProviderErrorIdentifier(error, "STT_ROLLOVER_FAILED"));
       await Promise.allSettled([previous.close(), next.close()]);
       previousPcmRing?.clear();
       nextPcmRing?.clear();

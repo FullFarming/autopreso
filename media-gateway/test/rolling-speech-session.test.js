@@ -155,6 +155,8 @@ test("a failed rollover restarts on a fresh stream instead of poisoning the sess
   let now = 0;
   const streams = [];
   const emitted = [];
+  const warnings = [];
+  const secret = ["test", "rollover", "marker"].join("-");
   const session = new RollingSpeechSession({
     now: () => now,
     provider: {
@@ -164,7 +166,7 @@ test("a failed rollover restarts on a fresh stream instead of poisoning the sess
           closed: 0,
           async sendAudio() {},
           async getFinalWords() { return []; },
-          async waitForFinalWords() { throw new Error("STT_ROLLOVER_WORDS_UNAVAILABLE"); },
+          async waitForFinalWords() { throw new Error(`https://speech.example?key=${secret}`); },
           async close() { this.closed += 1; },
           onFinalUtterance,
           index,
@@ -176,22 +178,32 @@ test("a failed rollover restarts on a fresh stream instead of poisoning the sess
     async onFinalUtterance(utterance) { emitted.push(utterance.text); },
     onRemap() {},
   });
-  await session.start();
-  await session.sendAudio(new Uint8Array(1_280));
-  now = 270_000;
-  // Rollover fires here: overlap remap fails (nobody spoke), but audio must keep flowing.
-  await session.sendAudio(new Uint8Array(1_280));
-  await session.sendAudio(new Uint8Array(1_280));
-  assert.equal(streams.length >= 3, true); // original + failed rollover attempt + fresh restart
-  const active = streams.at(-1);
-  await active.onFinalUtterance({ speakerLabel: "A", text: "still alive", sourceEndOffsetMs: 400 });
-  await new Promise((resolve) => setImmediate(resolve));
-  assert.deepEqual(emitted, ["still alive"]);
-  await session.close();
+  const originalWarn = console.warn;
+  console.warn = (...values) => warnings.push(values.join(" "));
+  try {
+    await session.start();
+    await session.sendAudio(new Uint8Array(1_280));
+    now = 270_000;
+    // Rollover fires here: overlap remap fails (nobody spoke), but audio must keep flowing.
+    await session.sendAudio(new Uint8Array(1_280));
+    await session.sendAudio(new Uint8Array(1_280));
+    assert.equal(streams.length >= 3, true); // original + failed rollover attempt + fresh restart
+    const active = streams.at(-1);
+    await active.onFinalUtterance({ speakerLabel: "A", text: "still alive", sourceEndOffsetMs: 400 });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(emitted, ["still alive"]);
+    await session.close();
+  } finally {
+    console.warn = originalWarn;
+  }
+  assert.match(warnings.join("\n"), /STT_ROLLOVER_FAILED/u);
+  assert.doesNotMatch(warnings.join("\n"), /AIza|speech\.example|key=/u);
 });
 
 test("a broken stream is replaced on the next audio frame instead of failing the session", async () => {
   const streams = [];
+  const warnings = [];
+  const secret = ["test", "rolling", "marker"].join("-");
   const session = new RollingSpeechSession({
     now: () => 0,
     provider: {
@@ -199,7 +211,7 @@ test("a broken stream is replaced on the next audio frame instead of failing the
         const index = streams.length;
         const stream = {
           async sendAudio() {
-            if (index === 0) throw new Error("STT_STREAM_FAILED");
+            if (index === 0) throw new Error(`https://speech.example?key=${secret}`);
           },
           async getFinalWords() { return []; },
           async close() {},
@@ -212,9 +224,17 @@ test("a broken stream is replaced on the next audio frame instead of failing the
     async onFinalUtterance() {},
     onRemap() {},
   });
-  await session.start();
-  await session.sendAudio(new Uint8Array(1_280)); // first frame hits the broken stream; must not throw
-  await session.sendAudio(new Uint8Array(1_280));
-  assert.equal(streams.length, 2);
-  await session.close();
+  const originalWarn = console.warn;
+  console.warn = (...values) => warnings.push(values.join(" "));
+  try {
+    await session.start();
+    await session.sendAudio(new Uint8Array(1_280)); // first frame hits the broken stream; must not throw
+    await session.sendAudio(new Uint8Array(1_280));
+    assert.equal(streams.length, 2);
+    await session.close();
+  } finally {
+    console.warn = originalWarn;
+  }
+  assert.match(warnings.join("\n"), /STT_STREAM_SEND_FAILED/u);
+  assert.doesNotMatch(warnings.join("\n"), /AIza|speech\.example|key=/u);
 });

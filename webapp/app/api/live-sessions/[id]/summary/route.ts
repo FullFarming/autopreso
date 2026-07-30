@@ -4,11 +4,14 @@ import { AuthenticationError, requireHost } from "@/lib/auth/live-auth";
 import { buildParticipantActivity } from "@/lib/live/activity";
 import { toLiveFailure } from "@/lib/live/errors";
 import {
+  claimMeetingSummaryGeneration,
+  completeMeetingSummaryGeneration,
+  failMeetingSummaryGeneration,
   fetchUtterances,
   generateMeetingSummary,
   readMeetingSummary,
+  readMeetingSummaryGenerationStatus,
   SummaryError,
-  upsertMeetingSummary,
 } from "@/lib/live/summary";
 import { parseSessionId } from "@/lib/live/validation";
 import { apiError, apiSuccess } from "@/lib/security/api-response";
@@ -22,7 +25,7 @@ function parseLanguage(value: string | null): string | null {
   return parsed.success ? parsed.data : null;
 }
 
-/** Host-only: generate (or regenerate) the meeting summary for one language. */
+/** Host-only: claim the one allowed meeting-summary generation for a language. */
 export async function POST(request: NextRequest, context: { params: Promise<{ id: string }> }) {
   try {
     const { hostId } = await requireHost(request);
@@ -38,28 +41,59 @@ export async function POST(request: NextRequest, context: { params: Promise<{ id
         : null,
     );
     if (!language) return apiError("요약할 언어를 선택하세요.", "LANGUAGE_REQUIRED", 400);
-    const [utterances, activity] = await Promise.all([
-      fetchUtterances(sessionId, language),
-      buildParticipantActivity(sessionId, hostId, language),
-    ]);
-    if (utterances.length === 0) {
-      return apiError("요약할 발언 기록이 없습니다.", "NO_UTTERANCES", 404);
+    const claim = await claimMeetingSummaryGeneration(sessionId, language);
+    if (claim.status === "ready") {
+      const record = await readMeetingSummary(sessionId, language);
+      if (!record) throw new SummaryError("완료된 요약을 읽을 수 없습니다.", "SUMMARY_READY_MISSING", 502);
+      return apiSuccess({
+        summary: record.summary,
+        model: record.model,
+        utteranceCount: 0,
+        generationStatus: "ready" as const,
+      });
     }
-    const participantById = new Map(activity.participants.map((participant) => [participant.participantId, participant]));
-    const attributedUtterances = utterances.map((utterance) => {
-      const participant = utterance.participantId ? participantById.get(utterance.participantId) : undefined;
-      return participant
-        ? {
-            ...utterance,
-            speakerName: participant.displayName,
-            speakerDepartment: participant.department,
-            speakerJobTitle: participant.jobTitle,
-          }
-        : utterance;
-    });
-    const { summary, model } = await generateMeetingSummary(attributedUtterances, language);
-    await upsertMeetingSummary(sessionId, language, summary, model);
-    return apiSuccess({ summary, model, utteranceCount: utterances.length });
+    if (claim.status === "running") {
+      return apiError("요약을 생성하고 있습니다.", "SUMMARY_GENERATION_RUNNING", 409);
+    }
+    if (claim.status === "exhausted") {
+      return apiError("요약 생성 재시도 횟수를 모두 사용했습니다.", "SUMMARY_GENERATION_EXHAUSTED", 409);
+    }
+    if (claim.status === "permanent_failed") {
+      return apiError("요약을 생성할 수 없습니다.", "SUMMARY_GENERATION_PERMANENT_FAILED", 409);
+    }
+    if (claim.status !== "claimed") throw new SummaryError("요약 생성 상태가 올바르지 않습니다.", "SUMMARY_STATE_FAILED", 502);
+    try {
+      const [utterances, activity] = await Promise.all([
+        fetchUtterances(sessionId, language),
+        buildParticipantActivity(sessionId, hostId, language),
+      ]);
+      if (utterances.length === 0) {
+        await failMeetingSummaryGeneration(sessionId, language, claim.generationToken, "NO_UTTERANCES");
+        return apiError("요약할 발언 기록이 없습니다.", "NO_UTTERANCES", 404);
+      }
+      const participantById = new Map(activity.participants.map((participant) => [participant.participantId, participant]));
+      const attributedUtterances = utterances.map((utterance) => {
+        const participant = utterance.participantId ? participantById.get(utterance.participantId) : undefined;
+        return participant
+          ? {
+              ...utterance,
+              speakerName: participant.displayName,
+              speakerDepartment: participant.department,
+              speakerJobTitle: participant.jobTitle,
+            }
+          : utterance;
+      });
+      const { summary, model } = await generateMeetingSummary(attributedUtterances, language);
+      const completed = await completeMeetingSummaryGeneration(
+        sessionId, language, claim.generationToken, summary, model,
+      );
+      if (!completed) throw new SummaryError("요약 완료 상태를 저장할 수 없습니다.", "SUMMARY_COMPLETE_FAILED", 502);
+      return apiSuccess({ summary, model, utteranceCount: utterances.length, generationStatus: "saved" as const });
+    } catch (error: unknown) {
+      const errorCode = error instanceof SummaryError ? error.code : "SUMMARY_FAILED";
+      await failMeetingSummaryGeneration(sessionId, language, claim.generationToken, errorCode).catch(() => false);
+      throw error;
+    }
   } catch (error: unknown) {
     if (error instanceof AuthenticationError) return apiError(error.message, "HOST_AUTH_REQUIRED", 401);
     if (error instanceof LiveAdmissionError) return apiError(error.message, error.code, error.status);
@@ -90,7 +124,27 @@ export async function GET(request: NextRequest, context: { params: Promise<{ id:
       await authorizeParticipantRecordRequest(request, sessionId, store);
     }
     const record = await readMeetingSummary(sessionId, language);
-    if (!record) return apiError("아직 요약이 준비되지 않았습니다.", "SUMMARY_NOT_READY", 404);
+    if (!record) {
+      const generation = await readMeetingSummaryGenerationStatus(sessionId, language);
+      if (generation.status === "running") {
+        return apiError("요약을 생성하고 있습니다.", "SUMMARY_GENERATION_RUNNING", 409);
+      }
+      if (generation.status === "retryable_failed") {
+        return apiError("요약 생성 중 일시적인 오류가 발생했습니다.", "SUMMARY_GENERATION_RETRYABLE_FAILED", 409);
+      }
+      if (generation.status === "exhausted") {
+        return apiError("요약 생성 재시도 횟수를 모두 사용했습니다.", "SUMMARY_GENERATION_EXHAUSTED", 409);
+      }
+      if (generation.status === "permanent_failed") {
+        return apiError("요약을 생성할 수 없습니다.", "SUMMARY_GENERATION_PERMANENT_FAILED", 409);
+      }
+      if (generation.status === "ready") {
+        const completedRecord = await readMeetingSummary(sessionId, language);
+        if (!completedRecord) throw new SummaryError("완료된 요약을 읽을 수 없습니다.", "SUMMARY_READY_MISSING", 502);
+        return apiSuccess(completedRecord);
+      }
+      return apiError("아직 요약이 준비되지 않았습니다.", "SUMMARY_NOT_READY", 404);
+    }
     return apiSuccess(record);
   } catch (error: unknown) {
     if (error instanceof AuthenticationError || error instanceof AuthorizationError) {

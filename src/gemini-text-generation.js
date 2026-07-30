@@ -19,8 +19,7 @@ export async function generateGeminiText({ apiKey, model, system = "", prompt = 
       ...(system ? { systemInstruction: { parts: [{ text: system }] } } : {}),
       contents: [{ role: "user", parts: [{ text: prompt }] }],
       generationConfig: {
-        temperature: 0.2,
-        candidateCount: 1,
+        thinkingConfig: { thinkingLevel: "minimal" },
         maxOutputTokens: 2048,
       },
     }),

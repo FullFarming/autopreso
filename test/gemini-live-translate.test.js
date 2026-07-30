@@ -231,7 +231,11 @@ test("gemini transcripts accumulate fragments and commit on turnComplete", () =>
   assert.equal(ctx.getSourceText(), "안녕하세요");
   assert.equal(ctx.getTranslatedText(), "Hello there");
   assert.ok(ctx.events.some((event) => event.type === "schedulePartialFlush"));
-  assert.equal(ctx.events.some((event) => event.type === "scheduleCommit"), false);
+  assert.equal(
+    ctx.events.some((event) => event.type === "scheduleCommit"),
+    false,
+    "output fragments must not manufacture a sentence boundary before turnComplete",
+  );
 
   handleGeminiLiveMessage(JSON.stringify({ serverContent: { turnComplete: true } }), ctx);
   const commit = ctx.events.find((event) => event.type === "commit");
@@ -295,6 +299,52 @@ test("gemini transcript merge never shrinks or duplicates on out-of-order/revise
   // A genuine new increment still appends.
   handleGeminiLiveMessage(JSON.stringify({ serverContent: { outputTranscription: { text: " 검증합니다" } } }), ctx);
   assert.equal(ctx.getTranslatedText(), "운영사가 딜을 검증합니다");
+});
+
+test("gemini transcript merge replaces a non-prefix revision while still accepting later deltas and snapshots", () => {
+  const ctx = makeCtx();
+  const output = (text) => handleGeminiLiveMessage(JSON.stringify({
+    serverContent: { outputTranscription: { text } },
+  }), ctx);
+
+  output("이건 제 개인적인 프로젝트로 시작해서");
+  output("이건 제 개인 프로젝트로 시작해서");
+  assert.equal(
+    ctx.getTranslatedText(),
+    "이건 제 개인 프로젝트로 시작해서",
+    "a provider revision that edits the middle of a snapshot must replace the stale draft",
+  );
+
+  output(" 통화 후에");
+  assert.equal(ctx.getTranslatedText(), "이건 제 개인 프로젝트로 시작해서 통화 후에");
+
+  output("이건 제 개인 프로젝트로 시작해서 통화 후에 이걸 개선했습니다");
+  assert.equal(
+    ctx.getTranslatedText(),
+    "이건 제 개인 프로젝트로 시작해서 통화 후에 이걸 개선했습니다",
+    "a cumulative snapshot after a delta must not duplicate the shared prefix",
+  );
+});
+
+test("gemini transcript merge de-duplicates the overlapping fragments captured in the regression video", () => {
+  const ctx = makeCtx();
+  for (const text of [
+    "이건 제 개인적인",
+    " 프로젝트로 시작해서 그리고 통화 후에",
+    "통화 후에 좋은 시도를 해보고, 그",
+    "그 호텔 세션에서 저희가 라이브를 시도하고 있어요.",
+    "라이브를 시도하고 있어요. 라이브 통화 기능이죠. 처음으로.",
+  ]) {
+    handleGeminiLiveMessage(JSON.stringify({
+      serverContent: { outputTranscription: { text } },
+    }), ctx);
+  }
+
+  assert.equal(
+    ctx.getTranslatedText(),
+    "이건 제 개인적인 프로젝트로 시작해서 그리고 통화 후에 좋은 시도를 해보고, 그 호텔 세션에서 저희가 라이브를 시도하고 있어요. 라이브 통화 기능이죠. 처음으로.",
+    "suffix-prefix overlap must be appended once without dropping the genuine incremental text",
+  );
 });
 
 test("gemini interrupted resets the in-progress utterance", () => {

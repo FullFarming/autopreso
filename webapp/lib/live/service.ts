@@ -1,5 +1,4 @@
 import type { GlossaryPack, LiveOutputMode, LiveSession, LiveSessionType, LiveSnapshot, LiveVoiceProvider } from "../live-contract";
-import { LANGUAGE_CODES, toOpenAITranslationLanguageCode } from "../languageDetect";
 import { LiveSessionError } from "./errors";
 import type { LiveSessionStore } from "./store";
 import {
@@ -11,12 +10,10 @@ import {
   parseSessionType,
   parseTitle,
   parseVersion,
-  parseVoiceProvider,
 } from "./validation";
 
 const SESSION_TTL_MILLISECONDS = 6 * 60 * 60 * 1_000;
 const MAX_SCHEDULE_AHEAD_MILLISECONDS = 30 * 24 * 60 * 60 * 1_000;
-const OPENAI_REALTIME_TRANSLATION_LANGUAGES = new Set(LANGUAGE_CODES.map(toOpenAITranslationLanguageCode));
 const DUAL_CAPTION_LANGUAGES = ["ko", "en"] as const;
 const MAX_SESSION_LANGUAGES = 3;
 
@@ -51,7 +48,6 @@ export class LiveSessionService {
     if (scheduledTimestamp > this.now() + MAX_SCHEDULE_AHEAD_MILLISECONDS) {
       throw new LiveSessionError("라이브 일정은 30일 이내로 예약하세요.", "SCHEDULE_TOO_FAR", 400);
     }
-    assertOpenAIVoiceLanguages(voiceProvider, languages);
     const session: LiveSession = {
       id: crypto.randomUUID(),
       hostId,
@@ -75,9 +71,22 @@ export class LiveSessionService {
   }
 
   /** Contract C10: mark the uploaded cover object on the owned session. */
-  async setCoverImage(hostId: string, sessionId: string, path: string): Promise<void> {
-    const updated = await this.store.setCoverImageOwned(sessionId, hostId, path);
-    if (!updated) throw new LiveSessionError("세션을 찾을 수 없습니다.", "SESSION_NOT_FOUND", 404);
+  async setCoverImage(
+    hostId: string,
+    sessionId: string,
+    path: string,
+    expectedCurrentPath: string | null,
+  ): Promise<void> {
+    const updated = await this.store.setCoverImageOwned(sessionId, hostId, path, expectedCurrentPath);
+    if (updated) return;
+    const current = await this.store.get(sessionId);
+    if (!current || current.hostId !== hostId) {
+      throw new LiveSessionError("세션을 찾을 수 없습니다.", "SESSION_NOT_FOUND", 404);
+    }
+    if (!new Set(["preparing", "live", "paused"]).has(current.status)) {
+      throw new LiveSessionError("종료된 세션에는 커버를 올릴 수 없습니다.", "SESSION_ENDED", 409);
+    }
+    throw new LiveSessionError("다른 커버가 먼저 저장되었습니다. 다시 시도하세요.", "COVER_FINALIZE_CONFLICT", 409);
   }
 
   async update(hostId: string, sessionId: string, input: UpdateServiceInput): Promise<LiveSession> {
@@ -93,7 +102,6 @@ export class LiveSessionService {
     const languages = input.languages === undefined
       ? withDualCaptionLanguages(current.languages)
       : withDualCaptionLanguages(parseLanguages(input.languages));
-    assertOpenAIVoiceLanguages(voiceProvider, languages);
     const maxViewers = input.maxViewers === undefined ? current.maxViewers : parseMaxViewers(input.maxViewers);
     if (maxViewers < current.viewerCount) {
       throw new LiveSessionError("현재 접속자 수보다 최대 시청자를 낮출 수 없습니다.", "MAX_VIEWERS_BELOW_CURRENT", 409);
@@ -192,20 +200,6 @@ export class LiveSessionService {
   }
 }
 
-function assertOpenAIVoiceLanguages(voiceProvider: LiveVoiceProvider, languages: readonly string[]): void {
-  if (voiceProvider !== "openai") return;
-  const unsupportedLanguage = languages.find((language) => !OPENAI_REALTIME_TRANSLATION_LANGUAGES.has(
-    toOpenAITranslationLanguageCode(language),
-  ));
-  if (unsupportedLanguage) {
-    throw new LiveSessionError(
-      `OpenAI 실시간 음성이 지원하지 않는 언어입니다: ${unsupportedLanguage}`,
-      "OPENAI_VOICE_LANGUAGE_UNSUPPORTED",
-      400,
-    );
-  }
-}
-
 interface LegacySessionSettingsInput {
   mode?: unknown;
   voiceOutputMode?: unknown;
@@ -257,18 +251,7 @@ function normalizeSessionSettings(
     else throw new LiveSessionError("지원하지 않는 음성 출력 모드입니다.", "INVALID_VOICE_OUTPUT_MODE", 400);
   } else outputMode = current?.outputMode ?? "captions";
 
-  const requestedVoiceProvider = input.voiceProvider === undefined
-    ? current?.voiceProvider ?? "gemini"
-    : parseVoiceProvider(input.voiceProvider);
-  const hasAudioOutput = outputMode === "captions_audio" || outputMode === "audio";
-  if (input.voiceProvider === "openai" && (sessionType !== "presentation" || !hasAudioOutput)) {
-    throw new LiveSessionError(
-      "OpenAI 음성 출력은 프레젠테이션의 음성 출력 모드에서만 사용할 수 있습니다.",
-      "OPENAI_VOICE_OUTPUT_ONLY",
-      400,
-    );
-  }
-  const voiceProvider = sessionType === "presentation" && hasAudioOutput ? requestedVoiceProvider : "gemini";
+  const voiceProvider: LiveVoiceProvider = "gemini";
 
   return { sessionType, outputMode, voiceProvider };
 }

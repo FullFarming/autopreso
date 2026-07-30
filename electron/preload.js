@@ -16,6 +16,18 @@ contextBridge.exposeInMainWorld("realtimeNoelDesktop", {
   goLiveCall: () => ipcRenderer.invoke("live-call:go-live"),
   hostSpeak: () => ipcRenderer.invoke("live-call:host-speak"),
   ensureLiveCallBridge: () => ipcRenderer.invoke("live-call:bridge-ensure"),
+  reconnectLiveCallTranslation: () => ipcRenderer.invoke("live-call:translation-reconnect"),
+  onLiveCallPreflight: (listener) => {
+    const handler = (_event, request) => listener(request);
+    ipcRenderer.on("live-call:preflight-request", handler);
+    return () => ipcRenderer.removeListener("live-call:preflight-request", handler);
+  },
+  completeLiveCallPreflight: (requestId, result) => ipcRenderer.send("live-call:preflight-result", requestId, result),
+  onLiveCallPreflightCancel: (listener) => {
+    const handler = (_event, request) => listener(request);
+    ipcRenderer.on("live-call:preflight-cancel", handler);
+    return () => ipcRenderer.removeListener("live-call:preflight-cancel", handler);
+  },
   reportLiveCallAudioFailure: (detail) => ipcRenderer.invoke("live-call:audio-failed", detail),
   sendLiveCallAudioFrame: (packet) => ipcRenderer.send("live-call:audio-frame", packet),
   onLiveCallCaption: (listener) => {
@@ -31,8 +43,20 @@ contextBridge.exposeInMainWorld("realtimeNoelDesktop", {
   endLiveCall: () => ipcRenderer.invoke("live-call:end"),
   saveLiveHostLogin: (config) => ipcRenderer.invoke("live-call:save-host-login", config),
   getLiveHostLoginStatus: () => ipcRenderer.invoke("live-call:get-host-login-status"),
+  listGlossaryPresets: () => ipcRenderer.invoke("glossary-presets:list"),
+  createGlossaryPreset: (input) => ipcRenderer.invoke("glossary-presets:create", input),
+  updateGlossaryPreset: (input) => ipcRenderer.invoke("glossary-presets:update", input),
+  deleteGlossaryPreset: (input) => ipcRenderer.invoke("glossary-presets:delete", input),
   getOverlayEnabled: () => ipcRenderer.invoke("subtitle-overlay:get-enabled"),
   setOverlayEnabled: (enabled) => ipcRenderer.invoke("subtitle-overlay:set-enabled", Boolean(enabled)),
+  listOverlayDisplays: () => ipcRenderer.invoke("subtitle-overlay:list-displays"),
+  selectOverlayDisplay: (displayId) => ipcRenderer.invoke("subtitle-overlay:select-display", displayId),
+  setOverlayAllDisplays: (allDisplays) => ipcRenderer.invoke("subtitle-overlay:set-all-displays", allDisplays),
+  onOverlayDisplaysChanged: (listener) => {
+    const handler = (_event, payload) => listener(payload);
+    ipcRenderer.on("subtitle-overlay:displays-changed", handler);
+    return () => ipcRenderer.removeListener("subtitle-overlay:displays-changed", handler);
+  },
   // Momentary caption hide (e.g. while a video plays). Not persisted.
   setOverlaysMuted: (muted) => ipcRenderer.invoke("subtitle-overlay:set-muted", Boolean(muted)),
   getOverlaysMuted: () => ipcRenderer.invoke("subtitle-overlay:get-muted"),

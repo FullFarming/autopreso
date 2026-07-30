@@ -562,6 +562,14 @@ test("subtitle:start carries optional meeting identity into the record", async (
     ws = new WebSocket(url.replace("http:", "ws:") + "/ws", { headers: { Origin: url } });
     await new Promise((resolve, reject) => { ws.once("open", resolve); ws.once("error", reject); });
     ws.send(JSON.stringify({
+      type: "subtitle:preflight",
+      requestId: "preflight-1",
+      settings: { inputMode: "mic", translationProvider: "gemini" },
+      meeting: { kind: "live-call", liveSessionId: "session-1" },
+    }));
+    const preflightAck = await waitForWebSocketMessage(ws, (message) => message.type === "subtitle:preflight-ready");
+    assert.equal(preflightAck.requestId, "preflight-1");
+    ws.send(JSON.stringify({
       type: "subtitle:start",
       sessionId: "live-9",
       settings: { inputMode: "mic", translationProvider: "gemini" },
@@ -704,9 +712,16 @@ test("a gateway-canonical Live Call records captions without opening the local t
       settings: { inputMode: "mic", translationProvider: "gemini" },
       meeting: { kind: "live-call", liveSessionId: "session-1", title: "Canonical call" },
     }));
-    await new Promise((resolve) => setImmediate(resolve));
+    const startAck = await waitForWebSocketMessage(ws, (message) => message.type === "subtitle:started");
+    assert.equal(startAck.sessionId, "live-session-1");
+    assert.equal(startAck.captionProducer, "gateway");
     const attacker = new WebSocket(url.replace("http:", "ws:") + "/ws");
     await new Promise((resolve, reject) => { attacker.once("open", resolve); attacker.once("error", reject); });
+    attacker.send(JSON.stringify({ type: "subtitle:stop", sessionId: "live-session-1" }));
+    const stopRejection = await waitForWebSocketMessage(attacker, (message) => message.code === "SUBTITLE_SESSION_MISMATCH");
+    assert.equal(stopRejection.type, "subtitle:error");
+    const stillActive = await (await fetch(new URL("/api/subtitles/sessions/live-session-1", url))).json();
+    assert.equal(stillActive.data.meta.endedAt, "", "a secondary renderer must not finalize the active record");
     const injected = [];
     ws.on("message", (raw) => {
       const message = JSON.parse(raw.toString("utf8"));
@@ -755,11 +770,18 @@ test("a gateway-canonical Live Call records captions without opening the local t
       targetLanguage: "en",
       speakerRole: "host",
       utteranceKey: "session-1:input:1",
+      sourceSeq: 41,
       sourceLanguage: "ko",
       sourceText: "안녕하세요",
       translatedText: "Hello.",
     }));
     const hostCaption = await waitForWebSocketMessage(ws, (message) => message.type === "subtitle:committed");
+    assert.equal(
+      hostCaption.utteranceKey,
+      "session-1:input:1",
+      "the desktop overlay must receive the canonical Live Call utterance identity",
+    );
+    assert.equal(hostCaption.sourceSeq, 41, "the gateway sequence must survive the desktop relay as fallback identity");
     assert.deepEqual(hostCaption.liveCallSpeaker, {
       role: "host",
       name: "Host",
@@ -786,14 +808,73 @@ test("a gateway-canonical Live Call records captions without opening the local t
       translatedText: "Hello.",
     }));
     await waitForWebSocketMessage(ws, (message) => message.type === "subtitle:committed");
+    ws.send(JSON.stringify({
+      type: "subtitle:live-call-caption",
+      sessionId: "session-1",
+      recordOnly: true,
+      partial: false,
+      targetLanguage: "ko",
+      speakerRole: "host",
+      translatedText: "키가 없는 원문",
+    }));
+    ws.send(JSON.stringify({
+      type: "subtitle:live-call-caption",
+      sessionId: "session-1",
+      partial: false,
+      targetLanguage: "en",
+      speakerRole: "host",
+      sourceLanguage: "ko",
+      translatedText: "Unkeyed translated line.",
+    }));
+    await waitForWebSocketMessage(ws, (message) => message.type === "subtitle:committed"
+      && message.translatedText === "Unkeyed translated line.");
     ws.send(JSON.stringify({ type: "subtitle:stop", sessionId: "live-session-1" }));
     await new Promise((resolve) => setTimeout(resolve, 50));
     const body = await (await fetch(new URL("/api/subtitles/sessions/live-session-1", url))).json();
     assert.equal(body.ok, true);
     assert.equal(body.data.lines[0].sourceText, "안녕하세요");
     assert.equal(body.data.lines[0].translatedText, "Hello.");
-    assert.equal(body.data.lines.length, 2, "identical text in two utterances must remain two recorded lines");
+    assert.equal(body.data.lines.length, 3, "keyed duplicates and the unkeyed FIFO pair must each remain one record");
+    assert.equal(body.data.lines[2].sourceText, "키가 없는 원문");
+    assert.equal(body.data.lines[2].translatedText, "Unkeyed translated line.");
     assert.equal(localSocketCount, 0, "the local Gemini/OpenAI producer must remain cold");
+  } finally {
+    ws?.close();
+    await new Promise((resolve) => httpServer.close(resolve));
+  }
+});
+
+test("a transcript begin failure compensates the already-opened local providers", async () => {
+  const root = await makeStorageDir();
+  const unusableStoragePath = path.join(root, "not-a-directory");
+  await fs.writeFile(unusableStoragePath, "occupied");
+  const providerSockets = [];
+  const { httpServer, url } = await startServer({
+    host: "127.0.0.1",
+    port: 0,
+    env: { GEMINI_API_KEY: "AIza-test" },
+    transcriptsDir: unusableStoragePath,
+    transcriptPersistDelayMs: 0,
+    createTranscription: () => ({ ready: async () => {}, sendAudio: () => {}, stop: () => {}, close: () => {} }),
+    createSubtitleWebSocket: (socketUrl, protocols, init) => {
+      const socket = new FakeRealtimeSocket(socketUrl, init);
+      providerSockets.push(socket);
+      return socket;
+    },
+  });
+  let ws;
+  try {
+    ws = new WebSocket(url.replace("http:", "ws:") + "/ws", { headers: { Origin: url } });
+    await new Promise((resolve, reject) => { ws.once("open", resolve); ws.once("error", reject); });
+    ws.send(JSON.stringify({
+      type: "subtitle:start",
+      sessionId: "begin-failure",
+      settings: { inputMode: "mic", translationProvider: "gemini" },
+    }));
+    const error = await waitForWebSocketMessage(ws, (message) => message.code === "SUBTITLE_START_FAILED");
+    assert.equal(error.sessionId, "begin-failure");
+    assert.ok(providerSockets.length > 0);
+    assert.equal(providerSockets.every((socket) => socket.closed === true), true);
   } finally {
     ws?.close();
     await new Promise((resolve) => httpServer.close(resolve));

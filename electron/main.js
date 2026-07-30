@@ -9,8 +9,14 @@ import { startServer } from "../src/server.js";
 import { createCaptionPcmResampler } from "../src/caption-pcm-resampler.js";
 import { encodeLiveAudioWireFrame } from "../src/live-audio-wire.js";
 import { sanitizeLiveCaptionDisplayLanguage, shouldDisplayLiveCaption } from "../src/live-caption-display-policy.js";
-import { buildLiveCallGlossary } from "../src/live-call-glossary.js";
-import { createSettingsStore, migrateSettingsFile } from "../src/settings-store.js";
+import {
+  createLiveCaptionIpcRelay,
+  resolveControllerDisplay,
+  resolveOverlayDisplays,
+  resolveSelectedOverlayDisplay,
+} from "../src/live-caption-ipc-relay.js";
+import { createSettingsStore, migrateSettingsFile, validateSubtitleSettings } from "../src/settings-store.js";
+import { createGeminiCaptionConfig, geminiCaptionConfigFingerprint } from "../packages/caption-core/index.js";
 // The renderer owns the UI language choice (localStorage); it pushes the value
 // over IPC so the application menu speaks the same language.
 import { normalizeLanguage, setLanguage, t as translate } from "../public/subtitle-i18n.js";
@@ -28,10 +34,12 @@ const OVERLAY_TOP_LEVEL = "screen-saver";
 // The console hugs its content, which before Go-Live is much narrower than the
 // old fixed 720 floor.
 const CONTROLLER_MIN_WIDTH = 420;
+const MAX_OVERLAY_DISPLAY_ID_LENGTH = 64;
 const DEFAULT_LIVE_WORKSPACE_URL = "https://realtime-noel-web.vercel.app/";
 const MAILTO_MAX_URL_LENGTH = 4_096;
-const MAX_LIVE_COVER_BYTES = 5 * 1024 * 1024;
+const MAX_LIVE_COVER_BYTES = 20 * 1024 * 1024;
 const LIVE_COVER_CONTENT_TYPES = new Set(["image/jpeg", "image/png", "image/webp"]);
+const LIVE_COVER_UPLOAD_TIMEOUT_MS = 120_000;
 // Renderer recovery: a window whose page failed to load never fires
 // `ready-to-show`, and a crashed renderer keeps `isDestroyed() === false`, so
 // the 1s overlay watchdog cannot see either. Reload with bounded exponential
@@ -62,9 +70,14 @@ let dashboardWindow = null;
 let controllerWindow = null;
 let lastServerUrl = "";
 let stageWindow = null;
-// Multi-display support: one always-on-top overlay window per connected
-// display, keyed by display id and reconciled as displays come and go.
+// Always-on-top overlay windows keyed by display id. In single mode the map
+// holds exactly one entry following the user's persisted display choice; with
+// the controller's "all displays" tick on it holds one per connected screen,
+// every one rendering the SAME caption stream from the local server.
 const overlayWindows = new Map();
+let overlayAllDisplays = false;
+let preferredOverlayDisplayId = "";
+let selectedOverlayDisplayId = "";
 // Overlay windows whose page currently hosts the cursor over a subtitle box —
 // these stay clickable (double-click restart) until the cursor leaves; the
 // watchdog must not flip them back to click-through mid-hover.
@@ -125,6 +138,8 @@ async function loadSettingsStoreResiliently() {
 async function createApp() {
   const { settingsStore, settings, quarantinedPath } = await loadSettingsStoreResiliently();
   overlayEnabled = settings.subtitle?.overlayEnabled !== false;
+  preferredOverlayDisplayId = settings.subtitle?.overlayDisplayId ?? "";
+  overlayAllDisplays = settings.subtitle?.overlayAllDisplays === true;
   server = await startDesktopServer(settingsStore);
   const liveCallEnabled = isLiveCallEnabled();
   const liveWorkspaceUrl = resolveLiveWorkspaceUrl();
@@ -155,6 +170,7 @@ async function createApp() {
   // stage window moves to the best remaining display (see C8).
   screen.on("display-added", repositionStageWindow);
   screen.on("display-removed", repositionStageWindow);
+  screen.on("display-metrics-changed", repositionStageWindow);
   // Event-driven re-assert: these fire exactly when macOS tends to de-level a
   // floating window (another app activating/going fullscreen, our own windows
   // gaining focus), so the overlay snaps back on top immediately instead of
@@ -180,7 +196,49 @@ async function createApp() {
 
 function syncOverlayBoundsAndTop() {
   syncOverlayBounds();
+  positionControllerForOverlayDisplay();
   reassertOverlayTop();
+  notifyOverlayDisplaysChanged();
+}
+
+function overlayDisplayState() {
+  const displays = screen.getAllDisplays();
+  const primaryDisplay = screen.getPrimaryDisplay();
+  const selected = resolveSelectedOverlayDisplay(displays, preferredOverlayDisplayId, primaryDisplay);
+  selectedOverlayDisplayId = selected ? String(selected.id) : "";
+  return {
+    displays: displays.map((display) => ({
+      id: String(display.id),
+      label: String(display.label ?? "Display").replace(/[\u0000-\u001f\u007f]/gu, " ").trim().slice(0, 160) || "Display",
+      isPrimary: String(display.id) === String(primaryDisplay?.id),
+      isConnected: true,
+    })),
+    selectedDisplayId: selectedOverlayDisplayId,
+    allDisplays: overlayAllDisplays,
+  };
+}
+
+function notifyOverlayDisplaysChanged() {
+  const payload = overlayDisplayState();
+  for (const rendererWindow of [dashboardWindow, controllerWindow]) {
+    if (rendererWindow && !rendererWindow.isDestroyed()) {
+      rendererWindow.webContents.send("subtitle-overlay:displays-changed", payload);
+    }
+  }
+}
+
+function positionControllerForOverlayDisplay() {
+  if (!controllerWindow || controllerWindow.isDestroyed()) return;
+  const displays = screen.getAllDisplays();
+  const primaryDisplay = screen.getPrimaryDisplay();
+  const overlayDisplay = resolveSelectedOverlayDisplay(displays, preferredOverlayDisplayId, primaryDisplay);
+  const target = resolveControllerDisplay(displays, overlayDisplay, primaryDisplay);
+  if (!target) return;
+  const [currentWidth, currentHeight] = controllerWindow.getSize();
+  const width = Math.min(currentWidth, Math.max(CONTROLLER_MIN_WIDTH, target.workArea.width - 48));
+  const x = Math.round(target.workArea.x + (target.workArea.width - width) / 2);
+  const y = Math.round(target.workArea.y + target.workArea.height - currentHeight - 120);
+  controllerWindow.setBounds({ x, y, width, height: currentHeight });
 }
 
 // ── Renderer death recovery ────────────────────────────────────────────────
@@ -496,6 +554,7 @@ function parseLiveWorkspaceUrl(value) {
 let liveCallSession = null; // { sessionId, version, baseUrl, status }
 let isLiveCallStarting = false;
 let isLiveCallEnding = false;
+let isLiveCallGoingLive = false;
 
 // Bounded so a hung workspace can never freeze Start Live Call or the
 // save-time verification; expiry surfaces as NETWORK_UNAVAILABLE.
@@ -528,35 +587,49 @@ async function liveCallApi(baseUrl, pathname, { method = "POST", body } = {}) {
   return { ok: true, data: payload.data };
 }
 
-async function liveCallRawApi(baseUrl, pathname, bytes, contentType) {
-  const origin = new URL(baseUrl).origin;
-  let response;
+function validateLiveCoverSignedUpload(value, sessionId) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return { ok: false, code: "COVER_STORAGE_RESPONSE_INVALID" };
+  const { uploadUrl, storageOrigin, objectPath, uploadTicket } = value;
+  const pendingPrefix = `${sessionId}/pending/`;
+  if (typeof uploadUrl !== "string"
+    || typeof storageOrigin !== "string"
+    || typeof objectPath !== "string"
+    || typeof uploadTicket !== "string"
+    || !objectPath.startsWith(pendingPrefix)
+    || !/^[0-9a-f]{32}\.(?:jpg|png|webp)$/u.test(objectPath.slice(pendingPrefix.length))) {
+    return { ok: false, code: "COVER_STORAGE_RESPONSE_INVALID" };
+  }
+  let target;
+  let expectedOrigin;
   try {
-    response = await net.fetch(new URL(pathname, baseUrl).href, {
-      method: "POST",
-      credentials: "include",
-      headers: {
-        "content-type": contentType,
-        "content-length": String(bytes.byteLength),
-        origin,
-      },
-      signal: AbortSignal.timeout(LIVE_CALL_API_TIMEOUT_MS),
-      body: bytes,
-    });
+    target = new URL(uploadUrl);
+    expectedOrigin = new URL(storageOrigin);
   } catch {
-    return { ok: false, code: "NETWORK_UNAVAILABLE" };
+    return { ok: false, code: "COVER_STORAGE_RESPONSE_INVALID" };
   }
-  let payload = null;
-  try {
-    payload = await response.json();
-  } catch {
-    payload = null;
+  const expectedPath = `/storage/v1/object/upload/sign/live-covers/${objectPath}`;
+  const queryKeys = [...target.searchParams.keys()];
+  if (target.protocol !== "https:"
+    || expectedOrigin.protocol !== "https:"
+    || !/^[a-z0-9-]+\.supabase\.co$/u.test(expectedOrigin.hostname)
+    || target.origin !== expectedOrigin.origin
+    || expectedOrigin.pathname !== "/"
+    || expectedOrigin.search
+    || expectedOrigin.hash
+    || expectedOrigin.username
+    || expectedOrigin.password
+    || expectedOrigin.port
+    || target.port
+    || target.username
+    || target.password
+    || target.pathname !== expectedPath
+    || target.hash
+    || queryKeys.length !== 1
+    || queryKeys[0] !== "token"
+    || !target.searchParams.get("token")) {
+    return { ok: false, code: "COVER_STORAGE_RESPONSE_INVALID" };
   }
-  if (response.status === 401) return { ok: false, code: "HOST_LOGIN_REQUIRED" };
-  if (!response.ok || payload?.ok !== true) {
-    return { ok: false, code: typeof payload?.code === "string" ? payload.code : `HTTP_${response.status}` };
-  }
-  return { ok: true, data: payload.data };
+  return { ok: true, uploadUrl: target.href, objectPath, uploadTicket };
 }
 
 function matchesLiveCoverMagicBytes(bytes, contentType) {
@@ -599,12 +672,65 @@ function validateLiveCoverImage(value) {
 
 async function uploadLiveCover(baseUrl, sessionId, image) {
   if (!image) return { ok: true };
-  return liveCallRawApi(
-    baseUrl,
-    `/api/live-sessions/${encodeURIComponent(sessionId)}/cover`,
-    image.bytes,
-    image.contentType,
-  );
+  const endpoint = `/api/live-sessions/${encodeURIComponent(sessionId)}/cover`;
+  const prepared = await liveCallApi(baseUrl, endpoint, {
+    body: {
+      action: "prepare",
+      size: image.bytes.byteLength,
+      contentType: image.contentType,
+    },
+  });
+  if (!prepared.ok) return prepared;
+  const signed = validateLiveCoverSignedUpload(prepared.data, sessionId);
+  if (!signed.ok) return signed;
+
+  let uploadResponse;
+  try {
+    uploadResponse = await net.fetch(signed.uploadUrl, {
+      method: "PUT",
+      credentials: "omit",
+      headers: {
+        "content-type": image.contentType,
+        "cache-control": "max-age=3600",
+        "x-upsert": "false",
+      },
+      signal: AbortSignal.timeout(LIVE_COVER_UPLOAD_TIMEOUT_MS),
+      body: image.bytes,
+    });
+  } catch {
+    await discardPreparedLiveCover(baseUrl, endpoint, signed);
+    return { ok: false, code: "COVER_UPLOAD_NETWORK_FAILED" };
+  }
+  if (!uploadResponse.ok) {
+    await discardPreparedLiveCover(baseUrl, endpoint, signed);
+    return { ok: false, code: liveCoverUploadFailureCode(uploadResponse.status) };
+  }
+  return liveCallApi(baseUrl, endpoint, {
+    body: {
+      action: "finalize",
+      objectPath: signed.objectPath,
+      uploadTicket: signed.uploadTicket,
+    },
+  });
+}
+
+async function discardPreparedLiveCover(baseUrl, endpoint, signed) {
+  await liveCallApi(baseUrl, endpoint, {
+    body: {
+      action: "discard",
+      objectPath: signed.objectPath,
+      uploadTicket: signed.uploadTicket,
+    },
+  });
+}
+
+function liveCoverUploadFailureCode(status) {
+  if (status === 401 || status === 403) return "COVER_UPLOAD_AUTH_EXPIRED";
+  if (status === 409) return "COVER_UPLOAD_CONFLICT";
+  if (status === 413) return "COVER_TOO_LARGE";
+  if (status === 415) return "COVER_UNSUPPORTED_TYPE";
+  if (status >= 500) return "COVER_STORAGE_UNAVAILABLE";
+  return "COVER_UPLOAD_REJECTED";
 }
 
 async function cleanupPreparedLiveSession(baseUrl, sessionId) {
@@ -619,8 +745,65 @@ async function failPreparedLiveSession(baseUrl, sessionId, code, cause) {
 }
 
 const LIVE_DRAFT_LANGUAGES = new Set(["en", "ko", "ja", "zh-Hans", "zh-Hant", "es", "pt", "fr", "de", "ru", "hi", "id", "vi", "it"]);
+const GLOSSARY_PRESET_ERROR_CODES = new Set([
+  "HOST_LOGIN_REQUIRED",
+  "NETWORK_UNAVAILABLE",
+  "INVALID_GLOSSARY_PRESET",
+  "GLOSSARY_PRESET_LIMIT_REACHED",
+  "GLOSSARY_PRESET_NAME_CONFLICT",
+  "GLOSSARY_PRESET_VERSION_CONFLICT",
+  "GLOSSARY_PRESET_NOT_FOUND",
+]);
+const GLOSSARY_PRESET_UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
 
-function sanitizeLiveCallDraft(draft) {
+function sanitizeGlossaryPresetInput(value, { includeIdentity = false } = {}) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const name = typeof value.name === "string" ? value.name.normalize("NFC").trim() : "";
+  const domain = typeof value.domain === "string" ? value.domain.normalize("NFC").trim() : "";
+  const glossary = typeof value.glossary === "string" ? value.glossary.normalize("NFC").trim() : "";
+  const languageA = value.languagePair?.a;
+  const languageB = value.languagePair?.b;
+  if (!name || [...name].length > 80 || /[<>]|\p{Cc}|\p{Cf}/u.test(name)
+    || [...domain].length > 600 || /[<>]|\p{Cc}|\p{Cf}/u.test(domain)
+    || !glossary || [...glossary].length > 16_000
+    || /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]|\p{Cf}/u.test(glossary)
+    || !LIVE_DRAFT_LANGUAGES.has(languageA) || !LIVE_DRAFT_LANGUAGES.has(languageB) || languageA === languageB) {
+    return null;
+  }
+  const input = { name, domain, glossary, languagePair: { a: languageA, b: languageB } };
+  if (!includeIdentity) return input;
+  if (typeof value.id !== "string" || !GLOSSARY_PRESET_UUID_PATTERN.test(value.id)
+    || !Number.isSafeInteger(value.version) || value.version < 1) return null;
+  return { id: value.id, version: value.version, ...input };
+}
+
+function sanitizeRemoteGlossaryPreset(value) {
+  const input = sanitizeGlossaryPresetInput(value, { includeIdentity: true });
+  if (!input || typeof value.updatedAt !== "string" || !Number.isFinite(Date.parse(value.updatedAt))) return null;
+  return { ...input, updatedAt: new Date(value.updatedAt).toISOString() };
+}
+
+function glossaryPresetFailure(result) {
+  const code = GLOSSARY_PRESET_ERROR_CODES.has(result?.code) ? result.code : "NETWORK_UNAVAILABLE";
+  return { ok: false, error: typeof result?.error === "string" ? result.error.slice(0, 240) : "용어집을 동기화할 수 없습니다.", code };
+}
+
+async function liveCallApiWithHostSession(baseUrl, pathname, options) {
+  const first = await liveCallApi(baseUrl, pathname, options);
+  if (first.ok || first.code !== "HOST_LOGIN_REQUIRED") return first;
+  const login = await silentHostLogin(baseUrl);
+  if (!login.ok) {
+    if (login.code === "NO_STORED_LOGIN" || login.code === "HOST_LOGIN_REJECTED" || login.code === "HOST_LOGIN_REQUIRED") {
+      return { ok: false, error: "호스트 로그인이 필요합니다.", code: "HOST_LOGIN_REQUIRED" };
+    }
+    return glossaryPresetFailure(login);
+  }
+  // A single authentication refresh is safe; network failures and application
+  // errors are never retried or hidden.
+  return liveCallApi(baseUrl, pathname, options);
+}
+
+function sanitizeLiveCallDraft(draft, subtitleSettings = {}) {
   const source = draft && typeof draft === "object" ? draft : {};
   const title = typeof source.title === "string" && source.title.trim()
     ? source.title.trim().slice(0, 100)
@@ -631,14 +814,17 @@ function sanitizeLiveCallDraft(draft) {
   const maxViewers = Number.isInteger(source.maxViewers)
     ? Math.min(50, Math.max(2, source.maxViewers))
     : 50;
-  const languages = Array.isArray(source.languages)
-    ? [...new Set(source.languages.filter((code) => LIVE_DRAFT_LANGUAGES.has(code)))].slice(0, 3)
+  const configuredLanguages = Array.isArray(subtitleSettings.translationLanguages)
+    ? subtitleSettings.translationLanguages
+    : source.languages;
+  const languages = Array.isArray(configuredLanguages)
+    ? [...new Set(configuredLanguages.filter((code) => LIVE_DRAFT_LANGUAGES.has(code)))].slice(0, 3)
     : [];
   return {
     title,
     scheduledAt,
     sessionType: "meeting",
-    outputMode: "captions",
+    outputMode: subtitleSettings.outputMode === "audio" ? "audio" : "captions",
     voiceProvider: "gemini",
     // The webapp schema is .strict() and glossaryPack is REQUIRED — omitting
     // it turns every create into a 400.
@@ -715,18 +901,24 @@ function isLiveCallEnabled(environment = process.env) {
   return raw.trim().toLowerCase() !== "false";
 }
 
-// Pure display selection for the stage view (C8): fullscreen on the first
-// extended (non-primary) display when one exists; otherwise a mirror-like
-// large window on the primary display.
-function resolveStageDisplayPlacement(displays, primaryDisplayId) {
-  const extended = displays.find((display) => display.id !== primaryDisplayId);
-  if (extended) return { bounds: extended.bounds, fullscreen: true };
-  const primary = displays.find((display) => display.id === primaryDisplayId) ?? displays[0];
-  return primary ? { bounds: primary.bounds, fullscreen: false } : null;
+// Pure display selection for the stage view (C8): the QR stage sits on the
+// SAME monitor as the caption overlay ("자막이 생성되는 모니터와 동일한 위치"),
+// resolved by resolveSelectedOverlayDisplay — the persisted selection, then a
+// non-primary display by default. Fullscreen while the primary display remains
+// for the controller/dashboard; a mirror-like large window on a single display.
+function resolveStageDisplayPlacement(displays, primaryDisplayId, preferredDisplayId = "") {
+  const connected = Array.isArray(displays) ? displays.filter(Boolean) : [];
+  if (connected.length === 0) return null;
+  const target = resolveSelectedOverlayDisplay(connected, preferredDisplayId, { id: primaryDisplayId });
+  return { bounds: target.bounds, fullscreen: connected.length > 1 };
 }
 
 function stageWindowPlacement() {
-  return resolveStageDisplayPlacement(screen.getAllDisplays(), screen.getPrimaryDisplay().id);
+  return resolveStageDisplayPlacement(
+    screen.getAllDisplays(),
+    screen.getPrimaryDisplay().id,
+    preferredOverlayDisplayId,
+  );
 }
 
 function applyStagePlacement(window, placement) {
@@ -827,7 +1019,10 @@ function createOverlayWindow(url) {
 }
 
 function createControllerWindow(url) {
+  const displays = screen.getAllDisplays();
   const primaryDisplay = screen.getPrimaryDisplay();
+  const overlayDisplay = resolveSelectedOverlayDisplay(displays, preferredOverlayDisplayId, primaryDisplay);
+  const controllerDisplay = resolveControllerDisplay(displays, overlayDisplay, primaryDisplay) ?? primaryDisplay;
   // Wide mini-player bar: every control fits one row on common displays; on
   // narrow screens the row wraps and fit-height grows the window to match.
   // Sized so the packed row NEVER wraps in any state the console can reach.
@@ -841,14 +1036,14 @@ function createControllerWindow(url) {
   // Only the INITIAL width: the renderer measures the console's real content
   // width and the fit-size IPC resizes the window to hug it, in every session
   // state. A fixed width left slack that pushed the right-hand cluster away.
-  const width = Math.min(1152, Math.max(CONTROLLER_MIN_WIDTH, primaryDisplay.workArea.width - 48));
+  const width = Math.min(1152, Math.max(CONTROLLER_MIN_WIDTH, controllerDisplay.workArea.width - 48));
   // Mini-player console: a single packed row. This is only the INITIAL
   // height — the renderer measures its exact content height and the
   // subtitle-controller:fit-height IPC resizes the window to hug it, so the
   // transparent window never shows an empty band.
   const height = 84;
-  const x = Math.round(primaryDisplay.workArea.x + (primaryDisplay.workArea.width - width) / 2);
-  const y = Math.round(primaryDisplay.workArea.y + primaryDisplay.workArea.height - height - 120);
+  const x = Math.round(controllerDisplay.workArea.x + (controllerDisplay.workArea.width - width) / 2);
+  const y = Math.round(controllerDisplay.workArea.y + controllerDisplay.workArea.height - height - 120);
   controllerWindow = new BrowserWindow({
     x,
     y,
@@ -908,7 +1103,15 @@ function createOverlayWindowForDisplay(display) {
   window.setAlwaysOnTop(true, OVERLAY_TOP_LEVEL, 1);
   window.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true, skipTransformProcessType: true });
   window.setIgnoreMouseEvents(true, { forward: true });
-  const loadOverlay = () => window.loadURL(`${overlayUrl}/subtitle-overlay.html`);
+  const displayId = String(display.id);
+  const loadOverlay = () => {
+    // The first load runs BEFORE syncOverlayBounds records this window in the
+    // map, so an "is the current window" test would skip it and leave the
+    // display permanently blank. Only a slot already owned by a DIFFERENT
+    // window means this one was superseded.
+    if (isSupersededOverlayWindow(window, displayId)) return Promise.resolve();
+    return window.loadURL(`${overlayUrl}/subtitle-overlay.html`);
+  };
   // An overlay whose loadURL failed never fires ready-to-show, so that display
   // silently had no subtitles for the rest of the session. Retry with backoff
   // and show it as soon as the page actually renders.
@@ -932,48 +1135,70 @@ function createOverlayWindowForDisplay(display) {
     // local flag — after a reload that flag starts false, so it would never send
     // the release and the stale claim would be permanent.
     interactiveOverlayIds.delete(window.id);
-    if (!overlayEnabled || isQuitting || window.isDestroyed()) return;
+    if (!overlayEnabled || isQuitting || window.isDestroyed() || !isCurrentOverlayWindow(window, displayId)) return;
     window.setIgnoreMouseEvents(true, { forward: true });
+    const floor = typeof liveGatewayBridge === "undefined" ? null : liveGatewayBridge?.lastFloorMessage;
+    if (typeof liveGatewayBridge !== "undefined"
+      && liveGatewayBridge?.ready === true
+      && floor?.type === "floor"
+      && floor.sessionId === liveGatewayBridge.session?.sessionId) {
+      window.webContents.send("live-call:floor", floor);
+    }
     window.showInactive();
   });
   void Promise.resolve(loadOverlay()).catch(() => { /* did-fail-load drives the retry */ });
   window.once("ready-to-show", () => {
-    if (!overlayEnabled || overlaysMuted || isQuitting) return;
+    if (!overlayEnabled || overlaysMuted || isQuitting || !isCurrentOverlayWindow(window, displayId)) return;
     window.showInactive();
   });
   window.on("closed", () => {
     interactiveOverlayIds.delete(window.id);
-    if (overlayWindows.get(display.id) === window) overlayWindows.delete(display.id);
+    if (overlayWindows.get(displayId) === window) overlayWindows.delete(displayId);
   });
   return window;
 }
 
-// Reconcile one overlay window per connected display: create for new displays
-// (extended/mirrored screens get subtitles too), re-bound existing ones, and
-// destroy windows whose display was unplugged.
+function isCurrentOverlayWindow(window, displayId) {
+  return overlayWindows.get(String(displayId)) === window;
+}
+
+function isSupersededOverlayWindow(window, displayId) {
+  const current = overlayWindows.get(String(displayId));
+  return Boolean(current) && current !== window;
+}
+
+// Reconcile the overlay window set with the displays that should carry one.
+// Windows for displays that left the set (unplugged, or the "all displays"
+// tick turned off) are destroyed; the rest are created or re-bounded in place
+// so an already-rendering overlay is never torn down just to move.
 function syncOverlayBounds() {
   if (!overlayEnabled || isQuitting || !overlayUrl) return;
   const displays = screen.getAllDisplays();
-  const liveDisplayIds = new Set();
-  for (const display of displays) {
-    liveDisplayIds.add(display.id);
-    const existing = overlayWindows.get(display.id);
-    if (existing && !existing.isDestroyed()) {
-      existing.setBounds(display.bounds);
-    } else {
-      overlayWindows.set(display.id, createOverlayWindowForDisplay(display));
-    }
-  }
-  for (const [displayId, window] of overlayWindows) {
-    if (liveDisplayIds.has(displayId)) continue;
+  const preferredId = typeof preferredOverlayDisplayId === "string" ? preferredOverlayDisplayId : "";
+  const primary = typeof screen.getPrimaryDisplay === "function" ? screen.getPrimaryDisplay() : displays[0];
+  const targets = resolveOverlayDisplays(displays, preferredId, primary, overlayAllDisplays);
+  const selected = resolveSelectedOverlayDisplay(displays, preferredId, primary);
+  selectedOverlayDisplayId = selected ? String(selected.id) : "";
+  const targetIds = new Set(targets.map((display) => String(display.id)));
+  for (const [displayId, window] of [...overlayWindows]) {
+    if (targetIds.has(displayId)) continue;
     overlayWindows.delete(displayId);
-    if (!window.isDestroyed()) window.destroy();
+    if (window && !window.isDestroyed()) window.destroy();
+  }
+  for (const display of targets) {
+    const displayId = String(display.id);
+    const existing = overlayWindows.get(displayId);
+    if (!existing || existing.isDestroyed()) {
+      overlayWindows.set(displayId, createOverlayWindowForDisplay(display));
+    } else {
+      existing.setBounds(display.bounds);
+    }
   }
 }
 
 function eachOverlayWindow(callback) {
   for (const window of overlayWindows.values()) {
-    if (!window.isDestroyed()) callback(window);
+    if (window && !window.isDestroyed()) callback(window);
   }
 }
 
@@ -1036,6 +1261,10 @@ let liveBridgeCredentialRefreshTimer = null;
 let liveBridgeAlert = null;
 let hasNotifiedLiveBridgeFailure = false;
 let hostSpeakInFlight = null;
+let liveTranslationReconnectInFlight = null;
+let liveCaptionPreflightSequence = 0;
+const liveCaptionPreflightRequests = new Map();
+let liveGatewayEnsureInFlight = null;
 
 function getLiveBridgeCredentialRefreshDelay(expiresAt) {
   const expiresAtMilliseconds = Date.parse(String(expiresAt ?? ""));
@@ -1081,9 +1310,49 @@ function clearLiveBridgeAlert() {
 }
 
 function liveBridgeStatus() {
-  if (liveBridgeAlert) return liveBridgeAlert;
-  if (liveGatewayBridge?.ready === true) return { state: "connected", code: null };
-  return { state: liveGatewayBridge ? "connecting" : "idle", code: null };
+  const floorState = {
+    floorKnown: liveGatewayBridge?.floorKnown === true,
+    hostAudioBlocked: liveGatewayBridge?.isHostAudioBlocked !== false,
+  };
+  if (liveBridgeAlert) {
+    const state = ["connecting", "reconnecting", "failed"].includes(liveBridgeAlert.state)
+      ? liveBridgeAlert.state
+      : "connecting";
+    const code = typeof liveBridgeAlert.code === "string" && /^[A-Z0-9_]{1,80}$/u.test(liveBridgeAlert.code)
+      ? liveBridgeAlert.code
+      : null;
+    const attempts = Number.isSafeInteger(liveBridgeAlert.attempts)
+      ? Math.max(0, Math.min(1_000_000, liveBridgeAlert.attempts))
+      : null;
+    // This IPC is polled by an unprivileged renderer. Project only bounded
+    // operational metadata; provider errors and renderer-supplied details can
+    // contain transcript text, URLs, or credentials and stay main-process-only.
+    return { state, code, ...(attempts === null ? {} : { attempts }), ...floorState };
+  }
+  if (liveGatewayBridge?.ready === true) {
+    const languageStatuses = [...(liveGatewayBridge.languageStatuses?.values?.() ?? [])];
+    if (languageStatuses.some((status) => status === "preparing" || status === "unavailable")) {
+      return { state: "reconnecting", code: "TRANSLATION_RECOVERING", ...floorState };
+    }
+    return { state: "connected", code: null, ...floorState };
+  }
+  return { state: liveGatewayBridge ? "connecting" : "idle", code: null, ...floorState };
+}
+
+// The only authoritative unmute is an authenticated floor snapshot for this
+// exact session with holder:null. Missing/malformed/stale snapshots therefore
+// fail closed and cannot leak host mic or loopback audio during a hand-off.
+function shouldBlockLiveHostAudioForFloor(message, sessionId) {
+  if (!message || message.type !== "floor" || message.sessionId !== sessionId) return true;
+  return message.holder !== null;
+}
+
+function relayLiveCallFloorToRenderers(message) {
+  const rendererWindows = [dashboardWindow, ...overlayWindows.values()];
+  for (const rendererWindow of rendererWindows) {
+    if (!rendererWindow) continue;
+    if (!rendererWindow.isDestroyed()) rendererWindow.webContents.send("live-call:floor", message);
+  }
 }
 
 // The controller polls live-call:get-state, but a modal is what actually reaches
@@ -1168,7 +1437,67 @@ function trustedGatewayHeaders(token) {
   return { "x-realtime-noel-client": "desktop-main", authorization: `Bearer ${token}` };
 }
 
-function stopLiveGatewayBridge(reason) {
+async function preflightLiveCallCaptionSession(settingsStore, armedSession) {
+  if (!dashboardWindow || dashboardWindow.isDestroyed() || dashboardWindow.webContents?.isDestroyed?.()) {
+    return { ok: false, error: "자막 화면을 준비할 수 없습니다.", code: "LIVE_CAPTION_RENDERER_UNAVAILABLE" };
+  }
+  try {
+    const saved = await settingsStore.load();
+    validateSubtitleSettings(saved?.subtitle);
+    const captionConfig = createGeminiCaptionConfig({
+      ...(saved?.subtitle ?? {}),
+      languages: armedSession.gatewaySettings?.languages ?? saved?.subtitle?.translationLanguages,
+      outputMode: armedSession.gatewaySettings?.outputMode ?? saved?.subtitle?.outputMode,
+      audioLanguage: saved?.subtitle?.audioLanguage,
+      glossaryPack: armedSession.gatewaySettings?.glossaryPack,
+    });
+    armedSession.gatewaySettings = {
+      ...(armedSession.gatewaySettings ?? {}),
+      voiceProvider: "gemini",
+      glossaryText: captionConfig.glossary,
+      translationTone: captionConfig.tone,
+      domainText: captionConfig.domain,
+      captionConfig,
+      captionConfigFingerprint: geminiCaptionConfigFingerprint(captionConfig),
+    };
+    return { ok: true };
+  } catch (error) {
+    console.warn(`[live-bridge] local caption preflight failed: ${error?.message ?? error}`);
+    return { ok: false, error: "자막 설정을 확인한 뒤 다시 시작해주세요.", code: "LIVE_CAPTION_PREFLIGHT_FAILED" };
+  }
+}
+
+function requestRendererLiveCaptionPreflight(armedSession) {
+  if (!dashboardWindow || dashboardWindow.isDestroyed() || dashboardWindow.webContents?.isDestroyed?.()) {
+    return Promise.resolve({ ok: false, code: "LIVE_CAPTION_RENDERER_UNAVAILABLE" });
+  }
+  const requestId = `live-caption-preflight-${Date.now()}-${++liveCaptionPreflightSequence}`;
+  return new Promise((resolve) => {
+    const timeout = setTimeout(() => {
+      liveCaptionPreflightRequests.delete(requestId);
+      resolve({ ok: false, code: "LIVE_CAPTION_PREFLIGHT_TIMEOUT" });
+    }, 12_000);
+    liveCaptionPreflightRequests.set(requestId, {
+      resolve: (result) => {
+        clearTimeout(timeout);
+        resolve(result);
+      },
+    });
+    dashboardWindow.webContents.send("live-call:preflight-request", {
+      requestId,
+      liveSessionId: armedSession.sessionId,
+      title: armedSession.title ?? "",
+      startedAt: armedSession.startedAt ?? "",
+    });
+  });
+}
+
+function cancelRendererLiveCaptionPreflight(requestId) {
+  if (!requestId || !dashboardWindow || dashboardWindow.isDestroyed()) return;
+  dashboardWindow.webContents.send("live-call:preflight-cancel", { requestId });
+}
+
+async function stopLiveGatewayBridge(reason, { terminateRemote = false } = {}) {
   // Cancel any armed retry FIRST: a pending reconnect used to survive
   // stop/end/quit and reopen the bridge against a session that was already gone.
   clearLiveBridgeReconnect();
@@ -1178,6 +1507,29 @@ function stopLiveGatewayBridge(reason) {
   const bridge = liveGatewayBridge;
   if (!bridge) return;
   liveGatewayBridge = null;
+  bridge.captionRelay?.close();
+  if (terminateRemote && bridge.socket.readyState === WebSocket.OPEN) {
+    await new Promise((resolve) => {
+      let settled = false;
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        bridge.socket.off("message", onMessage);
+        bridge.socket.off("close", finish);
+        resolve();
+      };
+      const onMessage = (data) => {
+        let message;
+        try { message = JSON.parse(data.toString("utf8")); } catch { return; }
+        if (message.type === "stopped" && message.sessionId === bridge.session.sessionId) finish();
+      };
+      const timer = setTimeout(finish, 1_500);
+      bridge.socket.on("message", onMessage);
+      bridge.socket.once("close", finish);
+      try { bridge.socket.send(JSON.stringify({ type: "stop" })); } catch { finish(); }
+    });
+  }
   try { bridge.socket.close(1000, reason || "bridge stopped"); } catch { /* closed */ }
   console.info(`[live-bridge] stopped${reason ? ` (${reason})` : ""}`);
 }
@@ -1202,7 +1554,7 @@ function adaptCaptionPcmForGateway(source, bytes) {
   return frames;
 }
 
-async function ensureLiveGatewayBridge() {
+async function ensureLiveGatewayBridgeOnce() {
   const armedSession = liveCallSession;
   if (!armedSession || armedSession.status !== "live") return { ok: false, code: "NOT_LIVE" };
   if (liveGatewayBridge?.session === armedSession) {
@@ -1210,6 +1562,9 @@ async function ensureLiveGatewayBridge() {
   }
   const connection = await fetchGatewayConnection(armedSession);
   if (!connection.ok) return connection;
+  if (liveCallSession !== armedSession || armedSession.status !== "live" || isQuitting) {
+    return { ok: false, code: "NOT_LIVE" };
+  }
   // Host authorization requires the EXACT current session version; anything
   // (invites, admission, config) may have bumped it since arming, so always
   // read it fresh right before the gateway start.
@@ -1228,8 +1583,15 @@ async function ensureLiveGatewayBridge() {
   if (currentStatus === "stopped" || currentStatus === "failed" || currentSession.code === "LIVE_SESSION_NOT_FOUND") {
     armedSession.status = "stopped";
     if (liveCallSession === armedSession) liveCallSession = null;
-    stopLiveGatewayBridge("session already ended");
+    relayLiveCallFloorToRenderers({
+      type: "live-call-ended",
+      sessionId: armedSession.sessionId,
+    });
+    void stopLiveGatewayBridge("session already ended", { terminateRemote: true });
     return { ok: false, code: "SESSION_ENDED" };
+  }
+  if (liveCallSession !== armedSession || armedSession.status !== "live" || isQuitting) {
+    return { ok: false, code: "NOT_LIVE" };
   }
   if (liveGatewayBridge?.session === armedSession) {
     return { ok: true, streaming: liveGatewayBridge.ready === true };
@@ -1240,7 +1602,33 @@ async function ensureLiveGatewayBridge() {
   } catch {
     return { ok: false, code: "GATEWAY_UNREACHABLE" };
   }
-  const bridge = { socket, ready: false, session: armedSession };
+  const captionRelayState = armedSession.captionRelayState ?? {
+    lastFinalSeqByLanguage: new Map(),
+    finalSnapshotByLanguage: new Map(),
+  };
+  armedSession.captionRelayState = captionRelayState;
+  const bridge = {
+    socket,
+    ready: false,
+    session: armedSession,
+    floorKnown: false,
+    isHostAudioBlocked: true,
+    lastFloorMessage: null,
+    languageStatuses: new Map(),
+  };
+  bridge.captionRelay = createLiveCaptionIpcRelay({
+    lastFinalSeqByLanguage: captionRelayState.lastFinalSeqByLanguage,
+    finalSnapshotByLanguage: captionRelayState.finalSnapshotByLanguage,
+    send: (caption) => {
+      if (liveGatewayBridge !== bridge) return;
+      if (!dashboardWindow || dashboardWindow.isDestroyed() || dashboardWindow.webContents?.isDestroyed?.()) return;
+      // The dashboard is the only caption IPC consumer. It relays the event to
+      // the local subtitle WebSocket, which then fans out to every overlay.
+      // Sending the same structured clone directly to N overlay renderers only
+      // filled unused IPC queues; overlays subscribe directly only to floor.
+      dashboardWindow.webContents.send("live-call:caption", caption);
+    },
+  });
   liveGatewayBridge = bridge;
   socket.on("open", () => socket.send(JSON.stringify({ type: "authenticate", token: connection.token })));
   socket.on("message", (data) => {
@@ -1269,23 +1657,49 @@ async function ensureLiveGatewayBridge() {
       clearLiveBridgeAlert();
       scheduleLiveGatewayCredentialRefresh(bridge, connection.expiresAt);
       console.info("[live-bridge] gateway host pipeline is running");
+    } else if (message.type === "language-status") {
+      if (!bridge.ready || message.sessionId !== armedSession.sessionId) return;
+      if (typeof message.language !== "string" || !["en", "ko"].includes(message.language)) return;
+      if (!["preparing", "ready", "unavailable"].includes(message.status)) return;
+      // Keep provider details inside the main process. The controller receives
+      // only the aggregate state from liveBridgeStatus on its next poll.
+      bridge.languageStatuses.set(message.language, message.status);
     } else if (message.type === "caption") {
+      if (!bridge.ready) return;
+      if (message.sessionId !== armedSession.sessionId) return;
       // The gateway retains both language lanes for web history. Desktop
       // surfaces receive only the translated lane opposite this utterance's
       // detected source language, independent of the old fixed display setting.
       if (!shouldDisplayLiveCaption(message, armedSession.displayLanguage)) return;
-      for (const rendererWindow of [dashboardWindow, ...overlayWindows.values()]) {
-        if (!rendererWindow) continue;
-        if (!rendererWindow.isDestroyed()) rendererWindow.webContents.send("live-call:caption", message);
-      }
+      bridge.captionRelay.push(message);
     } else if (message.type === "floor") {
+      // Floor authority exists only after this socket's host pipeline started.
+      // A pre-start payload must never be able to unmute local capture.
+      if (!bridge.ready) return;
+      bridge.floorKnown = message.sessionId === armedSession.sessionId
+        && (message.holder === null
+          || (typeof message.holder?.participantId === "string" && message.holder.participantId.length > 0));
+      bridge.isHostAudioBlocked = shouldBlockLiveHostAudioForFloor(message, armedSession.sessionId);
+      // Any block is also a PCM epoch boundary. Discard sub-frame FIR/carry
+      // state so host audio captured immediately before the hand-off cannot be
+      // completed and forwarded after Host Speak resumes the floor.
+      if (bridge.isHostAudioBlocked) liveBridgeAudioAdapters.clear();
+      if (!bridge.floorKnown) {
+        // Do not expose untrusted fields to renderers, but close their local
+        // fallback gate immediately instead of waiting for the next state poll.
+        bridge.lastFloorMessage = {
+          type: "floor",
+          sessionId: armedSession.sessionId,
+          holder: { participantId: "unavailable" },
+        };
+        relayLiveCallFloorToRenderers(bridge.lastFloorMessage);
+        return;
+      }
       // 2026-07-26 fix: a floor change is an utterance boundary. Forward it to
       // every local caption surface before participant/host audio can produce
       // the next hypothesis, so the previous speaker's final cannot linger.
-      for (const rendererWindow of [dashboardWindow, ...overlayWindows.values()]) {
-        if (!rendererWindow) continue;
-        if (!rendererWindow.isDestroyed()) rendererWindow.webContents.send("live-call:floor", message);
-      }
+      bridge.lastFloorMessage = message;
+      relayLiveCallFloorToRenderers(message);
     } else if (message.type === "error") {
       console.warn(`[live-bridge] gateway error: ${message.code ?? "unknown"}`);
       // A rejected start leaves the socket open but useless: close it so the
@@ -1300,7 +1714,11 @@ async function ensureLiveGatewayBridge() {
   });
   socket.on("close", () => {
     if (liveGatewayBridge !== bridge) return;
+    bridge.isHostAudioBlocked = true;
+    bridge.floorKnown = false;
+    liveBridgeAudioAdapters.clear();
     clearLiveBridgeCredentialRefresh();
+    bridge.captionRelay.close();
     liveGatewayBridge = null;
     // Token rotation or a transient drop mid-call: reconnect while still live.
     if (liveCallSession === armedSession && armedSession.status === "live" && !isQuitting) {
@@ -1308,6 +1726,107 @@ async function ensureLiveGatewayBridge() {
     }
   });
   return { ok: true, streaming: false };
+}
+
+async function ensureLiveGatewayBridge() {
+  const armedSession = liveCallSession;
+  if (!armedSession || armedSession.status !== "live") return { ok: false, code: "NOT_LIVE" };
+  if (liveGatewayBridge?.session === armedSession) {
+    return { ok: true, streaming: liveGatewayBridge.ready === true };
+  }
+  if (liveBridgeReconnectTimer) return { ok: true, streaming: false, reconnecting: true };
+  if (liveGatewayEnsureInFlight) return liveGatewayEnsureInFlight;
+  liveGatewayEnsureInFlight = ensureLiveGatewayBridgeOnce()
+    .catch(() => ({ ok: false, code: "GATEWAY_UNREACHABLE" }))
+    .then((result) => {
+      const isRecoverable = !result.ok && !["NOT_LIVE", "SESSION_ENDED"].includes(result.code);
+      if (isRecoverable && liveCallSession === armedSession && armedSession.status === "live" && !isQuitting) {
+        setLiveBridgeAlert({
+          state: "reconnecting",
+          code: "GATEWAY_RECONNECTING",
+          attempts: liveBridgeReconnectAttempts,
+          message: "게이트웨이에 다시 연결하고 있습니다…",
+        });
+        scheduleLiveGatewayReconnect(armedSession);
+        return { ok: true, streaming: false, reconnecting: true };
+      }
+      return result;
+    })
+    .finally(() => { liveGatewayEnsureInFlight = null; });
+  return liveGatewayEnsureInFlight;
+}
+
+async function restartLiveTranslationBridge() {
+  if (liveTranslationReconnectInFlight) return liveTranslationReconnectInFlight;
+  liveTranslationReconnectInFlight = (async () => {
+    const armedSession = liveCallSession;
+    if (!armedSession || armedSession.status !== "live") return { ok: false, code: "NOT_LIVE" };
+    setLiveBridgeAlert({
+      state: "reconnecting",
+      code: "TRANSLATION_RECONNECTING",
+      message: "번역 연결을 다시 준비하고 있습니다…",
+    });
+    liveBridgeAudioAdapters.clear();
+
+    let bridge = liveGatewayBridge;
+    if (!bridge?.ready || bridge.socket.readyState !== WebSocket.OPEN) {
+      stopLiveGatewayBridge("manual translation reconnect");
+      const result = await ensureLiveGatewayBridge();
+      if (!result.ok) scheduleLiveGatewayReconnect(armedSession);
+      return result;
+    }
+
+    const current = await liveCallApi(
+      armedSession.baseUrl,
+      `/api/live-sessions/${encodeURIComponent(armedSession.sessionId)}`,
+      { method: "GET" },
+    );
+    if (!current.ok) return current;
+    if (Number.isSafeInteger(current.data?.version)) armedSession.version = current.data.version;
+    if (liveCallSession !== armedSession || liveGatewayBridge !== bridge) {
+      return { ok: false, code: "LIVE_CALL_STATE_CHANGED" };
+    }
+
+    bridge.ready = false;
+    return await new Promise((resolve) => {
+      let settled = false;
+      const finish = (result) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        bridge.socket.off("message", onMessage);
+        bridge.socket.off("close", onClose);
+        resolve(result);
+      };
+      const onMessage = (data) => {
+        let message;
+        try { message = JSON.parse(data.toString("utf8")); } catch { return; }
+        if (message.type === "restarted") finish({ ok: true, streaming: true });
+        else if (message.type === "error") {
+          try { bridge.socket.close(4000, "translation restart rejected"); } catch { /* closed */ }
+          finish({ ok: false, code: typeof message.code === "string" ? message.code : "GATEWAY_ERROR" });
+        }
+      };
+      const onClose = () => finish({ ok: false, code: "GATEWAY_CLOSED" });
+      const timer = setTimeout(() => {
+        try { bridge.socket.close(4000, "translation restart timeout"); } catch { /* closed */ }
+        finish({ ok: false, code: "GATEWAY_TIMEOUT" });
+      }, 20_000);
+      bridge.socket.on("message", onMessage);
+      bridge.socket.once("close", onClose);
+      try {
+        bridge.socket.send(JSON.stringify({
+          type: "restart",
+          sessionId: armedSession.sessionId,
+          version: armedSession.version,
+          ...(armedSession.gatewaySettings ?? {}),
+        }));
+      } catch {
+        finish({ ok: false, code: "GATEWAY_UNREACHABLE" });
+      }
+    });
+  })().finally(() => { liveTranslationReconnectInFlight = null; });
+  return liveTranslationReconnectInFlight;
 }
 
 // Host Speak: reclaim the speaking floor from a participant. Prefers the
@@ -1473,7 +1992,7 @@ function showDashboardWindow() {
 function showSubtitleOverlays() {
   if (!overlayEnabled || isQuitting) return false;
   maintainOverlayWindow();
-  return overlayWindows.size > 0;
+  return [...overlayWindows.values()].some((window) => window && !window.isDestroyed());
 }
 
 function showControllerWindow() {
@@ -1542,10 +2061,11 @@ function applyUiLanguage(language) {
 }
 
 function destroyOverlayWindow() {
-  for (const window of overlayWindows.values()) {
-    if (!window.isDestroyed()) window.destroy();
-  }
+  const windows = [...overlayWindows.values()];
   overlayWindows.clear();
+  for (const window of windows) {
+    if (window && !window.isDestroyed()) window.destroy();
+  }
 }
 
 function registerOverlayIpc(settingsStore, { localAppOrigin, liveWorkspaceUrl, liveCallEnabled }) {
@@ -1570,7 +2090,8 @@ function registerOverlayIpc(settingsStore, { localAppOrigin, liveWorkspaceUrl, l
     try {
     const cover = validateLiveCoverImage(draft?.coverImage);
     if (!cover.ok) return cover;
-    const input = sanitizeLiveCallDraft(draft);
+    const savedSettings = await settingsStore.load();
+    const input = sanitizeLiveCallDraft(draft, savedSettings?.subtitle);
     const login = await silentHostLogin(liveWorkspaceUrl);
     if (!login.ok) {
       return { ok: false, code: login.code === "NO_STORED_LOGIN" ? "HOST_LOGIN_REQUIRED" : login.code };
@@ -1629,18 +2150,18 @@ function registerOverlayIpc(settingsStore, { localAppOrigin, liveWorkspaceUrl, l
     // Live Call translation behaves exactly like local captions: glossary,
     // business tone, and domain hints feed the same second-pass finalizer.
     // Best-effort: a missing settings file never blocks go-live.
-    let liveGlossaryText = "";
-    let liveTranslationTone = "natural";
-    let liveDomainText = "";
+    let liveCaptionConfig = null;
     try {
       const savedSettings = await settingsStore.load();
-      // Keep the full captions-only glossary in Settings. Live Call sends a
-      // bounded prompt-oriented copy: acronyms, number rules, CRE terminology,
-      // and registered names survive; broad idioms and sentence memory do not
-      // tax every network translation request.
-      liveGlossaryText = buildLiveCallGlossary(savedSettings?.subtitle?.glossary ?? "");
-      liveTranslationTone = savedSettings?.subtitle?.tone === "business" ? "business" : "natural";
-      liveDomainText = String(savedSettings?.subtitle?.translationDomain ?? "").trim().slice(0, 2_000);
+      // The selected preset is cached with its full text in local Settings.
+      // Live Call therefore uses the exact Caption-only glossary even when the
+      // remote custom-preset list is temporarily unreachable.
+      liveCaptionConfig = createGeminiCaptionConfig({
+        ...(savedSettings?.subtitle ?? {}),
+        languages: config.languages,
+        outputMode: config.outputMode,
+        glossaryPack: config.glossaryPack,
+      });
     } catch { /* settings parity is best-effort */ }
     // A fresh call must never inherit the previous call's bridge failure banner.
     clearLiveBridgeAlert();
@@ -1658,12 +2179,16 @@ function registerOverlayIpc(settingsStore, { localAppOrigin, liveWorkspaceUrl, l
       gatewaySettings: {
         sessionType: config.sessionType,
         outputMode: config.outputMode,
-        voiceProvider: config.voiceProvider,
+        voiceProvider: "gemini",
         maxViewers: config.maxViewers,
         glossaryPack: config.glossaryPack,
-        glossaryText: liveGlossaryText,
-        translationTone: liveTranslationTone,
-        domainText: liveDomainText,
+        glossaryText: liveCaptionConfig?.glossary ?? "",
+        translationTone: liveCaptionConfig?.tone ?? "natural",
+        domainText: liveCaptionConfig?.domain ?? "",
+        ...(liveCaptionConfig ? {
+          captionConfig: liveCaptionConfig,
+          captionConfigFingerprint: geminiCaptionConfigFingerprint(liveCaptionConfig),
+        } : {}),
         languages: config.languages,
         inputSource: "mic",
       },
@@ -1690,7 +2215,8 @@ function registerOverlayIpc(settingsStore, { localAppOrigin, liveWorkspaceUrl, l
     try {
       const cover = validateLiveCoverImage(draft?.coverImage);
       if (!cover.ok) return cover;
-      const input = sanitizeLiveCallDraft(draft);
+      const savedSettings = await settingsStore.load();
+      const input = sanitizeLiveCallDraft(draft, savedSettings?.subtitle);
       const login = await silentHostLogin(liveWorkspaceUrl);
       if (!login.ok) {
         return { ok: false, code: login.code === "NO_STORED_LOGIN" ? "HOST_LOGIN_REQUIRED" : login.code };
@@ -1800,6 +2326,65 @@ function registerOverlayIpc(settingsStore, { localAppOrigin, liveWorkspaceUrl, l
     const config = readLiveHostConfig();
     return { ok: true, hasLogin: Boolean(config.hostId && config.hostPassword), hostId: config.hostId ?? "", hostName: config.hostName ?? "", workspaceUrl: config.workspaceUrl ?? "" };
   });
+  ipcMain.handle("glossary-presets:list", async (event) => {
+    if (!isAllowedOrigin(event.sender.getURL(), new Set([localAppOrigin]))) {
+      return { ok: false, error: "허용되지 않은 요청입니다.", code: "FORBIDDEN" };
+    }
+    const result = await liveCallApiWithHostSession(liveWorkspaceUrl, "/api/glossary-presets", { method: "GET" });
+    if (!result.ok) return glossaryPresetFailure(result);
+    const presets = Array.isArray(result.data?.presets)
+      ? result.data.presets.map(sanitizeRemoteGlossaryPreset)
+      : null;
+    if (!presets || presets.length > 50 || presets.some((preset) => !preset)) {
+      return glossaryPresetFailure({ code: "NETWORK_UNAVAILABLE" });
+    }
+    return { ok: true, data: { presets } };
+  });
+  ipcMain.handle("glossary-presets:create", async (event, value) => {
+    if (!isAllowedOrigin(event.sender.getURL(), new Set([localAppOrigin]))) {
+      return { ok: false, error: "허용되지 않은 요청입니다.", code: "FORBIDDEN" };
+    }
+    const input = sanitizeGlossaryPresetInput(value);
+    if (!input) return { ok: false, error: "용어집 입력이 올바르지 않습니다.", code: "INVALID_GLOSSARY_PRESET" };
+    const result = await liveCallApiWithHostSession(liveWorkspaceUrl, "/api/glossary-presets", { method: "POST", body: input });
+    if (!result.ok) return glossaryPresetFailure(result);
+    const preset = sanitizeRemoteGlossaryPreset(result.data?.preset);
+    return preset
+      ? { ok: true, data: { preset } }
+      : glossaryPresetFailure({ code: "NETWORK_UNAVAILABLE" });
+  });
+  ipcMain.handle("glossary-presets:update", async (event, value) => {
+    if (!isAllowedOrigin(event.sender.getURL(), new Set([localAppOrigin]))) {
+      return { ok: false, error: "허용되지 않은 요청입니다.", code: "FORBIDDEN" };
+    }
+    const input = sanitizeGlossaryPresetInput(value, { includeIdentity: true });
+    if (!input) return { ok: false, error: "용어집 입력이 올바르지 않습니다.", code: "INVALID_GLOSSARY_PRESET" };
+    const { id, ...body } = input;
+    const result = await liveCallApiWithHostSession(liveWorkspaceUrl, `/api/glossary-presets/${encodeURIComponent(id)}`, { method: "PATCH", body });
+    if (!result.ok) return glossaryPresetFailure(result);
+    const preset = sanitizeRemoteGlossaryPreset(result.data?.preset);
+    return preset
+      ? { ok: true, data: { preset } }
+      : glossaryPresetFailure({ code: "NETWORK_UNAVAILABLE" });
+  });
+  ipcMain.handle("glossary-presets:delete", async (event, value) => {
+    if (!isAllowedOrigin(event.sender.getURL(), new Set([localAppOrigin]))) {
+      return { ok: false, error: "허용되지 않은 요청입니다.", code: "FORBIDDEN" };
+    }
+    if (!value || typeof value !== "object" || Array.isArray(value)
+      || typeof value.id !== "string" || !GLOSSARY_PRESET_UUID_PATTERN.test(value.id)
+      || !Number.isSafeInteger(value.version) || value.version < 1) {
+      return { ok: false, error: "용어집 입력이 올바르지 않습니다.", code: "INVALID_GLOSSARY_PRESET" };
+    }
+    const result = await liveCallApiWithHostSession(liveWorkspaceUrl, `/api/glossary-presets/${encodeURIComponent(value.id)}`, {
+      method: "DELETE",
+      body: { version: value.version },
+    });
+    if (!result.ok) return glossaryPresetFailure(result);
+    return result.data?.id === value.id
+      ? { ok: true, data: { id: value.id } }
+      : glossaryPresetFailure({ code: "NETWORK_UNAVAILABLE" });
+  });
   ipcMain.handle("live-call:get-state", (event) => {
     if (!isAllowedOrigin(event.sender.getURL(), new Set([localAppOrigin]))) {
       return { armed: false, live: false };
@@ -1814,6 +2399,10 @@ function registerOverlayIpc(settingsStore, { localAppOrigin, liveWorkspaceUrl, l
         // call actually went live, so the renderer needs both when it starts
         // captions for this call.
         title: liveCallSession.title ?? "",
+        // Bounded to one committed cue per configured language. The dashboard
+        // can replay this after its local WebSocket recovers without asking the
+        // gateway to resend an unbounded transcript or losing the last final.
+        captionSnapshot: [...(liveCallSession.captionRelayState?.finalSnapshotByLanguage?.values?.() ?? [])],
         // Gateway/host-audio health. The controller polls this handler, so a
         // dead bridge is no longer invisible behind a still-ticking timer.
         bridge: liveBridgeStatus(),
@@ -1844,7 +2433,20 @@ function registerOverlayIpc(settingsStore, { localAppOrigin, liveWorkspaceUrl, l
     if (!isAllowedOrigin(event.sender.getURL(), new Set([localAppOrigin]))) return { ok: false, code: "FORBIDDEN" };
     if (!liveCallSession) return { ok: false, code: "NOT_ARMED" };
     if (isLiveCallEnding) return { ok: false, code: "LIVE_CALL_END_IN_PROGRESS" };
+    if (isLiveCallGoingLive) return { ok: false, code: "LIVE_CALL_GO_LIVE_IN_PROGRESS" };
+    isLiveCallGoingLive = true;
+    try {
     const armedSession = liveCallSession;
+    const rendererPreflight = await requestRendererLiveCaptionPreflight(armedSession);
+    if (!rendererPreflight.ok) return rendererPreflight;
+    const preflightRequestId = rendererPreflight.requestId;
+    // The renderer preflight persists the current form first. Loading settings
+    // before it completed made Go-Live use the previous glossary revision.
+    const preflight = await preflightLiveCallCaptionSession(settingsStore, armedSession);
+    if (!preflight.ok) {
+      cancelRendererLiveCaptionPreflight(preflightRequestId);
+      return preflight;
+    }
     // The invite-time version can go stale (any config change bumps it) and a
     // stale /start silently fails as a version conflict. Re-read the session
     // right before starting so Go-Live is never rejected for staleness.
@@ -1853,14 +2455,24 @@ function registerOverlayIpc(settingsStore, { localAppOrigin, liveWorkspaceUrl, l
       `/api/live-sessions/${encodeURIComponent(armedSession.sessionId)}`,
       { method: "GET" },
     );
+    if (!current.ok) {
+      cancelRendererLiveCaptionPreflight(preflightRequestId);
+      return current;
+    }
     if (current.ok && Number.isSafeInteger(current.data?.version)) {
       armedSession.version = current.data.version;
     }
     const started = await liveCallApi(armedSession.baseUrl, `/api/live-sessions/${encodeURIComponent(armedSession.sessionId)}/start`, {
       body: { version: armedSession.version },
     });
-    if (!started.ok) return started;
-    if (liveCallSession !== armedSession) return { ok: false, code: "NOT_ARMED" };
+    if (!started.ok) {
+      cancelRendererLiveCaptionPreflight(preflightRequestId);
+      return started;
+    }
+    if (liveCallSession !== armedSession) {
+      cancelRendererLiveCaptionPreflight(preflightRequestId);
+      return { ok: false, code: "NOT_ARMED" };
+    }
     armedSession.version = started.data.version ?? armedSession.version;
     armedSession.status = started.data.status ?? "live";
     // Stamp the moment the call actually went live (not arm time) so the
@@ -1873,6 +2485,9 @@ function registerOverlayIpc(settingsStore, { localAppOrigin, liveWorkspaceUrl, l
     if (stageWindow && !stageWindow.isDestroyed()) stageWindow.destroy();
     if (dashboardWindow && !dashboardWindow.isDestroyed()) dashboardWindow.hide();
     return { ok: true, status: armedSession.status };
+    } finally {
+      isLiveCallGoingLive = false;
+    }
   });
   // The desktop has no browser host-dashboard; the renderer asks the main
   // process to run the gateway host connection (Cloud Run only accepts the
@@ -1880,16 +2495,43 @@ function registerOverlayIpc(settingsStore, { localAppOrigin, liveWorkspaceUrl, l
   // then forwards microphone PCM frames over IPC.
   ipcMain.handle("live-call:bridge-ensure", async (event) => {
     if (!isAllowedOrigin(event.sender.getURL(), new Set([localAppOrigin]))) return { ok: false, code: "FORBIDDEN" };
+    if (!dashboardWindow || dashboardWindow.isDestroyed() || event.sender !== dashboardWindow.webContents) {
+      return { ok: false, code: "FORBIDDEN" };
+    }
     return ensureLiveGatewayBridge();
+  });
+  ipcMain.on("live-call:preflight-result", (event, requestId, result) => {
+    if (!isAllowedOrigin(event.sender.getURL(), new Set([localAppOrigin]))) return;
+    if (!dashboardWindow || dashboardWindow.isDestroyed() || event.sender !== dashboardWindow.webContents) return;
+    if (typeof requestId !== "string" || requestId.length > 128) return;
+    const pending = liveCaptionPreflightRequests.get(requestId);
+    if (!pending) return;
+    liveCaptionPreflightRequests.delete(requestId);
+    const code = typeof result?.code === "string" && /^[A-Z0-9_]{1,80}$/u.test(result.code)
+      ? result.code
+      : "LIVE_CAPTION_PREFLIGHT_FAILED";
+    pending.resolve(result?.ok === true
+      ? { ok: true, requestId }
+      : { ok: false, requestId, code });
+  });
+  ipcMain.handle("live-call:translation-reconnect", async (event) => {
+    if (!isAllowedOrigin(event.sender.getURL(), new Set([localAppOrigin]))) return { ok: false, code: "FORBIDDEN" };
+    if (!dashboardWindow || dashboardWindow.isDestroyed() || event.sender !== dashboardWindow.webContents) {
+      return { ok: false, code: "FORBIDDEN" };
+    }
+    return restartLiveTranslationBridge();
   });
   ipcMain.handle("live-call:audio-failed", async (event, detail) => {
     if (!isAllowedOrigin(event.sender.getURL(), new Set([localAppOrigin]))) return { ok: false, code: "FORBIDDEN" };
+    if (!dashboardWindow || dashboardWindow.isDestroyed() || event.sender !== dashboardWindow.webContents) {
+      return { ok: false, code: "FORBIDDEN" };
+    }
     if (!liveCallSession || liveCallSession.status !== "live") return { ok: false, code: "NOT_LIVE" };
     const safeDetail = String(detail ?? "")
       .replace(/[\u0000-\u001f\u007f]/gu, " ")
       .trim()
       .slice(0, 300);
-    stopLiveGatewayBridge("host audio capture failed");
+    await stopLiveGatewayBridge("host audio capture failed", { terminateRemote: true });
     setLiveBridgeAlert({
       state: "failed",
       code: "HOST_AUDIO_CAPTURE_FAILED",
@@ -1903,8 +2545,10 @@ function registerOverlayIpc(settingsStore, { localAppOrigin, liveWorkspaceUrl, l
   });
   ipcMain.on("live-call:audio-frame", (event, packet) => {
     if (!isAllowedOrigin(event.sender.getURL(), new Set([localAppOrigin]))) return;
+    if (!dashboardWindow || dashboardWindow.isDestroyed() || event.sender !== dashboardWindow.webContents) return;
     const bridge = liveGatewayBridge;
     if (!bridge?.ready || bridge.socket.readyState !== WebSocket.OPEN) return;
+    if (bridge.isHostAudioBlocked) return;
     const isKnownSource = packet?.source === "system" || packet?.source === "mic";
     const pcm = packet?.pcm;
     const bytes = Buffer.isBuffer(pcm)
@@ -1962,7 +2606,11 @@ function registerOverlayIpc(settingsStore, { localAppOrigin, liveWorkspaceUrl, l
       }
       if (liveCallSession !== endingSession) return { ok: false, code: "LIVE_CALL_STATE_CHANGED" };
       liveCallSession = null;
-      stopLiveGatewayBridge("live call ended");
+      relayLiveCallFloorToRenderers({
+        type: "live-call-ended",
+        sessionId: endingSession.sessionId,
+      });
+      await stopLiveGatewayBridge("live call ended", { terminateRemote: true });
       clearLiveBridgeAlert();
       if (stageWindow && !stageWindow.isDestroyed()) stageWindow.destroy();
       // The dashboard was hidden at go-live; ending the call brings it back so
@@ -1978,6 +2626,58 @@ function registerOverlayIpc(settingsStore, { localAppOrigin, liveWorkspaceUrl, l
     } finally {
       isLiveCallEnding = false;
     }
+  });
+  ipcMain.handle("subtitle-overlay:list-displays", (event) => {
+    if (!isAllowedOrigin(event.sender.getURL(), new Set([localAppOrigin]))) {
+      return { displays: [], selectedDisplayId: "" };
+    }
+    return overlayDisplayState();
+  });
+  ipcMain.handle("subtitle-overlay:select-display", async (event, displayId) => {
+    if (!isAllowedOrigin(event.sender.getURL(), new Set([localAppOrigin]))) {
+      return { displays: [], selectedDisplayId: "" };
+    }
+    if (typeof displayId !== "string"
+      || displayId.length < 1
+      || displayId.length > MAX_OVERLAY_DISPLAY_ID_LENGTH
+      || /[\u0000-\u001f\u007f]/u.test(displayId)) return overlayDisplayState();
+    const display = screen.getAllDisplays().find((candidate) => String(candidate.id) === displayId) ?? null;
+    if (!display) return overlayDisplayState();
+    const previousPreferredDisplayId = preferredOverlayDisplayId;
+    preferredOverlayDisplayId = displayId;
+    try {
+      await settingsStore.save({ subtitle: { overlayDisplayId: preferredOverlayDisplayId } });
+    } catch (error) {
+      preferredOverlayDisplayId = previousPreferredDisplayId;
+      throw error;
+    }
+    if (overlayEnabled) syncOverlayBounds();
+    positionControllerForOverlayDisplay();
+    // The QR stage shares the caption monitor, so a new selection moves it too.
+    repositionStageWindow();
+    notifyOverlayDisplaysChanged();
+    return overlayDisplayState();
+  });
+  // "All displays" tick: mirror the same captions onto every connected screen.
+  // Persist first so a crash cannot leave the windows and the setting disagreeing.
+  ipcMain.handle("subtitle-overlay:set-all-displays", async (event, allDisplays) => {
+    if (!isAllowedOrigin(event.sender.getURL(), new Set([localAppOrigin]))) {
+      return overlayDisplayState();
+    }
+    if (typeof allDisplays !== "boolean") return overlayDisplayState();
+    const previous = overlayAllDisplays;
+    overlayAllDisplays = allDisplays;
+    try {
+      await settingsStore.save({ subtitle: { overlayAllDisplays } });
+    } catch (error) {
+      overlayAllDisplays = previous;
+      throw error;
+    }
+    if (overlayEnabled) syncOverlayBounds();
+    positionControllerForOverlayDisplay();
+    repositionStageWindow();
+    notifyOverlayDisplaysChanged();
+    return overlayDisplayState();
   });
   ipcMain.handle("subtitle-overlay:get-enabled", () => overlayEnabled);
   ipcMain.handle("subtitle-overlay:set-muted", (event, muted) => {
@@ -2275,13 +2975,15 @@ async function terminateLiveCallForShutdown() {
   const endingSession = liveCallSession;
   if (!endingSession) return;
   liveCallSession = null;
-  stopLiveGatewayBridge("app quitting");
   try {
     await Promise.race([
-      liveCallApi(endingSession.baseUrl, `/api/live-sessions/${encodeURIComponent(endingSession.sessionId)}`, {
-        method: "DELETE",
-        body: { version: endingSession.version },
-      }),
+      Promise.allSettled([
+        stopLiveGatewayBridge("app quitting", { terminateRemote: true }),
+        liveCallApi(endingSession.baseUrl, `/api/live-sessions/${encodeURIComponent(endingSession.sessionId)}`, {
+          method: "DELETE",
+          body: { version: endingSession.version },
+        }),
+      ]),
       new Promise((resolve) => setTimeout(resolve, 4_000)),
     ]);
     console.info("[live] live call terminated on app quit");

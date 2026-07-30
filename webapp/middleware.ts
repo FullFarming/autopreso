@@ -5,6 +5,7 @@ import { apiError } from "@/lib/security/api-response";
 import {
   assertStrictOrigin,
   CsrfError,
+  isPublicLiveAudioWorkletRequest,
   isPublicUnauthenticatedPath,
   isViewerSnapshotPath,
 } from "@/lib/security/csrf";
@@ -37,7 +38,11 @@ export async function middleware(request: NextRequest) {
     }
   }
 
-  if (isPublicUnauthenticatedPath(pathname) || isViewerSnapshotPath(pathname)) {
+  if (
+    isPublicLiveAudioWorkletRequest(pathname, request.nextUrl.search, request.method)
+    || isPublicUnauthenticatedPath(pathname)
+    || isViewerSnapshotPath(pathname)
+  ) {
     return secure(NextResponse.next(), pathname);
   }
 

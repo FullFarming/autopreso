@@ -16,19 +16,29 @@ export interface MeetingTurn {
   speakerLabel: string;
   speakerColor: string;
   startedAt: string;
-  texts: string[];
+  captions: Array<{ seq: number; text: string; isFinal: boolean }>;
 }
 
-/** Groups consecutive final captions by speaker into turns, newest last. */
+/** Groups consecutive captions by speaker into turns, newest last. A seq can
+ *  arrive first as partial and then as final; the last value wins while its
+ *  React key remains unchanged. */
 export function groupCaptionsIntoTurns(captions: CaptionEvent[]): MeetingTurn[] {
   const turns: MeetingTurn[] = [];
   for (const caption of captions) {
-    if (!caption.isFinal) continue;
     const speakerIdentity = caption.speaker?.speakerId ?? "host";
     const speakerLabel = speakerMetaLine(caption.speaker);
     const previous = turns.at(-1);
+    const previousCaption = previous?.captions.at(-1);
+    if (previous && previous.speakerIdentity === speakerIdentity && previousCaption?.seq === caption.seq) {
+      previous.captions[previous.captions.length - 1] = {
+        seq: caption.seq,
+        text: caption.text,
+        isFinal: caption.isFinal,
+      };
+      continue;
+    }
     if (previous && previous.speakerIdentity === speakerIdentity) {
-      previous.texts.push(caption.text);
+      previous.captions.push({ seq: caption.seq, text: caption.text, isFinal: caption.isFinal });
       continue;
     }
     turns.push({
@@ -37,7 +47,7 @@ export function groupCaptionsIntoTurns(captions: CaptionEvent[]): MeetingTurn[] 
       speakerLabel,
       speakerColor: resolveSpeakerColor(caption.speaker),
       startedAt: caption.emittedAt,
-      texts: [caption.text],
+      captions: [{ seq: caption.seq, text: caption.text, isFinal: caption.isFinal }],
     });
   }
   return turns;
@@ -48,11 +58,14 @@ function isSameTurn(left: MeetingTurn, right: MeetingTurn): boolean {
   if (left.key !== right.key || left.speakerIdentity !== right.speakerIdentity
     || left.speakerLabel !== right.speakerLabel
     || left.speakerColor !== right.speakerColor || left.startedAt !== right.startedAt
-    || left.texts.length !== right.texts.length) return false;
+    || left.captions.length !== right.captions.length) return false;
   // Sentence strings come straight off the caption objects, so this is a
   // pointer comparison in practice, not a character-by-character one.
-  for (let index = 0; index < left.texts.length; index += 1) {
-    if (left.texts[index] !== right.texts[index]) return false;
+  for (let index = 0; index < left.captions.length; index += 1) {
+    const leftCaption = left.captions[index];
+    const rightCaption = right.captions[index];
+    if (leftCaption.seq !== rightCaption.seq || leftCaption.text !== rightCaption.text
+      || leftCaption.isFinal !== rightCaption.isFinal) return false;
   }
   return true;
 }
@@ -101,17 +114,14 @@ export function formatTurnTime(iso: string): string {
  * the length of the meeting. Every prop is a primitive or an identity-stable
  * object (see useStableTurns) so the default shallow comparison is enough.
  */
-const MeetingTurnCard = memo(function MeetingTurnCard({ turn, recentFromIndex, pendingText = "" }: {
+const MeetingTurnCard = memo(function MeetingTurnCard({ turn, recentFromIndex }: {
   turn: MeetingTurn;
   recentFromIndex: number;
-  /** The in-progress sentence, when it belongs to THIS speaker's turn. It is
-   *  rendered as the tail of this same paragraph so the transcript only ever
-   *  grows: rendering it as its own card meant the text was written separately
-   *  and then jumped up into the paragraph when it finalized. */
-  pendingText?: string;
 }) {
+  const hasPartial = turn.captions.some((caption) => !caption.isFinal);
   return (
-    <article className="live-turn-card">
+    <article className={`live-turn-card ${hasPartial ? "is-live" : ""}`}
+      data-caption-state={hasPartial ? "updating" : "final"}>
       {/* Plain header, not a control. Folding used to live here, but a speaker
           adding one more sentence then made the paragraph bundle and visibly
           drop text mid-meeting. A live transcript must only ever append; the
@@ -123,15 +133,12 @@ const MeetingTurnCard = memo(function MeetingTurnCard({ turn, recentFromIndex, p
         <time dateTime={turn.startedAt}>{formatTurnTime(turn.startedAt)}</time>
       </header>
       <p className="live-turn-body">
-        {turn.texts.map((text, textIndex) => (
-          <span key={`${turn.key}-${textIndex}`}
-            className={`live-turn-text ${textIndex >= recentFromIndex ? "is-recent" : ""}`}>
-            {text}{" "}
+        {turn.captions.map((caption, captionIndex) => (
+          <span key={`caption-${caption.seq}`}
+            className={`live-turn-text ${!caption.isFinal || captionIndex >= recentFromIndex ? "is-recent" : ""} ${caption.isFinal ? "" : "is-pending"}`}>
+            {caption.text}{" "}
           </span>
         ))}
-        {pendingText
-          ? <span className="live-turn-text is-recent is-pending" data-caption-state="updating">{pendingText}</span>
-          : null}
       </p>
     </article>
   );
@@ -155,7 +162,7 @@ export default function MeetingTurnFeed({ captions, floorHolder, emptyMessage }:
     let total = 0;
     for (const turn of turns) {
       offsets.push(total);
-      total += turn.texts.length;
+      total += turn.captions.filter((caption) => caption.isFinal).length;
     }
     return { offsets, total };
   }, [turns]);
@@ -165,32 +172,15 @@ export default function MeetingTurnFeed({ captions, floorHolder, emptyMessage }:
   // only the one or two cards straddling the boundary see a changed prop, and
   // the rest stay memo-stable.
   const turnRecentFrom = useMemo(() => turns.map((turn, turnIndex) => {
-    for (let textIndex = 0; textIndex < turn.texts.length; textIndex += 1) {
-      const globalIndex = turnOffsets.offsets[turnIndex] + textIndex;
-      if (globalIndex >= turnOffsets.total - 2) return textIndex;
+    let finalIndexInTurn = 0;
+    for (let captionIndex = 0; captionIndex < turn.captions.length; captionIndex += 1) {
+      if (!turn.captions[captionIndex].isFinal) continue;
+      const globalIndex = turnOffsets.offsets[turnIndex] + finalIndexInTurn;
+      if (globalIndex >= turnOffsets.total - 2) return captionIndex;
+      finalIndexInTurn += 1;
     }
-    return turn.texts.length;
+    return turn.captions.length;
   }), [turns, turnOffsets]);
-  // The in-progress utterance renders INSIDE the main record as the newest
-  // paragraph (speaker-attributed) — the mic-button sheet never duplicates
-  // caption text; it only signals who currently holds the floor. Scanned from
-  // the tail rather than filtered: the record holds thousands of captions and
-  // this runs on every streaming update.
-  const livePartial = useMemo(() => {
-    for (let index = captions.length - 1; index >= 0; index -= 1) {
-      if (!captions[index].isFinal) return captions[index];
-    }
-    return null;
-  }, [captions]);
-
-  // A partial CONTINUES the newest paragraph when it is the same speaker; a
-  // different speaker genuinely starts a new turn and gets its own paragraph.
-  const livePartialBelongsToLastTurn = useMemo(() => {
-    if (!livePartial) return false;
-    const lastTurn = turns.at(-1);
-    if (!lastTurn) return false;
-    return lastTurn.speakerIdentity === (livePartial.speaker?.speakerId ?? "host");
-  }, [livePartial, turns]);
 
   // Writing scrollTop needs scrollHeight read back, and that read is a forced
   // synchronous layout anywhere the DOM is still dirty — measured at ~0.5ms per
@@ -247,27 +237,14 @@ export default function MeetingTurnFeed({ captions, floorHolder, emptyMessage }:
     <div className="live-meeting-feed">
       <div ref={feedRef} className="live-turn-scroll" onScroll={handleScroll} aria-live="polite" aria-relevant="additions">
         <div ref={contentRef} className="live-turn-scroll-content">
-        {turns.length === 0 && !livePartial
+        {turns.length === 0
           ? <p className="live-empty-caption">{emptyMessage}</p>
           : (
             <>
               {turns.map((turn, turnIndex) => (
                 <MeetingTurnCard key={turn.key} turn={turn}
-                  recentFromIndex={turnRecentFrom[turnIndex]}
-                  pendingText={livePartialBelongsToLastTurn && turnIndex === turns.length - 1
-                    ? livePartial?.text ?? ""
-                    : ""} />
+                  recentFromIndex={turnRecentFrom[turnIndex]} />
               ))}
-              {livePartial && !livePartialBelongsToLastTurn && (
-                <article className="live-turn-card is-live" data-caption-state="updating">
-                  <header>
-                    <span className="live-speaker-dot" style={{ backgroundColor: resolveSpeakerColor(livePartial.speaker) }} aria-hidden="true" />
-                    <strong>{speakerMetaLine(livePartial.speaker)}</strong>
-                    <span className="live-speaking-waves" aria-hidden="true"><i /><i /><i /></span>
-                  </header>
-                  <p><span className="live-turn-text is-recent is-pending">{livePartial.text}</span></p>
-                </article>
-              )}
             </>
           )}
         </div>

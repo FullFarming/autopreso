@@ -35,6 +35,23 @@ async function waitForJson(webSocket, predicate) {
   }
 }
 
+function waitForJsonSet(webSocket, predicates) {
+  return new Promise((resolve) => {
+    const values = new Array(predicates.length).fill(null);
+    const onMessage = (data) => {
+      const message = JSON.parse(data.toString("utf8"));
+      for (let index = 0; index < predicates.length; index += 1) {
+        if (values[index] === null && predicates[index](message)) values[index] = message;
+      }
+      if (values.every((value) => value !== null)) {
+        webSocket.off("message", onMessage);
+        resolve(values);
+      }
+    };
+    webSocket.on("message", onMessage);
+  });
+}
+
 function createFloorGateway({ floorController, pipelineHooks = {}, gatewayOptions = {} } = {}) {
   const pipelines = [];
   const gateway = createGatewayServer({
@@ -74,7 +91,10 @@ async function startHost(port) {
   let received = nextJson(host);
   host.send(JSON.stringify({ type: "authenticate", token: signHostToken("gateway-secret") }));
   assert.equal((await received).type, "authenticated");
-  received = nextJson(host);
+  const responses = waitForJsonSet(host, [
+    (message) => message.type === "started",
+    (message) => message.type === "floor",
+  ]);
   host.send(JSON.stringify({
     type: "start",
     sessionId: "session-1",
@@ -83,7 +103,9 @@ async function startHost(port) {
     version: 1,
     languages: ["ko", "en"],
   }));
-  assert.equal((await received).type, "started");
+  const [started, floorSnapshot] = await responses;
+  assert.equal(started.type, "started");
+  assert.deepEqual(floorSnapshot, { type: "floor", sessionId: "session-1", holder: null });
   return host;
 }
 
@@ -279,7 +301,10 @@ test("translation restart preserves the active speaker and live call identity", 
   speaker.send(JSON.stringify({ type: "speak-start" }));
   await waitForJson(speaker, (message) => message.type === "speak-started");
 
-  const restarted = waitForJson(host, (message) => message.type === "restarted");
+  const restartResponses = waitForJsonSet(host, [
+    (message) => message.type === "restarted",
+    (message) => message.type === "floor",
+  ]);
   host.send(JSON.stringify({
     type: "restart",
     sessionId: "session-1",
@@ -288,7 +313,14 @@ test("translation restart preserves the active speaker and live call identity", 
     version: 1,
     languages: ["ko", "en"],
   }));
-  assert.equal((await restarted).type, "restarted");
+  const [restarted, restartFloor] = await restartResponses;
+  assert.equal(restarted.type, "restarted");
+  assert.deepEqual(restartFloor.holder, {
+    participantId: "grant-speaker",
+    name: "Noel Kim",
+    department: "",
+    jobTitle: "",
+  });
   assert.equal(pipelines.length, 2);
   assert.deepEqual(pipelines[1].floorSpeakers, [{ participantId: "grant-speaker", displayName: "Noel Kim", department: "", jobTitle: "" }]);
   assert.deepEqual(releaseCalls, []);

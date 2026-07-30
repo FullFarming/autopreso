@@ -23,7 +23,10 @@
     <main class="caption-player-controller caption-controller-window mini-player" data-i18n-aria="controller.windowLabel" aria-label="라이브 자막 제어">
       <div id="controller-drag" class="controller-drag mp-brand" role="button" tabindex="0" data-i18n-aria="controller.move" aria-label="자막 컨트롤러 이동">
         <strong data-i18n="app.name">NOVA</strong>
-        <span id="controller-live-call-status" class="mp-status" role="status" aria-live="polite" aria-atomic="true" data-i18n="controller.captionsReady">자막 준비됨</span>
+        <span id="controller-live-call-status" class="mp-status" role="status" aria-live="polite" aria-atomic="true">
+          <span id="controller-health-label" data-i18n="controller.captionsReady">자막 준비됨</span>
+          <span id="controller-health-detail" class="mp-status-detail" aria-hidden="true" hidden></span>
+        </span>
         <span class="mp-vu" aria-hidden="true"><i id="controller-vu-fill"></i></span>
       </div>
       <div class="controller-body">
@@ -79,11 +82,6 @@
             <button id="controller-gap-up" type="button" class="controller-icon" data-i18n-aria="controller.gapUp" aria-label="자막을 가장자리에서 멀게">+</button>
           </div>
         </div>
-        <div id="controller-voice-provider" class="controller-language-set" role="radiogroup" data-i18n-aria="controller.voiceEngine" aria-label="통역 음성 엔진" hidden>
-          <span data-i18n="controller.voice">음성</span>
-          <button type="button" class="controller-lang-option" data-controller-voice-provider="gemini" role="radio" aria-checked="true">Gemini</button>
-          <button type="button" class="controller-lang-option" data-controller-voice-provider="openai" role="radio" aria-checked="false">OpenAI</button>
-        </div>
         <div class="controller-cluster mp-window" role="group" data-i18n-aria="controller.appControls" aria-label="앱 제어">
           <button id="controller-main-window" type="button" class="mp-pill" data-i18n="controller.mainWindow">메인</button>
           <button id="controller-hide" type="button" class="mp-icon" data-i18n-aria="controller.hide" aria-label="컨트롤러 숨기기">
@@ -91,6 +89,17 @@
           </button>
           <button id="controller-quit" type="button" class="mp-icon controller-danger" data-i18n-aria="controller.quit" aria-label="종료">
             <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" aria-hidden="true"><path d="M8 1.8v6"/><path d="M4.2 4.1a5.4 5.4 0 1 0 7.6 0"/></svg>
+          </button>
+          <label for="controller-display" class="sr-only" data-i18n="controller.displaySelect">자막 표시 화면</label>
+          <select id="controller-display" class="controller-display-select" data-i18n-aria="controller.displaySelect" aria-label="자막 표시 화면" disabled>
+            <option data-i18n="controller.displayLoading">화면 확인 중</option>
+          </select>
+          <button id="controller-all-displays" type="button" class="mp-pill controller-tick" role="switch" aria-checked="false"
+                  data-i18n-title="controller.allDisplaysHint" title="연결된 모든 화면에 같은 자막을 표시합니다">
+            <span class="controller-tick-box" aria-hidden="true">
+              <svg viewBox="0 0 16 16" width="11" height="11" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M3.2 8.4 6.4 11.6 12.8 4.8"/></svg>
+            </span>
+            <span data-i18n="controller.allDisplays">모든 화면</span>
           </button>
         </div>
       </div>

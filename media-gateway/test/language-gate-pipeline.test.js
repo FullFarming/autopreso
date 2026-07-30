@@ -287,11 +287,14 @@ test("genuine Korean speech on the Korean lane still passes through verbatim", a
 // there too, or none of it applies to a real Live Call.
 // ─────────────────────────────────────────────────────────────────────────────
 
-function makeLivePipeline(state, languages = ["ko", "en"], clock = null) {
+function makeLivePipeline(state, languages = ["ko", "en"], clock = null, options = {}) {
   const sessions = new Map();
+  const sourceSessions = new Map();
   state.dependencies.liveTranslate = {
-    async open({ language, onCaption, onInputCaption }) {
-      sessions.set(language, { onCaption, onInputCaption });
+    async open({ language, inputSource = "system", onCaption, onInputCaption, onInputObservation }) {
+      const session = { onCaption, onInputCaption, onInputObservation };
+      sourceSessions.set(`${inputSource}:${language}`, session);
+      if (inputSource === "system") sessions.set(language, session);
       return { async sendAudio() {}, async audioStreamEnd() {}, async close() {} };
     },
   };
@@ -306,8 +309,9 @@ function makeLivePipeline(state, languages = ["ko", "en"], clock = null) {
       setTimeoutFn: clock.setTimeoutFn,
       clearTimeoutFn: clock.clearTimeoutFn,
     } : {}),
+    ...options,
   });
-  return { pipeline, sessions };
+  return { pipeline, sessions, sourceSessions };
 }
 
 test("the live path hides a translation that came back in the wrong language", async () => {
@@ -373,21 +377,380 @@ test("provider input language wins over script heuristics for code-switched sour
   assert.equal(captions[0].origin, "source");
 });
 
-test("provider input languages outside the session fail closed for partials and finals", async () => {
+test("clear single-script evidence corrects an in-pair provider mislabel", async () => {
+  const cases = [
+    { text: "Clearly English only.", languageCode: "ko-KR", expectedLanguage: "en" },
+    { text: "명백한 한국어 문장입니다.", languageCode: "en-US", expectedLanguage: "ko" },
+  ];
+
+  for (const scenario of cases) {
+    const state = makeDependencies();
+    const { pipeline, sessions } = makeLivePipeline(state);
+    await pipeline.start();
+    await sessions.get("ko").onInputCaption({ ...scenario, isFinal: true });
+    assert.equal(state.captions()[0]?.language, scenario.expectedLanguage);
+    await pipeline.close();
+  }
+});
+
+test("a clear new KO turn overrides the previous EN consensus on its first caption", async () => {
+  const state = makeDependencies();
+  const { pipeline, sessions } = makeLivePipeline(state);
+  await pipeline.start();
+
+  for (const language of ["ko", "en"]) {
+    await sessions.get(language).onInputObservation?.({
+      text: "We will review the Seoul office market today.",
+      languageCode: "en-US",
+    });
+  }
+  await sessions.get("ko").onInputCaption({
+    text: "이제 한국어 문장입니다.",
+    isFinal: true,
+    languageCode: "ko-KR",
+  });
+
+  assert.equal(state.captions()[0]?.language, "ko");
+});
+
+test("a mixed Korean turn overrides stale EN consensus with either KO or und metadata", async () => {
+  for (const languageCode of ["ko-KR", "und"]) {
+    const state = makeDependencies();
+    const { pipeline, sessions } = makeLivePipeline(state);
+    await pipeline.start();
+    for (const language of ["ko", "en"]) {
+      await sessions.get(language).onInputObservation?.({
+        text: "We will review the Seoul office market today.",
+        languageCode: "en-US",
+      });
+    }
+    await sessions.get("ko").onInputCaption({
+      text: "오늘 office market을 검토합니다.",
+      isFinal: true,
+      languageCode,
+    });
+    await pipeline.close();
+    assert.equal(state.captions()[0]?.language, "ko", `${languageCode} must begin a Korean turn`);
+  }
+});
+
+test("ambiguous revisions keep the utterance's EN-KO language lock until final", async () => {
+  const state = makeDependencies();
+  const { pipeline, sessions } = makeLivePipeline(state);
+  await pipeline.start();
+
+  await sessions.get("ko").onInputCaption({
+    text: "오늘 office market을",
+    isFinal: false,
+    languageCode: "ko-KR",
+  });
+  await sessions.get("ko").onInputCaption({
+    text: "temporarily looks English 하지만",
+    isFinal: true,
+    languageCode: "en-US",
+  });
+
+  await pipeline.close();
+  assert.deepEqual(state.captions().map((caption) => caption.language), ["ko"]);
+});
+
+test("outside Latin-script provider metadata cannot enter EN-KO source or translated records", async () => {
+  const cases = [
+    {
+      inputSource: "system",
+      sourceText: "We will review the Seoul office market today.",
+      providerLanguage: "ja-JP",
+      targetLanguage: "ko",
+      translatedText: "오늘 서울 오피스 시장을 검토하겠습니다.",
+    },
+    {
+      inputSource: "participant",
+      sourceText: "We will review the Seoul office market today.",
+      providerLanguage: "vi-VN",
+      targetLanguage: "ko",
+      translatedText: "오늘 서울 오피스 시장을 검토하겠습니다.",
+    },
+  ];
+
+  for (const scenario of cases) {
+    const state = makeDependencies();
+    const { pipeline, sourceSessions } = makeLivePipeline(state);
+    await pipeline.start();
+    if (scenario.inputSource === "participant") {
+      pipeline.setFloorSpeaker({ participantId: "participant-1", displayName: "Participant" });
+      await pipeline.acceptAudio(new Uint8Array(1_280), 0, {
+        participantId: "participant-1",
+        displayName: "Participant",
+      }, "participant");
+    }
+
+    const inputLane = sourceSessions.get(`${scenario.inputSource}:ko`);
+    const outputLane = sourceSessions.get(`${scenario.inputSource}:${scenario.targetLanguage}`);
+    for (const language of ["ko", "en"]) {
+      await sourceSessions.get(`${scenario.inputSource}:${language}`).onInputObservation?.({
+        text: scenario.sourceText,
+        languageCode: scenario.providerLanguage,
+      });
+    }
+    await inputLane.onInputCaption({
+      text: scenario.sourceText,
+      isFinal: true,
+      languageCode: scenario.providerLanguage,
+    });
+    await outputLane.onCaption({
+      text: scenario.translatedText,
+      isFinal: true,
+      languageCode: scenario.targetLanguage,
+    });
+
+    const captions = state.captions();
+    assert.deepEqual(captions, [], `${scenario.providerLanguage} must not create source or translated records`);
+    await pipeline.close();
+  }
+});
+
+test("Korean CRE grammar with Latin acronyms and proper nouns stays on the KO source lane", async () => {
+  for (const languageCode of ["ko-KR", "und", undefined]) {
+    const state = makeDependencies();
+    const { pipeline, sessions } = makeLivePipeline(state);
+    await pipeline.start();
+
+    await sessions.get("ko").onInputCaption({
+      text: "Cushman & Wakefield Korea의 ADR, RevPAR 지표입니다.",
+      isFinal: true,
+      ...(languageCode === undefined ? {} : { languageCode }),
+    });
+
+    assert.deepEqual(
+      state.captions().map(({ language, origin }) => ({ language, origin })),
+      [{ language: "ko", origin: "source" }],
+    );
+    await pipeline.close();
+  }
+});
+
+test("strong Hangul replaces stale outside metadata without allowing that metadata into state", async () => {
+  const state = makeDependencies();
+  const { pipeline, sessions } = makeLivePipeline(state);
+  await pipeline.start();
+
+  await sessions.get("ko").onInputCaption({
+    text: "오늘 서울 오피스 시장을 검토하겠습니다.",
+    isFinal: true,
+    languageCode: "fr-FR",
+  });
+
+  assert.equal(state.captions().length, 1);
+  assert.equal(state.captions()[0].language, "ko");
+  assert.equal(state.captions()[0].sourceLanguage, "ko");
+});
+
+test("a weak Hangul fragment cannot override outside provider metadata", async () => {
+  const state = makeDependencies();
+  const { pipeline, sessions } = makeLivePipeline(state);
+  await pipeline.start();
+  await sessions.get("ko").onInputCaption({ text: "네", isFinal: true, languageCode: "fr-FR" });
+  assert.equal(state.captions().length, 0);
+});
+
+test("genuinely unsupported scripts and malformed provider hints still fail closed", async () => {
   const state = makeDependencies();
   const { pipeline, sessions } = makeLivePipeline(state);
   await pipeline.start();
   const input = sessions.get("ko").onInputCaption;
 
-  await input({ text: "Vietnam market update", isFinal: false, languageCode: "vi-VN" });
-  await sessions.get("ko").onCaption({ text: "베트남 시장 업데이트", isFinal: false, languageCode: "ko-KR" });
-  await input({ text: "Vietnam market update.", isFinal: true, languageCode: "vi" });
-  await sessions.get("ko").onCaption({ text: "베트남 시장 업데이트입니다.", isFinal: true, languageCode: "ko-KR" });
-  await input({ text: "일본 시장 업데이트", isFinal: false, languageCode: "ja-JP" });
-  await input({ text: "일본 시장 업데이트입니다.", isFinal: true, languageCode: "ja" });
+  await input({ text: "日本市場の最新情報", isFinal: false, languageCode: "ja-JP" });
+  await input({ text: "日本市場の最新情報です。", isFinal: true, languageCode: "ja" });
+  await input({ text: "Прогноз рынка Москвы.", isFinal: true, languageCode: "ru" });
   await input({ text: "Looks English but the hint is malformed.", isFinal: true, languageCode: "not-a-language" });
 
   assert.equal(state.captions().length, 0, "unsupported or malformed explicit hints must not become source rows");
+});
+
+test("all outside EN-KO source metadata is rejected for both partial and final callbacks", async () => {
+  for (const languageCode of ["vi-VN", "ja-JP", "zh-CN", "es-ES", "fr-FR"]) {
+    const state = makeDependencies();
+    const clock = makeManualClock(1_000);
+    const { pipeline, sessions } = makeLivePipeline(state, ["ko", "en"], clock);
+    await pipeline.start();
+    await sessions.get("ko").onInputCaption({
+      text: "We will review the Seoul office market.",
+      isFinal: false,
+      languageCode,
+    });
+    await clock.advance(500);
+    await sessions.get("ko").onInputCaption({
+      text: "We will review the Seoul office market today.",
+      isFinal: true,
+      languageCode,
+    });
+    assert.equal(state.captions().length, 0, `${languageCode} source callbacks must fail closed`);
+    await pipeline.close();
+  }
+});
+
+test("missing or und source metadata cannot bypass the EN-KO script firewall", async () => {
+  const unsupported = [
+    "Ở đây bạn có thể xem và chúng ta bắt đầu.",
+    "日本市場の最新情報です。",
+    "你好世界今天开会。",
+    "Прогноз рынка Москвы.",
+    "Aquí puede ver el informe y podemos comenzar.",
+    "Vous pouvez consulter le rapport et commencer.",
+    "Wir können heute den Markt prüfen und beginnen.",
+    "Possiamo esaminare il mercato e iniziare oggi.",
+    "Podemos rever o mercado e começar hoje.",
+    "Kita dapat melihat laporan dan mulai hari ini.",
+  ];
+  for (const languageCode of [undefined, "und"]) {
+    for (const text of unsupported) {
+      const state = makeDependencies();
+      const clock = makeManualClock(1_000);
+      const { pipeline, sessions } = makeLivePipeline(state, ["ko", "en"], clock);
+      await pipeline.start();
+      await sessions.get("ko").onInputCaption({
+        text,
+        isFinal: false,
+        ...(languageCode === undefined ? {} : { languageCode }),
+      });
+      await clock.advance(500);
+      await sessions.get("ko").onInputCaption({
+        text,
+        isFinal: true,
+        ...(languageCode === undefined ? {} : { languageCode }),
+      });
+      assert.equal(state.captions().length, 0, `${languageCode ?? "missing"}: ${text}`);
+      await pipeline.close();
+    }
+  }
+});
+
+test("an earlier EN consensus cannot relabel a genuinely unsupported source script", async () => {
+  const state = makeDependencies();
+  const { pipeline, sessions } = makeLivePipeline(state);
+  await pipeline.start();
+
+  for (const language of ["ko", "en"]) {
+    await sessions.get(language).onInputObservation?.({
+      text: "We will review the Seoul office market today.",
+      languageCode: "en-US",
+    });
+  }
+  await sessions.get("ko").onInputCaption({
+    text: "日本市場の最新情報です。",
+    isFinal: true,
+    languageCode: "ja-JP",
+  });
+
+  assert.equal(state.captions().length, 0, "stale pair consensus must never override an unsupported provider language");
+});
+
+test("foreign scripts fail closed even when the provider mislabels them as EN or KO", async () => {
+  const cases = [
+    { text: "日本市場の最新情報です。", languageCode: "en-US" },
+    { text: "Прогноз рынка Москвы.", languageCode: "ko-KR" },
+    { text: "你好世界", languageCode: "en" },
+  ];
+
+  for (const scenario of cases) {
+    const state = makeDependencies();
+    const { pipeline, sessions } = makeLivePipeline(state);
+    await pipeline.start();
+    await sessions.get("ko").onInputCaption({ ...scenario, isFinal: true });
+    assert.equal(state.captions().length, 0, `${scenario.text} must not become an EN/KO source row`);
+    await pipeline.close();
+  }
+});
+
+test("short output callbacks require the configured target script and reject third-language scripts", async () => {
+  const invalidOutputs = [
+    { text: "はい", languageCode: "ja-JP" },
+    { text: "你好", languageCode: "zh-CN" },
+    { text: "Да", languageCode: "ru-RU" },
+  ];
+
+  for (const output of invalidOutputs) {
+    const state = makeDependencies();
+    const { pipeline, sessions } = makeLivePipeline(state);
+    await pipeline.start();
+    await sessions.get("ko").onInputCaption({ text: "Yes", isFinal: true, languageCode: "en-US" });
+    await sessions.get("ko").onCaption({
+      ...output,
+      isFinal: true,
+      sourceText: "Yes",
+      sourceLanguage: "en-US",
+    });
+    const outputCaptions = state.captions().filter((caption) => caption.origin !== "source");
+    assert.ok(
+      outputCaptions.every((caption) => caption.translationStatus !== "translated"),
+      `${output.text} must not be accepted as a Korean translation`,
+    );
+    await pipeline.close();
+  }
+
+  const validCases = [
+    { sourceText: "Yes", sourceLanguage: "en-US", targetLanguage: "ko", translatedText: "네" },
+    { sourceText: "Yes", sourceLanguage: "en-US", targetLanguage: "ko", translatedText: "OK" },
+    { sourceText: "네", sourceLanguage: "ko-KR", targetLanguage: "en", translatedText: "OK" },
+  ];
+  for (const scenario of validCases) {
+    const state = makeDependencies();
+    const { pipeline, sessions } = makeLivePipeline(state);
+    await pipeline.start();
+    await sessions.get("ko").onInputCaption({
+      text: scenario.sourceText,
+      isFinal: true,
+      languageCode: scenario.sourceLanguage,
+    });
+    await sessions.get(scenario.targetLanguage).onCaption({
+      text: scenario.translatedText,
+      isFinal: true,
+      languageCode: scenario.targetLanguage,
+      sourceText: scenario.sourceText,
+      sourceLanguage: scenario.sourceLanguage,
+    });
+    const translated = state.captions().filter((caption) => caption.origin !== "source");
+    assert.equal(translated.length, 1, `${scenario.translatedText} must remain a valid short translation`);
+    assert.equal(translated[0].translationStatus, "translated");
+    await pipeline.close();
+  }
+});
+
+test("malformed provider source metadata cannot create an uncorrelated translated output", async () => {
+  const state = makeDependencies();
+  const { pipeline, sessions } = makeLivePipeline(state);
+  await pipeline.start();
+
+  await sessions.get("ko").onCaption({
+    text: "서울 시장을 검토하겠습니다.",
+    isFinal: true,
+    languageCode: "ko-KR",
+    sourceText: "We will review the Seoul market.",
+    sourceLanguage: "not-a-language",
+  });
+
+  assert.equal(state.captions().length, 0, "malformed explicit source metadata must fail closed");
+});
+
+test("malformed observations cannot poison the next EN-KO source decision", async () => {
+  const state = makeDependencies();
+  const { pipeline, sessions } = makeLivePipeline(state);
+  await pipeline.start();
+
+  for (const language of ["ko", "en"]) {
+    await sessions.get(language).onInputObservation?.({
+      text: "Clearly English only.",
+      languageCode: "not-a-language",
+    });
+  }
+  await sessions.get("ko").onInputCaption({
+    text: "OK 네",
+    isFinal: true,
+    languageCode: "und",
+  });
+  await pipeline.close();
+
+  assert.equal(state.captions()[0]?.language, "ko");
 });
 
 test("missing and und input hints retain script fallback while explicit KO and EN remain canonical", async () => {
@@ -494,17 +857,17 @@ test("output callbacks drop unsupported explicit languages but allow und to use 
   const koreanOutput = sessions.get("ko").onCaption;
 
   await koreanOutput({
-    text: "겉보기에는 한국어인 베트남어 콜백",
+    text: "겉보기에는 한국어인 러시아어 콜백",
     isFinal: false,
     languageCode: "ko-KR",
-    sourceText: "Vietnamese source",
-    sourceLanguage: "vi",
+    sourceText: "Прогноз рынка Москвы.",
+    sourceLanguage: "ru",
   });
   await koreanOutput({
     text: "겉보기에는 한국어인 일본어 콜백입니다.",
     isFinal: true,
     languageCode: "ko-KR",
-    sourceText: "Japanese source",
+    sourceText: "日本市場の最新情報です。",
     sourceLanguage: "ja-JP",
   });
   await koreanOutput({
@@ -521,6 +884,168 @@ test("output callbacks drop unsupported explicit languages but allow und to use 
   assert.equal(captions[0].text, "언어 미확정 상태의 정상 한국어 번역입니다.");
 });
 
+test("outside output metadata is rejected for partials and finals even when text looks like the target", async () => {
+  const unsupportedLanguages = ["vi-VN", "ja-JP", "zh-CN", "es-ES", "fr-FR", "not-a-language"];
+  for (const languageCode of unsupportedLanguages) {
+    const state = makeDependencies();
+    const clock = makeManualClock(1_000);
+    const { pipeline, sessions } = makeLivePipeline(state, ["ko", "en"], clock);
+    await pipeline.start();
+    await sessions.get("ko").onInputCaption({
+      text: "We will review the Seoul office market.",
+      isFinal: true,
+      languageCode: "en-US",
+    });
+    await sessions.get("ko").onCaption({
+      text: "서울 오피스 시장을 검토하겠습니다.",
+      isFinal: false,
+      languageCode,
+      sourceText: "We will review the Seoul office market.",
+      sourceLanguage: "en-US",
+    });
+    await clock.advance(500);
+    await sessions.get("ko").onCaption({
+      text: "서울 오피스 시장을 검토하겠습니다.",
+      isFinal: true,
+      languageCode,
+      sourceText: "We will review the Seoul office market.",
+      sourceLanguage: "en-US",
+    });
+
+    assert.deepEqual(
+      state.captions().map(({ language, origin }) => ({ language, origin })),
+      [{ language: "en", origin: "source" }],
+      `${languageCode} output metadata must never create a caption or record`,
+    );
+    await pipeline.close();
+  }
+});
+
+test("non-string output metadata also fails closed before persistence", async () => {
+  const state = makeDependencies();
+  const { pipeline, sessions } = makeLivePipeline(state);
+  await pipeline.start();
+  await sessions.get("ko").onCaption({
+    text: "서울 오피스 시장을 검토하겠습니다.",
+    isFinal: true,
+    languageCode: { language: "ko" },
+    sourceText: "We will review the Seoul office market.",
+    sourceLanguage: "en-US",
+  });
+  assert.equal(state.captions().length, 0);
+});
+
+test("missing or und output metadata still rejects short and long third-language text", async () => {
+  const unsupported = [
+    "はい",
+    "你好",
+    "Да",
+    "Ở đây bạn có thể xem và chúng ta bắt đầu.",
+    "Aquí puede ver el informe y podemos comenzar.",
+    "Vous pouvez consulter le rapport et commencer.",
+    "Wir können heute den Markt prüfen und beginnen.",
+    "Possiamo esaminare il mercato e iniziare oggi.",
+    "Podemos rever o mercado e começar hoje.",
+    "Kita dapat melihat laporan dan mulai hari ini.",
+  ];
+  for (const languageCode of [undefined, "und"]) {
+    for (const text of unsupported) {
+      const state = makeDependencies();
+      const { pipeline, sessions } = makeLivePipeline(state);
+      await pipeline.start();
+      await sessions.get("ko").onCaption({
+        text,
+        isFinal: true,
+        ...(languageCode === undefined ? {} : { languageCode }),
+        sourceText: "We will review the Seoul office market.",
+        sourceLanguage: "en-US",
+      });
+      assert.equal(state.captions().length, 0, `${languageCode ?? "missing"}: ${text}`);
+      await pipeline.close();
+    }
+  }
+});
+
+test("two consecutive EN-KO language drifts request one fresh pipeline recovery", async () => {
+  const state = makeDependencies();
+  const fatalErrors = [];
+  const { pipeline, sessions } = makeLivePipeline(state, ["ko", "en"], null, {
+    onFatalError: (error) => fatalErrors.push(error),
+  });
+  await pipeline.start();
+
+  await sessions.get("ko").onCaption({
+    text: "서울 오피스 시장을 검토하겠습니다.",
+    isFinal: false,
+    languageCode: "vi-VN",
+    sourceText: "We will review the Seoul office market.",
+    sourceLanguage: "en-US",
+  });
+  assert.equal(fatalErrors.length, 0, "one anomalous callback is dropped without reconnecting");
+  await sessions.get("ko").onCaption({
+    text: "서울 오피스 시장을 검토하겠습니다.",
+    isFinal: true,
+    languageCode: "ja-JP",
+    sourceText: "We will review the Seoul office market.",
+    sourceLanguage: "en-US",
+  });
+  await sessions.get("ko").onCaption({
+    text: "서울 오피스 시장을 검토하겠습니다.",
+    isFinal: true,
+    languageCode: "fr-FR",
+    sourceText: "We will review the Seoul office market.",
+    sourceLanguage: "en-US",
+  });
+
+  assert.equal(fatalErrors.length, 1);
+  assert.equal(fatalErrors[0].message, "TRANSLATION_LANGUAGE_DRIFT");
+  assert.equal(state.captions().length, 0);
+});
+
+test("a post-polish third-language draft is blocked before seq and persistence", async () => {
+  const state = makeDependencies();
+  let polishCalls = 0;
+  state.dependencies.captionPolish = {
+    async polish() {
+      polishCalls += 1;
+      return "日本市場の最新情報です。";
+    },
+  };
+  const { pipeline, sessions } = makeLivePipeline(state, ["ko", "en"], null, {
+    captionPolishPolicy: "full",
+  });
+  await pipeline.start();
+
+  await sessions.get("ko").onCaption({
+    text: "서울 오피스 시장을 검토하겠습니다.",
+    isFinal: true,
+    languageCode: "ko-KR",
+    sourceText: "We will review the Seoul office market.",
+    sourceLanguage: "en-US",
+  });
+
+  assert.equal(polishCalls, 1, "full policy must exercise the post-polish language gate");
+  assert.equal(state.captions().length, 0);
+  assert.equal(pipeline.lastSequence, 0, "a rejected polish result must not consume durable seq");
+});
+
+test("committed CRE normalization never mutates the source-language record", async () => {
+  const state = makeDependencies();
+  const { pipeline, sessions } = makeLivePipeline(state);
+  await pipeline.start();
+  const sourceText = "The transaction value is KRW 300 billion.";
+
+  await sessions.get("ko").onInputCaption({
+    text: sourceText,
+    isFinal: true,
+    languageCode: "en-US",
+  });
+
+  assert.equal(state.captions().length, 1);
+  assert.equal(state.captions()[0].origin, "source");
+  assert.equal(state.captions()[0].text, sourceText);
+});
+
 // ─────────────────────────────────────────────────────────────────────────────
 // The caption is the FINAL ARTIFACT: corrections happen inline during
 // generation (glossary + number notation), so what is displayed is already the
@@ -530,10 +1055,7 @@ test("output callbacks drop unsupported explicit languages but allow und to use 
 //     that then visibly changes when the final lands
 // ─────────────────────────────────────────────────────────────────────────────
 
-test("number notation applies on the live path even with no glossary configured", () => {
-  // normalizeBusinessNumberNotation lives inside applyGlossaryCorrections, so a
-  // guard of `if (glossaryText)` silently skipped it for every session that had
-  // not picked a glossary preset.
+test("committed CRE number notation applies with no glossary configured", () => {
   const state = makeDependencies();
   const { pipeline, sessions } = makeLivePipeline(state, ["en"]);
   return (async () => {
@@ -541,11 +1063,11 @@ test("number notation applies on the live path even with no glossary configured"
     await sessions.get("en").onCaption({ text: "We are targeting 3,000억 원 this year.", isFinal: true });
     const captions = state.captions();
     assert.equal(captions.length, 1);
-    assert.equal(captions[0].text, "We are targeting KRW 300 billion this year.");
+    assert.equal(captions[0].text, "We are targeting KRW 300bn this year.");
   })();
 });
 
-test("an interim carries the same corrections as the final, so nothing changes under the reader", async () => {
+test("an incomplete number stays raw in partials and normalizes only on commit", async () => {
   const state = makeDependencies();
   const clock = makeManualClock(1_000);
   const { pipeline, sessions } = makeLivePipeline(state, ["en"], clock);
@@ -557,6 +1079,6 @@ test("an interim carries the same corrections as the final, so nothing changes u
 
   const captions = state.captions();
   assert.equal(captions.length, 2);
-  assert.match(captions[0].text, /KRW 300 billion/u, "the interim must already be corrected");
-  assert.match(captions[1].text, /KRW 300 billion/u);
+  assert.equal(captions[0].text, "The fund raised 3천억 원", "the interim must remain byte-stable");
+  assert.match(captions[1].text, /KRW 300bn/u);
 });

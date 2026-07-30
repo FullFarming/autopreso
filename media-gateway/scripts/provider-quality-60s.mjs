@@ -1,151 +1,178 @@
-import { readFile } from "node:fs/promises";
-
-import { v1 as speechV1 } from "@google-cloud/speech";
-import { v1 as textToSpeechV1 } from "@google-cloud/text-to-speech";
-import { v3 as translateV3 } from "@google-cloud/translate";
+import { pathToFileURL } from "node:url";
 
 import {
-  ChirpTextToSpeechAdapter,
-  CloudSpeechToTextAdapter,
-  CloudTranslationAdvancedAdapter,
-} from "../src/google-provider-adapters.js";
+  createCommittedCaptionFinalizer,
+  createGeminiCaptionConfig,
+  geminiCaptionConfigFingerprint,
+} from "../../packages/caption-core/index.js";
+import { LiveMediaPipeline } from "../src/live-media-pipeline.js";
 
-const MAX_AUDIO_MILLISECONDS = 60_000;
-const FRAME_BYTES = 1_280;
+const SIMULATED_AUDIO_MILLISECONDS = 60_000;
+const UTTERANCE_MILLISECONDS = 500;
+const QUALITY_GLOSSARY = [
+  "[Rules]",
+  "Keep registered names exact in both directions.",
+  "[Companies]",
+  "Cushman & Wakefield = 쿠시먼앤드웨이크필드",
+  "NOEL = 노엘",
+].join("\n");
+const QUALITY_CASES = Object.freeze([
+  Object.freeze({
+    sourceLanguage: "en",
+    targetLanguage: "ko",
+    sourceText: "Cushman & Wakefield uses NOEL.",
+    translatedText: "쿠시먼앤웨이크필드는 노엘을 사용합니다.",
+    requiredTerms: Object.freeze(["쿠시먼앤드웨이크필드", "노엘"]),
+  }),
+  Object.freeze({
+    sourceLanguage: "ko",
+    targetLanguage: "en",
+    sourceText: "쿠시먼앤드웨이크필드는 노엘을 사용합니다.",
+    translatedText: "Cushman and Wakefield uses NOEL.",
+    requiredTerms: Object.freeze(["Cushman & Wakefield", "NOEL"]),
+  }),
+]);
 
-assertDevelopmentGate(process.env);
-const pcmPath = String(process.env.QUALITY_PCM16_PATH ?? "").trim();
-if (!pcmPath) throw new Error("QUALITY_PCM16_PATH_REQUIRED");
-const pcm = new Uint8Array(await readFile(pcmPath));
-if (pcm.byteLength === 0 || pcm.byteLength % 2 !== 0) throw new Error("QUALITY_PCM16_INVALID");
-const audioMilliseconds = pcm.byteLength / (16_000 * 2) * 1_000;
-if (audioMilliseconds > MAX_AUDIO_MILLISECONDS) throw new Error("QUALITY_PCM16_EXCEEDS_60S");
-
-const projectId = process.env.GOOGLE_CLOUD_PROJECT;
-const sourceLanguage = String(process.env.QUALITY_SOURCE_LANGUAGE ?? "ko-KR");
-const targetLanguage = String(process.env.QUALITY_TARGET_LANGUAGE ?? "en");
-const diarization = String(process.env.QUALITY_DIARIZATION ?? "true") !== "false";
-const speechClient = new speechV1.SpeechClient();
-const translationClient = new translateV3.TranslationServiceClient();
-const textToSpeechClient = new textToSpeechV1.TextToSpeechClient();
-const speech = new CloudSpeechToTextAdapter({ client: speechClient, projectId, languageCodes: [sourceLanguage], diarization });
-const translation = new CloudTranslationAdvancedAdapter({ client: translationClient, projectId });
-const tts = new ChirpTextToSpeechAdapter({ client: textToSpeechClient });
-const metrics = {
-  audioMilliseconds,
-  diarization,
-  utterances: 0,
-  translated: 0,
-  completedTts: 0,
-  ttsBytes: 0,
-  peakBacklogUtterances: 0,
-  duplicateSourceRanges: 0,
-  continuityDiscardCount: 0,
-  backlogAtInputEnd: 0,
-  firstUtteranceMilliseconds: null,
-  firstTranslationMilliseconds: null,
-  firstTtsAudioMilliseconds: null,
-  inputElapsedMilliseconds: 0,
-  drainMilliseconds: 0,
-  elapsedMilliseconds: 0,
-  code: "OK",
-};
-const sourceRanges = new Set();
-const startedAt = Date.now();
-const providerAbortController = new AbortController();
-const deadline = AbortSignal.any([AbortSignal.timeout(120_000), providerAbortController.signal]);
-
-try {
-  const session = await speech.open({
-    onContinuityDiscard() { metrics.continuityDiscardCount += 1; },
-    async onFinalUtterance(utterance) {
-      const sourceRange = `${utterance.sourceStartOffsetMs}:${utterance.sourceEndOffsetMs}`;
-      if (sourceRanges.has(sourceRange)) metrics.duplicateSourceRanges += 1;
-      else sourceRanges.add(sourceRange);
-      metrics.utterances += 1;
-      metrics.firstUtteranceMilliseconds ??= Date.now() - startedAt;
-      metrics.peakBacklogUtterances = Math.max(metrics.peakBacklogUtterances, metrics.utterances - metrics.completedTts);
-      const translated = await translation.translate({ text: utterance.text, language: targetLanguage, sourceLanguage: utterance.sourceLanguage });
-      metrics.translated += 1;
-      metrics.firstTranslationMilliseconds ??= Date.now() - startedAt;
-      for await (const chunk of tts.synthesizeStream({
-        language: targetLanguage,
-        voiceName: "Achernar",
-        text: translated,
-        sampleRate: 24_000,
-        signal: deadline,
-      })) {
-        metrics.firstTtsAudioMilliseconds ??= Date.now() - startedAt;
-        metrics.ttsBytes += chunk.byteLength;
-      }
-      metrics.completedTts += 1;
+/**
+ * Runs a 60-second-equivalent, no-network Gemini caption/audio contract check.
+ * It deliberately injects provider outputs: CI validates our shared engine and
+ * Live callback wiring without credentials, quota use, or external side effects.
+ */
+export async function runGeminiCaptionQualityCheck() {
+  const config = createGeminiCaptionConfig({
+    translationLanguages: ["en", "ko"],
+    outputMode: "captions_audio",
+    audioLanguage: "en",
+    glossaryPresetId: "quality-fixture",
+    glossaryPresetName: "Gemini quality fixture",
+    glossary: QUALITY_GLOSSARY,
+    translationDomain: "Commercial real estate",
+    tone: "business",
+    captionPolishPolicy: "full",
+  });
+  let polishCalls = 0;
+  const finalizer = createCommittedCaptionFinalizer({
+    config,
+    async polish({ translatedText }) {
+      polishCalls += 1;
+      return translatedText;
     },
   });
-  for (let offset = 0; offset < pcm.byteLength; offset += FRAME_BYTES) {
-    if (deadline.aborted) throw deadline.reason;
-    const frame = pcm.slice(offset, Math.min(offset + FRAME_BYTES, pcm.byteLength));
-    if (frame.byteLength < FRAME_BYTES) {
-      const padded = new Uint8Array(FRAME_BYTES);
-      padded.set(frame);
-      await session.sendAudio(padded);
-      padded.fill(0);
-    } else {
-      await session.sendAudio(frame);
+  const utteranceCount = SIMULATED_AUDIO_MILLISECONDS / UTTERANCE_MILLISECONDS;
+  let finalized = 0;
+  for (let index = 0; index < utteranceCount; index += 1) {
+    const qualityCase = QUALITY_CASES[index % QUALITY_CASES.length];
+    const result = await finalizer.finalize(qualityCase);
+    if (!result || qualityCase.requiredTerms.some((term) => !result.text.includes(term))) {
+      throw new Error("QUALITY_GLOSSARY_PARITY_FAILED");
     }
-    await new Promise((resolve) => setTimeout(resolve, 40));
+    finalized += 1;
   }
-  metrics.inputElapsedMilliseconds = Date.now() - startedAt;
-  metrics.backlogAtInputEnd = metrics.utterances - metrics.completedTts;
-  const drainStartedAt = Date.now();
-  const closePromise = session.close();
-  let drainTimeout;
-  const didDrain = await Promise.race([
-    closePromise.then(() => true),
-    new Promise((resolve) => { drainTimeout = setTimeout(() => resolve(false), 30_000); }),
-  ]).finally(() => clearTimeout(drainTimeout));
-  metrics.drainMilliseconds = Date.now() - drainStartedAt;
-  if (!didDrain) {
-    providerAbortController.abort(new Error("QUALITY_BACKLOG_EXCEEDED"));
-    let abortDrainTimeout;
-    await Promise.race([
-      closePromise,
-      new Promise((resolve) => { abortDrainTimeout = setTimeout(resolve, 5_000); }),
-    ]).finally(() => clearTimeout(abortDrainTimeout));
-    throw new Error("QUALITY_BACKLOG_EXCEEDED");
+
+  const liveMetrics = await runLiveCallbackCheck(config);
+  const metrics = Object.freeze({
+    code: "OK",
+    provider: config.provider,
+    voiceProvider: config.voiceProvider,
+    configFingerprint: geminiCaptionConfigFingerprint(config),
+    simulatedAudioMilliseconds: SIMULATED_AUDIO_MILLISECONDS,
+    utterances: utteranceCount,
+    finalized,
+    polishCalls,
+    bidirectionalDirections: config.directions.length,
+    ...liveMetrics,
+  });
+  if (metrics.provider !== "gemini" || metrics.voiceProvider !== "gemini") throw new Error("QUALITY_NON_GEMINI_PROVIDER");
+  if (metrics.finalized !== utteranceCount || metrics.polishCalls !== utteranceCount) throw new Error("QUALITY_FINALIZER_INCOMPLETE");
+  if (metrics.translatedAudioChunks !== 1 || metrics.sameLanguageAudioChunks !== 0) throw new Error("QUALITY_AUDIO_ROUTING_FAILED");
+  return metrics;
+}
+
+async function runLiveCallbackCheck(config) {
+  const sessions = [];
+  const publishedAudioLanguages = [];
+  const pipeline = new LiveMediaPipeline({
+    sessionId: "gemini-quality-fixture",
+    sessionType: "meeting",
+    outputMode: config.outputMode,
+    voiceProvider: config.voiceProvider,
+    languages: config.languages,
+    captionConfig: config,
+    captionConfigFingerprint: geminiCaptionConfigFingerprint(config),
+    dependencies: {
+      liveTranslate: {
+        async open(callbacks) {
+          sessions.push(callbacks);
+          return {
+            async sendAudio() {},
+            async audioStreamEnd() {},
+            async close() {},
+          };
+        },
+      },
+      captionPolish: { async polish({ translatedText }) { return translatedText; } },
+      publisher: {
+        async markLive() {},
+        async publish() {},
+        async publishAudio(_sessionId, language) { publishedAudioLanguages.push(language); },
+      },
+    },
+  });
+  await pipeline.start();
+  try {
+    const englishLane = sessions.find((session) => session.language === "en");
+    if (!englishLane) throw new Error("QUALITY_ENGLISH_LANE_MISSING");
+    await englishLane.onInputObservation({
+      text: "쿠시먼앤드웨이크필드는 노엘을 사용합니다.",
+      languageCode: "ko",
+      isFinal: true,
+    });
+    await englishLane.onAudio({
+      pcm: new Uint8Array(480),
+      sampleRate: 24_000,
+      sourceLanguage: "ko",
+    });
+    const translatedAudioChunks = publishedAudioLanguages.length;
+    await englishLane.onInputObservation({
+      text: "Cushman & Wakefield uses NOEL.",
+      languageCode: "en",
+      isFinal: true,
+    });
+    await englishLane.onAudio({
+      pcm: new Uint8Array(480),
+      sampleRate: 24_000,
+      sourceLanguage: "en",
+    });
+    return {
+      liveSessions: sessions.length,
+      translatedAudioChunks,
+      sameLanguageAudioChunks: publishedAudioLanguages.length - translatedAudioChunks,
+    };
+  } finally {
+    await pipeline.close();
   }
-  if (metrics.utterances === 0) metrics.code = "NO_STABLE_UTTERANCE";
-  else if (metrics.duplicateSourceRanges > 0) metrics.code = "QUALITY_DUPLICATE_OUTPUT";
-  else if (metrics.completedTts === 0) metrics.code = "QUALITY_NO_TTS_OUTPUT";
-  else if (!diarization && Number(metrics.firstTtsAudioMilliseconds) >= 5_000) metrics.code = "QUALITY_FIRST_OUTPUT_SLOW";
-  if (metrics.code !== "OK") process.exitCode = 1;
-} catch (error) {
-  metrics.code = normalizeProbeCode(error);
-  if (Number.isInteger(error?.providerStatusCode)) metrics.grpcStatus = error.providerStatusCode;
-  if (typeof error?.providerReason === "string") metrics.reason = error.providerReason;
-  process.exitCode = 1;
-} finally {
-  providerAbortController.abort(new Error("QUALITY_PROBE_COMPLETE"));
-  await Promise.allSettled([
-    speechClient.close(),
-    translationClient.close(),
-    textToSpeechClient.close(),
-  ]);
-  pcm.fill(0);
-  metrics.elapsedMilliseconds = Date.now() - startedAt;
-  process.stdout.write(`${JSON.stringify(metrics)}\n`);
+}
+
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  try {
+    assertDevelopmentGate(process.env);
+    const metrics = await runGeminiCaptionQualityCheck();
+    process.stdout.write(`${JSON.stringify(metrics)}\n`);
+  } catch (error) {
+    const code = normalizeProbeCode(error);
+    process.stdout.write(`${JSON.stringify({ code })}\n`);
+    process.exitCode = 1;
+  }
 }
 
 function assertDevelopmentGate(environment) {
   if (environment.LIVE_EXTERNAL_ENV !== "development") throw new Error("QUALITY_DEVELOPMENT_ONLY");
-  if (!environment.GOOGLE_CLOUD_PROJECT || environment.GOOGLE_CLOUD_PROJECT !== environment.LIVE_ALLOWED_GCP_PROJECT) {
-    throw new Error("QUALITY_PROJECT_NOT_ALLOWED");
-  }
   if (environment.RUN_LIVE_QUALITY_PROBE !== "I_UNDERSTAND_DEVELOPMENT_ONLY") {
     throw new Error("QUALITY_EXPLICIT_GATE_REQUIRED");
   }
 }
 
 function normalizeProbeCode(error) {
-  const message = error instanceof Error ? error.message : "QUALITY_PROVIDER_FAILED";
-  return /^[A-Z][A-Z0-9_]{2,80}$/u.test(message) ? message : "QUALITY_PROVIDER_FAILED";
+  const message = error instanceof Error ? error.message : "QUALITY_CHECK_FAILED";
+  return /^[A-Z][A-Z0-9_]{2,80}$/u.test(message) ? message : "QUALITY_CHECK_FAILED";
 }

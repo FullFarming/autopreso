@@ -1,6 +1,6 @@
 export type LiveSessionType = "presentation" | "meeting";
 export type LiveOutputMode = "captions" | "captions_audio" | "audio";
-export type LiveVoiceProvider = "gemini" | "openai";
+export type LiveVoiceProvider = "gemini";
 export type GlossaryPack = "general_cre" | "hotel" | "fnb";
 export type VoiceStatus = "disabled" | "analyzing" | "ready" | "unavailable";
 
@@ -27,8 +27,8 @@ export interface LiveSession {
   /** Contract C10: true when a stage/waiting-room cover image was uploaded.
    *  Clients fetch it from GET /api/live-sessions/[id]/cover. */
   hasCoverImage?: boolean;
-  /** Content-hash version of the cover — clients append it as a cache key
-   *  so replacing the cover refreshes already-open stages and viewers. */
+  /** Opaque per-upload version — clients append it as a cache key so replacing
+   *  the cover refreshes already-open stages and viewers. */
   coverImageVersion?: string | null;
 }
 

@@ -196,6 +196,8 @@ export default function LiveStageView({ sessionId }: { sessionId: string }) {
   const visibleParticipants = participants.slice(0, 5);
   const joinedCount = Math.max(session.viewerCount, participants.length);
   const overflowCount = Math.max(0, joinedCount - visibleParticipants.length);
+  const manualJoinUrl = new URL("/watch", window.location.origin).toString();
+  const manualJoinLabel = manualJoinUrl.replace(/^https?:\/\//u, "").replace(/\/$/u, "");
 
   return (
     <main className="live-stage-shell" aria-label="Session stage">
@@ -245,6 +247,10 @@ export default function LiveStageView({ sessionId }: { sessionId: string }) {
                 <span>6-digit access code</span>
                 <strong>{invite.admissionCode}</strong>
               </div>
+              <a className="live-stage-manual-url" href={manualJoinUrl} target="_blank" rel="noreferrer">
+                <span>Join manually</span>
+                <strong>{manualJoinLabel}</strong>
+              </a>
             </aside>
           )}
         </div>

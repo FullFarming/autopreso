@@ -1,6 +1,6 @@
 {
   "name": "realtime-noel",
-  "version": "0.2.1",
+  "version": "0.2.3",
   "description": "Realtime bilingual subtitles and visual note taking.",
   "license": "MIT",
   "author": "Kun Chen <kun@kunchenguid.com>",
@@ -55,6 +55,7 @@
     ],
     "mac": {
       "category": "public.app-category.productivity",
+      "identity": "-",
       "hardenedRuntime": true,
       "entitlements": "build/entitlements.mac.plist",
       "entitlementsInherit": "build/entitlements.mac.plist",

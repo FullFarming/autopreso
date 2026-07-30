@@ -115,15 +115,19 @@ function installDom({ withDesktopFloor = false } = {}) {
   }
   const documentElement = new FakeElement("html");
   let fakeWs = null;
+  const sockets = [];
   class FakeWebSocket {
     constructor() {
       this.readyState = 1;
       this._handlers = {};
       fakeWs = this;
+      sockets.push(this);
     }
     addEventListener(type, cb) { this._handlers[type] = cb; }
     send() {}
     close() {}
+    disconnect() { this._handlers.close?.(); }
+    fail() { this._handlers.error?.(); }
     recv(message) { this._handlers.message?.({ data: JSON.stringify(message) }); }
     open() { this._handlers.open?.(); }
   }
@@ -146,7 +150,7 @@ function installDom({ withDesktopFloor = false } = {}) {
   }
   globalThis.location = { protocol: "http:", host: "localhost:3210" };
   globalThis.WebSocket = FakeWebSocket;
-  return { overlay, getWs: () => fakeWs, fireFloor: (floor) => floorListener?.(floor), zoneText, speakerText };
+  return { overlay, getWs: () => fakeWs, getSockets: () => sockets.slice(), fireFloor: (floor) => floorListener?.(floor), zoneText, speakerText };
 
   function zoneText(zone) {
     const z = overlay.querySelector(`[data-zone="${zone}"]`);
@@ -177,6 +181,56 @@ const SETTINGS = {
     },
   },
 };
+
+test("pipeline recovery statuses never render operational copy on the viewer overlay", async () => {
+  const dom = installDom();
+  await loadOverlay("operator-status-hidden");
+  const ws = dom.getWs();
+  ws.open();
+  ws.recv(SETTINGS);
+
+  ws.recv({ type: "subtitle:status", status: "reconnecting" });
+  ws.recv({ type: "subtitle:status", status: "recovering" });
+  ws.recv({ type: "subtitle:status", status: "degraded" });
+  ws.recv({ type: "subtitle:committed", targetLanguage: "en", translatedText: "" });
+
+  assert.equal(dom.overlay.textContent.trim(), "");
+});
+
+// The gateway already decided direction for every Live Call caption: it picks
+// the lane opposite the detected source and the desktop only forwards that one
+// (shouldDisplayLiveCaption in electron/main.js). The overlay's own direction
+// hysteresis exists for captions-only, where the desktop runs the language
+// arbiter itself. Re-judging a Live Call caption here is a SECOND, unsmoothed
+// decision layer: a sourceLanguage flap between the gateway's own partials made
+// the sentence-lock branch drop captions mid-utterance, so the host saw text
+// being continuously rewritten while the web app — which merges purely on seq —
+// showed the same stream cleanly.
+test("Live Call captions are never dropped by the overlay's direction hysteresis", async () => {
+  const dom = installDom();
+  await loadOverlay("live-direction-not-rejudged");
+  const ws = dom.getWs();
+  ws.open();
+  ws.recv(SETTINGS);
+
+  const liveLine = (translatedText, sourceLanguage) => ws.recv({
+    type: "subtitle:partial",
+    source: "live-call",
+    targetLanguage: "en",
+    sourceLanguage,
+    translationProvider: "gemini",
+    translatedText,
+    liveCallSpeaker: { role: "host" },
+  });
+
+  // An open (unpunctuated) sentence, then the gateway reports a different
+  // source language for the very next partial of the same utterance.
+  liveLine("The quarterly figures are still being consolidated", "ko");
+  assert.match(dom.zoneText("bottom-center"), /quarterly figures/u);
+  liveLine("The quarterly figures are still being consolidated this week", "en");
+  assert.match(dom.zoneText("bottom-center"), /this week/u,
+    "a gateway-side source flap must not make the overlay withhold the caption");
+});
 
 test("a new opposite-direction live line clears the stale reverse lane", async () => {
   const dom = installDom();
@@ -270,7 +324,7 @@ test("append-only word rendering keeps already-shown words stable as a partial g
   assert.match(dom.zoneText("bottom-center"), /expanding rapidly with recovering demand/);
 });
 
-test("Live Call floor boundaries clear only the uncommitted tail while completed sentences linger", async () => {
+test("Live Call floor boundaries preserve the old frame only until the next caption arrives", async () => {
   const dom = installDom({ withDesktopFloor: true });
   await loadOverlay("live-call-floor-boundary");
   const ws = dom.getWs();
@@ -331,7 +385,7 @@ test("Live Call floor boundaries clear only the uncommitted tail while completed
   });
   assert.equal(
     dom.zoneText("bottom-center"),
-    "The host's final sentence remains readable. The participant spoke through the web app.",
+    "The participant spoke through the web app.",
   );
 
   ws.recv({
@@ -344,9 +398,86 @@ test("Live Call floor boundaries clear only the uncommitted tail while completed
   });
   assert.equal(
     dom.zoneText("bottom-center"),
-    "The host's final sentence remains readable. The participant spoke through the web app. A new utterance replaces the old final.",
+    "The participant spoke through the web app. A new utterance replaces the old final.",
     "the same speaker's next completed sentence rolls up below the previous final",
   );
+});
+
+test("a Live Call floor change keeps a partial visible until the next speaker caption replaces it", async () => {
+  const dom = installDom({ withDesktopFloor: true });
+  await loadOverlay("live-call-floor-atomic-replacement");
+  const ws = dom.getWs();
+  ws.open();
+  ws.recv(SETTINGS);
+
+  ws.recv({
+    type: "subtitle:partial",
+    source: "live-call",
+    utteranceKey: "host:17",
+    targetLanguage: "en",
+    sourceLanguage: "ko",
+    translatedText: "The host is finishing the current thought",
+    liveCallSpeaker: { role: "host" },
+    seq: 17,
+  });
+  const previousText = dom.zoneText("bottom-center");
+  assert.equal(dom.speakerText("bottom-center"), "Host");
+
+  dom.fireFloor({ holder: { participantId: "participant-1", name: "김노엘" } });
+  assert.equal(dom.zoneText("bottom-center"), previousText,
+    "floor notification alone must not create an empty caption frame");
+  assert.equal(dom.speakerText("bottom-center"), "Host",
+    "the existing caption keeps its own metadata until the replacement caption arrives");
+
+  ws.recv({
+    type: "subtitle:partial",
+    source: "live-call",
+    utteranceKey: "participant-1:18",
+    targetLanguage: "en",
+    sourceLanguage: "ko",
+    translatedText: "The participant starts a new sentence",
+    liveCallSpeaker: { role: "participant", name: "김노엘", department: "전략기획실", jobTitle: "PM" },
+    seq: 18,
+  });
+  assert.equal(dom.zoneText("bottom-center"), "The participant starts a new sentence",
+    "the first new-speaker caption atomically replaces the stale interim tail");
+  assert.equal(dom.speakerText("bottom-center"), "김노엘 · 전략기획실 · PM",
+    "old metadata must never be attached to the new caption");
+});
+
+test("the first caption after a floor atomically replaces a previous final and its speaker", async () => {
+  const dom = installDom({ withDesktopFloor: true });
+  await loadOverlay("live-call-floor-final-speaker-replacement");
+  const ws = dom.getWs();
+  ws.open();
+  ws.recv(SETTINGS);
+
+  ws.recv({
+    type: "subtitle:committed",
+    source: "live-call",
+    utteranceKey: "host:final:1",
+    targetLanguage: "en",
+    sourceLanguage: "ko",
+    translatedText: "Yes.",
+    liveCallSpeaker: { role: "host" },
+    seq: 1,
+  });
+  dom.fireFloor({ holder: { participantId: "participant-1", name: "김노엘" } });
+  assert.equal(dom.zoneText("bottom-center"), "Yes.");
+  assert.equal(dom.speakerText("bottom-center"), "Host");
+
+  ws.recv({
+    type: "subtitle:partial",
+    source: "live-call",
+    utteranceKey: "participant:partial:2",
+    targetLanguage: "en",
+    sourceLanguage: "ko",
+    translatedText: "Yes.",
+    liveCallSpeaker: { role: "participant", name: "김노엘", department: "전략기획실", jobTitle: "PM" },
+    seq: 2,
+  });
+  assert.equal(dom.zoneText("bottom-center"), "Yes.", "same text from the next speaker must not be deduplicated away");
+  assert.equal(dom.speakerText("bottom-center"), "김노엘 · 전략기획실 · PM");
 });
 
 test("a new Live Call partial keeps the previous final until the next sentence commits", async () => {
@@ -366,7 +497,7 @@ test("a new Live Call partial keeps the previous final until the next sentence c
   );
 });
 
-test("Live Call uses the Caption-only natural flow and configured line budget", async () => {
+test("Live Call uses the natural flow inside a reserved three-line viewport", async () => {
   const dom = installDom();
   await loadOverlay("live-call-movie-row");
   const ws = dom.getWs();
@@ -383,9 +514,9 @@ test("Live Call uses the Caption-only natural flow and configured line budget", 
   const lane = zone?.querySelector(".subtitle-lane");
   const box = zone?.querySelector(".subtitle-box");
   const flow = zone?.querySelector(".subtitle-flow");
-  assert.equal(lane?.classList.contains("is-live-call"), false, "Live Call must not have a renderer fork");
+  assert.equal(lane?.classList.contains("is-live-call"), true, "Live Call gets layout-only stability hooks");
   assert.equal(flow?.children.some((child) => child.tag === "br"), false, "both modes must wrap from one natural word flow");
-  assert.equal(box?.style["--subtitle-line-clamp"], "8", "Live Call follows the same configured budget as Caption-only");
+  assert.equal(box?.style["--subtitle-line-clamp"], "3", "Live Call reserves at most three movie-caption lines");
 });
 
 test("captions-only keeps the reference flow unchanged", async () => {
@@ -393,16 +524,56 @@ test("captions-only keeps the reference flow unchanged", async () => {
   await loadOverlay("caption-reference-flow");
   const ws = dom.getWs();
   ws.open();
-  ws.recv(SETTINGS);
+  ws.recv({
+    ...SETTINGS,
+    settings: { subtitle: { ...SETTINGS.settings.subtitle, maxSubtitleLines: 8 } },
+  });
 
   ws.recv({ type: "subtitle:committed", targetLanguage: "en", sourceLanguage: "ko", translatedText: "Reference final.", seq: 1 });
   ws.recv({ type: "subtitle:partial", targetLanguage: "en", sourceLanguage: "ko", translatedText: "Reference partial continues", seq: 2 });
 
   const zone = dom.overlay.querySelector('[data-zone="bottom-center"]');
   const lane = zone?.querySelector(".subtitle-lane");
+  const box = zone?.querySelector(".subtitle-box");
   const flow = zone?.querySelector(".subtitle-flow");
   assert.equal(lane?.classList.contains("is-live-call"), false);
+  assert.equal(box?.style["--subtitle-line-clamp"], "8",
+    "Live-only viewport reservation must not change Caption-only's configured line budget");
   assert.equal(flow?.children.some((child) => child.tag === "br"), false, "the immutable captions-only renderer keeps its existing continuous flow");
+});
+
+test("a Live Call position change moves the speaker and caption shell together", async () => {
+  const dom = installDom();
+  await loadOverlay("live-position-shell");
+  const ws = dom.getWs();
+  ws.open();
+  ws.recv(SETTINGS);
+  ws.recv({
+    type: "subtitle:partial",
+    source: "live-call",
+    utteranceKey: "participant:position:1",
+    targetLanguage: "en",
+    sourceLanguage: "ko",
+    translationProvider: "gemini",
+    translatedText: "The participant caption moves with its identity",
+    liveCallSpeaker: { role: "participant", name: "김노엘" },
+  });
+
+  ws.recv({
+    ...SETTINGS,
+    settings: {
+      subtitle: {
+        ...SETTINGS.settings.subtitle,
+        subtitlePositions: { en: "top-center", ko: "bottom-center" },
+      },
+    },
+  });
+
+  const top = dom.overlay.querySelector('[data-zone="top-center"]');
+  const shell = top?.querySelector(".subtitle-lane");
+  assert.ok(shell, "the complete Live Call lane must move to the new zone");
+  assert.equal(shell.querySelector(".live-call-speaker-label")?.textContent, "김노엘");
+  assert.match(shell.querySelector(".subtitle-box")?.textContent ?? "", /moves with its identity/u);
 });
 
 test("Live Call speaker identity stays above the caption until its lane or floor clears", async (t) => {
@@ -427,7 +598,7 @@ test("Live Call speaker identity stays above the caption until its lane or floor
   assert.equal(dom.speakerText("bottom-center"), "Host", "identity must not use the previous five-second badge timer");
 
   dom.fireFloor({ holder: { participantId: "participant-1", name: "김노엘" } });
-  assert.equal(dom.speakerText("bottom-center"), "", "a floor boundary clears the previous speaker identity");
+  assert.equal(dom.speakerText("bottom-center"), "Host", "a floor boundary preserves the visible caption and its identity");
 
   ws.recv({
     type: "subtitle:partial",
@@ -438,6 +609,31 @@ test("Live Call speaker identity stays above the caption until its lane or floor
     liveCallSpeaker: { role: "participant", name: "김노엘", department: "전략기획실", jobTitle: "PM" },
   });
   assert.equal(dom.speakerText("bottom-center"), "김노엘 · 전략기획실 · PM");
+});
+
+test("Live Call idle clears both caption text and speaker metadata", async () => {
+  const dom = installDom();
+  await loadOverlay("live-idle-clears-speaker");
+  const ws = dom.getWs();
+  ws.open();
+  ws.recv(SETTINGS);
+  ws.recv({
+    type: "subtitle:partial",
+    source: "live-call",
+    utteranceKey: "host:idle:1",
+    targetLanguage: "en",
+    sourceLanguage: "ko",
+    translationProvider: "gemini",
+    translatedText: "The host caption is currently visible",
+    liveCallSpeaker: { role: "host" },
+  });
+  assert.equal(dom.speakerText("bottom-center"), "Host");
+
+  ws.recv({ type: "subtitle:status", status: "idle" });
+  assert.equal(dom.zoneText("bottom-center"), "");
+  assert.equal(dom.speakerText("bottom-center"), "");
+  const label = dom.overlay.querySelector('[data-zone="bottom-center"]')?.querySelector(".live-call-speaker-label");
+  assert.equal(label?.textContent, "", "idle must clear hidden speaker text, not only hide the row");
 });
 
 test("Live Call final roll-up respects the configured line budget and keeps the newest sentence", async () => {
@@ -588,6 +784,154 @@ test("roll-up offset is monotonic within a subtitle and never bounces back down"
   assert.equal(offsetOf("top-center"), 0, "a new generation resets the roll-up to the top");
 });
 
+test("Live Call roll-up stays monotonic across revisions and utterance keys", async () => {
+  const dom = installDom();
+  await loadOverlay("live-utterance-key-rollup");
+  const ws = dom.getWs();
+  ws.open();
+  ws.recv(SETTINGS);
+
+  const flow = () => dom.overlay.querySelector('[data-zone="bottom-center"]')?.querySelector(".subtitle-flow");
+  const offset = () => Number(String(flow()?.style.transform ?? "").match(/translateY\((-?\d+(?:\.\d+)?)px\)/)?.[1] ?? 0);
+  const partial = (translatedText, utteranceKey) => ws.recv({
+    type: "subtitle:partial", source: "live-call", targetLanguage: "en", sourceLanguage: "ko",
+    translationProvider: "gemini", translatedText, utteranceKey,
+  });
+
+  partial("The market outlook continues improving across every operating segment", "host:42");
+  const firstOffset = offset();
+  assert.ok(firstOffset < 0);
+  partial("Our revised outlook stays positive", "host:42");
+  assert.ok(offset() <= firstOffset,
+    "a shorter head-word polish inside one utterance must not reset monotonic roll-up");
+
+  partial("A short new thought", "host:43");
+  assert.ok(offset() <= firstOffset,
+    "identity metadata must not pull a still-visible Live Call lane back down");
+});
+
+test("Live Call keeps the latest caption inside the viewport after 100 bounded-queue replacements", async () => {
+  const dom = installDom();
+  await loadOverlay("live-bounded-queue-rollup-rebase");
+  const ws = dom.getWs();
+  ws.open();
+  ws.recv(SETTINGS);
+
+  const flow = () => dom.overlay.querySelector('[data-zone="bottom-center"]')?.querySelector(".subtitle-flow");
+  const transformY = () => Number(String(flow()?.style.transform ?? "").match(/translateY\((-?\d+(?:\.\d+)?)px\)/)?.[1] ?? 0);
+  const event = (type, translatedText, sequence) => ws.recv({
+    type,
+    source: "live-call",
+    targetLanguage: "en",
+    sourceLanguage: "ko",
+    translationProvider: "gemini",
+    translatedText,
+    utteranceKey: `host:long-run:${sequence}`,
+    liveCallSpeaker: { role: "host" },
+    seq: sequence,
+  });
+
+  for (let index = 0; index < 120; index += 1) {
+    const sequence = (index * 2) + 1;
+    event("subtitle:partial", `Sentence ${index} temporarily expands across many provisional words before the provider commits it`, sequence);
+    event("subtitle:committed", `Final caption ${index}.`, sequence + 1);
+  }
+
+  const currentFlow = flow();
+  const latest = currentFlow?.lastChild;
+  const latestIndex = (currentFlow?.childNodes.length ?? 0) - 1;
+  const latestTop = (latestIndex * FAKE_LINE_PX) + transformY();
+  const latestBottom = latestTop + FAKE_LINE_PX;
+  assert.match(latest?.textContent ?? "", /119/u, "the bounded model and DOM retain the newest final caption");
+  assert.ok(latestTop < FAKE_VIEW_PX && latestBottom > 0,
+    "the latest caption must intersect the clipped viewport after historical prefixes are removed");
+});
+
+// Live Call follows the captions-only retention cadence: a finished sentence
+// stays readable while the next one grows, then rolls off after
+// SUBTITLE_PREVIOUS_SENTENCE_LINGER_MS. It previously opted out of that timer
+// and dropped the previous sentence only when the bounded queue displaced it,
+// which read as an old sentence sitting indefinitely or vanishing the instant
+// a new one landed.
+test("Live Call keeps a completed sentence for the linger window, then rolls it off", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"] });
+  const dom = installDom();
+  await loadOverlay("live-sentence-linger-trim");
+  const ws = dom.getWs();
+  ws.open();
+  ws.recv(SETTINGS);
+
+  const committed = (translatedText, utteranceKey) => ws.recv({
+    type: "subtitle:committed",
+    source: "live-call",
+    targetLanguage: "en",
+    sourceLanguage: "ko",
+    translationProvider: "gemini",
+    translatedText,
+    utteranceKey,
+    liveCallSpeaker: { role: "host" },
+  });
+
+  committed("The already completed sentence remains part of the rolling caption.", "host:101");
+  committed("The next sentence now continues naturally.", "host:102");
+  assert.match(dom.zoneText("bottom-center"), /already completed/u);
+  assert.match(dom.zoneText("bottom-center"), /continues naturally/u);
+
+  // Still readable partway through the linger window.
+  t.mock.timers.tick(2_000);
+  assert.match(dom.zoneText("bottom-center"), /already completed/u,
+    "a completed sentence must stay readable for the linger window");
+  assert.match(dom.zoneText("bottom-center"), /continues naturally/u);
+
+  // Once the window elapses it rolls off and the newest sentence remains.
+  t.mock.timers.tick(2_000);
+  assert.doesNotMatch(dom.zoneText("bottom-center"), /already completed/u,
+    "the previous sentence rolls off after the linger window, like captions-only");
+  assert.match(dom.zoneText("bottom-center"), /continues naturally/u);
+
+  // New content keeps flowing in and the bounded queue still applies.
+  committed("A third sentence advances the rolling caption.", "host:103");
+  committed("A fourth sentence finally pushes the oldest one beyond the bounded queue.", "host:104");
+  assert.match(dom.zoneText("bottom-center"), /fourth sentence/u);
+  assert.doesNotMatch(dom.zoneText("bottom-center"), /already completed/u);
+
+  // And the linger window rolls those off in turn, leaving the newest.
+  t.mock.timers.tick(4_000);
+  assert.match(dom.zoneText("bottom-center"), /fourth sentence/u);
+  assert.doesNotMatch(dom.zoneText("bottom-center"), /third sentence/u);
+});
+
+test("Live Call roll-up stays monotonic across source sequences when utteranceKey is missing", async () => {
+  const dom = installDom();
+  await loadOverlay("live-source-seq-rollup");
+  const ws = dom.getWs();
+  ws.open();
+  ws.recv(SETTINGS);
+
+  const flow = () => dom.overlay.querySelector('[data-zone="bottom-center"]')?.querySelector(".subtitle-flow");
+  const offset = () => Number(String(flow()?.style.transform ?? "").match(/translateY\((-?\d+(?:\.\d+)?)px\)/)?.[1] ?? 0);
+  const partial = (translatedText, sourceSeq) => ws.recv({
+    type: "subtitle:partial",
+    source: "live-call",
+    targetLanguage: "en",
+    sourceLanguage: "ko",
+    translationProvider: "gemini",
+    translatedText,
+    sourceSeq,
+    liveCallSpeaker: { role: "participant", name: "김노엘" },
+  });
+
+  partial("The market outlook continues improving across every operating segment", 42);
+  const firstOffset = offset();
+  assert.ok(firstOffset < 0);
+  partial("Our revised outlook stays positive", 42);
+  assert.ok(offset() <= firstOffset, "one source sequence must remain one roll-up generation");
+
+  partial("A short new thought", 43);
+  assert.ok(offset() <= firstOffset,
+    "source sequence metadata must not pull a still-visible Live Call lane back down");
+});
+
 test("a transient shorter revision keeps already-shown trailing words (no blink)", async () => {
   const dom = installDom();
   await loadOverlay("no-blink");
@@ -623,6 +967,58 @@ test("a transient shorter revision keeps already-shown trailing words (no blink)
   partial("서울의 호텔 시장은 빠르게 다른방향으로 전환되었습니다");
   const diverged = wordSpans();
   assert.equal(diverged.map((s) => s.textContent.trim()).join(" "), "서울의 호텔 시장은 빠르게 다른방향으로 전환되었습니다");
+});
+
+test("a Live Call final truncates words removed by the provider's shorter final revision", async () => {
+  const dom = installDom();
+  await loadOverlay("live-shorter-final-truncates-tail");
+  const ws = dom.getWs();
+  ws.open();
+  ws.recv(SETTINGS);
+
+  const event = (type, translatedText) => ws.recv({
+    type,
+    source: "live-call",
+    utteranceKey: "host:short-final:1",
+    targetLanguage: "en",
+    sourceLanguage: "ko",
+    translationProvider: "gemini",
+    translatedText,
+    liveCallSpeaker: { role: "host" },
+  });
+  event("subtitle:partial", "The final answer includes a provisional trailing phrase");
+  event("subtitle:partial", "The final answer includes");
+  assert.match(dom.zoneText("bottom-center"), /provisional trailing phrase/u,
+    "a transient shorter partial keeps the no-blink tail");
+
+  event("subtitle:committed", "The final answer includes");
+  assert.equal(dom.zoneText("bottom-center"), "The final answer includes",
+    "committing the shorter Live Call revision must remove stale provisional words");
+});
+
+test("Caption-only keeps its existing shorter-prefix reconciliation on commit", async () => {
+  const dom = installDom();
+  await loadOverlay("caption-shorter-final-unchanged");
+  const ws = dom.getWs();
+  ws.open();
+  ws.recv(SETTINGS);
+
+  ws.recv({
+    type: "subtitle:partial",
+    targetLanguage: "en",
+    sourceLanguage: "ko",
+    translationProvider: "gemini",
+    translatedText: "Caption only keeps the existing provisional trailing words",
+  });
+  ws.recv({
+    type: "subtitle:committed",
+    targetLanguage: "en",
+    sourceLanguage: "ko",
+    translationProvider: "gemini",
+    translatedText: "Caption only keeps the existing",
+  });
+  assert.equal(dom.zoneText("bottom-center"), "Caption only keeps the existing provisional trailing words",
+    "this Live-only fix must not change Caption-only's byte-for-behaviour prefix retention");
 });
 
 // ---- Per-viewer channel (?lang=) ----
@@ -701,6 +1097,106 @@ test("snapshot sequence floor rejects stale replay and duplicate finals", async 
   ws.recv({ type: "subtitle:committed", targetLanguage: "en", sourceLanguage: "ko", translatedText: "Current confirmed caption", seq: 21 });
   const rendered = dom.zoneText("bottom-center");
   assert.equal(rendered.match(/Current confirmed caption/g)?.length, 1);
+});
+
+test("a new streamId resets stale sequence floors before accepting the restarted stream", async () => {
+  const dom = installDom();
+  globalThis.location.search = "";
+  await loadOverlay("stream-id-sequence-reset");
+  const ws = dom.getWs();
+  ws.open();
+  ws.recv(SETTINGS);
+  ws.recv({
+    type: "subtitle:snapshot",
+    streamId: "old-stream",
+    seq: 100,
+    lanes: [
+      {
+        type: "subtitle:committed",
+        source: "live-call",
+        streamId: "old-stream",
+        utteranceKey: "old:host:100",
+        targetLanguage: "en",
+        sourceLanguage: "ko",
+        translatedText: "Old server caption.",
+        liveCallSpeaker: { role: "host" },
+        seq: 100,
+      },
+    ],
+  });
+  assert.match(dom.zoneText("bottom-center"), /Old server/u);
+  assert.equal(dom.speakerText("bottom-center"), "Host");
+
+  ws.recv({ type: "subtitle:snapshot", streamId: "new-stream", seq: 0, lanes: [] });
+  assert.equal(dom.zoneText("bottom-center"), "", "a restarted stream must clear the old server's snapshot");
+  assert.equal(dom.speakerText("bottom-center"), "", "stream replacement must clear stale speaker metadata");
+  ws.recv({
+    type: "subtitle:committed",
+    source: "live-call",
+    streamId: "new-stream",
+    sourceSeq: 1,
+    targetLanguage: "ko",
+    sourceLanguage: "en",
+    translatedText: "New server sequence one is accepted.",
+    liveCallSpeaker: { role: "participant", name: "새 참여자" },
+    seq: 1,
+  });
+  assert.equal(dom.zoneText("top-center"), "New server sequence one is accepted.",
+    "the old stream's direction lock must not reject the restarted stream's reverse language");
+  assert.equal(dom.speakerText("top-center"), "새 참여자");
+});
+
+test("events from an old WebSocket cannot reset or clear the active restarted stream", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"] });
+  const dom = installDom();
+  globalThis.location.search = "";
+  await loadOverlay("old-websocket-fence");
+  const first = dom.getWs();
+  first.open();
+  first.recv(SETTINGS);
+  first.recv({
+    type: "subtitle:committed",
+    streamId: "old-stream",
+    targetLanguage: "en",
+    sourceLanguage: "ko",
+    translatedText: "Old connection caption.",
+    seq: 50,
+  });
+  first.disconnect();
+  t.mock.timers.tick(1500);
+
+  const second = dom.getWs();
+  assert.notEqual(second, first);
+  second.open();
+  second.recv({
+    type: "subtitle:snapshot",
+    streamId: "new-stream",
+    seq: 0,
+    lanes: [],
+  });
+  second.recv({
+    type: "subtitle:committed",
+    streamId: "new-stream",
+    targetLanguage: "ko",
+    sourceLanguage: "en",
+    translatedText: "The active restarted stream stays visible.",
+    seq: 1,
+  });
+  assert.match(dom.zoneText("top-center"), /active restarted stream/u);
+
+  first.recv({
+    type: "subtitle:committed",
+    streamId: "old-stream",
+    targetLanguage: "en",
+    sourceLanguage: "ko",
+    translatedText: "Late stale socket event.",
+    seq: 51,
+  });
+  first.disconnect();
+  first.fail();
+  t.mock.timers.tick(1500);
+  assert.match(dom.zoneText("top-center"), /active restarted stream/u);
+  assert.equal(dom.getSockets().length, 2, "stale close/error events must not schedule another reconnect");
 });
 
 test("partial growth reuses the same live word nodes instead of recreating the row", async () => {

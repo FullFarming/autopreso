@@ -2,7 +2,7 @@ import type { CaptionEvent, LiveSession, LiveSnapshot, SpeakerAssignment } from 
 import { LANGUAGE_CODES } from "../languageDetect";
 import { supabaseAdminHeaders, type SupabaseAdminCredential } from "../security/supabase-server-access";
 import { getLiveStoreConfig } from "./config";
-import { coverImageVersionFromPath } from "./cover-image";
+import { coverImagePath, coverImageVersionFromPath } from "./cover-image";
 import { LiveSessionError } from "./errors";
 
 const CANONICAL_LANGUAGE_CODES = new Set<string>(LANGUAGE_CODES);
@@ -21,7 +21,7 @@ export interface LiveSessionStore {
   resumeOwned(sessionId: string, hostId: string, expectedVersion: number): Promise<LiveSession | null>;
   terminateOwned(sessionId: string, hostId: string): Promise<boolean>;
   /** Contract C10: record that a cover image object exists for the session. */
-  setCoverImageOwned(sessionId: string, hostId: string, path: string): Promise<boolean>;
+  setCoverImageOwned(sessionId: string, hostId: string, path: string, expectedCurrentPath: string | null): Promise<boolean>;
   listOwnedActive(hostId: string): Promise<LiveSession[]>;
   getSnapshot(sessionId: string, language: string): Promise<LiveSnapshot | null>;
 }
@@ -157,11 +157,18 @@ export class MemoryLiveSessionStore implements LiveSessionStore {
       .map((session) => structuredClone(session));
   }
 
-  async setCoverImageOwned(sessionId: string, hostId: string, path: string): Promise<boolean> {
+  async setCoverImageOwned(
+    sessionId: string,
+    hostId: string,
+    path: string,
+    expectedCurrentPath: string | null,
+  ): Promise<boolean> {
     const current = this.sessions.get(sessionId);
+    const currentPath = current?.coverImageVersion ? coverImagePath(sessionId, current.coverImageVersion) : null;
     if (!current
       || current.hostId !== hostId
-      || current.status === "stopped"
+      || !ACTIVE_SESSION_STATUSES.includes(current.status)
+      || currentPath !== expectedCurrentPath
       || Date.parse(current.expiresAt) <= this.now()
       || !path) return false;
     this.sessions.set(sessionId, { ...current, hasCoverImage: true, coverImageVersion: coverImageVersionFromPath(path) });
@@ -348,13 +355,19 @@ export class SupabaseLiveSessionStore implements LiveSessionStore {
     return rows.map(fromRow);
   }
 
-  async setCoverImageOwned(sessionId: string, hostId: string, path: string): Promise<boolean> {
+  async setCoverImageOwned(
+    sessionId: string,
+    hostId: string,
+    path: string,
+    expectedCurrentPath: string | null,
+  ): Promise<boolean> {
     if (!path) return false;
     const query = new URLSearchParams({
       id: `eq.${sessionId}`,
       host_id: `eq.${hostId}`,
-      status: "neq.stopped",
+      status: `in.(${ACTIVE_SESSION_STATUSES.join(",")})`,
       expires_at: `gt.${new Date().toISOString()}`,
+      cover_image_path: expectedCurrentPath === null ? "is.null" : `eq.${expectedCurrentPath}`,
     });
     const rows = await this.request<SupabaseSessionRow[]>(`/rest/v1/live_sessions?${query}`, {
       method: "PATCH",
@@ -459,10 +472,7 @@ function fromRow(row: SupabaseSessionRow): LiveSession {
   }
   const sessionType = row.session_type ?? normalizeLegacySessionType(row.mode);
   const outputMode = row.output_mode ?? normalizeLegacyOutputMode(row.mode, row.voice_output_mode);
-  const voiceProvider = row.voice_provider;
-  if (voiceProvider === "openai" && (sessionType !== "presentation" || outputMode === "captions")) {
-    throw new LiveSessionError("저장된 음성 출력 설정이 올바르지 않습니다.", "INVALID_STORED_SESSION", 500);
-  }
+  const voiceProvider: LiveSession["voiceProvider"] = "gemini";
   return {
     id: row.id,
     hostId: row.host_id,

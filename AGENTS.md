@@ -168,11 +168,10 @@ desktop's own local engine; `electron/main.js` fans those to all renderers as
   `createGatewayServer` in `src/gateway-server.js` accepts exactly one WebSocket
   path, `/live`, for both host and viewer roles, and owns session lifecycle, the
   speaking floor, viewer topics, and per-language caption sequencing.
-  `src/live-media-pipeline.js` is the STT/translate/TTS pipeline; provider
-  adapters live in `google-provider-adapters.js` and
-  `openai-realtime-translation.js`; Supabase RPC wrappers in
-  `supabase-adapters.js`. Deployment and IAM constraints are in
-  `media-gateway/README.md` (Korean).
+  `src/live-media-pipeline.js` is the STT/translate/TTS pipeline; the active
+  Gemini STT/translation/TTS adapters live in `google-provider-adapters.js`;
+  Supabase RPC wrappers live in `supabase-adapters.js`. Deployment and IAM
+  constraints are in `media-gateway/README.md` (Korean).
 - **`webapp/`** is the Next.js participant app *and* the host-facing REST API the
   desktop main process calls (`/api/login`, `/api/live-sessions`,
   `.../gateway-token`, `/api/live-config` for the gateway URL).

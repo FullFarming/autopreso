@@ -2,11 +2,12 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { AUDIO_CONFIG, readGatewayEnvironment, validateLiveSettings } from "../src/config.js";
+import * as gatewayConfig from "../src/config.js";
+import { geminiCaptionConfigFingerprint } from "../../packages/caption-core/index.js";
 
 function gatewayEnvironment() {
   return {
     GEMINI_API_KEY: "test-key",
-    OPENAI_API_KEY: "sk-test-key",
     GEMINI_LIVE_MODEL: "live-model",
     GOOGLE_CLOUD_PROJECT: "dev-project",
     SUPABASE_URL: "https://dev-ref.supabase.co",
@@ -32,8 +33,14 @@ test("live audio settings use the documented audio-only envelope", () => {
   });
 });
 
+test("gateway config exposes no retired OpenAI translation language registry", () => {
+  assert.equal("OPENAI_REALTIME_TRANSLATION_LANGUAGES" in gatewayConfig, false);
+});
+
 test("live settings accept one to three unique languages", () => {
-  assert.deepEqual(validateLiveSettings({ sessionType: "meeting", languages: ["ko-KR", "en-US"] }), {
+  const validated = validateLiveSettings({ sessionType: "meeting", languages: ["ko-KR", "en-US"] });
+  const { captionConfig, captionConfigFingerprint, ...settings } = validated;
+  assert.deepEqual(settings, {
     sessionType: "meeting",
     languages: ["ko", "en"],
     outputMode: "captions",
@@ -44,15 +51,18 @@ test("live settings accept one to three unique languages", () => {
     translationTone: "natural",
     domainText: "",
   });
+  assert.equal(captionConfig.provider, "gemini");
+  assert.equal(captionConfig.voiceProvider, "gemini");
+  assert.match(captionConfigFingerprint, /^gemini-caption-v1-[a-f0-9]{16}$/u);
   const legacyTownhall = validateLiveSettings({ mode: "townhall", languages: ["ko"], voiceOutputMode: "auto_voice" });
   assert.equal(legacyTownhall.sessionType, "meeting");
   assert.equal(legacyTownhall.outputMode, "audio");
   assert.equal(validateLiveSettings({ sessionType: "presentation", outputMode: "captions_audio", languages: ["ko"] }).outputMode, "captions_audio");
-  assert.equal(validateLiveSettings({ sessionType: "presentation", outputMode: "captions_audio", voiceProvider: "openai", languages: ["ko"] }).voiceProvider, "openai");
-  assert.throws(() => validateLiveSettings({ sessionType: "presentation", outputMode: "audio", voiceProvider: "openai", languages: ["th"] }), /언어 코드/u);
+  assert.equal(validateLiveSettings({ sessionType: "presentation", outputMode: "captions_audio", voiceProvider: "openai", languages: ["ko"] }).voiceProvider, "gemini");
+  assert.equal(validateLiveSettings({ sessionType: "presentation", outputMode: "audio", voiceProvider: "openai", languages: ["it"] }).voiceProvider, "gemini");
   assert.throws(() => validateLiveSettings({ sessionType: "presentation", outputMode: "audio", voiceProvider: "unknown", languages: ["ko"] }), /음성 공급자/u);
-  assert.throws(() => validateLiveSettings({ sessionType: "presentation", outputMode: "captions", voiceProvider: "openai", languages: ["ko"] }), /프레젠테이션 음성 출력/u);
-  assert.throws(() => validateLiveSettings({ sessionType: "meeting", outputMode: "audio", voiceProvider: "openai", languages: ["ko"] }), /프레젠테이션 음성 출력/u);
+  assert.equal(validateLiveSettings({ sessionType: "presentation", outputMode: "captions", voiceProvider: "openai", languages: ["ko"] }).voiceProvider, "gemini");
+  assert.equal(validateLiveSettings({ sessionType: "meeting", outputMode: "audio", voiceProvider: "openai", languages: ["ko"] }).voiceProvider, "gemini");
   assert.throws(() => validateLiveSettings({ sessionType: "meeting", outputMode: "clone_voice", languages: ["ko"] }), /음성 출력/u);
   assert.throws(() => validateLiveSettings({ sessionType: "meeting", maxViewers: 51, languages: ["ko"] }), /50명/u);
   assert.throws(() => validateLiveSettings({ sessionType: "meeting", glossaryPack: "unknown", languages: ["ko"] }), /용어집/u);
@@ -61,6 +71,28 @@ test("live settings accept one to three unique languages", () => {
   assert.throws(() => validateLiveSettings({ sessionType: "meeting", languages: ["ko", "ko"] }), /중복/);
   assert.throws(() => validateLiveSettings({ sessionType: "meeting", languages: ["en", "en-US"] }), /중복/);
   assert.throws(() => validateLiveSettings({ sessionType: "meeting", languages: ["xx"] }), /언어 코드/u);
+});
+
+test("non-default Live Call settings round-trip through one canonical Gemini config", () => {
+  const settings = validateLiveSettings({
+    sessionType: "presentation",
+    languages: ["ko", "en"],
+    outputMode: "audio",
+    audioLanguage: "en",
+    voiceProvider: "gemini",
+    maxViewers: 24,
+    glossaryPack: "hotel",
+    glossaryText: "순영업소득 = NOI",
+    translationTone: "business",
+    domainText: "Hospitality investment",
+  });
+  assert.equal(settings.captionConfig.audioLanguage, "en");
+  assert.equal(settings.captionConfig.outputMode, "audio");
+  assert.equal(settings.captionConfig.preset.id, "hotel");
+  assert.equal(settings.captionConfig.glossary, "순영업소득 = NOI");
+  assert.equal(settings.captionConfig.tone, "business");
+  assert.equal(settings.captionConfig.domain, "Hospitality investment");
+  assert.equal(settings.captionConfigFingerprint, geminiCaptionConfigFingerprint(settings.captionConfig));
 });
 
 test("gateway refuses short signing secrets at startup", () => {
@@ -159,15 +191,15 @@ test("host reconnect grace window covers the desktop's maximum retry and honors 
   );
 });
 
-test("gateway keeps the OpenAI key in internal server config", () => {
+test("gateway ignores a stale OpenAI translation key in Gemini-only config", () => {
   const config = readGatewayEnvironment({ ...gatewayEnvironment(), OPENAI_API_KEY: "sk-server-only" });
-  assert.equal(config.openaiApiKey, "sk-server-only");
+  assert.equal(config.openaiApiKey, undefined);
 });
 
-test("gateway fails fast when the server-only OpenAI key is missing", () => {
-  const environment = gatewayEnvironment();
-  delete environment.OPENAI_API_KEY;
-  assert.throws(() => readGatewayEnvironment(environment), /OPENAI_API_KEY/u);
+test("gateway does not require an OpenAI key", () => {
+  const config = readGatewayEnvironment(gatewayEnvironment());
+  assert.equal(config.geminiApiKey, "test-key");
+  assert.equal(config.openaiApiKey, undefined);
 });
 
 test("live settings accept an optional desktop glossary text and cap its size", () => {

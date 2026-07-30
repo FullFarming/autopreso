@@ -20,10 +20,17 @@ const HISTORY_TIME_ZONE = "Asia/Seoul";
 const INPUT_SIGNAL_THRESHOLD = 0.035;
 const INPUT_SILENCE_WARNING_MS = 5000;
 const INPUT_STATUS_BROADCAST_MS = 1000;
+const LIVE_TRANSLATION_STALL_MILLISECONDS = 2_000;
+const LIVE_TRANSLATION_SIGNAL_GAP_MILLISECONDS = 250;
 const CAPTURE_TIMEOUT_MS = 8000;
+const WEBSOCKET_OPEN_TIMEOUT_MS = 5_000;
+const SUBTITLE_START_ACK_TIMEOUT_MS = 10_000;
+const SUBTITLE_PREFLIGHT_ACK_TIMEOUT_MS = 2_000;
 // Normal translated sentences can exceed three seconds. This cap prevents
 // unbounded memory growth while preserving ordinary continuous speech.
 const MAX_TRANSLATED_AUDIO_QUEUE_SECONDS = 30;
+const DEFAULT_GLOSSARY_PRESET_ID = "default-cre-ai-en-ko";
+const CUSTOM_GLOSSARY_PRESET_VALUE = "custom";
 const DEFAULT_SUBTITLE = {
   inputMode: "system_mic",
   micDeviceId: "",
@@ -36,7 +43,7 @@ const DEFAULT_SUBTITLE = {
   displayMode: "translation_only",
   showSourceText: false,
   translateAllLanguages: false,
-  model: "gpt-realtime-translate",
+  model: "gemini-3.5-live-translate-preview",
   fontFamily: "Arial, Helvetica, sans-serif",
   translationFontSize: 38,
   sourceFontSize: 36,
@@ -53,12 +60,10 @@ const DEFAULT_SUBTITLE = {
   translationProvider: "gemini",
   glossary: "",
   translationDomain: "",
+  glossaryPresetId: DEFAULT_GLOSSARY_PRESET_ID,
+  glossaryPresetName: "",
   verticalOffset: 48,
 };
-
-const OPENAI_REALTIME_TRANSLATION_LANGUAGES = new Set([
-  "en", "es", "pt", "fr", "ja", "ru", "zh", "de", "ko", "hi", "id", "vi", "it",
-]);
 
 const state = {
   ws: null,
@@ -68,13 +73,85 @@ const state = {
   streamers: [],
   running: false,
   hasOpenAIKey: false,
-  hasOpenAISecondaryKey: false,
   hasGeminiKey: false,
   hasGeminiSecondaryKey: false,
   previewStatusTimer: null,
   history: { records: [], topics: [], historyDays: [], recorderStatus: {} },
   audioMeters: new Map(),
 };
+
+const CAPTION_RUNTIME_TRANSITIONS = Object.freeze({
+  idle: new Set(["starting"]),
+  starting: new Set(["running", "stopping", "failed"]),
+  running: new Set(["reconnecting", "stopping"]),
+  reconnecting: new Set(["running", "stopping", "failed"]),
+  stopping: new Set(["idle"]),
+  failed: new Set(["idle", "starting", "reconnecting", "stopping"]),
+});
+let captionRuntimeState = "idle";
+let liveTranslationReconnectPromise = null;
+let captionWebSocketReconnectTimer = null;
+let liveCaptionSocketRecoveryPromise = null;
+let liveCaptionSocketRecoveryTimer = null;
+
+function createLiveTranslationStallMonitor(
+  onStall,
+  stallMilliseconds = LIVE_TRANSLATION_STALL_MILLISECONDS,
+  signalGapMilliseconds = LIVE_TRANSLATION_SIGNAL_GAP_MILLISECONDS,
+) {
+  const signalBySource = new Map();
+  let signalWindowStartedAt = null;
+  let lastSignalAt = null;
+  let isRecoveryRequested = false;
+
+  const suspend = () => {
+    signalBySource.clear();
+    signalWindowStartedAt = null;
+    lastSignalAt = null;
+  };
+
+  return {
+    noteInput(source, hasSignal, now, isEligible) {
+      signalBySource.set(source, hasSignal === true);
+      if (!isEligible) {
+        suspend();
+        return false;
+      }
+      if (![...signalBySource.values()].some(Boolean)) return false;
+      if (lastSignalAt === null || now - lastSignalAt > signalGapMilliseconds) signalWindowStartedAt = now;
+      lastSignalAt = now;
+      if (isRecoveryRequested || signalWindowStartedAt === null || now - signalWindowStartedAt < stallMilliseconds) return false;
+      isRecoveryRequested = true;
+      onStall();
+      return true;
+    },
+    noteOutput(now) {
+      isRecoveryRequested = false;
+      const hasSignal = [...signalBySource.values()].some(Boolean);
+      signalWindowStartedAt = hasSignal ? now : null;
+      lastSignalAt = hasSignal ? now : null;
+    },
+    suspend,
+    reset() {
+      suspend();
+      isRecoveryRequested = false;
+    },
+  };
+}
+
+const liveTranslationStallMonitor = createLiveTranslationStallMonitor(() => {
+  void reconnectLiveCallTranslation();
+});
+
+function transitionCaptionRuntime(nextState) {
+  if (captionRuntimeState === nextState) return true;
+  if (!CAPTION_RUNTIME_TRANSITIONS[captionRuntimeState]?.has(nextState)) {
+    console.warn(`[subtitle-runtime] ignored invalid transition ${captionRuntimeState} -> ${nextState}`);
+    return false;
+  }
+  captionRuntimeState = nextState;
+  return true;
+}
 
 const form = document.getElementById("subtitle-settings");
 const startButton = document.getElementById("start-subtitles");
@@ -96,12 +173,9 @@ const preview = document.getElementById("subtitle-preview");
 const previewPanel = preview.closest(".preview-panel");
 const micSelect = form.elements.micDeviceId;
 const openaiKeyInput = form.elements.openaiKey;
-const openaiSecondaryKeyInput = form.elements.openaiSecondaryKey;
 const opacityValue = document.getElementById("opacity-value");
 const saveOpenAIKeyButton = document.getElementById("save-openai-key");
 const openaiKeyStatus = document.getElementById("openai-key-status");
-const saveOpenAISecondaryKeyButton = document.getElementById("save-openai-secondary-key");
-const openaiSecondaryKeyStatus = document.getElementById("openai-secondary-key-status");
 const geminiKeyInput = form.elements.geminiKey;
 const saveGeminiKeyButton = document.getElementById("save-gemini-key");
 const geminiKeyStatus = document.getElementById("gemini-key-status");
@@ -183,17 +257,20 @@ function showFileProtocolWarning() {
 }
 
 form.addEventListener("input", (event) => {
-  if (event.target === openaiKeyInput || event.target === openaiSecondaryKeyInput || event.target === geminiKeyInput || event.target === geminiSecondaryKeyInput) return;
+  if (event.target === openaiKeyInput || event.target === geminiKeyInput || event.target === geminiSecondaryKeyInput || event.target === glossaryPresetNameInput) return;
+  if (event.target === form.elements.glossary
+    || event.target === form.elements.translationDomain
+    || event.target?.name === "translationLanguages") {
+    markGlossaryPresetCustom();
+  }
   const previousSettings = state.settings;
   syncLinkedControl(event.target);
   syncLanguageControls(event.target);
   syncAudioLanguageOptions(readTranslationLanguagesFromForm(), form.elements.audioLanguage?.value);
-  enforcePtOutputAvailability();
   state.settings = readSettingsFromForm();
   if (event.target?.name === "audioVolume") subtitleAudioPlayer.setVolume(state.settings.audioVolume);
-  if (["outputMode", "voiceProvider", "audioLanguage", "translationLanguages"].includes(event.target?.name)
+  if (["outputMode", "audioLanguage", "translationLanguages"].includes(event.target?.name)
     && (previousSettings.outputMode !== state.settings.outputMode
-      || previousSettings.voiceProvider !== state.settings.voiceProvider
       || previousSettings.audioLanguage !== state.settings.audioLanguage
       || event.target?.name === "translationLanguages")) {
     subtitleAudioPlayer.clear();
@@ -213,12 +290,12 @@ form.addEventListener("input", (event) => {
 // Settings that change the SET of translation channels (which languages, which
 // engine). When one of these changes mid-session the running channels are stale
 // and keep translating the old configuration — so we rebuild them.
-const CHANNEL_REBUILD_CONTROLS = new Set(["translationLanguages", "outputMode", "voiceProvider", "audioLanguage"]);
+const CHANNEL_REBUILD_CONTROLS = new Set(["translationLanguages", "outputMode", "audioLanguage"]);
 
 form.addEventListener("change", (event) => {
+  if (event.target === glossaryPresetNameInput) return;
   syncLanguageControls(event.target);
   syncAudioLanguageOptions(readTranslationLanguagesFromForm(), form.elements.audioLanguage?.value);
-  enforcePtOutputAvailability();
   state.settings = readSettingsFromForm();
   updatePtOutputControls();
   updateAudioInspectorLabels();
@@ -246,7 +323,7 @@ form.addEventListener("change", (event) => {
 
 startButton.addEventListener("click", startSubtitles);
 stopButton.addEventListener("click", stopSubtitles);
-controllerRestartButton?.addEventListener("click", restartSubtitles);
+controllerRestartButton?.addEventListener("click", restartCaptionsFromController);
 controllerStopButton?.addEventListener("click", stopSubtitles);
 controllerFontDownButton?.addEventListener("click", () => adjustControllerFontSize(-2));
 controllerFontUpButton?.addEventListener("click", () => adjustControllerFontSize(2));
@@ -258,7 +335,6 @@ for (const button of controllerPositionButtons) {
 }
 initCaptionControllerDrag();
 saveOpenAIKeyButton.addEventListener("click", saveOpenAIKey);
-saveOpenAISecondaryKeyButton.addEventListener("click", saveOpenAISecondaryKey);
 saveGeminiKeyButton.addEventListener("click", saveGeminiKey);
 saveGeminiSecondaryKeyButton?.addEventListener("click", saveGeminiSecondaryKey);
 // Download the un-cleared translation history as an Excel-compatible CSV.
@@ -356,28 +432,296 @@ importSettingsFileInput?.addEventListener("change", async (event) => {
   if (file) await importSettingsFromFile(file);
 });
 
-// Built-in industry glossary presets: selecting one fills glossary + domain +
-// language pair together and saves, so a prepared meeting type (hotel
-// investment EN↔KO, F&B leasing KO↔JA, …) is one click away.
+// Built-ins remain local and deterministic; only user-created presets cross
+// the authenticated Electron bridge. Keeping both sources in one native select
+// preserves keyboard, screen-reader, and older-browser behaviour.
 let glossaryPresets = [];
-async function hydrateGlossaryPresets() {
-  const select = form.elements.glossaryPreset;
-  if (!select) return;
-  try {
-    glossaryPresets = await fetch("/api/glossary-presets").then((res) => res.json());
-    for (const preset of glossaryPresets) {
-      select.append(new Option(`${preset.label} — ${preset.industry}`, preset.id));
-    }
-  } catch {
-    // Presets are a convenience; the manual glossary textarea still works.
+let syncedGlossaryPresets = [];
+let builtInGlossaryPresetStatus = "pending";
+let syncedGlossaryPresetStatus = "pending";
+let editingCustomPreset = null;
+let isGlossaryPresetBusy = false;
+let isGlossaryDeleteConfirmationOpen = false;
+
+const glossaryPresetSelect = form.elements.glossaryPreset;
+const glossaryPresetEditor = document.getElementById("glossary-preset-editor");
+const glossaryPresetNameInput = document.getElementById("glossary-preset-name");
+const createGlossaryPresetButton = document.getElementById("create-glossary-preset");
+const saveGlossaryPresetButton = document.getElementById("save-glossary-preset");
+const cancelGlossaryPresetButton = document.getElementById("cancel-glossary-preset");
+const updateGlossaryPresetButton = document.getElementById("update-glossary-preset");
+const deleteGlossaryPresetButton = document.getElementById("delete-glossary-preset");
+const confirmDeleteGlossaryPresetButton = document.getElementById("confirm-delete-glossary-preset");
+const cancelDeleteGlossaryPresetButton = document.getElementById("cancel-delete-glossary-preset");
+const glossaryPresetActions = document.querySelector(".glossary-preset-actions");
+const glossaryPresetStatus = document.getElementById("glossary-preset-status");
+
+const GLOSSARY_PRESET_ERROR_CODES = new Set([
+  "HOST_LOGIN_REQUIRED",
+  "NETWORK_UNAVAILABLE",
+  "INVALID_GLOSSARY_PRESET",
+  "GLOSSARY_PRESET_LIMIT_REACHED",
+  "GLOSSARY_PRESET_NAME_CONFLICT",
+  "GLOSSARY_PRESET_VERSION_CONFLICT",
+  "GLOSSARY_PRESET_NOT_FOUND",
+  "DESKTOP_BRIDGE_UNAVAILABLE",
+]);
+
+function glossaryPresetDisplayName(preset) {
+  return String(preset?.name ?? preset?.label ?? "").trim();
+}
+
+function normalizeSyncedGlossaryPreset(value) {
+  if (!value || typeof value !== "object") return null;
+  const id = String(value.id ?? "").trim();
+  const name = String(value.name ?? "").trim();
+  const languageA = String(value.languagePair?.a ?? "").trim();
+  const languageB = String(value.languagePair?.b ?? "").trim();
+  const version = Number(value.version);
+  if (!id || !name || !languageA || !languageB || !Number.isSafeInteger(version) || version < 1) return null;
+  return {
+    id,
+    name,
+    domain: String(value.domain ?? ""),
+    glossary: String(value.glossary ?? ""),
+    languagePair: { a: languageA, b: languageB },
+    version,
+    updatedAt: String(value.updatedAt ?? ""),
+    source: "user",
+  };
+}
+
+function findGlossaryPreset(presetId) {
+  const builtIn = glossaryPresets.find((entry) => entry.id === presetId);
+  if (builtIn) return { ...builtIn, source: "builtin" };
+  return syncedGlossaryPresets.find((entry) => entry.id === presetId) ?? null;
+}
+
+function createGlossaryPresetOption(preset, source) {
+  const option = document.createElement("option");
+  option.value = preset.id;
+  option.dataset.source = source;
+  option.dataset.name = glossaryPresetDisplayName(preset);
+  option.textContent = source === "builtin" && preset.industry
+    ? `${preset.label} — ${preset.industry}`
+    : glossaryPresetDisplayName(preset);
+  return option;
+}
+
+function appendCachedGlossaryPresetOption(presetId, presetName) {
+  const group = document.getElementById("glossary-preset-users");
+  if (!group || !presetId || !presetName) return null;
+  const option = document.createElement("option");
+  option.value = presetId;
+  option.dataset.source = "cached";
+  option.dataset.name = presetName;
+  option.textContent = `${presetName} (${t("glossary.cachedSuffix")})`;
+  group.append(option);
+  return option;
+}
+
+function renderGlossaryPresetOptions({ persistConfirmedMissing = false } = {}) {
+  if (!glossaryPresetSelect) return;
+  const customOption = document.createElement("option");
+  customOption.value = CUSTOM_GLOSSARY_PRESET_VALUE;
+  customOption.textContent = t("glossary.presetCustom");
+
+  const builtInGroup = document.createElement("optgroup");
+  builtInGroup.id = "glossary-preset-builtins";
+  builtInGroup.label = t("glossary.groupBuiltIn");
+  for (const preset of glossaryPresets) builtInGroup.append(createGlossaryPresetOption(preset, "builtin"));
+
+  const userGroup = document.createElement("optgroup");
+  userGroup.id = "glossary-preset-users";
+  userGroup.label = t("glossary.groupSynced");
+  for (const preset of syncedGlossaryPresets) userGroup.append(createGlossaryPresetOption(preset, "user"));
+  glossaryPresetSelect.replaceChildren(customOption, builtInGroup, userGroup);
+  restoreGlossaryPresetSelection(
+    state.settings?.glossaryPresetId,
+    state.settings?.glossaryPresetName,
+    { persistConfirmedMissing },
+  );
+}
+
+function selectedGlossaryPresetId() {
+  const value = glossaryPresetSelect?.value ?? CUSTOM_GLOSSARY_PRESET_VALUE;
+  return value === CUSTOM_GLOSSARY_PRESET_VALUE ? "" : value;
+}
+
+function selectedGlossaryPresetName() {
+  const option = glossaryPresetSelect?.selectedOptions?.[0];
+  return option?.dataset?.source === "user" || option?.dataset?.source === "cached"
+    ? String(option.dataset.name ?? "")
+    : "";
+}
+
+function selectedEditableGlossaryPreset() {
+  if (editingCustomPreset) return editingCustomPreset;
+  return syncedGlossaryPresets.find((preset) => preset.id === selectedGlossaryPresetId()) ?? null;
+}
+
+function syncGlossaryPresetActions() {
+  const editablePreset = selectedEditableGlossaryPreset();
+  const canEdit = Boolean(editablePreset && Number.isSafeInteger(editablePreset.version));
+  if (updateGlossaryPresetButton) {
+    updateGlossaryPresetButton.hidden = !canEdit || isGlossaryDeleteConfirmationOpen;
+    updateGlossaryPresetButton.disabled = isGlossaryPresetBusy;
+  }
+  if (deleteGlossaryPresetButton) {
+    deleteGlossaryPresetButton.hidden = !canEdit || isGlossaryDeleteConfirmationOpen;
+    deleteGlossaryPresetButton.disabled = isGlossaryPresetBusy;
+  }
+  if (confirmDeleteGlossaryPresetButton) {
+    confirmDeleteGlossaryPresetButton.hidden = !canEdit || !isGlossaryDeleteConfirmationOpen;
+    confirmDeleteGlossaryPresetButton.disabled = isGlossaryPresetBusy;
+  }
+  if (cancelDeleteGlossaryPresetButton) {
+    cancelDeleteGlossaryPresetButton.hidden = !canEdit || !isGlossaryDeleteConfirmationOpen;
+    cancelDeleteGlossaryPresetButton.disabled = isGlossaryPresetBusy;
   }
 }
-hydrateGlossaryPresets();
-form.elements.glossaryPreset?.addEventListener("change", (event) => applyGlossaryPreset(event.target.value));
+
+function openGlossaryPresetDeleteConfirmation() {
+  const current = selectedEditableGlossaryPreset();
+  if (!current || isGlossaryPresetBusy) return;
+  isGlossaryDeleteConfirmationOpen = true;
+  setGlossaryPresetStatus(t("glossary.deleteConfirm", { name: current.name }));
+  syncGlossaryPresetActions();
+  confirmDeleteGlossaryPresetButton?.focus();
+}
+
+function closeGlossaryPresetDeleteConfirmation({ restoreFocus = true, clearStatus = true } = {}) {
+  if (!isGlossaryDeleteConfirmationOpen) return;
+  isGlossaryDeleteConfirmationOpen = false;
+  syncGlossaryPresetActions();
+  if (clearStatus) setGlossaryPresetStatus();
+  if (restoreFocus && !deleteGlossaryPresetButton?.hidden) deleteGlossaryPresetButton.focus();
+}
+
+function setGlossaryPresetStatus(message = "", kind = "") {
+  if (!glossaryPresetStatus) return;
+  glossaryPresetStatus.textContent = message;
+  glossaryPresetStatus.classList.toggle("is-error", kind === "error");
+}
+
+function persistMissingGlossaryPresetReference() {
+  if (!state.settings?.glossaryPresetId && !state.settings?.glossaryPresetName) return;
+  state.settings = { ...state.settings, glossaryPresetId: "", glossaryPresetName: "" };
+  void saveSettings({ subtitle: state.settings }).catch(showError);
+}
+
+function restoreGlossaryPresetSelection(presetId, presetName = "", { persistConfirmedMissing = false } = {}) {
+  if (!glossaryPresetSelect) return;
+  const requestedId = String(presetId ?? "").trim();
+  const requestedName = String(presetName ?? "").trim();
+  if (!requestedId) {
+    glossaryPresetSelect.value = CUSTOM_GLOSSARY_PRESET_VALUE;
+    syncGlossaryPresetActions();
+    return;
+  }
+
+  let option = [...glossaryPresetSelect.options].find((entry) => entry.value === requestedId);
+  const isConfirmedMissingUserPreset = Boolean(requestedName) && syncedGlossaryPresetStatus === "loaded";
+  const isConfirmedMissingBuiltInPreset = !requestedName && builtInGlossaryPresetStatus === "loaded";
+  if (!option && requestedName && !isConfirmedMissingUserPreset) {
+    option = appendCachedGlossaryPresetOption(requestedId, requestedName);
+  }
+  if (option) {
+    glossaryPresetSelect.value = requestedId;
+    syncGlossaryPresetActions();
+    return;
+  }
+
+  glossaryPresetSelect.value = CUSTOM_GLOSSARY_PRESET_VALUE;
+  if ((isConfirmedMissingUserPreset || isConfirmedMissingBuiltInPreset) && persistConfirmedMissing) {
+    editingCustomPreset = null;
+    setGlossaryPresetStatus(t("glossary.remoteMissing"), "error");
+    persistMissingGlossaryPresetReference();
+  }
+  syncGlossaryPresetActions();
+}
+
+function markGlossaryPresetCustom() {
+  const selectedUserPreset = syncedGlossaryPresets.find((preset) => preset.id === selectedGlossaryPresetId());
+  if (selectedUserPreset) editingCustomPreset = selectedUserPreset;
+  if (glossaryPresetSelect) glossaryPresetSelect.value = CUSTOM_GLOSSARY_PRESET_VALUE;
+  state.settings = { ...state.settings, glossaryPresetId: "", glossaryPresetName: "" };
+  syncGlossaryPresetActions();
+}
+
+function glossaryPresetError(value, fallbackCode = "INVALID_GLOSSARY_PRESET") {
+  const code = String(value?.code ?? "").trim();
+  const resolvedCode = GLOSSARY_PRESET_ERROR_CODES.has(code) ? code : fallbackCode;
+  const error = new Error(t(`glossary.error.${resolvedCode}`));
+  error.code = resolvedCode;
+  return error;
+}
+
+async function invokeGlossaryPresetBridge(method, input) {
+  const bridge = window.realtimeNoelDesktop;
+  if (typeof bridge?.[method] !== "function") throw glossaryPresetError({ code: "DESKTOP_BRIDGE_UNAVAILABLE" });
+  let result;
+  try {
+    result = input === undefined ? await bridge[method]() : await bridge[method](input);
+  } catch (error) {
+    throw glossaryPresetError(error, "NETWORK_UNAVAILABLE");
+  }
+  if (!result?.ok) throw glossaryPresetError(result);
+  return result.data;
+}
+
+async function hydrateGlossaryPresets() {
+  if (!glossaryPresetSelect) return;
+  setGlossaryPresetStatus(t("glossary.loadingSynced"));
+  const builtInRequest = fetch("/api/glossary-presets").then((response) => {
+    if (!response.ok) throw new Error("BUILTIN_GLOSSARY_PRESETS_UNAVAILABLE");
+    return response.json();
+  });
+  const syncedRequest = typeof window.realtimeNoelDesktop?.listGlossaryPresets === "function"
+    ? invokeGlossaryPresetBridge("listGlossaryPresets")
+    : Promise.reject(glossaryPresetError({ code: "DESKTOP_BRIDGE_UNAVAILABLE" }));
+  const [builtInResult, syncedResult] = await Promise.allSettled([builtInRequest, syncedRequest]);
+
+  if (builtInResult.status === "fulfilled" && Array.isArray(builtInResult.value)) {
+    glossaryPresets = builtInResult.value;
+    builtInGlossaryPresetStatus = "loaded";
+  } else {
+    builtInGlossaryPresetStatus = "unavailable";
+  }
+
+  if (syncedResult.status === "fulfilled" && Array.isArray(syncedResult.value?.presets)) {
+    syncedGlossaryPresets = syncedResult.value.presets.map(normalizeSyncedGlossaryPreset).filter(Boolean);
+    syncedGlossaryPresetStatus = "loaded";
+    setGlossaryPresetStatus();
+  } else {
+    syncedGlossaryPresetStatus = "unavailable";
+    const error = syncedResult.status === "rejected"
+      ? glossaryPresetError(syncedResult.reason, "NETWORK_UNAVAILABLE")
+      : glossaryPresetError({ code: "INVALID_GLOSSARY_PRESET" });
+    setGlossaryPresetStatus(error.message, "error");
+  }
+  renderGlossaryPresetOptions({ persistConfirmedMissing: true });
+}
+
+void hydrateGlossaryPresets();
+glossaryPresetSelect?.addEventListener("change", (event) => {
+  event.stopPropagation();
+  closeGlossaryPresetDeleteConfirmation({ restoreFocus: false });
+  editingCustomPreset = null;
+  if (event.target.value === CUSTOM_GLOSSARY_PRESET_VALUE) {
+    state.settings = readSettingsFromForm();
+    syncGlossaryPresetActions();
+    void saveSettings({ subtitle: state.settings }).catch(showError);
+    return;
+  }
+  void applyGlossaryPreset(event.target.value);
+});
 
 async function applyGlossaryPreset(presetId) {
-  const preset = glossaryPresets.find((entry) => entry.id === presetId);
+  const preset = findGlossaryPreset(presetId);
   if (!preset) return;
+  closeGlossaryPresetDeleteConfirmation({ restoreFocus: false });
+  editingCustomPreset = null;
   if (form.elements.glossary) form.elements.glossary.value = preset.glossary;
   if (form.elements.translationDomain) form.elements.translationDomain.value = preset.domain;
   writeTranslationLanguageCheckboxes([preset.languagePair.a, preset.languagePair.b]);
@@ -386,20 +730,156 @@ async function applyGlossaryPreset(presetId) {
   state.settings = readSettingsFromForm();
   applyPreviewSettings(state.settings);
   updateAudioInspectorLabels();
+  syncGlossaryPresetActions();
   try {
     await saveSettings({ subtitle: state.settings });
+    const label = glossaryPresetDisplayName(preset);
     if (state.running) {
       // A running session keeps translating with the OLD glossary until its
       // channels are rebuilt — reconfigure in place (audio capture untouched).
       reconfigureRunningSession();
-      showNotice(t("notice.presetAppliedRebuilt", { label: preset.label }));
+      showNotice(t("notice.presetAppliedRebuilt", { label }));
     } else {
-      showNotice(t("notice.presetApplied", { label: preset.label }));
+      showNotice(t("notice.presetApplied", { label }));
     }
   } catch (error) {
     showError(error);
   }
 }
+
+function currentGlossaryPresetInput(name) {
+  const languages = readTranslationLanguagesFromForm();
+  return {
+    name: String(name ?? "").trim(),
+    domain: form.elements.translationDomain?.value ?? "",
+    glossary: form.elements.glossary?.value ?? "",
+    languagePair: deriveLanguagePairFromTargets(languages),
+  };
+}
+
+function setGlossaryPresetBusy(isBusy) {
+  isGlossaryPresetBusy = isBusy;
+  glossaryPresetEditor?.setAttribute("aria-busy", String(isBusy));
+  if (saveGlossaryPresetButton) saveGlossaryPresetButton.disabled = isBusy;
+  if (createGlossaryPresetButton) createGlossaryPresetButton.disabled = isBusy;
+  syncGlossaryPresetActions();
+}
+
+function openGlossaryPresetEditor() {
+  if (!glossaryPresetEditor || !createGlossaryPresetButton) return;
+  closeGlossaryPresetDeleteConfirmation({ restoreFocus: false });
+  glossaryPresetEditor.hidden = false;
+  createGlossaryPresetButton.setAttribute("aria-expanded", "true");
+  if (glossaryPresetNameInput) {
+    glossaryPresetNameInput.value = "";
+    glossaryPresetNameInput.focus();
+  }
+}
+
+function closeGlossaryPresetEditor({ restoreFocus = true } = {}) {
+  if (!glossaryPresetEditor || !createGlossaryPresetButton) return;
+  glossaryPresetEditor.hidden = true;
+  createGlossaryPresetButton.setAttribute("aria-expanded", "false");
+  if (restoreFocus) createGlossaryPresetButton.focus();
+}
+
+async function registerGlossaryPreset() {
+  if (!glossaryPresetNameInput?.reportValidity()) return;
+  setGlossaryPresetBusy(true);
+  try {
+    const data = await invokeGlossaryPresetBridge(
+      "createGlossaryPreset",
+      currentGlossaryPresetInput(glossaryPresetNameInput.value),
+    );
+    const preset = normalizeSyncedGlossaryPreset(data?.preset);
+    if (!preset) throw glossaryPresetError({ code: "INVALID_GLOSSARY_PRESET" });
+    syncedGlossaryPresets = [...syncedGlossaryPresets.filter((entry) => entry.id !== preset.id), preset];
+    syncedGlossaryPresetStatus = "loaded";
+    closeGlossaryPresetDeleteConfirmation({ restoreFocus: false });
+    editingCustomPreset = null;
+    state.settings = { ...state.settings, glossaryPresetId: preset.id, glossaryPresetName: preset.name };
+    renderGlossaryPresetOptions();
+    state.settings = readSettingsFromForm();
+    await saveSettings({ subtitle: state.settings });
+    closeGlossaryPresetEditor({ restoreFocus: false });
+    setGlossaryPresetStatus(t("glossary.created", { name: preset.name }));
+  } catch (error) {
+    const resolvedError = glossaryPresetError(error);
+    setGlossaryPresetStatus(resolvedError.message, "error");
+    showError(resolvedError);
+  } finally {
+    setGlossaryPresetBusy(false);
+    if (glossaryPresetEditor?.hidden) createGlossaryPresetButton?.focus();
+  }
+}
+
+async function updateSelectedGlossaryPreset() {
+  const current = selectedEditableGlossaryPreset();
+  if (!current) return;
+  setGlossaryPresetBusy(true);
+  try {
+    const data = await invokeGlossaryPresetBridge("updateGlossaryPreset", {
+      id: current.id,
+      version: current.version,
+      ...currentGlossaryPresetInput(current.name),
+    });
+    const preset = normalizeSyncedGlossaryPreset(data?.preset);
+    if (!preset) throw glossaryPresetError({ code: "INVALID_GLOSSARY_PRESET" });
+    syncedGlossaryPresets = [...syncedGlossaryPresets.filter((entry) => entry.id !== preset.id), preset];
+    closeGlossaryPresetDeleteConfirmation({ restoreFocus: false });
+    editingCustomPreset = null;
+    state.settings = { ...state.settings, glossaryPresetId: preset.id, glossaryPresetName: preset.name };
+    renderGlossaryPresetOptions();
+    state.settings = readSettingsFromForm();
+    await saveSettings({ subtitle: state.settings });
+    setGlossaryPresetStatus(t("glossary.updated", { name: preset.name }));
+  } catch (error) {
+    const resolvedError = glossaryPresetError(error);
+    setGlossaryPresetStatus(resolvedError.message, "error");
+    showError(resolvedError);
+  } finally {
+    setGlossaryPresetBusy(false);
+  }
+}
+
+async function deleteSelectedGlossaryPreset() {
+  const current = selectedEditableGlossaryPreset();
+  if (!current || !isGlossaryDeleteConfirmationOpen) return;
+  let wasDeleted = false;
+  setGlossaryPresetBusy(true);
+  try {
+    await invokeGlossaryPresetBridge("deleteGlossaryPreset", { id: current.id, version: current.version });
+    syncedGlossaryPresets = syncedGlossaryPresets.filter((entry) => entry.id !== current.id);
+    closeGlossaryPresetDeleteConfirmation({ restoreFocus: false, clearStatus: false });
+    editingCustomPreset = null;
+    state.settings = { ...state.settings, glossaryPresetId: "", glossaryPresetName: "" };
+    renderGlossaryPresetOptions();
+    state.settings = readSettingsFromForm();
+    await saveSettings({ subtitle: state.settings });
+    setGlossaryPresetStatus(t("glossary.deleted"));
+    wasDeleted = true;
+  } catch (error) {
+    const resolvedError = glossaryPresetError(error);
+    setGlossaryPresetStatus(resolvedError.message, "error");
+    showError(resolvedError);
+  } finally {
+    setGlossaryPresetBusy(false);
+    if (wasDeleted) glossaryPresetSelect?.focus();
+  }
+}
+
+createGlossaryPresetButton?.addEventListener("click", openGlossaryPresetEditor);
+cancelGlossaryPresetButton?.addEventListener("click", closeGlossaryPresetEditor);
+saveGlossaryPresetButton?.addEventListener("click", () => { void registerGlossaryPreset(); });
+updateGlossaryPresetButton?.addEventListener("click", () => { void updateSelectedGlossaryPreset(); });
+deleteGlossaryPresetButton?.addEventListener("click", openGlossaryPresetDeleteConfirmation);
+confirmDeleteGlossaryPresetButton?.addEventListener("click", () => { void deleteSelectedGlossaryPreset(); });
+cancelDeleteGlossaryPresetButton?.addEventListener("click", () => closeGlossaryPresetDeleteConfirmation());
+glossaryPresetActions?.addEventListener("keydown", (event) => {
+  if (event.key !== "Escape" || !isGlossaryDeleteConfirmationOpen) return;
+  event.preventDefault();
+  closeGlossaryPresetDeleteConfirmation();
+});
 
 // A patch section must be a PLAIN object. An array is truthy AND passes
 // `typeof x === "object"`, which is how importing `{"subtitle": []}` used to
@@ -729,24 +1209,32 @@ function updateVerticalOffsetValue(offset) {
 async function loadConfig() {
   try {
     const config = await fetch("/api/config").then((res) => res.json());
-    if (config.settings?.subtitle) state.settings = { ...DEFAULT_SUBTITLE, ...config.settings.subtitle };
+    const shouldNormalizeGeminiProviders = config.settings?.subtitle
+      && (config.settings.subtitle.translationProvider !== "gemini"
+        || config.settings.subtitle.voiceProvider !== "gemini");
+    if (config.settings?.subtitle) {
+      state.settings = {
+        ...DEFAULT_SUBTITLE,
+        ...config.settings.subtitle,
+        translationProvider: "gemini",
+        voiceProvider: "gemini",
+      };
+    }
     state.hasOpenAIKey = Boolean(config.settings?.hasOpenAIKey);
-    state.hasOpenAISecondaryKey = Boolean(config.settings?.hasOpenAISecondaryKey);
     state.hasGeminiKey = Boolean(config.settings?.hasGeminiKey);
     state.hasGeminiSecondaryKey = Boolean(config.settings?.hasGeminiSecondaryKey);
     writeSettingsToForm(state.settings);
     await hydrateOverlayEnabled();
     applyPreviewSettings(state.settings);
     updateOpenAIKeyPlaceholder();
-    updateOpenAISecondaryKeyPlaceholder();
     updateGeminiKeyStatus();
     updateGeminiSecondaryKeyStatus();
     updateOpenAIKeyStatus();
-    updateOpenAISecondaryKeyStatus();
     updateSessionSummary();
     updateServiceStrip();
     updateAudioInspectorLabels();
     syncCaptionPlayerController();
+    if (shouldNormalizeGeminiProviders) await saveSettings({ subtitle: state.settings });
   } catch (error) {
     showError(error);
   }
@@ -774,26 +1262,6 @@ function selectedOutputMode() {
   return value === "audio" ? value : "captions";
 }
 
-function enforcePtOutputAvailability() {
-  for (const input of form.querySelectorAll('input[name="outputMode"]')) {
-    input.disabled = false;
-  }
-  const targetLanguage = form.elements.audioLanguage?.value || "en";
-  const normalizedLanguage = targetLanguage.toLowerCase() === "zh-cn" ? "zh" : targetLanguage.toLowerCase().split("-")[0];
-  const openAIInput = form.querySelector('input[name="voiceProvider"][value="openai"]');
-  const isOpenAISupported = OPENAI_REALTIME_TRANSLATION_LANGUAGES.has(normalizedLanguage);
-  if (openAIInput) openAIInput.disabled = !isOpenAISupported;
-  if (!isOpenAISupported && selectedVoiceProvider() === "openai") {
-    const geminiInput = form.querySelector('input[name="voiceProvider"][value="gemini"]');
-    if (geminiInput) geminiInput.checked = true;
-    clearTranslatedAudioQueue();
-  }
-}
-
-function selectedVoiceProvider() {
-  return form.querySelector('input[name="voiceProvider"]:checked')?.value === "openai" ? "openai" : "gemini";
-}
-
 function syncAudioLanguageOptions(languages, preferredLanguage) {
   const select = form.elements.audioLanguage;
   if (!select) return;
@@ -811,24 +1279,12 @@ function syncAudioLanguageOptions(languages, preferredLanguage) {
 
 function updatePtOutputControls() {
   const outputMode = selectedOutputMode();
-  const voiceProvider = selectedVoiceProvider();
   if (playbackOptions) playbackOptions.hidden = outputMode === "captions";
-  // State-only line: it says something ONLY when the chosen voice language has
-  // no OpenAI Realtime voice, so Gemini voice is used instead.
-  const openAIHelp = document.getElementById("pt-openai-voice-help");
-  if (openAIHelp) {
-    const targetLanguage = form.elements.audioLanguage?.value || "en";
-    const normalizedLanguage = targetLanguage.toLowerCase() === "zh-cn" ? "zh" : targetLanguage.toLowerCase().split("-")[0];
-    const isUnsupported = !OPENAI_REALTIME_TRANSLATION_LANGUAGES.has(normalizedLanguage);
-    openAIHelp.textContent = isUnsupported ? t("output.openaiUnsupported") : "";
-    openAIHelp.hidden = !isUnsupported;
-  }
   if (audioVolumeValue) audioVolumeValue.textContent = `${Math.round(readNumber(form.elements.audioVolume?.value, DEFAULT_SUBTITLE.audioVolume) * 100)}%`;
   startButton.dataset.i18n = outputMode === "audio"
     ? "start.audio"
     : "start.captions";
   startButton.textContent = t(startButton.dataset.i18n);
-  void voiceProvider;
 }
 
 function syncRuntimeOutputVisibility() {
@@ -1434,16 +1890,34 @@ for (const button of document.querySelectorAll("[data-records-view]")) {
 }
 
 function connectWebSocket() {
+  if (state.ws?.readyState === WebSocket.OPEN || state.ws?.readyState === WebSocket.CONNECTING) return state.ws;
+  window.clearTimeout(captionWebSocketReconnectTimer);
+  captionWebSocketReconnectTimer = null;
   const proto = location.protocol === "https:" ? "wss" : "ws";
   const ws = new WebSocket(`${proto}://${location.host}/ws`);
   state.ws = ws;
 
-  ws.addEventListener("open", () => setConnectionStatus(t("status.captionsReady"), "active"));
+  ws.addEventListener("open", () => {
+    setConnectionStatus(t("status.captionsReady"), "active");
+    if (activeCaptionSessionOwner === "live-call" && state.running) void recoverLiveCaptionSocket();
+  });
   ws.addEventListener("close", () => {
-    setConnectionStatus(t("status.disconnected"), "error");
+    if (state.ws !== ws) return;
     clearTranslatedAudioQueue();
-    stopLocalStreams();
-    void setControllerWindowVisible(false);
+    state.ws = null;
+    captionWebSocketReconnectTimer = window.setTimeout(connectWebSocket, 1_000);
+    if (liveBridgePreflightRequestId) {
+      setConnectionStatus(t("status.reconnecting"), "active");
+      return;
+    }
+    if (activeCaptionSessionOwner === "live-call" && state.running) {
+      transitionCaptionRuntime("reconnecting");
+      setConnectionStatus(t("status.reconnecting"), "active");
+      setRealtimeApiStatus(t("status.realtimeReconnecting"), "active");
+      return;
+    }
+    setConnectionStatus(t("status.disconnected"), "error");
+    void stopSubtitles();
   });
   ws.addEventListener("error", () => setConnectionStatus(t("status.checkConnection"), "error"));
   ws.addEventListener("message", (event) => {
@@ -1451,15 +1925,12 @@ function connectWebSocket() {
     if (message.type === "settings" && message.settings?.subtitle) {
       state.settings = { ...DEFAULT_SUBTITLE, ...message.settings.subtitle };
       state.hasOpenAIKey = Boolean(message.settings.hasOpenAIKey);
-      state.hasOpenAISecondaryKey = Boolean(message.settings.hasOpenAISecondaryKey);
       state.hasGeminiKey = Boolean(message.settings.hasGeminiKey);
       state.hasGeminiSecondaryKey = Boolean(message.settings.hasGeminiSecondaryKey);
       writeSettingsToForm(state.settings);
       applyPreviewSettings(state.settings);
       updateOpenAIKeyPlaceholder();
-      updateOpenAISecondaryKeyPlaceholder();
       updateOpenAIKeyStatus();
-      updateOpenAISecondaryKeyStatus();
       updateGeminiKeyStatus();
       updateGeminiSecondaryKeyStatus();
       updateSessionSummary();
@@ -1467,8 +1938,13 @@ function connectWebSocket() {
       updateAudioInspectorLabels();
     }
     if (message.type === "subtitle:status") {
-      if (message.status === "connecting") setConnectionStatus(t("status.serviceConnecting"), "active");
+      if (message.status === "idle") clearActiveSubtitleSurface();
+      if (message.status === "connecting") {
+        if (activeCaptionSessionOwner === "live-call" && state.running) transitionCaptionRuntime("reconnecting");
+        setConnectionStatus(t("status.serviceConnecting"), "active");
+      }
       else if (message.status === "api_ready") {
+        if (captionRuntimeState === "reconnecting") transitionCaptionRuntime("running");
         setConnectionStatus(t("status.captionsReady"), "active");
         setRealtimeApiStatus(t("status.realtimeConnected"), "active");
       } else if (message.status === "hearing") {
@@ -1484,10 +1960,16 @@ function connectWebSocket() {
       } else setConnectionStatus(message.status === "listening" ? t("status.receivingCaptions") : t("status.captionsReady"), message.status === "listening" ? "active" : "");
     }
     if (message.type === "subtitle:partial" && state.settings.outputMode !== "audio") {
+      if (activeCaptionSessionOwner === "live-call" && String(message.translatedText ?? "").trim()) {
+        liveTranslationStallMonitor.noteOutput(performance.now());
+      }
       setPreviewText(message.translatedText, message.sourceText, true);
       return;
     }
     if (message.type === "subtitle:committed" && state.settings.outputMode !== "audio") {
+      if (activeCaptionSessionOwner === "live-call" && String(message.translatedText ?? "").trim()) {
+        liveTranslationStallMonitor.noteOutput(performance.now());
+      }
       setPreviewText(message.translatedText, message.sourceText, false);
     }
     if (message.type === "subtitle:translated-audio") {
@@ -1524,14 +2006,115 @@ function connectWebSocket() {
       void handleSubtitleControllerCommand(message);
     }
     if (message.type === "subtitle:error") {
-      void stopSubtitles();
-      showError(new Error(message.message));
+      void handleSubtitleRuntimeError(message);
     }
+  });
+  return ws;
+}
+
+async function recoverLiveCaptionSocket() {
+  if (liveCaptionSocketRecoveryPromise) return liveCaptionSocketRecoveryPromise;
+  if (activeCaptionSessionOwner !== "live-call" || !state.running || !state.sessionId) return false;
+  const sessionId = state.sessionId;
+  liveCaptionSocketRecoveryPromise = (async () => {
+    transitionCaptionRuntime("reconnecting");
+    const liveState = await window.realtimeNoelDesktop?.getLiveCallState?.();
+    if (!liveState?.armed || !liveState.live) return false;
+    await requestSubtitleStart({
+      type: "subtitle:start",
+      captionProducer: "gateway",
+      sessionId,
+      settings: state.settings,
+      meeting: {
+        kind: "live-call",
+        liveSessionId: String(liveState.sessionId ?? ""),
+        title: String(liveState.title ?? ""),
+        startedAt: String(liveState.liveStartedAt ?? ""),
+      },
+    });
+    if (state.sessionId !== sessionId || activeCaptionSessionOwner !== "live-call") return false;
+    for (const caption of liveState.captionSnapshot ?? []) {
+      enqueueLiveCallCaptionRelay(caption);
+    }
+    transitionCaptionRuntime("running");
+    setConnectionStatus(t("status.receivingCaptions"), "active");
+    setRealtimeApiStatus(t("status.realtimeConnected"), "active");
+    flushLiveCallCaptionRelayQueue();
+    return true;
+  })().catch((error) => {
+    console.warn(`[live-bridge] local caption socket recovery failed: ${error?.message ?? error}`);
+    window.clearTimeout(liveCaptionSocketRecoveryTimer);
+    liveCaptionSocketRecoveryTimer = window.setTimeout(() => { void recoverLiveCaptionSocket(); }, 1_000);
+    return false;
+  }).finally(() => {
+    liveCaptionSocketRecoveryPromise = null;
+  });
+  return liveCaptionSocketRecoveryPromise;
+}
+
+function requestSubtitleStart(payload) {
+  const socket = state.ws;
+  if (!socket || socket.readyState !== WebSocket.OPEN) {
+    return Promise.reject(new Error(t("error.websocketClosed")));
+  }
+  const expectedProducer = payload.captionProducer === "gateway" ? "gateway" : "local";
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const finish = (error, acknowledgement) => {
+      if (settled) return;
+      settled = true;
+      window.clearTimeout(timer);
+      socket.removeEventListener("message", onMessage);
+      socket.removeEventListener("close", onClose);
+      if (error) reject(error);
+      else resolve(acknowledgement);
+    };
+    const onMessage = (event) => {
+      let message;
+      try { message = JSON.parse(event.data); } catch { return; }
+      if (message.type === "subtitle:started") {
+        if (message.sessionId !== payload.sessionId) return;
+        if (message.captionProducer !== expectedProducer) return;
+        finish(null, message);
+        return;
+      }
+      if (message.type === "subtitle:error" && message.code === "SUBTITLE_START_FAILED") {
+        if (message.sessionId && message.sessionId !== payload.sessionId) return;
+        if (message.captionProducer && message.captionProducer !== expectedProducer) return;
+        finish(new Error(message.message || t("error.subtitleStartFailed")));
+      }
+    };
+    const onClose = () => finish(new Error(t("error.websocketClosed")));
+    const timer = window.setTimeout(
+      () => finish(new Error(t("error.subtitleStartTimeout"))),
+      SUBTITLE_START_ACK_TIMEOUT_MS,
+    );
+    socket.addEventListener("message", onMessage);
+    socket.addEventListener("close", onClose, { once: true });
+    socket.send(JSON.stringify(payload));
   });
 }
 
+async function handleSubtitleRuntimeError(message) {
+  // Initial-start errors are owned by requestSubtitleStart, which rejects the
+  // matching promise and lets that start path release its own capture exactly once.
+  if (captionRuntimeState === "starting") return;
+  if (liveBridgePreflightRequestId && message.code === "SUBTITLE_PREFLIGHT_FAILED") return;
+  if (activeCaptionSessionOwner === "live-call" && state.running) {
+    transitionCaptionRuntime("reconnecting");
+    setConnectionStatus(t("status.reconnecting"), "active");
+    setRealtimeApiStatus(t("status.realtimeReconnecting"), "active");
+    await reconnectLiveCallTranslation();
+    return;
+  }
+  await stopSubtitles();
+  showError(new Error(message.message));
+}
+
 async function startSubtitles() {
-  if (state.running) return;
+  if (state.running || captionRuntimeState === "starting" || captionRuntimeState === "stopping") return;
+  if (captionRuntimeState === "failed") transitionCaptionRuntime("idle");
+  transitionCaptionRuntime("starting");
   clearError();
   let captures = [];
   startButton.disabled = true;
@@ -1544,16 +2127,11 @@ async function startSubtitles() {
     const patch = { subtitle: state.settings };
     const apiKeysPatch = {};
     if (openaiKeyInput.value.trim()) apiKeysPatch.openai = openaiKeyInput.value.trim();
-    if (openaiSecondaryKeyInput?.value.trim()) apiKeysPatch.openaiSecondary = openaiSecondaryKeyInput.value.trim();
     if (geminiKeyInput?.value.trim()) apiKeysPatch.gemini = geminiKeyInput.value.trim();
     if (geminiSecondaryKeyInput?.value.trim()) apiKeysPatch.geminiSecondary = geminiSecondaryKeyInput.value.trim();
     if (Object.keys(apiKeysPatch).length > 0) patch.apiKeys = apiKeysPatch;
     if (!state.hasGeminiKey && !geminiKeyInput?.value.trim()) {
       throw new Error(t("key.geminiRequired"));
-    }
-    if (state.settings.outputMode !== "captions" && state.settings.voiceProvider === "openai"
-      && !state.hasOpenAIKey && !openaiKeyInput.value.trim()) {
-      throw new Error(t("key.openaiVoiceRequired"));
     }
     await saveSettings(patch);
     if (geminiKeyInput?.value.trim()) {
@@ -1573,13 +2151,6 @@ async function startSubtitles() {
       updateOpenAIKeyStatus();
       updateServiceStrip();
     }
-    if (openaiSecondaryKeyInput?.value.trim()) {
-      state.hasOpenAISecondaryKey = true;
-      openaiSecondaryKeyInput.value = "";
-      updateOpenAISecondaryKeyPlaceholder();
-      updateOpenAISecondaryKeyStatus();
-      updateServiceStrip();
-    }
     await ensureWebSocketOpen();
     setConnectionStatus(t("status.checkingInputs"), "active");
     setPreviewStatus(t("status.inputCheck"), 1200);
@@ -1592,12 +2163,12 @@ async function startSubtitles() {
 
     state.sessionId = crypto.randomUUID();
     translatedAudioGuard.reset();
-    state.ws.send(JSON.stringify({
+    await requestSubtitleStart({
       type: "subtitle:start",
       sessionId: state.sessionId,
       settings: state.settings,
       meeting: await describeActiveMeeting(),
-    }));
+    });
     if (state.settings.outputMode !== "audio") setPreviewStatus(t("status.waitingForCaptions"), 1800);
 
     for (const capture of captures) {
@@ -1625,6 +2196,7 @@ async function startSubtitles() {
     state.running = true;
     activeCaptionProducer = "local";
     activeCaptionSessionOwner = "caption-only";
+    transitionCaptionRuntime("running");
     stopButton.disabled = false;
     syncRuntimeOutputVisibility();
     setConnectionStatus(t("status.receivingCaptions"), "active");
@@ -1641,6 +2213,8 @@ async function startSubtitles() {
 }
 
 async function stopSubtitles() {
+  if (captionRuntimeState !== "stopping") transitionCaptionRuntime("stopping");
+  clearActiveSubtitleSurface();
   const sessionId = state.sessionId;
   state.sessionId = null;
   clearTranslatedAudioQueue();
@@ -1651,6 +2225,11 @@ async function stopSubtitles() {
   state.running = false;
   activeCaptionProducer = "none";
   activeCaptionSessionOwner = "none";
+  liveTranslationStallMonitor.reset();
+  resetLiveCallCaptionRelay();
+  window.clearTimeout(liveCaptionSocketRecoveryTimer);
+  liveCaptionSocketRecoveryTimer = null;
+  transitionCaptionRuntime("idle");
   startButton.disabled = false;
   stopButton.disabled = true;
   syncRuntimeOutputVisibility();
@@ -1674,7 +2253,7 @@ async function handleSubtitleControllerCommand(message) {
     return;
   }
   if (message.command === "restart") {
-    await restartSubtitles();
+    await restartCaptionsFromController();
     return;
   }
   if (message.command === "font") {
@@ -1691,15 +2270,6 @@ async function handleSubtitleControllerCommand(message) {
   }
   if (message.command === "languages") {
     applyControllerLanguagePreset(message.languages);
-    return;
-  }
-  if (message.command === "voice-provider") {
-    const provider = message.voiceProvider === "openai" ? "openai" : "gemini";
-    const input = form.querySelector(`input[name="voiceProvider"][value="${provider}"]`);
-    if (input && !input.disabled) {
-      input.checked = true;
-      input.dispatchEvent(new Event("change", { bubbles: true }));
-    }
     return;
   }
   if (message.command === "opacity") {
@@ -1719,6 +2289,61 @@ async function restartSubtitles() {
   await stopSubtitles();
   await startSubtitles();
   showNotice(t("notice.captionEngineRestarted"));
+}
+
+async function restartCaptionsFromController() {
+  if (activeCaptionSessionOwner === "live-call") {
+    await reconnectLiveCallTranslation();
+    return;
+  }
+  await restartSubtitles();
+}
+
+function clearActiveSubtitleSurface() {
+  clearTimeout(state.previewStatusTimer);
+  state.previewStatusTimer = null;
+  preview.querySelector(".translation-line").textContent = "";
+  preview.querySelector(".source-line").textContent = "";
+  preview.classList.remove("partial");
+}
+
+function clearUncommittedPreview() {
+  if (!preview.classList.contains("partial")) return;
+  clearActiveSubtitleSurface();
+}
+
+async function reconnectLiveCallTranslation() {
+  if (liveTranslationReconnectPromise) return liveTranslationReconnectPromise;
+  if (activeCaptionSessionOwner !== "live-call" || !state.running || !state.sessionId) return false;
+  const sessionId = state.sessionId;
+  const bridge = window.realtimeNoelDesktop;
+  if (!bridge?.reconnectLiveCallTranslation) {
+    transitionCaptionRuntime("reconnecting");
+    setConnectionStatus(t("status.reconnecting"), "active");
+    return false;
+  }
+  liveTranslationReconnectPromise = (async () => {
+    transitionCaptionRuntime("reconnecting");
+    clearTranslatedAudioQueue();
+    translatedAudioGuard.reset();
+    setConnectionStatus(t("status.reconnecting"), "active");
+    setRealtimeApiStatus(t("status.realtimeReconnecting"), "active");
+    const result = await bridge.reconnectLiveCallTranslation();
+    if (state.sessionId !== sessionId || activeCaptionSessionOwner !== "live-call") return false;
+    if (!result?.ok) return false;
+    transitionCaptionRuntime("running");
+    clearError();
+    setConnectionStatus(t("status.receivingCaptions"), "active");
+    setRealtimeApiStatus(t("status.realtimeConnected"), "active");
+    flushLiveCallCaptionRelayQueue();
+    return true;
+  })().catch((error) => {
+    console.warn(`[live-bridge] translation reconnect failed: ${error?.message ?? error}`);
+    return false;
+  }).finally(() => {
+    liveTranslationReconnectPromise = null;
+  });
+  return liveTranslationReconnectPromise;
 }
 
 function stopLocalStreams() {
@@ -1925,6 +2550,12 @@ function startAudioLevelMeter(sourceName, label, analyser) {
       sourceName,
     );
     const hasSignal = !isFeedbackSuppressed && level > INPUT_SIGNAL_THRESHOLD;
+    liveTranslationStallMonitor.noteInput(
+      sourceName,
+      hasSignal,
+      now,
+      activeCaptionSessionOwner === "live-call" && state.running && !isLiveHostAudioBlocked && !isFeedbackSuppressed,
+    );
     if (hasSignal) silentSince = now;
     const inputStatus = hasSignal ? "signal" : now - silentSince > INPUT_SILENCE_WARNING_MS ? "silent" : "waiting";
     setAudioSourceStatus(sourceName, isFeedbackSuppressed ? t("audio.outputIsolated") : hasSignal ? t("audio.signal") : t("audio.noSignal"), isFeedbackSuppressed ? 0 : level);
@@ -2040,13 +2671,10 @@ async function saveSettings(patch) {
   if (!res.ok) throw new Error(body.error || t("error.saveSettingsFailed"));
   if (body.settings) {
     state.hasOpenAIKey = Boolean(body.settings.hasOpenAIKey);
-    state.hasOpenAISecondaryKey = Boolean(body.settings.hasOpenAISecondaryKey);
     state.hasGeminiKey = Boolean(body.settings.hasGeminiKey);
     state.hasGeminiSecondaryKey = Boolean(body.settings.hasGeminiSecondaryKey);
     updateOpenAIKeyPlaceholder();
-    updateOpenAISecondaryKeyPlaceholder();
     updateOpenAIKeyStatus();
-    updateOpenAISecondaryKeyStatus();
     updateGeminiKeyStatus();
     updateGeminiSecondaryKeyStatus();
   }
@@ -2065,7 +2693,6 @@ function readSettingsFromForm() {
   const translationProvider = "gemini";
   const requestedOutputMode = selectedOutputMode();
   const outputMode = requestedOutputMode;
-  const voiceProvider = selectedVoiceProvider();
   const requestedAudioLanguage = form.elements.audioLanguage?.value;
   const audioLanguage = translationLanguages.includes(requestedAudioLanguage) ? requestedAudioLanguage : translationLanguages[0];
   return {
@@ -2075,14 +2702,14 @@ function readSettingsFromForm() {
     languagePair: deriveLanguagePairFromTargets(translationLanguages),
     translationLanguages,
     outputMode,
-    voiceProvider,
+    voiceProvider: "gemini",
     audioLanguage,
     audioVolume: Math.max(0, Math.min(1, readNumber(form.elements.audioVolume?.value, DEFAULT_SUBTITLE.audioVolume))),
     displayMode: "translation_only",
     // Source ("원문") display removed — subtitles are always translation-only.
     showSourceText: false,
     translateAllLanguages: translationLanguages.length >= 3,
-    model: "gpt-realtime-translate",
+    model: DEFAULT_SUBTITLE.model,
     fontFamily: form.elements.fontFamily.value || DEFAULT_SUBTITLE.fontFamily,
     translationFontSize,
     sourceFontSize,
@@ -2099,6 +2726,8 @@ function readSettingsFromForm() {
     translationProvider,
     glossary: form.elements.glossary?.value ?? "",
     translationDomain: form.elements.translationDomain?.value ?? "",
+    glossaryPresetId: selectedGlossaryPresetId(),
+    glossaryPresetName: selectedGlossaryPresetName(),
     verticalOffset: Math.min(600, Math.max(0, Math.round(readNumber(form.elements.verticalOffset?.value, DEFAULT_SUBTITLE.verticalOffset)))),
   };
 }
@@ -2121,14 +2750,12 @@ function writeSettingsToForm(settings) {
   const outputMode = ["captions", "audio"].includes(settings.outputMode) ? settings.outputMode : DEFAULT_SUBTITLE.outputMode;
   const outputModeInput = form.querySelector(`input[name="outputMode"][value="${outputMode}"]`);
   if (outputModeInput) outputModeInput.checked = true;
-  const voiceProvider = settings.voiceProvider === "openai" ? "openai" : "gemini";
-  const voiceProviderInput = form.querySelector(`input[name="voiceProvider"][value="${voiceProvider}"]`);
-  if (voiceProviderInput) voiceProviderInput.checked = true;
+  if (form.elements.voiceProvider) form.elements.voiceProvider.value = "gemini";
   if (form.elements.audioVolume) form.elements.audioVolume.value = Math.max(0, Math.min(1, readNumber(settings.audioVolume, DEFAULT_SUBTITLE.audioVolume)));
-  enforcePtOutputAvailability();
   updatePtOutputControls();
   if (form.elements.glossary) form.elements.glossary.value = settings.glossary ?? "";
   if (form.elements.translationDomain) form.elements.translationDomain.value = settings.translationDomain ?? "";
+  restoreGlossaryPresetSelection(settings.glossaryPresetId, settings.glossaryPresetName, { persistConfirmedMissing: true });
   if (form.elements.verticalOffset) form.elements.verticalOffset.value = settings.verticalOffset ?? DEFAULT_SUBTITLE.verticalOffset;
   updateVerticalOffsetValue(settings.verticalOffset ?? DEFAULT_SUBTITLE.verticalOffset);
   const perLanguagePositions = { ...DEFAULT_SUBTITLE.subtitlePositions, ...(settings.subtitlePositions ?? {}) };
@@ -2236,11 +2863,6 @@ function updateOpenAIKeyPlaceholder() {
   openaiKeyInput.placeholder = state.hasOpenAIKey ? t("key.configuredPlaceholder") : "sk-...";
 }
 
-function updateOpenAISecondaryKeyPlaceholder() {
-  if (!openaiSecondaryKeyInput) return;
-  openaiSecondaryKeyInput.placeholder = state.hasOpenAISecondaryKey ? t("key.configuredPlaceholder") : "sk-... (separate Project)";
-}
-
 async function saveOpenAIKey() {
   clearError();
   const openaiKey = openaiKeyInput.value.trim();
@@ -2264,29 +2886,6 @@ async function saveOpenAIKey() {
   }
 }
 
-async function saveOpenAISecondaryKey() {
-  clearError();
-  const openaiSecondaryKey = openaiSecondaryKeyInput?.value.trim() ?? "";
-  if (!openaiSecondaryKey) {
-    showError(new Error(state.hasOpenAISecondaryKey ? t("key.replaceHintSecondary") : t("key.enterOpenAISecondary")));
-    return;
-  }
-  try {
-    openaiSecondaryKeyStatus.textContent = t("key.validatingOpenAI");
-    await validateOpenAIKey(openaiSecondaryKey);
-    await saveSettings({ apiKeys: { openaiSecondary: openaiSecondaryKey } });
-    openaiSecondaryKeyInput.value = "";
-    state.hasOpenAISecondaryKey = true;
-    updateOpenAISecondaryKeyPlaceholder();
-    updateOpenAISecondaryKeyStatus();
-    updateServiceStrip();
-    showNotice(t("key.openaiSecondarySaved"));
-  } catch (error) {
-    updateOpenAISecondaryKeyStatus();
-    showError(error);
-  }
-}
-
 async function validateOpenAIKey(openaiKey) {
   const res = await fetch("/api/subtitles/openai/validate", {
     method: "POST",
@@ -2300,10 +2899,6 @@ async function validateOpenAIKey(openaiKey) {
 
 function updateOpenAIKeyStatus() {
   renderKeyStatus(openaiKeyStatus, state.hasOpenAIKey);
-}
-
-function updateOpenAISecondaryKeyStatus() {
-  renderKeyStatus(openaiSecondaryKeyStatus, state.hasOpenAISecondaryKey);
 }
 
 function updateGeminiKeyStatus() {
@@ -2616,18 +3211,8 @@ function updateSessionSummary() {
 }
 
 function updateServiceStrip() {
-  const openAIStatus = state.hasOpenAIKey
-    ? state.hasOpenAISecondaryKey && readTranslationLanguagesFromForm().length >= 3
-      ? "OpenAI Realtime: ready · dual project"
-      : "OpenAI Realtime: ready"
-    : "OpenAI Realtime: key needed";
   const geminiStatus = state.hasGeminiKey ? "Gemini Live: ready" : "Gemini Live: key needed";
-  const usesOpenAIVoice = state.settings.outputMode !== "captions" && state.settings.voiceProvider === "openai";
-  const realtimeStatus = usesOpenAIVoice
-    ? `${geminiStatus} · ${openAIStatus.replace("OpenAI Realtime", "OpenAI voice")}`
-    : geminiStatus;
-  const isRealtimeReady = state.hasGeminiKey && (!usesOpenAIVoice || state.hasOpenAIKey);
-  setRealtimeApiStatus(realtimeStatus, isRealtimeReady ? "active" : "error");
+  setRealtimeApiStatus(geminiStatus, state.hasGeminiKey ? "active" : "error");
   setTopicModelStatus(recorderStatusText(state.history.recorderStatus), state.history.recorderStatus?.lastError ? "error" : "active");
 }
 
@@ -2695,9 +3280,25 @@ function showNotice(message) {
 
 function ensureWebSocketOpen() {
   if (state.ws?.readyState === WebSocket.OPEN) return Promise.resolve();
+  const socket = state.ws?.readyState === WebSocket.CONNECTING ? state.ws : connectWebSocket();
   return new Promise((resolve, reject) => {
-    state.ws?.addEventListener("open", resolve, { once: true });
-    state.ws?.addEventListener("error", () => reject(new Error(t("error.websocketClosed"))), { once: true });
+    let settled = false;
+    const finish = (error) => {
+      if (settled) return;
+      settled = true;
+      window.clearTimeout(timer);
+      socket?.removeEventListener("open", onOpen);
+      socket?.removeEventListener("error", onError);
+      socket?.removeEventListener("close", onError);
+      if (error) reject(error);
+      else resolve();
+    };
+    const onOpen = () => finish();
+    const onError = () => finish(new Error(t("error.websocketClosed")));
+    const timer = window.setTimeout(onError, WEBSOCKET_OPEN_TIMEOUT_MS);
+    socket?.addEventListener("open", onOpen, { once: true });
+    socket?.addEventListener("error", onError, { once: true });
+    socket?.addEventListener("close", onError, { once: true });
   });
 }
 
@@ -2960,8 +3561,38 @@ function formatCaptureFailure(source, error) {
 // constraints, 24 kHz engine, and 100 ms framing as Caption-only.
 let liveBridgeCapture = null;
 let isLiveBridgeStarting = false;
+let liveBridgePreflightRequestId = null;
+let liveBridgeCaptureStartPromise = null;
+let isLiveHostAudioBlocked = true;
+let activeLiveFloorSessionId = "";
+let liveFloorGateRevision = 0;
+
+function applyLiveCallFloorGate(floor) {
+  if (floor?.type === "live-call-ended") {
+    if (!activeLiveFloorSessionId || floor.sessionId !== activeLiveFloorSessionId) return;
+    clearActiveSubtitleSurface();
+    stopLiveCallAudioBridge("live call ended");
+    if (activeCaptionSessionOwner === "live-call") void stopSubtitles();
+    isLiveHostAudioBlocked = true;
+    activeLiveFloorSessionId = "";
+    liveTranslationStallMonitor.reset();
+    return;
+  }
+  liveFloorGateRevision += 1;
+  const isCurrentFloor = floor?.type === "floor"
+    && activeLiveFloorSessionId.length > 0
+    && floor.sessionId === activeLiveFloorSessionId;
+  const hasValidParticipant = typeof floor?.holder?.participantId === "string"
+    && floor.holder.participantId.length > 0;
+  // Only an authenticated, current-session holder:null snapshot reopens host
+  // audio. Every malformed or stale value stays muted instead of guessing.
+  isLiveHostAudioBlocked = !(isCurrentFloor && floor.holder === null);
+  if (isLiveHostAudioBlocked) liveTranslationStallMonitor.suspend();
+  if (isCurrentFloor && (floor.holder === null || hasValidParticipant)) clearUncommittedPreview();
+}
 
 function stopLiveCallAudioBridge(reason) {
+  liveTranslationStallMonitor.suspend();
   if (!liveBridgeCapture) return;
   const capture = liveBridgeCapture;
   liveBridgeCapture = null;
@@ -2970,36 +3601,148 @@ function stopLiveCallAudioBridge(reason) {
   console.info(`[live-bridge] audio capture stopped${reason ? ` (${reason})` : ""}`);
 }
 
-async function startLiveCallMicCapture() {
-  const capture = { streams: [], streamers: [] };
+async function startLiveCallMicCapture({ requestId = "" } = {}) {
+  if (liveBridgeCapture?.ready) return { ok: true, reused: true };
+  if (liveBridgeCaptureStartPromise) return liveBridgeCaptureStartPromise;
+  if (liveBridgeCapture?.failed) stopLiveCallAudioBridge("retrying capture");
+  const capture = { streams: [], streamers: [], requestId };
   liveBridgeCapture = capture;
+  liveBridgeCaptureStartPromise = (async () => {
+    try {
+      state.settings = readSettingsFromForm();
+      const sources = await captureSelectedAudio(state.settings);
+      if (liveBridgeCapture !== capture) {
+        for (const source of sources) stopMediaStream(source.stream);
+        return { ok: false, cancelled: true };
+      }
+      capture.streams = sources.map((source) => source.stream);
+      for (const source of sources) {
+        if (liveBridgeCapture !== capture) return { ok: false, cancelled: true };
+        const streamer = await createAudioStreamer(source.stream, source.source, source.label, (packet) => {
+          if (liveBridgeCapture !== capture) return;
+          if (isLiveHostAudioBlocked) return;
+          window.realtimeNoelDesktop.sendLiveCallAudioFrame(packet);
+        });
+        if (liveBridgeCapture !== capture) {
+          void streamer.close?.();
+          return { ok: false, cancelled: true };
+        }
+        capture.streamers.push(streamer);
+      }
+      if (liveBridgeCapture !== capture) return { ok: false, cancelled: true };
+      capture.ready = true;
+      console.info(`[live-bridge] ${sources.map((source) => source.source).join("+")} audio is streaming to the gateway`);
+      return { ok: true };
+    } catch (error) {
+      console.warn(`[live-bridge] audio capture unavailable: ${error?.message ?? error}`);
+      for (const streamer of capture.streamers) void streamer.close?.();
+      for (const stream of capture.streams) stopMediaStream(stream);
+      capture.streamers = [];
+      capture.streams = [];
+      capture.failed = true;
+      return { ok: false, error };
+    }
+  })();
   try {
-    state.settings = readSettingsFromForm();
-    const sources = await captureSelectedAudio(state.settings);
-    if (liveBridgeCapture !== capture) {
-      for (const source of sources) stopMediaStream(source.stream);
-      return { ok: false, cancelled: true };
-    }
-    capture.streams = sources.map((source) => source.stream);
-    for (const source of sources) {
-      const streamer = await createAudioStreamer(source.stream, source.source, source.label, (packet) => {
-        if (liveBridgeCapture !== capture) return;
-        window.realtimeNoelDesktop.sendLiveCallAudioFrame(packet);
-      });
-      capture.streamers.push(streamer);
-    }
-    console.info(`[live-bridge] ${sources.map((source) => source.source).join("+")} audio is streaming to the gateway`);
-    return { ok: true };
-  } catch (error) {
-    console.warn(`[live-bridge] audio capture unavailable: ${error?.message ?? error}`);
-    for (const streamer of capture.streamers) void streamer.close?.();
-    for (const stream of capture.streams) stopMediaStream(stream);
-    capture.streamers = [];
-    capture.streams = [];
-    capture.failed = true;
-    return { ok: false, error };
+    return await liveBridgeCaptureStartPromise;
+  } finally {
+    liveBridgeCaptureStartPromise = null;
   }
 }
+
+function requestLocalSubtitlePreflight(requestId, request) {
+  const socket = state.ws;
+  if (!socket || socket.readyState !== WebSocket.OPEN) {
+    return Promise.reject(new Error(t("error.websocketClosed")));
+  }
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const finish = (error) => {
+      if (settled) return;
+      settled = true;
+      window.clearTimeout(timer);
+      socket.removeEventListener("message", onMessage);
+      socket.removeEventListener("close", onClose);
+      if (error) reject(error);
+      else resolve();
+    };
+    const onMessage = (event) => {
+      let message;
+      try { message = JSON.parse(event.data); } catch { return; }
+      if (message.type !== "subtitle:preflight-ready") {
+        if (message.type === "subtitle:preflight-failed" && message.requestId === requestId) {
+          finish(new Error(message.message || t("error.subtitleStartFailed")));
+        }
+        return;
+      }
+      if (message.requestId !== requestId) return;
+      finish();
+    };
+    const onClose = () => finish(new Error(t("error.websocketClosed")));
+    const timer = window.setTimeout(
+      () => finish(new Error(t("error.subtitleStartTimeout"))),
+      SUBTITLE_PREFLIGHT_ACK_TIMEOUT_MS,
+    );
+    socket.addEventListener("message", onMessage);
+    socket.addEventListener("close", onClose, { once: true });
+    socket.send(JSON.stringify({
+      type: "subtitle:preflight",
+      requestId,
+      settings: state.settings,
+      meeting: {
+        kind: "live-call",
+        liveSessionId: String(request?.liveSessionId ?? ""),
+        title: String(request?.title ?? ""),
+        startedAt: String(request?.startedAt ?? ""),
+      },
+    }));
+  });
+}
+
+async function handleLiveCallPreflight(request) {
+  const requestId = typeof request?.requestId === "string" ? request.requestId : "";
+  const bridge = window.realtimeNoelDesktop;
+  if (!requestId || !bridge?.completeLiveCallPreflight) return;
+  liveBridgePreflightRequestId = requestId;
+  let failureCode = "LIVE_CALL_AUDIO_CAPTURE_FAILED";
+  try {
+    state.settings = readSettingsFromForm();
+    // 2026-07-27 fix: Main reloads the saved settings after preflight. Persist
+    // the exact validated form first so Live Call and Caption Only share the
+    // same glossary, tone, and domain on their first translated utterance.
+    await saveSettings({ subtitle: state.settings });
+    await ensureWebSocketOpen();
+    const captureResult = await startLiveCallMicCapture({ requestId });
+    if (!captureResult?.ok) throw captureResult?.error ?? new Error("audio capture unavailable");
+    if (liveBridgePreflightRequestId !== requestId) return;
+    failureCode = "LIVE_CALL_SUBTITLE_PREFLIGHT_FAILED";
+    await requestLocalSubtitlePreflight(requestId, request);
+    if (liveBridgePreflightRequestId !== requestId) return;
+    await bridge.completeLiveCallPreflight(requestId, { ok: true });
+  } catch (error) {
+    if (liveBridgePreflightRequestId !== requestId) return;
+    liveBridgePreflightRequestId = null;
+    stopLiveCallAudioBridge("preflight failed");
+    await bridge.completeLiveCallPreflight(requestId, {
+      ok: false,
+      code: failureCode,
+      message: String(error?.message ?? error),
+    });
+  }
+}
+
+async function cancelLiveCallPreflight(request) {
+  const requestId = typeof request?.requestId === "string" ? request.requestId : "";
+  if (!requestId || requestId !== liveBridgePreflightRequestId) return;
+  let liveState = null;
+  try { liveState = await window.realtimeNoelDesktop?.getLiveCallState?.(); } catch { /* cancellation is best-effort */ }
+  if (liveState?.live) return;
+  liveBridgePreflightRequestId = null;
+  stopLiveCallAudioBridge("preflight cancelled");
+}
+
+window.realtimeNoelDesktop?.onLiveCallPreflight?.(handleLiveCallPreflight);
+window.realtimeNoelDesktop?.onLiveCallPreflightCancel?.(cancelLiveCallPreflight);
 
 let activeCaptionProducer = "none";
 let activeCaptionSessionOwner = "none";
@@ -3031,13 +3774,24 @@ async function describeActiveMeeting() {
 async function syncLiveCallAudioBridge() {
   const bridge = window.realtimeNoelDesktop;
   if (!bridge?.getLiveCallState || !bridge.ensureLiveCallBridge) return;
+  const floorGateRevisionAtRequest = liveFloorGateRevision;
   let liveState = null;
   try { liveState = await bridge.getLiveCallState(); } catch { return; }
   if (!liveState?.armed || !liveState.live) {
     if (liveBridgeCapture) stopLiveCallAudioBridge("live call ended");
+    liveFloorGateRevision += 1;
+    isLiveHostAudioBlocked = true;
+    activeLiveFloorSessionId = "";
     if (activeCaptionSessionOwner === "live-call") await stopSubtitles();
     return;
   }
+  activeLiveFloorSessionId = String(liveState.sessionId ?? "");
+  if (liveFloorGateRevision === floorGateRevisionAtRequest) {
+    isLiveHostAudioBlocked = liveState.bridge?.floorKnown === true
+      ? liveState.bridge.hostAudioBlocked !== false
+      : true;
+  }
+  liveBridgePreflightRequestId = null;
   if (liveBridgeCapture?.failed) return;
   if (isLiveBridgeStarting) return;
   isLiveBridgeStarting = true;
@@ -3045,11 +3799,9 @@ async function syncLiveCallAudioBridge() {
     if (activeCaptionSessionOwner === "caption-only" || activeCaptionProducer === "none") {
       await startGatewayCaptionSession(liveState);
     }
-    if (["reconnecting", "failed"].includes(liveState.bridge?.state) && activeCaptionProducer !== "local") {
-      await startLocalLiveCallFallback(liveState);
-    } else if (liveState.bridge?.state === "connected" && activeCaptionProducer === "local") {
-      await restoreGatewayCaptionProducer();
-    }
+    // 2026-07-29 perf: Live Call has exactly one Gemini translation producer.
+    // The gateway result feeds both web and desktop captions, avoiding a paid
+    // local duplicate while keeping the renderer capture solely as gateway PCM.
     const result = await bridge.ensureLiveCallBridge();
     if (!result?.ok) {
       console.warn(`[live-bridge] gateway bridge unavailable: ${result?.code ?? "unknown"}`);
@@ -3080,10 +3832,11 @@ async function syncLiveCallAudioBridge() {
 async function startGatewayCaptionSession(liveState) {
   if (state.running) await stopSubtitles();
   await ensureWebSocketOpen();
+  transitionCaptionRuntime("starting");
   state.settings = readSettingsFromForm();
   state.sessionId = `live-${String(liveState.sessionId ?? crypto.randomUUID())}`;
   translatedAudioGuard.reset();
-  state.ws.send(JSON.stringify({
+  await requestSubtitleStart({
     type: "subtitle:start",
     captionProducer: "gateway",
     sessionId: state.sessionId,
@@ -3094,83 +3847,23 @@ async function startGatewayCaptionSession(liveState) {
       title: String(liveState.title ?? ""),
       startedAt: String(liveState.liveStartedAt ?? ""),
     },
-  }));
+  });
+  for (const caption of liveState.captionSnapshot ?? []) {
+    enqueueLiveCallCaptionRelay(caption);
+  }
   activeCaptionProducer = "gateway";
   activeCaptionSessionOwner = "live-call";
   state.running = true;
+  liveTranslationStallMonitor.reset();
+  transitionCaptionRuntime("running");
   startButton.disabled = true;
   stopButton.disabled = false;
   syncRuntimeOutputVisibility();
   setConnectionStatus(t("status.receivingCaptions"), "active");
+  flushLiveCallCaptionRelayQueue();
 }
 
-async function startLocalLiveCallFallback(liveState) {
-  let captures = [];
-  try {
-    captures = await captureSelectedAudio(state.settings);
-    state.streams = captures.map((capture) => capture.stream);
-    state.ws.send(JSON.stringify({
-      type: "subtitle:start",
-      sessionId: state.sessionId,
-      settings: state.settings,
-      meeting: {
-        kind: "live-call",
-        liveSessionId: String(liveState.sessionId ?? ""),
-        title: String(liveState.title ?? ""),
-        startedAt: String(liveState.liveStartedAt ?? ""),
-      },
-    }));
-    for (const capture of captures) {
-      const streamer = await createAudioStreamer(capture.stream, capture.source, capture.label, (packet) => {
-        if ((state.ws?.bufferedAmount ?? 0) > 1_000_000) return;
-        if (state.ws?.readyState !== WebSocket.OPEN || !state.sessionId) return;
-        state.ws.send(JSON.stringify({
-          type: "subtitle:audio",
-          sessionId: state.sessionId,
-          source: capture.source,
-          audio: pcm16ArrayBufferToBase64(packet.pcm),
-        }));
-      });
-      state.streamers.push(streamer);
-    }
-    activeCaptionProducer = "local";
-    setConnectionStatus(t("status.reconnecting"), "error");
-    setPreviewStatus(t("status.reconnecting"), 3_000);
-  } catch (error) {
-    for (const capture of captures) capture.stream.getTracks().forEach((track) => track.stop());
-    await stopSubtitles();
-    throw error;
-  }
-}
-
-async function restoreGatewayCaptionProducer() {
-  if (state.ws?.readyState !== WebSocket.OPEN || !state.sessionId) return;
-  const requestId = crypto.randomUUID();
-  const isProducerStopped = await new Promise((resolve) => {
-    const timer = window.setTimeout(() => finish(false), 2_000);
-    function finish(didStop) {
-      window.clearTimeout(timer);
-      state.ws?.removeEventListener("message", onMessage);
-      resolve(didStop);
-    }
-    function onMessage(event) {
-      let message;
-      try { message = JSON.parse(event.data); } catch { return; }
-      if (message.type === "subtitle:producer-stopped" && message.requestId === requestId) finish(true);
-    }
-    state.ws.addEventListener("message", onMessage);
-    state.ws.send(JSON.stringify({ type: "subtitle:producer-stop", sessionId: state.sessionId, requestId }));
-  });
-  // 2026-07-26 fix: Gateway promotion is acknowledgement-gated. Keeping the
-  // local producer selected on an ambiguous stop prevents dual final captions.
-  if (!isProducerStopped) {
-    setConnectionStatus(t("status.reconnecting"), "error");
-    return;
-  }
-  stopLocalStreams();
-  activeCaptionProducer = "gateway";
-  setConnectionStatus(t("status.receivingCaptions"), "active");
-}
+window.realtimeNoelDesktop?.onLiveCallFloor?.(applyLiveCallFloorGate);
 
 if (window.realtimeNoelDesktop?.ensureLiveCallBridge) {
   window.setInterval(() => { void syncLiveCallAudioBridge(); }, 1_000);
@@ -3179,12 +3872,219 @@ if (window.realtimeNoelDesktop?.ensureLiveCallBridge) {
 // ── Live Call canonical captions → local subtitle system ──────────────────
 // 2026-07-26 fix: Gateway events for both host and participant speech enter
 // one local ingest path so overlay, preview, history, and records stay equal.
+// 2026-07-27 fix: The hidden dashboard can reconnect independently from the
+// gateway. Keep canonical captions until the gateway producer acknowledgement
+// restores the relay instead of dropping every event during that gap.
+const MAX_LIVE_CALL_PENDING_PARTIALS = 32;
+const MAX_LIVE_CALL_FINALIZED_KEYS = 512;
+const LIVE_CALL_CAPTION_RELAY_BUFFER_LIMIT = 1_000_000;
+let liveCallCaptionRelayFlushTimer = null;
+const liveCallCaptionRelayQueue = [];
+const liveCallFinalizedCaptionKeys = new Map();
+const liveCallFinalSeqByLane = new Map();
+const liveCallDeliveredFinalSeqByLane = new Map();
+
+function getLiveCallCaptionRelayKey(caption) {
+  const sessionId = String(caption.sessionId ?? state.sessionId ?? "");
+  const language = String(caption.language ?? "");
+  const utteranceKey = String(caption.utteranceKey ?? "");
+  const sourceSeq = Number.isSafeInteger(caption.seq) ? String(caption.seq) : "";
+  const identity = utteranceKey || sourceSeq;
+  return identity ? `${sessionId}\u0000${language}\u0000${identity}` : "";
+}
+
+function getLiveCallCaptionRelayLane(caption) {
+  return `${String(caption.sessionId ?? state.sessionId ?? "")}\u0000${String(caption.language ?? "")}`;
+}
+
+function rememberFinalizedLiveCallCaption(key) {
+  if (!key) return;
+  liveCallFinalizedCaptionKeys.delete(key);
+  liveCallFinalizedCaptionKeys.set(key, true);
+  while (liveCallFinalizedCaptionKeys.size > MAX_LIVE_CALL_FINALIZED_KEYS) {
+    const oldestKey = liveCallFinalizedCaptionKeys.keys().next().value;
+    liveCallFinalizedCaptionKeys.delete(oldestKey);
+  }
+}
+
+function normalizeLiveCallCaptionRelay(caption) {
+  const text = String(caption?.text ?? "").trim();
+  if (!text || caption?.translationStatus === "failed") return null;
+  // Main has already removed source-language events and selected the single
+  // opposite-language translation that belongs on the desktop screen.
+  const speakerRole = caption.speakerRole === "participant"
+    || caption.speaker?.isParticipant === true
+    ? "participant"
+    : "host";
+  const speakerName = speakerRole === "host"
+    ? "Host"
+    : String(caption.speakerName
+      ?? caption.speaker?.name
+      ?? caption.speaker?.label
+      ?? t("live.participant"));
+  const key = getLiveCallCaptionRelayKey(caption);
+  const isFinal = caption.isFinal === true;
+  return {
+    key,
+    lane: getLiveCallCaptionRelayLane(caption),
+    isFinal,
+    canonicalSeq: Number.isSafeInteger(caption.seq) ? caption.seq : null,
+    payload: {
+      type: "subtitle:live-call-caption",
+      sessionId: String(caption.sessionId ?? ""),
+      partial: !isFinal,
+      targetLanguage: String(caption.language ?? ""),
+      sourceLanguage: String(caption.sourceLanguage ?? ""),
+      utteranceKey: String(caption.utteranceKey ?? ""),
+      sourceSeq: Number.isSafeInteger(caption.seq) ? caption.seq : null,
+      sourceText: String(caption.sourceText ?? (caption.origin === "source" ? text : "")),
+      speaker: speakerName,
+      speakerRole,
+      speakerDepartment: speakerRole === "participant"
+        ? String(caption.speakerDepartment ?? caption.speaker?.department ?? "")
+        : "",
+      speakerJobTitle: speakerRole === "participant"
+        ? String(caption.speakerJobTitle ?? caption.speaker?.jobTitle ?? "")
+        : "",
+      translatedText: text,
+    },
+  };
+}
+
+function isLiveCallCaptionRelayReady() {
+  return activeCaptionProducer === "gateway"
+    && (typeof activeCaptionSessionOwner === "undefined"
+      || (activeCaptionSessionOwner === "live-call" && state.running))
+    && (typeof captionRuntimeState === "undefined" || captionRuntimeState === "running")
+    && state.ws?.readyState === WebSocket.OPEN;
+}
+
+function scheduleLiveCallCaptionRelayFlush() {
+  if (liveCallCaptionRelayFlushTimer) return;
+  liveCallCaptionRelayFlushTimer = window.setTimeout(() => {
+    liveCallCaptionRelayFlushTimer = null;
+    flushLiveCallCaptionRelayQueue();
+  }, 100);
+}
+
+function trimLiveCallCaptionRelayQueue() {
+  let partialCount = liveCallCaptionRelayQueue.reduce(
+    (count, entry) => count + (entry.isFinal ? 0 : 1),
+    0,
+  );
+  while (partialCount > MAX_LIVE_CALL_PENDING_PARTIALS) {
+    const partialIndex = liveCallCaptionRelayQueue.findIndex((entry) => !entry.isFinal);
+    if (partialIndex < 0) return;
+    liveCallCaptionRelayQueue.splice(partialIndex, 1);
+    partialCount -= 1;
+  }
+}
+
+function enqueueLiveCallCaptionRelay(caption) {
+  const entry = normalizeLiveCallCaptionRelay(caption);
+  if (!entry) return false;
+  const finalSeq = liveCallFinalSeqByLane.get(entry.lane);
+  const deliveredFinalSeq = liveCallDeliveredFinalSeqByLane.get(entry.lane);
+  if (!entry.isFinal
+    && entry.canonicalSeq !== null
+    && finalSeq !== undefined
+    && entry.canonicalSeq <= finalSeq) return false;
+  if (entry.isFinal
+    && entry.canonicalSeq !== null
+    && deliveredFinalSeq !== undefined
+    && entry.canonicalSeq <= deliveredFinalSeq) return false;
+  if (entry.key && liveCallFinalizedCaptionKeys.has(entry.key)) return false;
+
+  if (entry.isFinal) {
+    rememberFinalizedLiveCallCaption(entry.key);
+    if (entry.canonicalSeq !== null) {
+      liveCallFinalSeqByLane.set(entry.lane, Math.max(finalSeq ?? -1, entry.canonicalSeq));
+    }
+    for (let index = liveCallCaptionRelayQueue.length - 1; index >= 0; index -= 1) {
+      const queued = liveCallCaptionRelayQueue[index];
+      const isSameFinalizedIdentity = queued.key && queued.key === entry.key;
+      const isStaleLanePartial = queued.lane === entry.lane
+        && entry.canonicalSeq !== null
+        && queued.canonicalSeq !== null
+        && queued.canonicalSeq <= entry.canonicalSeq;
+      if (!queued.isFinal && (isSameFinalizedIdentity || isStaleLanePartial)) {
+        liveCallCaptionRelayQueue.splice(index, 1);
+      }
+    }
+  }
+
+  if (isLiveCallCaptionRelayReady()
+    && (state.ws?.bufferedAmount ?? 0) <= LIVE_CALL_CAPTION_RELAY_BUFFER_LIMIT) {
+    try {
+      state.ws.send(JSON.stringify(entry.payload));
+      if (entry.isFinal && entry.canonicalSeq !== null) {
+        liveCallDeliveredFinalSeqByLane.set(entry.lane, entry.canonicalSeq);
+      }
+      return true;
+    } catch {
+      // The socket can close after readyState is observed. Queue this exact
+      // event so the producer recovery acknowledgement can release it later.
+    }
+  }
+
+  if (!entry.isFinal && entry.key) {
+    const partialIndex = liveCallCaptionRelayQueue.findIndex(
+      (queued) => !queued.isFinal && queued.key === entry.key,
+    );
+    if (partialIndex >= 0) liveCallCaptionRelayQueue[partialIndex] = entry;
+    else liveCallCaptionRelayQueue.push(entry);
+  } else {
+    liveCallCaptionRelayQueue.push(entry);
+  }
+  trimLiveCallCaptionRelayQueue();
+  if (isLiveCallCaptionRelayReady()) scheduleLiveCallCaptionRelayFlush();
+  return false;
+}
+
+function flushLiveCallCaptionRelayQueue() {
+  if (!isLiveCallCaptionRelayReady()) return false;
+  liveCallCaptionRelayQueue.sort((left, right) => {
+    const leftSeq = left.canonicalSeq ?? Number.MAX_SAFE_INTEGER;
+    const rightSeq = right.canonicalSeq ?? Number.MAX_SAFE_INTEGER;
+    if (leftSeq !== rightSeq) return leftSeq - rightSeq;
+    if (left.isFinal !== right.isFinal) return left.isFinal ? -1 : 1;
+    return 0;
+  });
+  while (liveCallCaptionRelayQueue.length > 0) {
+    if ((state.ws?.bufferedAmount ?? 0) > LIVE_CALL_CAPTION_RELAY_BUFFER_LIMIT) {
+      scheduleLiveCallCaptionRelayFlush();
+      return false;
+    }
+    const entry = liveCallCaptionRelayQueue[0];
+    try {
+      state.ws.send(JSON.stringify(entry.payload));
+      liveCallCaptionRelayQueue.shift();
+      if (entry.isFinal && entry.canonicalSeq !== null) {
+        liveCallDeliveredFinalSeqByLane.set(entry.lane, entry.canonicalSeq);
+      }
+    } catch {
+      return false;
+    }
+  }
+  return true;
+}
+
+function resetLiveCallCaptionRelay() {
+  window.clearTimeout(liveCallCaptionRelayFlushTimer);
+  liveCallCaptionRelayFlushTimer = null;
+  liveCallCaptionRelayQueue.length = 0;
+  liveCallFinalizedCaptionKeys.clear();
+  liveCallFinalSeqByLane.clear();
+  liveCallDeliveredFinalSeqByLane.clear();
+}
+
 // ── UI language changes ───────────────────────────────────────────────────
 // subtitle-workspace.js repaints every static data-i18n node; the dynamic
 // panels this file renders have to be rebuilt from their current state.
 subscribeToLanguage(() => {
   renderLanguagePills();
   renderPlacementRows();
+  renderGlossaryPresetOptions();
   writeSettingsToForm(state.settings);
   renderLanguageChips();
   updatePtOutputControls();
@@ -3199,40 +4099,13 @@ subscribeToLanguage(() => {
 if (window.realtimeNoelDesktop?.onLiveCallCaption) {
   window.realtimeNoelDesktop.onLiveCallCaption((caption) => {
     if (!caption || activeCaptionProducer !== "gateway") return;
-    if (state.ws?.readyState !== WebSocket.OPEN) return;
-    const text = String(caption.text ?? "").trim();
-    if (!text) return;
-    const speakerRole = caption.speakerRole === "participant"
-      || caption.speaker?.isParticipant === true
-      ? "participant"
-      : "host";
-    const speakerName = speakerRole === "host"
-      ? "Host"
-      : String(caption.speakerName
-        ?? caption.speaker?.name
-        ?? caption.speaker?.label
-        ?? t("live.participant"));
-    // Main has already removed source-language events and selected the single
-    // opposite-language translation that belongs on the desktop screen.
-    if (caption.translationStatus === "failed") return;
-    state.ws.send(JSON.stringify({
-      type: "subtitle:live-call-caption",
-      sessionId: String(caption.sessionId ?? ""),
-      partial: caption.isFinal !== true,
-      targetLanguage: String(caption.language ?? ""),
-      sourceLanguage: String(caption.sourceLanguage ?? ""),
-      utteranceKey: String(caption.utteranceKey ?? ""),
-      sourceText: String(caption.sourceText ?? (caption.origin === "source" ? text : "")),
-      speaker: speakerName,
-      speakerRole,
-      speakerDepartment: speakerRole === "participant"
-        ? String(caption.speakerDepartment ?? caption.speaker?.department ?? "")
-        : "",
-      speakerJobTitle: speakerRole === "participant"
-        ? String(caption.speakerJobTitle ?? caption.speaker?.jobTitle ?? "")
-        : "",
-      translatedText: text,
-    }));
+    if (activeCaptionSessionOwner !== "live-call" || !state.running) return;
+    if (typeof activeLiveFloorSessionId !== "undefined"
+      && caption.sessionId !== activeLiveFloorSessionId) return;
+    if (String(caption.text ?? "").trim() && typeof liveTranslationStallMonitor !== "undefined") {
+      liveTranslationStallMonitor.noteOutput(performance.now());
+    }
+    enqueueLiveCallCaptionRelay(caption);
   });
 }
 

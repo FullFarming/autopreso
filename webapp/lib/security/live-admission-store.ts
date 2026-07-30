@@ -11,7 +11,7 @@ export interface LiveSessionSecurityView {
   status: "preparing" | "live" | "paused";
   sessionType: "presentation" | "meeting";
   outputMode: "captions" | "captions_audio" | "audio";
-  voiceProvider: "gemini" | "openai";
+  voiceProvider: "gemini";
   glossaryPack: "general_cre" | "hotel" | "fnb";
   languages: string[];
   maxViewers: number;
@@ -108,6 +108,15 @@ function requiredString(row: Record<string, unknown>, key: string): string {
   return value;
 }
 
+function optionalString(row: Record<string, unknown>, key: string): string {
+  const value = row[key];
+  if (value === null || value === undefined) return "";
+  if (typeof value !== "string") {
+    throw new LiveAdmissionError("라이브 인증 응답이 올바르지 않습니다.", "INVALID_STORE_RESPONSE", 503);
+  }
+  return value;
+}
+
 function requiredTimestamp(row: Record<string, unknown>, key: string): string {
   const value = requiredString(row, key);
   if (!Number.isFinite(Date.parse(value))) {
@@ -136,19 +145,14 @@ function parseLanguages(row: Record<string, unknown>): string[] {
   return languages;
 }
 
-function parseVoiceProvider(
-  row: Record<string, unknown>,
-  sessionType: LiveSessionSecurityView["sessionType"],
-  outputMode: LiveSessionSecurityView["outputMode"],
-): LiveSessionSecurityView["voiceProvider"] {
+function parseVoiceProvider(row: Record<string, unknown>): LiveSessionSecurityView["voiceProvider"] {
   const voiceProvider = requiredString(row, "voice_provider");
   if (voiceProvider !== "gemini" && voiceProvider !== "openai") {
     throw new LiveAdmissionError("음성 공급자 설정이 올바르지 않습니다.", "INVALID_STORE_RESPONSE", 503);
   }
-  if (voiceProvider === "openai" && (sessionType !== "presentation" || outputMode === "captions")) {
-    throw new LiveAdmissionError("음성 공급자 설정이 세션 모드와 일치하지 않습니다.", "INVALID_STORE_RESPONSE", 503);
-  }
-  return voiceProvider;
+  // 2026-07-27 fix: 기존 DB 행의 OpenAI 값은 라이브 저장소와 동일하게 Gemini로 승격한다.
+  // 신규 입력은 Gemini만 허용하므로 폐기된 공급자가 뷰어 계약으로 다시 노출되지 않는다.
+  return "gemini";
 }
 
 function mapRpcError(status: number, body: RpcErrorBody): LiveAdmissionError {
@@ -174,7 +178,7 @@ function mapRpcError(status: number, body: RpcErrorBody): LiveAdmissionError {
   if (providerCode === "RATE_LIMITED" || providerMessage.includes("RATE_LIMITED")) {
     return new LiveAdmissionError("요청이 너무 많습니다. 잠시 후 다시 시도해 주세요.", "RATE_LIMITED", 429);
   }
-  if (["INVALID_DISPLAY_NAME", "INVALID_JOIN_INPUT"].some(
+  if (["INVALID_DISPLAY_NAME", "INVALID_JOIN_INPUT", "INVALID_PARTICIPANT_IDENTITY"].some(
     (code) => providerCode === code || providerMessage.includes(code),
   )) {
     return new LiveAdmissionError("표시할 이름 또는 입장 정보가 올바르지 않습니다.", "INVALID_JOIN_REQUEST", 400);
@@ -196,7 +200,7 @@ function parseAdmissionRedemption(body: unknown): AdmissionRedemption {
   if (outputMode !== "captions" && outputMode !== "captions_audio" && outputMode !== "audio") {
     throw new LiveAdmissionError("입장권 출력 모드가 올바르지 않습니다.", "INVALID_STORE_RESPONSE", 503);
   }
-  const voiceProvider = parseVoiceProvider(row, sessionType, outputMode);
+  const voiceProvider = parseVoiceProvider(row);
   const glossaryPack = requiredString(row, "glossary_pack");
   if (glossaryPack !== "general_cre" && glossaryPack !== "hotel" && glossaryPack !== "fnb") {
     throw new LiveAdmissionError("입장권 용어집 설정이 올바르지 않습니다.", "INVALID_STORE_RESPONSE", 503);
@@ -227,8 +231,8 @@ function parseAdmissionRedemption(body: unknown): AdmissionRedemption {
       sessionId: requiredString(row, "session_id"),
       userId: requiredString(row, "user_id"),
       displayName: requiredString(row, "display_name"),
-      department: requiredString(row, "department"),
-      jobTitle: requiredString(row, "job_title"),
+      department: optionalString(row, "department"),
+      jobTitle: optionalString(row, "job_title"),
       participantId: requiredString(row, "participant_id"),
       expiresAt: requiredString(row, "grant_expires_at"),
     },
@@ -334,7 +338,7 @@ export class SupabaseLiveAdmissionStore {
     if (outputMode !== "captions" && outputMode !== "captions_audio" && outputMode !== "audio") {
       throw new LiveAdmissionError("라이브 세션 출력 모드가 올바르지 않습니다.", "INVALID_STORE_RESPONSE", 503);
     }
-    const voiceProvider = parseVoiceProvider(row, sessionType, outputMode);
+    const voiceProvider = parseVoiceProvider(row);
     const glossaryPack = requiredString(row, "glossary_pack");
     if (glossaryPack !== "general_cre" && glossaryPack !== "hotel" && glossaryPack !== "fnb") {
       throw new LiveAdmissionError("라이브 세션 용어집 설정이 올바르지 않습니다.", "INVALID_STORE_RESPONSE", 503);
@@ -564,8 +568,8 @@ export class SupabaseLiveAdmissionStore {
         p_user_id: input.userId,
         p_device_hash: input.deviceHash,
         p_display_name: input.displayName,
-        p_department: input.department,
-        p_job_title: input.jobTitle,
+        p_department: input.department || null,
+        p_job_title: input.jobTitle || null,
         p_grant_expires_at: input.expiresAt,
       }),
     });
@@ -588,8 +592,8 @@ export class SupabaseLiveAdmissionStore {
         p_user_id: input.userId,
         p_device_hash: input.deviceHash,
         p_display_name: input.displayName,
-        p_department: input.department,
-        p_job_title: input.jobTitle,
+        p_department: input.department || null,
+        p_job_title: input.jobTitle || null,
         p_grant_expires_at: input.expiresAt,
       }),
     });
@@ -625,8 +629,8 @@ export class SupabaseLiveAdmissionStore {
         grantId: requiredString(value, "grant_id"),
         userId: requiredString(value, "user_id"),
         displayName: requiredString(value, "display_name"),
-        department: requiredString(value, "department"),
-        jobTitle: requiredString(value, "job_title"),
+        department: optionalString(value, "department"),
+        jobTitle: optionalString(value, "job_title"),
         joinedAt: requiredTimestamp(value, "joined_at"),
         lastSeenAt: requiredTimestamp(value, "last_seen_at"),
         leftAt,

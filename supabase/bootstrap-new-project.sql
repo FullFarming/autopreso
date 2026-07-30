@@ -5393,3 +5393,1587 @@ grant execute on function public.persist_live_snapshot_if_active(uuid, text, jso
 
 -- Rollback is application-first. Older gateway binaries do not send these
 -- optional fields, so keep this additive wrapper during a rolling rollback.
+
+-- 20260727010000_live_optional_participant_identity.sql
+-- 2026-07-27 feat: Keep participant name required while making department and
+-- job title optional. Empty optional values are stored canonically as NULL;
+-- existing v3 redemption signatures and service-role boundaries stay intact.
+
+alter table public.live_participants
+  alter column department drop not null,
+  alter column job_title drop not null;
+
+alter table public.live_participants
+  drop constraint if exists live_participants_identity_check;
+
+alter table public.live_participants
+  add constraint live_participants_identity_check check (
+    char_length(display_name) between 1 and 40
+    and display_name = normalize(btrim(display_name), NFC)
+    and display_name !~ '[[:cntrl:]]'
+    and display_name !~ '[<>]'
+    and (
+      department is null or (
+        char_length(department) between 1 and 80
+        and department = normalize(btrim(department), NFC)
+        and department !~ '[[:cntrl:]]'
+        and department !~ '[<>]'
+      )
+    )
+    and (
+      job_title is null or (
+        char_length(job_title) between 1 and 100
+        and job_title = normalize(btrim(job_title), NFC)
+        and job_title !~ '[[:cntrl:]]'
+        and job_title !~ '[<>]'
+      )
+    )
+  );
+
+comment on column public.live_participants.department is
+  'Optional NFC-normalized department; omitted or blank input is stored as NULL.';
+comment on column public.live_participants.job_title is
+  'Optional NFC-normalized job title; omitted or blank input is stored as NULL.';
+
+create or replace function public.apply_live_viewer_grant(
+  p_session_id uuid,
+  p_user_id text,
+  p_device_hash text,
+  p_grant_expires_at timestamptz,
+  p_display_name text,
+  p_department text,
+  p_job_title text
+)
+returns table (
+  grant_id uuid,
+  grant_user_id text,
+  grant_expires_at timestamptz,
+  resolved_viewer_count integer,
+  resolved_display_name text,
+  resolved_department text,
+  resolved_job_title text,
+  participant_id uuid
+)
+language plpgsql
+security definer
+set search_path = ''
+as $$
+#variable_conflict use_column
+declare
+  grant_result record;
+  normalized_department text;
+  normalized_job_title text;
+begin
+  normalized_department := nullif(normalize(btrim(coalesce(p_department, '')), NFC), '');
+  normalized_job_title := nullif(normalize(btrim(coalesce(p_job_title, '')), NFC), '');
+  if (
+      normalized_department is not null
+      and (
+        char_length(normalized_department) not between 1 and 80
+        or normalized_department ~ '[[:cntrl:]]'
+        or normalized_department ~ '[<>]'
+      )
+    ) or (
+      normalized_job_title is not null
+      and (
+        char_length(normalized_job_title) not between 1 and 100
+        or normalized_job_title ~ '[[:cntrl:]]'
+        or normalized_job_title ~ '[<>]'
+      )
+    )
+  then
+    raise exception using errcode = '22023', message = 'INVALID_PARTICIPANT_IDENTITY';
+  end if;
+
+  select * into grant_result
+  from public.apply_live_viewer_grant(
+    p_session_id, p_user_id, p_device_hash, p_grant_expires_at, p_display_name
+  );
+
+  update public.viewer_grants
+  set department = normalized_department,
+      job_title = normalized_job_title
+  where id = grant_result.grant_id;
+
+  insert into public.live_participants as participant_row (
+    id, grant_id, session_id, user_id, display_name, department, job_title,
+    joined_at, last_seen_at, left_at, retention_expires_at
+  ) values (
+    grant_result.grant_id, grant_result.grant_id, p_session_id, p_user_id,
+    grant_result.resolved_display_name, normalized_department,
+    normalized_job_title, statement_timestamp(), statement_timestamp(), null, null
+  )
+  on conflict (session_id, user_id) do update
+    set grant_id = excluded.grant_id,
+        display_name = excluded.display_name,
+        department = excluded.department,
+        job_title = excluded.job_title,
+        last_seen_at = statement_timestamp(),
+        left_at = null,
+        retention_expires_at = null
+  returning participant_row.id into participant_id;
+
+  insert into public.live_participant_events (
+    participant_id, session_id, event_type, occurred_at
+  ) values (
+    participant_id, p_session_id, 'joined', statement_timestamp()
+  );
+
+  grant_id := grant_result.grant_id;
+  grant_user_id := grant_result.grant_user_id;
+  grant_expires_at := grant_result.grant_expires_at;
+  resolved_viewer_count := grant_result.resolved_viewer_count;
+  resolved_display_name := grant_result.resolved_display_name;
+  resolved_department := normalized_department;
+  resolved_job_title := normalized_job_title;
+  return next;
+end;
+$$;
+
+revoke all on function public.apply_live_viewer_grant(
+  uuid, text, text, timestamptz, text, text, text
+) from public, anon, authenticated;
+grant execute on function public.apply_live_viewer_grant(
+  uuid, text, text, timestamptz, text, text, text
+) to service_role;
+
+-- 20260727011000_live_cover_20mb.sql
+-- Raise only the existing private Live Call cover bucket limit. The image
+-- allowlist and private access boundary remain explicit during migration.
+update storage.buckets
+set file_size_limit = 20971520,
+    public = false,
+    allowed_mime_types = array['image/jpeg', 'image/png', 'image/webp']
+where id = 'live-covers';
+
+-- 20260727012000_host_glossary_presets.sql
+-- 2026-07-27 feat: Add private, host-owned glossary presets for bilingual live
+-- caption configuration. Service-only RPCs keep host identity server-derived,
+-- enforce bounded input, and use optimistic versions for safe concurrent edits.
+
+create table public.host_glossary_presets (
+  id uuid primary key default gen_random_uuid(),
+  host_id text not null,
+  name text not null,
+  domain text not null default '',
+  glossary text not null,
+  language_a text not null,
+  language_b text not null,
+  version integer not null default 1,
+  created_at timestamptz not null default statement_timestamp(),
+  updated_at timestamptz not null default statement_timestamp(),
+  constraint host_glossary_presets_host_id_check check (
+    char_length(host_id) between 1 and 100
+    and host_id = btrim(host_id)
+    and host_id !~ '[[:cntrl:]]'
+  ),
+  constraint host_glossary_presets_name_check check (
+    char_length(name) between 1 and 80
+    and name = btrim(name)
+    and name !~ '[[:cntrl:]]'
+    and name !~ '[<>]'
+  ),
+  constraint host_glossary_presets_domain_check check (
+    char_length(domain) <= 600
+    and domain = btrim(domain)
+    and domain !~ '[[:cntrl:]]'
+  ),
+  constraint host_glossary_presets_glossary_check check (
+    char_length(glossary) between 1 and 16000
+    and glossary = btrim(glossary)
+    and translate(glossary, E'\n\r\t', '') !~ '[[:cntrl:]]'
+  ),
+  constraint host_glossary_presets_languages_check check (
+    public.live_language_valid(language_a)
+    and public.live_language_valid(language_b)
+    and language_a <> language_b
+  ),
+  constraint host_glossary_presets_version_check check (version >= 1),
+  constraint host_glossary_presets_timestamps_check check (updated_at >= created_at)
+);
+
+create unique index host_glossary_presets_host_name_unique
+  on public.host_glossary_presets (lower(host_id), lower(name));
+
+create index host_glossary_presets_host_id_idx
+  on public.host_glossary_presets (host_id);
+
+alter table public.host_glossary_presets enable row level security;
+
+revoke all on table public.host_glossary_presets
+  from public, anon, authenticated, service_role;
+
+create or replace function public.list_host_glossary_presets(
+  p_host_id text
+)
+returns table (
+  id uuid,
+  name text,
+  domain text,
+  glossary text,
+  language_a text,
+  language_b text,
+  version integer,
+  updated_at timestamptz
+)
+language plpgsql
+stable
+security definer
+set search_path = ''
+as $$
+#variable_conflict use_column
+declare
+  clean_host_id text;
+begin
+  clean_host_id := pg_catalog.btrim(pg_catalog.coalesce(p_host_id, ''));
+  if pg_catalog.char_length(clean_host_id) not between 1 and 100
+    or clean_host_id ~ '[[:cntrl:]]'
+  then
+    raise exception using errcode = '22023', message = 'INVALID_HOST_GLOSSARY_PRESET_INPUT';
+  end if;
+
+  return query
+  select
+    preset_row.id,
+    preset_row.name,
+    preset_row.domain,
+    preset_row.glossary,
+    preset_row.language_a,
+    preset_row.language_b,
+    preset_row.version,
+    preset_row.updated_at
+  from public.host_glossary_presets as preset_row
+  where preset_row.host_id = clean_host_id
+  order by preset_row.updated_at desc, preset_row.id;
+end;
+$$;
+
+create or replace function public.create_host_glossary_preset(
+  p_host_id text,
+  p_name text,
+  p_domain text,
+  p_glossary text,
+  p_language_a text,
+  p_language_b text
+)
+returns table (
+  id uuid,
+  name text,
+  domain text,
+  glossary text,
+  language_a text,
+  language_b text,
+  version integer,
+  updated_at timestamptz
+)
+language plpgsql
+security definer
+set search_path = ''
+as $$
+#variable_conflict use_column
+declare
+  clean_host_id text;
+  clean_name text;
+  clean_domain text;
+  clean_glossary text;
+  clean_language_a text;
+  clean_language_b text;
+  preset_count integer;
+begin
+  clean_host_id := pg_catalog.btrim(pg_catalog.coalesce(p_host_id, ''));
+  clean_name := pg_catalog.btrim(pg_catalog.coalesce(p_name, ''));
+  clean_domain := pg_catalog.btrim(pg_catalog.coalesce(p_domain, ''));
+  clean_glossary := pg_catalog.btrim(pg_catalog.coalesce(p_glossary, ''));
+  clean_language_a := pg_catalog.btrim(pg_catalog.coalesce(p_language_a, ''));
+  clean_language_b := pg_catalog.btrim(pg_catalog.coalesce(p_language_b, ''));
+
+  if pg_catalog.char_length(clean_host_id) not between 1 and 100
+    or clean_host_id ~ '[[:cntrl:]]'
+    or pg_catalog.char_length(clean_name) not between 1 and 80
+    or clean_name ~ '[[:cntrl:]]'
+    or clean_name ~ '[<>]'
+    or pg_catalog.char_length(clean_domain) > 600
+    or clean_domain ~ '[[:cntrl:]]'
+    or pg_catalog.char_length(clean_glossary) not between 1 and 16000
+    or pg_catalog.translate(clean_glossary, E'\n\r\t', '') ~ '[[:cntrl:]]'
+    or public.live_language_valid(clean_language_a) is not true
+    or public.live_language_valid(clean_language_b) is not true
+    or clean_language_a = clean_language_b
+  then
+    raise exception using errcode = '22023', message = 'INVALID_HOST_GLOSSARY_PRESET_INPUT';
+  end if;
+
+  -- A host-scoped transaction lock makes count + insert one capacity decision.
+  perform pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtextextended(clean_host_id, 0));
+
+  select count(*) into preset_count
+  from public.host_glossary_presets as preset_row
+  where preset_row.host_id = clean_host_id;
+
+  if preset_count >= 50 then
+    raise exception using errcode = 'P0001', message = 'GLOSSARY_PRESET_LIMIT_REACHED';
+  end if;
+
+  return query
+  insert into public.host_glossary_presets as preset_row (
+    host_id, name, domain, glossary, language_a, language_b
+  ) values (
+    clean_host_id, clean_name, clean_domain, clean_glossary,
+    clean_language_a, clean_language_b
+  )
+  returning
+    preset_row.id,
+    preset_row.name,
+    preset_row.domain,
+    preset_row.glossary,
+    preset_row.language_a,
+    preset_row.language_b,
+    preset_row.version,
+    preset_row.updated_at;
+exception
+  when unique_violation then
+    raise exception using errcode = 'P0001', message = 'GLOSSARY_PRESET_NAME_CONFLICT';
+end;
+$$;
+
+create or replace function public.update_host_glossary_preset(
+  p_id uuid,
+  p_host_id text,
+  p_expected_version integer,
+  p_name text,
+  p_domain text,
+  p_glossary text,
+  p_language_a text,
+  p_language_b text
+)
+returns table (
+  id uuid,
+  name text,
+  domain text,
+  glossary text,
+  language_a text,
+  language_b text,
+  version integer,
+  updated_at timestamptz
+)
+language plpgsql
+security definer
+set search_path = ''
+as $$
+#variable_conflict use_column
+declare
+  clean_host_id text;
+  clean_name text;
+  clean_domain text;
+  clean_glossary text;
+  clean_language_a text;
+  clean_language_b text;
+  affected_count integer;
+  updated_preset public.host_glossary_presets%rowtype;
+begin
+  clean_host_id := pg_catalog.btrim(pg_catalog.coalesce(p_host_id, ''));
+  clean_name := pg_catalog.btrim(pg_catalog.coalesce(p_name, ''));
+  clean_domain := pg_catalog.btrim(pg_catalog.coalesce(p_domain, ''));
+  clean_glossary := pg_catalog.btrim(pg_catalog.coalesce(p_glossary, ''));
+  clean_language_a := pg_catalog.btrim(pg_catalog.coalesce(p_language_a, ''));
+  clean_language_b := pg_catalog.btrim(pg_catalog.coalesce(p_language_b, ''));
+
+  if p_id is null
+    or p_expected_version is null
+    or p_expected_version < 1
+    or pg_catalog.char_length(clean_host_id) not between 1 and 100
+    or clean_host_id ~ '[[:cntrl:]]'
+    or pg_catalog.char_length(clean_name) not between 1 and 80
+    or clean_name ~ '[[:cntrl:]]'
+    or clean_name ~ '[<>]'
+    or pg_catalog.char_length(clean_domain) > 600
+    or clean_domain ~ '[[:cntrl:]]'
+    or pg_catalog.char_length(clean_glossary) not between 1 and 16000
+    or pg_catalog.translate(clean_glossary, E'\n\r\t', '') ~ '[[:cntrl:]]'
+    or public.live_language_valid(clean_language_a) is not true
+    or public.live_language_valid(clean_language_b) is not true
+    or clean_language_a = clean_language_b
+  then
+    raise exception using errcode = '22023', message = 'INVALID_HOST_GLOSSARY_PRESET_INPUT';
+  end if;
+
+  update public.host_glossary_presets as preset_row
+  set name = clean_name,
+      domain = clean_domain,
+      glossary = clean_glossary,
+      language_a = clean_language_a,
+      language_b = clean_language_b,
+      version = preset_row.version + 1,
+      updated_at = statement_timestamp()
+  where preset_row.id = p_id
+    and preset_row.host_id = clean_host_id
+    and preset_row.version = p_expected_version
+  returning preset_row.* into updated_preset;
+
+  GET DIAGNOSTICS affected_count = ROW_COUNT;
+  if affected_count = 0 then
+    if exists (
+      select 1
+      from public.host_glossary_presets as preset_row
+      where preset_row.id = p_id
+        and preset_row.host_id = clean_host_id
+    ) then
+      raise exception using errcode = 'P0001', message = 'GLOSSARY_PRESET_VERSION_CONFLICT';
+    end if;
+    raise exception using errcode = 'P0001', message = 'GLOSSARY_PRESET_NOT_FOUND';
+  end if;
+
+  return query select
+    updated_preset.id,
+    updated_preset.name,
+    updated_preset.domain,
+    updated_preset.glossary,
+    updated_preset.language_a,
+    updated_preset.language_b,
+    updated_preset.version,
+    updated_preset.updated_at;
+exception
+  when unique_violation then
+    raise exception using errcode = 'P0001', message = 'GLOSSARY_PRESET_NAME_CONFLICT';
+end;
+$$;
+
+create or replace function public.delete_host_glossary_preset(
+  p_id uuid,
+  p_host_id text,
+  p_expected_version integer
+)
+returns boolean
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+  clean_host_id text;
+  affected_count integer;
+begin
+  clean_host_id := pg_catalog.btrim(pg_catalog.coalesce(p_host_id, ''));
+  if p_id is null
+    or p_expected_version is null
+    or p_expected_version < 1
+    or pg_catalog.char_length(clean_host_id) not between 1 and 100
+    or clean_host_id ~ '[[:cntrl:]]'
+  then
+    raise exception using errcode = '22023', message = 'INVALID_HOST_GLOSSARY_PRESET_INPUT';
+  end if;
+
+  delete from public.host_glossary_presets as preset_row
+  where preset_row.id = p_id
+    and preset_row.host_id = clean_host_id
+    and preset_row.version = p_expected_version;
+
+  GET DIAGNOSTICS affected_count = ROW_COUNT;
+  if affected_count = 0 then
+    if exists (
+      select 1
+      from public.host_glossary_presets as preset_row
+      where preset_row.id = p_id
+        and preset_row.host_id = clean_host_id
+    ) then
+      raise exception using errcode = 'P0001', message = 'GLOSSARY_PRESET_VERSION_CONFLICT';
+    end if;
+    raise exception using errcode = 'P0001', message = 'GLOSSARY_PRESET_NOT_FOUND';
+  end if;
+
+  return true;
+end;
+$$;
+
+revoke all on function public.list_host_glossary_presets(text)
+  from public, anon, authenticated;
+revoke all on function public.create_host_glossary_preset(text, text, text, text, text, text)
+  from public, anon, authenticated;
+revoke all on function public.update_host_glossary_preset(uuid, text, integer, text, text, text, text, text)
+  from public, anon, authenticated;
+revoke all on function public.delete_host_glossary_preset(uuid, text, integer)
+  from public, anon, authenticated;
+
+grant execute on function public.list_host_glossary_presets(text)
+  to service_role;
+grant execute on function public.create_host_glossary_preset(text, text, text, text, text, text)
+  to service_role;
+grant execute on function public.update_host_glossary_preset(uuid, text, integer, text, text, text, text, text)
+  to service_role;
+grant execute on function public.delete_host_glossary_preset(uuid, text, integer)
+  to service_role;
+
+-- Verification (run after applying to a development project only):
+-- select has_table_privilege('anon', 'public.host_glossary_presets', 'select'); -- false
+-- select has_table_privilege('service_role', 'public.host_glossary_presets', 'select'); -- false
+-- select has_function_privilege('authenticated', 'public.list_host_glossary_presets(text)', 'execute'); -- false
+-- select has_function_privilege('service_role', 'public.list_host_glossary_presets(text)', 'execute'); -- true
+-- select * from public.create_host_glossary_preset('host-1', 'CRE core', '', 'NOI = Net Operating Income', 'en', 'ko');
+-- select * from public.list_host_glossary_presets('host-1');
+-- Calling update/delete with a stale version must raise GLOSSARY_PRESET_VERSION_CONFLICT.
+
+-- 20260727013000_host_glossary_presets_coalesce_fix.sql
+-- 2026-07-27 fix: COALESCE is SQL syntax, not a pg_catalog function. Recreate
+-- the four already-deployed glossary RPCs without changing their signatures,
+-- ownership predicates, concurrency controls, or least-privilege grants.
+
+create or replace function public.list_host_glossary_presets(
+  p_host_id text
+)
+returns table (
+  id uuid,
+  name text,
+  domain text,
+  glossary text,
+  language_a text,
+  language_b text,
+  version integer,
+  updated_at timestamptz
+)
+language plpgsql
+stable
+security definer
+set search_path = ''
+as $$
+#variable_conflict use_column
+declare
+  clean_host_id text;
+begin
+  clean_host_id := pg_catalog.btrim(coalesce(p_host_id, ''));
+  if pg_catalog.char_length(clean_host_id) not between 1 and 100
+    or clean_host_id ~ '[[:cntrl:]]'
+  then
+    raise exception using errcode = '22023', message = 'INVALID_HOST_GLOSSARY_PRESET_INPUT';
+  end if;
+
+  return query
+  select
+    preset_row.id,
+    preset_row.name,
+    preset_row.domain,
+    preset_row.glossary,
+    preset_row.language_a,
+    preset_row.language_b,
+    preset_row.version,
+    preset_row.updated_at
+  from public.host_glossary_presets as preset_row
+  where preset_row.host_id = clean_host_id
+  order by preset_row.updated_at desc, preset_row.id;
+end;
+$$;
+
+create or replace function public.create_host_glossary_preset(
+  p_host_id text,
+  p_name text,
+  p_domain text,
+  p_glossary text,
+  p_language_a text,
+  p_language_b text
+)
+returns table (
+  id uuid,
+  name text,
+  domain text,
+  glossary text,
+  language_a text,
+  language_b text,
+  version integer,
+  updated_at timestamptz
+)
+language plpgsql
+security definer
+set search_path = ''
+as $$
+#variable_conflict use_column
+declare
+  clean_host_id text;
+  clean_name text;
+  clean_domain text;
+  clean_glossary text;
+  clean_language_a text;
+  clean_language_b text;
+  preset_count integer;
+begin
+  clean_host_id := pg_catalog.btrim(coalesce(p_host_id, ''));
+  clean_name := pg_catalog.btrim(coalesce(p_name, ''));
+  clean_domain := pg_catalog.btrim(coalesce(p_domain, ''));
+  clean_glossary := pg_catalog.btrim(coalesce(p_glossary, ''));
+  clean_language_a := pg_catalog.btrim(coalesce(p_language_a, ''));
+  clean_language_b := pg_catalog.btrim(coalesce(p_language_b, ''));
+
+  if pg_catalog.char_length(clean_host_id) not between 1 and 100
+    or clean_host_id ~ '[[:cntrl:]]'
+    or pg_catalog.char_length(clean_name) not between 1 and 80
+    or clean_name ~ '[[:cntrl:]]'
+    or clean_name ~ '[<>]'
+    or pg_catalog.char_length(clean_domain) > 600
+    or clean_domain ~ '[[:cntrl:]]'
+    or pg_catalog.char_length(clean_glossary) not between 1 and 16000
+    or pg_catalog.translate(clean_glossary, E'\n\r\t', '') ~ '[[:cntrl:]]'
+    or public.live_language_valid(clean_language_a) is not true
+    or public.live_language_valid(clean_language_b) is not true
+    or clean_language_a = clean_language_b
+  then
+    raise exception using errcode = '22023', message = 'INVALID_HOST_GLOSSARY_PRESET_INPUT';
+  end if;
+
+  -- A host-scoped transaction lock makes count + insert one capacity decision.
+  perform pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtextextended(clean_host_id, 0));
+
+  select count(*) into preset_count
+  from public.host_glossary_presets as preset_row
+  where preset_row.host_id = clean_host_id;
+
+  if preset_count >= 50 then
+    raise exception using errcode = 'P0001', message = 'GLOSSARY_PRESET_LIMIT_REACHED';
+  end if;
+
+  return query
+  insert into public.host_glossary_presets as preset_row (
+    host_id, name, domain, glossary, language_a, language_b
+  ) values (
+    clean_host_id, clean_name, clean_domain, clean_glossary,
+    clean_language_a, clean_language_b
+  )
+  returning
+    preset_row.id,
+    preset_row.name,
+    preset_row.domain,
+    preset_row.glossary,
+    preset_row.language_a,
+    preset_row.language_b,
+    preset_row.version,
+    preset_row.updated_at;
+exception
+  when unique_violation then
+    raise exception using errcode = 'P0001', message = 'GLOSSARY_PRESET_NAME_CONFLICT';
+end;
+$$;
+
+create or replace function public.update_host_glossary_preset(
+  p_id uuid,
+  p_host_id text,
+  p_expected_version integer,
+  p_name text,
+  p_domain text,
+  p_glossary text,
+  p_language_a text,
+  p_language_b text
+)
+returns table (
+  id uuid,
+  name text,
+  domain text,
+  glossary text,
+  language_a text,
+  language_b text,
+  version integer,
+  updated_at timestamptz
+)
+language plpgsql
+security definer
+set search_path = ''
+as $$
+#variable_conflict use_column
+declare
+  clean_host_id text;
+  clean_name text;
+  clean_domain text;
+  clean_glossary text;
+  clean_language_a text;
+  clean_language_b text;
+  affected_count integer;
+  updated_preset public.host_glossary_presets%rowtype;
+begin
+  clean_host_id := pg_catalog.btrim(coalesce(p_host_id, ''));
+  clean_name := pg_catalog.btrim(coalesce(p_name, ''));
+  clean_domain := pg_catalog.btrim(coalesce(p_domain, ''));
+  clean_glossary := pg_catalog.btrim(coalesce(p_glossary, ''));
+  clean_language_a := pg_catalog.btrim(coalesce(p_language_a, ''));
+  clean_language_b := pg_catalog.btrim(coalesce(p_language_b, ''));
+
+  if p_id is null
+    or p_expected_version is null
+    or p_expected_version < 1
+    or pg_catalog.char_length(clean_host_id) not between 1 and 100
+    or clean_host_id ~ '[[:cntrl:]]'
+    or pg_catalog.char_length(clean_name) not between 1 and 80
+    or clean_name ~ '[[:cntrl:]]'
+    or clean_name ~ '[<>]'
+    or pg_catalog.char_length(clean_domain) > 600
+    or clean_domain ~ '[[:cntrl:]]'
+    or pg_catalog.char_length(clean_glossary) not between 1 and 16000
+    or pg_catalog.translate(clean_glossary, E'\n\r\t', '') ~ '[[:cntrl:]]'
+    or public.live_language_valid(clean_language_a) is not true
+    or public.live_language_valid(clean_language_b) is not true
+    or clean_language_a = clean_language_b
+  then
+    raise exception using errcode = '22023', message = 'INVALID_HOST_GLOSSARY_PRESET_INPUT';
+  end if;
+
+  update public.host_glossary_presets as preset_row
+  set name = clean_name,
+      domain = clean_domain,
+      glossary = clean_glossary,
+      language_a = clean_language_a,
+      language_b = clean_language_b,
+      version = preset_row.version + 1,
+      updated_at = statement_timestamp()
+  where preset_row.id = p_id
+    and preset_row.host_id = clean_host_id
+    and preset_row.version = p_expected_version
+  returning preset_row.* into updated_preset;
+
+  GET DIAGNOSTICS affected_count = ROW_COUNT;
+  if affected_count = 0 then
+    if exists (
+      select 1
+      from public.host_glossary_presets as preset_row
+      where preset_row.id = p_id
+        and preset_row.host_id = clean_host_id
+    ) then
+      raise exception using errcode = 'P0001', message = 'GLOSSARY_PRESET_VERSION_CONFLICT';
+    end if;
+    raise exception using errcode = 'P0001', message = 'GLOSSARY_PRESET_NOT_FOUND';
+  end if;
+
+  return query select
+    updated_preset.id,
+    updated_preset.name,
+    updated_preset.domain,
+    updated_preset.glossary,
+    updated_preset.language_a,
+    updated_preset.language_b,
+    updated_preset.version,
+    updated_preset.updated_at;
+exception
+  when unique_violation then
+    raise exception using errcode = 'P0001', message = 'GLOSSARY_PRESET_NAME_CONFLICT';
+end;
+$$;
+
+create or replace function public.delete_host_glossary_preset(
+  p_id uuid,
+  p_host_id text,
+  p_expected_version integer
+)
+returns boolean
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+  clean_host_id text;
+  affected_count integer;
+begin
+  clean_host_id := pg_catalog.btrim(coalesce(p_host_id, ''));
+  if p_id is null
+    or p_expected_version is null
+    or p_expected_version < 1
+    or pg_catalog.char_length(clean_host_id) not between 1 and 100
+    or clean_host_id ~ '[[:cntrl:]]'
+  then
+    raise exception using errcode = '22023', message = 'INVALID_HOST_GLOSSARY_PRESET_INPUT';
+  end if;
+
+  delete from public.host_glossary_presets as preset_row
+  where preset_row.id = p_id
+    and preset_row.host_id = clean_host_id
+    and preset_row.version = p_expected_version;
+
+  GET DIAGNOSTICS affected_count = ROW_COUNT;
+  if affected_count = 0 then
+    if exists (
+      select 1
+      from public.host_glossary_presets as preset_row
+      where preset_row.id = p_id
+        and preset_row.host_id = clean_host_id
+    ) then
+      raise exception using errcode = 'P0001', message = 'GLOSSARY_PRESET_VERSION_CONFLICT';
+    end if;
+    raise exception using errcode = 'P0001', message = 'GLOSSARY_PRESET_NOT_FOUND';
+  end if;
+
+  return true;
+end;
+$$;
+
+revoke all on function public.list_host_glossary_presets(text)
+  from public, anon, authenticated;
+revoke all on function public.create_host_glossary_preset(text, text, text, text, text, text)
+  from public, anon, authenticated;
+revoke all on function public.update_host_glossary_preset(uuid, text, integer, text, text, text, text, text)
+  from public, anon, authenticated;
+revoke all on function public.delete_host_glossary_preset(uuid, text, integer)
+  from public, anon, authenticated;
+
+grant execute on function public.list_host_glossary_presets(text)
+  to service_role;
+grant execute on function public.create_host_glossary_preset(text, text, text, text, text, text)
+  to service_role;
+grant execute on function public.update_host_glossary_preset(uuid, text, integer, text, text, text, text, text)
+  to service_role;
+grant execute on function public.delete_host_glossary_preset(uuid, text, integer)
+  to service_role;
+
+-- Verification (run after applying to a development project only):
+-- select * from public.list_host_glossary_presets('host-1');
+-- Expected: zero or more rows, never SQLSTATE 42883 for pg_catalog.coalesce.
+
+-- 20260727014000_live_summary_generation_jobs.sql
+-- 2026-07-27 feat: Make post-session summary generation a single-winner,
+-- durable state transition. The table is private; service code may only claim,
+-- complete, or fail one immutable session-language generation through RPCs.
+
+create table public.live_summary_generation_jobs (
+  session_id uuid not null references public.live_sessions(id) on delete cascade,
+  language text not null,
+  status text not null default 'running',
+  generation_token uuid not null unique,
+  error_code text,
+  created_at timestamptz not null default statement_timestamp(),
+  started_at timestamptz not null default statement_timestamp(),
+  updated_at timestamptz not null default statement_timestamp(),
+  completed_at timestamptz,
+  failed_at timestamptz,
+  primary key (session_id, language),
+  constraint live_summary_generation_jobs_language_check check (
+    public.live_language_valid(language)
+  ),
+  constraint live_summary_generation_jobs_status_check check (
+    status in ('running', 'succeeded', 'failed')
+  ),
+  constraint live_summary_generation_jobs_error_code_check check (
+    error_code is null
+    or (
+      char_length(error_code) between 1 and 120
+      and error_code = btrim(error_code)
+      and error_code !~ '[[:cntrl:]]'
+    )
+  ),
+  constraint live_summary_generation_jobs_state_check check (
+    (
+      status = 'running'
+      and error_code is null
+      and completed_at is null
+      and failed_at is null
+    )
+    or (
+      status = 'succeeded'
+      and error_code is null
+      and completed_at is not null
+      and failed_at is null
+    )
+    or (
+      status = 'failed'
+      and error_code is not null
+      and completed_at is null
+      and failed_at is not null
+    )
+  ),
+  constraint live_summary_generation_jobs_timestamps_check check (
+    started_at >= created_at
+    and updated_at >= created_at
+    and (completed_at is null or completed_at >= started_at)
+    and (failed_at is null or failed_at >= started_at)
+  )
+);
+
+alter table public.live_summary_generation_jobs enable row level security;
+
+revoke all on table public.live_summary_generation_jobs
+  from public, anon, authenticated, service_role;
+
+create or replace function public.claim_live_summary_generation(
+  p_session_id uuid,
+  p_language text
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+  session_status text;
+  job_status text;
+  claimed_token uuid;
+begin
+  if p_session_id is null
+    or public.live_language_valid(p_language) is not true
+  then
+    return jsonb_build_object('ok', false, 'code', 'INVALID_SUMMARY_GENERATION_INPUT');
+  end if;
+
+  select session_row.status
+  into session_status
+  from public.live_sessions as session_row
+  where session_row.id = p_session_id;
+
+  if session_status is null then
+    return jsonb_build_object('ok', false, 'code', 'LIVE_SESSION_NOT_FOUND');
+  end if;
+  if session_status <> 'stopped' then
+    return jsonb_build_object('ok', false, 'code', 'LIVE_SESSION_NOT_STOPPED');
+  end if;
+
+  -- The lock covers the decision and insert. A concurrent loser observes the
+  -- committed row after waiting and therefore neither allocates nor stores a
+  -- second token. The primary key remains the independent database invariant.
+  perform pg_catalog.pg_advisory_xact_lock(
+    pg_catalog.hashtextextended(p_session_id::text || ':' || p_language, 0)
+  );
+
+  if exists (
+    select 1
+    from public.live_meeting_summaries as summary_row
+    where summary_row.session_id = p_session_id
+      and summary_row.language = p_language
+  ) then
+    return jsonb_build_object('ok', true, 'status', 'ready');
+  end if;
+
+  select job_row.status
+  into job_status
+  from public.live_summary_generation_jobs as job_row
+  where job_row.session_id = p_session_id
+    and job_row.language = p_language;
+
+  if job_status = 'running' then
+    return jsonb_build_object('ok', true, 'status', 'running');
+  end if;
+  if job_status = 'failed' then
+    return jsonb_build_object('ok', true, 'status', 'failed');
+  end if;
+  if job_status = 'succeeded' then
+    -- Completion writes the summary and state in one transaction, so a
+    -- succeeded job has the same externally observable meaning as ready.
+    return jsonb_build_object('ok', true, 'status', 'ready');
+  end if;
+
+  claimed_token := extensions.gen_random_uuid();
+  insert into public.live_summary_generation_jobs (
+    session_id,
+    language,
+    status,
+    generation_token
+  ) values (
+    p_session_id,
+    p_language,
+    'running',
+    claimed_token
+  );
+
+  return jsonb_build_object(
+    'ok', true,
+    'status', 'claimed',
+    'generationToken', claimed_token::text
+  );
+end;
+$$;
+
+create or replace function public.complete_live_summary_generation(
+  p_session_id uuid,
+  p_language text,
+  p_generation_token uuid,
+  p_summary jsonb,
+  p_model text
+)
+returns boolean
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+  affected_count integer;
+begin
+  if p_session_id is null
+    or p_generation_token is null
+    or public.live_language_valid(p_language) is not true
+    or p_summary is null
+    or jsonb_typeof(p_summary) <> 'object'
+    or octet_length(p_summary::text) > 65536
+    or p_model is null
+    or char_length(p_model) not between 1 and 120
+    or p_model <> btrim(p_model)
+    or p_model ~ '[[:cntrl:]]'
+  then
+    return false;
+  end if;
+
+  update public.live_summary_generation_jobs as job_row
+  set status = 'succeeded',
+      error_code = null,
+      completed_at = statement_timestamp(),
+      failed_at = null,
+      updated_at = statement_timestamp()
+  where job_row.session_id = p_session_id
+    and job_row.language = p_language
+    and job_row.generation_token = p_generation_token
+    and job_row.status = 'running';
+
+  GET DIAGNOSTICS affected_count = ROW_COUNT;
+  if affected_count = 0 then
+    return false;
+  end if;
+
+  -- PostgreSQL functions execute inside the caller transaction. A summary
+  -- constraint or upsert failure rolls the succeeded transition back as well.
+  insert into public.live_meeting_summaries (
+    session_id,
+    language,
+    summary,
+    model,
+    updated_at
+  ) values (
+    p_session_id,
+    p_language,
+    p_summary,
+    p_model,
+    statement_timestamp()
+  )
+  on conflict (session_id, language) do update
+  set summary = excluded.summary,
+      model = excluded.model,
+      updated_at = statement_timestamp();
+
+  return true;
+end;
+$$;
+
+create or replace function public.fail_live_summary_generation(
+  p_session_id uuid,
+  p_language text,
+  p_generation_token uuid,
+  p_error_code text
+)
+returns boolean
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+  affected_count integer;
+begin
+  if p_session_id is null
+    or p_generation_token is null
+    or public.live_language_valid(p_language) is not true
+    or p_error_code is null
+    or char_length(p_error_code) not between 1 and 120
+    or p_error_code <> btrim(p_error_code)
+    or p_error_code ~ '[[:cntrl:]]'
+  then
+    return false;
+  end if;
+
+  update public.live_summary_generation_jobs as job_row
+  set status = 'failed',
+      error_code = p_error_code,
+      completed_at = null,
+      failed_at = statement_timestamp(),
+      updated_at = statement_timestamp()
+  where job_row.session_id = p_session_id
+    and job_row.language = p_language
+    and job_row.generation_token = p_generation_token
+    and job_row.status = 'running';
+
+  GET DIAGNOSTICS affected_count = ROW_COUNT;
+  return affected_count = 1;
+end;
+$$;
+
+revoke all on function public.claim_live_summary_generation(uuid, text)
+  from public, anon, authenticated, service_role;
+revoke all on function public.complete_live_summary_generation(uuid, text, uuid, jsonb, text)
+  from public, anon, authenticated, service_role;
+revoke all on function public.fail_live_summary_generation(uuid, text, uuid, text)
+  from public, anon, authenticated, service_role;
+
+grant execute on function public.claim_live_summary_generation(uuid, text)
+  to service_role;
+grant execute on function public.complete_live_summary_generation(uuid, text, uuid, jsonb, text)
+  to service_role;
+grant execute on function public.fail_live_summary_generation(uuid, text, uuid, text)
+  to service_role;
+
+-- Verification (run after applying to a development project only):
+-- 1. End a development session and call claim twice concurrently. Exactly one
+--    response is claimed with a token; the other is running without a token.
+-- 2. Complete with a different UUID -> false and no summary row. Complete with
+--    the claimed token -> true, one summary row, and succeeded job state.
+-- 3. Direct authenticated/service-role table access remains denied; only these
+--    three RPCs are executable by service_role.
+
+-- 20260729235900_live_summary_generation_recovery.sql
+-- 2026-07-29 fix: Recover abandoned or transiently failed summary jobs without
+-- permitting two workers to complete the same attempt. Existing RPC signatures
+-- stay stable while a five-minute lease and generation token fence every claim.
+
+alter table public.live_summary_generation_jobs
+  add column attempt_count integer,
+  add column lease_expires_at timestamptz,
+  add column next_retry_at timestamptz,
+  add column retryable boolean;
+
+update public.live_summary_generation_jobs
+set attempt_count = 1,
+    lease_expires_at = started_at + interval '5 minutes',
+    next_retry_at = null,
+    retryable = false;
+
+alter table public.live_summary_generation_jobs
+  alter column attempt_count set default 1,
+  alter column attempt_count set not null,
+  alter column lease_expires_at set default (statement_timestamp() + interval '5 minutes'),
+  alter column lease_expires_at set not null,
+  alter column retryable set default false,
+  alter column retryable set not null,
+  add constraint live_summary_generation_jobs_attempt_count_check check (
+    attempt_count between 1 and 3
+  ),
+  add constraint live_summary_generation_jobs_lease_check check (
+    lease_expires_at >= started_at
+  ),
+  add constraint live_summary_generation_jobs_retry_state_check check (
+    (
+      retryable = false
+      and next_retry_at is null
+    )
+    or (
+      status = 'failed'
+      and retryable = true
+      and attempt_count < 3
+      and next_retry_at is not null
+    )
+  ),
+  add constraint live_summary_generation_jobs_retry_error_check check (
+    retryable = false
+    or error_code in (
+      'SUMMARY_TIMEOUT',
+      'SUMMARY_PROVIDER_RATE_LIMITED',
+      'SUMMARY_PROVIDER_UNAVAILABLE',
+      'SUMMARY_INCOMPLETE',
+      'UTTERANCES_READ_FAILED',
+      'PARTICIPANT_ACTIVITY_READ_FAILED'
+    )
+  );
+
+create or replace function public.claim_live_summary_generation(
+  p_session_id uuid,
+  p_language text
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+  session_status text;
+  job_status text;
+  job_generation_token uuid;
+  job_attempt_count integer;
+  job_lease_expires_at timestamptz;
+  job_next_retry_at timestamptz;
+  job_retryable boolean;
+  claimed_token uuid;
+  affected_count integer;
+begin
+  if p_session_id is null
+    or public.live_language_valid(p_language) is not true
+  then
+    return jsonb_build_object('ok', false, 'code', 'INVALID_SUMMARY_GENERATION_INPUT');
+  end if;
+
+  select session_row.status
+  into session_status
+  from public.live_sessions as session_row
+  where session_row.id = p_session_id;
+
+  if session_status is null then
+    return jsonb_build_object('ok', false, 'code', 'LIVE_SESSION_NOT_FOUND');
+  end if;
+  if session_status <> 'stopped' then
+    return jsonb_build_object('ok', false, 'code', 'LIVE_SESSION_NOT_STOPPED');
+  end if;
+
+  -- One session-language lane makes claim and reclaim decisions serial. The
+  -- token-and-attempt compare-and-set remains an independent stale-writer fence.
+  perform pg_catalog.pg_advisory_xact_lock(
+    pg_catalog.hashtextextended(p_session_id::text || ':' || p_language, 0)
+  );
+
+  if exists (
+    select 1
+    from public.live_meeting_summaries as summary_row
+    where summary_row.session_id = p_session_id
+      and summary_row.language = p_language
+  ) then
+    return jsonb_build_object('ok', true, 'status', 'ready');
+  end if;
+
+  select
+    job_row.status,
+    job_row.generation_token,
+    job_row.attempt_count,
+    job_row.lease_expires_at,
+    job_row.next_retry_at,
+    job_row.retryable
+  into
+    job_status,
+    job_generation_token,
+    job_attempt_count,
+    job_lease_expires_at,
+    job_next_retry_at,
+    job_retryable
+  from public.live_summary_generation_jobs as job_row
+  where job_row.session_id = p_session_id
+    and job_row.language = p_language;
+
+  if job_status = 'succeeded' then
+    return jsonb_build_object('ok', true, 'status', 'ready');
+  end if;
+
+  if job_status = 'running'
+    and job_lease_expires_at > statement_timestamp()
+  then
+    return jsonb_build_object('ok', true, 'status', 'running');
+  end if;
+
+  if job_status is not null and job_attempt_count >= 3 then
+    if job_status = 'running' then
+      update public.live_summary_generation_jobs as job_row
+      set status = 'failed',
+          error_code = 'SUMMARY_MAX_ATTEMPTS_EXCEEDED',
+          retryable = false,
+          next_retry_at = null,
+          completed_at = null,
+          failed_at = statement_timestamp(),
+          updated_at = statement_timestamp()
+      where job_row.session_id = p_session_id
+        and job_row.language = p_language
+        and job_row.generation_token = job_generation_token
+        and job_row.status = 'running'
+        and job_row.lease_expires_at <= statement_timestamp();
+    end if;
+    return jsonb_build_object(
+      'ok', true,
+      'status', 'exhausted'
+    );
+  end if;
+
+  if job_status = 'failed' and job_retryable is not true then
+    return jsonb_build_object(
+      'ok', true,
+      'status', 'permanent_failed'
+    );
+  end if;
+
+  if job_status = 'failed'
+    and job_next_retry_at > statement_timestamp()
+  then
+    return jsonb_build_object(
+      'ok', true,
+      'status', 'running'
+    );
+  end if;
+
+  if (
+    job_status = 'running'
+    and job_lease_expires_at <= statement_timestamp()
+  ) or (
+    job_status = 'failed'
+    and job_retryable is true
+    and job_next_retry_at <= statement_timestamp()
+  ) then
+    claimed_token := extensions.gen_random_uuid();
+    update public.live_summary_generation_jobs as job_row
+    set status = 'running',
+        generation_token = claimed_token,
+        error_code = null,
+        attempt_count = job_attempt_count + 1,
+        lease_expires_at = statement_timestamp() + interval '5 minutes',
+        next_retry_at = null,
+        retryable = false,
+        started_at = statement_timestamp(),
+        updated_at = statement_timestamp(),
+        completed_at = null,
+        failed_at = null
+    where job_row.session_id = p_session_id
+      and job_row.language = p_language
+      and job_row.generation_token = job_generation_token
+      and job_row.attempt_count = job_attempt_count;
+
+    GET DIAGNOSTICS affected_count = ROW_COUNT;
+    if affected_count <> 1 then
+      return jsonb_build_object('ok', true, 'status', 'running');
+    end if;
+
+    return jsonb_build_object(
+      'ok', true,
+      'status', 'claimed',
+      'generationToken', claimed_token::text
+    );
+  end if;
+
+  if job_status is not null then
+    return jsonb_build_object(
+      'ok', true,
+      'status', 'permanent_failed'
+    );
+  end if;
+
+  claimed_token := extensions.gen_random_uuid();
+  insert into public.live_summary_generation_jobs (
+    session_id,
+    language,
+    status,
+    generation_token,
+    attempt_count,
+    lease_expires_at,
+    retryable
+  ) values (
+    p_session_id,
+    p_language,
+    'running',
+    claimed_token,
+    1,
+    statement_timestamp() + interval '5 minutes',
+    false
+  );
+
+  return jsonb_build_object(
+    'ok', true,
+    'status', 'claimed',
+    'generationToken', claimed_token::text
+  );
+end;
+$$;
+
+create or replace function public.complete_live_summary_generation(
+  p_session_id uuid,
+  p_language text,
+  p_generation_token uuid,
+  p_summary jsonb,
+  p_model text
+)
+returns boolean
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+  affected_count integer;
+begin
+  if p_session_id is null
+    or p_generation_token is null
+    or public.live_language_valid(p_language) is not true
+    or p_summary is null
+    or jsonb_typeof(p_summary) <> 'object'
+    or octet_length(p_summary::text) > 65536
+    or p_model is null
+    or char_length(p_model) not between 1 and 120
+    or p_model <> btrim(p_model)
+    or p_model ~ '[[:cntrl:]]'
+  then
+    return false;
+  end if;
+
+  update public.live_summary_generation_jobs as job_row
+  set status = 'succeeded',
+      error_code = null,
+      retryable = false,
+      next_retry_at = null,
+      completed_at = statement_timestamp(),
+      failed_at = null,
+      updated_at = statement_timestamp()
+  where job_row.session_id = p_session_id
+    and job_row.language = p_language
+    and job_row.generation_token = p_generation_token
+    and job_row.status = 'running'
+    and job_row.lease_expires_at > statement_timestamp();
+
+  GET DIAGNOSTICS affected_count = ROW_COUNT;
+  if affected_count = 0 then
+    return false;
+  end if;
+
+  insert into public.live_meeting_summaries (
+    session_id,
+    language,
+    summary,
+    model,
+    updated_at
+  ) values (
+    p_session_id,
+    p_language,
+    p_summary,
+    p_model,
+    statement_timestamp()
+  )
+  on conflict (session_id, language) do update
+  set summary = excluded.summary,
+      model = excluded.model,
+      updated_at = statement_timestamp();
+
+  return true;
+end;
+$$;
+
+create or replace function public.fail_live_summary_generation(
+  p_session_id uuid,
+  p_language text,
+  p_generation_token uuid,
+  p_error_code text
+)
+returns boolean
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+  affected_count integer;
+  transient_error boolean;
+begin
+  if p_session_id is null
+    or p_generation_token is null
+    or public.live_language_valid(p_language) is not true
+    or p_error_code is null
+    or char_length(p_error_code) not between 1 and 120
+    or p_error_code <> btrim(p_error_code)
+    or p_error_code ~ '[[:cntrl:]]'
+  then
+    return false;
+  end if;
+
+  transient_error := p_error_code in (
+    'SUMMARY_TIMEOUT',
+    'SUMMARY_PROVIDER_RATE_LIMITED',
+    'SUMMARY_PROVIDER_UNAVAILABLE',
+    'SUMMARY_INCOMPLETE',
+    'UTTERANCES_READ_FAILED',
+    'PARTICIPANT_ACTIVITY_READ_FAILED'
+  );
+
+  update public.live_summary_generation_jobs as job_row
+  set status = 'failed',
+      error_code = p_error_code,
+      retryable = transient_error and job_row.attempt_count < 3,
+      next_retry_at = case
+        when transient_error and job_row.attempt_count < 3
+          then statement_timestamp()
+        else null
+      end,
+      completed_at = null,
+      failed_at = statement_timestamp(),
+      updated_at = statement_timestamp()
+  where job_row.session_id = p_session_id
+    and job_row.language = p_language
+    and job_row.generation_token = p_generation_token
+    and job_row.status = 'running'
+    and job_row.lease_expires_at > statement_timestamp();
+
+  GET DIAGNOSTICS affected_count = ROW_COUNT;
+  return affected_count = 1;
+end;
+$$;
+
+create or replace function public.read_live_summary_generation_status(
+  p_session_id uuid,
+  p_language text
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+  job_status text;
+  job_error_code text;
+  job_attempt_count integer;
+  job_lease_expires_at timestamptz;
+  job_retryable boolean;
+begin
+  if p_session_id is null
+    or public.live_language_valid(p_language) is not true
+  then
+    return jsonb_build_object('ok', false, 'code', 'INVALID_SUMMARY_GENERATION_INPUT');
+  end if;
+
+  if exists (
+    select 1
+    from public.live_meeting_summaries as summary_row
+    where summary_row.session_id = p_session_id
+      and summary_row.language = p_language
+  ) then
+    return jsonb_build_object('ok', true, 'status', 'ready');
+  end if;
+
+  select
+    job_row.status,
+    job_row.error_code,
+    job_row.attempt_count,
+    job_row.lease_expires_at,
+    job_row.retryable
+  into
+    job_status,
+    job_error_code,
+    job_attempt_count,
+    job_lease_expires_at,
+    job_retryable
+  from public.live_summary_generation_jobs as job_row
+  where job_row.session_id = p_session_id
+    and job_row.language = p_language;
+
+  if job_status is null then
+    return jsonb_build_object('ok', true, 'status', 'missing');
+  end if;
+
+  if job_status = 'succeeded' then
+    return jsonb_build_object('ok', false, 'code', 'SUMMARY_READY_MISSING');
+  end if;
+
+  if job_status = 'running' then
+    if job_lease_expires_at > statement_timestamp() then
+      return jsonb_build_object('ok', true, 'status', 'running');
+    end if;
+    if job_attempt_count >= 3 then
+      return jsonb_build_object('ok', true, 'status', 'exhausted');
+    end if;
+    return jsonb_build_object('ok', true, 'status', 'retryable_failed');
+  end if;
+
+  if job_status = 'failed' then
+    if job_attempt_count >= 3
+      or job_error_code = 'SUMMARY_MAX_ATTEMPTS_EXCEEDED'
+    then
+      return jsonb_build_object('ok', true, 'status', 'exhausted');
+    end if;
+    if job_retryable is true then
+      return jsonb_build_object('ok', true, 'status', 'retryable_failed');
+    end if;
+    return jsonb_build_object('ok', true, 'status', 'permanent_failed');
+  end if;
+
+  return jsonb_build_object('ok', false, 'code', 'SUMMARY_GENERATION_STATE_INVALID');
+end;
+$$;
+
+revoke all on function public.claim_live_summary_generation(uuid, text)
+  from public, anon, authenticated, service_role;
+revoke all on function public.complete_live_summary_generation(uuid, text, uuid, jsonb, text)
+  from public, anon, authenticated, service_role;
+revoke all on function public.fail_live_summary_generation(uuid, text, uuid, text)
+  from public, anon, authenticated, service_role;
+revoke all on function public.read_live_summary_generation_status(uuid, text)
+  from public, anon, authenticated, service_role;
+
+grant execute on function public.claim_live_summary_generation(uuid, text)
+  to service_role;
+grant execute on function public.complete_live_summary_generation(uuid, text, uuid, jsonb, text)
+  to service_role;
+grant execute on function public.fail_live_summary_generation(uuid, text, uuid, text)
+  to service_role;
+grant execute on function public.read_live_summary_generation_status(uuid, text)
+  to service_role;
+
+-- Verification (development project only): expire attempt one and claim twice
+-- concurrently. Exactly one caller receives the new token. The old token must
+-- return false from both complete and fail, and attempt four is never allocated.

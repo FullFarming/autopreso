@@ -22,7 +22,7 @@ export function resolveSpeakerColor(speaker: SpeakerAssignment | null): string {
 export function speakerMetaLine(speaker: SpeakerAssignment | null): string {
   if (!speaker) return "Host";
   if (!speaker.speakerId.startsWith("participant:")) return "Host";
-  const name = speaker.name?.trim() || speaker.label;
+  const name = speaker.name?.trim() || "Participant";
   return [name, speaker.department?.trim(), speaker.jobTitle?.trim()]
     .filter((part): part is string => Boolean(part))
     .join(" · ");
@@ -36,6 +36,7 @@ export default function SpeakerCaption({ caption, active = false }: { caption: C
   return (
     <article
       className={`live-caption-card ${active ? "is-active" : ""} ${caption.isFinal ? "" : "is-partial"}`}
+      data-caption-seq={caption.seq}
       aria-label={`${label} caption${caption.isFinal ? "" : ", updating"}`}
     >
       <div className="live-caption-speaker">

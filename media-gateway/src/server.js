@@ -1,26 +1,17 @@
 import { pathToFileURL } from "node:url";
 
+import { createGeminiCaptionConfig, geminiCaptionConfigFingerprint } from "../../packages/caption-core/index.js";
 import { createCaptionPolisher } from "./caption-polish.js";
 import { buildGlossaryInstruction } from "./glossary-packs.js";
 import { readGatewayEnvironment } from "./config.js";
 import { createGatewayServer } from "./gateway-server.js";
 import {
-  ChirpTextToSpeechAdapter,
   CloudSpeechToTextAdapter,
-  CloudTranslationAdvancedAdapter,
   GeminiLiveTranslateAdapter,
   GeminiTextTranslateAdapter,
 } from "./google-provider-adapters.js";
 import { LiveMediaPipeline } from "./live-media-pipeline.js";
-import { OpenAIRealtimeTranslationAdapter, OpenAITextToSpeechAdapter } from "./openai-realtime-translation.js";
 import { SupabaseFloorController, SupabaseHostAuthorizer, SupabaseLivePublisher, SupabaseViewerAuthorizer } from "./supabase-adapters.js";
-
-export function resolveTextToSpeechV1Client(textToSpeechModule) {
-  const TextToSpeechClient = textToSpeechModule.v1?.TextToSpeechClient
-    ?? textToSpeechModule.default?.v1?.TextToSpeechClient;
-  if (!TextToSpeechClient) throw new Error("TTS_V1_CLIENT_UNAVAILABLE");
-  return TextToSpeechClient;
-}
 
 export function listenMediaGateway(server, config) {
   return new Promise((resolve) => server.listen(config.port, config.host, resolve));
@@ -54,20 +45,12 @@ export function createCaptionPolishPolicyResolver({
 }
 
 export async function startMediaGateway(config = readGatewayEnvironment()) {
-  const [{ GoogleGenAI }, speechModule, textToSpeechModule, translateModule] = await Promise.all([
+  const [{ GoogleGenAI }, speechModule] = await Promise.all([
     import("@google/genai"),
     import("@google-cloud/speech"),
-    import("@google-cloud/text-to-speech"),
-    import("@google-cloud/translate"),
   ]);
   const geminiClient = new GoogleGenAI({ apiKey: config.geminiApiKey });
   const speechClient = new speechModule.v1.SpeechClient();
-  const TextToSpeechClient = resolveTextToSpeechV1Client(textToSpeechModule);
-  const textToSpeechClient = new TextToSpeechClient();
-  const TranslationServiceClient = translateModule.v3?.TranslationServiceClient
-    ?? translateModule.default?.v3?.TranslationServiceClient;
-  if (!TranslationServiceClient) throw new Error("TRANSLATION_V3_CLIENT_UNAVAILABLE");
-  const translationClient = new TranslationServiceClient();
   const viewerAuthorizer = new SupabaseViewerAuthorizer(config);
   const hostAuthorizer = new SupabaseHostAuthorizer(config);
   let gateway;
@@ -102,6 +85,18 @@ export async function startMediaGateway(config = readGatewayEnvironment()) {
         recoveryReason: options.recoveryReason,
         signal: options.signal,
       });
+      const captionPolishPolicy = resolveCaptionPolishPolicy(message.sessionId);
+      const captionConfig = createGeminiCaptionConfig({
+        ...(message.captionConfig ?? {
+          glossaryText: message.glossaryText,
+          glossaryPack: message.glossaryPack,
+          domainText: message.domainText,
+          translationTone: message.translationTone,
+          languages: message.languages,
+          outputMode: message.outputMode,
+        }),
+        captionPolishPolicy,
+      });
       return new LiveMediaPipeline({
         sessionId: message.sessionId,
         sessionType: message.sessionType,
@@ -112,8 +107,11 @@ export async function startMediaGateway(config = readGatewayEnvironment()) {
         glossaryText: message.glossaryText,
         translationTone: message.translationTone,
         domainText: message.domainText,
+        captionConfig,
+        captionConfigFingerprint: geminiCaptionConfigFingerprint(captionConfig),
+        audioLanguage: captionConfig.audioLanguage,
         languages: message.languages,
-        captionPolishPolicy: resolveCaptionPolishPolicy(message.sessionId),
+        captionPolishPolicy,
         speakerRegistry: previousPipeline?.speakers,
         initialSequences,
         getSubscriberCount: (language) => gateway.subscriberCount(message.sessionId, language),
@@ -121,37 +119,28 @@ export async function startMediaGateway(config = readGatewayEnvironment()) {
         onHostEvent,
         onFatalError: options.onFatalError,
         dependencies: {
-          liveTranslate: new GeminiLiveTranslateAdapter({ client: geminiClient, model: config.geminiLiveModel }),
-          openaiLiveTranslate: new OpenAIRealtimeTranslationAdapter({ apiKey: config.openaiApiKey, model: config.openaiRealtimeTranslateModel }),
+          liveTranslate: new GeminiLiveTranslateAdapter({
+            client: geminiClient,
+            model: captionConfig.models.live ?? config.geminiLiveModel,
+            finalFlushMilliseconds: captionConfig.streamingPolicy.commitSilenceMilliseconds,
+          }),
           speechToText: new CloudSpeechToTextAdapter({ client: speechClient, projectId: config.projectId, languageCodes: config.sttLanguageCodes }),
-          // Finals through Gemini Flash (desktop-pipeline tone parity); every
-          // partial and any Gemini failure routes to Cloud Translate.
+          // Finals use Gemini Flash, with no alternate translation engine.
           textTranslate: new GeminiTextTranslateAdapter({
             client: geminiClient,
-            model: config.geminiTextModel,
-            fallback: new CloudTranslationAdvancedAdapter({ client: translationClient, projectId: config.projectId }),
+            model: captionConfig.models.polish ?? config.geminiTextModel,
           }),
-          // Confirmed provider split: captions = Gemini 3.5, voice = OpenAI.
-          // Meeting/townhall TTS speaks through OpenAI with Chirp as the
-          // never-silent fallback; presentation voice is unaffected (it uses
-          // the live-translate audio path above).
           // 2026-07-26 fix: Match the desktop caption finalizer's six-second
           // quality budget. Live audio has a separate callback tail, so a slow
           // caption polish cannot delay interpreted audio playback.
           captionPolish: createCaptionPolisher({
             client: geminiClient,
-            model: config.geminiTextModel,
+            model: captionConfig.models.polish ?? config.geminiTextModel,
             timeoutMs: 6_000,
             // CRE is the product default, so it is the standing domain
             // instruction rather than a pack nothing reads.
             defaultDomain: buildGlossaryInstruction("general_cre"),
           }),
-          textToSpeech: message.sessionType === "presentation"
-            ? new ChirpTextToSpeechAdapter({ client: textToSpeechClient })
-            : new OpenAITextToSpeechAdapter({
-              apiKey: config.openaiApiKey,
-              fallback: new ChirpTextToSpeechAdapter({ client: textToSpeechClient }),
-            }),
           publisher,
         },
       });

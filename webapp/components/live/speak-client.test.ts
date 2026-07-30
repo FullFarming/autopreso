@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
+import { runInNewContext } from "node:vm";
+import { ModuleKind, ScriptTarget, transpileModule } from "typescript";
 
 import {
   SpeakCaptureError,
@@ -400,7 +402,7 @@ test("viewer enables Speak only after gateway authentication and subscription co
 test("viewer releases an active speaking turn before proactive socket replacement", () => {
   const source = readFileSync(new URL("./LiveViewer.tsx", import.meta.url), "utf8");
   const connectStart = source.indexOf("const connectGateway = useCallback");
-  const connectEnd = source.indexOf("const showSpeakerOverlay", connectStart);
+  const connectEnd = source.indexOf("const handleEvent = useCallback", connectStart);
   assert.ok(connectStart >= 0 && connectEnd > connectStart);
   const connection = source.slice(connectStart, connectEnd);
   const proactiveStart = connection.indexOf("audioProactiveTimerRef.current = window.setTimeout");
@@ -425,6 +427,18 @@ test("viewer exposes the connecting Speak state without changing its visual comp
   assert.match(render, /aria-label=\{!language[\s\S]*"Speak unavailable until a language is selected"[\s\S]*!isSpeakGatewayReady[\s\S]*"Speak unavailable while connecting"/u);
   assert.match(render, /role="status" aria-live="polite"/u);
   assert.match(render, /aria-describedby="live-speak-connection-status"/u);
+});
+
+test("viewer keeps its last live status when operator-only translation health is unavailable", () => {
+  const source = readFileSync(new URL("./LiveViewer.tsx", import.meta.url), "utf8");
+  const handlerStart = source.indexOf("const handleEvent = useCallback");
+  const handlerEnd = source.indexOf("handleEventRef.current = handleEvent", handlerStart);
+  assert.ok(handlerStart >= 0 && handlerEnd > handlerStart);
+  const handler = source.slice(handlerStart, handlerEnd);
+
+  assert.doesNotMatch(source, /Language unavailable|Translation unavailable|번역을 (?:표시할|사용할) 수 없습니다/u);
+  assert.match(handler, /event\.type === "session-status"[\s\S]*setStatus\(captionConnectionLabel\(event\.status\)\)/u);
+  assert.match(handler, /event\.type === "language-status"[\s\S]*event\.status !== "unavailable"[\s\S]*setStatus\(captionConnectionLabel\(event\.status\)\)/u);
 });
 
 test("ended-session language changes reload minutes without reconnecting the gateway", () => {
@@ -456,10 +470,159 @@ test("minutes retry transcript independently after summary succeeds", () => {
   assert.doesNotMatch(effect, /if \(!isSessionEnded \|\| summaryRecord\) return/u);
 });
 
+test("minutes Retry starts a fresh poll round after the previous round is exhausted", () => {
+  const source = readFileSync(new URL("./LiveViewer.tsx", import.meta.url), "utf8");
+  const effectStart = source.indexOf("// Contract C7: summaries are generated automatically after End");
+  const effectEnd = source.indexOf("// 호스트가 라이브를 종료하면", effectStart);
+  const retryStart = source.indexOf("onRetry={() => {");
+  const retryEnd = source.indexOf("}} />", retryStart);
+  assert.ok(effectStart >= 0 && effectEnd > effectStart && retryStart >= 0 && retryEnd > retryStart);
+
+  const effect = source.slice(effectStart, effectEnd);
+  const retry = source.slice(retryStart, retryEnd);
+  assert.match(effect, /minutesPollingRound/u,
+    "the polling effect needs an explicit restart dependency after exhaustion");
+  assert.match(retry, /setMinutesPollingRound\(\(round\) => round \+ 1\)/u,
+    "Retry must start a new polling lifecycle even when SUMMARY_NOT_READY leaves summary state unchanged");
+  assert.ok(retry.indexOf("setMinutesPollingRound") < retry.indexOf("loadMinutes"),
+    "restart the poll lifecycle before issuing the immediate read-only retry");
+});
+
 test("meeting minutes distinguish transcript failure from a successful empty record", () => {
   const source = readFileSync(new URL("./MeetingMinutes.tsx", import.meta.url), "utf8");
   assert.match(source, /transcriptError/u);
   assert.match(source, /isTranscriptLoaded/u);
   assert.match(source, /Unable to load the transcript/u);
   assert.match(source, /No transcript is available/u);
+});
+
+function loadSummaryPollingUtilities(): {
+  getSummaryPollDelayMilliseconds: (attempt: number, randomValue: number) => number;
+  startSummaryPollLoop: (options: {
+    poll: () => Promise<boolean>;
+    onExhausted: () => void;
+    onError: (error: unknown) => void;
+    random: () => number;
+    timerApi: {
+      setTimeout: (callback: () => void, delayMilliseconds: number) => number;
+      clearTimeout: (timer: number) => void;
+    };
+  }) => () => void;
+} {
+  const source = readFileSync(new URL("./MeetingMinutes.tsx", import.meta.url), "utf8");
+  const start = source.indexOf("// ─── Summary Polling ───");
+  const end = source.indexOf("// ─── Meeting Minutes ───", start);
+  assert.ok(start >= 0 && end > start, "summary polling helpers must remain independently testable");
+  const compiled = transpileModule(source.slice(start, end), {
+    compilerOptions: { module: ModuleKind.CommonJS, target: ScriptTarget.ES2022 },
+  }).outputText;
+  const module = { exports: {} as Record<string, unknown> };
+  runInNewContext(compiled, { module, exports: module.exports, Math, Promise });
+  return module.exports as ReturnType<typeof loadSummaryPollingUtilities>;
+}
+
+test("summary polling uses bounded jitter below the former 48 second ceiling", () => {
+  const { getSummaryPollDelayMilliseconds } = loadSummaryPollingUtilities();
+  assert.equal(getSummaryPollDelayMilliseconds(0, 0), 2_000);
+  assert.equal(getSummaryPollDelayMilliseconds(0, 1), 2_500);
+  assert.equal(getSummaryPollDelayMilliseconds(5, 0), 20_000);
+  assert.equal(getSummaryPollDelayMilliseconds(5, 1), 25_000);
+  assert.equal(getSummaryPollDelayMilliseconds(99, 2), 25_000, "attempt and jitter inputs must clamp");
+  assert.ok(getSummaryPollDelayMilliseconds(5, 1) < 48_000);
+});
+
+test("summary polling fake timer stops after cleanup without scheduling another request", async () => {
+  const { startSummaryPollLoop } = loadSummaryPollingUtilities();
+  const timers = new Map<number, { callback: () => void; delayMilliseconds: number }>();
+  const cleared: number[] = [];
+  let nextTimer = 1;
+  let pollCount = 0;
+  const cleanup = startSummaryPollLoop({
+    poll: async () => { pollCount += 1; return true; },
+    onExhausted: () => assert.fail("cleanup must happen before exhaustion"),
+    onError: (error) => assert.fail(String(error)),
+    random: () => 0.5,
+    timerApi: {
+      setTimeout(callback, delayMilliseconds) {
+        const timer = nextTimer;
+        nextTimer += 1;
+        timers.set(timer, { callback, delayMilliseconds });
+        return timer;
+      },
+      clearTimeout(timer) {
+        cleared.push(timer);
+        timers.delete(timer);
+      },
+    },
+  });
+
+  assert.equal(timers.size, 1);
+  const first = [...timers.entries()][0];
+  assert.ok(first);
+  assert.equal(first[1].delayMilliseconds, 2_250);
+  timers.delete(first[0]);
+  first[1].callback();
+  await Promise.resolve();
+  await Promise.resolve();
+  assert.equal(pollCount, 1);
+  assert.equal(timers.size, 1, "a pending result schedules the next bounded retry");
+
+  const pendingTimer = [...timers.keys()][0];
+  cleanup();
+  assert.deepEqual(cleared, [pendingTimer]);
+  assert.equal(timers.size, 0);
+  await Promise.resolve();
+  assert.equal(pollCount, 1, "cleanup prevents any later poll");
+});
+
+test("host summary polling stays GET-only while the operator Retry performs one guarded recovery POST", () => {
+  const host = readFileSync(new URL("./LiveHostDashboard.tsx", import.meta.url), "utf8");
+  const viewer = readFileSync(new URL("./LiveViewer.tsx", import.meta.url), "utf8");
+  const hostPollingStart = host.indexOf("const loadHostSummary");
+  const hostPollingEnd = host.indexOf("const retryHostSummary", hostPollingStart);
+  assert.ok(hostPollingStart >= 0 && hostPollingEnd > hostPollingStart);
+  const hostPolling = host.slice(hostPollingStart, hostPollingEnd);
+  assert.match(hostPolling, /fetch\([\s\S]*\/summary\?language=/u);
+  assert.match(hostPolling, /method: "GET"/u);
+  assert.match(hostPolling, /cache: "no-store"/u);
+  assert.doesNotMatch(hostPolling, /method: "POST"|generateSummaries/u);
+
+  const hostRetryStart = host.indexOf("const retryHostSummary");
+  const hostRetryEnd = host.indexOf("useEffect(() =>", hostRetryStart);
+  assert.ok(hostRetryStart >= 0 && hostRetryEnd > hostRetryStart);
+  const hostRetry = host.slice(hostRetryStart, hostRetryEnd);
+  assert.match(hostRetry, /hostSummaryRetryRef\.current/u);
+  assert.match(hostRetry, /hostSummaryFailureCode !== "SUMMARY_GENERATION_RETRYABLE_FAILED"/u,
+    "only an explicitly retryable generation failure may issue a recovery POST");
+  assert.ok(hostRetry.indexOf("if (hostSummaryRetryRef.current") < hostRetry.indexOf("method: \"POST\""),
+    "the single-flight guard must run before the recovery request");
+  assert.equal(hostRetry.match(/method: "POST"/gu)?.length, 1,
+    "one operator Retry must have exactly one POST call site");
+  assert.match(hostRetry, /headers: \{ "content-type": "application\/json" \}/u);
+  assert.match(hostRetry, /body: JSON\.stringify\(\{ language \}\)/u);
+  assert.match(hostRetry, /if \(!payload\.ok\)[\s\S]*setHostSummaryFailureCode\(payload\.code \?\? ""\)/u,
+    "a rejected recovery must retain the route code so exhausted or permanent jobs cannot POST again");
+  assert.match(hostRetry, /setHostSummaryPollingRound\(\(round\) => round \+ 1\)/u,
+    "a successful lease reclaim must restart GET polling");
+  assert.ok(hostRetry.indexOf("await fetch") < hostRetry.indexOf("setHostSummaryPollingRound"),
+    "GET polling may restart only after the recovery POST succeeds");
+  for (const blockedCode of [
+    "SUMMARY_GENERATION_EXHAUSTED",
+    "SUMMARY_GENERATION_PERMANENT_FAILED",
+    "SUMMARY_GENERATION_RUNNING",
+  ]) {
+    assert.doesNotMatch(hostRetry, new RegExp(`hostSummaryFailureCode === ["']${blockedCode}["']`, "u"),
+      `${blockedCode} must never authorize a recovery POST`);
+  }
+  assert.match(host, /hostSummaryFailureCode === "SUMMARY_GENERATION_RETRYABLE_FAILED"[\s\S]*?<button/u,
+    "the operator Retry control is visible only for a retryable failure");
+  assert.doesNotMatch(host, /Create summary again|Create AI summary|generateSummaries/u);
+  assert.match(host, /startSummaryPollLoop/u);
+
+  const retryStart = viewer.indexOf("onRetry={() => {");
+  const retryEnd = viewer.indexOf("}} />", retryStart);
+  assert.ok(retryStart >= 0 && retryEnd > retryStart);
+  const retry = viewer.slice(retryStart, retryEnd);
+  assert.match(retry, /loadMinutes/u);
+  assert.doesNotMatch(retry, /method: "POST"|\/summary`,\s*\{\s*method/u);
 });

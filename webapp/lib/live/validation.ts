@@ -4,7 +4,7 @@ import { LiveSessionError } from "./errors";
 
 const SESSION_TYPES = new Set<LiveSessionType>(["presentation", "meeting"]);
 const OUTPUT_MODES = new Set<LiveOutputMode>(["captions", "captions_audio", "audio"]);
-const VOICE_PROVIDERS = new Set<LiveVoiceProvider>(["gemini", "openai"]);
+const VOICE_PROVIDERS = new Set<LiveVoiceProvider>(["gemini"]);
 const GLOSSARY_PACKS = new Set<GlossaryPack>(["general_cre", "hotel", "fnb"]);
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
 

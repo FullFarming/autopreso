@@ -39,6 +39,8 @@
   --nova-green: #16bb76;
   --nova-yellow: #ffb134;
   --nova-purple: #ae3dd1;
+  --nova-status-ok: #03b26c;
+  --nova-status-error: #f04452;
 
   /* Overlay ramp: lets one control composite over any surface. */
   --nova-overlay-100: rgba(255, 255, 255, 0.07);
@@ -621,83 +623,6 @@ body {
   border-top: 1px solid var(--cw-grey-25);
 }
 
-.pt-voice-methods {
-  display: grid;
-  grid-column: 1 / -1;
-  gap: 10px;
-}
-
-.pt-voice-method-heading {
-  display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  gap: 12px;
-}
-
-.pt-voice-method-heading h3 {
-  margin: 0;
-  color: var(--cw-indigo);
-  font-size: 13px;
-  font-weight: 750;
-}
-
-.pt-voice-method-heading span {
-  color: var(--cw-grey-75);
-  font-size: 11px;
-  font-weight: 650;
-}
-
-.pt-voice-method-grid {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 10px;
-}
-
-.pt-voice-method-card {
-  display: grid;
-  align-content: start;
-  gap: 8px;
-  padding: 13px;
-  border: 1px solid var(--cw-grey-25);
-  border-radius: 8px;
-  background: var(--cw-white);
-}
-
-.pt-voice-method-card.is-current {
-  border-color: var(--cw-indigo);
-}
-
-.pt-voice-method-card > div {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-}
-
-.pt-voice-method-card strong {
-  color: var(--cw-indigo);
-  font-size: 12px;
-}
-
-.pt-voice-method-card p {
-  margin: 0;
-  color: var(--cw-grey);
-  font-size: 11px;
-  font-weight: 600;
-  line-height: 1.5;
-}
-
-.pt-method-status {
-  color: var(--cw-grey);
-  font-size: 10px;
-  font-weight: 700;
-  white-space: nowrap;
-}
-
-.pt-voice-method-card button {
-  justify-self: start;
-}
-
 .pt-volume-field > span {
   display: flex;
   align-items: center;
@@ -1155,7 +1080,12 @@ button:disabled {
   /* Hugs its content: the window then resizes to this width via the fit-size
      IPC, so there is never slack for a cluster to be pushed across. */
   width: max-content;
-  max-width: 100vw;
+  /* Measure the unwrapped row even before Electron widens its transparent
+     BrowserWindow. Capping this to the initial viewport made a newly-added
+     rightmost control wrap first, so ResizeObserver could never discover the
+     real width it needed to request. Main still clamps the final window to the
+     selected display's work area. */
+  max-width: none;
   display: flex;
   align-items: center;
   gap: 10px;
@@ -1193,11 +1123,45 @@ button:disabled {
 }
 
 .mp-status {
+  align-items: center;
   color: rgba(255, 255, 255, 0.62);
-  font-size: 10.5px;
+  display: flex;
+  font-size: var(--nova-t8);
+  gap: var(--nova-gap-4);
+  line-height: var(--nova-t8-lh);
   overflow: hidden;
   text-overflow: ellipsis;
+  transition: color var(--nova-dur-rapid) var(--nova-ease-out);
   white-space: nowrap;
+}
+
+.mp-status[data-connection-state]::before {
+  background: currentColor;
+  border-radius: var(--nova-r-pill);
+  content: "";
+  flex: 0 0 auto;
+  height: 6px;
+  width: 6px;
+}
+
+.mp-status[data-connection-state="healthy"] {
+  color: var(--nova-status-ok);
+}
+
+.mp-status[data-connection-state="waiting"],
+.mp-status[data-connection-state="recovering"] {
+  color: var(--nova-yellow);
+}
+
+.mp-status[data-connection-state="disconnected"] {
+  color: var(--nova-status-error);
+}
+
+.mp-status-detail {
+  color: var(--nova-text-muted);
+  font-variant-numeric: tabular-nums;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .mp-vu {
@@ -1319,7 +1283,7 @@ button:disabled {
 .subtitle-controller-body .controller-opacity input { width: 76px; }
 .subtitle-controller-body .controller-opacity output { min-width: 30px; }
 .subtitle-controller-body .controller-gap { gap: 3px; }
-.subtitle-controller-body .mp-brand { flex-basis: 148px; }
+.subtitle-controller-body .mp-brand { flex-basis: 248px; }
 .subtitle-controller-body .controller-cluster { padding: 0 2px; }
 .subtitle-controller-body .controller-group { gap: 3px; }
 .subtitle-controller-body .mp-elapsed { min-width: 36px; }
@@ -1328,6 +1292,70 @@ button:disabled {
 .subtitle-controller-body .mp-window {
   margin-left: 0;
   flex: none;
+}
+
+.controller-display-select {
+  width: 176px;
+  height: 30px;
+  min-height: 30px;
+  border: 1px solid transparent;
+  border-radius: var(--nova-r-pill);
+  background: var(--nova-overlay-200);
+  color: var(--nova-text-strong);
+  cursor: pointer;
+  flex: none;
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1;
+  padding: 0 28px 0 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  -webkit-app-region: no-drag;
+}
+
+/* "All screens" tick: a pill that reads as checked/unchecked at a glance, so
+   the host can tell where captions are going without opening the dashboard. */
+.controller-tick {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex: none;
+  -webkit-app-region: no-drag;
+}
+
+.controller-tick-box {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 15px;
+  height: 15px;
+  border: 1.5px solid var(--nova-text-disabled);
+  border-radius: 4px;
+  color: transparent;
+  flex: none;
+}
+
+.controller-tick[aria-checked="true"] .controller-tick-box {
+  background: var(--nova-accent, #4c8dff);
+  border-color: var(--nova-accent, #4c8dff);
+  color: #fff;
+}
+
+.controller-tick[aria-checked="true"] { color: var(--nova-text-strong); }
+.controller-tick:disabled { color: var(--nova-text-disabled); cursor: default; }
+
+.controller-display-select:hover { background: var(--nova-overlay-300); }
+.controller-display-select:disabled { color: var(--nova-text-disabled); cursor: default; }
+.controller-display-select:focus-visible {
+  border-color: transparent;
+  box-shadow: none;
+  outline: 2px solid var(--nova-blue);
+  outline-offset: 2px;
+}
+
+.controller-display-select option {
+  background: var(--nova-surface-float);
+  color: var(--nova-text-strong);
 }
 
 .controller-group {
@@ -1724,8 +1752,57 @@ button:disabled {
   max-width: 100%;
 }
 
+/* Live Call reserves the complete broadcast stack from the first word. The
+   signed roll offset in subtitle-overlay.js bottom-anchors short text inside
+   this fixed viewport, then moves the same word nodes upward as lines fill. */
+.subtitle-lane.is-live-call .translation-line {
+  height: calc(var(--subtitle-line-clamp, 3) * 1.18em);
+  max-height: none;
+}
+
+/* Live roll-up is positional feedback, so keep it quicker than the shared
+   Caption-only glide. The transition property remains transform-only, and the
+   reduced-motion rule below still removes it entirely. */
+.subtitle-lane.is-live-call .subtitle-flow {
+  transition-duration: 200ms;
+}
+
+.subtitle-lane.is-live-call .live-call-speaker-label {
+  height: 44px;
+  display: flex;
+  align-items: center;
+}
+
+/* `[hidden]` normally removes the label from layout. During a Live Call the
+   row remains reserved so a floor handoff cannot move the caption plate; the
+   old label is either kept with its old caption or hidden without collapsing. */
+.subtitle-lane.is-live-call .live-call-speaker-label[hidden] {
+  display: block !important;
+  visibility: hidden;
+}
+
+/* Live hypotheses revise often. Recreating only a changed tail is necessary,
+   but replaying entry fades on that tail reads as a full-caption blink. */
+.subtitle-lane.is-live-call .subtitle-word {
+  animation: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .subtitle-lane.is-live-call .subtitle-flow,
+  .subtitle-lane.is-live-call .subtitle-word {
+    transition: none;
+  }
+}
+
 .subtitle-box.partial {
   background: rgb(from var(--cw-indigo) r g b / 0.78);
+}
+
+/* Live Call revisions switch partial/final state many times per sentence. Keep
+   the user's configured plate alpha invariant across that state churn; the
+   legacy Caption-only partial treatment above remains untouched. */
+.subtitle-lane.is-live-call .subtitle-box.partial {
+  background: rgb(from var(--cw-indigo) r g b / var(--subtitle-opacity));
 }
 
 /* Apple-liquid refinements: panels settle in with a soft motion, controls
@@ -2017,12 +2094,6 @@ textarea:focus {
   color: rgba(255, 255, 255, 0.72);
 }
 
-/* When the voice-provider group is hidden (caption-only), the appearance
-   cluster owns the full band; when shown it shares the row. */
-.subtitle-controller-body .controller-row-appearance #controller-voice-provider:not([hidden]) {
-  flex: 0 0 auto;
-}
-
 /* Live Call + app controls share one tidy bottom row under a hairline,
    with Hide/Quit pushed to the right edge. */
 .controller-footer-row {
@@ -2186,15 +2257,8 @@ textarea:focus {
   }
 
   .pt-output-options,
-  .pt-playback-options,
-  .pt-voice-method-grid {
+  .pt-playback-options {
     grid-template-columns: 1fr;
-  }
-
-  .pt-voice-method-heading,
-  .pt-voice-method-card > div {
-    align-items: flex-start;
-    flex-direction: column;
   }
 
   .caption-player-controller {
@@ -2673,6 +2737,85 @@ textarea:focus {
 .cfg-section > .topic-field,
 .cfg-section > .tone-field {
   grid-column: auto;
+}
+
+.glossary-preset-field,
+.glossary-preset-editor {
+  display: grid;
+  gap: var(--nova-gap-8);
+}
+
+.field-help,
+.glossary-preset-status {
+  margin: 0;
+  color: var(--nova-text-muted);
+  font-size: var(--nova-t7);
+  font-weight: 500;
+  line-height: var(--nova-t7-lh);
+  word-break: keep-all;
+}
+
+.glossary-preset-actions,
+.glossary-preset-editor-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--nova-gap-8);
+}
+
+/* These controls change or delete a reusable preset. Keep the compact visual
+   density while preserving the 44px touch target used throughout Settings. */
+.workspace-page .glossary-preset-actions button,
+.workspace-page .glossary-preset-editor-actions button {
+  flex: 0 1 auto;
+  min-height: 44px;
+}
+
+.glossary-preset-editor {
+  padding: var(--nova-gap-16);
+  border: 1px solid var(--nova-hairline);
+  border-radius: var(--nova-r-md);
+  background: var(--nova-surface-raised);
+  animation: glossary-preset-reveal var(--nova-dur-rapid) var(--nova-ease-out);
+}
+
+.glossary-preset-editor[hidden] {
+  display: none;
+}
+
+.glossary-preset-editor h3 {
+  margin: 0;
+  color: var(--nova-text);
+  font-size: var(--nova-t6);
+  font-weight: 700;
+  line-height: var(--nova-t6-lh);
+  letter-spacing: -0.02em;
+  word-break: keep-all;
+}
+
+.glossary-preset-status:empty {
+  display: none;
+}
+
+.glossary-preset-status.is-error {
+  color: var(--nova-red);
+}
+
+@keyframes glossary-preset-reveal {
+  from { opacity: 0; transform: translateY(-4px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .glossary-preset-editor {
+    animation: none;
+  }
+}
+
+@media (max-width: 520px) {
+  .workspace-page .glossary-preset-actions button,
+  .workspace-page .glossary-preset-editor-actions button {
+    flex: 1 1 calc(50% - var(--nova-gap-8));
+  }
 }
 
 .cfg-heading {
@@ -3353,21 +3496,6 @@ button[aria-busy="true"] {
   border-top: 1px solid var(--nova-hairline);
 }
 
-.pt-voice-method-heading h3 {
-  margin: 0;
-  color: var(--nova-text);
-  font-size: var(--nova-t6);
-  font-weight: 600;
-  line-height: var(--nova-t6-lh);
-}
-
-.pt-voice-method-heading span {
-  color: var(--nova-text-subtle);
-  font-size: var(--nova-t7);
-  font-weight: 400;
-  line-height: var(--nova-t7-lh);
-}
-
 .pt-volume-field > span {
   color: var(--nova-text-muted);
 }
@@ -3857,20 +3985,6 @@ button[aria-busy="true"] {
   font-size: var(--nova-t7);
   line-height: var(--nova-t7-lh);
   padding: var(--nova-gap-12) var(--nova-gap-16);
-}
-
-/* Pipeline badge: only visible while reconnecting or degraded. */
-.subtitle-status-indicator {
-  background: var(--nova-surface-float);
-  border-radius: var(--nova-r-pill);
-  color: var(--nova-yellow);
-  font-size: var(--nova-t7);
-  font-weight: 600;
-  padding: 6px 14px;
-}
-
-.subtitle-status-indicator::before {
-  background: var(--nova-yellow);
 }
 
 /* ── Records page panels (the calendar itself owns its own styling below) ─── */
