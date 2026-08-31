@@ -1,10 +1,41 @@
+import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 
 import { readCodexCliAuthSync } from "./codex-auth.js";
+import { DEFAULT_GLOSSARY_PRESET_ID, GLOSSARY_PRESETS } from "./glossary-presets.js";
 import { MAX_TRANSLATION_LANGUAGES, isSupportedSubtitleLanguage } from "./subtitle-languages.js";
 
 export const MAX_AGENT_INSTRUCTIONS_CHARS = 100_000;
+
+const DEFAULT_GLOSSARY_PRESET = GLOSSARY_PRESETS.find((preset) => preset.id === DEFAULT_GLOSSARY_PRESET_ID);
+if (!DEFAULT_GLOSSARY_PRESET) throw new Error("Default glossary preset is missing.");
+const BUILT_IN_GLOSSARY_IDS = new Set([
+  "common_business", "ai_ax", "commercial_real_estate", "hospitality", "fnb_retail", "proper_nouns", "ko_ja_idioms",
+]);
+const GLOSSARY_PRESET_UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
+
+// Exact released defaults advance to the current full corpus. Matching both
+// fields protects user-owned Custom text, while upgrading the previously
+// focused presets ensures existing installs receive the restored terminology.
+const LEGACY_DEFAULT_PRESET_FINGERPRINTS = Object.freeze([
+  Object.freeze({
+    glossary: "c60af3a907b01188a3ab6345d84d3ee2f27ce332af51ec0e6e230b270213561a",
+    domain: "923ae9ab0dee73f2668e10ede1dd44d84f532c51bac39bf260568ad6437a277b",
+  }),
+  Object.freeze({
+    glossary: "41ea50d2b39c30385192d59075ad69ffb921e45abb4dc02b722f2ded47649888",
+    domain: "0554c8ec443eb21453209834e691e01d7f7c58c788827299929aeb0cc520dad4",
+  }),
+  Object.freeze({
+    glossary: "563ab9e0966cf71073ab87ff43f4da9834f487d5c51a5747b5f953d0e295bf25",
+    domain: "56a55879bb88fc3825e5a9b0bde0e13a54e04b795c0635a597ba84ab8c161897",
+  }),
+  Object.freeze({
+    glossary: "fc870dbf9a375af759d4063eb446b81dd51836445719a37e6089506d4b767fd9",
+    domain: "56a55879bb88fc3825e5a9b0bde0e13a54e04b795c0635a597ba84ab8c161897",
+  }),
+]);
 
 export async function migrateSettingsFile({ fromPath, toPath }) {
   if (!fromPath || !toPath || fromPath === toPath) return;
@@ -28,17 +59,19 @@ export async function migrateSettingsFile({ fromPath, toPath }) {
 }
 
 export const DEFAULT_SUBTITLE_SETTINGS = Object.freeze({
-  inputMode: "system_mic",
+  // 2026-08-22 비용 감사: system+mic 이중 캡처가 모든 유료 세션 비용을 2배로
+  // 만들던 기본값. 행사 계약(마이크 또는 믹서 하나)과 정렬해 mic 단일이 기본.
+  inputMode: "mic",
   micDeviceId: "",
   languagePair: { a: "en", b: "ko" },
   translationLanguages: ["en", "ko"],
+  // Live Call publishes its own language set; [] means "inherit the subtitle
+  // languages above" so existing settings files keep today's behavior.
+  liveCallTranslationLanguages: [],
   outputMode: "captions",
-  audioLanguage: "en",
-  audioVolume: 0.8,
   displayMode: "translation_only",
   showSourceText: false,
   translateAllLanguages: false,
-  model: "gpt-realtime-translate",
   fontFamily: "Arial, Helvetica, sans-serif",
   translationFontSize: 38,
   sourceFontSize: 36,
@@ -51,30 +84,36 @@ export const DEFAULT_SUBTITLE_SETTINGS = Object.freeze({
   opacity: 0.92,
   maxSubtitleLines: 2,
   overlayEnabled: true,
+  overlayDisplayId: "",
+  overlayAllDisplays: false,
   recordProvider: "ollama",
   ollamaBaseURL: "http://127.0.0.1:11434",
   ollamaModel: "gemma3n:e2b",
   tone: "natural",
   tonePolishModel: "gpt-5.5",
   translationProvider: "gemini",
-  voiceProvider: "gemini",
-  geminiModel: "gemini-3.5-live-translate-preview",
-  geminiPolishModel: "gemini-3.5-flash",
-  glossary: "",
-  translationDomain: "",
+  geminiTranscribeModel: "gemini-3.5-transcribe-live",
+  geminiPolishModel: "gemini-3.7-flash",
+  glossaryPresetId: DEFAULT_GLOSSARY_PRESET_ID,
+  glossaryPresetName: "",
+  glossaries: Object.freeze([Object.freeze({ sourceKind: "builtin", sourceId: "common_business" })]),
+  glossary: DEFAULT_GLOSSARY_PRESET.glossary,
+  translationDomain: DEFAULT_GLOSSARY_PRESET.domain,
   verticalOffset: 48,
 });
 
-// Has to clear the LARGEST shipped preset, not a round number: at 16,000 the
-// store rejected the hotel-investment preset (27.5k) outright and the webapp and
-// gateway silently sliced it, dropping whichever sections sat at the end.
-// test/glossary-presets.test.js pins all three ceilings against the presets.
-export const MAX_SUBTITLE_GLOSSARY_CHARS = 40000;
-export const MAX_SUBTITLE_DOMAIN_CHARS = 2000;
+// 2026-07-27 fix: local settings written before the synchronized-preset feature
+// legitimately exceed the remote preset's 16k storage cap. The gateway already
+// accepts 40k and filters the polish prompt to relevant entries, so rejecting a
+// 19k local glossary only bricked Live Call startup without reducing API work.
+export const MAX_SUBTITLE_GLOSSARY_CHARS = 40_000;
+// Local legacy domains may be more descriptive than synchronized preset
+// metadata. Keep this aligned with the gateway's bounded 2k start contract.
+export const MAX_SUBTITLE_DOMAIN_CHARS = 2_000;
 export const MAX_SUBTITLE_VERTICAL_OFFSET = 600;
 export const MAX_SUBTITLE_FONT_FAMILY_CHARS = 400;
 export const MAX_API_KEY_CHARS = 500;
-export const API_KEY_NAMES = Object.freeze(["openai", "openaiSecondary", "gemini", "geminiSecondary"]);
+export const API_KEY_NAMES = Object.freeze(["openai", "gemini", "geminiSecondary"]);
 
 export const DEFAULT_SETTINGS = Object.freeze({
   agent: {
@@ -90,7 +129,6 @@ export const DEFAULT_SETTINGS = Object.freeze({
   },
   apiKeys: {
     openai: "",
-    openaiSecondary: "",
     gemini: "",
     geminiSecondary: "",
   },
@@ -159,6 +197,7 @@ export function createSettingsStore({ filePath, env = process.env, readCodexAuth
     if (partial?.subtitle !== undefined && !isPlainObject(partial.subtitle)) {
       throw new Error("Subtitle settings must be a plain object.");
     }
+    if (partial?.subtitle) validateSubtitleSettings(partial.subtitle);
     validateApiKeys(partial?.apiKeys);
     // fontFamily is checked against the RAW patch: migrateSettings self-heals a
     // non-string value on the way in (so an already-poisoned file still boots),
@@ -166,8 +205,19 @@ export function createSettingsStore({ filePath, env = process.env, readCodexAuth
     if (partial?.subtitle?.fontFamily !== undefined) {
       validateSubtitleSettings({ fontFamily: partial.subtitle.fontFamily });
     }
+    if (partial?.subtitle?.glossaryPresetId !== undefined) {
+      validateSubtitleSettings({ glossaryPresetId: partial.subtitle.glossaryPresetId });
+    }
+    if (partial?.subtitle?.glossaryPresetName !== undefined) {
+      validateSubtitleSettings({ glossaryPresetName: partial.subtitle.glossaryPresetName });
+    }
     if (partial?.subtitle?.translationProvider !== undefined && partial.subtitle.translationProvider !== "gemini") {
       throw new Error("Subtitle translationProvider must remain gemini.");
+    }
+    const retiredSubtitleKeys = ["audioLanguage", "audioVolume", "voiceProvider", "model", "geminiModel"];
+    const retiredSubtitleKey = retiredSubtitleKeys.find((key) => partial?.subtitle?.[key] !== undefined);
+    if (retiredSubtitleKey) {
+      throw new Error(`Subtitle ${retiredSubtitleKey} is retired in caption-only mode.`);
     }
     const candidate = migrateSettings(deepMerge(cached, partial));
     if (partial?.subtitle) validateSubtitleSettings(candidate.subtitle);
@@ -182,7 +232,6 @@ export function createSettingsStore({ filePath, env = process.env, readCodexAuth
     return {
       ...rest,
       hasOpenAIKey: Boolean(apiKeys?.openai),
-      hasOpenAISecondaryKey: Boolean(apiKeys?.openaiSecondary),
       hasGeminiKey: Boolean(apiKeys?.gemini),
       hasGeminiSecondaryKey: Boolean(apiKeys?.geminiSecondary),
     };
@@ -227,22 +276,38 @@ function migrateSettings(settings) {
   if (!isPlainObject(settings.subtitle)) {
     settings.subtitle = JSON.parse(JSON.stringify(DEFAULT_SUBTITLE_SETTINGS));
   }
+  if (isPlainObject(settings.apiKeys)) {
+    settings.apiKeys = Object.fromEntries(
+      Object.entries(settings.apiKeys).filter(([name]) => name !== "openaiSecondary"),
+    );
+  }
   // Self-heal a fontFamily that an earlier unvalidated save turned into an
   // object/array: deepMerge spread the default string into per-index keys
   // ({"0":"A","1":"r",...}) that later reached setProperty("--subtitle-font-family").
   if (typeof settings.subtitle.fontFamily !== "string") {
     settings.subtitle.fontFamily = DEFAULT_SUBTITLE_SETTINGS.fontFamily;
   }
+  migrateGlossaryPresetSelection(settings.subtitle);
+  if (!isValidGlossarySelections(settings.subtitle.glossaries)) {
+    settings.subtitle.glossaries = DEFAULT_SUBTITLE_SETTINGS.glossaries.map((glossary) => ({ ...glossary }));
+  }
   settings.subtitle.translationProvider = "gemini";
-  // Mixed caption+audio output is retired. Any settings.json written before that
-  // still holds it, and validateSubtitleSettings now rejects it — so migrate on
-  // the way in rather than letting the file become unloadable. Captions is the
-  // safe half: it degrades what the user hears, never what they read.
-  if (settings.subtitle?.outputMode === "captions_audio") {
-    settings.subtitle.outputMode = "captions";
+  settings.subtitle.outputMode = "captions";
+  settings.subtitle.geminiTranscribeModel = DEFAULT_SUBTITLE_SETTINGS.geminiTranscribeModel;
+  // 2026-08-27 feat: audio output and Live Translate model aliases are read-only
+  // migration inputs. Canonical settings contain only the caption pipeline.
+  for (const retiredKey of ["audioLanguage", "audioVolume", "voiceProvider", "model", "geminiModel"]) {
+    delete settings.subtitle[retiredKey];
   }
   if (settings.subtitle?.tonePolishModel === "gpt-4o-mini") {
     settings.subtitle.tonePolishModel = DEFAULT_SUBTITLE_SETTINGS.tonePolishModel;
+  }
+  // 2026-07-29 fix: released Flash defaults are migrated forward so persisted
+  // settings do not silently bypass the current pinned polish model.
+  // Custom model ids remain untouched and the Live Translate model is separate.
+  if (settings.subtitle?.geminiPolishModel === "gemini-3.5-flash"
+    || settings.subtitle?.geminiPolishModel === "gemini-3.6-flash") {
+    settings.subtitle.geminiPolishModel = DEFAULT_SUBTITLE_SETTINGS.geminiPolishModel;
   }
   if (settings.subtitle?.displayMode === "translation_source") {
     settings.subtitle.displayMode = DEFAULT_SUBTITLE_SETTINGS.displayMode;
@@ -259,23 +324,83 @@ function migrateSettings(settings) {
   if (settings.subtitle?.maxWidth === 1100) {
     settings.subtitle.maxWidth = DEFAULT_SUBTITLE_SETTINGS.maxWidth;
   }
-  if (
-    settings.subtitle?.outputMode === "captions"
-    && Array.isArray(settings.subtitle?.translationLanguages)
-    && !settings.subtitle.translationLanguages.includes(settings.subtitle.audioLanguage)
-  ) {
-    settings.subtitle.audioLanguage = settings.subtitle.translationLanguages[0]
-      ?? DEFAULT_SUBTITLE_SETTINGS.audioLanguage;
+  if (typeof settings.subtitle.overlayDisplayId !== "string"
+    || settings.subtitle.overlayDisplayId.length > 64
+    || /[\u0000-\u001f\u007f]/u.test(settings.subtitle.overlayDisplayId)) {
+    settings.subtitle.overlayDisplayId = "";
+  }
+  if (typeof settings.subtitle.overlayAllDisplays !== "boolean") {
+    settings.subtitle.overlayAllDisplays = false;
   }
   return settings;
+}
+
+function migrateGlossaryPresetSelection(subtitle) {
+  const glossary = typeof subtitle.glossary === "string" ? subtitle.glossary : "";
+  const domain = typeof subtitle.translationDomain === "string" ? subtitle.translationDomain : "";
+  if (!glossary.trim() && !domain.trim()) {
+    subtitle.glossaryPresetId = DEFAULT_GLOSSARY_PRESET_ID;
+    subtitle.glossaryPresetName = "";
+    subtitle.glossary = DEFAULT_GLOSSARY_PRESET.glossary;
+    subtitle.translationDomain = DEFAULT_GLOSSARY_PRESET.domain;
+    return;
+  }
+
+  if (isReleasedDefaultGlossary(subtitle, glossary, domain)) {
+    subtitle.glossaryPresetId = DEFAULT_GLOSSARY_PRESET_ID;
+    subtitle.glossaryPresetName = "";
+    subtitle.glossary = DEFAULT_GLOSSARY_PRESET.glossary;
+    subtitle.translationDomain = DEFAULT_GLOSSARY_PRESET.domain;
+    return;
+  }
+
+  const exactBuiltIn = GLOSSARY_PRESETS.find((preset) => preset.glossary === glossary
+    && preset.domain === domain
+    && hasSameLanguagePair(preset.languagePair, subtitle.languagePair));
+  if (exactBuiltIn) {
+    subtitle.glossaryPresetId = exactBuiltIn.id;
+    subtitle.glossaryPresetName = "";
+    return;
+  }
+
+  const currentId = typeof subtitle.glossaryPresetId === "string"
+    ? subtitle.glossaryPresetId.trim().slice(0, 128)
+    : "";
+  const isKnownBuiltIn = GLOSSARY_PRESETS.some((preset) => preset.id === currentId);
+  subtitle.glossaryPresetId = isKnownBuiltIn ? "" : currentId;
+  subtitle.glossaryPresetName = subtitle.glossaryPresetId && typeof subtitle.glossaryPresetName === "string"
+    ? subtitle.glossaryPresetName.trim().slice(0, 80)
+    : "";
+}
+
+function isReleasedDefaultGlossary(subtitle, glossary, domain) {
+  const presetId = typeof subtitle.glossaryPresetId === "string" ? subtitle.glossaryPresetId.trim() : "";
+  const presetName = typeof subtitle.glossaryPresetName === "string" ? subtitle.glossaryPresetName.trim() : "";
+  if (presetName || (presetId && presetId !== DEFAULT_GLOSSARY_PRESET_ID)) return false;
+  if (!hasSameLanguagePair(DEFAULT_GLOSSARY_PRESET.languagePair, subtitle.languagePair)) return false;
+  const glossaryFingerprint = fingerprintPresetText(glossary);
+  const domainFingerprint = fingerprintPresetText(domain);
+  return LEGACY_DEFAULT_PRESET_FINGERPRINTS.some((fingerprints) => (
+    fingerprints.glossary === glossaryFingerprint && fingerprints.domain === domainFingerprint
+  ));
+}
+
+function fingerprintPresetText(value) {
+  const normalized = value.replace(/\r\n?/gu, "\n").replace(/\n$/u, "");
+  return createHash("sha256").update(normalized, "utf8").digest("hex");
+}
+
+function hasSameLanguagePair(left, right) {
+  if (!left || !right) return false;
+  return new Set([left.a, left.b]).size === 2
+    && new Set([left.a, left.b]).size === new Set([right.a, right.b]).size
+    && [left.a, left.b].every((language) => new Set([right.a, right.b]).has(language));
 }
 
 function seedFromEnv(settings, env, readCodexAuth) {
   const next = settings;
   const openaiKey = trimOrEmpty(env.OPENAI_API_KEY);
   if (openaiKey) next.apiKeys.openai = openaiKey;
-  const openaiSecondaryKey = trimOrEmpty(env.OPENAI_SECONDARY_API_KEY);
-  if (openaiSecondaryKey) next.apiKeys.openaiSecondary = openaiSecondaryKey;
   const geminiKey = trimOrEmpty(env.GEMINI_API_KEY);
   if (geminiKey) next.apiKeys.gemini = geminiKey;
   const geminiSecondaryKey = trimOrEmpty(env.GEMINI_SECONDARY_API_KEY);
@@ -334,7 +459,7 @@ export function validateAgentInstructions(value) {
 // API keys were persisted with no validation at all: `{ openai: { evil: 1 } }`
 // was written straight to disk and then made getSanitized() report
 // hasOpenAIKey: true for a "key" no provider call can ever use. Keys must be
-// strings under one of the four known slots.
+// strings under one of the three known slots.
 export function validateApiKeys(value) {
   if (value === undefined) return;
   if (!isPlainObject(value)) throw new Error("apiKeys must be a plain object.");
@@ -362,6 +487,11 @@ export function validateSubtitleSettings(value) {
   if (value.micDeviceId !== undefined && typeof value.micDeviceId !== "string") {
     throw new Error("Subtitle micDeviceId must be a string.");
   }
+  // Live Call 중 로컬 Gemini 엔진 병행(hybrid) opt-in. 기본 false = 게이트웨이
+  // 단일 정본 생산자(이중 번역 비용 방지).
+  if (value.liveCallLocalEngine !== undefined && typeof value.liveCallLocalEngine !== "boolean") {
+    throw new Error("Subtitle liveCallLocalEngine must be a boolean.");
+  }
   if (value.displayMode !== undefined && !["translation_only", "translation_source"].includes(value.displayMode)) {
     throw new Error("Subtitle display mode must be translation_only or translation_source.");
   }
@@ -373,43 +503,18 @@ export function validateSubtitleSettings(value) {
   }
   if (value.languagePair !== undefined) validateLanguagePair(value.languagePair);
   if (value.translationLanguages !== undefined) validateTranslationLanguages(value.translationLanguages);
+  if (value.liveCallTranslationLanguages !== undefined) {
+    validateLiveCallTranslationLanguages(value.liveCallTranslationLanguages);
+  }
   // Mixed caption+audio output is retired: a session produces captions OR
   // interpreted audio, not both. A settings file written before this still holds
   // the old value, so the READ path migrates it (see migrateSettingsFile) rather
   // than throwing here, which would make the file unloadable.
-  if (value.outputMode !== undefined && !["captions", "audio"].includes(value.outputMode)) {
-    throw new Error("Subtitle outputMode must be captions or audio.");
+  if (value.outputMode !== undefined && value.outputMode !== "captions") {
+    throw new Error("Subtitle outputMode must be captions.");
   }
-  const hasAudioOutput = value.outputMode === "audio";
-  if (hasAudioOutput) {
-    if (value.translationProvider !== "gemini") throw new Error("Subtitle translationProvider must remain gemini.");
-    const voiceProvider = value.voiceProvider ?? "gemini";
-    if (!["gemini", "openai"].includes(voiceProvider)) throw new Error("Subtitle voiceProvider must be gemini or openai.");
-    if (!Array.isArray(value.translationLanguages)) {
-      throw new Error("Subtitle audioLanguage requires translationLanguages.");
-    }
-    if (typeof value.audioLanguage !== "string" || !value.translationLanguages.includes(value.audioLanguage)) {
-      throw new Error("Subtitle audioLanguage must be one of translationLanguages.");
-    }
-    if (voiceProvider === "openai" && !OPENAI_REALTIME_TRANSLATION_LANGUAGES.has(value.audioLanguage)) {
-      throw new Error("Subtitle audioLanguage is not supported by OpenAI Realtime Translation.");
-    }
-    if (!Number.isFinite(value.audioVolume) || value.audioVolume < 0 || value.audioVolume > 1) {
-      throw new Error("Subtitle audioVolume must be between 0 and 1.");
-    }
-  } else {
-    if (value.audioLanguage !== undefined && !isSupportedSubtitleLanguage(value.audioLanguage)) {
-      throw new Error("Subtitle audioLanguage must be a supported language code.");
-    }
-    if (value.audioLanguage !== undefined
-      && Array.isArray(value.translationLanguages)
-      && !value.translationLanguages.includes(value.audioLanguage)) {
-      throw new Error("Subtitle audioLanguage must be one of translationLanguages.");
-    }
-    if (value.audioVolume !== undefined
-      && (!Number.isFinite(value.audioVolume) || value.audioVolume < 0 || value.audioVolume > 1)) {
-      throw new Error("Subtitle audioVolume must be between 0 and 1.");
-    }
+  for (const retiredKey of ["audioLanguage", "audioVolume", "voiceProvider", "model", "geminiModel"]) {
+    if (value[retiredKey] !== undefined) throw new Error(`Subtitle ${retiredKey} is retired in caption-only mode.`);
   }
   if (value.position !== undefined && !["bottom-center", "top-center", "middle-center"].includes(value.position)) {
     throw new Error("Subtitle position must be bottom-center, top-center, or middle-center.");
@@ -444,12 +549,22 @@ export function validateSubtitleSettings(value) {
   if (value.translationProvider !== undefined && value.translationProvider !== "gemini") {
     throw new Error("Subtitle translationProvider must remain gemini.");
   }
-  if (value.voiceProvider !== undefined && !["gemini", "openai"].includes(value.voiceProvider)) {
-    throw new Error("Subtitle voiceProvider must be gemini or openai.");
-  }
   if (value.glossary !== undefined) {
     if (typeof value.glossary !== "string" || value.glossary.length > MAX_SUBTITLE_GLOSSARY_CHARS) {
       throw new Error(`Subtitle glossary must be a string of ${MAX_SUBTITLE_GLOSSARY_CHARS} characters or fewer.`);
+    }
+  }
+  if (value.glossaries !== undefined && !isValidGlossarySelections(value.glossaries)) {
+    throw new Error("Subtitle glossaries must contain between 1 and 5 valid glossary selections.");
+  }
+  if (value.glossaryPresetId !== undefined) {
+    if (typeof value.glossaryPresetId !== "string" || value.glossaryPresetId.length > 128) {
+      throw new Error("Subtitle glossaryPresetId must be a string of 128 characters or fewer.");
+    }
+  }
+  if (value.glossaryPresetName !== undefined) {
+    if (typeof value.glossaryPresetName !== "string" || value.glossaryPresetName.length > 80) {
+      throw new Error("Subtitle glossaryPresetName must be a string of 80 characters or fewer.");
     }
   }
   if (value.translationDomain !== undefined) {
@@ -468,8 +583,9 @@ export function validateSubtitleSettings(value) {
       throw new Error(`Subtitle fontFamily must be a string of ${MAX_SUBTITLE_FONT_FAMILY_CHARS} characters or fewer.`);
     }
   }
-  if (value.geminiModel !== undefined && typeof value.geminiModel !== "string") {
-    throw new Error("Subtitle geminiModel must be a string.");
+  if (value.geminiTranscribeModel !== undefined
+    && value.geminiTranscribeModel !== DEFAULT_SUBTITLE_SETTINGS.geminiTranscribeModel) {
+    throw new Error("Subtitle geminiTranscribeModel must remain gemini-3.5-transcribe-live.");
   }
   if (value.geminiPolishModel !== undefined && typeof value.geminiPolishModel !== "string") {
     throw new Error("Subtitle geminiPolishModel must be a string.");
@@ -479,6 +595,15 @@ export function validateSubtitleSettings(value) {
   }
   if (value.overlayEnabled !== undefined && typeof value.overlayEnabled !== "boolean") {
     throw new Error("Subtitle overlayEnabled must be a boolean.");
+  }
+  if (value.overlayAllDisplays !== undefined && typeof value.overlayAllDisplays !== "boolean") {
+    throw new Error("Subtitle overlayAllDisplays must be a boolean.");
+  }
+  if (value.overlayDisplayId !== undefined
+    && (typeof value.overlayDisplayId !== "string"
+      || value.overlayDisplayId.length > 64
+      || /[\u0000-\u001f\u007f]/u.test(value.overlayDisplayId))) {
+    throw new Error("Subtitle overlayDisplayId must be a valid display ID.");
   }
   if (value.ollamaBaseURL !== undefined) validateLocalOllamaBaseURL(value.ollamaBaseURL);
   if (value.ollamaModel !== undefined) {
@@ -499,7 +624,26 @@ export function validateSubtitleSettings(value) {
   }
 }
 
-const OPENAI_REALTIME_TRANSLATION_LANGUAGES = new Set(["en", "es", "pt", "fr", "ja", "ru", "zh", "de", "ko", "hi", "id", "vi", "it"]);
+function isValidGlossarySelections(value) {
+  if (!Array.isArray(value) || value.length < 1 || value.length > 5) return false;
+  const keys = new Set();
+  for (const selection of value) {
+    if (!isPlainObject(selection)) return false;
+    const selectionKeys = Object.keys(selection);
+    if (selection.sourceKind === "builtin") {
+      if (selectionKeys.length !== 2 || !BUILT_IN_GLOSSARY_IDS.has(selection.sourceId)) return false;
+    } else if (selection.sourceKind === "host") {
+      if (selectionKeys.length !== 3 || typeof selection.sourceId !== "string"
+        || !GLOSSARY_PRESET_UUID_PATTERN.test(selection.sourceId)
+        || !Number.isSafeInteger(selection.documentVersion) || selection.documentVersion < 1) return false;
+    } else return false;
+    const key = `${selection.sourceKind}:${selection.sourceId}`;
+    if (keys.has(key)) return false;
+    keys.add(key);
+  }
+  return true;
+}
+
 
 function validateFontSize(value, label) {
   const fontSize = Number(value);
@@ -521,6 +665,18 @@ function validateTranslationLanguages(value) {
   if (value.length < 2 || value.length > MAX_TRANSLATION_LANGUAGES || unique.size !== value.length
     || value.some((language) => !isSupportedSubtitleLanguage(language))) {
     throw new Error(`Subtitle translationLanguages must include 2-${MAX_TRANSLATION_LANGUAGES} different supported language codes.`);
+  }
+}
+
+function validateLiveCallTranslationLanguages(value) {
+  if (!Array.isArray(value)) throw new Error("Subtitle liveCallTranslationLanguages must be an array.");
+  if (value.length === 0) return; // empty = inherit translationLanguages
+  const unique = new Set(value);
+  // Live Call sessions accept 1-3 languages (webapp schema min is 1), unlike
+  // the local overlay which needs at least 2.
+  if (value.length > MAX_TRANSLATION_LANGUAGES || unique.size !== value.length
+    || value.some((language) => !isSupportedSubtitleLanguage(language))) {
+    throw new Error(`Subtitle liveCallTranslationLanguages must include up to ${MAX_TRANSLATION_LANGUAGES} different supported language codes.`);
   }
 }
 

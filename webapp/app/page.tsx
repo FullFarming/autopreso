@@ -1,5 +1,11 @@
-import LiveHostDashboard from "@/components/live/LiveHostDashboard";
+import { redirect } from "next/navigation";
 
-export default function HomePage() {
-  return <LiveHostDashboard />;
+import { buildParticipantEntryUrl } from "@/components/live/viewer-surface-routing";
+
+export default async function HomePage({
+  searchParams,
+}: {
+  searchParams: Promise<Record<string, string | string[] | undefined>>;
+}) {
+  redirect(buildParticipantEntryUrl(await searchParams));
 }

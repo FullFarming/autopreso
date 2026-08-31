@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, timingSafeEqual } from "node:crypto";
 import { appendFileSync, mkdirSync } from "node:fs";
 import { createServer as createHttpServer } from "node:http";
 import os from "node:os";
@@ -20,12 +20,18 @@ import { createMoonshineTranscription as createDefaultMoonshineTranscription } f
 import { createOpenAITranscription as createDefaultOpenAITranscription } from "./openai-transcription.js";
 import { audioSecondsFromBase64Pcm16 } from "./session-cost.js";
 import { DEFAULT_SUBTITLE_SETTINGS, validateAgentInstructions, validateSubtitleSettings } from "./settings-store.js";
-import { generateGeminiText } from "./gemini-text-generation.js";
+import { generateGeminiText, generateGeminiTextWithModelFallback } from "./gemini-text-generation.js";
+
+// gemini-3.7-flash is the primary text workload model (caption polish,
+// transcript summaries). These are availability fallbacks only — one attempt
+// each when the primary is transiently unavailable, never a quality override.
+const SUBTITLE_POLISH_FALLBACK_MODELS = Object.freeze(["gemini-3.6-flash", "gemini-flash-lite-latest"]);
 import { GLOSSARY_PRESETS } from "./glossary-presets.js";
 import { createSessionTranscripts } from "./session-transcripts.js";
-import { createSubtitleChannelHub } from "./subtitle-channels.js";
+import { createSubtitleChannelHub, isRetiredTranslatedAudioMessage } from "./subtitle-channels.js";
 import { createSubtitleHistory, historyToCsv } from "./subtitle-history.js";
 import { SUBTITLE_LANGUAGES, isSupportedSubtitleLanguage } from "./subtitle-languages.js";
+import { getBuiltInGlossary } from "../packages/caption-core/index.js";
 import { createSubtitlePolisher } from "./subtitle-polish.js";
 import { createSubtitleRealtimeManager } from "./subtitle-realtime.js";
 import { broadcast, createWhiteboardSession } from "./whiteboard-session.js";
@@ -35,24 +41,119 @@ import { applyWhiteboardEditOperations, formatLineNumberedWhiteboard } from "./w
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = path.join(__dirname, "..", "public");
+const NOVA_SHARED_NO_STORE_ASSETS = new Set([
+  "nova-core.css",
+  "nova-transcript.js",
+  "subtitle-language-catalog.js",
+  "system-language.js",
+  "system-language-button.js",
+  "system-language-button.css",
+  "subtitle-i18n.js",
+  "subtitle-i18n-ja.js",
+]);
 const SUBTITLE_NO_STORE_ASSETS = new Set([
   "subtitle.html",
   "subtitle-dashboard.js",
   "subtitle-workspace.js",
-  "subtitle-audio-player.js",
   "subtitle.css",
   "subtitle-overlay.html",
   "subtitle-overlay.js",
   "subtitle-controller.html",
   "subtitle-controller.js",
 ]);
+const MEETING_COACH_CSP_ASSETS = new Set([
+  "meeting-coach-prep.html",
+  "meeting-coach-record.html",
+  "meeting-coach-response.html",
+]);
+const LIVE_INTERPRETER_NO_STORE_ASSETS = new Set([
+  "live-interpreter.html",
+  "live-interpreter.js",
+  "live-interpreter-audio.js",
+  "live-interpreter.css",
+]);
+const MEETING_COACH_CSP_HEADER = [
+  "default-src 'self'",
+  "script-src 'self'",
+  "style-src 'self'",
+  "connect-src 'self'",
+  "img-src 'self' data: blob:",
+  "font-src 'self'",
+  "object-src 'none'",
+  "base-uri 'self'",
+  "form-action 'self'",
+  "frame-ancestors 'self'",
+].join("; ");
+const LIVE_INTERPRETER_CSP_HEADER = [
+  "default-src 'self'",
+  "script-src 'self'",
+  "style-src 'self'",
+  "connect-src 'self'",
+  "img-src 'self' data:",
+  "font-src 'self'",
+  "media-src 'self' blob:",
+  "object-src 'none'",
+  "base-uri 'none'",
+  "form-action 'none'",
+  "frame-src 'none'",
+  "frame-ancestors 'none'",
+  "worker-src 'none'",
+].join("; ");
 export const DEFAULT_AGENT_TIMEOUT_MS = 90_000;
-const OPENAI_REALTIME_TRANSLATION_VALIDATE_URL = "wss://api.openai.com/v1/realtime/translations?model=gpt-realtime-translate";
+const OPENAI_REALTIME_TRANSCRIPTION_VALIDATE_URL = "wss://api.openai.com/v1/realtime?intent=transcription";
+const MAX_PENDING_UNKEYED_LIVE_CALL_SOURCES = 100;
+const MAX_PENDING_KEYED_LIVE_CALL_SOURCES = 500;
+const SUBTITLE_PCM_FRAME_BYTES = 4_800;
+const SUBTITLE_PCM_FRAME_BASE64_CHARS = 6_400;
+const SUBTITLE_PCM_FRAMES_PER_SECOND = 10;
+const SUBTITLE_PCM_BURST_FRAMES = 20;
+const MAX_LIVE_CALL_CAPTION_TEXT_CHARS = 2_000;
+
+function validateSubtitleAudioFrame({ client, source, audio, budgets, now = Date.now() }) {
+  const normalizedSource = source === "system" || source === "mic" ? source : "";
+  if (!normalizedSource
+    || typeof audio !== "string"
+    || audio.length !== SUBTITLE_PCM_FRAME_BASE64_CHARS
+    || !/^[A-Za-z0-9+/]+$/u.test(audio)) return null;
+  const bytes = Buffer.from(audio, "base64");
+  if (bytes.length !== SUBTITLE_PCM_FRAME_BYTES || bytes.toString("base64") !== audio) return null;
+
+  let clientBudgets = budgets.get(client);
+  if (!clientBudgets) {
+    clientBudgets = new Map();
+    budgets.set(client, clientBudgets);
+  }
+  const previous = clientBudgets.get(normalizedSource) ?? {
+    tokens: SUBTITLE_PCM_BURST_FRAMES,
+    updatedAt: now,
+  };
+  const elapsedMilliseconds = Math.max(0, now - previous.updatedAt);
+  const tokens = Math.min(
+    SUBTITLE_PCM_BURST_FRAMES,
+    previous.tokens + elapsedMilliseconds * SUBTITLE_PCM_FRAMES_PER_SECOND / 1_000,
+  );
+  if (tokens < 1) {
+    clientBudgets.set(normalizedSource, { tokens, updatedAt: now });
+    return null;
+  }
+  clientBudgets.set(normalizedSource, { tokens: tokens - 1, updatedAt: now });
+  return { source: normalizedSource, audio };
+}
 
 export async function startServer(options) {
   const app = express();
+  const configuredLiveCallProducerCapability = typeof options.liveCallProducerCapability === "string"
+    ? Buffer.from(options.liveCallProducerCapability, "utf8")
+    : null;
+  const hasLiveCallProducerCapability = (message) => {
+    if (!configuredLiveCallProducerCapability) return true;
+    if (typeof message?.producerCapability !== "string") return false;
+    const supplied = Buffer.from(message.producerCapability, "utf8");
+    return supplied.length === configuredLiveCallProducerCapability.length
+      && timingSafeEqual(supplied, configuredLiveCallProducerCapability);
+  };
   app.use((req, res, next) => {
-    if (!isMutatingMethod(req.method) || isAllowedLocalOrigin(req.headers.origin, req.headers.host)) {
+    if (!isMutatingMethod(req.method) || isAllowedLocalOrigin(req.headers.origin, req.headers.host, { allowMissingOrigin: false })) {
       next();
       return;
     }
@@ -62,11 +163,24 @@ export async function startServer(options) {
   app.use(express.static(PUBLIC_DIR, {
     setHeaders(res, filePath) {
       const relativePath = path.relative(PUBLIC_DIR, filePath).split(path.sep).join("/");
-      if (!SUBTITLE_NO_STORE_ASSETS.has(relativePath)) return;
-      res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
-      res.setHeader("Pragma", "no-cache");
-      res.setHeader("Expires", "0");
-      res.setHeader("Surrogate-Control", "no-store");
+      if (MEETING_COACH_CSP_ASSETS.has(relativePath)) {
+        res.setHeader("Content-Security-Policy", MEETING_COACH_CSP_HEADER);
+      }
+      if (relativePath === "live-interpreter.html") {
+        res.setHeader("Content-Security-Policy", LIVE_INTERPRETER_CSP_HEADER);
+      }
+      if (LIVE_INTERPRETER_NO_STORE_ASSETS.has(relativePath) || NOVA_SHARED_NO_STORE_ASSETS.has(relativePath)) {
+        res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
+        res.setHeader("Pragma", "no-cache");
+        res.setHeader("Expires", "0");
+        res.setHeader("Surrogate-Control", "no-store");
+      }
+      if (SUBTITLE_NO_STORE_ASSETS.has(relativePath)) {
+        res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
+        res.setHeader("Pragma", "no-cache");
+        res.setHeader("Expires", "0");
+        res.setHeader("Surrogate-Control", "no-store");
+      }
     },
   }));
 
@@ -112,24 +226,171 @@ export async function startServer(options) {
   // this keeps the ORIGINAL source text with per-line timestamps so a session
   // can be replayed and AI-summarized after it ends.
   const sessionTranscripts = options.transcriptsDir
-    ? createSessionTranscripts({ storageDir: options.transcriptsDir, log: options.log ?? console })
+    ? createSessionTranscripts({
+      storageDir: options.transcriptsDir,
+      log: options.log ?? console,
+      persistDelayMs: options.transcriptPersistDelayMs,
+    })
     : null;
   let transcriptRecordTail = Promise.resolve();
   const pendingLiveCallSources = new Map();
+  const pendingUnkeyedLiveCallSources = [];
   const recentlyRecordedLiveCallSources = new Set();
+  let liveCallCaptionProducer = null;
+  let liveCallCaptionSessionId = "";
+  let liveCallCaptionProducerKind = null;
+  let authoritativeLiveCallSessionId = "";
+  let authoritativeLiveCallFloorMode = "blocked";
+  let authoritativeLiveCallFloorHolderId = "";
+  let authoritativeLiveCallFloorRevision = -1;
+  const subtitleAudioBudgets = new WeakMap();
+  const authoritativeFloorResult = (ok) => ({
+    ok,
+    mode: authoritativeLiveCallFloorMode,
+    liveSessionId: authoritativeLiveCallSessionId,
+    floorRevision: authoritativeLiveCallFloorRevision,
+    holder: authoritativeLiveCallFloorMode === "participant"
+      ? { participantId: authoritativeLiveCallFloorHolderId }
+      : null,
+  });
+  const applyLiveCallFloorSnapshot = (snapshot) => {
+    if (snapshot === null) {
+      authoritativeLiveCallSessionId = "";
+      authoritativeLiveCallFloorMode = "blocked";
+      authoritativeLiveCallFloorHolderId = "";
+      authoritativeLiveCallFloorRevision = -1;
+      return authoritativeFloorResult(true);
+    }
+    const sessionId = snapshot && snapshot.type === "floor" && typeof snapshot.sessionId === "string"
+      ? snapshot.sessionId.trim().slice(0, 240)
+      : "";
+    const floorRevision = snapshot?.floorRevision;
+    const isHostFloor = snapshot?.holder === null;
+    const participantId = !isHostFloor
+      && snapshot?.holder
+      && typeof snapshot.holder === "object"
+      && !Array.isArray(snapshot.holder)
+      && typeof snapshot.holder.participantId === "string"
+      ? snapshot.holder.participantId.trim().slice(0, 240)
+      : "";
+    if (!sessionId || !Number.isSafeInteger(floorRevision) || floorRevision < 0 || (!isHostFloor && !participantId)) {
+      authoritativeLiveCallSessionId = "";
+      authoritativeLiveCallFloorMode = "blocked";
+      authoritativeLiveCallFloorHolderId = "";
+      authoritativeLiveCallFloorRevision = -1;
+      return authoritativeFloorResult(false);
+    }
+    if (liveCallCaptionSessionId && sessionId !== liveCallCaptionSessionId) {
+      return authoritativeFloorResult(false);
+    }
+    if (sessionId === authoritativeLiveCallSessionId && floorRevision < authoritativeLiveCallFloorRevision) {
+      return authoritativeFloorResult(false);
+    }
+    if (sessionId === authoritativeLiveCallSessionId && floorRevision === authoritativeLiveCallFloorRevision) {
+      const requestedMode = isHostFloor ? "host" : "participant";
+      const requestedHolderId = isHostFloor ? "" : participantId;
+      return authoritativeFloorResult(
+        requestedMode === authoritativeLiveCallFloorMode
+        && requestedHolderId === authoritativeLiveCallFloorHolderId,
+      );
+    }
+    authoritativeLiveCallSessionId = sessionId;
+    authoritativeLiveCallFloorMode = isHostFloor ? "host" : "participant";
+    authoritativeLiveCallFloorHolderId = isHostFloor ? "" : participantId;
+    authoritativeLiveCallFloorRevision = floorRevision;
+    return authoritativeFloorResult(true);
+  };
+  // Silence-clear parity with captions-only: the gateway emits no clear event,
+  // so without this the overlay holds a finished live-call sentence for the
+  // 15-20s stale backstops. The window is SILENCE_CLEAR_MS (3s, the
+  // captions-only silence threshold in subtitle-realtime.js) plus
+  // SUBTITLE_PREVIOUS_SENTENCE_LINGER_MS (3s, how long a completed sentence
+  // stays readable). A bare 3s measured this way removed the last sentence the
+  // moment silence was detected, with none of that reading time — gateway
+  // partials arrive every ~500ms (PARTIAL_MAX_HOLD_MILLISECONDS), so the timer
+  // effectively starts at the last spoken word rather than after the
+  // captions-only delta tail.
+  const liveCallSilenceClearMilliseconds = Number.isFinite(options.liveCallSilenceClearMilliseconds)
+    ? options.liveCallSilenceClearMilliseconds
+    : 6_000;
+  const liveCallSilenceClearTimers = new Map();
+  // Per-lane highest sourceSeq that reached the display (partials carry the
+  // seq their final will take). A final BELOW it belongs to an older sentence
+  // than what viewers already read, so it routes to records/history only.
+  const liveCallLaneMaxSourceSeq = new Map();
+  function cancelLiveCallSilenceClears() {
+    for (const timer of liveCallSilenceClearTimers.values()) clearTimeout(timer);
+    liveCallSilenceClearTimers.clear();
+    liveCallLaneMaxSourceSeq.clear();
+  }
+  function armLiveCallSilenceClear(liveSessionId, targetLanguage) {
+    if (!liveSessionId || !targetLanguage) return;
+    const existing = liveCallSilenceClearTimers.get(targetLanguage);
+    if (existing) clearTimeout(existing);
+    const timer = setTimeout(() => {
+      liveCallSilenceClearTimers.delete(targetLanguage);
+      if (liveSessionId !== liveCallCaptionSessionId) return;
+      broadcastSubtitleMessage({
+        type: "subtitle:clear",
+        source: "live-call",
+        liveSessionId,
+        targetLanguage,
+        reason: "silence",
+      });
+    }, liveCallSilenceClearMilliseconds);
+    timer.unref?.();
+    liveCallSilenceClearTimers.set(targetLanguage, timer);
+  }
+  let subtitleSessionProducer = null;
+  let subtitleSessionId = "";
+  let isSubtitleLocalProviderActive = false;
+  let subtitleProducerTransitionTail = Promise.resolve();
+  const queueSubtitleProducerTransition = (operation) => {
+    const result = subtitleProducerTransitionTail.then(operation, operation);
+    subtitleProducerTransitionTail = result.catch(() => undefined);
+    return result;
+  };
+  const stopSubtitleProviderSafely = async (sessionId, reason) => {
+    try {
+      await queueSubtitleProducerTransition(() => subtitles.stop(sessionId));
+      return null;
+    } catch (error) {
+      (options.log ?? console).warn?.(
+        `[subtitle] local provider stop failed (${reason}): ${error?.message ?? error}`,
+      );
+      return error;
+    }
+  };
   const queueTranscriptLine = (line) => {
     transcriptRecordTail = transcriptRecordTail
       .then(() => sessionTranscripts?.recordLine(line))
       .catch((error) => (options.log ?? console).warn?.(`[session-transcripts] record skipped: ${error?.message ?? error}`));
     return transcriptRecordTail;
   };
+  const isHybridLocalStatus = (message) => (
+    liveCallCaptionProducer !== null
+    && liveCallCaptionProducer === subtitleSessionProducer
+    && Boolean(liveCallCaptionSessionId)
+    && message?.type === "subtitle:status"
+    && message?.source !== "live-call"
+  );
   // Per-viewer subtitle channels: every lane message gets a seq stamp and is
   // fanned out through the hub so a client subscribed to specific languages
   // (subtitle:subscribe) only receives its own lanes. Clients that never
   // subscribe receive everything, exactly as before.
   const subtitleHub = createSubtitleChannelHub();
+  const normalizeLiveCallCaptionText = (value) => String(value ?? "")
+    .normalize("NFC")
+    .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/gu, " ")
+    .replace(/\s+/gu, " ")
+    .trim()
+    .slice(0, MAX_LIVE_CALL_CAPTION_TEXT_CHARS);
   const broadcastSubtitleMessage = (message) => {
-    const stamped = subtitleHub.ingest(message);
+    if (isRetiredTranslatedAudioMessage(message)) return;
+    // Local provider health is useful to the host, but the hub's generic
+    // connecting/idle semantics clear the canonical Live Call session. Keep
+    // health visible without letting it erase participant snapshot identity.
+    const stamped = isHybridLocalStatus(message) ? message : subtitleHub.ingest(message);
     const serialized = JSON.stringify(stamped);
     for (const wsClient of wss.clients) {
       if (wsClient.readyState === WebSocket.OPEN && subtitleHub.shouldSend(wsClient, stamped)) {
@@ -146,31 +407,33 @@ export async function startServer(options) {
         recorderStatus: { ...subtitleHistory.getSnapshot().recorderStatus, lastError: error.message },
       }));
   };
-  // Second-pass subtitle polish. Gemini is the primary translation path:
-  // key 1 stays on gemini-3.5-live-translate-preview for low-latency Live
-  // Translate, while key 2 (when configured) runs the committed-line glossary
-  // finalizer on Gemini Flash so terminology work cannot slow the live socket.
+  // Caption contract v2 transcribes with Gemini 3.5 Transcribe Live and uses
+  // Gemini 3.7 Flash for text translation/final terminology repair. The second
+  // key remains optional so committed-line repair cannot stall transcription.
   const subtitlePolish = async (args) => {
     const saved = options.settingsStore ? await options.settingsStore.load() : {};
     const env = options.env ?? process.env;
     const polishOptions = selectSubtitlePolishOptions({ args, saved, env });
     if (!polishOptions) return args?.translatedText;
-    const polisher = polishOptions.provider === "gemini"
-      ? createSubtitlePolisher({
-        generateText: options.subtitleGeminiPolishGenerateText ?? ((request) => generateGeminiText({
-          ...request,
-          apiKey: polishOptions.apiKey,
-          fetchImpl: options.fetchImpl ?? globalThis.fetch,
-        })),
-        model: polishOptions.modelId,
-      })
-      : createSubtitlePolisher({
-        generateText: options.subtitlePolishGenerateText ?? generateText,
-        model: createOpenAI({ apiKey: polishOptions.apiKey })(polishOptions.modelId),
-      });
+    const polisher = createSubtitlePolisher({
+      // Availability routing (2026-08-31 outage): gemini-3.7-flash stays the
+      // primary text model, but a transient 5xx/hang on it must not turn every
+      // committed caption into TEXT_TRANSLATION_FAILED — one attempt per
+      // fallback model inside the polisher's own 6s deadline.
+      generateText: options.subtitleGeminiPolishGenerateText ?? ((request) => generateGeminiTextWithModelFallback({
+        ...request,
+        models: [
+          polishOptions.modelId,
+          ...SUBTITLE_POLISH_FALLBACK_MODELS.filter((fallbackModel) => fallbackModel !== polishOptions.modelId),
+        ],
+        apiKey: polishOptions.apiKey,
+        fetchImpl: options.fetchImpl ?? globalThis.fetch,
+      })),
+      model: polishOptions.modelId,
+    });
     return polisher.polish(args);
   };
-  const subtitles = createSubtitleRealtimeManager({
+  const subtitles = (options.createSubtitleRealtimeManager ?? createSubtitleRealtimeManager)({
     broadcast: broadcastSubtitleMessage,
     settingsStore: options.settingsStore,
     env: options.env ?? process.env,
@@ -211,6 +474,25 @@ export async function startServer(options) {
     res.json(GLOSSARY_PRESETS);
   });
 
+  // Read-only projection of a built-in glossary pack for the dashboard's
+  // detail popup. Only the fields the viewer needs — never ids, tags, or
+  // provenance — so the payload stays a display contract, not a data export.
+  app.get("/api/built-in-glossaries/:id", (req, res) => {
+    const glossary = getBuiltInGlossary(String(req.params.id ?? ""));
+    if (!glossary) return res.status(404).json({ ok: false, error: "UNKNOWN_GLOSSARY" });
+    res.json({
+      ok: true,
+      glossary: {
+        id: glossary.id,
+        label: glossary.label,
+        description: glossary.description,
+        sourceLanguage: glossary.document.sourceLanguage,
+        targetLanguages: glossary.document.targetLanguages,
+        terms: glossary.document.terms.map(({ source, translations, context }) => ({ source, translations, context })),
+      },
+    });
+  });
+
   app.get("/api/settings/export", async (_req, res) => {
     if (!options.settingsStore) return res.status(404).json({ error: "Settings store not available." });
     const settings = await options.settingsStore.load();
@@ -242,24 +524,15 @@ export async function startServer(options) {
     const env = options.env ?? process.env;
     const geminiKey = saved.apiKeys?.gemini || env.GEMINI_API_KEY || "";
     if (geminiKey) {
-      const model = saved.subtitle?.geminiPolishModel || DEFAULT_SUBTITLE_SETTINGS.geminiPolishModel;
-      return (request) => generateGeminiText({
+      const model = DEFAULT_SUBTITLE_SETTINGS.geminiPolishModel;
+      return (request) => generateGeminiTextWithModelFallback({
         ...request,
+        models: [model, ...SUBTITLE_POLISH_FALLBACK_MODELS.filter((fallbackModel) => fallbackModel !== model)],
         apiKey: geminiKey,
-        model,
+        // Summaries produce long output; give each model attempt a real window.
+        perAttemptTimeoutMs: 20_000,
         fetchImpl: options.fetchImpl ?? globalThis.fetch,
       });
-    }
-    const openaiKey = saved.apiKeys?.openai || env.OPENAI_API_KEY || "";
-    if (openaiKey) {
-      return async ({ system, prompt }) => {
-        const { text } = await generateText({
-          model: createOpenAI({ apiKey: openaiKey })(env.OPENAI_SUMMARY_MODEL || "gpt-5.5-mini"),
-          system,
-          prompt,
-        });
-        return { text };
-      };
     }
     return null;
   };
@@ -267,7 +540,11 @@ export async function startServer(options) {
   const summarizeSessionTranscript = async (sessionId) => {
     if (!sessionTranscripts) throw new Error("세션 기록 저장소가 설정되지 않았습니다.");
     const generator = await selectTranscriptSummaryGenerator();
-    if (!generator) throw new Error("AI 요약에는 Gemini 또는 OpenAI API 키가 필요합니다. Settings에서 키를 저장하세요.");
+    if (!generator) throw createSafeHttpError(
+      503,
+      "TRANSCRIPT_SUMMARY_UNAVAILABLE",
+      "AI 요약을 사용하려면 Gemini API 키를 설정해 주세요.",
+    );
     const summary = await sessionTranscripts.summarize(sessionId, generator);
     broadcast(wss, { type: "subtitle:session-summary", sessionId, summary });
     return summary;
@@ -294,7 +571,8 @@ export async function startServer(options) {
     try {
       res.json({ ok: true, data: await summarizeSessionTranscript(req.params.id) });
     } catch (error) {
-      res.status(422).json({ ok: false, error: error.message });
+      const safe = safeHttpErrorResponse(error);
+      res.status(safe.status).json({ ok: false, error: safe.error, code: safe.code });
     }
   });
 
@@ -336,8 +614,9 @@ export async function startServer(options) {
       });
     }
     try {
-      await validateOpenAIRealtimeTranslationKey({
+      await validateOpenAIRealtimeTranscriptionKey({
         apiKey,
+        model: saved.transcription?.openai?.model || "gpt-realtime-whisper",
         createWebSocket: options.createSubtitleWebSocket ?? ((url, protocols, init) => new WebSocket(url, protocols, init)),
       });
       res.json({ ok: true, data: { status: "valid" } });
@@ -365,7 +644,7 @@ export async function startServer(options) {
     try {
       await validateGeminiTextGenerationKey({
         apiKey,
-        model: saved.subtitle?.geminiPolishModel || "gemini-3.5-flash",
+        model: DEFAULT_SUBTITLE_SETTINGS.geminiPolishModel,
         fetchImpl: options.fetchImpl ?? globalThis.fetch,
       });
       res.json({ ok: true, data: { status: "valid" } });
@@ -466,8 +745,10 @@ export async function startServer(options) {
     subtitles.close();
   });
 
-  wss.on("connection", async (client) => {
+  wss.on("connection", async (client, request) => {
     let activeAudioSessionId = null;
+    const hasTrustedBrowserOrigin = typeof request?.headers?.origin === "string"
+      && isAllowedLocalOrigin(request.headers.origin, request.headers.host);
     client.send(JSON.stringify({ type: "config", transcriptionEngine: transcription.getLabel() }));
     if (options.settingsStore) {
       const sanitized = await options.settingsStore.getSanitized();
@@ -481,7 +762,28 @@ export async function startServer(options) {
     // Late-join sync: paint the current live subtitle lanes immediately
     // instead of waiting for the next partial.
     client.send(JSON.stringify(subtitleHub.snapshotFor(client)));
-    client.on("close", () => subtitleHub.removeClient(client));
+    client.on("close", () => {
+      subtitleHub.removeClient(client);
+      if (client === subtitleSessionProducer) {
+        const orphanedSessionId = subtitleSessionId;
+        const shouldCloseLocalProvider = isSubtitleLocalProviderActive;
+        subtitleSessionProducer = null;
+        subtitleSessionId = "";
+        isSubtitleLocalProviderActive = false;
+        // Keep the transcript active for renderer recovery, but never leave a
+        // paid local provider orphaned after its only audio producer vanished.
+        if (shouldCloseLocalProvider && orphanedSessionId) {
+          void stopSubtitleProviderSafely(orphanedSessionId, "owner_closed");
+        }
+      }
+      if (client === liveCallCaptionProducer) {
+        cancelLiveCallSilenceClears();
+        subtitleHub.clearLiveCallSession(liveCallCaptionSessionId);
+        liveCallCaptionProducer = null;
+        liveCallCaptionSessionId = "";
+        liveCallCaptionProducerKind = null;
+      }
+    });
     if (state.mode === "live") {
       client.send(JSON.stringify({ type: "whiteboard:update", elements: state.elements }));
     }
@@ -532,6 +834,7 @@ export async function startServer(options) {
       }
 
       if (message.type === "settings:update" && options.settingsStore) {
+        if (!hasTrustedBrowserOrigin) return;
         try {
           await options.settingsStore.save(message.patch ?? {});
           await transcription.applyCurrent();
@@ -552,7 +855,46 @@ export async function startServer(options) {
         // Identity travels as structured fields — the overlay renders a
         // name·department·title badge instead of a "Name:" text prefix, and
         // the session record keeps attribution via the speaker field.
-        const translatedText = String(message.translatedText ?? "").trim();
+        if (!hasLiveCallProducerCapability(message)) {
+          client.send(JSON.stringify({
+            type: "subtitle:error",
+            code: "LIVE_CALL_PRODUCER_CAPABILITY_INVALID",
+            message: "Live Call 자막 채널을 확인할 수 없습니다.",
+          }));
+          return;
+        }
+        if (client !== liveCallCaptionProducer || !liveCallCaptionSessionId) {
+          client.send(JSON.stringify({
+            type: "subtitle:error",
+            message: "활성 Live Call 자막 채널이 아닙니다.",
+            code: "LIVE_CALL_CAPTION_PRODUCER_MISMATCH",
+          }));
+          return;
+        }
+        const relaySessionId = typeof message.sessionId === "string"
+          ? message.sessionId.trim().slice(0, 240)
+          : "";
+        if (!relaySessionId || relaySessionId !== liveCallCaptionSessionId) {
+          client.send(JSON.stringify({
+            type: "subtitle:error",
+            message: "Live Call 세션이 일치하지 않습니다.",
+            code: "LIVE_CALL_CAPTION_SESSION_MISMATCH",
+          }));
+          return;
+        }
+        const translatedText = normalizeLiveCallCaptionText(message.translatedText);
+        const suppliedSpeakerName = String(message.speaker ?? "").trim().slice(0, 80);
+        const suppliedSpeakerRole = ["host", "participant"].includes(message.speakerRole)
+          ? message.speakerRole
+          : "";
+        const speakerRole = suppliedSpeakerRole || (suppliedSpeakerName ? "participant" : "host");
+        const speakerName = suppliedSpeakerName || "Host";
+        const speakerDepartment = speakerRole === "participant"
+          ? String(message.speakerDepartment ?? "").trim().slice(0, 80)
+          : "";
+        const speakerJobTitle = speakerRole === "participant"
+          ? String(message.speakerJobTitle ?? "").trim().slice(0, 100)
+          : "";
         if (translatedText && message.recordOnly === true) {
           // 원문 보관: the untranslated source line goes into the session
           // record (Records shows the original alongside the translation)
@@ -562,48 +904,102 @@ export async function startServer(options) {
             ? message.utteranceKey.slice(0, 240)
             : null;
           if (utteranceKey && recentlyRecordedLiveCallSources.delete(utteranceKey)) return;
-          pendingLiveCallSources.set(utteranceKey ?? Symbol("unkeyed-live-source"), {
-            speaker: String(message.speaker ?? "").trim().slice(0, 80),
+          const sourceLine = {
+            speaker: speakerName,
             sourceText: translatedText,
             translatedText: "",
-          });
+          };
+          if (utteranceKey) {
+            if (!pendingLiveCallSources.has(utteranceKey)
+              && pendingLiveCallSources.size >= MAX_PENDING_KEYED_LIVE_CALL_SOURCES) {
+              const oldestKey = pendingLiveCallSources.keys().next().value;
+              const overflow = pendingLiveCallSources.get(oldestKey);
+              pendingLiveCallSources.delete(oldestKey);
+              if (overflow) void queueTranscriptLine(overflow);
+            }
+            pendingLiveCallSources.set(utteranceKey, sourceLine);
+          } else {
+            if (pendingUnkeyedLiveCallSources.length >= MAX_PENDING_UNKEYED_LIVE_CALL_SOURCES) {
+              const overflow = pendingUnkeyedLiveCallSources.shift();
+              if (overflow) void queueTranscriptLine(overflow);
+            }
+            pendingUnkeyedLiveCallSources.push(sourceLine);
+          }
           return;
         }
         if (translatedText) {
-          const speakerName = String(message.speaker ?? "").trim().slice(0, 80);
-          let sourceText = String(message.sourceText ?? "").trim();
+          let sourceText = normalizeLiveCallCaptionText(message.sourceText);
           const utteranceKey = typeof message.utteranceKey === "string" && message.utteranceKey
             ? message.utteranceKey.slice(0, 240)
             : null;
+          let pending = null;
           if (utteranceKey && message.partial !== true) {
-            const pending = pendingLiveCallSources.get(utteranceKey);
+            pending = pendingLiveCallSources.get(utteranceKey) ?? null;
             if (!sourceText && pending) sourceText = pending.sourceText;
             pendingLiveCallSources.delete(utteranceKey);
             recentlyRecordedLiveCallSources.add(utteranceKey);
             if (recentlyRecordedLiveCallSources.size > 500) {
               recentlyRecordedLiveCallSources.delete(recentlyRecordedLiveCallSources.values().next().value);
             }
+          } else if (!utteranceKey && message.partial !== true) {
+            const matchingIndex = pendingUnkeyedLiveCallSources.findIndex((line) => line.speaker === speakerName);
+            if (matchingIndex >= 0) {
+              [pending] = pendingUnkeyedLiveCallSources.splice(matchingIndex, 1);
+              if (!sourceText) sourceText = pending.sourceText;
+            }
           }
-          broadcastSubtitleMessage({
+          const sourceSeq = Number.isSafeInteger(message.sourceSeq) && message.sourceSeq >= 0
+            ? message.sourceSeq
+            : null;
+          const laneLanguage = String(message.targetLanguage ?? "");
+          // Caption-only parity. The overlay builds its rolling 2-3 line word
+          // stream from COMMITTED lines plus the live partial tail
+          // (renderLane in subtitle-overlay.js), so finals must keep
+          // displaying — they are what the accumulated text is made of.
+          // Caption-only looks smooth because its final lands in order, on the
+          // sentence currently on screen. What broke live-call is ORDER: the
+          // gateway awaits the polish pass, so a final can arrive after newer
+          // partials already painted (interims carry the seq their final will
+          // take — contract C1). Only those out-of-order finals go to
+          // records/history; painting one rewinds the lane to an older
+          // sentence, which caption-only never does.
+          const laneDisplayedSeq = liveCallLaneMaxSourceSeq.get(laneLanguage) ?? -1;
+          const isRecordOnlyFinal = message.partial !== true && sourceSeq !== null && sourceSeq < laneDisplayedSeq;
+          if (!isRecordOnlyFinal && sourceSeq !== null && sourceSeq > laneDisplayedSeq) {
+            liveCallLaneMaxSourceSeq.set(laneLanguage, sourceSeq);
+          }
+          const line = {
             type: message.partial ? "subtitle:partial" : "subtitle:committed",
             source: "live-call",
-            targetLanguage: String(message.targetLanguage ?? ""),
+            liveSessionId: relaySessionId,
+            targetLanguage: laneLanguage,
             sourceText,
             sourceLanguage: String(message.sourceLanguage ?? ""),
+            utteranceKey,
+            ...(sourceSeq !== null ? { sourceSeq } : {}),
             translatedText,
-            ...(speakerName ? {
-              speaker: speakerName,
-              liveCallSpeaker: {
-                name: speakerName,
-                department: String(message.speakerDepartment ?? "").trim().slice(0, 80),
-                jobTitle: String(message.speakerJobTitle ?? "").trim().slice(0, 100),
-              },
-            } : {}),
-          });
+            speaker: speakerName,
+            liveCallSpeaker: {
+              role: speakerRole,
+              name: speakerName,
+              department: speakerDepartment,
+              jobTitle: speakerJobTitle,
+            },
+          };
+          if (isRecordOnlyFinal) {
+            void queueTranscriptLine(line);
+            void subtitleHistory.record(line)
+              .then((snapshot) => broadcast(wss, { type: "subtitle:history", ...snapshot }))
+              .catch(() => {});
+            return;
+          }
+          broadcastSubtitleMessage(line);
+          armLiveCallSilenceClear(relaySessionId, laneLanguage);
         }
       }
 
       if (message.type === "subtitle:mirror") {
+        if (!hasTrustedBrowserOrigin) return;
         // Phone-link mirror: the dashboard renderer receives lines from the
         // paired web session (Supabase, Chromium network stack → passes
         // corporate proxies) and relays them here; rebroadcast as real
@@ -621,47 +1017,279 @@ export async function startServer(options) {
         }
       }
 
-      if (message.type === "subtitle:start") {
+      if (message.type === "subtitle:preflight") {
+        const requestId = typeof message.requestId === "string" ? message.requestId.slice(0, 128) : "";
         try {
+          if (options.canStartSubtitleSession && !options.canStartSubtitleSession()) throw new Error("HOST_LOGIN_REQUIRED");
+          const meeting = message.meeting && typeof message.meeting === "object" ? message.meeting : {};
+          if (!requestId || !hasTrustedBrowserOrigin || meeting.kind !== "live-call") {
+            throw new Error("LIVE_CALL_CAPTION_PREFLIGHT_UNTRUSTED");
+          }
+          if (!hasLiveCallProducerCapability(message)) {
+            throw new Error("LIVE_CALL_PRODUCER_CAPABILITY_INVALID");
+          }
+          if (typeof meeting.liveSessionId !== "string" || !meeting.liveSessionId.trim()) {
+            throw new Error("LIVE_CALL_SESSION_REQUIRED");
+          }
           validateSubtitleSettings(message.settings);
-          // 2026-07-26 fix: Live Call captions have one producer: the media gateway. Keep the
-          // local transcript lifecycle open while leaving the independent
-          // realtime translation manager cold.
-          if (message.captionProducer !== "gateway") {
-            await subtitles.start({ sessionId: message.sessionId, settings: message.settings });
+          client.send(JSON.stringify({ type: "subtitle:preflight-ready", requestId }));
+        } catch (error) {
+          client.send(JSON.stringify({
+            type: "subtitle:preflight-failed",
+            requestId,
+            message: error?.message ?? "SUBTITLE_PREFLIGHT_FAILED",
+            code: "SUBTITLE_PREFLIGHT_FAILED",
+          }));
+        }
+      }
+
+      if (message.type === "subtitle:start") {
+        if (options.canStartSubtitleSession && !options.canStartSubtitleSession()) {
+          client.send(JSON.stringify({ type: "subtitle:error", sessionId: typeof message.sessionId === "string" ? message.sessionId : "", code: "SUBTITLE_START_FAILED", message: "HOST_LOGIN_REQUIRED" }));
+          return;
+        }
+        let didAttemptLocalProviderStart = false;
+        let requestedSessionId = "";
+        try {
+          if (!hasTrustedBrowserOrigin) throw new Error("SUBTITLE_PRODUCER_UNTRUSTED");
+          requestedSessionId = typeof message.sessionId === "string" ? message.sessionId.trim().slice(0, 240) : "";
+          if (!requestedSessionId) throw new Error("SUBTITLE_SESSION_REQUIRED");
+          const requestedProducerKind = message.captionProducer === "hybrid"
+            ? "hybrid"
+            : message.captionProducer === "gateway"
+              ? "gateway"
+              : "local";
+          if (requestedProducerKind === "hybrid" && !hasLiveCallProducerCapability(message)) {
+            throw new Error("LIVE_CALL_PRODUCER_CAPABILITY_INVALID");
+          }
+          validateSubtitleSettings(message.settings);
+          if (subtitleSessionProducer && subtitleSessionProducer !== client) {
+            throw new Error("SUBTITLE_PRODUCER_ACTIVE");
+          }
+          if (subtitleSessionProducer === client && subtitleSessionId && subtitleSessionId !== requestedSessionId) {
+            throw new Error("SUBTITLE_SESSION_ACTIVE");
+          }
+          subtitleSessionProducer = client;
+          subtitleSessionId = requestedSessionId;
+          const meeting = message.meeting && typeof message.meeting === "object" ? message.meeting : {};
+          if (requestedProducerKind === "gateway" || requestedProducerKind === "hybrid") {
+            if (!hasTrustedBrowserOrigin || meeting.kind !== "live-call") {
+              throw new Error("LIVE_CALL_CAPTION_PRODUCER_UNTRUSTED");
+            }
+            const requestedLiveSessionId = String(meeting.liveSessionId ?? "").trim().slice(0, 240);
+            if (!requestedLiveSessionId) throw new Error("LIVE_CALL_SESSION_REQUIRED");
+            if (liveCallCaptionProducer && liveCallCaptionProducer !== client) {
+              throw new Error("LIVE_CALL_CAPTION_PRODUCER_ACTIVE");
+            }
+            if (liveCallCaptionProducer === client
+              && liveCallCaptionSessionId
+              && liveCallCaptionSessionId !== requestedLiveSessionId) {
+              throw new Error("LIVE_CALL_CAPTION_SESSION_ACTIVE");
+            }
+            liveCallCaptionProducer = client;
+            liveCallCaptionSessionId = requestedLiveSessionId;
+            liveCallCaptionProducerKind = requestedProducerKind;
+            cancelLiveCallSilenceClears();
+            subtitleHub.setLiveCallSession(liveCallCaptionSessionId);
+            if (requestedProducerKind === "hybrid") {
+              didAttemptLocalProviderStart = true;
+              await queueSubtitleProducerTransition(() => subtitles.start({
+                sessionId: requestedSessionId,
+                settings: message.settings,
+              }));
+              isSubtitleLocalProviderActive = true;
+            }
+          } else if (client === liveCallCaptionProducer) {
+            const requestedLiveSessionId = String(meeting.liveSessionId ?? "").trim().slice(0, 240);
+            if (meeting.kind !== "live-call" || requestedLiveSessionId !== liveCallCaptionSessionId) {
+              throw new Error("LIVE_CALL_LOCAL_SESSION_MISMATCH");
+            }
+            didAttemptLocalProviderStart = true;
+            await queueSubtitleProducerTransition(() => subtitles.start({
+              sessionId: requestedSessionId,
+              settings: message.settings,
+            }));
+            isSubtitleLocalProviderActive = true;
+          } else {
+            didAttemptLocalProviderStart = true;
+            await queueSubtitleProducerTransition(() => subtitles.start({
+              sessionId: requestedSessionId,
+              settings: message.settings,
+            }));
+            isSubtitleLocalProviderActive = true;
           }
           // Optional meeting identity. When captions are running for a Live Call
           // the record must be anchored to the CALL's start and carry its title,
           // because that is what the records calendar places on the grid. Every
           // field is bounded and validated inside begin(); absent means a plain
           // local caption session, which is the historical behaviour.
-          const meeting = message.meeting && typeof message.meeting === "object" ? message.meeting : {};
           await sessionTranscripts?.begin({
-            sessionId: message.sessionId,
+            sessionId: requestedSessionId,
             kind: meeting.kind === "live-call" ? "live-call" : "local",
             liveSessionId: typeof meeting.liveSessionId === "string" ? meeting.liveSessionId : "",
             title: typeof meeting.title === "string" ? meeting.title : "",
             startedAt: typeof meeting.startedAt === "string" ? meeting.startedAt : "",
           });
+          client.send(JSON.stringify({
+            type: "subtitle:started",
+            sessionId: requestedSessionId,
+            captionProducer: requestedProducerKind,
+          }));
         } catch (error) {
-          client.send(JSON.stringify({ type: "subtitle:error", message: error.message, code: "SUBTITLE_START_FAILED" }));
+          const shouldCompensateLocalProvider = requestedSessionId
+            && (didAttemptLocalProviderStart || isSubtitleLocalProviderActive);
+          if (shouldCompensateLocalProvider) {
+            await stopSubtitleProviderSafely(requestedSessionId, "start_failed");
+          }
+          if (client === subtitleSessionProducer) {
+            subtitleSessionProducer = null;
+            subtitleSessionId = "";
+            isSubtitleLocalProviderActive = false;
+          }
+          if (client === liveCallCaptionProducer) {
+            cancelLiveCallSilenceClears();
+            subtitleHub.clearLiveCallSession(liveCallCaptionSessionId);
+            liveCallCaptionProducer = null;
+            liveCallCaptionSessionId = "";
+            liveCallCaptionProducerKind = null;
+          }
+          client.send(JSON.stringify({
+            type: "subtitle:error",
+            sessionId: typeof message.sessionId === "string" ? message.sessionId : "",
+            captionProducer: message.captionProducer === "hybrid"
+              ? "hybrid"
+              : message.captionProducer === "gateway"
+                ? "gateway"
+                : "local",
+            message: error.message,
+            code: "SUBTITLE_START_FAILED",
+          }));
         }
       }
 
+      if (message.type === "subtitle:live-call-floor") {
+        if (!hasLiveCallProducerCapability(message)) {
+          client.send(JSON.stringify({
+            type: "subtitle:error",
+            code: "LIVE_CALL_PRODUCER_CAPABILITY_INVALID",
+            message: "Live Call 자막 채널을 확인할 수 없습니다.",
+          }));
+          return;
+        }
+        const requestSessionId = typeof message.sessionId === "string"
+          ? message.sessionId.trim().slice(0, 240)
+          : "";
+        const requestLiveSessionId = typeof message.liveSessionId === "string"
+          ? message.liveSessionId.trim().slice(0, 240)
+          : "";
+        const ownsHybridSession = hasTrustedBrowserOrigin
+          && client === subtitleSessionProducer
+          && client === liveCallCaptionProducer
+          && isSubtitleLocalProviderActive
+          && requestSessionId === subtitleSessionId
+          && requestLiveSessionId === liveCallCaptionSessionId;
+        if (!ownsHybridSession) {
+          client.send(JSON.stringify({
+            type: "subtitle:error",
+            code: "LIVE_CALL_FLOOR_OWNER_MISMATCH",
+            message: "활성 Live Call 자막 세션이 아닙니다.",
+          }));
+          return;
+        }
+        const floorRevision = message.floorRevision;
+        if (!Number.isSafeInteger(floorRevision) || floorRevision < 0) {
+          client.send(JSON.stringify({
+            type: "subtitle:error",
+            code: "LIVE_CALL_FLOOR_INVALID",
+            message: "Live Call 발언권 상태가 올바르지 않습니다.",
+          }));
+          return;
+        }
+        const isHostFloor = message.holder === null;
+        const participantId = !isHostFloor
+          && message.holder
+          && typeof message.holder === "object"
+          && !Array.isArray(message.holder)
+          ? String(message.holder.participantId ?? "").trim().slice(0, 240)
+          : "";
+        if (!isHostFloor && !participantId) {
+          client.send(JSON.stringify({
+            type: "subtitle:error",
+            code: "LIVE_CALL_FLOOR_INVALID",
+            message: "Live Call 발언권 상태가 올바르지 않습니다.",
+          }));
+          return;
+        }
+        const requestedMode = isHostFloor ? "host" : "participant";
+        const requestedHolderId = isHostFloor ? "" : participantId;
+        const matchesAuthoritativeFloor = requestLiveSessionId === authoritativeLiveCallSessionId
+          && floorRevision === authoritativeLiveCallFloorRevision
+          && requestedMode === authoritativeLiveCallFloorMode
+          && requestedHolderId === authoritativeLiveCallFloorHolderId;
+        if (!matchesAuthoritativeFloor) {
+          client.send(JSON.stringify({
+            type: "subtitle:error",
+            code: "LIVE_CALL_FLOOR_AUTHORITY_MISMATCH",
+            message: "확인되지 않은 Live Call 발언권 상태는 적용할 수 없습니다.",
+          }));
+          return;
+        }
+        client.send(JSON.stringify({
+          type: "subtitle:live-call-floor-applied",
+          sessionId: subtitleSessionId,
+          liveSessionId: liveCallCaptionSessionId,
+          floorRevision,
+          mode: authoritativeLiveCallFloorMode,
+        }));
+      }
+
       if (message.type === "subtitle:audio") {
+        if (client !== subtitleSessionProducer
+          || message.sessionId !== subtitleSessionId
+          || !isSubtitleLocalProviderActive) return;
+        const normalizedAudio = client === liveCallCaptionProducer
+          && liveCallCaptionProducerKind === "hybrid"
+          ? validateSubtitleAudioFrame({
+            client,
+            source: message.source,
+            audio: message.audio,
+            budgets: subtitleAudioBudgets,
+          })
+          : { source: message.source, audio: message.audio };
+        if (!normalizedAudio) return;
         subtitles.sendAudio({
           sessionId: message.sessionId,
-          source: message.source,
-          audio: message.audio,
+          source: normalizedAudio.source,
+          audio: normalizedAudio.audio,
         });
         // Archive the raw session audio (24 kHz PCM16) alongside the
         // transcript so Records can replay what was actually said.
-        void sessionTranscripts?.appendAudioChunk(message.source, message.audio);
+        void sessionTranscripts?.appendAudioChunk(normalizedAudio.source, normalizedAudio.audio);
       }
 
       if (message.type === "subtitle:producer-stop") {
         if (typeof message.sessionId !== "string" || message.sessionId.length === 0) return;
-        await subtitles.stop(message.sessionId);
+        if (client !== subtitleSessionProducer || message.sessionId !== subtitleSessionId) {
+          client.send(JSON.stringify({
+            type: "subtitle:error",
+            requestId: typeof message.requestId === "string" ? message.requestId : "",
+            code: "SUBTITLE_PRODUCER_MISMATCH",
+            message: "활성 자막 세션이 아닙니다.",
+          }));
+          return;
+        }
+        if (isSubtitleLocalProviderActive) {
+          const stopError = await stopSubtitleProviderSafely(message.sessionId, "producer_stop");
+          isSubtitleLocalProviderActive = false;
+          if (stopError) {
+            client.send(JSON.stringify({
+              type: "subtitle:error",
+              code: "SUBTITLE_PROVIDER_STOP_FAILED",
+              message: "로컬 자막 엔진을 종료하지 못했습니다.",
+            }));
+            return;
+          }
+        }
         client.send(JSON.stringify({
           type: "subtitle:producer-stopped",
           requestId: typeof message.requestId === "string" ? message.requestId : "",
@@ -677,8 +1305,16 @@ export async function startServer(options) {
       }
 
       if (message.type === "subtitle:input-status") {
+        if (client !== subtitleSessionProducer
+          || message.sessionId !== subtitleSessionId
+          || !isSubtitleLocalProviderActive) return;
         // Feed the stall watchdog: speech signal present → subtitles expected.
-        if (message.status === "signal") subtitles.noteInputSignal({ sessionId: message.sessionId });
+        if (message.status === "signal") {
+          subtitles.noteInputSignal({
+            sessionId: message.sessionId,
+            source: message.source === "mic" ? "mic" : "system",
+          });
+        }
         broadcast(wss, {
           type: "subtitle:input-status",
           source: message.source === "mic" ? "mic" : "system",
@@ -688,6 +1324,7 @@ export async function startServer(options) {
       }
 
       if (message.type === "subtitle:control") {
+        if (!hasTrustedBrowserOrigin) return;
         const command = typeof message.command === "string" ? message.command : "";
         if (!["stop", "restart", "font", "offset", "position", "languages", "opacity"].includes(command)) return;
         // Server-side recovery: rebuild the translation channels directly so a
@@ -708,16 +1345,64 @@ export async function startServer(options) {
 
       if (message.type === "subtitle:stop") {
         if (typeof message.sessionId !== "string" || message.sessionId.length === 0) return;
-        await subtitles.stop(message.sessionId);
+        if (client !== subtitleSessionProducer || message.sessionId !== subtitleSessionId) {
+          client.send(JSON.stringify({
+            type: "subtitle:error",
+            code: "SUBTITLE_SESSION_MISMATCH",
+            message: "활성 자막 세션이 아닙니다.",
+          }));
+          return;
+        }
+        const shouldBroadcastTerminalIdle = client === liveCallCaptionProducer
+          || !isSubtitleLocalProviderActive;
+        let providerStopError = null;
+        if (isSubtitleLocalProviderActive) {
+          providerStopError = await stopSubtitleProviderSafely(message.sessionId, "session_stop");
+          isSubtitleLocalProviderActive = false;
+        }
+        // Gateway-caption sessions deliberately keep the local realtime manager
+        // cold, so its stop() has no active state from which to emit idle. The
+        // accepted session stop still owns the terminal display boundary.
+        if (shouldBroadcastTerminalIdle) {
+          broadcastSubtitleMessage({
+            type: "subtitle:status",
+            status: "idle",
+            ...(client === liveCallCaptionProducer ? { source: "live-call" } : {}),
+          });
+        }
         for (const sourceLine of pendingLiveCallSources.values()) void queueTranscriptLine(sourceLine);
+        for (const sourceLine of pendingUnkeyedLiveCallSources) void queueTranscriptLine(sourceLine);
         pendingLiveCallSources.clear();
+        pendingUnkeyedLiveCallSources.length = 0;
         recentlyRecordedLiveCallSources.clear();
+        if (client === liveCallCaptionProducer) {
+          cancelLiveCallSilenceClears();
+          subtitleHub.clearLiveCallSession(liveCallCaptionSessionId);
+          liveCallCaptionProducer = null;
+          liveCallCaptionSessionId = "";
+          liveCallCaptionProducerKind = null;
+        }
+        subtitleSessionProducer = null;
+        subtitleSessionId = "";
         await transcriptRecordTail;
         // Close the transcript session and, when a provider key exists,
         // generate the AI summary automatically. Best-effort: a summary
         // failure never blocks or breaks the stop.
         const ended = await sessionTranscripts?.end();
         broadcast(wss, { type: "subtitle:sessions", sessions: await (sessionTranscripts?.list() ?? []) });
+        if (providerStopError) {
+          client.send(JSON.stringify({
+            type: "subtitle:error",
+            code: "SUBTITLE_PROVIDER_STOP_FAILED",
+            message: "로컬 자막 엔진 종료를 확인하지 못했습니다.",
+          }));
+        } else {
+          client.send(JSON.stringify({
+            type: "subtitle:stopped",
+            sessionId: message.sessionId,
+            requestId: typeof message.requestId === "string" ? message.requestId.slice(0, 128) : "",
+          }));
+        }
         if (ended && ended.lineCount > 0) {
           summarizeSessionTranscript(ended.id).catch((error) => {
             (options.log ?? console).warn?.(`[session-transcripts] auto summary skipped: ${error?.message ?? error}`);
@@ -738,8 +1423,10 @@ export async function startServer(options) {
   const port = typeof address === "object" && address ? address.port : options.port;
   return {
     app,
+    applyLiveCallFloorSnapshot,
     httpServer,
     state,
+    hasActiveSubtitleSession: () => Boolean(subtitleSessionId || liveCallCaptionSessionId || isSubtitleLocalProviderActive || subtitles._state?.active),
     url: `http://${options.host}:${port}`,
   };
 }
@@ -756,21 +1443,65 @@ export function createSafeSettingsExport(settings) {
   return { subtitle };
 }
 
+class SafeHttpError extends Error {
+  constructor(status, code, safeMessage) {
+    super(safeMessage);
+    this.name = "SafeHttpError";
+    this.status = status;
+    this.code = code;
+    this.safeMessage = safeMessage;
+  }
+}
+
+function createSafeHttpError(status, code, safeMessage) {
+  return new SafeHttpError(status, code, safeMessage);
+}
+
+function safeHttpErrorResponse(error) {
+  if (isSafeHttpError(error)
+    && error.status >= 400
+    && error.status <= 599) {
+    return { status: error.status, code: error.code, error: error.safeMessage };
+  }
+  return {
+    status: 422,
+    code: "TRANSCRIPT_SUMMARY_FAILED",
+    error: "AI 요약을 생성하지 못했습니다. 잠시 후 다시 시도해 주세요.",
+  };
+}
+
+function isSafeHttpError(error) {
+  return error instanceof SafeHttpError
+    && Number.isInteger(error.status)
+    && typeof error.code === "string"
+    && /^[A-Z0-9_]+$/u.test(error.code)
+    && typeof error.safeMessage === "string"
+    && error.safeMessage.trim().length > 0;
+}
+
 function isMutatingMethod(method) {
   return ["POST", "PUT", "PATCH", "DELETE"].includes(method);
 }
 
-function isAllowedLocalOrigin(origin, host) {
-  if (!origin) return true;
+function isAllowedLocalOrigin(origin, host, { allowMissingOrigin = true } = {}) {
+  if (!origin) return allowMissingOrigin;
+  if (!host) return false;
   try {
-    const originUrl = new URL(origin);
-    return originUrl.origin === `http://${host}` || originUrl.origin === `https://${host}`;
+    const rawOrigin = String(origin).trim();
+    const originUrl = new URL(rawOrigin);
+    const hostUrl = new URL(`http://${host}`);
+    const loopbackHosts = new Set(["127.0.0.1", "localhost", "[::1]"]);
+    return rawOrigin === originUrl.origin
+      && loopbackHosts.has(originUrl.hostname)
+      && loopbackHosts.has(hostUrl.hostname)
+      && originUrl.host === hostUrl.host
+      && (originUrl.protocol === "http:" || originUrl.protocol === "https:");
   } catch {
     return false;
   }
 }
 
-function validateOpenAIRealtimeTranslationKey({ apiKey, createWebSocket }) {
+function validateOpenAIRealtimeTranscriptionKey({ apiKey, model, createWebSocket }) {
   return new Promise((resolve, reject) => {
     let settled = false;
     const settle = (error, socket) => {
@@ -784,7 +1515,7 @@ function validateOpenAIRealtimeTranslationKey({ apiKey, createWebSocket }) {
     const timer = setTimeout(() => settle(new Error("OpenAI Realtime validation timed out."), socket), 8000);
     let socket;
     try {
-      socket = createWebSocket(OPENAI_REALTIME_TRANSLATION_VALIDATE_URL, undefined, {
+      socket = createWebSocket(OPENAI_REALTIME_TRANSCRIPTION_VALIDATE_URL, undefined, {
         headers: {
           Authorization: `Bearer ${apiKey}`,
           "OpenAI-Safety-Identifier": "realtime-noel-key-validation",
@@ -799,12 +1530,12 @@ function validateOpenAIRealtimeTranslationKey({ apiKey, createWebSocket }) {
       socket.send(JSON.stringify({
         type: "session.update",
         session: {
+          type: "transcription",
           audio: {
             input: {
-              transcription: { model: "gpt-realtime-whisper" },
-              noise_reduction: { type: "near_field" },
+              format: { type: "audio/pcm", rate: 24_000 },
+              transcription: { model },
             },
-            output: { language: "ko" },
           },
         },
       }));
@@ -817,7 +1548,10 @@ function validateOpenAIRealtimeTranslationKey({ apiKey, createWebSocket }) {
         settle(new Error("Invalid OpenAI Realtime validation response."), socket);
         return;
       }
-      if (message.type === "session.updated" || message.type === "session.created") {
+      if (
+        message.type === "transcription_session.updated"
+        || message.type === "session.updated"
+      ) {
         settle(null, socket);
       }
       if (message.type === "error") {
@@ -853,19 +1587,18 @@ export function selectSubtitlePolishOptions({ args = {}, saved = {}, env = proce
   const shouldRecoverPlaceholder = isEllipsisPlaceholder(args.translatedText)
     && String(args.sourceText ?? "").trim().length >= 2;
   if (args.tone !== "business" && !hasGlossaryOrDomain && !shouldRecoverPlaceholder) return null;
-  const provider = args.polishProvider === "gemini" || saved.subtitle?.translationProvider === "gemini" ? "gemini" : "openai";
-
-  const secondaryKey = provider === "gemini"
-    ? (saved.apiKeys?.geminiSecondary || env.GEMINI_SECONDARY_API_KEY || saved.apiKeys?.gemini || env.GEMINI_API_KEY || "").trim()
-    : (saved.apiKeys?.openaiSecondary || env.OPENAI_SECONDARY_API_KEY || "").trim();
+  const provider = "gemini";
+  const secondaryKey = (saved.apiKeys?.geminiSecondary
+    || env.GEMINI_SECONDARY_API_KEY
+    || saved.apiKeys?.gemini
+    || env.GEMINI_API_KEY
+    || "").trim();
   if (!secondaryKey) return null;
 
   return {
     provider,
     apiKey: secondaryKey,
-    modelId: provider === "gemini"
-      ? (saved.subtitle?.geminiPolishModel || "gemini-3.5-flash")
-      : (saved.subtitle?.tonePolishModel || "gpt-5.5"),
+    modelId: DEFAULT_SUBTITLE_SETTINGS.geminiPolishModel,
   };
 }
 

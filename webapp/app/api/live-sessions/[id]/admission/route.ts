@@ -6,6 +6,7 @@ import { LiveSessionError, toLiveFailure } from "@/lib/live/errors";
 import { isLiveCallEnabled } from "@/lib/live/feature-flag";
 import { parseSessionId } from "@/lib/live/validation";
 import { apiError, apiSuccess } from "@/lib/security/api-response";
+import { BoundedJsonBodyError, readBoundedJsonBody } from "@/lib/security/bounded-json-body";
 import { LIVE_ADMISSION_PEPPER } from "@/lib/security/config";
 import { hmacHex } from "@/lib/security/hmac";
 import {
@@ -21,7 +22,7 @@ export async function POST(request: NextRequest, context: { params: Promise<{ id
     const { hostId } = await requireHost(request);
     const { id } = await context.params;
     const sessionId = parseSessionId(id);
-    const parsed = admissionActionInputSchema.safeParse(await request.json().catch(() => null));
+    const parsed = admissionActionInputSchema.safeParse(await readBoundedJsonBody(request));
     if (!parsed.success) {
       return apiError("입장창 요청이 올바르지 않습니다.", "INVALID_REQUEST", 400);
     }
@@ -51,6 +52,7 @@ export async function POST(request: NextRequest, context: { params: Promise<{ id
     });
     return apiSuccess({ sessionId, code, admissionOpenUntil: openUntil, version: nextVersion });
   } catch (error: unknown) {
+    if (error instanceof BoundedJsonBodyError) return apiError(error.message, error.code, error.status);
     if (error instanceof LiveAdmissionError) return apiError(error.message, error.code, error.status);
     if (error instanceof AuthenticationError) {
       return apiError(error.message, "HOST_AUTH_REQUIRED", 401);

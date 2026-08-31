@@ -1,0 +1,187 @@
+@font-face {
+  font-family: "Pretendard";
+  src: local("Pretendard Regular"), local("Pretendard");
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "Pretendard";
+  src: local("Pretendard Medium"), local("Pretendard");
+  font-style: normal;
+  font-weight: 500;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "Pretendard";
+  src: local("Pretendard SemiBold"), local("Pretendard");
+  font-style: normal;
+  font-weight: 600;
+  font-display: swap;
+}
+
+:root {
+  --nova-black-1000: #000000;
+  --nova-grey-950: #0a0a0b;
+  --nova-grey-900: #15151a;
+  --nova-grey-850: #1f1f27;
+  --nova-grey-800: #2f2f3a;
+  --nova-grey-500: #6b7684;
+  --nova-grey-400: #8b95a1;
+  --nova-grey-100: #dddddd;
+  --nova-white-0: #ffffff;
+  --nova-indigo-600: #5355db;
+  --nova-indigo-500: #6566f7;
+  --nova-indigo-400: #7576ff;
+  --nova-indigo-100: #c9c9fc;
+  --nova-blue-500: #3182f6;
+  --nova-red-500: #f04452;
+  --nova-green-500: #03b26c;
+  --nova-yellow-500: #ffc342;
+
+  --nova-surface-recessed: var(--nova-black-1000);
+  --nova-surface-base: var(--nova-grey-950);
+  --nova-surface-layered: var(--nova-grey-900);
+  --nova-surface-float: var(--nova-grey-850);
+  --nova-surface-hairline: var(--nova-grey-800);
+  --nova-fg-intense: var(--nova-white-0);
+  --nova-fg-primary: var(--nova-grey-100);
+  --nova-fg-secondary: var(--nova-grey-400);
+  --nova-fg-tertiary: var(--nova-grey-500);
+  --nova-fg-disabled: var(--nova-grey-800);
+  --nova-brand-default: var(--nova-indigo-500);
+  --nova-brand-hover: var(--nova-indigo-400);
+  --nova-brand-pressed: var(--nova-indigo-600);
+  --nova-brand-subtle: rgba(101, 102, 247, 0.16);
+  --nova-brand-fg: var(--nova-indigo-100);
+  --nova-system-default: var(--nova-blue-500);
+  --nova-system-subtle: rgba(49, 130, 246, 0.16);
+  --nova-status-live: var(--nova-red-500);
+  --nova-status-ok: var(--nova-green-500);
+  --nova-status-warn: var(--nova-yellow-500);
+  --nova-status-error: var(--nova-red-500);
+  --nova-hover: rgba(255, 255, 255, 0.04);
+  --nova-press: rgba(255, 255, 255, 0.08);
+  --nova-shadow-tiny: 0 1px 3px rgba(0, 0, 0, 0.4);
+  --nova-ease-out: cubic-bezier(0.25, 0.1, 0.25, 1);
+  --nova-spring-rapid: 200ms;
+  --nova-spring-quick: 350ms;
+  --nova-font: "Pretendard", -apple-system, BlinkMacSystemFont, "Apple SD Gothic Neo", "Malgun Gothic", sans-serif;
+  --nova-font-size-t3: 22px;
+  --nova-line-height-t3: 31px;
+  --nova-font-size-t4: 20px;
+  --nova-line-height-t4: 29px;
+  --nova-font-size-t5: 17px;
+  --nova-line-height-t5: 25.5px;
+  --nova-font-size-t6: 15px;
+  --nova-line-height-t6: 22.5px;
+  --nova-font-size-t7: 13px;
+  --nova-line-height-t7: 19.5px;
+  --nova-font-size-st13: 11px;
+  --nova-line-height-st13: 16.5px;
+  --nova-radius-xs: 4px;
+  --nova-radius-sm: 8px;
+  --nova-radius-md: 12px;
+  --nova-radius-lg: 16px;
+  --nova-radius-pill: 999px;
+}
+
+* { box-sizing: border-box; }
+html, body { width: 100%; height: 100%; }
+
+body {
+  margin: 0;
+  background: var(--nova-surface-base);
+  color: var(--nova-fg-primary);
+  font-family: var(--nova-font);
+  font-size: var(--nova-font-size-t6);
+  line-height: var(--nova-line-height-t6);
+  letter-spacing: -0.02em;
+  word-break: keep-all;
+}
+
+button, select, input { font: inherit; }
+
+:where(button, select, .nova-button, .nova-field select) {
+  min-height: 44px;
+  border: 2px solid transparent;
+  color: inherit;
+}
+
+:where(button, .nova-button) { cursor: pointer; }
+:where(button, .nova-button):disabled { cursor: default; opacity: 0.3; }
+:where(button, .nova-button):focus:not(:focus-visible) { outline: none; }
+
+:focus-visible {
+  outline: 2px solid var(--nova-system-default);
+  outline-offset: 2px;
+}
+
+.nova-button {
+  border-radius: var(--nova-radius-sm);
+  padding: 2px 16px;
+  background: var(--nova-brand-subtle);
+  color: var(--nova-brand-fg);
+  font-weight: 600;
+  white-space: nowrap;
+  transition: color 0.1s ease-in-out, background-color 0.1s ease-in-out,
+    transform var(--nova-spring-rapid) var(--nova-ease-out);
+}
+
+.nova-button[data-variant="fill"] { min-height: 48px; border-radius: var(--nova-radius-sm); background: var(--nova-brand-default); color: var(--nova-fg-intense); }
+.nova-button:hover { background: var(--nova-hover); }
+.nova-button[data-variant="fill"]:hover { background: var(--nova-brand-hover); }
+.nova-button:active { transform: scale(0.96); }
+.nova-button[data-variant="fill"]:active { background: var(--nova-brand-pressed); }
+
+.nova-field { display: grid; gap: 4px; color: var(--nova-fg-secondary); font-size: var(--nova-font-size-t7); line-height: var(--nova-line-height-t7); }
+.nova-field select { width: 100%; padding: 0 36px 0 12px; border-color: var(--nova-surface-hairline); border-radius: var(--nova-radius-sm); background: var(--nova-surface-float); color: var(--nova-fg-primary); }
+
+.nova-status-chip { display: inline-flex; height: 24px; align-items: center; gap: 6px; padding: 0 10px; border-radius: var(--nova-radius-pill); background: var(--nova-surface-float); color: var(--nova-fg-secondary); font-size: var(--nova-font-size-st13); line-height: var(--nova-line-height-st13); }
+
+.nova-segmented { display: grid; min-height: 52px; padding: 4px; border-radius: var(--nova-radius-pill); background: var(--nova-surface-float); }
+.nova-segmented > button { min-height: 44px; }
+.nova-segmented > [aria-selected="true"] { background: var(--nova-surface-layered); color: var(--nova-fg-intense); font-weight: 600; }
+
+.nova-sr-only { position: absolute; width: 1px; height: 1px; margin: -1px; clip: rect(0 0 0 0); overflow: hidden; }
+
+.nova-transcript-list {
+  display: flex;
+  flex-direction: column;
+  gap: 22px;
+  min-width: 0;
+}
+
+.nova-transcript-row {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.nova-transcript-row__metadata {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  color: var(--nova-fg-tertiary);
+  font-size: var(--nova-font-size-t7);
+  font-variant-numeric: tabular-nums;
+  line-height: var(--nova-line-height-t7);
+}
+
+.nova-transcript-row__avatar,
+.nova-transcript-row__type,
+.nova-transcript-row__status {
+  display: none;
+}
+
+.nova-transcript-row__source,
+.nova-transcript-row__translation {
+  margin: 0;
+  white-space: pre-wrap;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { scroll-behavior: auto !important; transition-duration: 0.01ms !important; animation-duration: 0.01ms !important; }
+}

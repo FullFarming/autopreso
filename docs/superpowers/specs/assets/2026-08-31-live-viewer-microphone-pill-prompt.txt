@@ -1,0 +1,16 @@
+Built-in Image Gen — initial edit prompt
+
+Use case: precise-object-edit.
+Asset type: high-fidelity Korean NOVA live-call UI mockup.
+Input image 1 is the EXACT EDIT TARGET, not inspiration. Preserve this selected design and all content.
+Target: same 1485x1059 canvas and aspect ratio, two existing panels (left live, right ended). Current date August 31 2026, preserve source dates/content.
+Change ONLY the microphone control near bottom of LEFT panel:
+1. Completely remove the visible Korean label "발언하기" below the microphone. No text inside or below the new microphone button.
+2. Replace the small circular blue microphone button with a wide horizontal blue capsule/pill button, EXACTLY as wide as the "요약·원문 받기" button in the RIGHT panel. The right CTA spans ~640 px. New left button should span x57 to x697 (same content margins as left divider) and sit at y912 to y967, aligned with the right CTA. Use height approximately 56 px; fully rounded semicircular ends (radius half height; design token pill radius 980px), not slightly rounded rectangular corners and not a whole ellipse.
+3. Keep the white microphone outline icon, centered exactly both vertically and horizontally in the pill. It must be the ONLY content inside. Solid existing action blue, no new gradient, no shadow. Existing dark background fills the removed label area.
+Invariants: RIGHT panel entirely unchanged, including its button text, button shape, width, tabs, summary and 6-hour access text. LEFT header, title, transcript, gray in-progress sentence, white completed sentences, language tabs, timestamps and "번역 중" unchanged. No new icons, labels, avatars, cards, ornament, or helper text. Do not add live summary button. Do not crop or re-layout. This is a tiny focused revision to an approved mockup. Keep Korean typography sharp.
+
+Final correction prompt
+
+Precise localized UI image edit. Use attached image as exact edit target. Preserve same 1485 x 1059 canvas/aspect and ALL text and panels. Change ONLY bottom-left blue capsule microphone button geometry: its left edge stays aligned at x56 with left content, but extend its RIGHT edge to x696, directly aligned with the far right end of the LEFT panel horizontal dividers. This makes its total width 640 pixels, exactly matching right panel blue "요약·원문 받기" button. Current left button is about22px too short and this MUST be fixed. Left and right inset inside the left panel must be equal. Keep capsule height about72px, rounded semicircular ends radius36, same blue. Recenter the white microphone at x376 in new width, only icon no text. No "발언하기" anywhere. Preserve right panel entirely unchanged, every paragraph, gray drafting and white finalized text, all spacing and existing Korean typography. Do NOT alter right CTA radius. No other additions or changes. Current date Aug31 2026; keep source dates.
+

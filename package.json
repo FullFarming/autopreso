@@ -1,6 +1,6 @@
 {
   "name": "realtime-noel",
-  "version": "0.2.1",
+  "version": "0.2.3",
   "description": "Realtime bilingual subtitles and visual note taking.",
   "license": "MIT",
   "author": "Kun Chen <kun@kunchenguid.com>",
@@ -24,6 +24,8 @@
     "assets/",
     "electron/",
     "LICENSE",
+    "packages/caption-core/",
+    "packages/gemini-server/",
     "public/",
     "src/"
   ],
@@ -36,7 +38,9 @@
     "dist:win": "electron-builder --win portable --x64 --publish never",
     "prepare:release-packages": "node ./scripts/prepare-release-packages.js",
     "start": "node ./src/cli.js",
-    "test": "node --test \"test/**/*.test.js\"",
+    "cloud-run:configure-scale-zero": "bash ./scripts/configure-cloud-run-scale-zero.sh",
+    "cloud-run:verify-scale-zero": "node ./scripts/verify-cloud-run-scale-zero.mjs",
+    "test": "node --test \"test/**/*.test.js\" \"packages/gemini-server/*.test.js\"",
     "test:all": "npm test && npm --prefix media-gateway test && npm --prefix webapp test",
     "typecheck": "tsc --noEmit"
   },
@@ -47,12 +51,20 @@
     "files": [
       "assets/**",
       "electron/**",
+      "packages/caption-core/**",
+      "packages/moonshine-darwin-arm64/**",
+      "packages/moonshine-darwin-x64/package.json",
+      "packages/moonshine-darwin-x64/LICENSE",
       "public/**",
       "src/**",
       "package.json"
     ],
+    "asarUnpack": [
+      "packages/moonshine-darwin-*/bin/**"
+    ],
     "mac": {
       "category": "public.app-category.productivity",
+      "identity": "-",
       "hardenedRuntime": true,
       "entitlements": "build/entitlements.mac.plist",
       "entitlementsInherit": "build/entitlements.mac.plist",

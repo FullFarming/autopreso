@@ -37,35 +37,36 @@ test("createSettingsStore returns defaults when file is missing and env is empty
   assert.equal(settings.subtitle.translateAllLanguages, false);
   assert.deepEqual(settings.subtitle.translationLanguages, ["en", "ko"]);
   assert.equal(settings.subtitle.outputMode, "captions");
-  assert.equal(settings.subtitle.audioLanguage, "en");
-  assert.equal(settings.subtitle.audioVolume, 0.8);
+  assert.equal(settings.subtitle.geminiTranscribeModel, "gemini-3.5-transcribe-live");
+  for (const retiredKey of ["audioLanguage", "audioVolume", "voiceProvider", "model", "geminiModel"]) {
+    assert.equal(Object.hasOwn(settings.subtitle, retiredKey), false);
+  }
   assert.equal(settings.subtitle.recordProvider, "ollama");
   assert.equal(settings.subtitle.ollamaModel, "gemma3n:e2b");
   assert.equal(settings.subtitle.tone, "natural");
-  assert.equal(settings.apiKeys.openaiSecondary, "");
+  assert.equal(Object.hasOwn(settings.apiKeys, "openaiSecondary"), false);
   // The second Gemini project key is a first-class slot (parallel 3-language
   // translation), so it defaults to an empty string rather than being absent.
   assert.equal(settings.apiKeys.geminiSecondary, "");
-  assert.equal(settings.subtitle.geminiPolishModel, "gemini-3.5-flash");
+  assert.equal(settings.subtitle.geminiPolishModel, "gemini-3.7-flash");
 });
 
-test("createSettingsStore persists and validates interpreted audio settings", async () => {
+test("createSettingsStore normalizes retired interpreted audio settings to captions", async () => {
   const filePath = await tempPath();
-  const store = createSettingsStore({ filePath, env: {}, readCodexAuth: noCodexAuth });
-  await store.load();
-  await store.save({
+  await fs.writeFile(filePath, JSON.stringify({
     subtitle: {
       translationLanguages: ["en", "ko", "ja"],
       outputMode: "audio",
       audioLanguage: "ja",
       audioVolume: 0.35,
     },
-  });
+  }));
+  const store = createSettingsStore({ filePath, env: {}, readCodexAuth: noCodexAuth });
 
   const saved = await store.load();
-  assert.equal(saved.subtitle.outputMode, "audio");
-  assert.equal(saved.subtitle.audioLanguage, "ja");
-  assert.equal(saved.subtitle.audioVolume, 0.35);
+  assert.equal(saved.subtitle.outputMode, "captions");
+  assert.equal(Object.hasOwn(saved.subtitle, "audioLanguage"), false);
+  assert.equal(Object.hasOwn(saved.subtitle, "audioVolume"), false);
 
   await assert.rejects(
     () => store.save({ subtitle: { outputMode: "video" } }),
@@ -74,14 +75,6 @@ test("createSettingsStore persists and validates interpreted audio settings", as
   await assert.rejects(
     () => store.save({ subtitle: { audioVolume: 1.01 } }),
     /audioVolume/,
-  );
-  await assert.rejects(
-    () => store.save({ subtitle: { audioLanguage: "zh" } }),
-    /audioLanguage/,
-  );
-  await assert.rejects(
-    () => store.save({ subtitle: { translationLanguages: ["en", "ko"] } }),
-    /audioLanguage/,
   );
 });
 
@@ -173,7 +166,7 @@ test("createSettingsStore persists and validates the vertical offset and domain"
   const store = createSettingsStore({ filePath, env: {}, readCodexAuth: noCodexAuth });
   const settings = await store.load();
   assert.equal(settings.subtitle.verticalOffset, 48);
-  assert.equal(settings.subtitle.translationDomain, "");
+  assert.equal(settings.subtitle.translationDomain, DEFAULT_SUBTITLE_SETTINGS.translationDomain);
 
   await store.save({ subtitle: { verticalOffset: 120, translationDomain: "Commercial real estate hospitality" } });
   const reloaded = createSettingsStore({ filePath, env: {}, readCodexAuth: noCodexAuth });
@@ -195,17 +188,15 @@ test("createSettingsStore persists and validates the subtitle glossary", async (
   const filePath = await tempPath();
   const store = createSettingsStore({ filePath, env: {}, readCodexAuth: noCodexAuth });
   const settings = await store.load();
-  assert.equal(settings.subtitle.glossary, "");
+  assert.equal(settings.subtitle.glossary, DEFAULT_SUBTITLE_SETTINGS.glossary);
 
   await store.save({ subtitle: { glossary: "MRG -> keep verbatim\n운영사 -> operator" } });
   const reloaded = createSettingsStore({ filePath, env: {}, readCodexAuth: noCodexAuth });
   assert.match((await reloaded.load()).subtitle.glossary, /operator/);
 
-  // A serious interpreting termbase (domain + idioms + economics + proper nouns)
-  // runs well past 20k chars — the shipped hotel preset alone is 27.5k. The cap
-  // exists only to keep the polish prompt sane, so it is derived from the
-  // exported constant rather than hardcoded, and pinned against the presets in
-  // test/glossary-presets.test.js.
+  // The realtime prompt cap is shared with synchronized custom presets. Shipped
+  // presets are compacted at complete section boundaries and pinned against the
+  // same exported constant in test/glossary-presets.test.js.
   await store.save({ subtitle: { glossary: "y".repeat(MAX_SUBTITLE_GLOSSARY_CHARS) } });
   await assert.rejects(
     () => store.save({ subtitle: { glossary: "x".repeat(MAX_SUBTITLE_GLOSSARY_CHARS + 1) } }),
@@ -213,28 +204,94 @@ test("createSettingsStore persists and validates the subtitle glossary", async (
   );
 });
 
-test("createSettingsStore fixes captions to Gemini and persists a separate voice provider", async () => {
+test("createSettingsStore keeps legacy 19k glossary and 701-char domain valid for Live Call", async () => {
   const filePath = await tempPath();
   const store = createSettingsStore({ filePath, env: {}, readCodexAuth: noCodexAuth });
+  const glossary = "x".repeat(19_719);
+
+  await store.load();
+  await store.save({ subtitle: { glossary, translationDomain: "d".repeat(701) } });
+
+  assert.equal((await store.load()).subtitle.glossary.length, 19_719);
+  assert.equal((await store.load()).subtitle.translationDomain.length, 701);
+});
+
+test("createSettingsStore retains a synchronized custom preset snapshot for offline reuse", async () => {
+  const filePath = await tempPath();
+  const store = createSettingsStore({ filePath, env: {}, readCodexAuth: noCodexAuth });
+  await store.load();
+  await store.save({ subtitle: {
+    glossaryPresetId: "0192d0f4-9f72-7a36-91f5-6a76ef736f41",
+    glossaryPresetName: "Board terms",
+    glossary: "수임 = mandate",
+    translationDomain: "CRE board meeting",
+  } });
+
+  const reopened = createSettingsStore({ filePath, env: {}, readCodexAuth: noCodexAuth });
+  const saved = await reopened.load();
+  assert.equal(saved.subtitle.glossaryPresetId, "0192d0f4-9f72-7a36-91f5-6a76ef736f41");
+  assert.equal(saved.subtitle.glossaryPresetName, "Board terms");
+  assert.equal(saved.subtitle.glossary, "수임 = mandate");
+  assert.equal(saved.subtitle.translationDomain, "CRE board meeting");
+
+  await store.save({ subtitle: {
+    glossaryPresetId: "",
+    glossaryPresetName: "",
+    glossary: "수동 = manual",
+  } });
+  assert.equal((await store.load()).subtitle.glossaryPresetId, "");
+  assert.equal((await store.load()).subtitle.glossaryPresetName, "");
+});
+
+test("createSettingsStore persists the exact plural glossary pin contract and rejects unsafe selections", async () => {
+  const filePath = await tempPath();
+  const store = createSettingsStore({ filePath, env: {}, readCodexAuth: noCodexAuth });
+  await store.load();
+  const glossaries = [
+    { sourceKind: "builtin", sourceId: "common_business" },
+    { sourceKind: "host", sourceId: "0192d0f4-9f72-7a36-91f5-6a76ef736f41", documentVersion: 2 },
+  ];
+  assert.deepEqual((await store.save({ subtitle: { glossaries } })).subtitle.glossaries, glossaries);
+  await assert.rejects(() => store.save({ subtitle: { glossaries: [] } }), /between 1 and 5/u);
+  await assert.rejects(() => store.save({ subtitle: { glossaries: Array.from({ length: 6 }, () => ({ sourceKind: "builtin", sourceId: "common_business" })) } }), /between 1 and 5/u);
+  await assert.rejects(() => store.save({ subtitle: { glossaries: [{ sourceKind: "builtin", sourceId: "unknown" }] } }), /valid glossary selections/u);
+});
+
+test("createSettingsStore migrates Live Translate and voice settings to caption-only Transcribe", async () => {
+  const filePath = await tempPath();
+  await fs.writeFile(filePath, JSON.stringify({
+    subtitle: { translationProvider: "openai", voiceProvider: "openai" },
+  }));
+  const store = createSettingsStore({ filePath, env: {}, readCodexAuth: noCodexAuth });
   const settings = await store.load();
-  // Gemini is the default translation engine.
   assert.equal(settings.subtitle.translationProvider, "gemini");
-  assert.equal(settings.subtitle.geminiModel, "gemini-3.5-live-translate-preview");
+  assert.equal(settings.subtitle.geminiTranscribeModel, "gemini-3.5-transcribe-live");
+  assert.equal(Object.hasOwn(settings.subtitle, "geminiModel"), false);
+  assert.equal(Object.hasOwn(settings.subtitle, "voiceProvider"), false);
+  await assert.rejects(() => store.save({ subtitle: { voiceProvider: "gemini" } }), /retired/u);
+  assert.equal(settings.subtitle.geminiPolishModel, "gemini-3.7-flash");
 
-  assert.equal(settings.subtitle.voiceProvider, "gemini");
-  await store.save({ subtitle: { voiceProvider: "openai" } });
-  assert.equal((await store.load()).subtitle.voiceProvider, "openai");
-  assert.equal(settings.subtitle.geminiPolishModel, "gemini-3.5-flash");
+  await assert.rejects(() => store.save({ subtitle: { translationProvider: "openai" } }), /translationProvider/u);
 
-  await store.save({ subtitle: { voiceProvider: "gemini" } });
-  const reloaded = createSettingsStore({ filePath, env: {}, readCodexAuth: noCodexAuth });
-  assert.equal((await reloaded.load()).subtitle.voiceProvider, "gemini");
+  await assert.rejects(() => store.save({ subtitle: { translationProvider: "claude" } }), /translationProvider/u);
+});
 
-  await assert.rejects(
-    () => store.save({ subtitle: { voiceProvider: "claude" } }),
-    /voiceProvider must be gemini or openai/,
-  );
-  await assert.rejects(() => store.save({ subtitle: { translationProvider: "openai" } }), /translationProvider must remain gemini/);
+test("createSettingsStore migrates released polish and Live Translate defaults", async () => {
+  for (const geminiPolishModel of ["gemini-3.5-flash", "gemini-3.6-flash"]) {
+    const filePath = await tempPath();
+    await fs.writeFile(filePath, JSON.stringify({
+      subtitle: {
+        geminiModel: "gemini-3.5-live-translate-preview",
+        geminiPolishModel,
+      },
+    }));
+
+    const store = createSettingsStore({ filePath, env: {}, readCodexAuth: noCodexAuth });
+    const settings = await store.load();
+    assert.equal(settings.subtitle.geminiTranscribeModel, "gemini-3.5-transcribe-live");
+    assert.equal(Object.hasOwn(settings.subtitle, "geminiModel"), false);
+    assert.equal(settings.subtitle.geminiPolishModel, "gemini-3.7-flash");
+  }
 });
 
 test("getSanitized strips the gemini key but reports registration status", async () => {
@@ -254,17 +311,30 @@ test("getSanitized strips the gemini key but reports registration status", async
   assert.equal((await store.load()).apiKeys.geminiSecondary, "AIza-test-key-2");
 });
 
-test("getSanitized strips the secondary OpenAI key but reports registration status", async () => {
+test("getSanitized exposes only the primary OpenAI key registration status", async () => {
   const store = createSettingsStore({ filePath: await tempPath(), env: {}, readCodexAuth: noCodexAuth });
   await store.load();
-  await store.save({ apiKeys: { openai: "sk-primary", openaiSecondary: "sk-secondary" } });
+  await store.save({ apiKeys: { openai: "sk-primary" } });
 
   const sanitized = await store.getSanitized();
   assert.equal(sanitized.apiKeys, undefined);
   assert.equal(sanitized.hasOpenAIKey, true);
-  assert.equal(sanitized.hasOpenAISecondaryKey, true);
+  assert.equal(Object.hasOwn(sanitized, "hasOpenAISecondaryKey"), false);
   assert.equal(JSON.stringify(sanitized).includes("sk-primary"), false);
-  assert.equal(JSON.stringify(sanitized).includes("sk-secondary"), false);
+});
+
+test("an obsolete secondary OpenAI key on disk is discarded without exposing it", async () => {
+  const filePath = await tempPath();
+  await fs.writeFile(filePath, JSON.stringify({ apiKeys: { openai: "sk-primary", openaiSecondary: "sk-obsolete" } }));
+  const store = createSettingsStore({ filePath, env: {}, readCodexAuth: noCodexAuth });
+
+  const settings = await store.load();
+  const sanitized = await store.getSanitized();
+
+  assert.equal(settings.apiKeys.openai, "sk-primary");
+  assert.equal(Object.hasOwn(settings.apiKeys, "openaiSecondary"), false);
+  assert.equal(Object.hasOwn(sanitized, "hasOpenAISecondaryKey"), false);
+  assert.equal(JSON.stringify(sanitized).includes("sk-obsolete"), false);
 });
 
 test("createSettingsStore.save persists subtitle settings", async () => {
@@ -287,7 +357,7 @@ test("createSettingsStore.save persists subtitle settings", async () => {
   assert.equal(settings.subtitle.micDeviceId, "input-device-1");
   assert.equal(settings.subtitle.translationFontSize, 44);
   assert.equal(settings.subtitle.sourceFontSize, 42);
-  assert.equal(settings.subtitle.model, DEFAULT_SUBTITLE_SETTINGS.model);
+  assert.equal(settings.subtitle.geminiTranscribeModel, DEFAULT_SUBTITLE_SETTINGS.geminiTranscribeModel);
   assert.equal(settings.subtitle.displayMode, "translation_only");
   assert.equal(settings.subtitle.overlayEnabled, true);
 });
@@ -365,7 +435,7 @@ test("createSettingsStore seeds settings from environment on first run", async (
   });
   const settings = await store.load();
   assert.equal(settings.apiKeys.openai, "sk-env");
-  assert.equal(settings.apiKeys.openaiSecondary, "sk-env-secondary");
+  assert.equal(Object.hasOwn(settings.apiKeys, "openaiSecondary"), false);
   assert.equal(settings.apiKeys.gemini, "AIza-env");
   // The second Gemini key is a first-class slot; with no env value it defaults
   // to an empty string rather than being absent.
@@ -636,10 +706,11 @@ test("a fontFamily already poisoned on disk self-heals to the default", async ()
   assert.equal(settings.subtitle.fontFamily, DEFAULT_SUBTITLE_SETTINGS.fontFamily);
 });
 
-test("validateApiKeys accepts an absent section and every known slot", () => {
+test("validateApiKeys accepts an absent section and active slots only", () => {
   assert.doesNotThrow(() => validateApiKeys(undefined));
   assert.doesNotThrow(() => validateApiKeys({}));
-  assert.doesNotThrow(() => validateApiKeys({ openai: "", openaiSecondary: "a", gemini: "b", geminiSecondary: "c" }));
+  assert.doesNotThrow(() => validateApiKeys({ openai: "", gemini: "b", geminiSecondary: "c" }));
+  assert.throws(() => validateApiKeys({ openaiSecondary: "obsolete" }), /Unknown API key slot: openaiSecondary/u);
 });
 
 
@@ -650,20 +721,16 @@ test("validateApiKeys accepts an absent section and every known slot", () => {
 test("the retired captions_audio output mode is rejected on write", () => {
   assert.throws(
     () => validateSubtitleSettings({ outputMode: "captions_audio" }),
-    /outputMode must be captions or audio/u,
+    /outputMode must be captions/u,
   );
-  // The two surviving modes still validate.
   validateSubtitleSettings({ outputMode: "captions" });
-  validateSubtitleSettings({
-    outputMode: "audio",
-    translationProvider: "gemini",
-    translationLanguages: ["en", "ko"],
-    audioLanguage: "en",
-    audioVolume: 0.5,
-  });
+  assert.throws(
+    () => validateSubtitleSettings({ outputMode: "audio" }),
+    /outputMode must be captions/u,
+  );
 });
 
-test("an existing captions_audio settings file migrates to captions instead of failing to load", async () => {
+test("an existing audio settings file migrates to caption-only Transcribe instead of failing to load", async () => {
   const filePath = await tempPath();
   await fs.writeFile(filePath, JSON.stringify({
     subtitle: { outputMode: "captions_audio", translationLanguages: ["en", "ko"], audioLanguage: "ko" },
@@ -672,6 +739,8 @@ test("an existing captions_audio settings file migrates to captions instead of f
   const store = createSettingsStore({ filePath, env: {}, readCodexAuth: noCodexAuth });
   const loaded = await store.load();
   assert.equal(loaded.subtitle.outputMode, "captions", "the mixed mode degrades to captions, the safe half");
+  assert.equal(loaded.subtitle.geminiTranscribeModel, "gemini-3.5-transcribe-live");
+  assert.equal(Object.hasOwn(loaded.subtitle, "audioLanguage"), false);
 
   // And the migration is durable: saving afterwards must not throw on the value
   // it just read.

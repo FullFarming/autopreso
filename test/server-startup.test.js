@@ -11,6 +11,10 @@ import path from "node:path";
 import { DEFAULT_AGENT_TIMEOUT_MS, runWhiteboardAgent, selectSubtitlePolishOptions, startServer, whiteboardSystemPrompt } from "../src/server.js";
 import { createSettingsStore, MAX_SUBTITLE_GLOSSARY_CHARS } from "../src/settings-store.js";
 
+function sameOriginHeaders(url, headers = {}) {
+  return { origin: new URL(url).origin, ...headers };
+}
+
 test("default whiteboard agent timeout is 90 seconds", () => {
   assert.equal(DEFAULT_AGENT_TIMEOUT_MS, 90_000);
 });
@@ -102,7 +106,6 @@ test("desktop subtitle static assets are always revalidated instead of surviving
     for (const asset of [
       "subtitle.html",
       "subtitle-dashboard.js",
-      "subtitle-audio-player.js",
       "subtitle.css",
       "subtitle-overlay.html",
       "subtitle-overlay.js",
@@ -271,18 +274,6 @@ test("settings export downloads subtitle settings as a portable JSON file", asyn
 });
 
 test("subtitle second-pass polish uses separated provider keys", () => {
-  assert.deepEqual(
-    selectSubtitlePolishOptions({
-      args: { tone: "natural", glossary: "operator = 운영사", domain: "Commercial real estate" },
-      saved: {
-        apiKeys: { openai: "sk-primary", openaiSecondary: "sk-secondary" },
-        subtitle: { tonePolishModel: "gpt-5.5" },
-      },
-      env: {},
-    }),
-    { provider: "openai", apiKey: "sk-secondary", modelId: "gpt-5.5" },
-  );
-
   assert.equal(
     selectSubtitlePolishOptions({
       args: { tone: "natural", glossary: "operator = 운영사" },
@@ -290,24 +281,6 @@ test("subtitle second-pass polish uses separated provider keys", () => {
       env: {},
     }),
     null,
-  );
-
-  assert.equal(
-    selectSubtitlePolishOptions({
-      args: { tone: "business", glossary: "" },
-      saved: { apiKeys: { openai: "sk-primary" }, subtitle: {} },
-      env: {},
-    }),
-    null,
-  );
-
-  assert.deepEqual(
-    selectSubtitlePolishOptions({
-      args: { tone: "business", glossary: "" },
-      saved: { apiKeys: { openai: "sk-primary", openaiSecondary: "sk-secondary" }, subtitle: {} },
-      env: {},
-    }),
-    { provider: "openai", apiKey: "sk-secondary", modelId: "gpt-5.5" },
   );
 
   assert.deepEqual(
@@ -319,7 +292,7 @@ test("subtitle second-pass polish uses separated provider keys", () => {
       },
       env: {},
     }),
-    { provider: "gemini", apiKey: "AIza-finalizer", modelId: "gemini-3.5-flash" },
+    { provider: "gemini", apiKey: "AIza-finalizer", modelId: "gemini-3.7-flash" },
   );
 
   assert.deepEqual(
@@ -337,7 +310,7 @@ test("subtitle second-pass polish uses separated provider keys", () => {
       },
       env: {},
     }),
-    { provider: "gemini", apiKey: "AIza-finalizer", modelId: "gemini-3.5-flash" },
+    { provider: "gemini", apiKey: "AIza-finalizer", modelId: "gemini-3.7-flash" },
   );
 
   assert.deepEqual(
@@ -349,7 +322,7 @@ test("subtitle second-pass polish uses separated provider keys", () => {
       },
       env: {},
     }),
-    { provider: "gemini", apiKey: "AIza-live", modelId: "gemini-3.5-flash" },
+    { provider: "gemini", apiKey: "AIza-live", modelId: "gemini-3.7-flash" },
   );
 
   assert.equal(
@@ -359,6 +332,15 @@ test("subtitle second-pass polish uses separated provider keys", () => {
       env: {},
     }),
     null,
+  );
+
+  assert.deepEqual(
+    selectSubtitlePolishOptions({
+      args: { tone: "business", glossary: "", polishProvider: "gemini" },
+      saved: { apiKeys: { gemini: "AIza-live" }, subtitle: {} },
+      env: {},
+    }),
+    { provider: "gemini", apiKey: "AIza-live", modelId: "gemini-3.7-flash" },
   );
 });
 
@@ -378,7 +360,7 @@ test("subtitle:start validates runtime subtitle settings before opening provider
 
   let ws;
   try {
-    ws = new WebSocket(url.replace("http:", "ws:") + "/ws");
+    ws = new WebSocket(url.replace("http:", "ws:") + "/ws", { headers: { Origin: url } });
     await new Promise((resolve, reject) => {
       ws.once("open", resolve);
       ws.once("error", reject);
@@ -432,7 +414,7 @@ test("subtitle:stop without a sessionId cannot stop the active subtitle session"
 
   let ws;
   try {
-    ws = new WebSocket(url.replace("http:", "ws:") + "/ws");
+    ws = new WebSocket(url.replace("http:", "ws:") + "/ws", { headers: { Origin: url } });
     await new Promise((resolve, reject) => {
       ws.once("open", resolve);
       ws.once("error", reject);
@@ -459,6 +441,60 @@ test("subtitle:stop without a sessionId cannot stop the active subtitle session"
     );
   } finally {
     ws?.close();
+    await new Promise((resolve) => httpServer.close(resolve));
+  }
+});
+
+test("subtitle:input-status preserves the microphone source for the stall watchdog", { timeout: 2_000 }, async () => {
+  let resolveSignal;
+  const signalPromise = new Promise((resolve) => {
+    resolveSignal = resolve;
+  });
+  const { httpServer, url } = await startServer({
+    host: "127.0.0.1",
+    port: 0,
+    moonshineModel: "medium",
+    openaiApiKey: "test",
+    createTranscription: () => ({
+      ready: async () => {},
+      sendAudio: () => {},
+      stop: () => {},
+      close: () => {},
+    }),
+    createSubtitleRealtimeManager: () => ({
+      start: async () => {},
+      stop: async () => {},
+      sendAudio: () => {},
+      restartChannels: async () => {},
+      noteInputSignal: (signal) => resolveSignal(signal),
+      close: () => {},
+    }),
+  });
+
+  const ws = new WebSocket(url.replace("http:", "ws:") + "/ws", { headers: { Origin: url } });
+  try {
+    await new Promise((resolve, reject) => {
+      ws.once("open", resolve);
+      ws.once("error", reject);
+    });
+    const started = new Promise((resolve) => {
+      ws.on("message", (raw) => {
+        const message = JSON.parse(raw.toString("utf8"));
+        if (message.type === "subtitle:started") resolve();
+      });
+    });
+    ws.send(JSON.stringify({ type: "subtitle:start", sessionId: "mic-session", settings: {} }));
+    await started;
+    ws.send(JSON.stringify({
+      type: "subtitle:input-status",
+      sessionId: "mic-session",
+      source: "mic",
+      status: "signal",
+    }));
+
+    assert.deepEqual(await signalPromise, { sessionId: "mic-session", source: "mic" });
+  } finally {
+    ws.close();
     await new Promise((resolve) => httpServer.close(resolve));
   }
 });
@@ -492,7 +528,7 @@ test("history exports as Excel-compatible CSV with a UTF-8 BOM", async () => {
   }
 });
 
-test("server rejects cross-origin mutating HTTP and websocket requests", async () => {
+test("server requires exact local origin for mutating HTTP and websocket requests", async () => {
   const { httpServer, url } = await startServer({
     host: "127.0.0.1",
     port: 0,
@@ -507,6 +543,22 @@ test("server rejects cross-origin mutating HTTP and websocket requests", async (
   });
 
   try {
+    const sameOriginResponse = await fetch(`${url}/api/session/reset`, {
+      method: "POST",
+      headers: sameOriginHeaders(url),
+    });
+    assert.equal(sameOriginResponse.status, 200);
+
+    const missingOriginResponse = await fetch(`${url}/api/session/reset`, {
+      method: "POST",
+    });
+    assert.equal(missingOriginResponse.status, 403);
+    assert.deepEqual(await missingOriginResponse.json(), {
+      ok: false,
+      error: "허용되지 않은 요청 출처입니다.",
+      code: "INVALID_ORIGIN",
+    });
+
     const response = await fetch(`${url}/api/session/reset`, {
       method: "POST",
       headers: { origin: "https://example.test" },
@@ -517,6 +569,19 @@ test("server rejects cross-origin mutating HTTP and websocket requests", async (
       error: "허용되지 않은 요청 출처입니다.",
       code: "INVALID_ORIGIN",
     });
+
+    const localOrigin = new URL(url).origin;
+    for (const origin of [
+      `${localOrigin}.evil.test`,
+      `${localOrigin}/forged-path`,
+      localOrigin.replace(/:\d+$/u, ":444"),
+    ]) {
+      const confused = await fetch(`${url}/api/session/reset`, {
+        method: "POST",
+        headers: { origin },
+      });
+      assert.equal(confused.status, 403, origin);
+    }
 
     await assert.rejects(
       new Promise((resolve, reject) => {
@@ -535,7 +600,7 @@ test("server rejects cross-origin mutating HTTP and websocket requests", async (
   }
 });
 
-test("server validates OpenAI Realtime translation keys before saving", async () => {
+test("server validates OpenAI Realtime transcription keys before saving", async () => {
   const sockets = [];
   const { httpServer, url } = await startServer({
     host: "127.0.0.1",
@@ -550,6 +615,7 @@ test("server validates OpenAI Realtime translation keys before saving", async ()
     }),
     createSubtitleWebSocket: (socketUrl, protocols, init) => {
       const socket = new FakeRealtimeSocket(socketUrl, init);
+      socket.responseType = "transcription_session.updated";
       sockets.push(socket);
       return socket;
     },
@@ -558,14 +624,25 @@ test("server validates OpenAI Realtime translation keys before saving", async ()
   try {
     const response = await fetch(`${url}/api/subtitles/openai/validate`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: sameOriginHeaders(url, { "content-type": "application/json" }),
       body: JSON.stringify({ apiKey: "sk-test" }),
     });
     assert.equal(response.status, 200);
     assert.deepEqual(await response.json(), { ok: true, data: { status: "valid" } });
-    assert.equal(sockets[0].url, "wss://api.openai.com/v1/realtime/translations?model=gpt-realtime-translate");
+    assert.equal(sockets[0].url, "wss://api.openai.com/v1/realtime?intent=transcription");
     assert.equal(sockets[0].init.headers.Authorization, "Bearer sk-test");
-    assert.equal(JSON.parse(sockets[0].sent[0]).type, "session.update");
+    assert.deepEqual(JSON.parse(sockets[0].sent[0]), {
+      type: "session.update",
+      session: {
+        type: "transcription",
+        audio: {
+          input: {
+            format: { type: "audio/pcm", rate: 24_000 },
+            transcription: { model: "gpt-realtime-whisper" },
+          },
+        },
+      },
+    });
     assert.equal(sockets[0].closed, true);
   } finally {
     await new Promise((resolve) => httpServer.close(resolve));
@@ -594,7 +671,7 @@ test("server returns a sanitized OpenAI validation error", async () => {
   try {
     const response = await fetch(`${url}/api/subtitles/openai/validate`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: sameOriginHeaders(url, { "content-type": "application/json" }),
       body: JSON.stringify({ apiKey: "sk-secret-value" }),
     });
     assert.equal(response.status, 400);
@@ -633,12 +710,13 @@ test("server validates Gemini keys through text generation before saving", async
   try {
     const response = await fetch(`${url}/api/subtitles/gemini/validate`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: sameOriginHeaders(url, { "content-type": "application/json" }),
       body: JSON.stringify({ apiKey: "AIza-test" }),
     });
     assert.equal(response.status, 200);
     assert.deepEqual(await response.json(), { ok: true, data: { status: "valid" } });
     assert.match(fetchCalls[0].url, /generativelanguage\.googleapis\.com/);
+    assert.match(fetchCalls[0].url, /gemini-3\.7-flash/u);
     assert.equal(fetchCalls[0].init.headers["x-goog-api-key"], "AIza-test");
     assert.match(JSON.parse(fetchCalls[0].init.body).contents[0].parts[0].text, /ok/);
   } finally {
@@ -664,7 +742,7 @@ test("server returns a sanitized Gemini validation error", async () => {
   try {
     const response = await fetch(`${url}/api/subtitles/gemini/validate`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: sameOriginHeaders(url, { "content-type": "application/json" }),
       body: JSON.stringify({ apiKey: "AIza-secret" }),
     });
     assert.equal(response.status, 400);
@@ -745,7 +823,9 @@ class FakeRealtimeSocket extends EventEmitter {
       return;
     }
     const value = JSON.parse(message);
-    queueMicrotask(() => this.emit("message", JSON.stringify(value.setup ? { setupComplete: {} } : { type: "session.updated" })));
+    queueMicrotask(() => this.emit("message", JSON.stringify(
+      value.setup ? { setupComplete: {} } : { type: this.responseType ?? "session.updated" },
+    )));
   }
 
   close() {

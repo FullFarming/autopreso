@@ -1,22 +1,27 @@
-import type { GlossaryPack, LiveOutputMode, LiveSession, LiveSessionType, LiveSnapshot, LiveVoiceProvider } from "../live-contract";
-import { LANGUAGE_CODES, toOpenAITranslationLanguageCode } from "../languageDetect";
+import type { GlossaryPack, LiveAgendaItem, LiveEventType, LiveOutputMode, LiveSession, LiveSessionGlossaryPin, LiveSessionGlossaryPins, LiveSessionSection, LiveSessionType, LiveSnapshot, LiveVoiceProvider } from "../live-contract";
 import { LiveSessionError } from "./errors";
 import type { LiveSessionStore } from "./store";
 import {
+  parseAgenda,
+  parseEventType,
   parseGlossaryPack,
   parseLanguages,
+  parseLiveGlossaryPinInput,
+  parseLiveGlossaryPinsInput,
   parseMaxViewers,
-  parseOutputMode,
+  parsePublicMetadata,
   parseScheduledAt,
+  parseSection,
+  parseSectionTransitionKey,
   parseSessionType,
+  parseSourceSeq,
   parseTitle,
+  parseTicker,
   parseVersion,
-  parseVoiceProvider,
 } from "./validation";
 
-const SESSION_TTL_MILLISECONDS = 6 * 60 * 60 * 1_000;
+const SESSION_ACCESS_WINDOW_MILLISECONDS = 6 * 60 * 60 * 1_000;
 const MAX_SCHEDULE_AHEAD_MILLISECONDS = 30 * 24 * 60 * 60 * 1_000;
-const OPENAI_REALTIME_TRANSLATION_LANGUAGES = new Set(LANGUAGE_CODES.map(toOpenAITranslationLanguageCode));
 const DUAL_CAPTION_LANGUAGES = ["ko", "en"] as const;
 const MAX_SESSION_LANGUAGES = 3;
 
@@ -44,14 +49,16 @@ export class LiveSessionService {
 
   async create(hostId: string, input: CreateServiceInput): Promise<LiveSession> {
     const { sessionType, outputMode, voiceProvider } = normalizeSessionSettings(input);
+    const participantSpeakingEnabled = parseParticipantSpeakingEnabled(input.participantSpeakingEnabled, false);
+    assertParticipantSpeakingConfiguration(sessionType, participantSpeakingEnabled);
     const languages = withDualCaptionLanguages(parseLanguages(input.languages));
     const title = parseTitle(input.title ?? "Live Session");
     const scheduledAt = parseScheduledAt(input.scheduledAt);
+    const eventMetadata = parseEventMetadata(input);
     const scheduledTimestamp = scheduledAt === null ? this.now() : Date.parse(scheduledAt);
     if (scheduledTimestamp > this.now() + MAX_SCHEDULE_AHEAD_MILLISECONDS) {
       throw new LiveSessionError("라이브 일정은 30일 이내로 예약하세요.", "SCHEDULE_TOO_FAR", 400);
     }
-    assertOpenAIVoiceLanguages(voiceProvider, languages);
     const session: LiveSession = {
       id: crypto.randomUUID(),
       hostId,
@@ -60,24 +67,41 @@ export class LiveSessionService {
       sessionType,
       outputMode,
       voiceProvider,
-      maxViewers: input.maxViewers === undefined ? 50 : parseMaxViewers(input.maxViewers),
+      maxViewers: input.maxViewers === undefined ? 200 : parseMaxViewers(input.maxViewers),
+      participantSpeakingEnabled,
       glossaryPack: input.glossaryPack === undefined ? "general_cre" : parseGlossaryPack(input.glossaryPack),
       status: "preparing",
       languages,
       viewerCount: 0,
       version: 1,
       admissionOpenUntil: null,
-      expiresAt: new Date(Math.max(this.now(), scheduledTimestamp) + SESSION_TTL_MILLISECONDS).toISOString(),
+      expiresAt: new Date(Math.max(this.now(), scheduledTimestamp) + SESSION_ACCESS_WINDOW_MILLISECONDS).toISOString(),
       endedAt: null,
       hasCoverImage: false,
+      ...eventMetadata,
+      activeSection: "prepared_remarks",
+      sectionStartedAt: null,
     };
     return this.store.create(session);
   }
 
   /** Contract C10: mark the uploaded cover object on the owned session. */
-  async setCoverImage(hostId: string, sessionId: string, path: string): Promise<void> {
-    const updated = await this.store.setCoverImageOwned(sessionId, hostId, path);
-    if (!updated) throw new LiveSessionError("세션을 찾을 수 없습니다.", "SESSION_NOT_FOUND", 404);
+  async setCoverImage(
+    hostId: string,
+    sessionId: string,
+    path: string,
+    expectedCurrentPath: string | null,
+  ): Promise<void> {
+    const updated = await this.store.setCoverImageOwned(sessionId, hostId, path, expectedCurrentPath);
+    if (updated) return;
+    const current = await this.store.get(sessionId);
+    if (!current || current.hostId !== hostId) {
+      throw new LiveSessionError("세션을 찾을 수 없습니다.", "SESSION_NOT_FOUND", 404);
+    }
+    if (!new Set(["preparing", "live", "paused"]).has(current.status)) {
+      throw new LiveSessionError("종료된 세션에는 커버를 올릴 수 없습니다.", "SESSION_ENDED", 409);
+    }
+    throw new LiveSessionError("다른 커버가 먼저 저장되었습니다. 다시 시도하세요.", "COVER_FINALIZE_CONFLICT", 409);
   }
 
   async update(hostId: string, sessionId: string, input: UpdateServiceInput): Promise<LiveSession> {
@@ -93,12 +117,17 @@ export class LiveSessionService {
     const languages = input.languages === undefined
       ? withDualCaptionLanguages(current.languages)
       : withDualCaptionLanguages(parseLanguages(input.languages));
-    assertOpenAIVoiceLanguages(voiceProvider, languages);
     const maxViewers = input.maxViewers === undefined ? current.maxViewers : parseMaxViewers(input.maxViewers);
     if (maxViewers < current.viewerCount) {
       throw new LiveSessionError("현재 접속자 수보다 최대 시청자를 낮출 수 없습니다.", "MAX_VIEWERS_BELOW_CURRENT", 409);
     }
     const glossaryPack = input.glossaryPack === undefined ? current.glossaryPack : parseGlossaryPack(input.glossaryPack);
+    const participantSpeakingEnabled = parseParticipantSpeakingEnabled(
+      input.participantSpeakingEnabled,
+      current.participantSpeakingEnabled,
+    );
+    assertParticipantSpeakingConfiguration(sessionType, participantSpeakingEnabled);
+    const eventMetadata = parseEventMetadata(input, current);
     const updated = await this.store.updateOwned(sessionId, hostId, version, {
       sessionType,
       outputMode,
@@ -107,7 +136,9 @@ export class LiveSessionService {
       scheduledAt,
       languages,
       maxViewers,
+      participantSpeakingEnabled,
       glossaryPack,
+      ...eventMetadata,
     });
     if (!updated) throw new LiveSessionError("다른 변경이 먼저 저장되었습니다. 새로고침 후 다시 시도하세요.", "VERSION_CONFLICT", 409);
     return updated;
@@ -119,6 +150,23 @@ export class LiveSessionService {
     if (!await this.store.terminateOwned(sessionId, hostId)) {
       throw new LiveSessionError("세션을 찾을 수 없습니다.", "SESSION_NOT_FOUND", 404);
     }
+  }
+
+  async restore(hostId: string, sessionId: string, expectedVersion: unknown): Promise<LiveSession> {
+    const version = parseVersion(expectedVersion);
+    const current = await this.store.getOwned(sessionId, hostId);
+    if (!current || current.hostId !== hostId) throw new LiveSessionError("세션을 찾을 수 없습니다.", "SESSION_NOT_FOUND", 404);
+    if (current.status === "stopped" || current.status === "failed") {
+      throw new LiveSessionError("종료된 세션은 복원할 수 없습니다.", "SESSION_ENDED", 409);
+    }
+    if (current.version !== version) {
+      throw new LiveSessionError("다른 변경이 먼저 저장되었습니다. 다시 확인해 주세요.", "VERSION_CONFLICT", 409);
+    }
+    const restored = await this.store.renewAccessOwned(sessionId, hostId, version);
+    if (!restored || restored.status === "stopped" || restored.status === "failed") {
+      throw new LiveSessionError("다른 변경이 먼저 저장되었습니다. 다시 확인해 주세요.", "VERSION_CONFLICT", 409);
+    }
+    return restored;
   }
 
   async start(hostId: string, sessionId: string, expectedVersion: unknown): Promise<LiveSession> {
@@ -141,6 +189,25 @@ export class LiveSessionService {
     return started;
   }
 
+  async prepareStart(hostId: string, sessionId: string, expectedVersion: unknown): Promise<LiveSession> {
+    const version = parseVersion(expectedVersion);
+    const current = await this.store.get(sessionId);
+    if (!current || current.hostId !== hostId) {
+      throw new LiveSessionError("세션을 찾을 수 없습니다.", "SESSION_NOT_FOUND", 404);
+    }
+    if (current.status === "live") return current;
+    if (current.status === "stopped" || current.status === "failed") {
+      throw new LiveSessionError("종료된 세션은 시작할 수 없습니다.", "SESSION_NOT_STARTABLE", 409);
+    }
+    if (current.status === "paused") {
+      throw new LiveSessionError("일시정지된 세션은 재개로 다시 시작하세요.", "SESSION_PAUSED", 409);
+    }
+    if (current.version !== version) {
+      throw new LiveSessionError("다른 변경이 먼저 저장되었습니다. 새로고침 후 다시 시도하세요.", "VERSION_CONFLICT", 409);
+    }
+    return current;
+  }
+
   /** Contract C4: live → paused. Idempotent when the session is already paused. */
   async pause(hostId: string, sessionId: string, expectedVersion: unknown): Promise<LiveSession> {
     return this.transition(hostId, sessionId, expectedVersion, "pause");
@@ -149,6 +216,56 @@ export class LiveSessionService {
   /** Contract C4: paused → live. Idempotent when the session is already live. */
   async resume(hostId: string, sessionId: string, expectedVersion: unknown): Promise<LiveSession> {
     return this.transition(hostId, sessionId, expectedVersion, "resume");
+  }
+
+  async transitionSection(
+    hostId: string,
+    sessionId: string,
+    expectedVersion: unknown,
+    section: unknown,
+    transitionKey: unknown,
+    sourceSeq?: unknown,
+  ): Promise<LiveSession> {
+    const version = parseVersion(expectedVersion);
+    const nextSection = parseSection(section);
+    const key = parseSectionTransitionKey(transitionKey);
+    const seq = parseSourceSeq(sourceSeq);
+    const transitioned = await this.store.transitionSectionOwned(sessionId, hostId, version, nextSection, key, seq);
+    if (transitioned) return transitioned;
+    const current = await this.store.get(sessionId);
+    if (!current || current.hostId !== hostId) {
+      throw new LiveSessionError("세션을 찾을 수 없습니다.", "SESSION_NOT_FOUND", 404);
+    }
+    if (current.activeSection === nextSection) return current;
+    if (current.status !== "live" && current.status !== "paused") {
+      throw new LiveSessionError("라이브 중인 세션만 구간을 전환할 수 있습니다.", "SESSION_SECTION_NOT_TRANSITIONABLE", 409);
+    }
+    throw new LiveSessionError("다른 변경이 먼저 저장되었습니다. 새로고침 후 다시 시도하세요.", "VERSION_CONFLICT", 409);
+  }
+
+  async pinGlossaryVersion(hostId: string, sessionId: string, input: unknown): Promise<LiveSessionGlossaryPin> {
+    const parsed = parseLiveGlossaryPinInput(input);
+    return this.store.pinGlossaryVersionOwned(
+      sessionId,
+      hostId,
+      parsed.expectedVersion,
+      parsed.presetId,
+      parsed.documentVersion,
+    );
+  }
+
+  async replaceGlossaryPins(hostId: string, sessionId: string, input: unknown): Promise<LiveSessionGlossaryPins> {
+    const parsed = parseLiveGlossaryPinsInput(input);
+    return this.store.replaceGlossaryPinsOwned(
+      sessionId,
+      hostId,
+      parsed.expectedVersion,
+      parsed.glossaries,
+    );
+  }
+
+  async getGlossaryPins(hostId: string, sessionId: string): Promise<LiveSessionGlossaryPins> {
+    return this.store.getGlossaryPinsOwned(sessionId, hostId);
   }
 
   private async transition(
@@ -180,8 +297,8 @@ export class LiveSessionService {
   }
 
   /** Host session recovery: active sessions (preparing/live/paused) owned by the host. */
-  async listActive(hostId: string): Promise<LiveSession[]> {
-    return this.store.listOwnedActive(hostId);
+  async listActive(hostId: string, offset = 0): Promise<LiveSession[]> {
+    return this.store.listOwnedActive(hostId, offset);
   }
 
   async snapshot(sessionId: string, language: string): Promise<LiveSnapshot> {
@@ -189,20 +306,6 @@ export class LiveSessionService {
     if (!snapshot || snapshot.session.status === "stopped") throw new LiveSessionError("세션을 찾을 수 없습니다.", "SESSION_NOT_FOUND", 404);
     if (!snapshot.session.languages.includes(language)) throw new LiveSessionError("선택한 언어는 더 이상 제공되지 않습니다.", "LANGUAGE_REMOVED", 410);
     return snapshot;
-  }
-}
-
-function assertOpenAIVoiceLanguages(voiceProvider: LiveVoiceProvider, languages: readonly string[]): void {
-  if (voiceProvider !== "openai") return;
-  const unsupportedLanguage = languages.find((language) => !OPENAI_REALTIME_TRANSLATION_LANGUAGES.has(
-    toOpenAITranslationLanguageCode(language),
-  ));
-  if (unsupportedLanguage) {
-    throw new LiveSessionError(
-      `OpenAI 실시간 음성이 지원하지 않는 언어입니다: ${unsupportedLanguage}`,
-      "OPENAI_VOICE_LANGUAGE_UNSUPPORTED",
-      400,
-    );
   }
 }
 
@@ -219,7 +322,13 @@ interface CreateServiceInput extends LegacySessionSettingsInput {
   voiceProvider?: unknown;
   languages: unknown;
   maxViewers?: unknown;
+  participantSpeakingEnabled?: unknown;
   glossaryPack?: unknown;
+  companyName?: unknown;
+  ticker?: unknown;
+  fiscalPeriod?: unknown;
+  eventType?: unknown;
+  agenda?: unknown;
 }
 
 interface UpdateServiceInput extends LegacySessionSettingsInput {
@@ -231,7 +340,62 @@ interface UpdateServiceInput extends LegacySessionSettingsInput {
   voiceProvider?: unknown;
   languages?: unknown;
   maxViewers?: unknown;
+  participantSpeakingEnabled?: unknown;
   glossaryPack?: unknown;
+  companyName?: unknown;
+  ticker?: unknown;
+  fiscalPeriod?: unknown;
+  eventType?: unknown;
+  agenda?: unknown;
+}
+
+interface EventMetadataInput {
+  companyName?: unknown;
+  ticker?: unknown;
+  fiscalPeriod?: unknown;
+  eventType?: unknown;
+  agenda?: unknown;
+}
+
+function parseParticipantSpeakingEnabled(value: unknown, fallback: boolean): boolean {
+  if (value === undefined) return fallback;
+  if (typeof value !== "boolean") {
+    throw new LiveSessionError(
+      "참여자 발언권 설정이 올바르지 않습니다.",
+      "INVALID_PARTICIPANT_SPEAKING_SETTING",
+      400,
+    );
+  }
+  return value;
+}
+
+function assertParticipantSpeakingConfiguration(
+  sessionType: LiveSessionType,
+  participantSpeakingEnabled: boolean,
+): void {
+  if (participantSpeakingEnabled && sessionType !== "meeting") {
+    throw new LiveSessionError(
+      "참여자 발언권은 미팅 세션에서만 사용할 수 있습니다.",
+      "INVALID_PARTICIPANT_SPEAKING_SETTING",
+      400,
+    );
+  }
+}
+
+function parseEventMetadata(input: EventMetadataInput, current?: LiveSession): {
+  companyName: string | null;
+  ticker: string | null;
+  fiscalPeriod: string | null;
+  eventType: LiveEventType | null;
+  agenda: LiveAgendaItem[];
+} {
+  return {
+    companyName: input.companyName === undefined ? current?.companyName ?? null : parsePublicMetadata(input.companyName, 160, "INVALID_COMPANY_NAME"),
+    ticker: input.ticker === undefined ? current?.ticker ?? null : parseTicker(input.ticker),
+    fiscalPeriod: input.fiscalPeriod === undefined ? current?.fiscalPeriod ?? null : parsePublicMetadata(input.fiscalPeriod, 80, "INVALID_FISCAL_PERIOD"),
+    eventType: input.eventType === undefined ? current?.eventType ?? null : parseEventType(input.eventType),
+    agenda: input.agenda === undefined ? current?.agenda ?? [] : parseAgenda(input.agenda),
+  };
 }
 
 function normalizeSessionSettings(
@@ -248,27 +412,21 @@ function normalizeSessionSettings(
         : current?.sessionType;
   if (!sessionType) throw new LiveSessionError("라이브 모드가 필요합니다.", "INVALID_LIVE_MODE", 400);
 
-  let outputMode: LiveOutputMode;
-  if (input.outputMode !== undefined) outputMode = parseOutputMode(input.outputMode);
-  else if (isLegacyTownhall) outputMode = "audio";
-  else if (input.voiceOutputMode !== undefined) {
-    if (input.voiceOutputMode === "captions") outputMode = "captions";
-    else if (input.voiceOutputMode === "fixed_voice" || input.voiceOutputMode === "auto_voice") outputMode = "audio";
-    else throw new LiveSessionError("지원하지 않는 음성 출력 모드입니다.", "INVALID_VOICE_OUTPUT_MODE", 400);
-  } else outputMode = current?.outputMode ?? "captions";
-
-  const requestedVoiceProvider = input.voiceProvider === undefined
-    ? current?.voiceProvider ?? "gemini"
-    : parseVoiceProvider(input.voiceProvider);
-  const hasAudioOutput = outputMode === "captions_audio" || outputMode === "audio";
-  if (input.voiceProvider === "openai" && (sessionType !== "presentation" || !hasAudioOutput)) {
-    throw new LiveSessionError(
-      "OpenAI 음성 출력은 프레젠테이션의 음성 출력 모드에서만 사용할 수 있습니다.",
-      "OPENAI_VOICE_OUTPUT_ONLY",
-      400,
-    );
-  }
-  const voiceProvider = sessionType === "presentation" && hasAudioOutput ? requestedVoiceProvider : "gemini";
+  assertLegacyOutputMode(input.outputMode ?? input.voiceOutputMode);
+  assertLegacyVoiceProvider(input.voiceProvider);
+  const outputMode: LiveOutputMode = "captions";
+  const voiceProvider: LiveVoiceProvider = "gemini";
 
   return { sessionType, outputMode, voiceProvider };
+}
+
+function assertLegacyOutputMode(value: unknown): void {
+  if (value === undefined || value === "captions" || value === "captions_audio" || value === "audio"
+    || value === "fixed_voice" || value === "auto_voice") return;
+  throw new LiveSessionError("지원하지 않는 음성 출력 모드입니다.", "INVALID_VOICE_OUTPUT_MODE", 400);
+}
+
+function assertLegacyVoiceProvider(value: unknown): void {
+  if (value === undefined || value === "gemini" || value === "openai") return;
+  throw new LiveSessionError("지원하지 않는 음성 공급자입니다.", "INVALID_VOICE_PROVIDER", 400);
 }

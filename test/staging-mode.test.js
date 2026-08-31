@@ -12,6 +12,10 @@ const SAMPLE_STAGING_ELEMENTS = [
 ];
 const SAMPLE_SCREENSHOT = "data:image/png;base64,c3RhZ2luZw==";
 
+function sameOriginHeaders(url, headers = {}) {
+  return { origin: new URL(url).origin, ...headers };
+}
+
 function makeTranscriptionMock() {
   const audioCalls = [];
   const stopCalls = [];
@@ -89,7 +93,7 @@ test("POST /api/preso/start flips to live, primes agentHistory, blanks the live 
 
     const res = await fetch(`${url}/api/preso/start`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: sameOriginHeaders(url, { "content-type": "application/json" }),
       body: JSON.stringify({
         stagingElements: SAMPLE_STAGING_ELEMENTS,
         stagingScreenshot: SAMPLE_SCREENSHOT,
@@ -145,7 +149,7 @@ test("POST /api/preso/start broadcasts mode change and fresh whiteboard", async 
 
     const res = await fetch(`${url}/api/preso/start`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: sameOriginHeaders(url, { "content-type": "application/json" }),
       body: JSON.stringify({
         stagingElements: SAMPLE_STAGING_ELEMENTS,
         stagingScreenshot: SAMPLE_SCREENSHOT,
@@ -178,7 +182,7 @@ test("POST /api/preso/start pushes staging keyword vocabulary to the transcripti
   try {
     const res = await fetch(`${url}/api/preso/start`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: sameOriginHeaders(url, { "content-type": "application/json" }),
       body: JSON.stringify({
         stagingElements: [
           { type: "text", id: "t1", text: "Schema registry" },
@@ -233,7 +237,7 @@ test("settings reload reapplies staging keyword vocabulary to the new transcript
   try {
     const startRes = await fetch(`${url}/api/preso/start`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: sameOriginHeaders(url, { "content-type": "application/json" }),
       body: JSON.stringify({
         stagingElements: [{ type: "text", id: "t1", text: "Schema registry" }],
         stagingScreenshot: SAMPLE_SCREENSHOT,
@@ -245,7 +249,7 @@ test("settings reload reapplies staging keyword vocabulary to the new transcript
 
     const settingsRes = await fetch(`${url}/api/settings`, {
       method: "PUT",
-      headers: { "content-type": "application/json" },
+      headers: sameOriginHeaders(url, { "content-type": "application/json" }),
       body: JSON.stringify({
         transcription: {
           provider: "openai",
@@ -268,7 +272,7 @@ test("POST /api/preso/back-to-staging clears any previously pushed transcription
   try {
     await fetch(`${url}/api/preso/start`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: sameOriginHeaders(url, { "content-type": "application/json" }),
       body: JSON.stringify({
         stagingElements: [{ type: "text", id: "t1", text: "Kafka consumer group" }],
         stagingScreenshot: SAMPLE_SCREENSHOT,
@@ -276,7 +280,7 @@ test("POST /api/preso/back-to-staging clears any previously pushed transcription
     });
     transcription.sessionContextCalls.length = 0;
 
-    const res = await fetch(`${url}/api/preso/back-to-staging`, { method: "POST" });
+    const res = await fetch(`${url}/api/preso/back-to-staging`, { method: "POST", headers: sameOriginHeaders(url) });
     assert.equal(res.status, 200);
 
     assert.equal(transcription.sessionContextCalls.length, 1, "expected one clearing setSessionContext call");
@@ -291,7 +295,7 @@ test("POST /api/preso/back-to-staging flips mode without clearing history", asyn
   try {
     await fetch(`${url}/api/preso/start`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: sameOriginHeaders(url, { "content-type": "application/json" }),
       body: JSON.stringify({
         stagingElements: SAMPLE_STAGING_ELEMENTS,
         stagingScreenshot: SAMPLE_SCREENSHOT,
@@ -300,7 +304,7 @@ test("POST /api/preso/back-to-staging flips mode without clearing history", asyn
     assert.equal(state.mode, "live");
     const historyBefore = state.agentHistory;
 
-    const res = await fetch(`${url}/api/preso/back-to-staging`, { method: "POST" });
+    const res = await fetch(`${url}/api/preso/back-to-staging`, { method: "POST", headers: sameOriginHeaders(url) });
     assert.equal(res.status, 200);
 
     assert.equal(state.mode, "staging");
@@ -340,7 +344,7 @@ test("audio frames are forwarded to transcription after Start preso", async () =
 
     await fetch(`${url}/api/preso/start`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: sameOriginHeaders(url, { "content-type": "application/json" }),
       body: JSON.stringify({
         stagingElements: SAMPLE_STAGING_ELEMENTS,
         stagingScreenshot: SAMPLE_SCREENSHOT,
@@ -369,7 +373,7 @@ test("late audio frames from a stopped listening session are ignored", async () 
 
     await fetch(`${url}/api/preso/start`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: sameOriginHeaders(url, { "content-type": "application/json" }),
       body: JSON.stringify({
         stagingElements: SAMPLE_STAGING_ELEMENTS,
         stagingScreenshot: SAMPLE_SCREENSHOT,
@@ -412,7 +416,7 @@ test("repeat Start preso calls cleanly replace the primer", async () => {
   try {
     await fetch(`${url}/api/preso/start`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: sameOriginHeaders(url, { "content-type": "application/json" }),
       body: JSON.stringify({
         stagingElements: SAMPLE_STAGING_ELEMENTS,
         stagingScreenshot: SAMPLE_SCREENSHOT,
@@ -427,7 +431,7 @@ test("repeat Start preso calls cleanly replace the primer", async () => {
     ];
     await fetch(`${url}/api/preso/start`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: sameOriginHeaders(url, { "content-type": "application/json" }),
       body: JSON.stringify({ stagingElements: secondElements, stagingScreenshot: secondScreenshot }),
     });
     await state.warmupPromise;
@@ -469,7 +473,7 @@ test("warmup loop retries until cache is hit, then stops", async () => {
   try {
     await fetch(`${url}/api/preso/start`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: sameOriginHeaders(url, { "content-type": "application/json" }),
       body: JSON.stringify({
         stagingElements: SAMPLE_STAGING_ELEMENTS,
         stagingScreenshot: SAMPLE_SCREENSHOT,
@@ -507,7 +511,7 @@ test("warmup loop transitions to exhausted after maxAttempts without a cache hit
   try {
     await fetch(`${url}/api/preso/start`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: sameOriginHeaders(url, { "content-type": "application/json" }),
       body: JSON.stringify({
         stagingElements: SAMPLE_STAGING_ELEMENTS,
         stagingScreenshot: SAMPLE_SCREENSHOT,
@@ -541,7 +545,7 @@ test("POST /api/preso/warmup/cancel short-circuits the loop", async () => {
   try {
     await fetch(`${url}/api/preso/start`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: sameOriginHeaders(url, { "content-type": "application/json" }),
       body: JSON.stringify({
         stagingElements: SAMPLE_STAGING_ELEMENTS,
         stagingScreenshot: SAMPLE_SCREENSHOT,
@@ -549,7 +553,7 @@ test("POST /api/preso/warmup/cancel short-circuits the loop", async () => {
     });
     // Cancel while attempt 1 is still in-flight.
     await new Promise((r) => setTimeout(r, 30));
-    const res = await fetch(`${url}/api/preso/warmup/cancel`, { method: "POST" });
+    const res = await fetch(`${url}/api/preso/warmup/cancel`, { method: "POST", headers: sameOriginHeaders(url) });
     assert.equal(res.status, 200);
     resolveBlock();
     await state.warmupPromise;
@@ -571,7 +575,7 @@ test("Start preso fires a warmup call shaped like a real transcript turn", async
   try {
     await fetch(`${url}/api/preso/start`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: sameOriginHeaders(url, { "content-type": "application/json" }),
       body: JSON.stringify({
         stagingElements: SAMPLE_STAGING_ELEMENTS,
         stagingScreenshot: SAMPLE_SCREENSHOT,
@@ -613,7 +617,7 @@ test("transcripts queued during warmup wait for warmup to finish, then run", asy
   try {
     await fetch(`${url}/api/preso/start`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: sameOriginHeaders(url, { "content-type": "application/json" }),
       body: JSON.stringify({
         stagingElements: SAMPLE_STAGING_ELEMENTS,
         stagingScreenshot: SAMPLE_SCREENSHOT,
@@ -655,7 +659,7 @@ test("multiple transcripts queued during warmup are batched into a single follow
   try {
     await fetch(`${url}/api/preso/start`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: sameOriginHeaders(url, { "content-type": "application/json" }),
       body: JSON.stringify({
         stagingElements: SAMPLE_STAGING_ELEMENTS,
         stagingScreenshot: SAMPLE_SCREENSHOT,
@@ -700,7 +704,7 @@ test("warmup broadcasts agent:status thinking while running, idle when done", as
 
     await fetch(`${url}/api/preso/start`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: sameOriginHeaders(url, { "content-type": "application/json" }),
       body: JSON.stringify({
         stagingElements: SAMPLE_STAGING_ELEMENTS,
         stagingScreenshot: SAMPLE_SCREENSHOT,
@@ -748,7 +752,7 @@ test("whiteboard:user-elements WS messages update state.elements in live mode", 
     // Drop staging mode by going live first.
     await fetch(`${url}/api/preso/start`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: sameOriginHeaders(url, { "content-type": "application/json" }),
       body: JSON.stringify({ stagingElements: SAMPLE_STAGING_ELEMENTS }),
     });
     assert.equal(state.mode, "live");
@@ -798,7 +802,7 @@ test("POST /api/preso/start rejects payload missing required fields", async () =
   try {
     const res = await fetch(`${url}/api/preso/start`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: sameOriginHeaders(url, { "content-type": "application/json" }),
       body: JSON.stringify({}),
     });
     assert.equal(res.status, 400);
@@ -849,7 +853,7 @@ test("agent instructions snapshot at preso start are folded into system prompt f
   try {
     await fetch(`${url}/api/preso/start`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: sameOriginHeaders(url, { "content-type": "application/json" }),
       body: JSON.stringify({
         stagingElements: SAMPLE_STAGING_ELEMENTS,
         stagingScreenshot: SAMPLE_SCREENSHOT,
@@ -873,7 +877,7 @@ test("POST /api/preso/start rejects oversized saved agent instructions", async (
   try {
     const res = await fetch(`${url}/api/preso/start`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: sameOriginHeaders(url, { "content-type": "application/json" }),
       body: JSON.stringify({
         stagingElements: SAMPLE_STAGING_ELEMENTS,
         stagingScreenshot: SAMPLE_SCREENSHOT,
@@ -902,7 +906,7 @@ test("agent instructions are included in real-turn system prompt and stay stable
   try {
     await fetch(`${url}/api/preso/start`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: sameOriginHeaders(url, { "content-type": "application/json" }),
       body: JSON.stringify({
         stagingElements: SAMPLE_STAGING_ELEMENTS,
         stagingScreenshot: SAMPLE_SCREENSHOT,
@@ -941,7 +945,7 @@ test("agent instructions changed mid-preso do NOT affect the running preso (cach
   try {
     await fetch(`${url}/api/preso/start`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: sameOriginHeaders(url, { "content-type": "application/json" }),
       body: JSON.stringify({
         stagingElements: SAMPLE_STAGING_ELEMENTS,
         stagingScreenshot: SAMPLE_SCREENSHOT,
@@ -979,7 +983,7 @@ test("empty agentInstructions adds nothing to the system prompt", async () => {
   try {
     await fetch(`${url}/api/preso/start`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: sameOriginHeaders(url, { "content-type": "application/json" }),
       body: JSON.stringify({
         stagingElements: SAMPLE_STAGING_ELEMENTS,
         stagingScreenshot: SAMPLE_SCREENSHOT,

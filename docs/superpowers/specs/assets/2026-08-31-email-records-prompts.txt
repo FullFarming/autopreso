@@ -1,0 +1,32 @@
+Generation mode: built-in Image Gen
+
+Participant final text correction:
+Precise text-only edit of attached NOVA UI image. Keep same dimensions/aspect ratio and all graphics/layout/text unchanged EXCEPT ONE line in upper RIGHT ended panel. Replace the line '오늘 20:00까지 열람 가능' with exactly '새로고침해도 오늘 20:00까지 열람 가능'. Use same gray font at same left origin, fit within right content width without wrapping or moving other elements. The next line '14:00 종료 · 종료 후 6시간' remains intact. Preserve LEFT live panel and CAPSULE icon-only microphone, white/gray captions, RIGHT summary, consent notice with email minji@example.com, marketing exclusion, blue 요약·원문 받기 CTA, footer about received files separate retention. No additions beyond this single text replacement. Current date2026-08-31 but source dates retained.
+
+Participant revision:
+Use case: precise-object-edit. Continue the approved NOVA two-panel UI mockup in attached image, same aspect ratio and ~1485x1059 canvas. Current date August31 2026; retain exact source dates. LEFT live panel is entirely locked: its blue CAPSULE microphone icon-only button (no 발언하기 label), transcript white finalized/gray drafting, title, tabs must remain unchanged.
+Only update RIGHT ended panel bottom action area to communicate email delivery consent BEFORE the existing 요약·원문 받기 CTA. Keep same dark theme #15151A, white/gray Korean Pretendard-like text, #0071E3 action blue, no new decorative cards.
+Retain right title, deadline today20:00 and ended14:00+6h, 원문/AI요약 tabs, summary paragraphs and topic list. Slightly compact right topic area vertically only if needed.
+Above the existing right blue CTA, add a compact two-line readable notice:
+"받을 이메일  minji@example.com"
+"버튼을 누르면 이 회의의 요약·원문 이메일 수신에 동의해요."
+Below it a smaller but readable line "마케팅 수신 동의는 포함되지 않아요."
+Keep button text exact "요약·원문 받기", same wide width, no need to change its corner radius. Under CTA place short gray line "웹 열람은 종료 후 6시간 · 받은 파일은 별도 보관"
+Do not show email sent or checked consent yet: this is pre-click state. No checkbox, modal, added avatars, charts, new tabs. No change to left live panel. All other elements preserved. Sharp correct Korean, comfortably fitted.
+
+Host records extension:
+Create ONE high-fidelity NOVA HOST live-call records detail UI, extending the approved dark product visual in the attached reference. Reference is visual-system grounding, not an existing host screenshot. Current date 2026-08-31 Asia/Seoul. Desktop canvas1440x1024. One screen only, no device/browser frame, no multiple concepts, no detached cards. Use near-black #15151A surface, fine gray separators, white Korean Pretendard-like typography, muted gray metadata, solid action blue #0071E3. Same disciplined Toss-style hierarchy and SEED-like component consistency as reference. No gradients, shadows, avatars, emoji, purple, extra charts/metrics. Main content max-width1180 with generous balanced padding.
+Top left small NOVA brand, then top breadcrumb/back "‹ 라이브콜 기록". Main title "2026년 2분기 실적 발표", metadata "노바 테크놀로지 · 2026.08.31 13:00–14:00 · 회의 종료". Top right prominent solid blue button with download icon "전체 Excel 내보내기", rounded8px. Below button small quiet caption "이 회의의 전체 기록".
+Under header, four full horizontal tabs exact: "참여자 8" | "원문" | "AI 요약" | "수신 신청자 6". Last is selected with blue underline and white text. They are top-level content tabs (not language tabs).
+Main selected section "수신 신청자" with gray supporting line "요약·원문 이메일 수신에 동의한 참여자". Small status totals plain inline text "발송 완료 3 · 발송 대기 2 · 확인 필요 1". These are mock data, not real delivery assertion outside UI.
+Search field on right above table placeholder "이름 또는 이메일 검색".
+Clean roomy table with headers "이름" "이메일" "소속" "신청 시각" "발송 상태". Six rows, horizontal separators, no avatars/checkmarks:
+김민지 | minji@example.com | 한빛투자 | 14:02 | 발송 완료
+이준호 | junho@example.com | 미래증권 | 14:03 | 발송 완료
+박서연 | seoyeon@example.com | 세움자산운용 | 14:04 | 발송 완료
+최현우 | hyunwoo@example.com | 라온리서치 | 14:05 | 발송 대기
+정수빈 | subin@example.com | 이음파트너스 | 14:06 | 발송 대기
+오지훈 | jihoon@example.com | 모아투자 | 14:07 | 이메일 확인 필요
+Statuses use neutral text, light blue emphasis only where helpful, no loud multicolor pills.
+Below table "전체 6명" then a divider and muted export note: "Excel에는 회의 정보, 참여자, 원문, AI 요약, 수신 신청자가 각각의 시트로 담겨요." Second shorter note "검색·페이지와 관계없이 이 회의 전체를 내보내요."
+Keep generous bottom negative space, elegant readable UI. Top original and AI summary tabs must clearly remain visible and accessible. No participant six-hour expiry limitation on host UI. No resend email button, no delete field, no marketing status column. Include tiny "예시 데이터" label near footer so mock dataset is explicit.

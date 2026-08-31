@@ -82,7 +82,7 @@ test("subtitle frontend assets live only in public/", () => {
     `subtitle frontend assets belong in public/ only; found at repo root: ${strays.join(", ")}`,
   );
   // And the real copies must still be there.
-  for (const file of ["subtitle.html", "subtitle.css", "subtitle-dashboard.js", "subtitle-controller.html", "subtitle-controller.js", "subtitle-overlay.js", "subtitle-workspace.js", "subtitle-audio-player.js"]) {
+  for (const file of ["subtitle.html", "subtitle.css", "subtitle-dashboard.js", "subtitle-controller.html", "subtitle-controller.js", "subtitle-overlay.js", "subtitle-workspace.js"]) {
     assert.ok(fs.existsSync(path.join(repoRoot, "public", file)), `public/${file} is missing`);
   }
 });

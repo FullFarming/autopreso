@@ -37,6 +37,8 @@ export const GLOSSARY_PRESETS = [
   ...GLOSSARY_PRESET_LIBRARY,
 ];
 
+for (const preset of GLOSSARY_PRESETS) preset.source = "built-in";
+
 const HOSPITALITY_TRANSLATION_MEMORY = `[번역 메모리 — Hospitality Market Session 2026 문장 매칭]
 서울 호텔 시장의 현 주소와 전망 = Current Landscape and Outlook for the Seoul Hotel Market
 안녕하세요. C&W Hospitality Advisory Services입니다 = Hello. This is C&W Hospitality Advisory Services.
@@ -264,7 +266,7 @@ if (hospitalityPreset && !hospitalityPreset.glossary.includes("[추가 2026-06-2
  *  used to take the first pair match, and hotel-investment-en-ko is listed
  *  before the library, so a fresh install silently defaulted every EN↔KO session
  *  to the hotel glossary (MRG, RevPAR, hotel translation memory). */
-const DEFAULT_PRESET_ID = "default-cre-ai-en-ko";
+export const DEFAULT_GLOSSARY_PRESET_ID = "default-cre-ai-en-ko";
 
 export function getDefaultSubtitleGlossaryContext(languagePair = {}) {
   const a = normalizePresetLanguage(languagePair.a) || "en";
@@ -276,7 +278,7 @@ export function getDefaultSubtitleGlossaryContext(languagePair = {}) {
   };
   // The designated default wins for its own language pair; every other pair
   // falls back to the first prepared preset that covers it.
-  const preset = GLOSSARY_PRESETS.find((entry) => entry.id === DEFAULT_PRESET_ID && matchesPair(entry))
+  const preset = GLOSSARY_PRESETS.find((entry) => entry.id === DEFAULT_GLOSSARY_PRESET_ID && matchesPair(entry))
     ?? GLOSSARY_PRESETS.find(matchesPair);
   if (!preset) return { glossary: "", domain: "" };
   return { glossary: preset.glossary, domain: preset.domain };

@@ -1,39 +1,48 @@
 import {
-  createSubtitleAudioPlayer,
-  createTranslatedAudioGuard,
-  shouldGateTranslatedAudioInput,
-} from "./subtitle-audio-player.js";
+  CAPTION_AUDIO_PROCESSOR_BUFFER_SIZE,
+  CAPTION_AUDIO_SAMPLE_RATE,
+  captureMicrophoneStream,
+  createCaptionAudioChunker,
+  pcm16ArrayBufferToBase64,
+} from "./subtitle-audio-capture.js";
 import { buildMonthGrid, buildTimeGrid } from "./records-calendar.js";
 // Every user-visible string in this file resolves through t(); subtitle-workspace.js
 // owns restoring/persisting the choice and the declarative data-i18n pass.
-import { getLanguage, subscribe as subscribeToLanguage, t } from "./subtitle-i18n.js";
+import { getLanguage, hasKey, subscribe as subscribeToLanguage, t } from "./subtitle-i18n.js";
 
-const SAMPLE_RATE = 24000;
-const LIVE_AUDIO_CHUNK_DURATION_MS = 100;
-const LIVE_AUDIO_CHUNK_SAMPLES = SAMPLE_RATE * LIVE_AUDIO_CHUNK_DURATION_MS / 1_000;
-const AUDIO_PROCESSOR_BUFFER_SIZE = 1024;
 const LOCAL_SERVER_DASHBOARD_URL = "http://127.0.0.1:3210/subtitle.html";
 const HISTORY_TIME_ZONE = "Asia/Seoul";
 const INPUT_SIGNAL_THRESHOLD = 0.035;
 const INPUT_SILENCE_WARNING_MS = 5000;
 const INPUT_STATUS_BROADCAST_MS = 1000;
+const LIVE_TRANSLATION_STALL_MILLISECONDS = 2_000;
+const LIVE_TRANSLATION_SIGNAL_GAP_MILLISECONDS = 250;
 const CAPTURE_TIMEOUT_MS = 8000;
-// Normal translated sentences can exceed three seconds. This cap prevents
-// unbounded memory growth while preserving ordinary continuous speech.
-const MAX_TRANSLATED_AUDIO_QUEUE_SECONDS = 30;
+const WEBSOCKET_OPEN_TIMEOUT_MS = 5_000;
+const SUBTITLE_START_ACK_TIMEOUT_MS = 10_000;
+const SUBTITLE_PREFLIGHT_ACK_TIMEOUT_MS = 2_000;
+const DEFAULT_GLOSSARY_PRESET_ID = "default-cre-ai-en-ko";
+const CUSTOM_GLOSSARY_PRESET_VALUE = "custom";
+const MAX_GLOSSARY_SELECTIONS = 5;
+const BUILT_IN_GLOSSARY_OPTIONS = Object.freeze([
+  { sourceId: "common_business", label: "공통 비즈니스", description: "회의·발표 기본 표현", targetLanguages: ["en"] },
+  { sourceId: "ai_ax", label: "AI·AX", description: "AI 전환·데이터·자동화", targetLanguages: ["en"] },
+  { sourceId: "commercial_real_estate", label: "상업용 부동산", description: "투자·개발·자산관리", targetLanguages: ["en"] },
+  { sourceId: "hospitality", label: "호텔·호스피탈리티", description: "호텔 운영·투자·브랜드", targetLanguages: ["en"] },
+  { sourceId: "fnb_retail", label: "F&B·리테일", description: "식음·임대·리테일", targetLanguages: ["en", "ja"] },
+  { sourceId: "proper_nouns", label: "고유명사", description: "회사·브랜드·인명 표기", targetLanguages: ["en"] },
+  { sourceId: "ko_ja_idioms", label: "한·일 관용표현", description: "자연스러운 일본어 관용표현", targetLanguages: ["ja"] },
+]);
 const DEFAULT_SUBTITLE = {
   inputMode: "system_mic",
   micDeviceId: "",
   languagePair: { a: "en", b: "ko" },
   translationLanguages: ["en", "ko"],
   outputMode: "captions",
-  voiceProvider: "gemini",
-  audioLanguage: "en",
-  audioVolume: 0.8,
   displayMode: "translation_only",
   showSourceText: false,
   translateAllLanguages: false,
-  model: "gpt-realtime-translate",
+  geminiTranscribeModel: "gemini-3.5-transcribe-live",
   fontFamily: "Arial, Helvetica, sans-serif",
   translationFontSize: 38,
   sourceFontSize: 36,
@@ -50,12 +59,53 @@ const DEFAULT_SUBTITLE = {
   translationProvider: "gemini",
   glossary: "",
   translationDomain: "",
+  glossaryPresetId: DEFAULT_GLOSSARY_PRESET_ID,
+  glossaryPresetName: "",
+  glossaries: [{ sourceKind: "builtin", sourceId: "common_business" }],
   verticalOffset: 48,
 };
-
-const OPENAI_REALTIME_TRANSLATION_LANGUAGES = new Set([
-  "en", "es", "pt", "fr", "ja", "ru", "zh", "de", "ko", "hi", "id", "vi", "it",
+const RETIRED_SUBTITLE_SETTING_KEYS = new Set([
+  "model",
+  "geminiModel",
+  "liveModel",
+  "voiceProvider",
+  "audioLanguage",
+  "audioVolume",
 ]);
+
+function normalizeCaptionSettings(settings = {}) {
+  const currentSettings = Object.fromEntries(
+    Object.entries(settings).filter(([key]) => !RETIRED_SUBTITLE_SETTING_KEYS.has(key)),
+  );
+  const glossaries = normalizeGlossarySelections(currentSettings.glossaries);
+  return {
+    ...DEFAULT_SUBTITLE,
+    ...currentSettings,
+    outputMode: "captions",
+    geminiTranscribeModel: DEFAULT_SUBTITLE.geminiTranscribeModel,
+    translationProvider: "gemini",
+    glossaries,
+  };
+}
+
+function normalizeGlossarySelections(value) {
+  if (!Array.isArray(value)) return DEFAULT_SUBTITLE.glossaries.map((selection) => ({ ...selection }));
+  const selections = [];
+  const keys = new Set();
+  for (const item of value) {
+    const sourceKind = item?.sourceKind;
+    const sourceId = String(item?.sourceId ?? "");
+    const documentVersion = Number(item?.documentVersion);
+    const isBuiltIn = sourceKind === "builtin" && BUILT_IN_GLOSSARY_OPTIONS.some((option) => option.sourceId === sourceId);
+    const isHost = sourceKind === "host" && /^[0-9a-f-]{36}$/iu.test(sourceId) && Number.isSafeInteger(documentVersion) && documentVersion > 0;
+    const key = `${sourceKind}:${sourceId}`;
+    if ((!isBuiltIn && !isHost) || keys.has(key)) continue;
+    keys.add(key);
+    selections.push(isBuiltIn ? { sourceKind, sourceId } : { sourceKind, sourceId, documentVersion });
+    if (selections.length === MAX_GLOSSARY_SELECTIONS) break;
+  }
+  return selections.length ? selections : DEFAULT_SUBTITLE.glossaries.map((selection) => ({ ...selection }));
+}
 
 const state = {
   ws: null,
@@ -65,13 +115,86 @@ const state = {
   streamers: [],
   running: false,
   hasOpenAIKey: false,
-  hasOpenAISecondaryKey: false,
   hasGeminiKey: false,
   hasGeminiSecondaryKey: false,
   previewStatusTimer: null,
   history: { records: [], topics: [], historyDays: [], recorderStatus: {} },
   audioMeters: new Map(),
 };
+
+const CAPTION_RUNTIME_TRANSITIONS = Object.freeze({
+  idle: new Set(["starting"]),
+  starting: new Set(["running", "stopping", "failed"]),
+  running: new Set(["reconnecting", "stopping"]),
+  reconnecting: new Set(["running", "stopping", "failed"]),
+  stopping: new Set(["idle"]),
+  failed: new Set(["idle", "starting", "reconnecting", "stopping"]),
+});
+let captionRuntimeState = "idle";
+let liveTranslationReconnectPromise = null;
+let isLiveParticipantDemandEnabled = false;
+let captionWebSocketReconnectTimer = null;
+let liveCaptionSocketRecoveryPromise = null;
+let liveCaptionSocketRecoveryTimer = null;
+
+function createLiveTranslationStallMonitor(
+  onStall,
+  stallMilliseconds = LIVE_TRANSLATION_STALL_MILLISECONDS,
+  signalGapMilliseconds = LIVE_TRANSLATION_SIGNAL_GAP_MILLISECONDS,
+) {
+  const signalBySource = new Map();
+  let signalWindowStartedAt = null;
+  let lastSignalAt = null;
+  let isRecoveryRequested = false;
+
+  const suspend = () => {
+    signalBySource.clear();
+    signalWindowStartedAt = null;
+    lastSignalAt = null;
+  };
+
+  return {
+    noteInput(source, hasSignal, now, isEligible) {
+      signalBySource.set(source, hasSignal === true);
+      if (!isEligible) {
+        suspend();
+        return false;
+      }
+      if (![...signalBySource.values()].some(Boolean)) return false;
+      if (lastSignalAt === null || now - lastSignalAt > signalGapMilliseconds) signalWindowStartedAt = now;
+      lastSignalAt = now;
+      if (isRecoveryRequested || signalWindowStartedAt === null || now - signalWindowStartedAt < stallMilliseconds) return false;
+      isRecoveryRequested = true;
+      onStall();
+      return true;
+    },
+    noteOutput(now) {
+      isRecoveryRequested = false;
+      const hasSignal = [...signalBySource.values()].some(Boolean);
+      signalWindowStartedAt = hasSignal ? now : null;
+      lastSignalAt = hasSignal ? now : null;
+    },
+    suspend,
+    reset() {
+      suspend();
+      isRecoveryRequested = false;
+    },
+  };
+}
+
+const liveTranslationStallMonitor = createLiveTranslationStallMonitor(() => {
+  void reconnectLiveCallTranslation();
+});
+
+function transitionCaptionRuntime(nextState) {
+  if (captionRuntimeState === nextState) return true;
+  if (!CAPTION_RUNTIME_TRANSITIONS[captionRuntimeState]?.has(nextState)) {
+    console.warn(`[subtitle-runtime] ignored invalid transition ${captionRuntimeState} -> ${nextState}`);
+    return false;
+  }
+  captionRuntimeState = nextState;
+  return true;
+}
 
 const form = document.getElementById("subtitle-settings");
 const startButton = document.getElementById("start-subtitles");
@@ -93,12 +216,9 @@ const preview = document.getElementById("subtitle-preview");
 const previewPanel = preview.closest(".preview-panel");
 const micSelect = form.elements.micDeviceId;
 const openaiKeyInput = form.elements.openaiKey;
-const openaiSecondaryKeyInput = form.elements.openaiSecondaryKey;
 const opacityValue = document.getElementById("opacity-value");
 const saveOpenAIKeyButton = document.getElementById("save-openai-key");
 const openaiKeyStatus = document.getElementById("openai-key-status");
-const saveOpenAISecondaryKeyButton = document.getElementById("save-openai-secondary-key");
-const openaiSecondaryKeyStatus = document.getElementById("openai-secondary-key-status");
 const geminiKeyInput = form.elements.geminiKey;
 const saveGeminiKeyButton = document.getElementById("save-gemini-key");
 const geminiKeyStatus = document.getElementById("gemini-key-status");
@@ -116,9 +236,8 @@ const clearHistoryButton = document.getElementById("clear-history");
 const realtimeApiStatus = document.getElementById("realtime-api-status");
 const topicModelStatus = document.getElementById("topic-model-status");
 const refreshAudioDevicesButton = document.getElementById("refresh-audio-devices");
-const playbackOptions = document.getElementById("pt-playback-options");
-const audioVolumeValue = document.getElementById("audio-volume-value");
 const primaryNavigationLinks = [...document.querySelectorAll(".subtitle-app-rail nav a[href^='#']")];
+const railNavigationItems = [...document.querySelectorAll(".subtitle-app-rail nav a, .subtitle-app-rail nav button")];
 const settingsDrawer = document.querySelector("details.settings-drawer");
 const CONTROLLER_POSITION_STORAGE_KEY = "realtime-noel-caption-controller-position";
 const audioStatus = {
@@ -133,30 +252,6 @@ const audioStatus = {
     state: document.getElementById("mic-audio-state"),
   },
 };
-
-const subtitleAudioPlayer = createSubtitleAudioPlayer({
-  maxQueueSeconds: MAX_TRANSLATED_AUDIO_QUEUE_SECONDS,
-  onQueueRestart: () => {
-    setPreviewStatus(t("audio.recoveryContinuing"), 2400);
-    showNotice(t("notice.audioQueueTrimmed"));
-  },
-  onFailure: (error) => {
-    showError(error);
-  },
-});
-const translatedAudioGuard = createTranslatedAudioGuard();
-
-function clearTranslatedAudioQueue() {
-  // The player owns the source set and clears each source with source.stop()
-  // followed by source.disconnect() before dropping the in-memory queue.
-  subtitleAudioPlayer.clear();
-}
-
-function failTranslatedAudio(error) {
-  clearTranslatedAudioQueue();
-  showError(error);
-  setPreviewStatus(t("audio.recoveryWaiting"), 2400);
-}
 
 if (location.protocol === "file:") {
   showFileProtocolWarning();
@@ -180,26 +275,17 @@ function showFileProtocolWarning() {
 }
 
 form.addEventListener("input", (event) => {
-  if (event.target === openaiKeyInput || event.target === openaiSecondaryKeyInput || event.target === geminiKeyInput || event.target === geminiSecondaryKeyInput) return;
-  const previousSettings = state.settings;
+  if (event.target === openaiKeyInput || event.target === geminiKeyInput || event.target === geminiSecondaryKeyInput || event.target === glossaryPresetNameInput) return;
+  if (event.target === form.elements.glossary
+    || event.target === form.elements.translationDomain
+    || event.target?.name === "translationLanguages") {
+    markGlossaryPresetCustom();
+  }
   syncLinkedControl(event.target);
   syncLanguageControls(event.target);
-  syncAudioLanguageOptions(readTranslationLanguagesFromForm(), form.elements.audioLanguage?.value);
-  enforcePtOutputAvailability();
+  syncLiveCallLanguageControls(event.target);
   state.settings = readSettingsFromForm();
-  if (event.target?.name === "audioVolume") subtitleAudioPlayer.setVolume(state.settings.audioVolume);
-  if (["outputMode", "voiceProvider", "audioLanguage", "translationLanguages"].includes(event.target?.name)
-    && (previousSettings.outputMode !== state.settings.outputMode
-      || previousSettings.voiceProvider !== state.settings.voiceProvider
-      || previousSettings.audioLanguage !== state.settings.audioLanguage
-      || event.target?.name === "translationLanguages")) {
-    subtitleAudioPlayer.clear();
-  }
-  if (state.running && event.target?.name === "outputMode" && state.settings.outputMode !== "captions") {
-    void subtitleAudioPlayer.resume(state.settings.audioVolume).catch(showError);
-  }
   applyPreviewSettings(state.settings);
-  updatePtOutputControls();
   if (state.running) syncRuntimeOutputVisibility();
   updateSessionSummary();
   updateServiceStrip();
@@ -210,14 +296,13 @@ form.addEventListener("input", (event) => {
 // Settings that change the SET of translation channels (which languages, which
 // engine). When one of these changes mid-session the running channels are stale
 // and keep translating the old configuration — so we rebuild them.
-const CHANNEL_REBUILD_CONTROLS = new Set(["translationLanguages", "outputMode", "voiceProvider", "audioLanguage"]);
+const CHANNEL_REBUILD_CONTROLS = new Set(["translationLanguages"]);
 
 form.addEventListener("change", (event) => {
+  if (event.target === glossaryPresetNameInput) return;
   syncLanguageControls(event.target);
-  syncAudioLanguageOptions(readTranslationLanguagesFromForm(), form.elements.audioLanguage?.value);
-  enforcePtOutputAvailability();
+  syncLiveCallLanguageControls(event.target);
   state.settings = readSettingsFromForm();
-  updatePtOutputControls();
   updateAudioInspectorLabels();
   if (event.target === overlayEnabledInput) syncDesktopOverlayVisibility(state.settings.overlayEnabled);
   const name = event.target?.name;
@@ -243,7 +328,7 @@ form.addEventListener("change", (event) => {
 
 startButton.addEventListener("click", startSubtitles);
 stopButton.addEventListener("click", stopSubtitles);
-controllerRestartButton?.addEventListener("click", restartSubtitles);
+controllerRestartButton?.addEventListener("click", restartCaptionsFromController);
 controllerStopButton?.addEventListener("click", stopSubtitles);
 controllerFontDownButton?.addEventListener("click", () => adjustControllerFontSize(-2));
 controllerFontUpButton?.addEventListener("click", () => adjustControllerFontSize(2));
@@ -255,7 +340,6 @@ for (const button of controllerPositionButtons) {
 }
 initCaptionControllerDrag();
 saveOpenAIKeyButton.addEventListener("click", saveOpenAIKey);
-saveOpenAISecondaryKeyButton.addEventListener("click", saveOpenAISecondaryKey);
 saveGeminiKeyButton.addEventListener("click", saveGeminiKey);
 saveGeminiSecondaryKeyButton?.addEventListener("click", saveGeminiSecondaryKey);
 // Download the un-cleared translation history as an Excel-compatible CSV.
@@ -288,6 +372,20 @@ for (const navigationLink of primaryNavigationLinks) {
   });
 }
 
+for (const railNavigationItem of railNavigationItems) {
+  railNavigationItem.addEventListener("keydown", (event) => {
+    if (!["ArrowUp", "ArrowDown", "Home", "End"].includes(event.key)) return;
+    const availableItems = railNavigationItems.filter((item) => !item.disabled && !item.closest("[hidden]"));
+    const currentIndex = availableItems.indexOf(railNavigationItem);
+    if (currentIndex < 0 || availableItems.length === 0) return;
+    event.preventDefault();
+    const nextIndex = event.key === "Home" ? 0
+      : event.key === "End" ? availableItems.length - 1
+      : (currentIndex + (event.key === "ArrowDown" ? 1 : -1) + availableItems.length) % availableItems.length;
+    availableItems[nextIndex]?.focus();
+  });
+}
+
 window.addEventListener("hashchange", () => {
   const navigationLink = primaryNavigationLinks.find((link) => link.getAttribute("href") === window.location.hash);
   if (navigationLink) activatePrimaryNavigation(navigationLink, false);
@@ -295,6 +393,97 @@ window.addEventListener("hashchange", () => {
 
 const initialNavigationLink = primaryNavigationLinks.find((link) => link.getAttribute("href") === window.location.hash);
 if (initialNavigationLink) activatePrimaryNavigation(initialNavigationLink, false);
+
+// Settings uses two peer panels instead of nesting operational controls inside
+// an always-visible engine form. Switching is local-only and preserves every
+// form value because both panels remain mounted.
+const settingsViewTabs = [...document.querySelectorAll("[data-settings-view]")];
+const settingsViewPanels = [...document.querySelectorAll("[data-settings-panel]")];
+
+function activateSettingsView(view, { focus = false } = {}) {
+  const selected = view === "advanced" ? "advanced" : "general";
+  for (const tab of settingsViewTabs) {
+    const isSelected = tab.dataset.settingsView === selected;
+    tab.classList.toggle("is-selected", isSelected);
+    tab.setAttribute("aria-selected", String(isSelected));
+    tab.tabIndex = isSelected ? 0 : -1;
+    if (focus && isSelected) tab.focus();
+  }
+  for (const panel of settingsViewPanels) {
+    panel.hidden = panel.dataset.settingsPanel !== selected;
+  }
+  if (selected === "advanced" && settingsDrawer) settingsDrawer.open = true;
+}
+
+for (const tab of settingsViewTabs) {
+  tab.addEventListener("click", () => activateSettingsView(tab.dataset.settingsView));
+  tab.addEventListener("keydown", (event) => {
+    if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+    event.preventDefault();
+    const currentIndex = settingsViewTabs.indexOf(tab);
+    const nextIndex = event.key === "Home" ? 0
+      : event.key === "End" ? settingsViewTabs.length - 1
+      : (currentIndex + (event.key === "ArrowRight" ? 1 : -1) + settingsViewTabs.length) % settingsViewTabs.length;
+    activateSettingsView(settingsViewTabs[nextIndex]?.dataset.settingsView, { focus: true });
+  });
+}
+activateSettingsView("general");
+document.getElementById("manage-glossaries")?.addEventListener("click", () => activateSettingsView("advanced"));
+
+async function initializeDesktopLaunch({ buttonId, methodName, failureKey, availabilityMethodName = "" }) {
+  const button = document.getElementById(buttonId);
+  const desktopBridge = window.realtimeNoelDesktop;
+  if (!button || typeof desktopBridge?.[methodName] !== "function") return;
+  button.hidden = true;
+  try {
+    if (availabilityMethodName) {
+      if (typeof desktopBridge?.[availabilityMethodName] !== "function") return;
+      const response = await desktopBridge[availabilityMethodName]();
+      const isEnabled = response === true || (response?.ok === true && response.data === true);
+      if (!isEnabled) return;
+    }
+    button.hidden = false;
+    button.addEventListener("click", async () => {
+      button.disabled = true;
+      button.setAttribute("aria-busy", "true");
+      try {
+        const result = await desktopBridge[methodName]();
+        if (result?.ok === false) throw new Error(result.error || failureKey);
+      } catch {
+        showError(new Error(t(failureKey)));
+      } finally {
+        button.disabled = false;
+        button.removeAttribute("aria-busy");
+      }
+    });
+  } catch {
+    button.hidden = true;
+  }
+}
+
+function initializeMeetingCoachLaunch() {
+  return Promise.all([
+    initializeDesktopLaunch({
+      buttonId: "open-meeting-prep",
+      methodName: "meetingCoachOpenPrep",
+      failureKey: "launch.meetingPrepFailed",
+    }),
+    initializeDesktopLaunch({
+      buttonId: "open-live-coach",
+      methodName: "meetingCoachOpenLiveWindows",
+      failureKey: "launch.liveCoachFailed",
+    }),
+  ]);
+}
+
+function initializeLiveInterpreterLaunch() {
+  return initializeDesktopLaunch({
+    buttonId: "open-live-interpreter",
+    methodName: "openLiveInterpreter",
+    failureKey: "launch.liveInterpreterFailed",
+    availabilityMethodName: "getLiveInterpreterEnabled",
+  });
+}
 
 // Live Call feature flag (desktop host, REALTIME_NOEL_LIVE_CALL_ENABLED):
 // when the host disables Live Call, hide the whole entry section. Base
@@ -305,6 +494,9 @@ if (window.realtimeNoelDesktop?.getLiveCallEnabled) {
     document.querySelector(".live-handoff")?.setAttribute("hidden", "");
   }).catch(() => {});
 }
+
+void initializeMeetingCoachLaunch();
+void initializeLiveInterpreterLaunch();
 
 document.getElementById("export-settings")?.addEventListener("click", () => {
   window.location.href = "/api/settings/export";
@@ -317,29 +509,666 @@ importSettingsFileInput?.addEventListener("change", async (event) => {
   if (file) await importSettingsFromFile(file);
 });
 
-// Built-in industry glossary presets: selecting one fills glossary + domain +
-// language pair together and saves, so a prepared meeting type (hotel
-// investment EN↔KO, F&B leasing KO↔JA, …) is one click away.
+// Built-ins remain local and deterministic; only user-created presets cross
+// the authenticated Electron bridge. Keeping both sources in one native select
+// preserves keyboard, screen-reader, and older-browser behaviour.
 let glossaryPresets = [];
-async function hydrateGlossaryPresets() {
-  const select = form.elements.glossaryPreset;
-  if (!select) return;
+let syncedGlossaryPresets = [];
+let builtInGlossaryPresetStatus = "pending";
+let syncedGlossaryPresetStatus = "pending";
+let editingCustomPreset = null;
+let isGlossaryPresetBusy = false;
+let isGlossaryDeleteConfirmationOpen = false;
+
+const glossaryPresetSelect = form.elements.glossaryPreset;
+const glossaryPresetEditor = document.getElementById("glossary-preset-editor");
+const glossaryPresetNameInput = document.getElementById("glossary-preset-name");
+const createGlossaryPresetButton = document.getElementById("create-glossary-preset");
+const saveGlossaryPresetButton = document.getElementById("save-glossary-preset");
+const cancelGlossaryPresetButton = document.getElementById("cancel-glossary-preset");
+const updateGlossaryPresetButton = document.getElementById("update-glossary-preset");
+const deleteGlossaryPresetButton = document.getElementById("delete-glossary-preset");
+const confirmDeleteGlossaryPresetButton = document.getElementById("confirm-delete-glossary-preset");
+const cancelDeleteGlossaryPresetButton = document.getElementById("cancel-delete-glossary-preset");
+const glossaryPresetActions = document.querySelector(".glossary-preset-actions");
+const glossaryPresetStatus = document.getElementById("glossary-preset-status");
+const glossarySelectionBuiltIns = document.getElementById("glossary-selection-builtins");
+const glossarySelectionUsers = document.getElementById("glossary-selection-users");
+const glossarySelectionCount = document.getElementById("glossary-selection-count");
+const glossarySelectionStatus = document.getElementById("glossary-selection-status");
+
+const GLOSSARY_PRESET_ERROR_CODES = new Set([
+  "HOST_LOGIN_REQUIRED",
+  "NETWORK_UNAVAILABLE",
+  "INVALID_GLOSSARY_PRESET",
+  "GLOSSARY_PRESET_LIMIT_REACHED",
+  "GLOSSARY_PRESET_NAME_CONFLICT",
+  "GLOSSARY_PRESET_VERSION_CONFLICT",
+  "GLOSSARY_PRESET_NOT_FOUND",
+  "INVALID_GLOSSARY_DOCUMENT",
+  "DESKTOP_BRIDGE_UNAVAILABLE",
+]);
+
+function glossaryPresetDisplayName(preset, source = preset?.source) {
+  const key = `glossary.presetLabel.${preset?.id}`;
+  if ((source === "builtin" || source === "built-in") && hasKey(key)) return t(key);
+  return String(preset?.name ?? preset?.label ?? "").trim();
+}
+
+function normalizeSyncedGlossaryPreset(value) {
+  if (!value || typeof value !== "object") return null;
+  const id = String(value.id ?? "").trim();
+  const name = String(value.name ?? "").trim();
+  const languageA = String(value.languagePair?.a ?? "").trim();
+  const languageB = String(value.languagePair?.b ?? "").trim();
+  const version = Number(value.version);
+  const isStructured = value.source === "structured";
+  if (!id || !name || !languageA || !languageB || !Number.isSafeInteger(version) || version < 1) return null;
+  return {
+    id,
+    name,
+    domain: String(value.domain ?? ""),
+    glossary: String(value.glossary ?? ""),
+    languagePair: { a: languageA, b: languageB },
+    version,
+    activeDocumentVersion: Number.isSafeInteger(Number(value.activeDocumentVersion)) && Number(value.activeDocumentVersion) > 0
+      ? Number(value.activeDocumentVersion)
+      : null,
+    updatedAt: String(value.updatedAt ?? ""),
+    source: "user",
+    isStructured,
+  };
+}
+
+function selectedGlossaries() {
+  return [...document.querySelectorAll('input[name="glossaries"]:checked')].map((input) => (
+    input.dataset.sourceKind === "host"
+      ? { sourceKind: "host", sourceId: input.value, documentVersion: Number(input.dataset.documentVersion) }
+      : { sourceKind: "builtin", sourceId: input.value }
+  ));
+}
+
+let glossarySelectionStatusState = { key: "glossary.selection.checkConflicts", kind: "", values: {} };
+let glossaryPresetStatusState = { key: "", kind: "", values: {} };
+let glossaryCustomStatusState = { key: "", values: {}, message: "" };
+
+function setGlossarySelectionStatus(key = "glossary.selection.checkConflicts", kind = "", values = {}) {
+  glossarySelectionStatusState = { key, kind, values };
+  if (!glossarySelectionStatus) return;
+  glossarySelectionStatus.textContent = t(key, values);
+  glossarySelectionStatus.classList.toggle("is-error", kind === "error");
+}
+setGlossarySelectionStatus();
+
+function hostTargetLanguages(option) {
+  return Array.isArray(option.targetLanguages) && option.targetLanguages.length
+    ? option.targetLanguages
+    : [option.languagePair?.b];
+}
+
+function glossarySelectionOption(option, sourceKind, selectedKeys, targetLanguages, selectedSourceLanguage) {
+  const label = document.createElement("label");
+  label.className = "glossary-selection-option";
+  const input = document.createElement("input");
+  input.type = "checkbox";
+  input.name = "glossaries";
+  input.value = option.sourceId ?? option.id;
+  input.dataset.sourceKind = sourceKind;
+  input.dataset.sourceLanguage = sourceKind === "host" ? option.languagePair?.a : "ko";
+  if (sourceKind === "host") input.dataset.documentVersion = String(option.activeDocumentVersion);
+  const key = `${sourceKind}:${input.value}`;
+  const isSelected = selectedKeys.has(key);
+  const isTargetCompatible = sourceKind === "host"
+    ? hostTargetLanguages(option).some((language) => targetLanguages.includes(language))
+    : option.targetLanguages.some((language) => targetLanguages.includes(language));
+  const isSourceCompatible = !selectedSourceLanguage || selectedSourceLanguage === input.dataset.sourceLanguage;
+  const canToggle = isSelected || (isTargetCompatible && isSourceCompatible);
+  input.disabled = !canToggle;
+  input.checked = isSelected;
+  label.classList.toggle("is-incompatible", !isTargetCompatible || !isSourceCompatible);
+  const copy = document.createElement("span");
+  const title = document.createElement("strong");
+  title.textContent = sourceKind === "builtin" ? t(`glossary.builtin.${input.value}.label`) : option.label ?? option.name;
+  // Compact rows: the long description moves to a tooltip; only the reason an
+  // option cannot be picked stays visible.
+  const reason = !isTargetCompatible
+    ? t("glossary.selection.targetIncompatible")
+    : !isSourceCompatible
+      ? t("glossary.selection.sourceIncompatible")
+      : "";
+  label.title = sourceKind === "builtin" ? t(`glossary.builtin.${input.value}.description`) : option.description ?? option.domain ?? "";
+  copy.append(title);
+  if (reason) {
+    const description = document.createElement("small");
+    description.textContent = reason;
+    copy.append(description);
+  }
+  label.append(input, copy);
+  const row = document.createElement("div");
+  row.className = "glossary-option-row";
+  const detail = document.createElement("button");
+  detail.type = "button";
+  detail.className = "glossary-detail-button";
+  detail.textContent = t("glossary.detail");
+  detail.addEventListener("click", () => {
+    void openGlossaryDetail({
+      sourceKind,
+      sourceId: input.value,
+      label: title.textContent,
+      documentVersion: sourceKind === "host" ? option.activeDocumentVersion : null,
+      targetLanguage: sourceKind === "host" ? option.languagePair?.b : "en",
+    });
+  });
+  row.append(label, detail);
+  return row;
+}
+
+function updateGlossaryDropdownSummary() {
+  const summary = document.querySelector('[data-lang-select="glossary"] .lang-select-summary');
+  if (!summary) return;
+  const names = [...document.querySelectorAll('input[name="glossaries"]:checked')]
+    .map((input) => input.closest(".glossary-selection-option")?.querySelector("strong")?.textContent ?? input.value);
+  summary.textContent = names.length ? names.join(", ") : t("glossary.detailNone");
+}
+
+// ── Glossary detail popup ───────────────────────────────────────────────────
+// "자세히" on any pack opens a read view of its terms: searchable, filterable
+// per target language, with a custom-term form that appends to the LOCAL
+// glossary (직접 입력) through the normal settings save path.
+
+const GLOSSARY_DETAIL_RENDER_CAP = 200;
+const glossaryDetailState = { label: "", sourceKind: "", sourceId: "", sourceLanguage: "", targetLanguages: [], terms: [], language: "all", query: "" };
+
+async function openGlossaryDetail({ sourceKind, sourceId, label, documentVersion, targetLanguage }) {
+  const overlay = document.getElementById("glossary-detail-overlay");
+  if (!overlay) return;
   try {
-    glossaryPresets = await fetch("/api/glossary-presets").then((res) => res.json());
-    for (const preset of glossaryPresets) {
-      select.append(new Option(`${preset.label} — ${preset.industry}`, preset.id));
+    let detail;
+    if (sourceKind === "builtin") {
+      const response = await fetch(`/api/built-in-glossaries/${encodeURIComponent(sourceId)}`);
+      if (!response.ok) throw new Error(t("glossary.detailLoadFailed"));
+      const body = await response.json();
+      detail = {
+        label: body.glossary.label,
+        sourceLanguage: body.glossary.sourceLanguage,
+        targetLanguages: body.glossary.targetLanguages,
+        terms: body.glossary.terms,
+      };
+    } else {
+      const data = await invokeGlossaryPresetBridge("readGlossaryPresetVersion", {
+        id: sourceId,
+        version: documentVersion,
+        targetLanguage: targetLanguage ?? "en",
+      });
+      const terms = Array.isArray(data?.terms) ? data.terms : [];
+      detail = {
+        label,
+        sourceLanguage: "",
+        targetLanguages: [...new Set(terms.flatMap((term) => Object.keys(term.translations ?? {})))],
+        terms,
+      };
     }
-  } catch {
-    // Presets are a convenience; the manual glossary textarea still works.
+    Object.assign(glossaryDetailState, detail, { sourceKind, sourceId, language: "all", query: "" });
+    const search = document.getElementById("glossary-detail-search");
+    if (search) search.value = "";
+    setGlossaryCustomStatus();
+    renderGlossaryDetail();
+    overlay.hidden = false;
+    document.getElementById("glossary-detail-search")?.focus();
+  } catch (error) {
+    showError(error);
   }
 }
-hydrateGlossaryPresets();
-form.elements.glossaryPreset?.addEventListener("change", (event) => applyGlossaryPreset(event.target.value));
+
+function closeGlossaryDetail() {
+  const overlay = document.getElementById("glossary-detail-overlay");
+  if (overlay) overlay.hidden = true;
+}
+
+function glossaryDetailFilteredTerms() {
+  const query = glossaryDetailState.query.normalize("NFC").toLocaleLowerCase("und");
+  return glossaryDetailState.terms.filter((term) => {
+    const translations = term.translations ?? {};
+    if (glossaryDetailState.language !== "all" && typeof translations[glossaryDetailState.language] !== "string") return false;
+    if (!query) return true;
+    const haystack = [term.source, ...Object.values(translations), term.context ?? ""]
+      .join("\n").normalize("NFC").toLocaleLowerCase("und");
+    return haystack.includes(query);
+  });
+}
+
+function renderGlossaryDetail() {
+  const title = document.getElementById("glossary-detail-title");
+  const meta = document.getElementById("glossary-detail-meta");
+  const chips = document.getElementById("glossary-detail-languages");
+  const list = document.getElementById("glossary-detail-terms");
+  const more = document.getElementById("glossary-detail-more");
+  if (!title || !meta || !chips || !list || !more) return;
+  title.textContent = glossaryDetailState.sourceKind === "builtin"
+    ? t(`glossary.builtin.${glossaryDetailState.sourceId}.label`)
+    : glossaryDetailState.label;
+  meta.textContent = glossaryDetailState.sourceLanguage
+    ? `${glossaryDetailState.terms.length}${t("glossary.detailTermCount")} · ${t("glossary.detailSourceLanguage")} ${glossaryDetailState.sourceLanguage}`
+    : `${glossaryDetailState.terms.length}${t("glossary.detailTermCount")}`;
+
+  chips.replaceChildren(...["all", ...glossaryDetailState.targetLanguages].map((language) => {
+    const chip = document.createElement("button");
+    chip.type = "button";
+    chip.className = "glossary-detail-language-chip";
+    chip.textContent = language === "all" ? t("glossary.detailAll") : language;
+    chip.setAttribute("aria-pressed", String(glossaryDetailState.language === language));
+    chip.addEventListener("click", () => {
+      glossaryDetailState.language = language;
+      renderGlossaryDetail();
+    });
+    return chip;
+  }));
+
+  const filtered = glossaryDetailFilteredTerms();
+  list.replaceChildren(...filtered.slice(0, GLOSSARY_DETAIL_RENDER_CAP).map((term) => {
+    const item = document.createElement("li");
+    const source = document.createElement("strong");
+    source.textContent = term.source;
+    const translation = document.createElement("span");
+    const translations = term.translations ?? {};
+    translation.textContent = glossaryDetailState.language === "all"
+      ? Object.entries(translations).map(([language, value]) => (
+        glossaryDetailState.targetLanguages.length > 1 ? `${language}: ${value}` : value
+      )).join(" · ")
+      : translations[glossaryDetailState.language] ?? "";
+    item.append(source, translation);
+    if (term.context) {
+      const context = document.createElement("small");
+      context.textContent = term.context;
+      item.append(context);
+    }
+    return item;
+  }));
+  if (filtered.length === 0) {
+    const empty = document.createElement("li");
+    empty.className = "glossary-detail-empty";
+    empty.textContent = t("glossary.detailEmpty");
+    list.append(empty);
+  }
+  more.hidden = filtered.length <= GLOSSARY_DETAIL_RENDER_CAP;
+  if (!more.hidden) more.textContent = t("glossary.detailMore", { count: filtered.length - GLOSSARY_DETAIL_RENDER_CAP });
+}
+
+function setGlossaryCustomStatus(key = "", values = {}, message = "") {
+  glossaryCustomStatusState = { key, values, message };
+  const status = document.getElementById("glossary-custom-status");
+  if (status) status.textContent = key ? t(key, values) : message;
+}
+
+function saveGlossaryCustomTerm() {
+  const sourceInput = document.getElementById("glossary-custom-source");
+  const targetInput = document.getElementById("glossary-custom-target");
+  const status = document.getElementById("glossary-custom-status");
+  if (!sourceInput || !targetInput || !status || !form.elements.glossary) return;
+  const source = sourceInput.value.normalize("NFC").trim();
+  const target = targetInput.value.normalize("NFC").trim();
+  if (!source || !target) {
+    setGlossaryCustomStatus("glossary.detailCustomRequired");
+    return;
+  }
+  const line = `${source} = ${target}`;
+  const current = form.elements.glossary.value;
+  if (current.split(/\r?\n/u).some((existing) => existing.trim() === line)) {
+    setGlossaryCustomStatus("glossary.detailCustomDuplicate");
+    return;
+  }
+  const header = "[커스텀 추가]";
+  form.elements.glossary.value = current.includes(header)
+    ? `${current}\n${line}`
+    : `${current.trimEnd()}\n\n${header}\n${line}`.trimStart();
+  markGlossaryPresetCustom();
+  state.settings = readSettingsFromForm();
+  saveSettings({ subtitle: state.settings })
+    .then(() => {
+      setGlossaryCustomStatus("glossary.detailCustomSaved", { line });
+      sourceInput.value = "";
+      targetInput.value = "";
+      sourceInput.focus();
+    })
+    .catch((error) => {
+      if (error?.message != null) setGlossaryCustomStatus("", {}, error.message);
+      else setGlossaryCustomStatus("glossary.detailLoadFailed");
+    });
+}
+
+document.getElementById("glossary-detail-close")?.addEventListener("click", closeGlossaryDetail);
+document.getElementById("glossary-detail-overlay")?.addEventListener("pointerdown", (event) => {
+  if (event.target === event.currentTarget) closeGlossaryDetail();
+});
+document.getElementById("glossary-detail-overlay")?.addEventListener("keydown", (event) => {
+  if (event.key === "Escape") closeGlossaryDetail();
+});
+document.getElementById("glossary-detail-search")?.addEventListener("input", (event) => {
+  glossaryDetailState.query = event.currentTarget.value;
+  renderGlossaryDetail();
+});
+document.getElementById("glossary-custom-save")?.addEventListener("click", saveGlossaryCustomTerm);
+
+function renderGlossarySelections(settings = state.settings) {
+  if (!glossarySelectionBuiltIns || !glossarySelectionUsers) return;
+  const selections = normalizeGlossarySelections(settings?.glossaries);
+  const selectedKeys = new Set(selections.map((selection) => `${selection.sourceKind}:${selection.sourceId}`));
+  const targetLanguages = readTranslationLanguagesFromForm();
+  const selectedSourceLanguage = selections.map((selection) => {
+    if (selection.sourceKind === "builtin") return "ko";
+    return syncedGlossaryPresets.find((preset) => preset.id === selection.sourceId)?.languagePair?.a ?? "";
+  }).find(Boolean) ?? "";
+  glossarySelectionBuiltIns.replaceChildren(...BUILT_IN_GLOSSARY_OPTIONS.map((option) => (
+    glossarySelectionOption(option, "builtin", selectedKeys, targetLanguages, selectedSourceLanguage)
+  )));
+  const activeUserPresets = syncedGlossaryPresets.filter((preset) => preset.activeDocumentVersion);
+  glossarySelectionUsers.replaceChildren(...activeUserPresets.map((option) => (
+    glossarySelectionOption(option, "host", selectedKeys, targetLanguages, selectedSourceLanguage)
+  )));
+  if (activeUserPresets.length === 0) {
+    const empty = document.createElement("p");
+    empty.textContent = t("glossary.selection.noActive");
+    glossarySelectionUsers.append(empty);
+  }
+  const activeSelections = selectedGlossaries();
+  if (glossarySelectionCount) glossarySelectionCount.textContent = `${activeSelections.length}/5`;
+  updateGlossaryDropdownSummary();
+  if (activeSelections.length !== selections.length) setGlossarySelectionStatus("glossary.selection.removedIncompatible", "error");
+}
+
+document.getElementById("glossary-session-selection")?.addEventListener("change", (event) => {
+  const input = event.target;
+  if (!(input instanceof HTMLInputElement) || input.name !== "glossaries") return;
+  const selections = selectedGlossaries();
+  const selectedInputs = [...document.querySelectorAll('input[name="glossaries"]:checked')];
+  const sourceLanguages = new Set(selectedInputs.map((selectedInput) => selectedInput.dataset.sourceLanguage));
+  if (sourceLanguages.size > 1) {
+    input.checked = false;
+    setGlossarySelectionStatus("glossary.selection.mixedSources", "error");
+    return;
+  }
+  if (selections.length > MAX_GLOSSARY_SELECTIONS) {
+    input.checked = false;
+    setGlossarySelectionStatus("glossary.selection.maximum", "error", { max: MAX_GLOSSARY_SELECTIONS });
+    return;
+  }
+  if (selections.length === 0) {
+    input.checked = true;
+    setGlossarySelectionStatus("glossary.selection.minimum", "error");
+    return;
+  }
+  // GLOSSARY_SELECTION_CONFLICT is returned by the canonical merge when two
+  // equal-priority entries prescribe different translations. The server then
+  // rejects the selection and this same live region presents the error.
+  setGlossarySelectionStatus("glossary.selection.selected", "", { count: selections.length });
+  if (glossarySelectionCount) glossarySelectionCount.textContent = `${selections.length}/5`;
+  updateGlossaryDropdownSummary();
+});
+
+function findGlossaryPreset(presetId) {
+  const builtIn = glossaryPresets.find((entry) => entry.id === presetId);
+  if (builtIn) return { ...builtIn, source: "builtin" };
+  return syncedGlossaryPresets.find((entry) => entry.id === presetId) ?? null;
+}
+
+function createGlossaryPresetOption(preset, source) {
+  const option = document.createElement("option");
+  option.value = preset.id;
+  option.dataset.source = source;
+  option.dataset.name = glossaryPresetDisplayName(preset, source);
+  const industryKey = `glossary.presetIndustry.${preset.id}`;
+  const industry = source === "builtin" && hasKey(industryKey) ? t(industryKey) : preset.industry;
+  option.textContent = source === "builtin" && preset.industry
+    ? `${glossaryPresetDisplayName(preset, source)} — ${industry}`
+    : glossaryPresetDisplayName(preset, source);
+  return option;
+}
+
+function appendCachedGlossaryPresetOption(presetId, presetName) {
+  const group = document.getElementById("glossary-preset-users");
+  if (!group || !presetId || !presetName) return null;
+  const option = document.createElement("option");
+  option.value = presetId;
+  option.dataset.source = "cached";
+  option.dataset.name = presetName;
+  option.textContent = `${presetName} (${t("glossary.cachedSuffix")})`;
+  group.append(option);
+  return option;
+}
+
+function renderGlossaryPresetOptions({ persistConfirmedMissing = false } = {}) {
+  if (!glossaryPresetSelect) return;
+  const customOption = document.createElement("option");
+  customOption.value = CUSTOM_GLOSSARY_PRESET_VALUE;
+  customOption.textContent = t("glossary.presetCustom");
+
+  const builtInGroup = document.createElement("optgroup");
+  builtInGroup.id = "glossary-preset-builtins";
+  builtInGroup.label = t("glossary.groupBuiltIn");
+  for (const preset of glossaryPresets) builtInGroup.append(createGlossaryPresetOption(preset, "builtin"));
+
+  const userGroup = document.createElement("optgroup");
+  userGroup.id = "glossary-preset-users";
+  userGroup.label = t("glossary.groupSynced");
+  for (const preset of syncedGlossaryPresets.filter((preset) => !preset.isStructured)) userGroup.append(createGlossaryPresetOption(preset, "user"));
+  glossaryPresetSelect.replaceChildren(customOption, builtInGroup, userGroup);
+  restoreGlossaryPresetSelection(
+    state.settings?.glossaryPresetId,
+    state.settings?.glossaryPresetName,
+    { persistConfirmedMissing },
+  );
+}
+
+function selectedGlossaryPresetId() {
+  const value = glossaryPresetSelect?.value ?? CUSTOM_GLOSSARY_PRESET_VALUE;
+  return value === CUSTOM_GLOSSARY_PRESET_VALUE ? "" : value;
+}
+
+function selectedGlossaryPresetName() {
+  const option = glossaryPresetSelect?.selectedOptions?.[0];
+  return option?.dataset?.source === "user" || option?.dataset?.source === "cached"
+    ? String(option.dataset.name ?? "")
+    : "";
+}
+
+function selectedEditableGlossaryPreset() {
+  if (editingCustomPreset) return editingCustomPreset;
+  return syncedGlossaryPresets.find((preset) => preset.id === selectedGlossaryPresetId()) ?? null;
+}
+
+function syncGlossaryPresetActions() {
+  const editablePreset = selectedEditableGlossaryPreset();
+  const canEdit = Boolean(editablePreset && Number.isSafeInteger(editablePreset.version));
+  if (updateGlossaryPresetButton) {
+    updateGlossaryPresetButton.hidden = !canEdit || isGlossaryDeleteConfirmationOpen;
+    updateGlossaryPresetButton.disabled = isGlossaryPresetBusy;
+  }
+  if (deleteGlossaryPresetButton) {
+    deleteGlossaryPresetButton.hidden = !canEdit || isGlossaryDeleteConfirmationOpen;
+    deleteGlossaryPresetButton.disabled = isGlossaryPresetBusy;
+  }
+  if (confirmDeleteGlossaryPresetButton) {
+    confirmDeleteGlossaryPresetButton.hidden = !canEdit || !isGlossaryDeleteConfirmationOpen;
+    confirmDeleteGlossaryPresetButton.disabled = isGlossaryPresetBusy;
+  }
+  if (cancelDeleteGlossaryPresetButton) {
+    cancelDeleteGlossaryPresetButton.hidden = !canEdit || !isGlossaryDeleteConfirmationOpen;
+    cancelDeleteGlossaryPresetButton.disabled = isGlossaryPresetBusy;
+  }
+}
+
+function openGlossaryPresetDeleteConfirmation() {
+  const current = selectedEditableGlossaryPreset();
+  if (!current || isGlossaryPresetBusy) return;
+  isGlossaryDeleteConfirmationOpen = true;
+  setGlossaryPresetStatus("glossary.deleteConfirm", "", { name: current.name });
+  syncGlossaryPresetActions();
+  confirmDeleteGlossaryPresetButton?.focus();
+}
+
+function closeGlossaryPresetDeleteConfirmation({ restoreFocus = true, clearStatus = true } = {}) {
+  if (!isGlossaryDeleteConfirmationOpen) return;
+  isGlossaryDeleteConfirmationOpen = false;
+  syncGlossaryPresetActions();
+  if (clearStatus) setGlossaryPresetStatus();
+  if (restoreFocus && !deleteGlossaryPresetButton?.hidden) deleteGlossaryPresetButton.focus();
+}
+
+function setGlossaryPresetStatus(key = "", kind = "", values = {}) {
+  glossaryPresetStatusState = { key, kind, values };
+  if (!glossaryPresetStatus) return;
+  glossaryPresetStatus.textContent = key ? t(key, values) : "";
+  glossaryPresetStatus.classList.toggle("is-error", kind === "error");
+}
+
+function refreshGlossarySystemLanguagePresentation() {
+  // 2026-08-31 fix: Repaint from the current draft, not saved settings, without reloading glossary documents.
+  renderGlossarySelections({ ...state.settings, glossaries: selectedGlossaries() });
+  const selection = glossarySelectionStatusState;
+  setGlossarySelectionStatus(selection.key, selection.kind, selection.values);
+  const preset = glossaryPresetStatusState;
+  setGlossaryPresetStatus(preset.key, preset.kind, preset.values);
+  const custom = glossaryCustomStatusState;
+  setGlossaryCustomStatus(custom.key, custom.values, custom.message);
+  if (document.getElementById("glossary-detail-overlay")?.hidden === false) renderGlossaryDetail();
+}
+
+function persistMissingGlossaryPresetReference() {
+  if (!state.settings?.glossaryPresetId && !state.settings?.glossaryPresetName) return;
+  state.settings = { ...state.settings, glossaryPresetId: "", glossaryPresetName: "" };
+  void saveSettings({ subtitle: state.settings }).catch(showError);
+}
+
+function restoreGlossaryPresetSelection(presetId, presetName = "", { persistConfirmedMissing = false } = {}) {
+  if (!glossaryPresetSelect) return;
+  const requestedId = String(presetId ?? "").trim();
+  const requestedName = String(presetName ?? "").trim();
+  if (!requestedId) {
+    glossaryPresetSelect.value = CUSTOM_GLOSSARY_PRESET_VALUE;
+    syncGlossaryPresetActions();
+    return;
+  }
+
+  let option = [...glossaryPresetSelect.options].find((entry) => entry.value === requestedId);
+  const isConfirmedMissingUserPreset = Boolean(requestedName) && syncedGlossaryPresetStatus === "loaded";
+  const isConfirmedMissingBuiltInPreset = !requestedName && builtInGlossaryPresetStatus === "loaded";
+  if (!option && requestedName && !isConfirmedMissingUserPreset) {
+    option = appendCachedGlossaryPresetOption(requestedId, requestedName);
+  }
+  if (option) {
+    glossaryPresetSelect.value = requestedId;
+    syncGlossaryPresetActions();
+    return;
+  }
+
+  glossaryPresetSelect.value = CUSTOM_GLOSSARY_PRESET_VALUE;
+  if ((isConfirmedMissingUserPreset || isConfirmedMissingBuiltInPreset) && persistConfirmedMissing) {
+    editingCustomPreset = null;
+    setGlossaryPresetStatus("glossary.remoteMissing", "error");
+    persistMissingGlossaryPresetReference();
+  }
+  syncGlossaryPresetActions();
+}
+
+function markGlossaryPresetCustom() {
+  const selectedUserPreset = syncedGlossaryPresets.find((preset) => preset.id === selectedGlossaryPresetId());
+  if (selectedUserPreset) editingCustomPreset = selectedUserPreset;
+  if (glossaryPresetSelect) glossaryPresetSelect.value = CUSTOM_GLOSSARY_PRESET_VALUE;
+  state.settings = { ...state.settings, glossaryPresetId: "", glossaryPresetName: "" };
+  syncGlossaryPresetActions();
+}
+
+function glossaryPresetError(value, fallbackCode = "INVALID_GLOSSARY_PRESET") {
+  const code = String(value?.code ?? "").trim();
+  const resolvedCode = GLOSSARY_PRESET_ERROR_CODES.has(code) ? code : fallbackCode;
+  const error = new Error(t(`glossary.error.${resolvedCode}`));
+  error.code = resolvedCode;
+  return error;
+}
+
+async function invokeGlossaryPresetBridge(method, input) {
+  const bridge = window.realtimeNoelDesktop;
+  if (typeof bridge?.[method] !== "function") throw glossaryPresetError({ code: "DESKTOP_BRIDGE_UNAVAILABLE" });
+  let result;
+  try {
+    result = input === undefined ? await bridge[method]() : await bridge[method](input);
+  } catch (error) {
+    throw glossaryPresetError(error, "NETWORK_UNAVAILABLE");
+  }
+  if (!result?.ok) throw glossaryPresetError(result);
+  return result.data;
+}
+
+async function hydrateGlossaryPresets() {
+  if (!glossaryPresetSelect) return;
+  setGlossaryPresetStatus("glossary.loadingSynced");
+  const builtInRequest = fetch("/api/glossary-presets").then((response) => {
+    if (!response.ok) throw new Error("BUILTIN_GLOSSARY_PRESETS_UNAVAILABLE");
+    return response.json();
+  });
+  const syncedRequest = typeof window.realtimeNoelDesktop?.listGlossaryPresets === "function"
+    ? invokeGlossaryPresetBridge("listGlossaryPresets")
+    : Promise.reject(glossaryPresetError({ code: "DESKTOP_BRIDGE_UNAVAILABLE" }));
+  const [builtInResult, syncedResult] = await Promise.allSettled([builtInRequest, syncedRequest]);
+
+  if (builtInResult.status === "fulfilled" && Array.isArray(builtInResult.value)) {
+    glossaryPresets = builtInResult.value;
+    builtInGlossaryPresetStatus = "loaded";
+  } else {
+    builtInGlossaryPresetStatus = "unavailable";
+  }
+
+  if (syncedResult.status === "fulfilled" && Array.isArray(syncedResult.value?.presets)) {
+    syncedGlossaryPresets = syncedResult.value.presets.map(normalizeSyncedGlossaryPreset).filter(Boolean);
+    syncedGlossaryPresetStatus = "loaded";
+    setGlossaryPresetStatus();
+  } else {
+    syncedGlossaryPresetStatus = "unavailable";
+    const error = syncedResult.status === "rejected"
+      ? glossaryPresetError(syncedResult.reason, "NETWORK_UNAVAILABLE")
+      : glossaryPresetError({ code: "INVALID_GLOSSARY_PRESET" });
+    setGlossaryPresetStatus(`glossary.error.${error.code}`, "error");
+  }
+  renderGlossaryPresetOptions({ persistConfirmedMissing: true });
+  renderGlossarySelections(state.settings);
+}
+
+void hydrateGlossaryPresets();
+glossaryPresetSelect?.addEventListener("change", (event) => {
+  event.stopPropagation();
+  closeGlossaryPresetDeleteConfirmation({ restoreFocus: false });
+  editingCustomPreset = null;
+  if (event.target.value === CUSTOM_GLOSSARY_PRESET_VALUE) {
+    state.settings = readSettingsFromForm();
+    syncGlossaryPresetActions();
+    void saveSettings({ subtitle: state.settings }).catch(showError);
+    return;
+  }
+  void applyGlossaryPreset(event.target.value);
+});
 
 async function applyGlossaryPreset(presetId) {
-  const preset = glossaryPresets.find((entry) => entry.id === presetId);
+  const preset = findGlossaryPreset(presetId);
   if (!preset) return;
-  if (form.elements.glossary) form.elements.glossary.value = preset.glossary;
+  closeGlossaryPresetDeleteConfirmation({ restoreFocus: false });
+  editingCustomPreset = null;
+  let glossaryText = preset.glossary;
+  if (preset.isStructured && !glossaryText && preset.activeDocumentVersion) {
+    // Structured (synced) presets carry no inline text — fetch the active
+    // document and render it, instead of silently applying an empty glossary.
+    try {
+      const data = await invokeGlossaryPresetBridge("readGlossaryPresetVersion", {
+        id: preset.id,
+        version: preset.activeDocumentVersion,
+        targetLanguage: preset.languagePair.b,
+      });
+      glossaryText = String(data?.glossary ?? "");
+    } catch (error) {
+      showError(error);
+      return;
+    }
+  }
+  if (form.elements.glossary) form.elements.glossary.value = glossaryText;
   if (form.elements.translationDomain) form.elements.translationDomain.value = preset.domain;
   writeTranslationLanguageCheckboxes([preset.languagePair.a, preset.languagePair.b]);
   syncPlacementRows([preset.languagePair.a, preset.languagePair.b]);
@@ -347,20 +1176,156 @@ async function applyGlossaryPreset(presetId) {
   state.settings = readSettingsFromForm();
   applyPreviewSettings(state.settings);
   updateAudioInspectorLabels();
+  syncGlossaryPresetActions();
   try {
     await saveSettings({ subtitle: state.settings });
+    const label = glossaryPresetDisplayName(preset);
     if (state.running) {
       // A running session keeps translating with the OLD glossary until its
       // channels are rebuilt — reconfigure in place (audio capture untouched).
       reconfigureRunningSession();
-      showNotice(t("notice.presetAppliedRebuilt", { label: preset.label }));
+      showNotice(t("notice.presetAppliedRebuilt", { label }));
     } else {
-      showNotice(t("notice.presetApplied", { label: preset.label }));
+      showNotice(t("notice.presetApplied", { label }));
     }
   } catch (error) {
     showError(error);
   }
 }
+
+function currentGlossaryPresetInput(name) {
+  const languages = readTranslationLanguagesFromForm();
+  return {
+    name: String(name ?? "").trim(),
+    domain: form.elements.translationDomain?.value ?? "",
+    glossary: form.elements.glossary?.value ?? "",
+    languagePair: deriveLanguagePairFromTargets(languages),
+  };
+}
+
+function setGlossaryPresetBusy(isBusy) {
+  isGlossaryPresetBusy = isBusy;
+  glossaryPresetEditor?.setAttribute("aria-busy", String(isBusy));
+  if (saveGlossaryPresetButton) saveGlossaryPresetButton.disabled = isBusy;
+  if (createGlossaryPresetButton) createGlossaryPresetButton.disabled = isBusy;
+  syncGlossaryPresetActions();
+}
+
+function openGlossaryPresetEditor() {
+  if (!glossaryPresetEditor || !createGlossaryPresetButton) return;
+  closeGlossaryPresetDeleteConfirmation({ restoreFocus: false });
+  glossaryPresetEditor.hidden = false;
+  createGlossaryPresetButton.setAttribute("aria-expanded", "true");
+  if (glossaryPresetNameInput) {
+    glossaryPresetNameInput.value = "";
+    glossaryPresetNameInput.focus();
+  }
+}
+
+function closeGlossaryPresetEditor({ restoreFocus = true } = {}) {
+  if (!glossaryPresetEditor || !createGlossaryPresetButton) return;
+  glossaryPresetEditor.hidden = true;
+  createGlossaryPresetButton.setAttribute("aria-expanded", "false");
+  if (restoreFocus) createGlossaryPresetButton.focus();
+}
+
+async function registerGlossaryPreset() {
+  if (!glossaryPresetNameInput?.reportValidity()) return;
+  setGlossaryPresetBusy(true);
+  try {
+    const data = await invokeGlossaryPresetBridge(
+      "createGlossaryPreset",
+      currentGlossaryPresetInput(glossaryPresetNameInput.value),
+    );
+    const preset = normalizeSyncedGlossaryPreset(data?.preset);
+    if (!preset) throw glossaryPresetError({ code: "INVALID_GLOSSARY_PRESET" });
+    syncedGlossaryPresets = [...syncedGlossaryPresets.filter((entry) => entry.id !== preset.id), preset];
+    syncedGlossaryPresetStatus = "loaded";
+    closeGlossaryPresetDeleteConfirmation({ restoreFocus: false });
+    editingCustomPreset = null;
+    state.settings = { ...state.settings, glossaryPresetId: preset.id, glossaryPresetName: preset.name };
+    renderGlossaryPresetOptions();
+    state.settings = readSettingsFromForm();
+    await saveSettings({ subtitle: state.settings });
+    closeGlossaryPresetEditor({ restoreFocus: false });
+    setGlossaryPresetStatus("glossary.created", "", { name: preset.name });
+  } catch (error) {
+    const resolvedError = glossaryPresetError(error);
+    setGlossaryPresetStatus(`glossary.error.${resolvedError.code}`, "error");
+    showError(resolvedError);
+  } finally {
+    setGlossaryPresetBusy(false);
+    if (glossaryPresetEditor?.hidden) createGlossaryPresetButton?.focus();
+  }
+}
+
+async function updateSelectedGlossaryPreset() {
+  const current = selectedEditableGlossaryPreset();
+  if (!current) return;
+  setGlossaryPresetBusy(true);
+  try {
+    const data = await invokeGlossaryPresetBridge("updateGlossaryPreset", {
+      id: current.id,
+      version: current.version,
+      ...currentGlossaryPresetInput(current.name),
+    });
+    const preset = normalizeSyncedGlossaryPreset(data?.preset);
+    if (!preset) throw glossaryPresetError({ code: "INVALID_GLOSSARY_PRESET" });
+    syncedGlossaryPresets = [...syncedGlossaryPresets.filter((entry) => entry.id !== preset.id), preset];
+    closeGlossaryPresetDeleteConfirmation({ restoreFocus: false });
+    editingCustomPreset = null;
+    state.settings = { ...state.settings, glossaryPresetId: preset.id, glossaryPresetName: preset.name };
+    renderGlossaryPresetOptions();
+    state.settings = readSettingsFromForm();
+    await saveSettings({ subtitle: state.settings });
+    setGlossaryPresetStatus("glossary.updated", "", { name: preset.name });
+  } catch (error) {
+    const resolvedError = glossaryPresetError(error);
+    setGlossaryPresetStatus(`glossary.error.${resolvedError.code}`, "error");
+    showError(resolvedError);
+  } finally {
+    setGlossaryPresetBusy(false);
+  }
+}
+
+async function deleteSelectedGlossaryPreset() {
+  const current = selectedEditableGlossaryPreset();
+  if (!current || !isGlossaryDeleteConfirmationOpen) return;
+  let wasDeleted = false;
+  setGlossaryPresetBusy(true);
+  try {
+    await invokeGlossaryPresetBridge("deleteGlossaryPreset", { id: current.id, version: current.version });
+    syncedGlossaryPresets = syncedGlossaryPresets.filter((entry) => entry.id !== current.id);
+    closeGlossaryPresetDeleteConfirmation({ restoreFocus: false, clearStatus: false });
+    editingCustomPreset = null;
+    state.settings = { ...state.settings, glossaryPresetId: "", glossaryPresetName: "" };
+    renderGlossaryPresetOptions();
+    state.settings = readSettingsFromForm();
+    await saveSettings({ subtitle: state.settings });
+    setGlossaryPresetStatus("glossary.deleted");
+    wasDeleted = true;
+  } catch (error) {
+    const resolvedError = glossaryPresetError(error);
+    setGlossaryPresetStatus(`glossary.error.${resolvedError.code}`, "error");
+    showError(resolvedError);
+  } finally {
+    setGlossaryPresetBusy(false);
+    if (wasDeleted) glossaryPresetSelect?.focus();
+  }
+}
+
+createGlossaryPresetButton?.addEventListener("click", openGlossaryPresetEditor);
+cancelGlossaryPresetButton?.addEventListener("click", closeGlossaryPresetEditor);
+saveGlossaryPresetButton?.addEventListener("click", () => { void registerGlossaryPreset(); });
+updateGlossaryPresetButton?.addEventListener("click", () => { void updateSelectedGlossaryPreset(); });
+deleteGlossaryPresetButton?.addEventListener("click", openGlossaryPresetDeleteConfirmation);
+confirmDeleteGlossaryPresetButton?.addEventListener("click", () => { void deleteSelectedGlossaryPreset(); });
+cancelDeleteGlossaryPresetButton?.addEventListener("click", () => closeGlossaryPresetDeleteConfirmation());
+glossaryPresetActions?.addEventListener("keydown", (event) => {
+  if (event.key !== "Escape" || !isGlossaryDeleteConfirmationOpen) return;
+  event.preventDefault();
+  closeGlossaryPresetDeleteConfirmation();
+});
 
 // A patch section must be a PLAIN object. An array is truthy AND passes
 // `typeof x === "object"`, which is how importing `{"subtitle": []}` used to
@@ -432,6 +1397,7 @@ async function loadSubtitleLanguages() {
     // Offline / older server: keep the core trio.
   }
   renderLanguagePills();
+  renderLiveCallLanguagePills();
   renderPlacementRows();
 }
 
@@ -452,178 +1418,148 @@ function languageDisplayName(language) {
   return koLabel && koLabel !== native ? `${koLabel} · ${native}` : native;
 }
 
-// Search-and-tag language picker. Instead of listing every registry language
-// as a pill, the selected languages render as removable chips and new ones are
-// added through a type-ahead search (Korean name, English name, native name,
-// or ISO code). The underlying form state is still a hidden checkbox per
-// registry language — every existing reader (readSettingsFromForm,
-// syncLanguageControls, placement rows, presets) keeps working unchanged.
 function renderLanguagePills() {
-  const container = document.querySelector(".language-pills");
+  const container = document.querySelector("#subtitle-language-panel .language-pills");
   if (!container) return;
   const selected = new Set([
     ...(Array.isArray(state.settings?.translationLanguages) ? state.settings.translationLanguages : []),
     ...[...container.querySelectorAll('input[name="translationLanguages"]:checked')].map((input) => input.value),
   ]);
-  container.replaceChildren();
-  container.classList.add("language-tag-picker");
+  container.classList.remove("language-tag-picker");
+  container.replaceChildren(...subtitleLanguageRegistry.map((language) => (
+    buildLanguagePill("translationLanguages", language, selected.has(language.code))
+  )));
+  markLanguageMinimum();
+  updateLanguageDropdownSummaries();
+}
 
-  for (const language of subtitleLanguageRegistry) {
-    const input = document.createElement("input");
-    input.name = "translationLanguages";
-    input.type = "checkbox";
-    input.value = language.code;
-    input.checked = selected.has(language.code);
-    input.hidden = true;
-    container.append(input);
+// Shared pill factory: both language multi-selects render the exact same
+// control, differing only in the form name that scopes their behavior.
+function buildLanguagePill(name, language, isChecked) {
+  const label = document.createElement("label");
+  label.className = "lang-pill";
+  const input = document.createElement("input");
+  input.name = name;
+  input.type = "checkbox";
+  input.value = language.code;
+  input.checked = isChecked;
+  const text = document.createElement("span");
+  text.textContent = languageDisplayName(language);
+  text.title = languageDisplayName(language);
+  label.append(input, text);
+  return label;
+}
+
+// Live Call has its own language selection (0 = "자막 언어와 동일"). It shares
+// the pill styling but never the translationLanguages name, so the local
+// engine's 2-language minimum and channel rebuilds are unaffected.
+function renderLiveCallLanguagePills() {
+  const container = document.querySelector("#live-call-language-panel .live-call-language-pills");
+  if (!container) return;
+  const selected = new Set([
+    ...(Array.isArray(state.settings?.liveCallTranslationLanguages) ? state.settings.liveCallTranslationLanguages : []),
+    ...[...container.querySelectorAll('input[name="liveCallTranslationLanguages"]:checked')].map((input) => input.value),
+  ]);
+  container.replaceChildren(...subtitleLanguageRegistry.map((language) => (
+    buildLanguagePill("liveCallTranslationLanguages", language, selected.has(language.code))
+  )));
+  updateLanguageDropdownSummaries();
+}
+
+function readLiveCallLanguagesFromForm() {
+  return [...form.querySelectorAll('input[name="liveCallTranslationLanguages"]:checked')]
+    .map((input) => input.value)
+    .filter((code) => isSupportedLanguageCode(code))
+    .slice(0, MAX_SELECTED_LANGUAGES);
+}
+
+function writeLiveCallLanguageCheckboxes(languages = []) {
+  const selected = new Set(languages.filter((language) => isSupportedLanguageCode(language)).slice(0, MAX_SELECTED_LANGUAGES));
+  for (const input of form.querySelectorAll('input[name="liveCallTranslationLanguages"]')) {
+    input.checked = selected.has(input.value);
   }
+  updateLanguageDropdownSummaries();
+}
 
-  const chips = document.createElement("div");
-  chips.className = "language-chips";
-  container.append(chips);
+function syncLiveCallLanguageControls(target) {
+  if (target?.name !== "liveCallTranslationLanguages") return;
+  const checked = form.querySelectorAll('input[name="liveCallTranslationLanguages"]:checked');
+  if (checked.length > MAX_SELECTED_LANGUAGES && target.checked) target.checked = false;
+  updateLanguageDropdownSummaries();
+}
 
-  const search = document.createElement("div");
-  search.className = "language-search";
-  const searchInput = document.createElement("input");
-  searchInput.type = "search";
-  searchInput.id = "language-search-input";
-  searchInput.placeholder = t("language.searchPlaceholder");
-  searchInput.autocomplete = "off";
-  searchInput.setAttribute("aria-label", t("language.searchLabel"));
-  const suggestions = document.createElement("ul");
-  suggestions.className = "language-suggestions";
-  suggestions.hidden = true;
-  search.append(searchInput, suggestions);
-  container.append(search);
+function languageSummaryText(names) {
+  return names.join(", ");
+}
 
-  searchInput.addEventListener("input", () => renderLanguageSuggestions(searchInput.value));
-  searchInput.addEventListener("focus", () => renderLanguageSuggestions(searchInput.value));
-  searchInput.addEventListener("keydown", (event) => {
-    if (event.key === "Enter") {
-      // Never submit the settings form from the search box; add the top match.
-      event.preventDefault();
-      const first = suggestions.querySelector("[data-language-code]");
-      if (first) addLanguageTag(first.dataset.languageCode);
+function updateLanguageDropdownSummaries() {
+  const byCode = new Map(subtitleLanguageRegistry.map((language) => [language.code, languageDisplayName(language)]));
+  const subtitleSummary = document.querySelector('[data-lang-select="subtitle"] .lang-select-summary');
+  if (subtitleSummary) {
+    const selected = [...form.querySelectorAll('input[name="translationLanguages"]:checked')]
+      .map((input) => byCode.get(input.value) ?? input.value);
+    if (selected.length) subtitleSummary.textContent = languageSummaryText(selected);
+  }
+  const liveCallSummary = document.querySelector('[data-lang-select="live-call"] .lang-select-summary');
+  if (liveCallSummary) {
+    const selected = [...form.querySelectorAll('input[name="liveCallTranslationLanguages"]:checked')]
+      .map((input) => byCode.get(input.value) ?? input.value);
+    liveCallSummary.textContent = selected.length ? languageSummaryText(selected) : t("live.languagesInherit");
+  }
+}
+
+// Dropdown behavior for both language multi-selects: the trigger toggles the
+// checkbox panel; Escape and outside clicks close it. The checkboxes inside
+// keep their form names, so every existing settings/save path is untouched.
+function setupLanguageDropdowns() {
+  for (const root of document.querySelectorAll(".lang-select")) {
+    const trigger = root.querySelector(".lang-select-trigger");
+    const panel = root.querySelector(".lang-select-panel");
+    if (!trigger || !panel) continue;
+    const close = () => {
+      panel.hidden = true;
+      panel.style.marginLeft = "";
+      trigger.setAttribute("aria-expanded", "false");
+    };
+    trigger.addEventListener("click", () => {
+      const isOpen = !panel.hidden;
+      if (isOpen) { close(); return; }
+      panel.hidden = false;
+      trigger.setAttribute("aria-expanded", "true");
+      // Clamp the panel inside the viewport: it opens trigger-aligned, but a
+      // narrow trigger near the right edge would otherwise push it off-screen.
+      panel.style.marginLeft = "";
+      const viewportWidth = document.documentElement.clientWidth;
+      const rect = panel.getBoundingClientRect();
+      const overflowRight = rect.right - (viewportWidth - 12);
+      if (overflowRight > 0) {
+        panel.style.marginLeft = `${-Math.min(overflowRight, Math.max(0, rect.left - 12))}px`;
+      }
+    });
+    root.addEventListener("keydown", (event) => {
+      if (event.key === "Escape" && !panel.hidden) {
+        close();
+        trigger.focus();
+      }
+    });
+    document.addEventListener("pointerdown", (event) => {
+      if (!panel.hidden && !root.contains(event.target)) close();
+    });
+  }
+  document.getElementById("live-call-language-clear")?.addEventListener("click", () => {
+    for (const input of form.querySelectorAll('input[name="liveCallTranslationLanguages"]:checked')) {
+      input.checked = false;
     }
-    if (event.key === "Escape") {
-      suggestions.hidden = true;
-    }
-  });
-  document.addEventListener("click", (event) => {
-    if (!search.contains(event.target)) suggestions.hidden = true;
-  });
-
-  renderLanguageChips();
-}
-
-function languageSearchMatches(query) {
-  const q = String(query ?? "").trim().toLowerCase();
-  const selected = new Set(readCheckedLanguageCodes());
-  return subtitleLanguageRegistry.filter((language) => {
-    if (selected.has(language.code)) return false;
-    if (!q) return true;
-    const haystack = [
-      language.code,
-      language.label,
-      language.nativeLabel,
-      LANGUAGE_KO_LABELS[language.code],
-    ].filter(Boolean).join(" ").toLowerCase();
-    return haystack.includes(q);
+    updateLanguageDropdownSummaries();
+    // Persist the cleared (= inherit) selection through the normal save path.
+    form.dispatchEvent(new Event("change", { bubbles: true }));
   });
 }
 
-function readCheckedLanguageCodes() {
-  return [...form.querySelectorAll('input[name="translationLanguages"]:checked')].map((input) => input.value);
-}
+setupLanguageDropdowns();
 
-function renderLanguageSuggestions(query) {
-  const suggestions = document.querySelector(".language-suggestions");
-  if (!suggestions) return;
-  const matches = languageSearchMatches(query);
-  suggestions.replaceChildren();
-  const atMax = readCheckedLanguageCodes().length >= MAX_SELECTED_LANGUAGES;
-  if (atMax) {
-    const li = document.createElement("li");
-    li.className = "language-suggestion-empty";
-    li.textContent = t("language.maxSelected", { max: MAX_SELECTED_LANGUAGES });
-    suggestions.append(li);
-    suggestions.hidden = false;
-    return;
-  }
-  if (matches.length === 0) {
-    const li = document.createElement("li");
-    li.className = "language-suggestion-empty";
-    li.textContent = t("language.noMatch");
-    suggestions.append(li);
-    suggestions.hidden = false;
-    return;
-  }
-  for (const language of matches) {
-    const li = document.createElement("li");
-    const button = document.createElement("button");
-    button.type = "button";
-    button.className = "language-suggestion";
-    button.dataset.languageCode = language.code;
-    button.textContent = `${languageDisplayName(language)} (${language.code})`;
-    button.addEventListener("click", () => addLanguageTag(language.code));
-    li.append(button);
-    // The Enter-key shortcut reads the first row's code from the li as well.
-    li.dataset.languageCode = language.code;
-    suggestions.append(li);
-  }
-  suggestions.hidden = false;
-}
-
-function addLanguageTag(code) {
-  if (readCheckedLanguageCodes().length >= MAX_SELECTED_LANGUAGES) return;
-  const input = form.querySelector(`input[name="translationLanguages"][value="${code}"]`);
-  if (!input || input.checked) return;
-  input.checked = true;
-  // Bubble a real change event so the form's save/rebuild pipeline runs
-  // exactly as if a checkbox had been clicked.
-  input.dispatchEvent(new Event("change", { bubbles: true }));
-  const searchInput = document.getElementById("language-search-input");
-  if (searchInput) {
-    searchInput.value = "";
-    searchInput.focus();
-  }
-  const suggestions = document.querySelector(".language-suggestions");
-  if (suggestions) suggestions.hidden = true;
-  renderLanguageChips();
-}
-
-function removeLanguageTag(code) {
-  const input = form.querySelector(`input[name="translationLanguages"][value="${code}"]`);
-  if (!input || !input.checked) return;
-  input.checked = false;
-  // syncLanguageControls reverts this change (and flashes the hint) if it
-  // would drop the selection below the 2-language minimum.
-  input.dispatchEvent(new Event("change", { bubbles: true }));
-  renderLanguageChips();
-}
-
-// Selected languages as removable tags, ordered as the registry lists them.
 function renderLanguageChips() {
-  const chips = document.querySelector(".language-chips");
-  if (!chips) return;
-  chips.replaceChildren();
-  const selected = new Set(readCheckedLanguageCodes());
-  const atMinimum = selected.size <= 2;
-  for (const language of subtitleLanguageRegistry) {
-    if (!selected.has(language.code)) continue;
-    const chip = document.createElement("span");
-    chip.className = `language-chip${atMinimum ? " at-minimum" : ""}`;
-    const text = document.createElement("span");
-    text.textContent = languageDisplayName(language);
-    const remove = document.createElement("button");
-    remove.type = "button";
-    remove.className = "language-chip-remove";
-    remove.setAttribute("aria-label", t("language.remove", { language: languageDisplayName(language) }));
-    remove.textContent = "×";
-    remove.addEventListener("click", () => removeLanguageTag(language.code));
-    chip.append(text, remove);
-    chips.append(chip);
-  }
+  markLanguageMinimum();
 }
 const SUBTITLE_POSITION_VALUES = ["top-center", "middle-center", "bottom-center"];
 
@@ -690,24 +1626,28 @@ function updateVerticalOffsetValue(offset) {
 async function loadConfig() {
   try {
     const config = await fetch("/api/config").then((res) => res.json());
-    if (config.settings?.subtitle) state.settings = { ...DEFAULT_SUBTITLE, ...config.settings.subtitle };
+    const shouldNormalizeCaptionSettings = config.settings?.subtitle
+      && (config.settings.subtitle.translationProvider !== "gemini"
+        || config.settings.subtitle.geminiTranscribeModel !== DEFAULT_SUBTITLE.geminiTranscribeModel
+        || [...RETIRED_SUBTITLE_SETTING_KEYS].some((key) => Object.hasOwn(config.settings.subtitle, key)));
+    if (config.settings?.subtitle) {
+      state.settings = normalizeCaptionSettings(config.settings.subtitle);
+    }
     state.hasOpenAIKey = Boolean(config.settings?.hasOpenAIKey);
-    state.hasOpenAISecondaryKey = Boolean(config.settings?.hasOpenAISecondaryKey);
     state.hasGeminiKey = Boolean(config.settings?.hasGeminiKey);
     state.hasGeminiSecondaryKey = Boolean(config.settings?.hasGeminiSecondaryKey);
     writeSettingsToForm(state.settings);
     await hydrateOverlayEnabled();
     applyPreviewSettings(state.settings);
     updateOpenAIKeyPlaceholder();
-    updateOpenAISecondaryKeyPlaceholder();
     updateGeminiKeyStatus();
     updateGeminiSecondaryKeyStatus();
     updateOpenAIKeyStatus();
-    updateOpenAISecondaryKeyStatus();
     updateSessionSummary();
     updateServiceStrip();
     updateAudioInspectorLabels();
     syncCaptionPlayerController();
+    if (shouldNormalizeCaptionSettings) await saveSettings({ subtitle: state.settings });
   } catch (error) {
     showError(error);
   }
@@ -729,74 +1669,10 @@ function syncDesktopOverlayVisibility(enabled) {
   window.realtimeNoelDesktop.setOverlayEnabled(enabled).catch(showError);
 }
 
-function selectedOutputMode() {
-  const value = form.querySelector('input[name="outputMode"]:checked')?.value;
-  // captions_audio is retired; anything unrecognised falls back to captions.
-  return value === "audio" ? value : "captions";
-}
-
-function enforcePtOutputAvailability() {
-  for (const input of form.querySelectorAll('input[name="outputMode"]')) {
-    input.disabled = false;
-  }
-  const targetLanguage = form.elements.audioLanguage?.value || "en";
-  const normalizedLanguage = targetLanguage.toLowerCase() === "zh-cn" ? "zh" : targetLanguage.toLowerCase().split("-")[0];
-  const openAIInput = form.querySelector('input[name="voiceProvider"][value="openai"]');
-  const isOpenAISupported = OPENAI_REALTIME_TRANSLATION_LANGUAGES.has(normalizedLanguage);
-  if (openAIInput) openAIInput.disabled = !isOpenAISupported;
-  if (!isOpenAISupported && selectedVoiceProvider() === "openai") {
-    const geminiInput = form.querySelector('input[name="voiceProvider"][value="gemini"]');
-    if (geminiInput) geminiInput.checked = true;
-    clearTranslatedAudioQueue();
-  }
-}
-
-function selectedVoiceProvider() {
-  return form.querySelector('input[name="voiceProvider"]:checked')?.value === "openai" ? "openai" : "gemini";
-}
-
-function syncAudioLanguageOptions(languages, preferredLanguage) {
-  const select = form.elements.audioLanguage;
-  if (!select) return;
-  const selectedLanguages = Array.isArray(languages) && languages.length > 0 ? languages : ["en"];
-  const preferred = selectedLanguages.includes(preferredLanguage) ? preferredLanguage : selectedLanguages[0];
-  select.replaceChildren(...selectedLanguages.map((code) => {
-    const language = subtitleLanguageRegistry.find((entry) => entry.code === code);
-    const option = document.createElement("option");
-    option.value = code;
-    option.textContent = language ? languageDisplayName(language) : code.toUpperCase();
-    return option;
-  }));
-  select.value = preferred;
-}
-
-function updatePtOutputControls() {
-  const outputMode = selectedOutputMode();
-  const voiceProvider = selectedVoiceProvider();
-  if (playbackOptions) playbackOptions.hidden = outputMode === "captions";
-  // State-only line: it says something ONLY when the chosen voice language has
-  // no OpenAI Realtime voice, so Gemini voice is used instead.
-  const openAIHelp = document.getElementById("pt-openai-voice-help");
-  if (openAIHelp) {
-    const targetLanguage = form.elements.audioLanguage?.value || "en";
-    const normalizedLanguage = targetLanguage.toLowerCase() === "zh-cn" ? "zh" : targetLanguage.toLowerCase().split("-")[0];
-    const isUnsupported = !OPENAI_REALTIME_TRANSLATION_LANGUAGES.has(normalizedLanguage);
-    openAIHelp.textContent = isUnsupported ? t("output.openaiUnsupported") : "";
-    openAIHelp.hidden = !isUnsupported;
-  }
-  if (audioVolumeValue) audioVolumeValue.textContent = `${Math.round(readNumber(form.elements.audioVolume?.value, DEFAULT_SUBTITLE.audioVolume) * 100)}%`;
-  startButton.dataset.i18n = outputMode === "audio"
-    ? "start.audio"
-    : "start.captions";
-  startButton.textContent = t(startButton.dataset.i18n);
-  void voiceProvider;
-}
-
 function syncRuntimeOutputVisibility() {
-  const isAudioOnly = state.running && state.settings.outputMode === "audio";
-  if (previewPanel) previewPanel.hidden = isAudioOnly;
+  if (previewPanel) previewPanel.hidden = false;
   syncCaptionPlayerController();
-  void setControllerWindowVisible(state.running && !isAudioOnly);
+  void setControllerWindowVisible(state.running);
 }
 
 async function loadSubtitleHistory() {
@@ -825,18 +1701,25 @@ function setSessionRecordsStatus(message, isError = false) {
   status.classList.toggle("is-error", isError);
 }
 
-async function loadSessionRecords() {
+async function loadSessionRecords({ showBusy = false } = {}) {
   if (!getSessionRecordsList() && !document.getElementById("records-cal-grid")) return;
+  const refreshButton = document.getElementById("refresh-session-records");
+  if (showBusy && refreshButton) {
+    refreshButton.disabled = true;
+    refreshButton.setAttribute("aria-busy", "true");
+  }
   try {
     const body = await fetch("/api/subtitles/sessions").then((res) => res.json());
     if (!body.ok) return;
-    const sessions = body.data ?? [];
-    // Only Live Call meetings have a meeting time worth placing on a calendar;
-    // caption-only sessions go to the plain list below it.
-    renderRecordsCalendar(sessions.filter((session) => session.kind === "live-call"));
-    renderSessionRecords(sessions.filter((session) => session.kind !== "live-call"));
+    sessionRecordsCatalog.sessions = Array.isArray(body.data) ? body.data : [];
+    applySessionRecordFilters();
   } catch {
     // Server unavailable — keep whatever is on screen.
+  } finally {
+    if (showBusy && refreshButton) {
+      refreshButton.disabled = false;
+      refreshButton.removeAttribute("aria-busy");
+    }
   }
 }
 
@@ -844,7 +1727,80 @@ async function loadSessionRecords() {
 // anchored on today. Placement maths lives in records-calendar.js so it can be
 // tested without a DOM; this only renders. ───────────────────────────────────
 
+const sessionRecordsCatalog = {
+  sessions: [],
+  query: "",
+  type: "all",
+  status: "all",
+};
 const recordsCalendar = { view: "month", anchor: new Date(), meetings: [] };
+
+function normalizeRecordFilterText(value) {
+  return String(value ?? "").normalize("NFC").trim().toLocaleLowerCase();
+}
+
+function isRecordObject(value) {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function recordHasFeatureType(session, type) {
+  const kind = normalizeRecordFilterText(session?.kind ?? session?.type ?? session?.recordType).replaceAll("_", "-");
+  if (type === "captions") return ["local", "caption", "captions", "subtitle", "subtitles"].includes(kind);
+  if (type === "live-call") return kind === "live-call";
+  if (type === "live-coach") {
+    return ["live-coach", "meeting-coach"].includes(kind)
+      || isRecordObject(session?.coach)
+      || isRecordObject(session?.meetingCoach);
+  }
+  if (type === "live-interpreter") {
+    return ["live-interpreter", "interpreter"].includes(kind)
+      || isRecordObject(session?.liveInterpreter)
+      || isRecordObject(session?.interpreter)
+      || isRecordObject(session?.interpretation);
+  }
+  return type === "all";
+}
+
+function isCompletedSessionRecord(session) {
+  if (session?.isUnterminated === true) return false;
+  const status = normalizeRecordFilterText(session?.status);
+  if (["completed", "ended", "finished"].includes(status)) return true;
+  return Number.isFinite(Date.parse(session?.endedAt ?? ""));
+}
+
+function matchesSessionRecordFilters(session, filters = sessionRecordsCatalog) {
+  if (!isRecordObject(session)) return false;
+  if (filters.type !== "all" && !recordHasFeatureType(session, filters.type)) return false;
+  const isCompleted = isCompletedSessionRecord(session);
+  if (filters.status === "completed" && !isCompleted) return false;
+  if (filters.status === "in-progress" && isCompleted) return false;
+  const query = normalizeRecordFilterText(filters.query);
+  if (!query) return true;
+  const searchable = [session.title, session.id, session.kind, session.type, session.recordType]
+    .map(normalizeRecordFilterText)
+    .join("\n");
+  return searchable.includes(query);
+}
+
+function isCalendarSessionRecord(session) {
+  return normalizeRecordFilterText(session?.kind).replaceAll("_", "-") === "live-call";
+}
+
+function applySessionRecordFilters() {
+  const filtered = sessionRecordsCatalog.sessions.filter((session) => matchesSessionRecordFilters(session));
+  const calendarMeetings = filtered.filter(isCalendarSessionRecord);
+  const localSessions = filtered.filter((session) => !isCalendarSessionRecord(session));
+  renderRecordsCalendar(calendarMeetings);
+  renderSessionRecords(localSessions);
+  if (sessionRecordsCatalog.sessions.length > 0 && filtered.length === 0) {
+    setSessionRecordsStatus(t("records.noFilteredResults"));
+  } else if (calendarMeetings.length > 0) {
+    setSessionRecordsStatus(t("records.meetingCount", { count: calendarMeetings.length }));
+  } else {
+    setSessionRecordsStatus("");
+  }
+}
+
 function recordsWeekday(dayIndex) {
   return t(`records.weekday.${dayIndex}`);
 }
@@ -891,8 +1847,6 @@ function renderRecordsCalendar(meetings) {
   if (view === "month") grid.append(buildRecordsMonth());
   else grid.append(buildRecordsTimeGrid(view === "week" ? 7 : 1));
 
-  const count = recordsCalendar.meetings.length;
-  setSessionRecordsStatus(count ? t("records.meetingCount", { count }) : "");
 }
 
 function buildRecordsMonth() {
@@ -938,6 +1892,7 @@ function buildRecordsChip(segment) {
   const chip = document.createElement("button");
   chip.type = "button";
   chip.className = "records-chip";
+  chip.dataset.sessionRecordId = String(segment.id ?? "");
   chip.classList.toggle("is-unterminated", Boolean(segment.isUnterminated));
   const time = document.createElement("b");
   time.textContent = segment.isContinuation ? t("records.continued") : formatRecordsClock(segment.startMinute);
@@ -1011,6 +1966,7 @@ function buildRecordsBlock(segment, laneCount, startHour) {
   const block = document.createElement("button");
   block.type = "button";
   block.className = "records-block";
+  block.dataset.sessionRecordId = String(segment.id ?? "");
   block.classList.toggle("is-unterminated", Boolean(segment.isUnterminated));
   // Offsets are minutes from the gutter's first hour, which the caller widened
   // if any meeting starts earlier than the default open time.
@@ -1043,7 +1999,7 @@ function stepRecordsCalendar(direction) {
 function formatSessionRecordTime(iso) {
   const time = Date.parse(iso ?? "");
   if (!Number.isFinite(time)) return "";
-  return new Intl.DateTimeFormat(getLanguage() === "ko" ? "ko-KR" : "en-US", {
+  return new Intl.DateTimeFormat({ ko: "ko-KR", en: "en-US", ja: "ja-JP" }[getLanguage()], {
     timeZone: "Asia/Seoul",
     month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit",
   }).format(new Date(time));
@@ -1069,6 +2025,7 @@ function buildSessionRecordCard(session) {
   const row = document.createElement("button");
   row.type = "button";
   row.className = "records-local-row";
+  row.dataset.sessionRecordId = String(session.id ?? "");
 
   const heading = document.createElement("div");
   heading.className = "records-local-heading";
@@ -1094,21 +2051,42 @@ function buildSessionRecordCard(session) {
 function sessionDetailElements() {
   return {
     page: document.getElementById("records-page"),
+    listPanel: document.getElementById("session-records-panel"),
     panel: document.getElementById("session-record-detail-page"),
     title: document.getElementById("session-detail-title"),
     meta: document.getElementById("session-detail-meta"),
     transcript: document.getElementById("session-detail-transcript"),
     summary: document.getElementById("session-detail-summary"),
+    coach: document.getElementById("session-detail-coach"),
+    participants: document.getElementById("session-detail-participants"),
     generate: document.getElementById("session-detail-generate-summary"),
     audio: document.getElementById("session-detail-audio"),
     exportButton: document.getElementById("session-detail-export"),
     tabs: [...document.querySelectorAll("[data-transcript-lang]")],
+    viewTabs: [...document.querySelectorAll("[data-record-detail-tab]")],
+    viewPanels: [...document.querySelectorAll("[data-record-detail-panel]")],
   };
 }
 
 // Held so a language tab re-renders from what is already loaded instead of
 // refetching the whole transcript.
-const openSessionDetail = { id: "", lines: [], language: "en" };
+const openSessionDetail = { id: "", lines: [], participants: [], language: "en", view: "summary", returnFocus: null };
+
+function activateSessionDetailView(view, { focus = false } = {}) {
+  const els = sessionDetailElements();
+  const available = new Set(["summary", "transcript", "coach", "participants"]);
+  openSessionDetail.view = available.has(view) ? view : "summary";
+  for (const tab of els.viewTabs) {
+    const isSelected = tab.dataset.recordDetailTab === openSessionDetail.view;
+    tab.classList.toggle("is-selected", isSelected);
+    tab.setAttribute("aria-selected", String(isSelected));
+    tab.tabIndex = isSelected ? 0 : -1;
+    if (focus && isSelected) tab.focus();
+  }
+  for (const panel of els.viewPanels) {
+    panel.hidden = panel.dataset.recordDetailPanel !== openSessionDetail.view;
+  }
+}
 
 function renderOpenSessionTranscript() {
   const els = sessionDetailElements();
@@ -1118,12 +2096,151 @@ function renderOpenSessionTranscript() {
     const isSelected = tab.dataset.transcriptLang === openSessionDetail.language;
     tab.classList.toggle("is-selected", isSelected);
     tab.setAttribute("aria-selected", String(isSelected));
+    tab.tabIndex = isSelected ? 0 : -1;
   }
+  els.transcript.setAttribute("aria-labelledby", `session-transcript-tab-${openSessionDetail.language}`);
+}
+
+function stableParticipantColor(identity) {
+  let hash = 0;
+  for (const character of String(identity ?? "")) hash = ((hash << 5) - hash + character.codePointAt(0)) | 0;
+  return Math.abs(hash) % 5 + 1;
+}
+
+function participantName(participant, index) {
+  if (typeof participant === "string") return participant.trim() || `${t("live.participant")} ${index + 1}`;
+  return String(participant?.displayName ?? participant?.name ?? participant?.label ?? "").trim()
+    || `${t("live.participant")} ${index + 1}`;
+}
+
+function renderSessionParticipants(container, participants) {
+  container.replaceChildren();
+  if (!participants.length) {
+    const empty = document.createElement("p");
+    empty.textContent = `${t("live.participant")} · 0`;
+    container.append(empty);
+    return;
+  }
+  participants.forEach((participant, index) => {
+    const name = participantName(participant, index);
+    const identity = typeof participant === "string"
+      ? participant
+      : participant?.participantId ?? participant?.speakerId ?? participant?.id ?? name;
+    const row = document.createElement("div");
+    row.className = "session-detail-participant";
+    const avatar = document.createElement("span");
+    avatar.className = `session-detail-participant-avatar color-${stableParticipantColor(identity)}`;
+    avatar.setAttribute("aria-hidden", "true");
+    avatar.textContent = Array.from(name)[0]?.toUpperCase() ?? "";
+    const copy = document.createElement("div");
+    copy.className = "session-detail-participant-copy";
+    const heading = document.createElement("strong");
+    heading.textContent = name;
+    copy.append(heading);
+    if (participant && typeof participant === "object") {
+      const meta = [participant.department, participant.jobTitle].map((value) => String(value ?? "").trim()).filter(Boolean);
+      if (meta.length) {
+        const detail = document.createElement("span");
+        detail.textContent = meta.join(" · ");
+        copy.append(detail);
+      }
+    }
+    row.append(avatar, copy);
+    container.append(row);
+  });
+}
+
+function coachHistoryEntryText(entry) {
+  if (typeof entry === "string") return entry.trim();
+  if (!isRecordObject(entry)) return "";
+  const values = [entry.english, entry.korean, entry.text, entry.answer, entry.response, entry.recommendation]
+    .map((value) => typeof value === "string" ? value.trim() : "")
+    .filter(Boolean);
+  return [...new Set(values)].join("\n");
+}
+
+function sessionCoachHistory(detail, sessionId) {
+  if (!isRecordObject(detail)) return { usedAnswers: [], unusedRecommendations: [] };
+  const candidates = [detail.coach, detail.meetingCoach, detail.meta?.coach, detail.meta?.meetingCoach]
+    .filter(isRecordObject);
+  const matching = candidates.find((candidate) => {
+    const associationFields = [candidate.sourceSessionId, candidate.sessionId, candidate.meetingSessionId, candidate.meetingId];
+    const hasDeclaredAssociation = associationFields.some((value) => value !== undefined && value !== null);
+    const associationIds = associationFields
+      .filter((value) => typeof value === "string" && value.trim())
+      .map((value) => value.trim());
+    if (hasDeclaredAssociation && associationIds.length === 0) return false;
+    return associationIds.length === 0 || associationIds.includes(sessionId);
+  });
+  if (!matching) return { usedAnswers: [], unusedRecommendations: [] };
+
+  const explicitUsed = [matching.usedAnswers, matching.usedResponses, matching.used].filter(Array.isArray).flat();
+  const explicitUnused = [matching.unusedRecommendations, matching.unusedSuggestions, matching.unused].filter(Array.isArray).flat();
+  const suggestions = [matching.recommendations, matching.suggestions].filter(Array.isArray).flat();
+  const isUsed = (entry) => isRecordObject(entry)
+    && (entry.used === true || entry.selected === true || ["used", "applied", "selected"].includes(normalizeRecordFilterText(entry.status)));
+  const isUnused = (entry) => typeof entry === "string" || (isRecordObject(entry)
+    && !isUsed(entry)
+    && (entry.used === false
+      || entry.selected === false
+      || ["ready", "ready-grounded", "ready-verify"].includes(normalizeRecordFilterText(entry.status).replaceAll("_", "-"))));
+  const usedAnswers = [...explicitUsed, ...suggestions.filter(isUsed)].map(coachHistoryEntryText).filter(Boolean);
+  const unusedRecommendations = [...explicitUnused, ...suggestions.filter(isUnused)]
+    .map(coachHistoryEntryText)
+    .filter(Boolean);
+  return {
+    usedAnswers: [...new Set(usedAnswers)],
+    unusedRecommendations: [...new Set(unusedRecommendations)],
+  };
+}
+
+function appendSessionCoachGroup(container, labelKey, entries, className) {
+  if (!entries.length) return;
+  const group = document.createElement("section");
+  group.className = `session-coach-group ${className}`;
+  const heading = document.createElement("h3");
+  heading.textContent = t(labelKey);
+  const list = document.createElement("ol");
+  list.className = "session-coach-list";
+  for (const entry of entries) {
+    const item = document.createElement("li");
+    item.className = "session-coach-entry";
+    item.textContent = entry;
+    list.append(item);
+  }
+  group.append(heading, list);
+  container.append(group);
+}
+
+function renderSessionCoachHistory(container, history) {
+  if (!container) return;
+  container.replaceChildren();
+  const usedAnswers = Array.isArray(history?.usedAnswers) ? history.usedAnswers : [];
+  const unusedRecommendations = Array.isArray(history?.unusedRecommendations) ? history.unusedRecommendations : [];
+  if (usedAnswers.length === 0 && unusedRecommendations.length === 0) {
+    const empty = document.createElement("p");
+    empty.className = "session-coach-empty";
+    empty.textContent = t("records.coachEmpty");
+    container.append(empty);
+    return;
+  }
+  appendSessionCoachGroup(container, "records.coachUsed", usedAnswers, "is-used");
+  appendSessionCoachGroup(container, "records.coachUnused", unusedRecommendations, "is-unused");
 }
 
 async function openSessionRecordDetail(session) {
   const els = sessionDetailElements();
   if (!els.panel) return;
+  const trigger = document.activeElement instanceof HTMLElement
+    && document.activeElement.matches(".records-chip, .records-block, .records-local-row")
+    ? document.activeElement
+    : null;
+  openSessionDetail.returnFocus = trigger;
+  if (trigger) {
+    trigger.disabled = true;
+    trigger.setAttribute("aria-busy", "true");
+  }
+  let didOpen = false;
   try {
     const body = await fetch(`/api/subtitles/sessions/${encodeURIComponent(session.id)}`).then((res) => res.json());
     if (!body.ok) throw new Error(body.error || t("records.loadFailed"));
@@ -1138,11 +2255,16 @@ async function openSessionRecordDetail(session) {
     els.meta.textContent = `${period} · ${t("records.lineCount", { count: meta.lineCount ?? session.lineCount ?? 0 })}`;
     openSessionDetail.id = session.id;
     openSessionDetail.lines = detail.lines ?? [];
+    openSessionDetail.participants = Array.isArray(detail.participants)
+      ? detail.participants
+      : (Array.isArray(meta.participants) ? meta.participants : []);
     // Open on whichever language the record actually has, so a KO-only session
     // does not land on an empty EN tab.
     const hasEnglish = openSessionDetail.lines.some((line) => transcriptTextForLanguage(line, "en"));
     openSessionDetail.language = hasEnglish ? "en" : "ko";
     renderOpenSessionTranscript();
+    renderSessionCoachHistory(els.coach, sessionCoachHistory(detail, String(session.id ?? "")));
+    renderSessionParticipants(els.participants, openSessionDetail.participants);
     els.summary.replaceChildren();
     if (detail.summary) {
       renderSessionSummary(els.summary, detail.summary);
@@ -1171,17 +2293,33 @@ async function openSessionRecordDetail(session) {
       els.exportButton.onclick = () => exportSessionTranscript(session);
     }
     els.page?.classList.add("is-detail-view");
+    els.listPanel.hidden = true;
     els.panel.hidden = false;
+    activateSessionDetailView("summary", { focus: true });
+    didOpen = true;
   } catch (error) {
     setSessionRecordsStatus(error.message, true);
+  } finally {
+    if (trigger) {
+      trigger.disabled = false;
+      trigger.removeAttribute("aria-busy");
+      if (!didOpen) trigger.focus();
+    }
   }
 }
 
 function closeSessionRecordDetail() {
   const els = sessionDetailElements();
   if (!els.panel) return;
+  const returnFocus = openSessionDetail.returnFocus;
   els.panel.hidden = true;
+  els.listPanel.hidden = false;
   els.page?.classList.remove("is-detail-view");
+  const matchingRecord = [...document.querySelectorAll("[data-session-record-id]")]
+    .find((record) => record.dataset.sessionRecordId === openSessionDetail.id);
+  const nextFocus = returnFocus?.isConnected ? returnFocus : matchingRecord ?? document.getElementById("records-search");
+  nextFocus?.focus();
+  openSessionDetail.returnFocus = null;
 }
 
 async function generateSessionDetailSummary(session) {
@@ -1300,52 +2438,101 @@ function renderSessionSummary(container, summary) {
   }
 }
 
-document.getElementById("refresh-session-records")?.addEventListener("click", () => void loadSessionRecords());
+document.getElementById("refresh-session-records")?.addEventListener("click", () => void loadSessionRecords({ showBusy: true }));
 document.getElementById("records-cal-prev")?.addEventListener("click", () => stepRecordsCalendar(-1));
 document.getElementById("records-cal-next")?.addEventListener("click", () => stepRecordsCalendar(1));
 document.getElementById("records-cal-today")?.addEventListener("click", () => {
   recordsCalendar.anchor = new Date();
   renderRecordsCalendar();
 });
-for (const button of document.querySelectorAll("[data-records-view]")) {
-  button.addEventListener("click", () => {
-    recordsCalendar.view = button.dataset.recordsView ?? "month";
-    for (const sibling of document.querySelectorAll("[data-records-view]")) {
-      const isSelected = sibling === button;
-      sibling.classList.toggle("is-selected", isSelected);
-      sibling.setAttribute("aria-pressed", String(isSelected));
-    }
-    renderRecordsCalendar();
+document.getElementById("records-search")?.addEventListener("input", (event) => {
+  sessionRecordsCatalog.query = event.target.value;
+  applySessionRecordFilters();
+});
+document.getElementById("records-search")?.addEventListener("keydown", (event) => {
+  if (event.key !== "Enter") return;
+  event.preventDefault();
+});
+document.getElementById("records-type-filter")?.addEventListener("change", (event) => {
+  sessionRecordsCatalog.type = event.target.value;
+  applySessionRecordFilters();
+});
+document.getElementById("records-status-filter")?.addEventListener("change", (event) => {
+  sessionRecordsCatalog.status = event.target.value;
+  applySessionRecordFilters();
+});
+const recordsCalendarViewButtons = [...document.querySelectorAll("[data-records-view]")];
+
+function activateRecordsCalendarView(button, { focus = false } = {}) {
+  if (!button || !recordsCalendarViewButtons.includes(button)) return;
+  recordsCalendar.view = button.dataset.recordsView ?? "month";
+  for (const sibling of recordsCalendarViewButtons) {
+    const isSelected = sibling === button;
+    sibling.classList.toggle("is-selected", isSelected);
+    sibling.setAttribute("aria-pressed", String(isSelected));
+    sibling.tabIndex = isSelected ? 0 : -1;
+  }
+  renderRecordsCalendar();
+  if (focus) button.focus();
+}
+
+for (const button of recordsCalendarViewButtons) {
+  button.addEventListener("click", () => activateRecordsCalendarView(button));
+  button.addEventListener("keydown", (event) => {
+    if (!["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "Home", "End"].includes(event.key)) return;
+    event.preventDefault();
+    const currentIndex = recordsCalendarViewButtons.indexOf(button);
+    const nextIndex = event.key === "Home" ? 0
+      : event.key === "End" ? recordsCalendarViewButtons.length - 1
+      : (currentIndex + (["ArrowRight", "ArrowDown"].includes(event.key) ? 1 : -1) + recordsCalendarViewButtons.length)
+        % recordsCalendarViewButtons.length;
+    activateRecordsCalendarView(recordsCalendarViewButtons[nextIndex], { focus: true });
   });
 }
 
 function connectWebSocket() {
+  if (state.ws?.readyState === WebSocket.OPEN || state.ws?.readyState === WebSocket.CONNECTING) return state.ws;
+  window.clearTimeout(captionWebSocketReconnectTimer);
+  captionWebSocketReconnectTimer = null;
   const proto = location.protocol === "https:" ? "wss" : "ws";
   const ws = new WebSocket(`${proto}://${location.host}/ws`);
   state.ws = ws;
 
-  ws.addEventListener("open", () => setConnectionStatus(t("status.captionsReady"), "active"));
+  ws.addEventListener("open", () => {
+    setConnectionStatus(t("status.captionsReady"), "active");
+    if (activeCaptionSessionOwner === "live-call" && state.running) void recoverLiveCaptionSocket();
+  });
   ws.addEventListener("close", () => {
+    if (state.ws !== ws) return;
+    state.ws = null;
+    captionWebSocketReconnectTimer = window.setTimeout(connectWebSocket, 1_000);
+    if (liveBridgePreflightRequestId) {
+      setConnectionStatus(t("status.reconnecting"), "active");
+      return;
+    }
+    if (activeCaptionSessionOwner === "live-call" && state.running) {
+      appliedLiveFloorGateRevision = -1;
+      liveTranslationStallMonitor.suspend();
+      transitionCaptionRuntime("reconnecting");
+      setConnectionStatus(t("status.reconnecting"), "active");
+      setRealtimeApiStatus(t("status.realtimeReconnecting"), "active");
+      return;
+    }
     setConnectionStatus(t("status.disconnected"), "error");
-    clearTranslatedAudioQueue();
-    stopLocalStreams();
-    void setControllerWindowVisible(false);
+    void stopSubtitles();
   });
   ws.addEventListener("error", () => setConnectionStatus(t("status.checkConnection"), "error"));
   ws.addEventListener("message", (event) => {
     const message = JSON.parse(event.data);
     if (message.type === "settings" && message.settings?.subtitle) {
-      state.settings = { ...DEFAULT_SUBTITLE, ...message.settings.subtitle };
+      state.settings = normalizeCaptionSettings(message.settings.subtitle);
       state.hasOpenAIKey = Boolean(message.settings.hasOpenAIKey);
-      state.hasOpenAISecondaryKey = Boolean(message.settings.hasOpenAISecondaryKey);
       state.hasGeminiKey = Boolean(message.settings.hasGeminiKey);
       state.hasGeminiSecondaryKey = Boolean(message.settings.hasGeminiSecondaryKey);
       writeSettingsToForm(state.settings);
       applyPreviewSettings(state.settings);
       updateOpenAIKeyPlaceholder();
-      updateOpenAISecondaryKeyPlaceholder();
       updateOpenAIKeyStatus();
-      updateOpenAISecondaryKeyStatus();
       updateGeminiKeyStatus();
       updateGeminiSecondaryKeyStatus();
       updateSessionSummary();
@@ -1353,8 +2540,13 @@ function connectWebSocket() {
       updateAudioInspectorLabels();
     }
     if (message.type === "subtitle:status") {
-      if (message.status === "connecting") setConnectionStatus(t("status.serviceConnecting"), "active");
+      if (message.status === "idle") clearActiveSubtitleSurface();
+      if (message.status === "connecting") {
+        if (activeCaptionSessionOwner === "live-call" && state.running) transitionCaptionRuntime("reconnecting");
+        setConnectionStatus(t("status.serviceConnecting"), "active");
+      }
       else if (message.status === "api_ready") {
+        if (captionRuntimeState === "reconnecting") transitionCaptionRuntime("running");
         setConnectionStatus(t("status.captionsReady"), "active");
         setRealtimeApiStatus(t("status.realtimeConnected"), "active");
       } else if (message.status === "hearing") {
@@ -1369,32 +2561,20 @@ function connectWebSocket() {
         setPreviewStatus(t("status.reconnecting"), 1800);
       } else setConnectionStatus(message.status === "listening" ? t("status.receivingCaptions") : t("status.captionsReady"), message.status === "listening" ? "active" : "");
     }
-    if (message.type === "subtitle:partial" && state.settings.outputMode !== "audio") {
+    if (message.type === "subtitle:partial") {
+      if (shouldSuppressLocalLiveCallOutput(message)) return;
+      if (activeCaptionSessionOwner === "live-call" && String(message.translatedText ?? "").trim()) {
+        liveTranslationStallMonitor.noteOutput(performance.now());
+      }
       setPreviewText(message.translatedText, message.sourceText, true);
       return;
     }
-    if (message.type === "subtitle:committed" && state.settings.outputMode !== "audio") {
-      setPreviewText(message.translatedText, message.sourceText, false);
-    }
-    if (message.type === "subtitle:translated-audio") {
-      if (!state.running || !state.sessionId || state.settings.outputMode === "captions" || message.targetLanguage !== state.settings.audioLanguage) return;
-      const isCanonicalAudio = message.mimeType === "audio/pcm;rate=24000"
-        && message.sampleRate === 24_000
-        && typeof message.audio === "string";
-      if (!isCanonicalAudio) {
-        failTranslatedAudio(new Error(t("error.badAudioFrame")));
-        return;
+    if (message.type === "subtitle:committed") {
+      if (shouldSuppressLocalLiveCallOutput(message)) return;
+      if (activeCaptionSessionOwner === "live-call" && String(message.translatedText ?? "").trim()) {
+        liveTranslationStallMonitor.noteOutput(performance.now());
       }
-      const previousAudioStreamId = translatedAudioGuard.activeStreamId;
-      if (!translatedAudioGuard.shouldAccept(message)) return;
-      if (previousAudioStreamId && previousAudioStreamId !== translatedAudioGuard.activeStreamId) clearTranslatedAudioQueue();
-      const base64Audio = message.audio;
-      subtitleAudioPlayer.enqueue({ audio: base64Audio, sampleRate: message.sampleRate });
-    }
-    if (message.type === "subtitle:audio-control" && (message.action === "clear" || message.action === "restart")) {
-      if (!translatedAudioGuard.markControl(message)) return;
-      clearTranslatedAudioQueue();
-      if (message.action === "restart") setPreviewStatus(t("audio.recoveryContinuing"), 2400);
+      setPreviewText(message.translatedText, message.sourceText, false);
     }
     if (message.type === "subtitle:history") {
       renderHistory(message);
@@ -1409,37 +2589,154 @@ function connectWebSocket() {
     if (message.type === "subtitle:control") {
       void handleSubtitleControllerCommand(message);
     }
-    if (message.type === "subtitle:error") {
-      void stopSubtitles();
-      showError(new Error(message.message));
+    if (message.type === "subtitle:live-call-floor-applied") {
+      applyLiveCallFloorAcknowledgement(message);
     }
+    if (message.type === "subtitle:error") {
+      void handleSubtitleRuntimeError(message);
+    }
+  });
+  return ws;
+}
+
+// 게이트웨이 단일 정본 생산자(2026-07-26 결정): Live Call 중 로컬 Gemini 엔진을
+// 함께 돌리면 같은 오디오를 두 번 번역해 비용이 배가된다. 데스크톱 표시
+// (대시보드·오버레이)는 게이트웨이 host mirror(live-call:caption)로 채워지므로
+// 기본은 "gateway"이며, settings.liveCallLocalEngine=true로만 hybrid를 켠다.
+function resolveLiveCallProducerKind() {
+  return state.settings?.liveCallLocalEngine === true ? "hybrid" : "gateway";
+}
+
+async function recoverLiveCaptionSocket() {
+  if (liveCaptionSocketRecoveryPromise) return liveCaptionSocketRecoveryPromise;
+  if (activeCaptionSessionOwner !== "live-call" || !state.running || !state.sessionId) return false;
+  const sessionId = state.sessionId;
+  liveCaptionSocketRecoveryPromise = (async () => {
+    transitionCaptionRuntime("reconnecting");
+    const liveState = await window.realtimeNoelDesktop?.getLiveCallState?.();
+    if (!liveState?.armed || !liveState.live) return false;
+    const startPayload = {
+      type: "subtitle:start",
+      sessionId,
+      settings: state.settings,
+      meeting: {
+        kind: "live-call",
+        liveSessionId: String(liveState.sessionId ?? ""),
+        title: String(liveState.title ?? ""),
+        startedAt: String(liveState.liveStartedAt ?? ""),
+      },
+    };
+    await ensureLiveCallProducerCapability();
+    // 복구는 원래 시작과 같은 프로듀서 종류로 재등록한다.
+    const recoveredProducerKind = liveState.demandEnabled === true ? "gateway" : resolveLiveCallProducerKind();
+    await requestSubtitleStart({
+      ...startPayload,
+      captionProducer: recoveredProducerKind,
+      producerCapability: liveCallProducerCapability,
+    });
+    if (state.sessionId !== sessionId || activeCaptionSessionOwner !== "live-call") return false;
+    activeCaptionProducer = recoveredProducerKind;
+    sendCurrentLiveCallFloorGate();
+    for (const caption of liveState.captionSnapshot ?? []) {
+      enqueueLiveCallCaptionRelay(caption);
+    }
+    transitionCaptionRuntime("running");
+    setConnectionStatus(t("status.receivingCaptions"), "active");
+    setRealtimeApiStatus(t("status.realtimeConnected"), "active");
+    flushLiveCallCaptionRelayQueue();
+    return true;
+  })().catch((error) => {
+    console.warn(`[live-bridge] local caption socket recovery failed: ${error?.message ?? error}`);
+    window.clearTimeout(liveCaptionSocketRecoveryTimer);
+    liveCaptionSocketRecoveryTimer = window.setTimeout(() => { void recoverLiveCaptionSocket(); }, 1_000);
+    return false;
+  }).finally(() => {
+    liveCaptionSocketRecoveryPromise = null;
+  });
+  return liveCaptionSocketRecoveryPromise;
+}
+
+function requestSubtitleStart(payload) {
+  const socket = state.ws;
+  if (!socket || socket.readyState !== WebSocket.OPEN) {
+    return Promise.reject(new Error(t("error.websocketClosed")));
+  }
+  const expectedProducer = payload.captionProducer === "hybrid"
+    ? "hybrid"
+    : payload.captionProducer === "gateway"
+      ? "gateway"
+      : "local";
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const finish = (error, acknowledgement) => {
+      if (settled) return;
+      settled = true;
+      window.clearTimeout(timer);
+      socket.removeEventListener("message", onMessage);
+      socket.removeEventListener("close", onClose);
+      if (error) reject(error);
+      else resolve(acknowledgement);
+    };
+    const onMessage = (event) => {
+      let message;
+      try { message = JSON.parse(event.data); } catch { return; }
+      if (message.type === "subtitle:started") {
+        if (message.sessionId !== payload.sessionId) return;
+        if (message.captionProducer !== expectedProducer) return;
+        finish(null, message);
+        return;
+      }
+      if (message.type === "subtitle:error" && message.code === "SUBTITLE_START_FAILED") {
+        if (message.sessionId && message.sessionId !== payload.sessionId) return;
+        if (message.captionProducer && message.captionProducer !== expectedProducer) return;
+        finish(new Error(message.message || t("error.subtitleStartFailed")));
+      }
+    };
+    const onClose = () => finish(new Error(t("error.websocketClosed")));
+    const timer = window.setTimeout(
+      () => finish(new Error(t("error.subtitleStartTimeout"))),
+      SUBTITLE_START_ACK_TIMEOUT_MS,
+    );
+    socket.addEventListener("message", onMessage);
+    socket.addEventListener("close", onClose, { once: true });
+    socket.send(JSON.stringify(payload));
   });
 }
 
+async function handleSubtitleRuntimeError(message) {
+  // Initial-start errors are owned by requestSubtitleStart, which rejects the
+  // matching promise and lets that start path release its own capture exactly once.
+  if (captionRuntimeState === "starting") return;
+  if (liveBridgePreflightRequestId && message.code === "SUBTITLE_PREFLIGHT_FAILED") return;
+  if (activeCaptionSessionOwner === "live-call" && state.running) {
+    transitionCaptionRuntime("reconnecting");
+    setConnectionStatus(t("status.reconnecting"), "active");
+    setRealtimeApiStatus(t("status.realtimeReconnecting"), "active");
+    await reconnectLiveCallTranslation();
+    return;
+  }
+  await stopSubtitles();
+  showError(new Error(message.message));
+}
+
 async function startSubtitles() {
-  if (state.running) return;
+  if (state.running || captionRuntimeState === "starting" || captionRuntimeState === "stopping") return;
+  if (captionRuntimeState === "failed") transitionCaptionRuntime("idle");
+  transitionCaptionRuntime("starting");
   clearError();
   let captures = [];
   startButton.disabled = true;
   stopButton.disabled = true;
   try {
     state.settings = readSettingsFromForm();
-    if (state.settings.outputMode !== "captions") {
-      await subtitleAudioPlayer.resume(state.settings.audioVolume);
-    }
     const patch = { subtitle: state.settings };
     const apiKeysPatch = {};
     if (openaiKeyInput.value.trim()) apiKeysPatch.openai = openaiKeyInput.value.trim();
-    if (openaiSecondaryKeyInput?.value.trim()) apiKeysPatch.openaiSecondary = openaiSecondaryKeyInput.value.trim();
     if (geminiKeyInput?.value.trim()) apiKeysPatch.gemini = geminiKeyInput.value.trim();
     if (geminiSecondaryKeyInput?.value.trim()) apiKeysPatch.geminiSecondary = geminiSecondaryKeyInput.value.trim();
     if (Object.keys(apiKeysPatch).length > 0) patch.apiKeys = apiKeysPatch;
     if (!state.hasGeminiKey && !geminiKeyInput?.value.trim()) {
       throw new Error(t("key.geminiRequired"));
-    }
-    if (state.settings.outputMode !== "captions" && state.settings.voiceProvider === "openai"
-      && !state.hasOpenAIKey && !openaiKeyInput.value.trim()) {
-      throw new Error(t("key.openaiVoiceRequired"));
     }
     await saveSettings(patch);
     if (geminiKeyInput?.value.trim()) {
@@ -1459,13 +2756,6 @@ async function startSubtitles() {
       updateOpenAIKeyStatus();
       updateServiceStrip();
     }
-    if (openaiSecondaryKeyInput?.value.trim()) {
-      state.hasOpenAISecondaryKey = true;
-      openaiSecondaryKeyInput.value = "";
-      updateOpenAISecondaryKeyPlaceholder();
-      updateOpenAISecondaryKeyStatus();
-      updateServiceStrip();
-    }
     await ensureWebSocketOpen();
     setConnectionStatus(t("status.checkingInputs"), "active");
     setPreviewStatus(t("status.inputCheck"), 1200);
@@ -1477,32 +2767,26 @@ async function startSubtitles() {
     void hydrateMicrophones();
 
     state.sessionId = crypto.randomUUID();
-    translatedAudioGuard.reset();
-    state.ws.send(JSON.stringify({
+    await requestSubtitleStart({
       type: "subtitle:start",
       sessionId: state.sessionId,
       settings: state.settings,
       meeting: await describeActiveMeeting(),
-    }));
-    if (state.settings.outputMode !== "audio") setPreviewStatus(t("status.waitingForCaptions"), 1800);
+    });
+    setPreviewStatus(t("status.waitingForCaptions"), 1800);
 
     for (const capture of captures) {
-      const streamer = await createAudioStreamer(capture.stream, capture.source, capture.label, (audio) => {
+      const streamer = await createAudioStreamer(capture.stream, capture.source, capture.label, (packet) => {
         // Backpressure guard: if the server stops draining our socket, drop
         // frames instead of letting the browser's ws buffer grow without bound
         // (audio queues up, subtitles fall behind, then appear frozen).
         if ((state.ws?.bufferedAmount ?? 0) > 1_000_000) return;
-        if (shouldGateTranslatedAudioInput(
-          state.settings.outputMode,
-          subtitleAudioPlayer.isInputSuppressionActive(),
-          capture.source,
-        )) return;
         if (state.ws?.readyState === WebSocket.OPEN && state.sessionId) {
           state.ws.send(JSON.stringify({
             type: "subtitle:audio",
             sessionId: state.sessionId,
             source: capture.source,
-            audio,
+            audio: pcm16ArrayBufferToBase64(packet.pcm),
           }));
         }
       });
@@ -1511,12 +2795,10 @@ async function startSubtitles() {
     state.running = true;
     activeCaptionProducer = "local";
     activeCaptionSessionOwner = "caption-only";
+    transitionCaptionRuntime("running");
     stopButton.disabled = false;
     syncRuntimeOutputVisibility();
     setConnectionStatus(t("status.receivingCaptions"), "active");
-    if (state.settings.outputMode !== "captions" && state.settings.inputMode !== "mic") {
-      showNotice(t("notice.audioFeedbackWarning"));
-    }
   } catch (error) {
     if (state.streams.length === 0) {
       for (const capture of captures) capture.stream.getTracks().forEach((track) => track.stop());
@@ -1527,9 +2809,10 @@ async function startSubtitles() {
 }
 
 async function stopSubtitles() {
+  if (captionRuntimeState !== "stopping") transitionCaptionRuntime("stopping");
+  clearActiveSubtitleSurface();
   const sessionId = state.sessionId;
   state.sessionId = null;
-  clearTranslatedAudioQueue();
   stopLocalStreams();
   if (state.ws?.readyState === WebSocket.OPEN && sessionId) {
     state.ws.send(JSON.stringify({ type: "subtitle:stop", sessionId }));
@@ -1537,6 +2820,11 @@ async function stopSubtitles() {
   state.running = false;
   activeCaptionProducer = "none";
   activeCaptionSessionOwner = "none";
+  liveTranslationStallMonitor.reset();
+  resetLiveCallCaptionRelay();
+  window.clearTimeout(liveCaptionSocketRecoveryTimer);
+  liveCaptionSocketRecoveryTimer = null;
+  transitionCaptionRuntime("idle");
   startButton.disabled = false;
   stopButton.disabled = true;
   syncRuntimeOutputVisibility();
@@ -1550,8 +2838,33 @@ async function stopSubtitles() {
 // the old configuration.
 function reconfigureRunningSession() {
   if (!state.running || !state.sessionId || state.ws?.readyState !== WebSocket.OPEN) return;
-  clearTranslatedAudioQueue();
+  if (activeCaptionSessionOwner === "live-call") {
+    void reconfigureLiveCallLocalProvider().catch((error) => {
+      console.warn(`[live-bridge] local settings reconfigure failed: ${error?.message ?? error}`);
+    });
+    return;
+  }
   state.ws.send(JSON.stringify({ type: "subtitle:start", sessionId: state.sessionId, settings: state.settings }));
+}
+
+async function reconfigureLiveCallLocalProvider() {
+  const sessionId = state.sessionId;
+  if (!sessionId || activeCaptionProducer !== "hybrid") return false;
+  const liveState = await window.realtimeNoelDesktop?.getLiveCallState?.();
+  if (!liveState?.armed || !liveState.live || String(liveState.sessionId ?? "") !== activeLiveFloorSessionId) return false;
+  await requestSubtitleStart({
+    type: "subtitle:start",
+    captionProducer: "local",
+    sessionId,
+    settings: state.settings,
+    meeting: {
+      kind: "live-call",
+      liveSessionId: activeLiveFloorSessionId,
+      title: String(liveState.title ?? ""),
+      startedAt: String(liveState.liveStartedAt ?? ""),
+    },
+  });
+  return state.sessionId === sessionId && activeCaptionSessionOwner === "live-call";
 }
 
 async function handleSubtitleControllerCommand(message) {
@@ -1560,7 +2873,7 @@ async function handleSubtitleControllerCommand(message) {
     return;
   }
   if (message.command === "restart") {
-    await restartSubtitles();
+    await restartCaptionsFromController();
     return;
   }
   if (message.command === "font") {
@@ -1577,15 +2890,6 @@ async function handleSubtitleControllerCommand(message) {
   }
   if (message.command === "languages") {
     applyControllerLanguagePreset(message.languages);
-    return;
-  }
-  if (message.command === "voice-provider") {
-    const provider = message.voiceProvider === "openai" ? "openai" : "gemini";
-    const input = form.querySelector(`input[name="voiceProvider"][value="${provider}"]`);
-    if (input && !input.disabled) {
-      input.checked = true;
-      input.dispatchEvent(new Event("change", { bubbles: true }));
-    }
     return;
   }
   if (message.command === "opacity") {
@@ -1605,6 +2909,65 @@ async function restartSubtitles() {
   await stopSubtitles();
   await startSubtitles();
   showNotice(t("notice.captionEngineRestarted"));
+}
+
+async function restartCaptionsFromController() {
+  if (activeCaptionSessionOwner === "live-call") {
+    await reconnectLiveCallTranslation();
+    return;
+  }
+  await restartSubtitles();
+}
+
+function clearActiveSubtitleSurface() {
+  clearTimeout(state.previewStatusTimer);
+  state.previewStatusTimer = null;
+  preview.querySelector(".translation-line").textContent = "";
+  preview.querySelector(".source-line").textContent = "";
+  preview.classList.remove("partial");
+}
+
+function clearUncommittedPreview() {
+  if (!preview.classList.contains("partial")) return;
+  clearActiveSubtitleSurface();
+}
+
+function shouldSuppressLocalLiveCallOutput(message) {
+  return activeCaptionSessionOwner === "live-call"
+    && isLiveParticipantFloorActive
+    && message.source !== "live-call";
+}
+
+async function reconnectLiveCallTranslation() {
+  if (liveTranslationReconnectPromise) return liveTranslationReconnectPromise;
+  if (activeCaptionSessionOwner !== "live-call" || !state.running || !state.sessionId) return false;
+  const sessionId = state.sessionId;
+  const bridge = window.realtimeNoelDesktop;
+  if (!bridge?.reconnectLiveCallTranslation) {
+    transitionCaptionRuntime("reconnecting");
+    setConnectionStatus(t("status.reconnecting"), "active");
+    return false;
+  }
+  liveTranslationReconnectPromise = (async () => {
+    transitionCaptionRuntime("reconnecting");
+    setConnectionStatus(t("status.reconnecting"), "active");
+    setRealtimeApiStatus(t("status.realtimeReconnecting"), "active");
+    const result = await bridge.reconnectLiveCallTranslation();
+    if (state.sessionId !== sessionId || activeCaptionSessionOwner !== "live-call") return false;
+    if (!result?.ok) return false;
+    transitionCaptionRuntime("running");
+    clearError();
+    setConnectionStatus(t("status.receivingCaptions"), "active");
+    setRealtimeApiStatus(t("status.realtimeConnected"), "active");
+    flushLiveCallCaptionRelayQueue();
+    return true;
+  })().catch((error) => {
+    console.warn(`[live-bridge] translation reconnect failed: ${error?.message ?? error}`);
+    return false;
+  }).finally(() => {
+    liveTranslationReconnectPromise = null;
+  });
+  return liveTranslationReconnectPromise;
 }
 
 function stopLocalStreams() {
@@ -1672,22 +3035,9 @@ async function captureSystemAudio() {
 }
 
 async function captureMicrophoneAudio() {
-  const audio = {
-    echoCancellation: true,
-    noiseSuppression: true,
-    autoGainControl: true,
-  };
-  if (!micSelect.value) return navigator.mediaDevices.getUserMedia({ audio });
-  try {
-    return await navigator.mediaDevices.getUserMedia({ audio: { ...audio, deviceId: { exact: micSelect.value } } });
-  } catch (error) {
-    // A persisted device id can go stale (mic unplugged, ids renumbered) and
-    // then the exact constraint throws OverconstrainedError. Permission errors
-    // would fail again anyway, so always retry once on the system default mic
-    // rather than losing the whole mic input.
+  return captureMicrophoneStream(navigator.mediaDevices, micSelect.value, (error) => {
     console.warn(`[subtitle] selected microphone failed (${error?.name ?? error}); retrying with system default`);
-    return navigator.mediaDevices.getUserMedia({ audio });
-  }
+  });
 }
 
 function withMediaCaptureTimeout(promise, sourceName) {
@@ -1724,14 +3074,13 @@ function stopMediaStream(stream) {
 
 
 async function createAudioStreamer(media, sourceName, label, onChunk) {
-  const context = new AudioContext({ sampleRate: SAMPLE_RATE, latencyHint: "interactive" });
+  const context = new AudioContext({ sampleRate: CAPTION_AUDIO_SAMPLE_RATE, latencyHint: "interactive" });
   await ensureAudioContextRunning(context, sourceName);
   const source = context.createMediaStreamSource(media);
-  const processor = context.createScriptProcessor(AUDIO_PROCESSOR_BUFFER_SIZE, 1, 1);
+  const processor = context.createScriptProcessor(CAPTION_AUDIO_PROCESSOR_BUFFER_SIZE, 1, 1);
   const analyser = context.createAnalyser();
   analyser.fftSize = 256;
-  let carry = new Float32Array(0);
-  let pendingSamples = new Float32Array(0);
+  const chunker = createCaptionAudioChunker({ inputSampleRate: context.sampleRate, source: sourceName, onChunk });
   const meter = startAudioLevelMeter(sourceName, label, analyser);
   const cleanupTrackDiagnostics = watchAudioTrackState(media, sourceName);
 
@@ -1741,21 +3090,7 @@ async function createAudioStreamer(media, sourceName, label, onChunk) {
   });
 
   processor.onaudioprocess = (event) => {
-    const input = event.inputBuffer.getChannelData(0);
-    const resampled = context.sampleRate === SAMPLE_RATE
-      ? { samples: input, carry: new Float32Array(0) }
-      : resample(input, context.sampleRate, SAMPLE_RATE, carry);
-    carry = resampled.carry;
-    if (resampled.samples.length === 0) return;
-    const availableSamples = new Float32Array(pendingSamples.length + resampled.samples.length);
-    availableSamples.set(pendingSamples);
-    availableSamples.set(resampled.samples, pendingSamples.length);
-    let offset = 0;
-    while (availableSamples.length - offset >= LIVE_AUDIO_CHUNK_SAMPLES) {
-      onChunk(pcm16ToBase64(availableSamples.subarray(offset, offset + LIVE_AUDIO_CHUNK_SAMPLES)));
-      offset += LIVE_AUDIO_CHUNK_SAMPLES;
-    }
-    pendingSamples = availableSamples.slice(offset);
+    chunker.push(event.inputBuffer.getChannelData(0));
   };
 
   source.connect(processor);
@@ -1769,7 +3104,7 @@ async function createAudioStreamer(media, sourceName, label, onChunk) {
     close: async () => {
       // A trailing fragment shorter than the Live API's 100 ms frame belongs to
       // the ending session and must not leak into a later session.
-      pendingSamples = new Float32Array(0);
+      chunker.reset();
       cleanupTrackDiagnostics();
       meter.close();
       processor.disconnect();
@@ -1833,17 +3168,19 @@ function startAudioLevelMeter(sourceName, label, analyser) {
     const rms = Math.sqrt(sum / data.length);
     const level = Math.min(1, rms * 6);
     const now = performance.now();
-    const isFeedbackSuppressed = shouldGateTranslatedAudioInput(
-      state.settings.outputMode,
-      subtitleAudioPlayer.isInputSuppressionActive(),
+    const hasSignal = level > INPUT_SIGNAL_THRESHOLD;
+    liveTranslationStallMonitor.noteInput(
       sourceName,
+      hasSignal,
+      now,
+      activeCaptionSessionOwner === "live-call" && state.running && !isLiveParticipantFloorActive
+        && !isLiveParticipantDemandEnabled,
     );
-    const hasSignal = !isFeedbackSuppressed && level > INPUT_SIGNAL_THRESHOLD;
     if (hasSignal) silentSince = now;
     const inputStatus = hasSignal ? "signal" : now - silentSince > INPUT_SILENCE_WARNING_MS ? "silent" : "waiting";
-    setAudioSourceStatus(sourceName, isFeedbackSuppressed ? t("audio.outputIsolated") : hasSignal ? t("audio.signal") : t("audio.noSignal"), isFeedbackSuppressed ? 0 : level);
+    setAudioSourceStatus(sourceName, hasSignal ? t("audio.signal") : t("audio.noSignal"), level);
     if (inputStatus !== lastBroadcastStatus || now - lastBroadcastAt > INPUT_STATUS_BROADCAST_MS) {
-      broadcastInputStatus(sourceName, inputStatus, isFeedbackSuppressed ? 0 : level);
+      broadcastInputStatus(sourceName, inputStatus, level);
       lastBroadcastStatus = inputStatus;
       lastBroadcastAt = now;
     }
@@ -1861,6 +3198,7 @@ function startAudioLevelMeter(sourceName, label, analyser) {
 
 function broadcastInputStatus(sourceName, status, level) {
   if (state.ws?.readyState !== WebSocket.OPEN || !state.sessionId) return;
+  if (activeCaptionSessionOwner === "live-call" && isLiveParticipantFloorActive) return;
   state.ws.send(JSON.stringify({
     type: "subtitle:input-status",
     sessionId: state.sessionId,
@@ -1911,36 +3249,6 @@ function getAudioTrackLabel(stream, fallback) {
   return stream.getAudioTracks()[0]?.label || fallback;
 }
 
-function resample(input, fromRate, toRate, carry) {
-  const merged = new Float32Array(carry.length + input.length);
-  merged.set(carry);
-  merged.set(input, carry.length);
-  const ratio = fromRate / toRate;
-  const outputLength = Math.floor((merged.length - 1) / ratio);
-  const output = new Float32Array(outputLength);
-  for (let index = 0; index < outputLength; index += 1) {
-    const sourceIndex = index * ratio;
-    const left = Math.floor(sourceIndex);
-    const right = Math.min(left + 1, merged.length - 1);
-    const weight = sourceIndex - left;
-    output[index] = merged[left] * (1 - weight) + merged[right] * weight;
-  }
-  const consumed = Math.floor(outputLength * ratio);
-  return { samples: output, carry: merged.slice(consumed) };
-}
-
-function pcm16ToBase64(samples) {
-  const pcm = new Int16Array(samples.length);
-  for (let index = 0; index < samples.length; index += 1) {
-    const sample = Math.max(-1, Math.min(1, samples[index]));
-    pcm[index] = sample < 0 ? sample * 0x8000 : sample * 0x7fff;
-  }
-  const bytes = new Uint8Array(pcm.buffer);
-  let binary = "";
-  for (let index = 0; index < bytes.length; index += 1) binary += String.fromCharCode(bytes[index]);
-  return btoa(binary);
-}
-
 // Device labels stay empty until the page has held a mic permission grant at
 // least once. Only open a temporary stream when labels are actually missing,
 // so routine devicechange refreshes don't grab the microphone.
@@ -1984,13 +3292,10 @@ async function saveSettings(patch) {
   if (!res.ok) throw new Error(body.error || t("error.saveSettingsFailed"));
   if (body.settings) {
     state.hasOpenAIKey = Boolean(body.settings.hasOpenAIKey);
-    state.hasOpenAISecondaryKey = Boolean(body.settings.hasOpenAISecondaryKey);
     state.hasGeminiKey = Boolean(body.settings.hasGeminiKey);
     state.hasGeminiSecondaryKey = Boolean(body.settings.hasGeminiSecondaryKey);
     updateOpenAIKeyPlaceholder();
-    updateOpenAISecondaryKeyPlaceholder();
     updateOpenAIKeyStatus();
-    updateOpenAISecondaryKeyStatus();
     updateGeminiKeyStatus();
     updateGeminiSecondaryKeyStatus();
   }
@@ -2007,26 +3312,19 @@ function readSettingsFromForm() {
   // language's placement.
   const position = subtitlePositions[translationLanguages[0]] || form.elements.position?.value || DEFAULT_SUBTITLE.position;
   const translationProvider = "gemini";
-  const requestedOutputMode = selectedOutputMode();
-  const outputMode = requestedOutputMode;
-  const voiceProvider = selectedVoiceProvider();
-  const requestedAudioLanguage = form.elements.audioLanguage?.value;
-  const audioLanguage = translationLanguages.includes(requestedAudioLanguage) ? requestedAudioLanguage : translationLanguages[0];
   return {
-    ...state.settings,
+    ...normalizeCaptionSettings(state.settings),
     inputMode: form.elements.inputMode.value,
     micDeviceId: form.elements.micDeviceId.value,
     languagePair: deriveLanguagePairFromTargets(translationLanguages),
     translationLanguages,
-    outputMode,
-    voiceProvider,
-    audioLanguage,
-    audioVolume: Math.max(0, Math.min(1, readNumber(form.elements.audioVolume?.value, DEFAULT_SUBTITLE.audioVolume))),
+    liveCallTranslationLanguages: readLiveCallLanguagesFromForm(),
+    outputMode: "captions",
     displayMode: "translation_only",
     // Source ("원문") display removed — subtitles are always translation-only.
     showSourceText: false,
     translateAllLanguages: translationLanguages.length >= 3,
-    model: "gpt-realtime-translate",
+    geminiTranscribeModel: DEFAULT_SUBTITLE.geminiTranscribeModel,
     fontFamily: form.elements.fontFamily.value || DEFAULT_SUBTITLE.fontFamily,
     translationFontSize,
     sourceFontSize,
@@ -2043,6 +3341,9 @@ function readSettingsFromForm() {
     translationProvider,
     glossary: form.elements.glossary?.value ?? "",
     translationDomain: form.elements.translationDomain?.value ?? "",
+    glossaryPresetId: selectedGlossaryPresetId(),
+    glossaryPresetName: selectedGlossaryPresetName(),
+    glossaries: selectedGlossaries(),
     verticalOffset: Math.min(600, Math.max(0, Math.round(readNumber(form.elements.verticalOffset?.value, DEFAULT_SUBTITLE.verticalOffset)))),
   };
 }
@@ -2051,6 +3352,8 @@ function writeSettingsToForm(settings) {
   form.elements.inputMode.value = settings.inputMode;
   form.elements.micDeviceId.value = settings.micDeviceId ?? "";
   writeTranslationLanguageCheckboxes(settings.translationLanguages ?? [settings.languagePair?.a ?? "en", settings.languagePair?.b ?? "ko"]);
+  writeLiveCallLanguageCheckboxes(settings.liveCallTranslationLanguages ?? []);
+  renderGlossarySelections(settings);
   form.elements.displayMode.value = "translation_only";
   if (form.elements.translateAllLanguages) form.elements.translateAllLanguages.checked = readTranslationLanguagesFromForm().length >= 3;
   form.elements.recordProvider.value = settings.recordProvider ?? DEFAULT_SUBTITLE.recordProvider;
@@ -2058,21 +3361,9 @@ function writeSettingsToForm(settings) {
   if (form.elements.translationProvider) {
     form.elements.translationProvider.value = "gemini";
   }
-  syncAudioLanguageOptions(
-    settings.translationLanguages ?? [settings.languagePair?.a ?? "en", settings.languagePair?.b ?? "ko"],
-    settings.audioLanguage ?? DEFAULT_SUBTITLE.audioLanguage,
-  );
-  const outputMode = ["captions", "audio"].includes(settings.outputMode) ? settings.outputMode : DEFAULT_SUBTITLE.outputMode;
-  const outputModeInput = form.querySelector(`input[name="outputMode"][value="${outputMode}"]`);
-  if (outputModeInput) outputModeInput.checked = true;
-  const voiceProvider = settings.voiceProvider === "openai" ? "openai" : "gemini";
-  const voiceProviderInput = form.querySelector(`input[name="voiceProvider"][value="${voiceProvider}"]`);
-  if (voiceProviderInput) voiceProviderInput.checked = true;
-  if (form.elements.audioVolume) form.elements.audioVolume.value = Math.max(0, Math.min(1, readNumber(settings.audioVolume, DEFAULT_SUBTITLE.audioVolume)));
-  enforcePtOutputAvailability();
-  updatePtOutputControls();
   if (form.elements.glossary) form.elements.glossary.value = settings.glossary ?? "";
   if (form.elements.translationDomain) form.elements.translationDomain.value = settings.translationDomain ?? "";
+  restoreGlossaryPresetSelection(settings.glossaryPresetId, settings.glossaryPresetName, { persistConfirmedMissing: true });
   if (form.elements.verticalOffset) form.elements.verticalOffset.value = settings.verticalOffset ?? DEFAULT_SUBTITLE.verticalOffset;
   updateVerticalOffsetValue(settings.verticalOffset ?? DEFAULT_SUBTITLE.verticalOffset);
   const perLanguagePositions = { ...DEFAULT_SUBTITLE.subtitlePositions, ...(settings.subtitlePositions ?? {}) };
@@ -2133,7 +3424,6 @@ function writeTranslationLanguageCheckboxes(languages = []) {
     input.checked = selected.has(input.value);
   }
   if (form.elements.translateAllLanguages) form.elements.translateAllLanguages.checked = selected.size >= 3;
-  syncAudioLanguageOptions([...selected], form.elements.audioLanguage?.value ?? state.settings.audioLanguage);
   renderLanguageChips();
 }
 
@@ -2151,6 +3441,7 @@ function syncLanguageControls(target) {
   markLanguageMinimum();
   renderLanguageChips();
   syncPlacementRows(readTranslationLanguagesFromForm());
+  renderGlossarySelections({ ...state.settings, glossaries: selectedGlossaries() });
 }
 
 function markLanguageMinimum() {
@@ -2180,11 +3471,6 @@ function updateOpenAIKeyPlaceholder() {
   openaiKeyInput.placeholder = state.hasOpenAIKey ? t("key.configuredPlaceholder") : "sk-...";
 }
 
-function updateOpenAISecondaryKeyPlaceholder() {
-  if (!openaiSecondaryKeyInput) return;
-  openaiSecondaryKeyInput.placeholder = state.hasOpenAISecondaryKey ? t("key.configuredPlaceholder") : "sk-... (separate Project)";
-}
-
 async function saveOpenAIKey() {
   clearError();
   const openaiKey = openaiKeyInput.value.trim();
@@ -2208,29 +3494,6 @@ async function saveOpenAIKey() {
   }
 }
 
-async function saveOpenAISecondaryKey() {
-  clearError();
-  const openaiSecondaryKey = openaiSecondaryKeyInput?.value.trim() ?? "";
-  if (!openaiSecondaryKey) {
-    showError(new Error(state.hasOpenAISecondaryKey ? t("key.replaceHintSecondary") : t("key.enterOpenAISecondary")));
-    return;
-  }
-  try {
-    openaiSecondaryKeyStatus.textContent = t("key.validatingOpenAI");
-    await validateOpenAIKey(openaiSecondaryKey);
-    await saveSettings({ apiKeys: { openaiSecondary: openaiSecondaryKey } });
-    openaiSecondaryKeyInput.value = "";
-    state.hasOpenAISecondaryKey = true;
-    updateOpenAISecondaryKeyPlaceholder();
-    updateOpenAISecondaryKeyStatus();
-    updateServiceStrip();
-    showNotice(t("key.openaiSecondarySaved"));
-  } catch (error) {
-    updateOpenAISecondaryKeyStatus();
-    showError(error);
-  }
-}
-
 async function validateOpenAIKey(openaiKey) {
   const res = await fetch("/api/subtitles/openai/validate", {
     method: "POST",
@@ -2244,10 +3507,6 @@ async function validateOpenAIKey(openaiKey) {
 
 function updateOpenAIKeyStatus() {
   renderKeyStatus(openaiKeyStatus, state.hasOpenAIKey);
-}
-
-function updateOpenAISecondaryKeyStatus() {
-  renderKeyStatus(openaiSecondaryKeyStatus, state.hasOpenAISecondaryKey);
 }
 
 function updateGeminiKeyStatus() {
@@ -2308,10 +3567,9 @@ function updateGeminiSecondaryKeyStatus() {
   if (geminiSecondaryKeyInput) geminiSecondaryKeyInput.placeholder = state.hasGeminiSecondaryKey ? t("key.configuredPlaceholder") : "AIza... (separate Project)";
 }
 
-// Second Gemini key: a separate Gemini project for committed-line glossary
-// finalization first, and extra Live channels second. Key 1 keeps the realtime
-// Gemini 3.5 Live Translate socket responsive while key 2 handles terminology
-// correction after an utterance commits.
+// Second Gemini key: a separate project for committed-line glossary
+// finalization so terminology correction cannot consume the live caption key's
+// quota after an utterance commits.
 async function saveGeminiSecondaryKey() {
   clearError();
   const geminiSecondaryKey = geminiSecondaryKeyInput?.value.trim() ?? "";
@@ -2560,18 +3818,8 @@ function updateSessionSummary() {
 }
 
 function updateServiceStrip() {
-  const openAIStatus = state.hasOpenAIKey
-    ? state.hasOpenAISecondaryKey && readTranslationLanguagesFromForm().length >= 3
-      ? "OpenAI Realtime: ready · dual project"
-      : "OpenAI Realtime: ready"
-    : "OpenAI Realtime: key needed";
   const geminiStatus = state.hasGeminiKey ? "Gemini Live: ready" : "Gemini Live: key needed";
-  const usesOpenAIVoice = state.settings.outputMode !== "captions" && state.settings.voiceProvider === "openai";
-  const realtimeStatus = usesOpenAIVoice
-    ? `${geminiStatus} · ${openAIStatus.replace("OpenAI Realtime", "OpenAI voice")}`
-    : geminiStatus;
-  const isRealtimeReady = state.hasGeminiKey && (!usesOpenAIVoice || state.hasOpenAIKey);
-  setRealtimeApiStatus(realtimeStatus, isRealtimeReady ? "active" : "error");
+  setRealtimeApiStatus(geminiStatus, state.hasGeminiKey ? "active" : "error");
   setTopicModelStatus(recorderStatusText(state.history.recorderStatus), state.history.recorderStatus?.lastError ? "error" : "active");
 }
 
@@ -2639,9 +3887,25 @@ function showNotice(message) {
 
 function ensureWebSocketOpen() {
   if (state.ws?.readyState === WebSocket.OPEN) return Promise.resolve();
+  const socket = state.ws?.readyState === WebSocket.CONNECTING ? state.ws : connectWebSocket();
   return new Promise((resolve, reject) => {
-    state.ws?.addEventListener("open", resolve, { once: true });
-    state.ws?.addEventListener("error", () => reject(new Error(t("error.websocketClosed"))), { once: true });
+    let settled = false;
+    const finish = (error) => {
+      if (settled) return;
+      settled = true;
+      window.clearTimeout(timer);
+      socket?.removeEventListener("open", onOpen);
+      socket?.removeEventListener("error", onError);
+      socket?.removeEventListener("close", onError);
+      if (error) reject(error);
+      else resolve();
+    };
+    const onOpen = () => finish();
+    const onError = () => finish(new Error(t("error.websocketClosed")));
+    const timer = window.setTimeout(onError, WEBSOCKET_OPEN_TIMEOUT_MS);
+    socket?.addEventListener("open", onOpen, { once: true });
+    socket?.addEventListener("error", onError, { once: true });
+    socket?.addEventListener("close", onError, { once: true });
   });
 }
 
@@ -2664,7 +3928,7 @@ function syncLinkedControl(target) {
 
 function syncCaptionPlayerController() {
   if (!captionPlayerController) return;
-  const isVisible = state.running && state.settings.outputMode !== "audio";
+  const isVisible = state.running;
   captionPlayerController.hidden = !isVisible;
   captionPlayerController.classList.toggle("active", isVisible);
   if (isVisible) restoreCaptionControllerPosition();
@@ -2899,98 +4163,321 @@ function formatCaptureFailure(source, error) {
 
 // ── Live Call host audio bridge ────────────────────────────────────────────
 // Cloud Run only admits the desktop through the trusted non-browser path, so
-// the MAIN process owns the gateway host socket. This renderer's only job is
-// the microphone: once the call is live it captures 16 kHz mono PCM and
-// forwards 40ms (1280-byte) frames over IPC.
-const LIVE_BRIDGE_SAMPLE_RATE = 16_000;
-const LIVE_BRIDGE_FRAME_SAMPLES = LIVE_BRIDGE_SAMPLE_RATE * 40 / 1_000;
+// the MAIN process owns the gateway host socket. Capture remains in this
+// renderer and deliberately uses the same source selection, microphone
+// constraints, 24 kHz engine, and 100 ms framing as Caption-only.
 let liveBridgeCapture = null;
 let isLiveBridgeStarting = false;
+let liveBridgePreflightRequestId = null;
+let liveBridgeCaptureStartPromise = null;
+let isLiveParticipantFloorActive = false;
+let activeLiveFloorSessionId = "";
+let liveFloorGateRevision = -1;
+let appliedLiveFloorGateRevision = -1;
+let activeLiveParticipantId = "";
+let lastAuthorizedLiveParticipantId = "";
+let desiredLiveFloorHolder = undefined;
+let activeLiveFloorKey = "";
+let liveCallProducerCapability = "";
+
+async function ensureLiveCallProducerCapability() {
+  if (/^[A-Za-z0-9_-]{43}$/u.test(liveCallProducerCapability)) return liveCallProducerCapability;
+  const result = await window.realtimeNoelDesktop?.getLiveCallProducerCapability?.();
+  const candidate = result?.ok === true ? String(result.producerCapability ?? "") : "";
+  if (!/^[A-Za-z0-9_-]{43}$/u.test(candidate)) throw new Error("LIVE_CALL_PRODUCER_CAPABILITY_UNAVAILABLE");
+  liveCallProducerCapability = candidate;
+  return liveCallProducerCapability;
+}
+
+function discardPendingLiveCallCaptionRelay() {
+  window.clearTimeout(liveCallCaptionRelayFlushTimer);
+  liveCallCaptionRelayFlushTimer = null;
+  liveCallCaptionRelayQueue.length = 0;
+}
+
+function sendCurrentLiveCallFloorGate() {
+  if (activeCaptionProducer !== "hybrid" || activeCaptionSessionOwner !== "live-call" || !state.running) return false;
+  if (!/^[A-Za-z0-9_-]{43}$/u.test(liveCallProducerCapability)) return false;
+  if (desiredLiveFloorHolder === undefined || !state.sessionId || !activeLiveFloorSessionId) return false;
+  if (!Number.isSafeInteger(liveFloorGateRevision) || liveFloorGateRevision < 0) return false;
+  if (state.ws?.readyState !== WebSocket.OPEN) return false;
+  state.ws.send(JSON.stringify({
+    type: "subtitle:live-call-floor",
+    producerCapability: liveCallProducerCapability,
+    sessionId: state.sessionId,
+    liveSessionId: activeLiveFloorSessionId,
+    floorRevision: liveFloorGateRevision,
+    holder: desiredLiveFloorHolder,
+  }));
+  return true;
+}
+
+function applyLiveCallFloorAcknowledgement(message) {
+  if (message.sessionId !== state.sessionId || message.liveSessionId !== activeLiveFloorSessionId) return false;
+  if (message.floorRevision !== liveFloorGateRevision) return false;
+  const expectedMode = desiredLiveFloorHolder === null ? "host" : "participant";
+  if (message.mode !== expectedMode) return false;
+  appliedLiveFloorGateRevision = message.floorRevision;
+  if (expectedMode === "participant") flushLiveCallCaptionRelayQueue();
+  return true;
+}
+
+function applyLiveCallFloorGate(floor) {
+  if (floor?.type === "live-call-ended") {
+    if (!activeLiveFloorSessionId || floor.sessionId !== activeLiveFloorSessionId) return;
+    clearActiveSubtitleSurface();
+    stopLiveCallAudioBridge("live call ended");
+    if (activeCaptionSessionOwner === "live-call") void stopSubtitles();
+    isLiveParticipantFloorActive = false;
+    activeLiveFloorSessionId = "";
+    activeLiveParticipantId = "";
+    lastAuthorizedLiveParticipantId = "";
+    desiredLiveFloorHolder = undefined;
+    liveFloorGateRevision = -1;
+    appliedLiveFloorGateRevision = -1;
+    activeLiveFloorKey = "";
+    liveTranslationStallMonitor.reset();
+    return;
+  }
+  const isCurrentFloor = floor?.type === "floor"
+    && activeLiveFloorSessionId.length > 0
+    && floor.sessionId === activeLiveFloorSessionId;
+  const floorRevision = floor?.floorRevision;
+  const hasValidRevision = Number.isSafeInteger(floorRevision) && floorRevision >= 0;
+  const participantId = typeof floor?.holder?.participantId === "string"
+    ? floor.holder.participantId.trim()
+    : "";
+  const hasValidParticipant = participantId.length > 0
+    && participantId.length <= 128
+    && !/[\u0000-\u001f\u007f]/u.test(participantId);
+  const nextFloorKey = isCurrentFloor && hasValidRevision && floor.holder === null
+    ? `${activeLiveFloorSessionId}\u0000host`
+    : isCurrentFloor && hasValidRevision && hasValidParticipant
+      ? `${activeLiveFloorSessionId}\u0000participant\u0000${participantId}`
+      : "";
+  if (nextFloorKey && floorRevision < liveFloorGateRevision) return;
+  if (nextFloorKey && floorRevision === liveFloorGateRevision && nextFloorKey === activeLiveFloorKey) return;
+  liveFloorGateRevision = nextFloorKey ? floorRevision : -1;
+  activeLiveFloorKey = nextFloorKey;
+  appliedLiveFloorGateRevision = -1;
+  activeLiveParticipantId = isCurrentFloor && hasValidParticipant
+    ? participantId
+    : "";
+  isLiveParticipantFloorActive = Boolean(activeLiveParticipantId);
+  if (activeLiveParticipantId) lastAuthorizedLiveParticipantId = activeLiveParticipantId;
+  desiredLiveFloorHolder = isCurrentFloor && floor.holder === null
+    ? null
+    : isCurrentFloor && hasValidParticipant
+      ? { participantId }
+      : undefined;
+  liveTranslationStallMonitor.suspend();
+  discardPendingLiveCallCaptionRelay();
+  if (desiredLiveFloorHolder !== undefined) {
+    clearUncommittedPreview();
+    sendCurrentLiveCallFloorGate();
+  }
+}
 
 function stopLiveCallAudioBridge(reason) {
+  liveTranslationStallMonitor.suspend();
   if (!liveBridgeCapture) return;
   const capture = liveBridgeCapture;
   liveBridgeCapture = null;
-  try { capture.processor?.disconnect(); } catch { /* detached */ }
-  try { capture.sourceNode?.disconnect(); } catch { /* detached */ }
-  try { capture.stream?.getTracks().forEach((track) => track.stop()); } catch { /* stopped */ }
-  try { void capture.audioContext?.close(); } catch { /* closed */ }
-  console.info(`[live-bridge] mic capture stopped${reason ? ` (${reason})` : ""}`);
+  for (const streamer of capture.streamers ?? []) void streamer.close?.();
+  for (const stream of capture.streams ?? []) stopMediaStream(stream);
+  console.info(`[live-bridge] audio capture stopped${reason ? ` (${reason})` : ""}`);
 }
 
-function resampleLinear(input, fromRate, toRate) {
-  if (fromRate === toRate) return input;
-  const outputLength = Math.floor(input.length * toRate / fromRate);
-  const output = new Float32Array(outputLength);
-  const step = fromRate / toRate;
-  for (let index = 0; index < outputLength; index += 1) {
-    const position = index * step;
-    const base = Math.floor(position);
-    const fraction = position - base;
-    const next = Math.min(base + 1, input.length - 1);
-    output[index] = input[base] * (1 - fraction) + input[next] * fraction;
-  }
-  return output;
-}
-
-async function startLiveCallMicCapture() {
-  const capture = { pcmQueue: new Float32Array(0) };
+async function startLiveCallMicCapture({ requestId = "" } = {}) {
+  if (liveBridgeCapture?.ready) return { ok: true, reused: true };
+  if (liveBridgeCaptureStartPromise) return liveBridgeCaptureStartPromise;
+  if (liveBridgeCapture?.failed) stopLiveCallAudioBridge("retrying capture");
+  const capture = { streams: [], streamers: [], requestId };
   liveBridgeCapture = capture;
-  try {
-    capture.stream = await navigator.mediaDevices.getUserMedia({
-      audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true },
-    });
-    capture.audioContext = new AudioContext({ sampleRate: LIVE_BRIDGE_SAMPLE_RATE });
-    capture.sourceNode = capture.audioContext.createMediaStreamSource(capture.stream);
-    capture.processor = capture.audioContext.createScriptProcessor(4096, 1, 1);
-    capture.processor.onaudioprocess = (audioEvent) => {
-      if (liveBridgeCapture !== capture) return;
-      const captured = resampleLinear(
-        audioEvent.inputBuffer.getChannelData(0),
-        capture.audioContext.sampleRate,
-        LIVE_BRIDGE_SAMPLE_RATE,
-      );
-      // Silent-mic detector: a live session where every frame is ~0 means the
-      // OS handed us a muted/wrong device — the gateway then captions nothing
-      // ("Audio Timeout"). Logged with the [live-bridge] prefix so the main
-      // process mirrors it into the app log.
-      let rmsEnergy = 0;
-      for (let sampleIndex = 0; sampleIndex < captured.length; sampleIndex += 1) {
-        rmsEnergy += captured[sampleIndex] * captured[sampleIndex];
+  liveBridgeCaptureStartPromise = (async () => {
+    try {
+      state.settings = readSettingsFromForm();
+      const sources = await captureSelectedAudio(state.settings);
+      if (liveBridgeCapture !== capture) {
+        for (const source of sources) stopMediaStream(source.stream);
+        return { ok: false, cancelled: true };
       }
-      capture.rmsSum = (capture.rmsSum ?? 0) + rmsEnergy;
-      capture.rmsSamples = (capture.rmsSamples ?? 0) + captured.length;
-      const rmsNow = Date.now();
-      if (rmsNow - (capture.rmsLoggedAt ?? 0) >= 5_000 && capture.rmsSamples > 0) {
-        const rms = Math.sqrt(capture.rmsSum / capture.rmsSamples);
-        console.info(`[live-bridge] mic rms=${rms.toFixed(4)}${rms < 0.001 ? " — SILENT INPUT: check macOS mic permission and the selected input device" : ""}`);
-        capture.rmsSum = 0;
-        capture.rmsSamples = 0;
-        capture.rmsLoggedAt = rmsNow;
-      }
-      const merged = new Float32Array(capture.pcmQueue.length + captured.length);
-      merged.set(capture.pcmQueue);
-      merged.set(captured, capture.pcmQueue.length);
-      let offset = 0;
-      while (merged.length - offset >= LIVE_BRIDGE_FRAME_SAMPLES) {
-        const frame = new Int16Array(LIVE_BRIDGE_FRAME_SAMPLES);
-        for (let index = 0; index < LIVE_BRIDGE_FRAME_SAMPLES; index += 1) {
-          const sample = Math.max(-1, Math.min(1, merged[offset + index]));
-          frame[index] = sample < 0 ? sample * 0x8000 : sample * 0x7fff;
+      capture.streams = sources.map((source) => source.stream);
+      for (const source of sources) {
+        if (liveBridgeCapture !== capture) return { ok: false, cancelled: true };
+        const streamer = await createAudioStreamer(source.stream, source.source, source.label, (packet) => {
+          forwardLiveCallHostAudioPacket(packet, capture, source.source);
+        });
+        if (liveBridgeCapture !== capture) {
+          void streamer.close?.();
+          return { ok: false, cancelled: true };
         }
-        window.realtimeNoelDesktop.sendLiveCallAudioFrame(frame.buffer);
-        offset += LIVE_BRIDGE_FRAME_SAMPLES;
+        capture.streamers.push(streamer);
       }
-      capture.pcmQueue = merged.slice(offset);
-    };
-    capture.sourceNode.connect(capture.processor);
-    capture.processor.connect(capture.audioContext.destination);
-    console.info("[live-bridge] host microphone is streaming to the gateway");
-  } catch (error) {
-    console.warn(`[live-bridge] microphone unavailable: ${error?.message ?? error}`);
-    stopLiveCallAudioBridge("microphone unavailable");
+      if (liveBridgeCapture !== capture) return { ok: false, cancelled: true };
+      capture.ready = true;
+      console.info(`[live-bridge] ${sources.map((source) => source.source).join("+")} audio is streaming to the gateway`);
+      return { ok: true };
+    } catch (error) {
+      console.warn(`[live-bridge] audio capture unavailable: ${error?.message ?? error}`);
+      for (const streamer of capture.streamers) void streamer.close?.();
+      for (const stream of capture.streams) stopMediaStream(stream);
+      capture.streamers = [];
+      capture.streams = [];
+      capture.failed = true;
+      return { ok: false, error };
+    }
+  })();
+  try {
+    return await liveBridgeCaptureStartPromise;
+  } finally {
+    liveBridgeCaptureStartPromise = null;
   }
 }
+
+function forwardLiveCallHostAudioPacket(packet, capture, sourceName) {
+  if (liveBridgeCapture !== capture) return false;
+  const audio = pcm16ArrayBufferToBase64(packet.pcm);
+  let didSendLocally = false;
+  if (activeCaptionProducer === "hybrid"
+    && activeCaptionSessionOwner === "live-call"
+    && state.running
+    && state.sessionId
+    && state.ws?.readyState === WebSocket.OPEN
+    && (state.ws.bufferedAmount ?? 0) <= LIVE_CALL_CAPTION_RELAY_BUFFER_LIMIT) {
+    state.ws.send(JSON.stringify({
+      type: "subtitle:audio",
+      sessionId: state.sessionId,
+      source: sourceName,
+      audio,
+    }));
+    didSendLocally = true;
+  }
+  // Gateway transport is a separate sink fed by the SAME capture: main
+  // resamples these 24 kHz / 100 ms packets into the gateway's 16 kHz / 40 ms
+  // frames, so the packet must travel in its raw PCM form — the base64 the
+  // local server takes is rejected by that handler as a malformed frame. Main
+  // owns the authoritative floor gate, so participant turns never pause or tear
+  // down the local Caption Only provider that keeps the Electron overlay warm.
+  void window.realtimeNoelDesktop?.sendLiveCallAudioFrame?.({
+    sessionId: activeLiveFloorSessionId,
+    source: sourceName,
+    pcm: packet.pcm,
+    sampleRate: packet.sampleRate,
+    frameDurationMs: packet.frameDurationMs,
+  });
+  return didSendLocally;
+}
+
+function requestLocalSubtitlePreflight(requestId, request) {
+  const socket = state.ws;
+  if (!socket || socket.readyState !== WebSocket.OPEN) {
+    return Promise.reject(new Error(t("error.websocketClosed")));
+  }
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const finish = (error) => {
+      if (settled) return;
+      settled = true;
+      window.clearTimeout(timer);
+      socket.removeEventListener("message", onMessage);
+      socket.removeEventListener("close", onClose);
+      if (error) reject(error);
+      else resolve();
+    };
+    const onMessage = (event) => {
+      let message;
+      try { message = JSON.parse(event.data); } catch { return; }
+      if (message.type !== "subtitle:preflight-ready") {
+        if (message.type === "subtitle:preflight-failed" && message.requestId === requestId) {
+          finish(new Error(message.message || t("error.subtitleStartFailed")));
+        }
+        return;
+      }
+      if (message.requestId !== requestId) return;
+      finish();
+    };
+    const onClose = () => finish(new Error(t("error.websocketClosed")));
+    const timer = window.setTimeout(
+      () => finish(new Error(t("error.subtitleStartTimeout"))),
+      SUBTITLE_PREFLIGHT_ACK_TIMEOUT_MS,
+    );
+    socket.addEventListener("message", onMessage);
+    socket.addEventListener("close", onClose, { once: true });
+    socket.send(JSON.stringify({
+      type: "subtitle:preflight",
+      producerCapability: liveCallProducerCapability,
+      requestId,
+      settings: state.settings,
+      meeting: {
+        kind: "live-call",
+        liveSessionId: String(request?.liveSessionId ?? ""),
+        title: String(request?.title ?? ""),
+        startedAt: String(request?.startedAt ?? ""),
+      },
+    }));
+  });
+}
+
+async function handleLiveCallPreflight(request) {
+  const requestId = typeof request?.requestId === "string" ? request.requestId : "";
+  const bridge = window.realtimeNoelDesktop;
+  if (!requestId || !bridge?.completeLiveCallPreflight) return;
+  liveBridgePreflightRequestId = requestId;
+  isLiveParticipantDemandEnabled = request?.demandEnabled === true;
+  let failureCode = "LIVE_CALL_AUDIO_CAPTURE_FAILED";
+  try {
+    state.settings = readSettingsFromForm();
+    // 2026-07-27 fix: Main reloads the saved settings after preflight. Persist
+    // the exact validated form first so Live Call and Caption Only share the
+    // same glossary, tone, and domain on their first translated utterance.
+    await saveSettings({ subtitle: state.settings });
+    await ensureWebSocketOpen();
+    await ensureLiveCallProducerCapability();
+    activeLiveFloorSessionId = String(request?.liveSessionId ?? "");
+    const captureResult = await startLiveCallMicCapture({ requestId });
+    if (!captureResult?.ok) throw captureResult?.error ?? new Error("audio capture unavailable");
+    if (liveBridgePreflightRequestId !== requestId) return;
+    failureCode = "LIVE_CALL_SUBTITLE_PREFLIGHT_FAILED";
+    await requestLocalSubtitlePreflight(requestId, request);
+    if (liveBridgePreflightRequestId !== requestId) return;
+    activeLiveFloorSessionId = String(request?.liveSessionId ?? "");
+    await startHybridCaptionSession({
+      sessionId: activeLiveFloorSessionId,
+      title: String(request?.title ?? ""),
+      liveStartedAt: String(request?.startedAt ?? ""),
+      captionSnapshot: [],
+      demandEnabled: request?.demandEnabled === true,
+    });
+    if (liveBridgePreflightRequestId !== requestId) return;
+    await bridge.completeLiveCallPreflight(requestId, { ok: true });
+  } catch (error) {
+    if (liveBridgePreflightRequestId !== requestId) return;
+    liveBridgePreflightRequestId = null;
+    liveCallProducerCapability = "";
+    stopLiveCallAudioBridge("preflight failed");
+    await bridge.completeLiveCallPreflight(requestId, {
+      ok: false,
+      code: failureCode,
+      message: String(error?.message ?? error),
+    });
+  }
+}
+
+async function cancelLiveCallPreflight(request) {
+  const requestId = typeof request?.requestId === "string" ? request.requestId : "";
+  if (!requestId || requestId !== liveBridgePreflightRequestId) return;
+  let liveState = null;
+  try { liveState = await window.realtimeNoelDesktop?.getLiveCallState?.(); } catch { /* cancellation is best-effort */ }
+  if (liveState?.live) return;
+  liveBridgePreflightRequestId = null;
+  stopLiveCallAudioBridge("preflight cancelled");
+  if (activeCaptionSessionOwner === "live-call") await stopSubtitles();
+  liveCallProducerCapability = "";
+}
+
+window.realtimeNoelDesktop?.onLiveCallPreflight?.(handleLiveCallPreflight);
+window.realtimeNoelDesktop?.onLiveCallPreflightCancel?.(cancelLiveCallPreflight);
 
 let activeCaptionProducer = "none";
 let activeCaptionSessionOwner = "none";
@@ -3025,29 +4512,54 @@ async function syncLiveCallAudioBridge() {
   let liveState = null;
   try { liveState = await bridge.getLiveCallState(); } catch { return; }
   if (!liveState?.armed || !liveState.live) {
+    if (liveState?.armed && liveBridgePreflightRequestId) return;
+    isLiveParticipantDemandEnabled = false;
     if (liveBridgeCapture) stopLiveCallAudioBridge("live call ended");
+    liveFloorGateRevision = -1;
+    isLiveParticipantFloorActive = false;
+    activeLiveFloorSessionId = "";
+    activeLiveParticipantId = "";
+    lastAuthorizedLiveParticipantId = "";
+    liveCallProducerCapability = "";
     if (activeCaptionSessionOwner === "live-call") await stopSubtitles();
     return;
   }
+  activeLiveFloorSessionId = String(liveState.sessionId ?? "");
+  isLiveParticipantDemandEnabled = liveState.demandEnabled === true;
+  const floorSnapshot = liveState.bridge?.floorSnapshot;
+  if (floorSnapshot?.type === "floor" && floorSnapshot.sessionId === activeLiveFloorSessionId) {
+    applyLiveCallFloorGate(floorSnapshot);
+  }
+  liveBridgePreflightRequestId = null;
+  if (liveBridgeCapture?.failed) return;
   if (isLiveBridgeStarting) return;
   isLiveBridgeStarting = true;
   try {
-    if (activeCaptionSessionOwner === "caption-only" || activeCaptionProducer === "none") {
-      await startGatewayCaptionSession(liveState);
+    if (activeCaptionSessionOwner !== "live-call" || activeCaptionProducer === "none") {
+      await startHybridCaptionSession(liveState);
     }
-    if (["reconnecting", "failed"].includes(liveState.bridge?.state) && activeCaptionProducer !== "local") {
-      await startLocalLiveCallFallback(liveState);
-    } else if (liveState.bridge?.state === "connected" && activeCaptionProducer === "local") {
-      await restoreGatewayCaptionProducer();
+    // Preflight normally owns this capture. This is only a recovery path for a
+    // renderer reload between preflight and the first live-state poll.
+    if (!liveBridgeCapture) {
+      const captureResult = await startLiveCallMicCapture();
+      if (captureResult.cancelled) return;
+      if (!captureResult.ok) {
+        const error = captureResult.error instanceof Error
+          ? captureResult.error
+          : new Error(String(captureResult.error ?? t("error.micFailed", { reason: "unknown" })));
+        showError(error);
+        setConnectionStatus(error.message, "error");
+        await bridge.reportLiveCallAudioFailure?.(error.message);
+        return;
+      }
     }
+    // Recovery must prove capture before asking for media. In demand mode an
+    // idle gateway deliberately cannot establish source readiness for us.
     const result = await bridge.ensureLiveCallBridge();
     if (!result?.ok) {
       console.warn(`[live-bridge] gateway bridge unavailable: ${result?.code ?? "unknown"}`);
       return;
     }
-    // Capture starts once and keeps feeding frames; main drops them until the
-    // gateway pipeline reports started.
-    if (!liveBridgeCapture) await startLiveCallMicCapture();
   } catch (error) {
     console.warn(`[live-bridge] producer transition failed: ${error?.message ?? error}`);
   } finally {
@@ -3055,15 +4567,15 @@ async function syncLiveCallAudioBridge() {
   }
 }
 
-async function startGatewayCaptionSession(liveState) {
+async function startHybridCaptionSession(liveState) {
+  await ensureLiveCallProducerCapability();
   if (state.running) await stopSubtitles();
   await ensureWebSocketOpen();
+  transitionCaptionRuntime("starting");
   state.settings = readSettingsFromForm();
   state.sessionId = `live-${String(liveState.sessionId ?? crypto.randomUUID())}`;
-  translatedAudioGuard.reset();
-  state.ws.send(JSON.stringify({
+  const startPayload = {
     type: "subtitle:start",
-    captionProducer: "gateway",
     sessionId: state.sessionId,
     settings: state.settings,
     meeting: {
@@ -3072,83 +4584,30 @@ async function startGatewayCaptionSession(liveState) {
       title: String(liveState.title ?? ""),
       startedAt: String(liveState.liveStartedAt ?? ""),
     },
-  }));
-  activeCaptionProducer = "gateway";
+  };
+  const startedProducerKind = liveState.demandEnabled === true ? "gateway" : resolveLiveCallProducerKind();
+  await requestSubtitleStart({
+    ...startPayload,
+    captionProducer: startedProducerKind,
+    producerCapability: liveCallProducerCapability,
+  });
+  for (const caption of liveState.captionSnapshot ?? []) {
+    enqueueLiveCallCaptionRelay(caption);
+  }
+  activeCaptionProducer = startedProducerKind;
   activeCaptionSessionOwner = "live-call";
   state.running = true;
+  liveTranslationStallMonitor.reset();
+  transitionCaptionRuntime("running");
   startButton.disabled = true;
   stopButton.disabled = false;
   syncRuntimeOutputVisibility();
   setConnectionStatus(t("status.receivingCaptions"), "active");
+  sendCurrentLiveCallFloorGate();
+  flushLiveCallCaptionRelayQueue();
 }
 
-async function startLocalLiveCallFallback(liveState) {
-  let captures = [];
-  try {
-    captures = await captureSelectedAudio(state.settings);
-    state.streams = captures.map((capture) => capture.stream);
-    state.ws.send(JSON.stringify({
-      type: "subtitle:start",
-      sessionId: state.sessionId,
-      settings: state.settings,
-      meeting: {
-        kind: "live-call",
-        liveSessionId: String(liveState.sessionId ?? ""),
-        title: String(liveState.title ?? ""),
-        startedAt: String(liveState.liveStartedAt ?? ""),
-      },
-    }));
-    for (const capture of captures) {
-      const streamer = await createAudioStreamer(capture.stream, capture.source, capture.label, (audio) => {
-        if ((state.ws?.bufferedAmount ?? 0) > 1_000_000) return;
-        if (state.ws?.readyState !== WebSocket.OPEN || !state.sessionId) return;
-        state.ws.send(JSON.stringify({
-          type: "subtitle:audio",
-          sessionId: state.sessionId,
-          source: capture.source,
-          audio,
-        }));
-      });
-      state.streamers.push(streamer);
-    }
-    activeCaptionProducer = "local";
-    setConnectionStatus(t("status.reconnecting"), "error");
-    setPreviewStatus(t("status.reconnecting"), 3_000);
-  } catch (error) {
-    for (const capture of captures) capture.stream.getTracks().forEach((track) => track.stop());
-    await stopSubtitles();
-    throw error;
-  }
-}
-
-async function restoreGatewayCaptionProducer() {
-  if (state.ws?.readyState !== WebSocket.OPEN || !state.sessionId) return;
-  const requestId = crypto.randomUUID();
-  const isProducerStopped = await new Promise((resolve) => {
-    const timer = window.setTimeout(() => finish(false), 2_000);
-    function finish(didStop) {
-      window.clearTimeout(timer);
-      state.ws?.removeEventListener("message", onMessage);
-      resolve(didStop);
-    }
-    function onMessage(event) {
-      let message;
-      try { message = JSON.parse(event.data); } catch { return; }
-      if (message.type === "subtitle:producer-stopped" && message.requestId === requestId) finish(true);
-    }
-    state.ws.addEventListener("message", onMessage);
-    state.ws.send(JSON.stringify({ type: "subtitle:producer-stop", sessionId: state.sessionId, requestId }));
-  });
-  // 2026-07-26 fix: Gateway promotion is acknowledgement-gated. Keeping the
-  // local producer selected on an ambiguous stop prevents dual final captions.
-  if (!isProducerStopped) {
-    setConnectionStatus(t("status.reconnecting"), "error");
-    return;
-  }
-  stopLocalStreams();
-  activeCaptionProducer = "gateway";
-  setConnectionStatus(t("status.receivingCaptions"), "active");
-}
+window.realtimeNoelDesktop?.onLiveCallFloor?.(applyLiveCallFloorGate);
 
 if (window.realtimeNoelDesktop?.ensureLiveCallBridge) {
   window.setInterval(() => { void syncLiveCallAudioBridge(); }, 1_000);
@@ -3157,55 +4616,296 @@ if (window.realtimeNoelDesktop?.ensureLiveCallBridge) {
 // ── Live Call canonical captions → local subtitle system ──────────────────
 // 2026-07-26 fix: Gateway events for both host and participant speech enter
 // one local ingest path so overlay, preview, history, and records stay equal.
+// 2026-07-27 fix: The hidden dashboard can reconnect independently from the
+// gateway. Keep canonical captions until the gateway producer acknowledgement
+// restores the relay instead of dropping every event during that gap.
+const MAX_LIVE_CALL_PENDING_PARTIALS = 32;
+const MAX_LIVE_CALL_FINALIZED_KEYS = 512;
+const LIVE_CALL_CAPTION_RELAY_BUFFER_LIMIT = 1_000_000;
+let liveCallCaptionRelayFlushTimer = null;
+const liveCallCaptionRelayQueue = [];
+const liveCallFinalizedCaptionKeys = new Map();
+const liveCallFinalSeqByLane = new Map();
+const liveCallDeliveredFinalSeqByLane = new Map();
+
+function getLiveCallCaptionRelayKey(caption) {
+  const sessionId = String(caption.sessionId ?? state.sessionId ?? "");
+  const language = String(caption.language ?? "");
+  const utteranceKey = String(caption.utteranceKey ?? "");
+  const sourceSeq = Number.isSafeInteger(caption.seq) ? String(caption.seq) : "";
+  const identity = utteranceKey || sourceSeq;
+  return identity ? `${sessionId}\u0000${language}\u0000${identity}` : "";
+}
+
+function getLiveCallCaptionRelayLane(caption) {
+  return `${String(caption.sessionId ?? state.sessionId ?? "")}\u0000${String(caption.language ?? "")}`;
+}
+
+function rememberFinalizedLiveCallCaption(key) {
+  if (!key) return;
+  liveCallFinalizedCaptionKeys.delete(key);
+  liveCallFinalizedCaptionKeys.set(key, true);
+  while (liveCallFinalizedCaptionKeys.size > MAX_LIVE_CALL_FINALIZED_KEYS) {
+    const oldestKey = liveCallFinalizedCaptionKeys.keys().next().value;
+    liveCallFinalizedCaptionKeys.delete(oldestKey);
+  }
+}
+
+function normalizeLiveCallCaptionRelay(caption) {
+  const text = String(caption?.text ?? "").trim();
+  if (!text || caption?.translationStatus === "failed") return null;
+  // Main has already removed source-language events and selected the single
+  // opposite-language translation that belongs on the desktop screen.
+  const speakerRole = caption.speakerRole === "participant"
+    || caption.speaker?.isParticipant === true
+    ? "participant"
+    : "host";
+  const speakerName = speakerRole === "host"
+    ? "Host"
+    : String(caption.speakerName
+      ?? caption.speaker?.name
+      ?? caption.speaker?.label
+      ?? t("live.participant"));
+  const key = getLiveCallCaptionRelayKey(caption);
+  const isFinal = caption.isFinal === true;
+  return {
+    key,
+    lane: getLiveCallCaptionRelayLane(caption),
+    isFinal,
+    canonicalSeq: Number.isSafeInteger(caption.seq) ? caption.seq : null,
+    payload: {
+      type: "subtitle:live-call-caption",
+      ...(typeof liveCallProducerCapability === "string" && liveCallProducerCapability
+        ? { producerCapability: liveCallProducerCapability }
+        : {}),
+      sessionId: String(caption.sessionId ?? ""),
+      partial: !isFinal,
+      targetLanguage: String(caption.language ?? ""),
+      sourceLanguage: String(caption.sourceLanguage ?? ""),
+      utteranceKey: String(caption.utteranceKey ?? ""),
+      sourceSeq: Number.isSafeInteger(caption.seq) ? caption.seq : null,
+      sourceText: String(caption.sourceText ?? (caption.origin === "source" ? text : "")),
+      speaker: speakerName,
+      speakerRole,
+      speakerDepartment: speakerRole === "participant"
+        ? String(caption.speakerDepartment ?? caption.speaker?.department ?? "")
+        : "",
+      speakerJobTitle: speakerRole === "participant"
+        ? String(caption.speakerJobTitle ?? caption.speaker?.jobTitle ?? "")
+        : "",
+      translatedText: text,
+    },
+  };
+}
+
+function isLiveCallCaptionRelayReady() {
+  return activeCaptionProducer === "hybrid"
+    && (typeof activeCaptionSessionOwner === "undefined"
+      || (activeCaptionSessionOwner === "live-call" && state.running))
+    && (typeof captionRuntimeState === "undefined" || captionRuntimeState === "running")
+    && typeof activeLiveParticipantId === "string"
+    && activeLiveParticipantId.length > 0
+    && appliedLiveFloorGateRevision === liveFloorGateRevision
+    && state.ws?.readyState === WebSocket.OPEN;
+}
+
+function scheduleLiveCallCaptionRelayFlush() {
+  if (liveCallCaptionRelayFlushTimer) return;
+  liveCallCaptionRelayFlushTimer = window.setTimeout(() => {
+    liveCallCaptionRelayFlushTimer = null;
+    flushLiveCallCaptionRelayQueue();
+  }, 100);
+}
+
+function trimLiveCallCaptionRelayQueue() {
+  let partialCount = liveCallCaptionRelayQueue.reduce(
+    (count, entry) => count + (entry.isFinal ? 0 : 1),
+    0,
+  );
+  while (partialCount > MAX_LIVE_CALL_PENDING_PARTIALS) {
+    const partialIndex = liveCallCaptionRelayQueue.findIndex((entry) => !entry.isFinal);
+    if (partialIndex < 0) return;
+    liveCallCaptionRelayQueue.splice(partialIndex, 1);
+    partialCount -= 1;
+  }
+}
+
+function enqueueLiveCallCaptionRelay(caption) {
+  const entry = normalizeLiveCallCaptionRelay(caption);
+  if (!entry) return false;
+  const finalSeq = liveCallFinalSeqByLane.get(entry.lane);
+  const deliveredFinalSeq = liveCallDeliveredFinalSeqByLane.get(entry.lane);
+  if (!entry.isFinal
+    && entry.canonicalSeq !== null
+    && finalSeq !== undefined
+    && entry.canonicalSeq <= finalSeq) return false;
+  if (entry.isFinal
+    && entry.canonicalSeq !== null
+    && deliveredFinalSeq !== undefined
+    && entry.canonicalSeq <= deliveredFinalSeq) return false;
+  if (entry.key && liveCallFinalizedCaptionKeys.has(entry.key)) return false;
+
+  if (entry.isFinal) {
+    rememberFinalizedLiveCallCaption(entry.key);
+    if (entry.canonicalSeq !== null) {
+      liveCallFinalSeqByLane.set(entry.lane, Math.max(finalSeq ?? -1, entry.canonicalSeq));
+    }
+    for (let index = liveCallCaptionRelayQueue.length - 1; index >= 0; index -= 1) {
+      const queued = liveCallCaptionRelayQueue[index];
+      const isSameFinalizedIdentity = queued.key && queued.key === entry.key;
+      const isStaleLanePartial = queued.lane === entry.lane
+        && entry.canonicalSeq !== null
+        && queued.canonicalSeq !== null
+        && queued.canonicalSeq <= entry.canonicalSeq;
+      if (!queued.isFinal && (isSameFinalizedIdentity || isStaleLanePartial)) {
+        liveCallCaptionRelayQueue.splice(index, 1);
+      }
+    }
+  }
+
+  if (isLiveCallCaptionRelayReady()
+    && (state.ws?.bufferedAmount ?? 0) <= LIVE_CALL_CAPTION_RELAY_BUFFER_LIMIT) {
+    try {
+      state.ws.send(JSON.stringify(entry.payload));
+      if (entry.isFinal && entry.canonicalSeq !== null) {
+        liveCallDeliveredFinalSeqByLane.set(entry.lane, entry.canonicalSeq);
+      }
+      return true;
+    } catch {
+      // The socket can close after readyState is observed. Queue this exact
+      // event so the producer recovery acknowledgement can release it later.
+    }
+  }
+
+  if (!entry.isFinal && entry.key) {
+    const partialIndex = liveCallCaptionRelayQueue.findIndex(
+      (queued) => !queued.isFinal && queued.key === entry.key,
+    );
+    if (partialIndex >= 0) liveCallCaptionRelayQueue[partialIndex] = entry;
+    else liveCallCaptionRelayQueue.push(entry);
+  } else {
+    liveCallCaptionRelayQueue.push(entry);
+  }
+  trimLiveCallCaptionRelayQueue();
+  if (isLiveCallCaptionRelayReady()) scheduleLiveCallCaptionRelayFlush();
+  return false;
+}
+
+function flushLiveCallCaptionRelayQueue() {
+  if (!isLiveCallCaptionRelayReady()) return false;
+  liveCallCaptionRelayQueue.sort((left, right) => {
+    const leftSeq = left.canonicalSeq ?? Number.MAX_SAFE_INTEGER;
+    const rightSeq = right.canonicalSeq ?? Number.MAX_SAFE_INTEGER;
+    if (leftSeq !== rightSeq) return leftSeq - rightSeq;
+    if (left.isFinal !== right.isFinal) return left.isFinal ? -1 : 1;
+    return 0;
+  });
+  while (liveCallCaptionRelayQueue.length > 0) {
+    if ((state.ws?.bufferedAmount ?? 0) > LIVE_CALL_CAPTION_RELAY_BUFFER_LIMIT) {
+      scheduleLiveCallCaptionRelayFlush();
+      return false;
+    }
+    const entry = liveCallCaptionRelayQueue[0];
+    try {
+      state.ws.send(JSON.stringify(entry.payload));
+      liveCallCaptionRelayQueue.shift();
+      if (entry.isFinal && entry.canonicalSeq !== null) {
+        liveCallDeliveredFinalSeqByLane.set(entry.lane, entry.canonicalSeq);
+      }
+    } catch {
+      return false;
+    }
+  }
+  return true;
+}
+
+function resetLiveCallCaptionRelay() {
+  window.clearTimeout(liveCallCaptionRelayFlushTimer);
+  liveCallCaptionRelayFlushTimer = null;
+  liveCallCaptionRelayQueue.length = 0;
+  liveCallFinalizedCaptionKeys.clear();
+  liveCallFinalSeqByLane.clear();
+  liveCallDeliveredFinalSeqByLane.clear();
+}
+
 // ── UI language changes ───────────────────────────────────────────────────
 // subtitle-workspace.js repaints every static data-i18n node; the dynamic
 // panels this file renders have to be rebuilt from their current state.
-subscribeToLanguage(() => {
+function refreshSystemLanguagePresentation() {
+  const targetSelector = 'input[name="translationLanguages"], input[name="liveCallTranslationLanguages"]';
+  const selectedTargets = new Set([...form.querySelectorAll(targetSelector)]
+    .filter((input) => input.checked).map((input) => `${input.name}:${input.value}`));
+  const presetId = selectedGlossaryPresetId();
+  const presetName = selectedGlossaryPresetName();
   renderLanguagePills();
+  renderLiveCallLanguagePills();
+  for (const input of form.querySelectorAll(targetSelector)) input.checked = selectedTargets.has(`${input.name}:${input.value}`);
+  updateLanguageDropdownSummaries();
   renderPlacementRows();
-  writeSettingsToForm(state.settings);
+  syncPlacementRows(readTranslationLanguagesFromForm());
+  renderGlossaryPresetOptions();
+  restoreGlossaryPresetSelection(presetId, presetName, { persistConfirmedMissing: false });
   renderLanguageChips();
   updatePtOutputControls();
   updateAudioInspectorLabels();
   updateSessionSummary();
   updateServiceStrip();
   renderHistory(state.history);
-  renderRecordsCalendar();
-  void loadSessionRecords();
-});
+  applySessionRecordFilters();
+}
+subscribeToLanguage(refreshSystemLanguagePresentation);
+subscribeToLanguage(refreshGlossarySystemLanguagePresentation);
 
 if (window.realtimeNoelDesktop?.onLiveCallCaption) {
   window.realtimeNoelDesktop.onLiveCallCaption((caption) => {
-    if (!caption || activeCaptionProducer !== "gateway") return;
-    if (state.ws?.readyState !== WebSocket.OPEN) return;
-    const text = String(caption.text ?? "").trim();
-    if (!text) return;
-    const speakerName = String(caption.speaker?.name
-      ?? caption.speaker?.label
-      ?? (caption.speaker?.isParticipant === true ? t("live.participant") : ""));
-    // Main has already removed source-language events and selected the single
-    // opposite-language translation that belongs on the desktop screen.
-    if (caption.translationStatus === "failed") return;
-    state.ws.send(JSON.stringify({
-      type: "subtitle:live-call-caption",
-      partial: caption.isFinal !== true,
-      targetLanguage: String(caption.language ?? ""),
-      sourceLanguage: String(caption.sourceLanguage ?? ""),
-      utteranceKey: String(caption.utteranceKey ?? ""),
-      sourceText: String(caption.sourceText ?? (caption.origin === "source" ? text : "")),
-      speaker: speakerName,
-      speakerDepartment: String(caption.speaker?.department ?? ""),
-      speakerJobTitle: String(caption.speaker?.jobTitle ?? ""),
-      translatedText: text,
-    }));
+    if (!caption || activeCaptionProducer !== "hybrid") return;
+    if (activeCaptionSessionOwner !== "live-call" || !state.running) return;
+    if (typeof activeLiveFloorSessionId !== "undefined"
+      && caption.sessionId !== activeLiveFloorSessionId) return;
+    const participantId = String(caption.speaker?.participantId ?? "");
+    const isParticipant = caption.speakerRole === "participant" || caption.speaker?.isParticipant === true;
+    if (!isParticipant || !participantId || participantId !== lastAuthorizedLiveParticipantId) return;
+    if (isLiveParticipantFloorActive && participantId !== activeLiveParticipantId) return;
+    if (!isLiveParticipantFloorActive && caption.isFinal !== true) return;
+    if (String(caption.text ?? "").trim() && typeof liveTranslationStallMonitor !== "undefined") {
+      liveTranslationStallMonitor.noteOutput(performance.now());
+    }
+    enqueueLiveCallCaptionRelay(caption);
   });
 }
 
-// ── Session detail: language tabs + per-session export ───────────────────────
+// ── Session detail: local-only content/language tabs + per-session export ────
+for (const tab of document.querySelectorAll("[data-record-detail-tab]")) {
+  tab.addEventListener("click", () => activateSessionDetailView(tab.dataset.recordDetailTab));
+  tab.addEventListener("keydown", (event) => {
+    if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+    event.preventDefault();
+    const tabs = [...document.querySelectorAll("[data-record-detail-tab]")];
+    const currentIndex = tabs.indexOf(tab);
+    const nextIndex = event.key === "Home" ? 0
+      : event.key === "End" ? tabs.length - 1
+      : (currentIndex + (event.key === "ArrowRight" ? 1 : -1) + tabs.length) % tabs.length;
+    activateSessionDetailView(tabs[nextIndex]?.dataset.recordDetailTab, { focus: true });
+  });
+}
+
 for (const tab of document.querySelectorAll("[data-transcript-lang]")) {
   tab.addEventListener("click", () => {
     openSessionDetail.language = tab.dataset.transcriptLang === "ko" ? "ko" : "en";
     renderOpenSessionTranscript();
+  });
+  tab.addEventListener("keydown", (event) => {
+    if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+    event.preventDefault();
+    const tabs = [...document.querySelectorAll("[data-transcript-lang]")];
+    const currentIndex = tabs.indexOf(tab);
+    const nextIndex = event.key === "Home" ? 0
+      : event.key === "End" ? tabs.length - 1
+      : (currentIndex + (event.key === "ArrowRight" ? 1 : -1) + tabs.length) % tabs.length;
+    const next = tabs[nextIndex];
+    openSessionDetail.language = next?.dataset.transcriptLang === "ko" ? "ko" : "en";
+    renderOpenSessionTranscript();
+    next?.focus();
   });
 }
 

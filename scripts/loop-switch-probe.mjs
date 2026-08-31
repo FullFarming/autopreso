@@ -15,8 +15,6 @@ const URL = `ws://localhost:${PORT}/ws`;
 const PACE_MS = 170, FRAME = 8192;
 const SEG = Number(process.env.SEG || 14);      // seconds per spoken segment
 const CYCLES = Number(process.env.CYCLES || 2); // ko+en per cycle
-const OUTPUT_MODE = process.env.OUTPUT_MODE || "captions";
-const AUDIO_LANGUAGE = process.env.AUDIO_LANGUAGE || "";
 const SWITCH_GRACE_MS = Number(process.env.SWITCH_GRACE_MS || 2000);
 const SWITCH_SILENCE_MS = Number(process.env.SWITCH_SILENCE_MS || 0);
 const OUT = "/tmp/loop-switch-events.jsonl";
@@ -41,19 +39,16 @@ const out = fs.createWriteStream(OUT);
 const t0 = Date.now(); const el = ()=>((Date.now()-t0)/1000).toFixed(2);
 let spoken = "ko"; // current spoken language (updated as segments stream)
 
-const stats = segments.map(s=>({ lang:s.lang, expect:s.expect, expected:0, echo:0, graceEcho:0, passthrough:0, audio:0, audioClears:0 }));
+const stats = segments.map(s=>({ lang:s.lang, expect:s.expect, expected:0, echo:0, graceEcho:0, passthrough:0 }));
 let segIdx = 0;
 let segmentStartedAt = Date.now();
 ws.on("message", raw=>{
   let m; try{m=JSON.parse(raw.toString())}catch{return}
-  if(!["subtitle:partial","subtitle:committed","subtitle:debug","subtitle:translated-audio","subtitle:audio-control","subtitle:error","subtitle:status"].includes(m.type))return;
-  const safeEvent = m.type === "subtitle:translated-audio" ? { ...m, audio: `[${String(m.audio || "").length} base64 chars]` } : m;
-  out.write(JSON.stringify({t:el(),spoken,...safeEvent})+"\n");
+  if(!["subtitle:partial","subtitle:committed","subtitle:debug","subtitle:error","subtitle:status"].includes(m.type))return;
+  out.write(JSON.stringify({t:el(),spoken,...m})+"\n");
   if(m.type==="subtitle:error"){console.error(`[${el()}s] ${m.code || "SUBTITLE_ERROR"}: ${m.message || "unknown error"}`);return}
   if(m.type==="subtitle:status")return;
   const st=stats[segIdx]; if(!st)return;
-  if(m.type==="subtitle:translated-audio"){st.audio++;return}
-  if(m.type==="subtitle:audio-control"){st.audioClears++;return}
   if(m.type==="subtitle:debug")return;
   const text=(m.translatedText||"").trim(); if(!text)return;
   const lang=detect(text);
@@ -67,7 +62,7 @@ ws.on("message", raw=>{
   if(m.targetLanguage===st.expect && lang===st.lang) st.passthrough++;
 });
 
-ws.send(JSON.stringify({type:"subtitle:start",sessionId:sid,settings:{translationProvider:"gemini",voiceProvider:"gemini",inputMode:"mic",languagePair:{a:"en",b:"ko"},translationLanguages:["en","ko"],outputMode:OUTPUT_MODE,audioVolume:0.8,...(AUDIO_LANGUAGE?{audioLanguage:AUDIO_LANGUAGE}:{})}}));
+ws.send(JSON.stringify({type:"subtitle:start",sessionId:sid,settings:{translationProvider:"gemini",inputMode:"mic",languagePair:{a:"en",b:"ko"},translationLanguages:["en","ko"],outputMode:"captions"}}));
 await sleep(900);
 for(let i=0;i<segments.length;i++){
   if (i > 0 && SWITCH_SILENCE_MS > 0) {
@@ -89,9 +84,9 @@ let ok=true;
 stats.forEach((s,i)=>{
   const good = s.expected>0 && s.echo===0 && s.passthrough===0;
   if(!good) ok=false;
-  console.log(`${good?"✅":"❌"} seg${i} speak=${s.lang.toUpperCase()}→expect ${s.expect.toUpperCase()}: expected=${s.expected} sourceEcho=${s.echo} graceTail=${s.graceEcho} passthrough=${s.passthrough} audio=${s.audio} clears=${s.audioClears}`);
+  console.log(`${good?"PASS":"FAIL"} seg${i} speak=${s.lang.toUpperCase()}→expect ${s.expect.toUpperCase()}: expected=${s.expected} sourceEcho=${s.echo} graceTail=${s.graceEcho} passthrough=${s.passthrough}`);
 });
-console.log(ok?"\n🎉 server stream clean per segment":"\n⚠️ issues in server stream");
+console.log(ok?"\nserver stream clean per segment":"\nissues in server stream");
 
 // Replay into the REAL overlay module to check the two lanes never show at once.
 const OURL=pathToFileURL(path.join(process.cwd(),"public","subtitle-overlay.js")).href;
@@ -120,5 +115,5 @@ let both=0,frames=0;
 for(const m of lines){ if(m.type==="subtitle:partial"||m.type==="subtitle:committed"||m.type==="subtitle:clear"){ows.recv(m);frames++;const top=zt("top-center"),bot=zt("bottom-center");if(top&&bot)both++;}}
 console.log("\n========== OVERLAY REPLAY ==========");
 console.log("rendered frames:",frames,"| SIMULTANEOUS both-lanes frames:",both);
-console.log(both===0?"🎉 the two lanes NEVER show at once (no 동시 표시/섞임)":"⚠️ simultaneous display occurred");
+console.log(both===0?"the two lanes NEVER show at once (no simultaneous display)":"simultaneous display occurred");
 ws.close(); process.exit(0);

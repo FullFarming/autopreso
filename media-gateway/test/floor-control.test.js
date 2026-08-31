@@ -9,18 +9,39 @@ import { AUDIO_CONFIG } from "../src/config.js";
 import { createGatewayServer } from "../src/gateway-server.js";
 
 const INPUT_FRAME_BYTES = AUDIO_CONFIG.inputSampleRate * 2 * AUDIO_CONFIG.chunkMilliseconds / 1_000;
+const SESSION_ID = "11111111-1111-4111-8111-111111111111";
 
-function signHostToken(secret, { now = Date.now(), expiresInSeconds = 900 } = {}) {
-  const nowSeconds = Math.floor(now / 1_000);
-  const claims = { role: "HOST", sub: "host-1", sessionId: "session-1", aud: "media-gateway", iat: nowSeconds, exp: nowSeconds + expiresInSeconds };
+function fixtureUuid(seed) {
+  const digest = createHmac("sha256", "fixture-uuid").update(seed).digest("hex");
+  return `${digest.slice(0, 8)}-${digest.slice(8, 12)}-4${digest.slice(13, 16)}-8${digest.slice(17, 20)}-${digest.slice(20, 32)}`;
+}
+
+function signToken(secret, claims) {
   const encoded = Buffer.from(JSON.stringify(claims)).toString("base64url");
   return `${encoded}.${createHmac("sha256", secret).update(encoded).digest("hex")}`;
 }
 
-function signViewerToken(secret, grantId, { now = Date.now(), expiresInMilliseconds = 60_000 } = {}) {
-  const claims = { role: "VIEWER", grantId, sessionId: "session-1", userId: grantId, issuedAt: now, expiresAt: now + expiresInMilliseconds };
-  const encoded = Buffer.from(JSON.stringify(claims)).toString("base64url");
-  return `${encoded}.${createHmac("sha256", secret).update(encoded).digest("hex")}`;
+function signHostToken() {
+  const nowSeconds = Math.floor(Date.now() / 1_000);
+  return signToken("gateway-secret", {
+    role: "HOST", sub: "host-1", sessionId: SESSION_ID, aud: "media-gateway",
+    iat: nowSeconds, exp: nowSeconds + 900,
+  });
+}
+
+function signViewerToken(grantId) {
+  const nowSeconds = Math.floor(Date.now() / 1_000);
+  const grantUuid = fixtureUuid(grantId);
+  return signToken("viewer-secret", {
+    role: "VIEWER",
+    sub: grantUuid,
+    grantId: grantUuid,
+    sessionId: SESSION_ID,
+    aud: "live-gateway-viewer",
+    jti: fixtureUuid(`ticket-${grantId}`),
+    iat: nowSeconds,
+    exp: nowSeconds + 60,
+  });
 }
 
 async function nextJson(webSocket) {
@@ -35,648 +56,273 @@ async function waitForJson(webSocket, predicate) {
   }
 }
 
-function createFloorGateway({ floorController, pipelineHooks = {}, gatewayOptions = {} } = {}) {
+async function createHarness(context, { participantSpeakingEnabled = false, gatewayOptions = {} } = {}) {
+  const floorCalls = [];
   const pipelines = [];
   const gateway = createGatewayServer({
     gatewaySecret: "gateway-secret",
     viewerSecret: "viewer-secret",
-    viewerAuthorizer: { async authorize() { return true; } },
+    viewerAuthorizer: {
+      async authorize() { return true; },
+      async authorizeBatch(requests) { return new Map(requests.map(({ key }) => [key, true])); },
+      async authorizeSpeaking() {
+        return typeof participantSpeakingEnabled === "function"
+          ? participantSpeakingEnabled()
+          : participantSpeakingEnabled;
+      },
+    },
     hostAuthorizer: { async authorize() { return true; } },
-    floorController,
+    floorController: {
+      async take(...args) { floorCalls.push(["take", ...args]); return { ok: true }; },
+      async release(...args) { floorCalls.push(["release", ...args]); return true; },
+    },
     ...gatewayOptions,
-    async pipelineFactory(settings) {
+    async pipelineFactory() {
       const pipeline = {
-        settings,
         frames: [],
         captures: [],
         floorSpeakers: [],
-        async start() {},
-        async tick() {},
-        async acceptAudio(frame, capturedAt, floorSpeaker) {
+        async start() {}, async tick() {}, async endAudioStream() {}, async close() {},
+        async acceptAudio(frame, capturedAt, floorSpeaker, source) {
           this.frames.push(frame);
-          this.captures.push({ capturedAt, floorSpeaker });
+          this.captures.push({ capturedAt, floorSpeaker, source });
         },
         setFloorSpeaker(speaker) { this.floorSpeakers.push(speaker); },
-        async endAudioStream() {},
-        async close() {},
-        ...pipelineHooks,
       };
       pipelines.push(pipeline);
       return pipeline;
     },
   });
-  return { gateway, pipelines };
+  await new Promise((resolve) => gateway.server.listen(0, "127.0.0.1", resolve));
+  context.after(async () => gateway.close());
+  return { gateway, floorCalls, pipelines, port: gateway.server.address().port };
 }
 
 async function startHost(port) {
   const host = new WebSocket(`ws://127.0.0.1:${port}/live`);
   await once(host, "open");
-  let received = nextJson(host);
-  host.send(JSON.stringify({ type: "authenticate", token: signHostToken("gateway-secret") }));
-  assert.equal((await received).type, "authenticated");
-  received = nextJson(host);
+  let reply = nextJson(host);
+  host.send(JSON.stringify({ type: "authenticate", token: signHostToken() }));
+  assert.equal((await reply).role, "HOST");
+  const messages = [];
+  const started = new Promise((resolve) => {
+    const onMessage = (data) => {
+      const message = JSON.parse(data.toString("utf8"));
+      if (message.type !== "started" && message.type !== "floor") return;
+      messages.push(message);
+      if (messages.length === 2) {
+        host.off("message", onMessage);
+        resolve();
+      }
+    };
+    host.on("message", onMessage);
+  });
   host.send(JSON.stringify({
-    type: "start",
-    sessionId: "session-1",
-    sessionType: "meeting",
-    outputMode: "captions_audio",
-    version: 1,
-    languages: ["ko", "en"],
+    type: "start", sessionId: SESSION_ID, sessionType: "meeting",
+    outputMode: "captions", version: 1, languages: ["ko"],
   }));
-  assert.equal((await received).type, "started");
+  await started;
   return host;
 }
 
-async function joinViewer(port, grantId, language = "ko") {
+async function joinViewer(port, grantId) {
   const viewer = new WebSocket(`ws://127.0.0.1:${port}/live`);
   await once(viewer, "open");
-  let received = nextJson(viewer);
-  viewer.send(JSON.stringify({ type: "authenticate", token: signViewerToken("viewer-secret", grantId) }));
-  assert.equal((await received).type, "authenticated");
-  received = nextJson(viewer);
-  viewer.send(JSON.stringify({ type: "subscribe", sessionId: "session-1", language }));
-  assert.equal((await received).type, "subscribed");
+  let reply = nextJson(viewer);
+  viewer.send(JSON.stringify({ type: "authenticate", token: signViewerToken(grantId) }));
+  assert.equal((await reply).role, "VIEWER");
+  reply = nextJson(viewer);
+  viewer.send(JSON.stringify({ type: "subscribe", sessionId: SESSION_ID, language: "ko" }));
+  assert.equal((await reply).type, "subscribed");
   return viewer;
 }
 
-test("speak-start takes the floor, notifies everyone, and routes speaker audio into the pipeline", async (context) => {
-  const takeCalls = [];
-  const releaseCalls = [];
-  const { gateway, pipelines } = createFloorGateway({
-    floorController: {
-      async take(sessionId, grantId) {
-        takeCalls.push([sessionId, grantId]);
-        return { ok: true, displayName: "김노엘" };
-      },
-      async release(sessionId, grantId) {
-        releaseCalls.push([sessionId, grantId]);
-        return true;
-      },
-    },
-  });
-  await new Promise((resolve) => gateway.server.listen(0, "127.0.0.1", resolve));
-  context.after(async () => gateway.close());
-  const { port } = gateway.server.address();
+test("VIEWER floor request, release, and preempt messages fail closed without controller access", async (context) => {
+  const { floorCalls, port } = await createHarness(context);
+  for (const [index, type] of ["speak-start", "speak-end", "host-speak"].entries()) {
+    const viewer = await joinViewer(port, `grant-${index}`);
+    context.after(() => viewer.terminate());
+    const reply = nextJson(viewer);
+    viewer.send(JSON.stringify({ type }));
+    assert.equal((await reply).code, "VIEWER_CONTROL_FORBIDDEN");
+    await once(viewer, "close");
+  }
+  assert.deepEqual(floorCalls, []);
+});
 
+test("VIEWER PCM fails closed while HOST PCM remains the only media ingress", async (context) => {
+  const { floorCalls, pipelines, port } = await createHarness(context);
+  const host = await startHost(port);
+  context.after(() => host.terminate());
+  const viewer = await joinViewer(port, "grant-forged-pcm");
+  context.after(() => viewer.terminate());
+
+  const reply = nextJson(viewer);
+  viewer.send(Buffer.alloc(INPUT_FRAME_BYTES));
+  assert.equal((await reply).code, "VIEWER_MEDIA_FORBIDDEN");
+  await once(viewer, "close");
+  assert.equal(pipelines[0].frames.length, 0);
+
+  host.send(Buffer.alloc(INPUT_FRAME_BYTES));
+  for (let attempt = 0; attempt < 100 && pipelines[0].frames.length === 0; attempt += 1) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  assert.equal(pipelines[0].frames.length, 1);
+  assert.deepEqual(floorCalls, []);
+});
+
+test("caption subscribers still receive live events under the subscribe-only policy", async (context) => {
+  const { gateway, floorCalls, port } = await createHarness(context);
+  const viewer = await joinViewer(port, "grant-caption");
+  context.after(() => viewer.terminate());
+  const caption = nextJson(viewer);
+  await gateway.broadcastEvent(SESSION_ID, "ko", {
+    type: "caption", sessionId: SESSION_ID, language: "ko", seq: 1,
+    text: "실시간 번역", isFinal: true,
+  });
+  assert.equal((await caption).payload.text, "실시간 번역");
+  assert.deepEqual(floorCalls, []);
+});
+
+test("HOST floor reclaim acknowledgement remains available to web and desktop hosts", async (context) => {
+  const { floorCalls, port } = await createHarness(context);
+  const host = await startHost(port);
+  context.after(() => host.terminate());
+  const reply = nextJson(host);
+  host.send(JSON.stringify({ type: "host-speak" }));
+  assert.deepEqual(await reply, { type: "host-speak-started", sessionId: SESSION_ID });
+  assert.deepEqual(floorCalls, []);
+});
+
+test("enabled participant speaking takes one floor, routes only its PCM, and releases back to host", async (context) => {
+  const { floorCalls, pipelines, port } = await createHarness(context, { participantSpeakingEnabled: true });
   const host = await startHost(port);
   context.after(() => host.terminate());
   const speaker = await joinViewer(port, "grant-speaker");
   context.after(() => speaker.terminate());
-  const listener = await joinViewer(port, "grant-listener", "en");
-  context.after(() => listener.terminate());
 
-  const speakerStarted = waitForJson(speaker, (message) => message.type === "speak-started");
-  const listenerFloor = waitForJson(listener, (message) => message.type === "live-event" && message.payload.type === "floor");
-  const hostFloor = waitForJson(host, (message) => message.type === "floor");
   speaker.send(JSON.stringify({ type: "speak-start" }));
-  const started = await speakerStarted;
-  assert.equal(started.displayName, "김노엘");
+  const started = await waitForJson(speaker, (message) => message.type === "speak-started");
   assert.equal(started.audio.sampleRate, AUDIO_CONFIG.inputSampleRate);
-  // Contract C5: the floor broadcast carries the holder's identity.
-  assert.deepEqual((await listenerFloor).payload.holder, { participantId: "grant-speaker", name: "김노엘", department: "", jobTitle: "" });
-  assert.deepEqual((await hostFloor).holder, { participantId: "grant-speaker", name: "김노엘", department: "", jobTitle: "" });
-  assert.deepEqual(takeCalls, [["session-1", "grant-speaker"]]);
-  assert.deepEqual(pipelines[0].floorSpeakers, [{ participantId: "grant-speaker", displayName: "김노엘", department: "", jobTitle: "" }]);
+  assert.deepEqual(floorCalls[0].slice(0, 3), ["take", SESSION_ID, fixtureUuid("grant-speaker")]);
 
-  // Floor holder audio flows into the pipeline; host audio is dropped meanwhile.
   speaker.send(Buffer.alloc(INPUT_FRAME_BYTES));
   host.send(Buffer.alloc(INPUT_FRAME_BYTES));
-  await new Promise((resolve) => setTimeout(resolve, 100));
-  assert.equal(pipelines[0].frames.length, 1);
-  assert.equal(pipelines[0].captures[0].floorSpeaker.participantId, "grant-speaker");
+  for (let attempt = 0; attempt < 100 && pipelines[0].frames.length === 0; attempt += 1) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  assert.equal(pipelines[0].frames.length, 1, "host PCM is gated while the participant owns the floor");
+  assert.equal(pipelines[0].captures[0].source, "participant");
+  assert.equal(pipelines[0].captures[0].floorSpeaker.participantId, fixtureUuid("grant-speaker"));
 
-  // Explicit speak-end releases the floor and broadcasts a null holder.
-  const speakerEnded = waitForJson(speaker, (message) => message.type === "speak-ended");
-  const listenerCleared = waitForJson(listener, (message) => message.type === "live-event" && message.payload.type === "floor" && message.payload.holder === null);
   speaker.send(JSON.stringify({ type: "speak-end" }));
-  assert.equal((await speakerEnded).reason, "ended");
-  await listenerCleared;
-  assert.deepEqual(releaseCalls, [["session-1", "grant-speaker"]]);
-  assert.deepEqual(pipelines[0].floorSpeakers.at(-1), null);
-
-  // After release, host audio flows again.
+  assert.equal((await waitForJson(speaker, (message) => message.type === "speak-ended")).reason, "ended");
+  assert.deepEqual(floorCalls[1].slice(0, 3), ["release", SESSION_ID, fixtureUuid("grant-speaker")]);
   host.send(Buffer.alloc(INPUT_FRAME_BYTES));
-  await new Promise((resolve) => setTimeout(resolve, 100));
-  assert.equal(pipelines[0].frames.length, 2);
+  for (let attempt = 0; attempt < 100 && pipelines[0].frames.length < 2; attempt += 1) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
   assert.equal(pipelines[0].captures[1].floorSpeaker, null);
 });
 
-test("a second speaker preempts the current one and non-holders may not send audio", async (context) => {
-  const { gateway } = createFloorGateway({
-    floorController: {
-      async take(sessionId, grantId) {
-        return { ok: true, displayName: grantId === "grant-a" ? "발표자A" : "발표자B" };
-      },
-      async release() { return true; },
-    },
-  });
-  await new Promise((resolve) => gateway.server.listen(0, "127.0.0.1", resolve));
-  context.after(async () => gateway.close());
-  const { port } = gateway.server.address();
-
+test("enabled participant speaking preempts the prior holder and stray PCM stays receive-only", async (context) => {
+  const { pipelines, port } = await createHarness(context, { participantSpeakingEnabled: true });
   const host = await startHost(port);
   context.after(() => host.terminate());
-  const speakerA = await joinViewer(port, "grant-a");
-  context.after(() => speakerA.terminate());
-  const speakerB = await joinViewer(port, "grant-b");
-  context.after(() => speakerB.terminate());
+  const first = await joinViewer(port, "grant-first");
+  const second = await joinViewer(port, "grant-second");
+  context.after(() => first.terminate());
+  context.after(() => second.terminate());
 
-  speakerA.send(JSON.stringify({ type: "speak-start" }));
-  await waitForJson(speakerA, (message) => message.type === "speak-started");
-
-  const preempted = waitForJson(speakerA, (message) => message.type === "speak-ended");
-  speakerB.send(JSON.stringify({ type: "speak-start" }));
-  await waitForJson(speakerB, (message) => message.type === "speak-started");
+  first.send(JSON.stringify({ type: "speak-start" }));
+  await waitForJson(first, (message) => message.type === "speak-started");
+  const preempted = waitForJson(first, (message) => message.type === "speak-ended");
+  second.send(JSON.stringify({ type: "speak-start" }));
+  await waitForJson(second, (message) => message.type === "speak-started");
   assert.equal((await preempted).reason, "preempted");
 
-  // speakerA lost the floor: stray frames are dropped without killing the
-  // connection (they race the speak-ended notification).
-  speakerA.send(Buffer.alloc(INPUT_FRAME_BYTES));
-  await new Promise((resolve) => setTimeout(resolve, 100));
-  assert.equal(speakerA.readyState, WebSocket.OPEN);
-});
-
-test("delayed floor identity cannot race a second take or host preemption into split ownership", async (context) => {
-  let releaseFirstProfile;
-  const firstProfileGate = new Promise((resolve) => { releaseFirstProfile = resolve; });
-  const takeCalls = [];
-  const releaseCalls = [];
-  const { gateway, pipelines } = createFloorGateway({
-    gatewayOptions: {
-      floorTakeCooldownMilliseconds: 0,
-      async fetchFloorParticipant(_sessionId, participantId) {
-        if (participantId === "grant-a") await firstProfileGate;
-        return { department: participantId };
-      },
-    },
-    floorController: {
-      async take(_sessionId, grantId) {
-        takeCalls.push(grantId);
-        return { ok: true, participantId: grantId, displayName: grantId };
-      },
-      async release(_sessionId, grantId) { releaseCalls.push(grantId); return true; },
-    },
-  });
-  await new Promise((resolve) => gateway.server.listen(0, "127.0.0.1", resolve));
-  context.after(async () => gateway.close());
-  const { port } = gateway.server.address();
-  const host = await startHost(port);
-  const speakerA = await joinViewer(port, "grant-a");
-  const speakerB = await joinViewer(port, "grant-b");
-  context.after(() => host.terminate());
-  context.after(() => speakerA.terminate());
-  context.after(() => speakerB.terminate());
-
-  speakerA.send(JSON.stringify({ type: "speak-start" }));
-  while (takeCalls.length < 1) await new Promise((resolve) => setImmediate(resolve));
-  speakerB.send(JSON.stringify({ type: "speak-start" }));
-  host.send(JSON.stringify({ type: "host-speak" }));
-  await new Promise((resolve) => setImmediate(resolve));
-  assert.deepEqual(takeCalls, ["grant-a"], "the second take must wait for the first identity lookup");
-
-  const aMessages = [];
-  const bMessages = [];
-  const hostMessages = [];
-  speakerA.on("message", (data) => aMessages.push(JSON.parse(data.toString("utf8"))));
-  speakerB.on("message", (data) => bMessages.push(JSON.parse(data.toString("utf8"))));
-  host.on("message", (data) => hostMessages.push(JSON.parse(data.toString("utf8"))));
-  releaseFirstProfile();
-  for (let attempt = 0; attempt < 100
-    && (!aMessages.some((message) => message.type === "speak-started")
-      || !bMessages.some((message) => message.type === "speak-started")
-      || !hostMessages.some((message) => message.type === "host-speak-started")); attempt += 1) {
-    await new Promise((resolve) => setTimeout(resolve, 10));
+  first.send(Buffer.alloc(INPUT_FRAME_BYTES));
+  second.send(Buffer.alloc(INPUT_FRAME_BYTES));
+  for (let attempt = 0; attempt < 100 && pipelines[0].frames.length === 0; attempt += 1) {
+    await new Promise((resolve) => setImmediate(resolve));
   }
-  assert.equal(aMessages.some((message) => message.type === "speak-started"), true);
-  assert.equal(bMessages.some((message) => message.type === "speak-started"), true);
-  assert.equal(hostMessages.some((message) => message.type === "host-speak-started"), true);
-  assert.deepEqual(takeCalls, ["grant-a", "grant-b"]);
-  assert.deepEqual(releaseCalls, ["grant-b"], "host preemption releases the actual final DB holder");
-  assert.equal(pipelines[0].floorSpeakers.at(-1), null, "gateway and DB finish with the host owning audio");
-});
-
-test("translation restart preserves the active speaker and live call identity", async (context) => {
-  const releaseCalls = [];
-  const { gateway, pipelines } = createFloorGateway({
-    floorController: {
-      async take() { return { ok: true, displayName: "Noel Kim" }; },
-      async release(sessionId, grantId) {
-        releaseCalls.push([sessionId, grantId]);
-        return true;
-      },
-    },
-  });
-  await new Promise((resolve) => gateway.server.listen(0, "127.0.0.1", resolve));
-  context.after(async () => gateway.close());
-  const { port } = gateway.server.address();
-  const host = await startHost(port);
-  context.after(() => host.terminate());
-  const speaker = await joinViewer(port, "grant-speaker");
-  context.after(() => speaker.terminate());
-
-  speaker.send(JSON.stringify({ type: "speak-start" }));
-  await waitForJson(speaker, (message) => message.type === "speak-started");
-
-  const restarted = waitForJson(host, (message) => message.type === "restarted");
-  host.send(JSON.stringify({
-    type: "restart",
-    sessionId: "session-1",
-    sessionType: "meeting",
-    outputMode: "captions_audio",
-    version: 1,
-    languages: ["ko", "en"],
-  }));
-  assert.equal((await restarted).type, "restarted");
-  assert.equal(pipelines.length, 2);
-  assert.deepEqual(pipelines[1].floorSpeakers, [{ participantId: "grant-speaker", displayName: "Noel Kim", department: "", jobTitle: "" }]);
-  assert.deepEqual(releaseCalls, []);
-
-  speaker.send(Buffer.alloc(INPUT_FRAME_BYTES));
-  await new Promise((resolve) => setTimeout(resolve, 50));
-  assert.equal(pipelines[1].frames.length, 1);
-});
-
-test("disconnecting floor holder releases the floor and a denied take does not disturb viewing", async (context) => {
-  const releaseCalls = [];
-  let allowTake = true;
-  const { gateway, pipelines } = createFloorGateway({
-    floorController: {
-      async take() {
-        if (!allowTake) return { ok: false, code: "SESSION_NOT_LIVE" };
-        return { ok: true, displayName: "발표자" };
-      },
-      async release(sessionId, grantId) {
-        releaseCalls.push([sessionId, grantId]);
-        return true;
-      },
-    },
-  });
-  await new Promise((resolve) => gateway.server.listen(0, "127.0.0.1", resolve));
-  context.after(async () => gateway.close());
-  const { port } = gateway.server.address();
-
-  const host = await startHost(port);
-  context.after(() => host.terminate());
-  const speaker = await joinViewer(port, "grant-speaker");
-  const listener = await joinViewer(port, "grant-listener");
-  context.after(() => listener.terminate());
-
-  speaker.send(JSON.stringify({ type: "speak-start" }));
-  await waitForJson(speaker, (message) => message.type === "speak-started");
-
-  const cleared = waitForJson(listener, (message) => message.type === "live-event" && message.payload.type === "floor" && message.payload.holder === null);
-  speaker.terminate();
-  await cleared;
-  assert.deepEqual(releaseCalls, [["session-1", "grant-speaker"]]);
-  assert.deepEqual(pipelines[0].floorSpeakers.at(-1), null);
-
-  // Denied take: the viewer stays connected and subscribed.
-  allowTake = false;
-  const denied = waitForJson(listener, (message) => message.type === "error" && message.code === "SESSION_NOT_LIVE");
-  listener.send(JSON.stringify({ type: "speak-start" }));
-  await denied;
-  assert.equal(listener.readyState, WebSocket.OPEN);
-});
-
-test("one grant cannot repeatedly preempt a live speaker inside the cooldown", async (context) => {
-  let timestamp = Date.now();
-  let takeCount = 0;
-  const { gateway } = createFloorGateway({
-    gatewayOptions: {
-      now: () => timestamp,
-      floorTakeCooldownMilliseconds: 2_000,
-    },
-    floorController: {
-      async take(sessionId, grantId) {
-        takeCount += 1;
-        return { ok: true, displayName: grantId };
-      },
-      async release() { return true; },
-    },
-  });
-  await new Promise((resolve) => gateway.server.listen(0, "127.0.0.1", resolve));
-  context.after(async () => gateway.close());
-  const { port } = gateway.server.address();
-  const host = await startHost(port);
-  context.after(() => host.terminate());
-  const first = await joinViewer(port, "grant-one");
-  context.after(() => first.terminate());
-  const nextFirstMessage = bufferJson(first);
-  const second = await joinViewer(port, "grant-two");
-  context.after(() => second.terminate());
-  const nextSecondMessage = bufferJson(second);
-
-  first.send(JSON.stringify({ type: "speak-start" }));
-  await nextFirstMessage((message) => message.type === "speak-started");
-
-  // grant-two grabs the floor from a live speaker.
-  timestamp += 100;
-  second.send(JSON.stringify({ type: "speak-start" }));
-  await nextSecondMessage((message) => message.type === "speak-started");
-  assert.equal((await nextFirstMessage((message) => message.type === "speak-ended")).reason, "preempted");
-
-  // grant-one tries to grab it straight back while grant-two is still live.
-  // Preemption stays rate limited so the floor cannot be volleyed.
-  timestamp += 100;
-  first.send(JSON.stringify({ type: "speak-start" }));
-  const limited = await nextFirstMessage((message) => (
-    message.type === "speak-started" || typeof message.code === "string"
-  ));
-  assert.equal(limited.code, "FLOOR_RATE_LIMITED");
-  assert.equal(limited.message, "발언 요청이 너무 빠릅니다. 잠시 후 다시 시도해 주세요.");
-  assert.equal(takeCount, 2);
   assert.equal(first.readyState, WebSocket.OPEN);
-
-  timestamp += 2_000;
-  first.send(JSON.stringify({ type: "speak-start" }));
-  await nextFirstMessage((message) => message.type === "speak-started");
-  assert.equal(takeCount, 3);
+  assert.equal(pipelines[0].frames.length, 1);
+  assert.equal(pipelines[0].captures[0].floorSpeaker.participantId, fixtureUuid("grant-second"));
 });
 
-test("a speaker the host preempted may retake the free floor without waiting out the preemption cooldown", async (context) => {
-  let timestamp = Date.now();
-  let takeCount = 0;
-  const { gateway } = createFloorGateway({
+test("periodic grant audit revokes an active floor when participant speaking is disabled", async (context) => {
+  const capability = { enabled: true };
+  const { pipelines, port } = await createHarness(context, {
+    participantSpeakingEnabled: () => capability.enabled,
     gatewayOptions: {
-      now: () => timestamp,
-      floorTakeCooldownMilliseconds: 2_000,
-      floorResumeCooldownMilliseconds: 250,
-    },
-    floorController: {
-      async take() {
-        takeCount += 1;
-        return { ok: true, displayName: "발표자" };
-      },
-      async release() { return true; },
+      viewerAuthorizationLeaseMilliseconds: 50,
+      viewerAuthorizationJitterMilliseconds: 0,
+      viewerAuthorizationBatchWindowMilliseconds: 0,
     },
   });
-  await new Promise((resolve) => gateway.server.listen(0, "127.0.0.1", resolve));
-  context.after(async () => gateway.close());
-  const { port } = gateway.server.address();
   const host = await startHost(port);
   context.after(() => host.terminate());
-  const nextHostMessage = bufferJson(host);
-  const speaker = await joinViewer(port, "grant-speaker");
+  const speaker = await joinViewer(port, "grant-revoked");
   context.after(() => speaker.terminate());
-  const nextSpeakerMessage = bufferJson(speaker);
-
-  speaker.send(JSON.stringify({ type: "speak-start" }));
-  await nextSpeakerMessage((message) => message.type === "speak-started");
-
-  // The host takes over mid-sentence, which frees the floor entirely.
-  host.send(JSON.stringify({ type: "host-speak" }));
-  await nextHostMessage((message) => message.type === "host-speak-started");
-  assert.equal((await nextSpeakerMessage((message) => message.type === "speak-ended")).reason, "host-preempt");
-
-  // The participant answers back well inside the 2s preemption window. The
-  // floor is unowned, so taking it preempts nobody and must not be refused.
-  timestamp += 300;
-  speaker.send(JSON.stringify({ type: "speak-start" }));
-  const outcome = await nextSpeakerMessage((message) => (
-    message.type === "speak-started" || typeof message.code === "string"
-  ));
-  assert.equal(outcome.code, undefined, `retaking a free floor was refused: ${outcome.code}`);
-  assert.equal(outcome.type, "speak-started");
-  assert.equal(takeCount, 2);
-});
-
-test("zeroing the floor take cooldown disables the resume cooldown with it", async (context) => {
-  let takeCount = 0;
-  const { gateway } = createFloorGateway({
-    // The single knob callers already use to mean "no floor rate limiting".
-    gatewayOptions: { floorTakeCooldownMilliseconds: 0 },
-    floorController: {
-      async take() {
-        takeCount += 1;
-        return { ok: true, displayName: "발표자" };
-      },
-      async release() { return true; },
-    },
-  });
-  await new Promise((resolve) => gateway.server.listen(0, "127.0.0.1", resolve));
-  context.after(async () => gateway.close());
-  const { port } = gateway.server.address();
-  const host = await startHost(port);
-  context.after(() => host.terminate());
-  const speaker = await joinViewer(port, "grant-speaker");
-  context.after(() => speaker.terminate());
-  const nextSpeakerMessage = bufferJson(speaker);
-
-  speaker.send(JSON.stringify({ type: "speak-start" }));
-  await nextSpeakerMessage((message) => message.type === "speak-started");
-  speaker.send(JSON.stringify({ type: "speak-end" }));
-  await nextSpeakerMessage((message) => message.type === "speak-ended");
-
-  // Back-to-back on the real clock, far inside the 250ms default.
-  speaker.send(JSON.stringify({ type: "speak-start" }));
-  const outcome = await nextSpeakerMessage((message) => (
-    message.type === "speak-started" || typeof message.code === "string"
-  ));
-  assert.equal(outcome.code, undefined, `retake was refused: ${outcome.code}`);
-  assert.equal(takeCount, 2);
-});
-
-test("retaking a free floor still collapses spam inside the resume cooldown", async (context) => {
-  let timestamp = Date.now();
-  let takeCount = 0;
-  const { gateway } = createFloorGateway({
-    gatewayOptions: {
-      now: () => timestamp,
-      floorTakeCooldownMilliseconds: 2_000,
-      floorResumeCooldownMilliseconds: 250,
-    },
-    floorController: {
-      async take() {
-        takeCount += 1;
-        return { ok: true, displayName: "발표자" };
-      },
-      async release() { return true; },
-    },
-  });
-  await new Promise((resolve) => gateway.server.listen(0, "127.0.0.1", resolve));
-  context.after(async () => gateway.close());
-  const { port } = gateway.server.address();
-  const host = await startHost(port);
-  context.after(() => host.terminate());
-  const speaker = await joinViewer(port, "grant-speaker");
-  context.after(() => speaker.terminate());
-
   speaker.send(JSON.stringify({ type: "speak-start" }));
   await waitForJson(speaker, (message) => message.type === "speak-started");
-  speaker.send(JSON.stringify({ type: "speak-end" }));
-  await waitForJson(speaker, (message) => message.type === "speak-ended");
 
-  // Hammering Speak must not amplify into floorController.take writes.
-  timestamp += 100;
-  speaker.send(JSON.stringify({ type: "speak-start" }));
-  const spam = await waitForJson(speaker, (message) => (
-    message.type === "speak-started" || typeof message.code === "string"
-  ));
-  assert.equal(spam.code, "FLOOR_RATE_LIMITED");
-  assert.equal(takeCount, 1);
-  assert.equal(speaker.readyState, WebSocket.OPEN);
-});
-
-test("repeating speak-start while already holding the floor is an idempotent acknowledgement", async (context) => {
-  let takeCount = 0;
-  const releaseCalls = [];
-  const { gateway, pipelines } = createFloorGateway({
-    gatewayOptions: { floorTakeCooldownMilliseconds: 60_000 },
-    floorController: {
-      async take() {
-        takeCount += 1;
-        return { ok: true, displayName: "지속 발표자" };
-      },
-      async release(sessionId, grantId) {
-        releaseCalls.push([sessionId, grantId]);
-        return true;
-      },
-    },
-  });
-  await new Promise((resolve) => gateway.server.listen(0, "127.0.0.1", resolve));
-  context.after(async () => gateway.close());
-  const { port } = gateway.server.address();
-  const host = await startHost(port);
-  context.after(() => host.terminate());
-  const speaker = await joinViewer(port, "grant-speaker");
-  context.after(() => speaker.terminate());
-
-  speaker.send(JSON.stringify({ type: "speak-start" }));
-  await waitForJson(speaker, (message) => message.type === "speak-started");
-  speaker.send(JSON.stringify({ type: "speak-start" }));
-  const repeated = await waitForJson(speaker, (message) => message.type === "speak-started" || message.type === "error");
-
-  assert.equal(repeated.type, "speak-started");
-  assert.equal(repeated.displayName, "지속 발표자");
-  assert.equal(takeCount, 1, "an active holder must not take or preempt its own floor again");
-  assert.deepEqual(releaseCalls, []);
-  assert.notDeepEqual(pipelines[0].floorSpeakers.at(-1), null);
-
-  speaker.send(Buffer.alloc(INPUT_FRAME_BYTES));
-  await new Promise((resolve) => setTimeout(resolve, 50));
-  assert.equal(pipelines[0].frames.length, 1, "the existing floor remains usable after the repeated request");
-});
-
-// waitForJson re-attaches `once` between messages, so back-to-back frames on
-// one socket (floor:null immediately followed by the host-speak ack) can land
-// in the re-attach gap and vanish. This buffers every frame instead.
-function bufferJson(webSocket) {
-  const queue = [];
-  const waiters = [];
-  webSocket.on("message", (data) => {
-    const message = JSON.parse(data.toString("utf8"));
-    const waiter = waiters.shift();
-    if (waiter) waiter(message);
-    else queue.push(message);
-  });
-  return async function next(predicate) {
-    while (true) {
-      const message = queue.length > 0 ? queue.shift() : await new Promise((resolve) => waiters.push(resolve));
-      if (predicate(message)) return message;
-    }
-  };
-}
-
-test("host-speak reclaims the floor from a participant so host audio flows again", async (context) => {
-  const releaseCalls = [];
-  const { gateway, pipelines } = createFloorGateway({
-    floorController: {
-      async take() { return { ok: true, displayName: "김노엘" }; },
-      async release(sessionId, grantId) {
-        releaseCalls.push([sessionId, grantId]);
-        return true;
-      },
-    },
-  });
-  await new Promise((resolve) => gateway.server.listen(0, "127.0.0.1", resolve));
-  context.after(async () => gateway.close());
-  const { port } = gateway.server.address();
-
-  const host = await startHost(port);
-  context.after(() => host.terminate());
-  const nextHostMessage = bufferJson(host);
-  const speaker = await joinViewer(port, "grant-speaker");
-  context.after(() => speaker.terminate());
-  const nextSpeakerMessage = bufferJson(speaker);
-
-  speaker.send(JSON.stringify({ type: "speak-start" }));
-  await nextSpeakerMessage((message) => message.type === "speak-started");
-
-  // Host takes the floor back: participant gets speak-ended(host-preempt),
-  // floor broadcast clears, and host audio reaches the pipeline again.
-  host.send(JSON.stringify({ type: "host-speak" }));
-  assert.equal((await nextSpeakerMessage((message) => message.type === "speak-ended")).reason, "host-preempt");
-  assert.equal((await nextHostMessage((message) => message.type === "host-speak-started")).sessionId, "session-1");
-  assert.deepEqual(releaseCalls, [["session-1", "grant-speaker"]]);
-  assert.deepEqual(pipelines[0].floorSpeakers.at(-1), null);
+  capability.enabled = false;
+  const ended = await waitForJson(speaker, (message) => message.type === "speak-ended");
+  assert.equal(ended.reason, "disabled");
 
   host.send(Buffer.alloc(INPUT_FRAME_BYTES));
-  await new Promise((resolve) => setTimeout(resolve, 100));
-  assert.equal(pipelines[0].frames.length, 1);
-
-  // With no holder, host-speak is an idempotent ack.
-  host.send(JSON.stringify({ type: "host-speak" }));
-  assert.equal((await nextHostMessage((message) => message.type === "host-speak-started")).sessionId, "session-1");
+  for (let attempt = 0; attempt < 100 && pipelines[0].frames.length === 0; attempt += 1) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  assert.equal(pipelines[0].captures[0].source, null, "revocation reopens host PCM immediately");
+  assert.equal(pipelines[0].floorSpeakers.at(-1), null);
 });
 
-// A holder whose client dies without sending speak-end used to stall the WHOLE
-// meeting: host audio is dropped outright while any participant holds the floor,
-// so once the holder's frames stopped, nothing reached the pipeline at all and
-// captions froze with no automatic recovery. Only another Speak press, the host
-// reclaiming, or the dead socket finally closing could unstick it.
-test("a silent floor holder is released so host audio resumes without ending the session", async (context) => {
-  const releaseCalls = [];
-  // Tokens are signed with the real clock, so the injected clock must start
-  // there or verifyLiveToken rejects them outright.
-  let clock = Date.now();
-  const { gateway, pipelines } = createFloorGateway({
-    floorController: {
-      async take() { return { ok: true, displayName: "김노엘" }; },
-      async release(sessionId, grantId) { releaseCalls.push(grantId); return true; },
+test("periodic speaking re-auth is leased per session instead of per viewer", async (context) => {
+  let speakingChecks = 0;
+  const reauthorizeCallbacks = [];
+  const { port } = await createHarness(context, {
+    participantSpeakingEnabled: () => {
+      speakingChecks += 1;
+      return true;
     },
-    gatewayOptions: { now: () => clock, floorIdleReleaseMilliseconds: 8_000 },
+    gatewayOptions: {
+      setReauthorizeIntervalFn: (callback) => {
+        reauthorizeCallbacks.push(callback);
+        return { fake: true };
+      },
+      clearReauthorizeIntervalFn: () => {},
+    },
   });
-  await new Promise((resolve) => gateway.server.listen(0, "127.0.0.1", resolve));
-  context.after(async () => gateway.close());
-  const { port } = gateway.server.address();
-
   const host = await startHost(port);
   context.after(() => host.terminate());
-  const speaker = await joinViewer(port, "grant-idle");
-  context.after(() => speaker.terminate());
 
-  const frame = Buffer.alloc(AUDIO_CONFIG.inputSampleRate * 2 * AUDIO_CONFIG.chunkMilliseconds / 1_000);
-  const until = async (condition) => {
-    for (let attempt = 0; attempt < 200; attempt += 1) {
-      if (condition()) return;
-      await new Promise((resolve) => setTimeout(resolve, 5));
-    }
-    throw new Error("condition never became true");
-  };
-  host.send(frame);
-  await until(() => pipelines[0].frames.length === 1);
+  const viewerA = await joinViewer(port, "11111111-1111-4111-8111-0000000000a1");
+  const viewerB = await joinViewer(port, "11111111-1111-4111-8111-0000000000b2");
+  context.after(() => viewerA.terminate());
+  context.after(() => viewerB.terminate());
 
-  // Participant takes the floor: host audio is now deliberately discarded.
-  speaker.send(JSON.stringify({ type: "speak-start" }));
-  await waitForJson(speaker, (message) => message.type === "speak-started");
-  const speakerEnded = waitForJson(speaker, (message) => message.type === "speak-ended");
-  host.send(frame);
+  // Both viewers arm the speaking capability (direct, non-leased checks).
+  for (const viewer of [viewerA, viewerB]) {
+    const reply = nextJson(viewer);
+    viewer.send(JSON.stringify({ type: "speak-start" }));
+    await reply;
+  }
+  // Subscribe-time capability checks resolve asynchronously; settle before
+  // snapshotting so the periodic delta below counts only leased rechecks.
   await new Promise((resolve) => setTimeout(resolve, 150));
-  assert.equal(pipelines[0].frames.length, 1, "host audio must be gated while a participant holds the floor");
+  const checksAfterSpeakStart = speakingChecks;
+  assert.ok(checksAfterSpeakStart >= 2, "speak-start stays a direct, fresh check");
 
-  // The holder goes silent — its client is gone, but it never sent speak-end.
-  clock += 9_000;
-  const ended = await speakerEnded;
-  assert.equal(ended.reason, "idle", "the holder must be told its turn ended so its UI resets");
-  assert.deepEqual(releaseCalls, ["grant-idle"]);
-
-  // The meeting recovers on its own: host audio flows again.
-  host.send(frame);
-  await until(() => pipelines[0].frames.length === 2);
-  assert.match(gateway.metrics.render(), /floor_idle_releases_total/u);
-
-  // And the session itself is untouched — no close, no teardown.
-  assert.equal(pipelines.length, 1);
-  assert.equal(host.readyState, WebSocket.OPEN);
-  assert.equal(speaker.readyState, WebSocket.OPEN);
+  // Fire every viewer's periodic re-auth within one lease window: the
+  // session-level speaking answer must be fetched once, not once per viewer.
+  await Promise.all(reauthorizeCallbacks.map((callback) => callback()));
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  assert.equal(
+    speakingChecks - checksAfterSpeakStart,
+    1,
+    "one leased speaking check should serve every viewer in the window",
+  );
 });

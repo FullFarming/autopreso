@@ -168,11 +168,10 @@ desktop's own local engine; `electron/main.js` fans those to all renderers as
   `createGatewayServer` in `src/gateway-server.js` accepts exactly one WebSocket
   path, `/live`, for both host and viewer roles, and owns session lifecycle, the
   speaking floor, viewer topics, and per-language caption sequencing.
-  `src/live-media-pipeline.js` is the STT/translate/TTS pipeline; provider
-  adapters live in `google-provider-adapters.js` and
-  `openai-realtime-translation.js`; Supabase RPC wrappers in
-  `supabase-adapters.js`. Deployment and IAM constraints are in
-  `media-gateway/README.md` (Korean).
+  `src/live-media-pipeline.js` is the STT/translate/TTS pipeline; the active
+  Gemini STT/translation/TTS adapters live in `google-provider-adapters.js`;
+  Supabase RPC wrappers live in `supabase-adapters.js`. Deployment and IAM
+  constraints are in `media-gateway/README.md` (Korean).
 - **`webapp/`** is the Next.js participant app *and* the host-facing REST API the
   desktop main process calls (`/api/login`, `/api/live-sessions`,
   `.../gateway-token`, `/api/live-config` for the gateway URL).
@@ -186,19 +185,31 @@ desktop's own local engine; `electron/main.js` fans those to all renderers as
   rate limits. Nearly everything goes through `security definer` RPCs rather
   than table writes.
 
-### Why the desktop host connects from the MAIN process, not the renderer
+### Two supported HOST connection paths (do NOT tighten one to "fix" the other)
 
-Cloud Run rejects a browser WebSocket whose `Origin` is not in
-`LIVE_GATEWAY_ALLOWED_ORIGINS`, and the desktop renderer's origin is
-`http://127.0.0.1:<port>`. So the renderer never opens a gateway socket: it only
-captures the mic and pushes 1280-byte frames over `live-call:audio-frame` IPC,
-and `electron/main.js` holds the HOST socket itself. A Node client sends no
-`Origin` at all, which is the branch `isAllowedWebSocketUpgrade`
-(`media-gateway/src/gateway-security.js`) admits - but only with
-`LIVE_GATEWAY_ALLOW_TRUSTED_NON_BROWSER` enabled, the header
-`x-realtime-noel-client: desktop-main`, *and* a `Bearer` token that verifies to
-role `HOST`. Moving that socket into a renderer breaks the upgrade; adding the
-header from a renderer does not help, because a browser sends `Origin` anyway.
+The gateway upgrade (`isAllowedWebSocketUpgrade`,
+`media-gateway/src/gateway-security.js`) admits two host lanes, and both are
+production paths — `media-gateway/test/gateway-security.test.js` pins this
+contract:
+
+1. **Web host (browser)** — the webapp host dashboard connects as HOST from the
+   browser. The upgrade carries the webapp `Origin` (must be in
+   `LIVE_GATEWAY_ALLOWED_ORIGINS`); browsers cannot set bearer headers, so HOST
+   authentication happens post-upgrade via the `authenticate` message.
+   `webapp/components/live/live-audio-client.ts` owns capture, proactive token
+   refresh, and reconnects. Requiring the desktop-main marker for HOST would
+   silently kill this shipped path.
+2. **Electron desktop (main process)** — the desktop renderer's origin is
+   `http://127.0.0.1:<port>`, which is never allowlisted, so the renderer only
+   captures the mic and pushes 1280-byte frames over `live-call:audio-frame`
+   IPC while `electron/main.js` holds the HOST socket. A Node client sends no
+   `Origin`; that lane requires `LIVE_GATEWAY_ALLOW_TRUSTED_NON_BROWSER`, the
+   header `x-realtime-noel-client: desktop-main`, *and* a `Bearer` token that
+   verifies to role `HOST`.
+
+Host takeover between the two is last-wins: the gateway closes the losing
+socket with code 4410 (`REPLACED`), and warm pipeline reattach requires the
+same `activationKey` on both clients.
 
 ### Speaking floor contract (`media-gateway/src/gateway-server.js`)
 
@@ -325,3 +336,44 @@ Other notes:
 ## Project status (from README)
 
 The project is in **alpha**. The README's prominent warning is intentional - keep the rough-edges framing rather than over-promising stability when editing it.
+
+## Skill routing
+
+When the user's request matches an available skill, invoke it via the Skill tool. The
+skill has multi-step workflows, checklists, and quality gates that produce better
+results than an ad-hoc answer. When in doubt, invoke the skill. A false positive is
+cheaper than a false negative.
+
+Key routing rules:
+- Product ideas, "is this worth building", brainstorming → invoke /office-hours
+- Strategy, scope, "think bigger", "what should we build" → invoke /plan-ceo-review
+- Architecture, "does this design make sense" → invoke /plan-eng-review
+- Design system, brand, "how should this look" → invoke /design-consultation
+- Design review of a plan → invoke /plan-design-review
+- Developer experience of a plan, API/CLI/SDK design → invoke /plan-devex-review
+- "Review everything", full review pipeline → invoke /autoplan
+- Bugs, errors, "why is this broken", "this doesn't work" → invoke /investigate
+- Test the site, find bugs, "does this work" → invoke /qa (or /qa-only for report only)
+- Code review, check the diff, pre-landing review → invoke /review
+- Visual polish, design audit, "this looks off" → invoke /design-review
+- Developer experience audit, try onboarding → invoke /devex-review
+- Ship, deploy, push, create a PR → invoke /ship
+- Merge + deploy + verify → invoke /land-and-deploy
+- Configure deployment → invoke /setup-deploy
+- Post-deploy monitoring → invoke /canary
+- Update docs after shipping → invoke /document-release
+- Weekly retro, "how'd we do" → invoke /retro
+- Second opinion, codex review → invoke /codex
+- Safety mode, careful mode → invoke /careful or /guard
+- Restrict edits to a directory → invoke /freeze or /unfreeze
+- Upgrade gstack → invoke /gstack-upgrade
+- Save progress or checkpoint → invoke /context-save
+- Resume or restore context → invoke /context-restore
+- Security audit, OWASP, vulnerabilities → invoke /cso
+- Make a PDF, document, publication → invoke /make-pdf
+- Launch real browser for QA → invoke /open-gstack-browser
+- Import cookies for authenticated testing → invoke /setup-browser-cookies
+- Performance regression, page speed, benchmarks → invoke /benchmark
+- Review what gstack has learned → invoke /learn
+- Tune question sensitivity → invoke /plan-tune
+- Code quality dashboard → invoke /health

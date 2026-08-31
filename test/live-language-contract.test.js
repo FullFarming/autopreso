@@ -4,6 +4,7 @@ import path from "node:path";
 import test from "node:test";
 
 import { LIVE_TRANSLATION_LANGUAGES } from "../media-gateway/src/config.js";
+import { CAPTION_LANGUAGE_CODES } from "../packages/caption-core/index.js";
 import { SUBTITLE_LANGUAGES } from "../src/subtitle-languages.js";
 
 const ROOT = path.resolve(import.meta.dirname, "..");
@@ -18,10 +19,11 @@ function extractQuotedArray(source, declaration) {
 }
 
 test("desktop, web, gateway, Chrome, and database share one canonical live-language contract", async () => {
-  const [webSource, chromeSource, migrationSource] = await Promise.all([
+  const [webSource, chromeSource, migrationSource, electronSource] = await Promise.all([
     readFile(path.join(ROOT, "webapp/lib/languageDetect.ts"), "utf8"),
     readFile(path.join(ROOT, "chrome-extension/sidepanel.html"), "utf8"),
     readFile(path.join(ROOT, "supabase/migrations/202607230001_live_multilingual_languages.sql"), "utf8"),
+    readFile(path.join(ROOT, "electron/main.js"), "utf8"),
   ]);
 
   const desktopLanguages = SUBTITLE_LANGUAGES.map(({ code }) => code);
@@ -29,6 +31,11 @@ test("desktop, web, gateway, Chrome, and database share one canonical live-langu
   const chromeLanguages = [...chromeSource.matchAll(/<option value="([^"]+)"/gu)].map((entry) => entry[1]);
   const databaseLanguages = [...migrationSource.matchAll(/when '([^']+)' then '\1'/gu)].map((entry) => entry[1]);
 
+  // caption-core is the single source of truth; the literal list above exists
+  // so a code change here is a conscious, reviewable act.
+  assert.deepEqual([...CAPTION_LANGUAGE_CODES], CANONICAL_LANGUAGES);
+  // Derived (not duplicated) lists must stay derived.
+  assert.match(electronSource, /LIVE_DRAFT_LANGUAGES = new Set\(CAPTION_LANGUAGE_CODES\)/u);
   assert.deepEqual(desktopLanguages, CANONICAL_LANGUAGES);
   assert.deepEqual(webLanguages, CANONICAL_LANGUAGES);
   assert.deepEqual(LIVE_TRANSLATION_LANGUAGES, CANONICAL_LANGUAGES);

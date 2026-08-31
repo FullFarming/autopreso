@@ -5,6 +5,10 @@ import { WebSocket } from "ws";
 import { startServer } from "../src/server.js";
 import { STARTER_ELEMENTS } from "../public/starter-elements.js";
 
+function sameOriginHeaders(url, headers = {}) {
+  return { origin: new URL(url).origin, ...headers };
+}
+
 test("POST /api/session/reset restores starter whiteboard and clears agent history", async () => {
   const { httpServer, url, state } = await startServer({
     host: "127.0.0.1",
@@ -24,7 +28,7 @@ test("POST /api/session/reset restores starter whiteboard and clears agent histo
     state.agentHistory = [{ role: "user", content: "old turn" }];
     state.latestScreenshot = "data:image/png;base64,old";
 
-    const res = await fetch(`${url}/api/session/reset`, { method: "POST" });
+    const res = await fetch(`${url}/api/session/reset`, { method: "POST", headers: sameOriginHeaders(url) });
     assert.equal(res.status, 200);
     const body = await res.json();
     assert.equal(body.ok, true);
@@ -71,7 +75,7 @@ test("session reset broadcasts the starter whiteboard to connected websocket cli
     }
     const initialCount = messages.length;
 
-    const res = await fetch(`${url}/api/session/reset`, { method: "POST" });
+    const res = await fetch(`${url}/api/session/reset`, { method: "POST", headers: sameOriginHeaders(url) });
     assert.equal(res.status, 200);
 
     const broadcastDeadline = Date.now() + 2000;
@@ -111,7 +115,7 @@ test("POST /api/session/reset clears transcription vocabulary context", async ()
   try {
     const startRes = await fetch(`${url}/api/preso/start`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: sameOriginHeaders(url, { "content-type": "application/json" }),
       body: JSON.stringify({
         stagingElements: [{ type: "text", id: "t1", text: "Kafka consumer group" }],
         stagingScreenshot: "data:image/png;base64,c3RhZ2luZw==",
@@ -120,7 +124,7 @@ test("POST /api/session/reset clears transcription vocabulary context", async ()
     assert.equal(startRes.status, 200);
     assert.deepEqual(sessionContextCalls.at(-1), { keywords: ["Kafka consumer group"] });
 
-    const resetRes = await fetch(`${url}/api/session/reset`, { method: "POST" });
+    const resetRes = await fetch(`${url}/api/session/reset`, { method: "POST", headers: sameOriginHeaders(url) });
     assert.equal(resetRes.status, 200);
 
     assert.deepEqual(sessionContextCalls.at(-1), { keywords: [] });

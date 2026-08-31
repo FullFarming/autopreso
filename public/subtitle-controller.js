@@ -2,14 +2,17 @@ import {
   applyDocumentLanguage,
   applyTranslations,
   initLanguage,
+  readStoredLanguage,
+  setLanguage,
   subscribe as subscribeToLanguage,
   t,
 } from "./subtitle-i18n.js";
+import { mountSystemLanguageButton } from "./system-language-button.js";
+import { SYSTEM_LANGUAGE_STORAGE_KEY } from "./system-language.js";
 
 const DEFAULT_SUBTITLE = {
   translationLanguages: ["en", "ko"],
   outputMode: "captions",
-  voiceProvider: "gemini",
   translationFontSize: 38,
   verticalOffset: 48,
   opacity: 0.92,
@@ -23,24 +26,47 @@ const fontSize = document.getElementById("controller-font-size");
 const gapValue = document.getElementById("controller-gap-value");
 const vuFill = document.getElementById("controller-vu-fill");
 const elapsedReadout = document.getElementById("controller-elapsed");
+const liveCallStatus = document.getElementById("controller-live-call-status");
+const healthLabel = document.getElementById("controller-health-label");
+const healthDetail = document.getElementById("controller-health-detail");
 const positionButtons = [...document.querySelectorAll("[data-controller-position]")];
-const voiceProviderGroup = document.getElementById("controller-voice-provider");
-const voiceProviderButtons = [...document.querySelectorAll("[data-controller-voice-provider]")];
 let settings = { ...DEFAULT_SUBTITLE };
 let ws = null;
+const TRANSLATION_EVENT_STALE_MS = 5_000;
+const TRANSLATION_ACTIVE_CAPTION_MS = 3_000;
+const translationHealth = {
+  socketState: "connecting",
+  bridgeState: "idle",
+  isLive: false,
+  mediaWaiting: false,
+  lastEventAt: null,
+  lastCaptionAt: null,
+  signalSinceAt: null,
+  lastInputStatus: "",
+  pipelineStatus: "",
+};
+let lastRenderedHealthState = "";
+let isLiveActionStatusLocked = false;
 
-// The dashboard owns the language choice; this window reads the same key and
-// repaints its own labels whenever it changes.
 initLanguage();
 applyDocumentLanguage(document);
 applyTranslations(document);
 window.addEventListener("storage", (event) => {
-  if (event?.key === "realtime-noel-ui-language") initLanguage();
+  if (event.key !== SYSTEM_LANGUAGE_STORAGE_KEY && event.key !== null) return;
+  if (event.storageArea && event.storageArea !== window.localStorage) return;
+  setLanguage(readStoredLanguage());
 });
 subscribeToLanguage(() => {
   applyDocumentLanguage(document);
   applyTranslations(document);
   renderSettings();
+  renderOverlayDisplayState(overlayDisplayState);
+  renderTranslationHealth();
+});
+mountSystemLanguageButton(document.getElementById("controller-system-language"), {
+  onOpenChange(isOpen) {
+    document.querySelector(".caption-controller-window")?.classList.toggle("is-language-menu-open", isOpen);
+  },
 });
 
 document.getElementById("controller-restart")?.addEventListener("click", () => sendControl({ command: "restart" }));
@@ -52,6 +78,8 @@ document.getElementById("controller-stop")?.addEventListener("click", () => send
 const mainWindowButton = document.getElementById("controller-main-window");
 const hideButton = document.getElementById("controller-hide");
 const quitButton = document.getElementById("controller-quit");
+const displaySelect = document.getElementById("controller-display");
+const allDisplaysTick = document.getElementById("controller-all-displays");
 if (window.realtimeNoelDesktop?.isElectron) {
   mainWindowButton?.addEventListener("click", () => {
     // Show/raise only — the main window's renderer is the host microphone
@@ -69,6 +97,127 @@ if (window.realtimeNoelDesktop?.isElectron) {
   if (hideButton) hideButton.hidden = true;
   if (quitButton) quitButton.hidden = true;
 }
+
+// ── Caption display selection ──────────────────────────────────────────────
+// Main owns all display geometry. This renderer deals only in opaque ids and
+// labels, so selecting a monitor cannot become a renderer-controlled window
+// placement primitive.
+let overlayDisplayState = { displays: [], selectedDisplayId: "", allDisplays: false };
+let isSelectingOverlayDisplay = false;
+
+function normalizeOverlayDisplayState(value) {
+  const displays = Array.isArray(value?.displays)
+    ? value.displays.filter((display) => display
+      && (typeof display.id === "string" || Number.isSafeInteger(display.id))
+      && typeof display.label === "string"
+      && display.label.trim()
+      && display.isConnected !== false)
+    : [];
+  const selectedDisplayId = typeof value?.selectedDisplayId === "string"
+    || Number.isSafeInteger(value?.selectedDisplayId)
+    ? String(value.selectedDisplayId)
+    : "";
+  return { displays, selectedDisplayId, allDisplays: value?.allDisplays === true };
+}
+
+function renderOverlayDisplayState(state) {
+  if (!displaySelect) return;
+  while (displaySelect.firstChild) displaySelect.removeChild(displaySelect.firstChild);
+  for (const display of state.displays) {
+    const option = document.createElement("option");
+    option.value = String(display.id);
+    option.textContent = display.label;
+    if (display.isPrimary) option.textContent += ` · ${t("controller.primaryDisplay")}`;
+    displaySelect.append(option);
+  }
+  if (state.displays.length === 0) {
+    const option = document.createElement("option");
+    option.textContent = t("controller.displayUnavailable");
+    displaySelect.append(option);
+  } else if (state.displays.some((display) => String(display.id) === String(state.selectedDisplayId))) {
+    displaySelect.value = String(state.selectedDisplayId);
+  } else {
+    displaySelect.selectedIndex = 0;
+  }
+  displaySelect.disabled = isSelectingOverlayDisplay || state.displays.length === 0;
+  renderAllDisplaysTick(state);
+}
+
+// With the tick on, every screen carries the same captions, so choosing ONE
+// caption display is meaningless — disable the picker rather than leaving a
+// control that silently does nothing.
+function renderAllDisplaysTick(state) {
+  if (!allDisplaysTick) return;
+  allDisplaysTick.setAttribute("aria-checked", state.allDisplays ? "true" : "false");
+  allDisplaysTick.disabled = isSelectingOverlayDisplay || state.displays.length === 0;
+  if (displaySelect) {
+    displaySelect.disabled = displaySelect.disabled || state.allDisplays;
+  }
+}
+
+async function refreshOverlayDisplays() {
+  if (!window.realtimeNoelDesktop?.listOverlayDisplays) return;
+  try {
+    overlayDisplayState = normalizeOverlayDisplayState(
+      await window.realtimeNoelDesktop.listOverlayDisplays(),
+    );
+  } catch {
+    overlayDisplayState = { displays: [], selectedDisplayId: "", allDisplays: false };
+  }
+  renderOverlayDisplayState(overlayDisplayState);
+}
+
+if (displaySelect && window.realtimeNoelDesktop?.listOverlayDisplays) {
+  displaySelect.addEventListener("change", async () => {
+    const display = overlayDisplayState.displays.find(
+      (candidate) => String(candidate.id) === displaySelect.value,
+    );
+    if (!display || isSelectingOverlayDisplay) return;
+    isSelectingOverlayDisplay = true;
+    displaySelect.disabled = true;
+    displaySelect.setAttribute("aria-busy", "true");
+    try {
+      overlayDisplayState = normalizeOverlayDisplayState(
+        await window.realtimeNoelDesktop.selectOverlayDisplay(display.id),
+      );
+    } catch {
+      await refreshOverlayDisplays();
+    } finally {
+      isSelectingOverlayDisplay = false;
+      displaySelect.removeAttribute("aria-busy");
+      renderOverlayDisplayState(overlayDisplayState);
+    }
+  });
+  allDisplaysTick?.addEventListener("click", async () => {
+    if (isSelectingOverlayDisplay || !window.realtimeNoelDesktop?.setOverlayAllDisplays) return;
+    const next = allDisplaysTick.getAttribute("aria-checked") !== "true";
+    isSelectingOverlayDisplay = true;
+    allDisplaysTick.disabled = true;
+    allDisplaysTick.setAttribute("aria-busy", "true");
+    try {
+      overlayDisplayState = normalizeOverlayDisplayState(
+        await window.realtimeNoelDesktop.setOverlayAllDisplays(next),
+      );
+    } catch {
+      await refreshOverlayDisplays();
+    } finally {
+      isSelectingOverlayDisplay = false;
+      allDisplaysTick.removeAttribute("aria-busy");
+      renderOverlayDisplayState(overlayDisplayState);
+    }
+  });
+  const unsubscribeOverlayDisplays = window.realtimeNoelDesktop.onOverlayDisplaysChanged?.((state) => {
+    overlayDisplayState = normalizeOverlayDisplayState(state);
+    renderOverlayDisplayState(overlayDisplayState);
+  });
+  if (typeof unsubscribeOverlayDisplays === "function") {
+    window.addEventListener("beforeunload", unsubscribeOverlayDisplays, { once: true });
+  }
+  void refreshOverlayDisplays();
+} else if (displaySelect) {
+  displaySelect.hidden = true;
+}
+
 document.getElementById("controller-font-down")?.addEventListener("click", () => sendControl({ command: "font", delta: -2 }));
 document.getElementById("controller-font-up")?.addEventListener("click", () => sendControl({ command: "font", delta: 2 }));
 // Vertical gap: how far the subtitle sits from its anchored screen edge.
@@ -79,17 +228,17 @@ opacityInput?.addEventListener("change", () => sendControl({ command: "opacity",
 for (const button of positionButtons) {
   button.addEventListener("click", () => sendControl({ command: "position", position: button.dataset.controllerPosition }));
 }
-for (const button of voiceProviderButtons) {
-  button.addEventListener("click", () => {
-    sendControl({ command: "voice-provider", voiceProvider: button.dataset.controllerVoiceProvider });
-  });
-}
-
 connect();
 
 function connect() {
   const proto = location.protocol === "https:" ? "wss" : "ws";
+  translationHealth.socketState = "connecting";
+  renderTranslationHealth();
   ws = new WebSocket(`${proto}://${location.host}/ws`);
+  ws.addEventListener("open", () => {
+    translationHealth.socketState = "open";
+    renderTranslationHealth();
+  });
   ws.addEventListener("message", (event) => {
     const message = JSON.parse(event.data);
     if (message.type === "settings" && message.settings?.subtitle) {
@@ -97,8 +246,13 @@ function connect() {
       renderSettings();
     }
     if (message.type === "subtitle:input-status") updateVuMeter(message);
+    noteTranslationHealthEvent(message);
   });
-  ws.addEventListener("close", () => setTimeout(connect, 1000));
+  ws.addEventListener("close", () => {
+    translationHealth.socketState = "closed";
+    renderTranslationHealth();
+    setTimeout(connect, 1000);
+  });
 }
 
 // ── VU meter: the server already broadcasts subtitle:input-status with a
@@ -136,14 +290,6 @@ function renderSettings() {
   for (const button of positionButtons) {
     button.classList.toggle("active", button.dataset.controllerPosition === activePosition);
   }
-  const isCaptionsOnly = settings.outputMode === "captions";
-  if (voiceProviderGroup) voiceProviderGroup.hidden = isCaptionsOnly;
-  for (const button of voiceProviderButtons) {
-    const isActive = button.dataset.controllerVoiceProvider === (settings.voiceProvider === "openai" ? "openai" : "gemini");
-    button.classList.toggle("active", isActive);
-    button.ariaChecked = String(isActive);
-    button.setAttribute("aria-checked", String(isActive));
-  }
 }
 
 function updateOpacityReadout(opacity) {
@@ -154,16 +300,131 @@ function updateOpacityReadout(opacity) {
 // Status writes go through these two helpers so the data-i18n marker stays in
 // step with the text: keyed messages survive a language switch, one-off
 // interpolated ones do not carry a key.
-function setControllerStatus(key) {
-  if (!liveCallStatus) return;
-  liveCallStatus.dataset.i18n = key;
-  liveCallStatus.textContent = t(key);
+function setControllerStatus(key, connectionState = "") {
+  if (!liveCallStatus || !healthLabel) return;
+  delete liveCallStatus.dataset.i18n;
+  healthLabel.dataset.i18n = key;
+  if (connectionState) liveCallStatus.dataset.connectionState = connectionState;
+  else delete liveCallStatus.dataset.connectionState;
+  healthLabel.textContent = t(key);
+  if (healthDetail) healthDetail.hidden = true;
+  lastRenderedHealthState = "";
 }
 
 function setControllerText(text) {
-  if (!liveCallStatus) return;
+  if (!liveCallStatus || !healthLabel) return;
   delete liveCallStatus.dataset.i18n;
-  liveCallStatus.textContent = text;
+  delete healthLabel.dataset.i18n;
+  delete liveCallStatus.dataset.connectionState;
+  healthLabel.textContent = text;
+  if (healthDetail) healthDetail.hidden = true;
+  lastRenderedHealthState = "";
+}
+
+function noteTranslationHealthEvent(message) {
+  if (!message || typeof message.type !== "string") return;
+  const now = Date.now();
+  if (message.type === "subtitle:input-status") {
+    translationHealth.lastEventAt = now;
+    const nextInputStatus = String(message.status ?? "");
+    if (nextInputStatus === "signal" && translationHealth.lastInputStatus !== "signal") {
+      translationHealth.signalSinceAt = now;
+    } else if (nextInputStatus !== "signal") {
+      translationHealth.signalSinceAt = null;
+    }
+    translationHealth.lastInputStatus = nextInputStatus;
+  } else if (message.type === "subtitle:partial" || message.type === "subtitle:committed") {
+    translationHealth.lastEventAt = now;
+    translationHealth.lastCaptionAt = now;
+    translationHealth.pipelineStatus = "listening";
+  } else if (message.type === "subtitle:status") {
+    translationHealth.lastEventAt = now;
+    translationHealth.pipelineStatus = String(message.status ?? "");
+  } else {
+    return;
+  }
+  renderTranslationHealth(now);
+}
+
+function translationHealthState(now = Date.now()) {
+  if (translationHealth.socketState !== "open"
+    || ["failed", "idle"].includes(translationHealth.bridgeState)) return "disconnected";
+  if (["connecting", "reconnecting"].includes(translationHealth.bridgeState)
+    || ["recovering", "reconnecting", "degraded"].includes(translationHealth.pipelineStatus)) return "recovering";
+  if (!Number.isFinite(translationHealth.lastEventAt)) return "waiting";
+  if (now - translationHealth.lastEventAt > TRANSLATION_EVENT_STALE_MS) return "recovering";
+  if (["waiting", "silent", "idle"].includes(translationHealth.lastInputStatus)) return "waiting";
+  if (translationHealth.lastInputStatus === "signal") {
+    const hasRecentOutput = Number.isFinite(translationHealth.lastCaptionAt)
+      && Number.isFinite(translationHealth.signalSinceAt)
+      && translationHealth.lastCaptionAt >= translationHealth.signalSinceAt
+      && now - translationHealth.lastCaptionAt <= TRANSLATION_ACTIVE_CAPTION_MS;
+    if (hasRecentOutput) return "healthy";
+    if (Number.isFinite(translationHealth.signalSinceAt)
+      && now - translationHealth.signalSinceAt > TRANSLATION_ACTIVE_CAPTION_MS) return "recovering";
+    return "waiting";
+  }
+  if (Number.isFinite(translationHealth.lastCaptionAt)
+    && now - translationHealth.lastCaptionAt <= TRANSLATION_ACTIVE_CAPTION_MS) return "healthy";
+  return "waiting";
+}
+
+function translationHealthDetail(state, now = Date.now()) {
+  if (!Number.isFinite(translationHealth.lastEventAt)) {
+    if (state === "disconnected") return t("controller.healthRestartAction");
+    return state === "recovering"
+      ? t("controller.healthAutomaticRecovery")
+      : t("controller.healthSpeakAction");
+  }
+  const elapsedSeconds = Math.max(0, Math.floor((now - translationHealth.lastEventAt) / 1000));
+  const elapsed = elapsedSeconds < 2
+    ? t("controller.healthUpdatedNow")
+    : elapsedSeconds < 60
+      ? t("controller.healthUpdatedSeconds", { seconds: elapsedSeconds })
+      : t("controller.healthUpdatedMinutes", { minutes: Math.floor(elapsedSeconds / 60) });
+  if (state === "disconnected") return `${t("controller.healthRestartAction")} · ${elapsed}`;
+  if (state === "recovering") return `${t("controller.healthAutomaticRecovery")} · ${elapsed}`;
+  if (state === "waiting") return `${t("controller.healthSpeakAction")} · ${elapsed}`;
+  return elapsed;
+}
+
+function renderTranslationHealth(now = Date.now()) {
+  if (isLiveActionStatusLocked) return;
+  if (!translationHealth.isLive || !liveCallStatus || !healthLabel) return;
+  if (translationHealth.mediaWaiting) {
+    setControllerStatus("controller.waitingForParticipants", "waiting");
+    return;
+  }
+  const state = translationHealthState(now);
+  const key = `controller.health.${state}`;
+  if (state !== lastRenderedHealthState) {
+    healthLabel.dataset.i18n = key;
+    healthLabel.textContent = t(key);
+    liveCallStatus.dataset.connectionState = state;
+    lastRenderedHealthState = state;
+  }
+  if (healthDetail) {
+    healthDetail.textContent = translationHealthDetail(state, now);
+    healthDetail.hidden = false;
+  }
+}
+
+function syncLiveBridgeStatus(state) {
+  const wasLive = translationHealth.isLive;
+  translationHealth.isLive = Boolean(state?.armed && state.live);
+  translationHealth.mediaWaiting = Boolean(state?.mediaWaiting);
+  translationHealth.bridgeState = String(state?.bridge?.state ?? "idle");
+  // A new call must earn its own healthy state; a recent event from the prior
+  // session would otherwise make dead audio look healthy for several seconds.
+  if (!wasLive && translationHealth.isLive) {
+    translationHealth.lastEventAt = null;
+    translationHealth.lastCaptionAt = null;
+    translationHealth.signalSinceAt = null;
+    translationHealth.lastInputStatus = "";
+    translationHealth.pipelineStatus = "";
+    lastRenderedHealthState = "";
+  }
+  renderTranslationHealth();
 }
 
 function isSupportedLanguage(language) {
@@ -176,7 +437,6 @@ const liveCallGroup = document.getElementById("controller-live-call");
 const goLiveButton = document.getElementById("controller-go-live");
 const hostSpeakButton = document.getElementById("controller-host-speak");
 const endLiveCallButton = document.getElementById("controller-end-live-call");
-const liveCallStatus = document.getElementById("controller-live-call-status");
 if (window.realtimeNoelDesktop?.getLiveCallState && liveCallGroup && goLiveButton && endLiveCallButton && liveCallStatus) {
   let isEndingLiveCall = false;
   // Elapsed "now playing" timer: ticks only while live, renders next to End.
@@ -209,27 +469,34 @@ if (window.realtimeNoelDesktop?.getLiveCallState && liveCallGroup && goLiveButto
       liveCallGroup.hidden = !state?.armed;
       if (state?.armed) {
         goLiveButton.disabled = Boolean(state.live);
-        goLiveButton.dataset.i18n = state.live ? "controller.live" : "controller.goLive";
+        goLiveButton.dataset.i18n = state.live && state.mediaWaiting
+          ? "controller.waitingForParticipants" : state.live ? "controller.live" : "controller.goLive";
         goLiveButton.textContent = t(goLiveButton.dataset.i18n);
-        goLiveButton.classList.toggle("is-live", Boolean(state.live));
+        goLiveButton.classList.toggle("is-live", Boolean(state.live && !state.mediaWaiting));
         // Host Speak only matters once the call is live and a guest may be
         // holding the speaking floor.
         if (hostSpeakButton) hostSpeakButton.hidden = !state.live;
         endLiveCallButton.disabled = isEndingLiveCall;
         if (state.live && state.liveStartedAt) setLiveElapsed(state.liveStartedAt);
         if (!state.live) stopLiveElapsed();
+        syncLiveBridgeStatus(state);
       } else {
+        translationHealth.isLive = false;
+        translationHealth.bridgeState = "idle";
         if (hostSpeakButton) hostSpeakButton.hidden = true;
         stopLiveElapsed();
         setControllerStatus("controller.captionsReady");
       }
     } catch {
+      translationHealth.isLive = false;
+      translationHealth.bridgeState = "idle";
       liveCallGroup.hidden = true;
       stopLiveElapsed();
     }
   };
   hostSpeakButton?.addEventListener("click", async () => {
     if (!window.realtimeNoelDesktop?.hostSpeak) return;
+    isLiveActionStatusLocked = true;
     hostSpeakButton.disabled = true;
     hostSpeakButton.setAttribute("aria-busy", "true");
     setControllerStatus("controller.reclaiming");
@@ -239,12 +506,15 @@ if (window.realtimeNoelDesktop?.getLiveCallState && liveCallGroup && goLiveButto
     } catch {
       setControllerStatus("controller.reclaimFailed");
     } finally {
+      isLiveActionStatusLocked = false;
       hostSpeakButton.disabled = false;
       hostSpeakButton.removeAttribute("aria-busy");
     }
   });
   goLiveButton.addEventListener("click", async () => {
+    isLiveActionStatusLocked = true;
     goLiveButton.disabled = true;
+    goLiveButton.setAttribute("aria-busy", "true");
     setControllerStatus("controller.startingLive");
     try {
       const result = await window.realtimeNoelDesktop.goLiveCall();
@@ -253,11 +523,14 @@ if (window.realtimeNoelDesktop?.getLiveCallState && liveCallGroup && goLiveButto
     } catch {
       setControllerStatus("controller.goLiveFailed");
     } finally {
+      isLiveActionStatusLocked = false;
+      goLiveButton.removeAttribute("aria-busy");
       void syncLiveCall();
     }
   });
   endLiveCallButton.addEventListener("click", async () => {
     if (!window.confirm(t("controller.endConfirm"))) return;
+    isLiveActionStatusLocked = true;
     isEndingLiveCall = true;
     endLiveCallButton.disabled = true;
     endLiveCallButton.setAttribute("aria-busy", "true");
@@ -274,12 +547,14 @@ if (window.realtimeNoelDesktop?.getLiveCallState && liveCallGroup && goLiveButto
       endLiveCallButton.disabled = false;
     } finally {
       isEndingLiveCall = false;
+      isLiveActionStatusLocked = false;
       endLiveCallButton.removeAttribute("aria-busy");
       if (!liveCallGroup.hidden) endLiveCallButton.disabled = false;
     }
   });
   void syncLiveCall();
   window.setInterval(() => { void syncLiveCall(); }, 3_000);
+  window.setInterval(() => renderTranslationHealth(), 1_000);
 }
 
 // ── Drag-to-move: -webkit-app-region is unreliable on this transparent
@@ -316,8 +591,8 @@ if (dragStrip && window.realtimeNoelDesktop?.moveControllerBy) {
 }
 
 // ── Fit-height: the window hugs the console exactly, so there is never an
-// empty band above or below — even when the voice-provider row appears in
-// audio mode. The renderer measures, the main process clamps and resizes. ───
+// empty band above or below. The renderer measures, the main process clamps
+// and resizes. ───
 const consoleRoot = document.querySelector(".caption-controller-window");
 if (consoleRoot && window.realtimeNoelDesktop?.fitControllerHeight && typeof ResizeObserver !== "undefined") {
   let lastRequestedHeight = 0;
@@ -326,7 +601,7 @@ if (consoleRoot && window.realtimeNoelDesktop?.fitControllerHeight && typeof Res
     const rect = consoleRoot.getBoundingClientRect();
     const height = Math.ceil(rect.height);
     // Width too: the console hugs its content, and the clusters change with the
-    // session (Live Call group, Host Speak, the voice row), so a fixed window
+    // session (Live Call group and Host Speak), so a fixed window
     // width leaves slack the right-hand cluster used to be pushed across.
     // A small buffer, because the shell is capped at the window width: without
     // it the row WRAPS the moment a control grows (the elapsed readout gains a
@@ -341,4 +616,35 @@ if (consoleRoot && window.realtimeNoelDesktop?.fitControllerHeight && typeof Res
   };
   new ResizeObserver(requestFit).observe(consoleRoot);
   requestFit();
+}
+
+// ── Momentary caption hide ────────────────────────────────────────────────────
+// A video is playing and the captions should be off screen for a moment. This is
+// NOT the overlay setting: the engine keeps running, lines keep being recorded,
+// and because the flag lives in the main process's memory, quitting clears it.
+// The button carries the state visibly — a mute the user forgot about would
+// otherwise look exactly like broken captions.
+const muteCaptionsButton = document.getElementById("controller-mute-captions");
+if (muteCaptionsButton && window.realtimeNoelDesktop?.setOverlaysMuted) {
+  const paint = (muted) => {
+    muteCaptionsButton.setAttribute("aria-pressed", String(muted));
+    muteCaptionsButton.classList.toggle("is-muted", muted);
+    const key = muted ? "controller.showCaptions" : "controller.hideCaptions";
+    muteCaptionsButton.dataset.i18nTitle = key;
+    muteCaptionsButton.dataset.i18nAria = key;
+    muteCaptionsButton.title = t(key);
+    muteCaptionsButton.setAttribute("aria-label", t(key));
+    // The icon flips via CSS on .is-muted -- both SVGs are in the markup, since
+    // innerHTML is forbidden here and pinned by two tests.
+  };
+  muteCaptionsButton.addEventListener("click", async () => {
+    const next = muteCaptionsButton.getAttribute("aria-pressed") !== "true";
+    // Paint from what the main process reports, not from the optimistic guess:
+    // a rejected origin check returns the unchanged value.
+    paint(Boolean(await window.realtimeNoelDesktop.setOverlaysMuted(next)));
+  });
+  // The controller can be reopened mid-session, so adopt the real state.
+  void window.realtimeNoelDesktop.getOverlaysMuted?.().then((muted) => paint(Boolean(muted))).catch(() => {});
+} else if (muteCaptionsButton) {
+  muteCaptionsButton.hidden = true;
 }

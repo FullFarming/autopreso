@@ -2,16 +2,14 @@ import { NextRequest } from "next/server";
 
 import {
   AuthenticationError,
-  createRecapGrantToken,
-  RECAP_GRANT_COOKIE,
   requireHost,
 } from "@/lib/auth/live-auth";
 import { toLiveFailure } from "@/lib/live/errors";
 import { parseSessionId } from "@/lib/live/validation";
 import { apiError, apiSuccess } from "@/lib/security/api-response";
-import { isProductionRuntime } from "@/lib/security/config";
 import { LiveAdmissionError, SupabaseLiveAdmissionStore } from "@/lib/security/live-admission-store";
 import { authorizeParticipantRecordRequest, isHostOwnershipMiss, AuthorizationError } from "@/lib/security/live-viewer-authorization";
+import { privateNoStoreHeaders } from "@/lib/security/live-topic-validation";
 
 /** Session lifecycle status for the host or any participant of the session.
  *  Works after the session ends — the viewer uses this to tell "the host
@@ -32,34 +30,28 @@ export async function GET(request: NextRequest, context: { params: Promise<{ id:
       participant = await authorizeParticipantRecordRequest(request, sessionId, store);
     }
     const session = await store.readSessionLifecycle(sessionId);
-    if (!session) return apiError("세션을 찾을 수 없습니다.", "SESSION_NOT_FOUND", 404);
+    if (!session) return apiError("세션을 찾을 수 없습니다.", "SESSION_NOT_FOUND", 404, privateNoStoreHeaders());
     const response = apiSuccess({
       id: session.id,
       title: session.title,
       scheduledAt: session.scheduledAt,
       status: session.status,
-      endedAt: session.status === "stopped" ? session.endedAt : null,
-    });
-    if (participant && session.status === "stopped") {
-      const recap = await createRecapGrantToken({ sessionId, userId: participant.userId });
-      response.cookies.set(RECAP_GRANT_COOKIE, recap.token, {
-        httpOnly: true,
-        secure: isProductionRuntime(),
-        sameSite: "lax",
-        path: `/api/live-sessions/${sessionId}`,
-        maxAge: 30 * 24 * 60 * 60,
-      });
-    }
+      endedAt: session.status === "stopped" || session.status === "failed" ? session.endedAt : null,
+      recordsExpiresAt: participant && session.endedAt
+        && (session.status === "stopped" || session.status === "failed")
+        ? new Date(Date.parse(session.endedAt) + 6 * 60 * 60 * 1_000).toISOString()
+        : null,
+    }, { headers: privateNoStoreHeaders() });
     return response;
   } catch (error: unknown) {
     if (error instanceof AuthenticationError || error instanceof AuthorizationError) {
-      return apiError("세션 상태를 볼 권한이 없습니다.", "STATUS_FORBIDDEN", 403);
+      return apiError("세션 상태를 볼 권한이 없습니다.", "STATUS_FORBIDDEN", 403, privateNoStoreHeaders());
     }
-    if (error instanceof LiveAdmissionError) return apiError(error.message, error.code, error.status);
+    if (error instanceof LiveAdmissionError) return apiError(error.message, error.code, error.status, privateNoStoreHeaders());
     const failure = toLiveFailure(error);
     if (failure.body.code === "SECURITY_NOT_CONFIGURED") {
-      return apiError(failure.body.error, failure.body.code, failure.status);
+      return apiError(failure.body.error, failure.body.code, failure.status, privateNoStoreHeaders());
     }
-    return apiError("세션 상태를 확인할 수 없습니다.", "STATUS_READ_FAILED", 500);
+    return apiError("세션 상태를 확인할 수 없습니다.", "STATUS_READ_FAILED", 500, privateNoStoreHeaders());
   }
 }

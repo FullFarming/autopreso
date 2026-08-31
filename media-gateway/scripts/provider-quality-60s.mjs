@@ -1,151 +1,186 @@
-import { readFile } from "node:fs/promises";
-
-import { v1 as speechV1 } from "@google-cloud/speech";
-import { v1 as textToSpeechV1 } from "@google-cloud/text-to-speech";
-import { v3 as translateV3 } from "@google-cloud/translate";
+import { pathToFileURL } from "node:url";
 
 import {
-  ChirpTextToSpeechAdapter,
-  CloudSpeechToTextAdapter,
-  CloudTranslationAdvancedAdapter,
-} from "../src/google-provider-adapters.js";
+  createCommittedCaptionFinalizer,
+  createGeminiCaptionConfig,
+  geminiCaptionConfigFingerprint,
+  GEMINI_WORKLOAD_MODEL_MATRIX,
+} from "../../packages/caption-core/index.js";
+import { LiveMediaPipeline } from "../src/live-media-pipeline.js";
 
-const MAX_AUDIO_MILLISECONDS = 60_000;
-const FRAME_BYTES = 1_280;
+const SIMULATED_AUDIO_MILLISECONDS = 60_000;
+const UTTERANCE_MILLISECONDS = 500;
+const QUALITY_GLOSSARY = [
+  "[Rules]",
+  "Keep registered names exact in both directions.",
+  "[Companies]",
+  "Cushman & Wakefield = 쿠시먼앤드웨이크필드",
+  "NOEL = 노엘",
+].join("\n");
+const QUALITY_CASES = Object.freeze([
+  Object.freeze({
+    sourceLanguage: "en",
+    targetLanguage: "ko",
+    sourceText: "Cushman & Wakefield uses NOEL.",
+    translatedText: "쿠시먼앤드웨이크필드는 노엘을 사용합니다.",
+    requiredTerms: Object.freeze(["쿠시먼앤드웨이크필드", "노엘"]),
+  }),
+  Object.freeze({
+    sourceLanguage: "ko",
+    targetLanguage: "en",
+    sourceText: "쿠시먼앤드웨이크필드는 노엘을 사용합니다.",
+    translatedText: "Cushman & Wakefield uses NOEL.",
+    requiredTerms: Object.freeze(["Cushman & Wakefield", "NOEL"]),
+  }),
+]);
 
-assertDevelopmentGate(process.env);
-const pcmPath = String(process.env.QUALITY_PCM16_PATH ?? "").trim();
-if (!pcmPath) throw new Error("QUALITY_PCM16_PATH_REQUIRED");
-const pcm = new Uint8Array(await readFile(pcmPath));
-if (pcm.byteLength === 0 || pcm.byteLength % 2 !== 0) throw new Error("QUALITY_PCM16_INVALID");
-const audioMilliseconds = pcm.byteLength / (16_000 * 2) * 1_000;
-if (audioMilliseconds > MAX_AUDIO_MILLISECONDS) throw new Error("QUALITY_PCM16_EXCEEDS_60S");
-
-const projectId = process.env.GOOGLE_CLOUD_PROJECT;
-const sourceLanguage = String(process.env.QUALITY_SOURCE_LANGUAGE ?? "ko-KR");
-const targetLanguage = String(process.env.QUALITY_TARGET_LANGUAGE ?? "en");
-const diarization = String(process.env.QUALITY_DIARIZATION ?? "true") !== "false";
-const speechClient = new speechV1.SpeechClient();
-const translationClient = new translateV3.TranslationServiceClient();
-const textToSpeechClient = new textToSpeechV1.TextToSpeechClient();
-const speech = new CloudSpeechToTextAdapter({ client: speechClient, projectId, languageCodes: [sourceLanguage], diarization });
-const translation = new CloudTranslationAdvancedAdapter({ client: translationClient, projectId });
-const tts = new ChirpTextToSpeechAdapter({ client: textToSpeechClient });
-const metrics = {
-  audioMilliseconds,
-  diarization,
-  utterances: 0,
-  translated: 0,
-  completedTts: 0,
-  ttsBytes: 0,
-  peakBacklogUtterances: 0,
-  duplicateSourceRanges: 0,
-  continuityDiscardCount: 0,
-  backlogAtInputEnd: 0,
-  firstUtteranceMilliseconds: null,
-  firstTranslationMilliseconds: null,
-  firstTtsAudioMilliseconds: null,
-  inputElapsedMilliseconds: 0,
-  drainMilliseconds: 0,
-  elapsedMilliseconds: 0,
-  code: "OK",
-};
-const sourceRanges = new Set();
-const startedAt = Date.now();
-const providerAbortController = new AbortController();
-const deadline = AbortSignal.any([AbortSignal.timeout(120_000), providerAbortController.signal]);
-
-try {
-  const session = await speech.open({
-    onContinuityDiscard() { metrics.continuityDiscardCount += 1; },
-    async onFinalUtterance(utterance) {
-      const sourceRange = `${utterance.sourceStartOffsetMs}:${utterance.sourceEndOffsetMs}`;
-      if (sourceRanges.has(sourceRange)) metrics.duplicateSourceRanges += 1;
-      else sourceRanges.add(sourceRange);
-      metrics.utterances += 1;
-      metrics.firstUtteranceMilliseconds ??= Date.now() - startedAt;
-      metrics.peakBacklogUtterances = Math.max(metrics.peakBacklogUtterances, metrics.utterances - metrics.completedTts);
-      const translated = await translation.translate({ text: utterance.text, language: targetLanguage, sourceLanguage: utterance.sourceLanguage });
-      metrics.translated += 1;
-      metrics.firstTranslationMilliseconds ??= Date.now() - startedAt;
-      for await (const chunk of tts.synthesizeStream({
-        language: targetLanguage,
-        voiceName: "Achernar",
-        text: translated,
-        sampleRate: 24_000,
-        signal: deadline,
-      })) {
-        metrics.firstTtsAudioMilliseconds ??= Date.now() - startedAt;
-        metrics.ttsBytes += chunk.byteLength;
-      }
-      metrics.completedTts += 1;
+/**
+ * Runs a 60-second-equivalent, no-network caption contract check. Provider
+ * results are injected so CI validates Transcribe Live -> Gemini text
+ * translation -> terminology repair without credentials or quota use.
+ */
+export async function runGeminiCaptionQualityCheck() {
+  const config = createGeminiCaptionConfig({
+    translationLanguages: ["en", "ko"],
+    glossaryPresetId: "quality-fixture",
+    glossaryPresetName: "Gemini quality fixture",
+    glossary: QUALITY_GLOSSARY,
+    translationDomain: "Commercial real estate",
+    tone: "business",
+    captionPolishPolicy: "full",
+  });
+  let polishCalls = 0;
+  const finalizer = createCommittedCaptionFinalizer({
+    config,
+    async polish({ translatedText }) {
+      polishCalls += 1;
+      return translatedText;
     },
   });
-  for (let offset = 0; offset < pcm.byteLength; offset += FRAME_BYTES) {
-    if (deadline.aborted) throw deadline.reason;
-    const frame = pcm.slice(offset, Math.min(offset + FRAME_BYTES, pcm.byteLength));
-    if (frame.byteLength < FRAME_BYTES) {
-      const padded = new Uint8Array(FRAME_BYTES);
-      padded.set(frame);
-      await session.sendAudio(padded);
-      padded.fill(0);
-    } else {
-      await session.sendAudio(frame);
+  const utteranceCount = SIMULATED_AUDIO_MILLISECONDS / UTTERANCE_MILLISECONDS;
+  let finalized = 0;
+  for (let index = 0; index < utteranceCount; index += 1) {
+    const qualityCase = QUALITY_CASES[index % QUALITY_CASES.length];
+    const result = await finalizer.finalize(qualityCase);
+    if (!result || qualityCase.requiredTerms.some((term) => !result.text.includes(term))) {
+      throw new Error("QUALITY_GLOSSARY_PARITY_FAILED");
     }
-    await new Promise((resolve) => setTimeout(resolve, 40));
+    finalized += 1;
   }
-  metrics.inputElapsedMilliseconds = Date.now() - startedAt;
-  metrics.backlogAtInputEnd = metrics.utterances - metrics.completedTts;
-  const drainStartedAt = Date.now();
-  const closePromise = session.close();
-  let drainTimeout;
-  const didDrain = await Promise.race([
-    closePromise.then(() => true),
-    new Promise((resolve) => { drainTimeout = setTimeout(() => resolve(false), 30_000); }),
-  ]).finally(() => clearTimeout(drainTimeout));
-  metrics.drainMilliseconds = Date.now() - drainStartedAt;
-  if (!didDrain) {
-    providerAbortController.abort(new Error("QUALITY_BACKLOG_EXCEEDED"));
-    let abortDrainTimeout;
-    await Promise.race([
-      closePromise,
-      new Promise((resolve) => { abortDrainTimeout = setTimeout(resolve, 5_000); }),
-    ]).finally(() => clearTimeout(abortDrainTimeout));
-    throw new Error("QUALITY_BACKLOG_EXCEEDED");
+
+  const liveMetrics = await runLiveCaptionCheck(config, utteranceCount);
+  const metrics = Object.freeze({
+    code: "OK",
+    provider: config.provider,
+    transcriptionModel: config.models.transcription,
+    textModel: config.models.polish,
+    configFingerprint: geminiCaptionConfigFingerprint(config),
+    simulatedAudioMilliseconds: SIMULATED_AUDIO_MILLISECONDS,
+    utterances: utteranceCount,
+    finalized,
+    polishCalls,
+    bidirectionalDirections: config.directions.length,
+    ...liveMetrics,
+  });
+  if (metrics.provider !== "gemini") throw new Error("QUALITY_NON_GEMINI_PROVIDER");
+  if (metrics.transcriptionModel !== GEMINI_WORKLOAD_MODEL_MATRIX.transcription
+    || metrics.textModel !== GEMINI_WORKLOAD_MODEL_MATRIX.translation) {
+    throw new Error("QUALITY_MODEL_MATRIX_MISMATCH");
   }
-  if (metrics.utterances === 0) metrics.code = "NO_STABLE_UTTERANCE";
-  else if (metrics.duplicateSourceRanges > 0) metrics.code = "QUALITY_DUPLICATE_OUTPUT";
-  else if (metrics.completedTts === 0) metrics.code = "QUALITY_NO_TTS_OUTPUT";
-  else if (!diarization && Number(metrics.firstTtsAudioMilliseconds) >= 5_000) metrics.code = "QUALITY_FIRST_OUTPUT_SLOW";
-  if (metrics.code !== "OK") process.exitCode = 1;
-} catch (error) {
-  metrics.code = normalizeProbeCode(error);
-  if (Number.isInteger(error?.providerStatusCode)) metrics.grpcStatus = error.providerStatusCode;
-  if (typeof error?.providerReason === "string") metrics.reason = error.providerReason;
-  process.exitCode = 1;
-} finally {
-  providerAbortController.abort(new Error("QUALITY_PROBE_COMPLETE"));
-  await Promise.allSettled([
-    speechClient.close(),
-    translationClient.close(),
-    textToSpeechClient.close(),
-  ]);
-  pcm.fill(0);
-  metrics.elapsedMilliseconds = Date.now() - startedAt;
-  process.stdout.write(`${JSON.stringify(metrics)}\n`);
+  if (metrics.finalized !== utteranceCount || metrics.polishCalls !== utteranceCount) {
+    throw new Error("QUALITY_FINALIZER_INCOMPLETE");
+  }
+  if (metrics.committedCaptions !== utteranceCount * config.languages.length
+    || metrics.translatedCaptions !== utteranceCount) {
+    throw new Error("QUALITY_CAPTION_ROUTING_FAILED");
+  }
+  return metrics;
+}
+
+async function runLiveCaptionCheck(config, utteranceCount) {
+  const published = [];
+  let transcriptionSessions = 0;
+  let sourceSequence = 0;
+  const pipeline = new LiveMediaPipeline({
+    sessionId: "gemini-quality-fixture",
+    sessionType: "meeting",
+    languages: config.languages,
+    captionConfig: config,
+    captionConfigFingerprint: geminiCaptionConfigFingerprint(config),
+    dependencies: {
+      speechToText: {
+        async open() {
+          transcriptionSessions += 1;
+          return {
+            async sendAudio() {},
+            async close() {},
+          };
+        },
+      },
+      textTranslate: {
+        async translate({ text, language }) {
+          const qualityCase = QUALITY_CASES.find((entry) => entry.sourceText === text && entry.targetLanguage === language);
+          if (!qualityCase) throw new Error("QUALITY_TRANSLATION_FIXTURE_MISSING");
+          return qualityCase.translatedText;
+        },
+      },
+      captionPolish: { async polish({ translatedText }) { return translatedText; } },
+      publisher: {
+        async markLive() {},
+        async persistAuthoritativeSource() {
+          sourceSequence += 1;
+          return { sourceUtteranceId: `source-${sourceSequence}`, sourceSeq: sourceSequence, idempotent: false };
+        },
+        async publish(_sessionId, _language, event) {
+          published.push(event);
+        },
+      },
+    },
+  });
+  await pipeline.start();
+  try {
+    for (let index = 0; index < utteranceCount; index += 1) {
+      const qualityCase = QUALITY_CASES[index % QUALITY_CASES.length];
+      await pipeline.acceptFinalUtterance({
+        speakerLabel: "Host",
+        text: qualityCase.sourceText,
+        sourceLanguage: qualityCase.sourceLanguage,
+        sourceStartOffsetMs: index * UTTERANCE_MILLISECONDS,
+        sourceEndOffsetMs: (index + 1) * UTTERANCE_MILLISECONDS,
+        sourceEndedAt: new Date(index * UTTERANCE_MILLISECONDS).toISOString(),
+      });
+    }
+  } finally {
+    await pipeline.close();
+  }
+  const committed = published.filter((event) => event.type === "caption" && event.isFinal === true);
+  return {
+    transcriptionSessions,
+    committedCaptions: committed.length,
+    translatedCaptions: committed.filter((event) => event.translationStatus === "translated").length,
+  };
+}
+
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  try {
+    assertDevelopmentGate(process.env);
+    const metrics = await runGeminiCaptionQualityCheck();
+    process.stdout.write(`${JSON.stringify(metrics)}\n`);
+  } catch (error) {
+    const code = normalizeProbeCode(error);
+    process.stdout.write(`${JSON.stringify({ code })}\n`);
+    process.exitCode = 1;
+  }
 }
 
 function assertDevelopmentGate(environment) {
   if (environment.LIVE_EXTERNAL_ENV !== "development") throw new Error("QUALITY_DEVELOPMENT_ONLY");
-  if (!environment.GOOGLE_CLOUD_PROJECT || environment.GOOGLE_CLOUD_PROJECT !== environment.LIVE_ALLOWED_GCP_PROJECT) {
-    throw new Error("QUALITY_PROJECT_NOT_ALLOWED");
-  }
   if (environment.RUN_LIVE_QUALITY_PROBE !== "I_UNDERSTAND_DEVELOPMENT_ONLY") {
     throw new Error("QUALITY_EXPLICIT_GATE_REQUIRED");
   }
 }
 
 function normalizeProbeCode(error) {
-  const message = error instanceof Error ? error.message : "QUALITY_PROVIDER_FAILED";
-  return /^[A-Z][A-Z0-9_]{2,80}$/u.test(message) ? message : "QUALITY_PROVIDER_FAILED";
+  const message = error instanceof Error ? error.message : "QUALITY_CHECK_FAILED";
+  return /^[A-Z][A-Z0-9_]{2,80}$/u.test(message) ? message : "QUALITY_CHECK_FAILED";
 }

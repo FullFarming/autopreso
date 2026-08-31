@@ -4,6 +4,7 @@ import test from "node:test";
 import vm from "node:vm";
 
 import { MESSAGES } from "../public/subtitle-i18n.js";
+import { resolveSelectedOverlayDisplay } from "../src/live-caption-ipc-relay.js";
 
 const mainSource = fs.readFileSync(new URL("../electron/main.js", import.meta.url), "utf8");
 const preloadSource = fs.readFileSync(new URL("../electron/preload.js", import.meta.url), "utf8");
@@ -44,25 +45,47 @@ test("stage is opened only by the direct main-process route", () => {
   assert.doesNotMatch(openStage, /window\.open|frameName/u);
 });
 
-test("stage placement prefers a fullscreen extended display and falls back to primary", () => {
+test("stage placement follows the caption overlay's selected display", () => {
   const resolveStageDisplayPlacement = vm.runInNewContext(
     `${sourceBetween("function resolveStageDisplayPlacement", "function stageWindowPlacement")}; resolveStageDisplayPlacement`,
-    {},
+    { resolveSelectedOverlayDisplay },
   );
   const primary = { id: 1, bounds: { x: 0, y: 0, width: 1512, height: 982 } };
   const extended = { id: 2, bounds: { x: 1512, y: 0, width: 1920, height: 1080 } };
   // Placement objects are created inside the vm context, so compare plain
   // JSON snapshots rather than prototypes.
-  const placement = (displays, primaryId) => JSON.parse(JSON.stringify(resolveStageDisplayPlacement(displays, primaryId)));
+  const placement = (displays, primaryId, preferredId) =>
+    JSON.parse(JSON.stringify(resolveStageDisplayPlacement(displays, primaryId, preferredId)));
 
-  // Extended display present: fullscreen on the extended display.
-  assert.deepEqual(placement([primary, extended], primary.id), { bounds: extended.bounds, fullscreen: true });
+  // The QR stage sits on the SAME monitor as the caption overlay: the
+  // selected overlay display wins, fullscreen while another display remains
+  // for the controller/dashboard.
+  assert.deepEqual(placement([primary, extended], primary.id, String(extended.id)), { bounds: extended.bounds, fullscreen: true });
+  assert.deepEqual(placement([primary, extended], primary.id, String(primary.id)), { bounds: primary.bounds, fullscreen: true });
   // Display order must not matter.
-  assert.deepEqual(placement([extended, primary], primary.id), { bounds: extended.bounds, fullscreen: true });
-  // No extended display: mirror-like large window on the primary display.
-  assert.deepEqual(placement([primary], primary.id), { bounds: primary.bounds, fullscreen: false });
+  assert.deepEqual(placement([extended, primary], primary.id, String(extended.id)), { bounds: extended.bounds, fullscreen: true });
+  // No explicit selection: reserve the primary display for the controller and
+  // put captions/stage on the first connected non-primary display.
+  assert.deepEqual(placement([primary, extended], primary.id, ""), { bounds: extended.bounds, fullscreen: true });
+  // Selected display unplugged: fall back to the primary display.
+  assert.deepEqual(placement([primary], primary.id, String(extended.id)), { bounds: primary.bounds, fullscreen: false });
+  // Single display: mirror-like large window instead of fullscreen takeover.
+  assert.deepEqual(placement([primary], primary.id, ""), { bounds: primary.bounds, fullscreen: false });
   // Defensive: empty display list yields no placement.
-  assert.equal(resolveStageDisplayPlacement([], primary.id), null);
+  assert.equal(resolveStageDisplayPlacement([], primary.id, ""), null);
+});
+
+test("stage window repositions when the overlay display selection changes", () => {
+  // The select-display IPC moves the caption overlay; the QR stage must move
+  // with it ("자막 위치를 설정할때 같이 움직여야 해").
+  const selectHandler = sourceBetween(
+    'ipcMain.handle("subtitle-overlay:select-display"',
+    'ipcMain.handle("subtitle-overlay:get-enabled"',
+  );
+  assert.match(selectHandler, /repositionStageWindow\(\)/u);
+  // stageWindowPlacement resolves against the persisted overlay selection.
+  const stagePlacementSource = sourceBetween("function stageWindowPlacement", "function applyStagePlacement");
+  assert.match(stagePlacementSource, /preferredOverlayDisplayId/u);
 });
 
 test("direct stage window is positioned and keeps hardened renderer settings", () => {
@@ -111,7 +134,7 @@ test("showing the main window raises it and never reloads, recreates or closes i
   };
   const showDashboardWindow = vm.runInNewContext(
     `${windowReachabilitySource()}; showDashboardWindow`,
-    { dashboardWindow, overlayEnabled: true, isQuitting: false, maintainOverlayWindow: () => {}, overlayWindows: new Map() },
+    { dashboardWindow, isDesktopAuthenticated: true, overlayEnabled: true, isQuitting: false, maintainOverlayWindow: () => {}, overlayWindows: new Map() },
   );
 
   assert.equal(showDashboardWindow(), true);
@@ -143,7 +166,7 @@ test("showing the subtitle overlays re-asserts them without rewriting the persis
   const context = {
     overlayEnabled: true,
     isQuitting: false,
-    overlayWindows: new Map([[1, {}]]),
+    overlayWindows: new Map([["11", { isDestroyed: () => false }]]),
     maintainOverlayWindow: () => calls.push("maintain"),
     dashboardWindow: null,
   };
@@ -178,7 +201,7 @@ test("macOS dock activation brings the main window back without disturbing a liv
     showDashboardWindow: () => { calls.push("show-dashboard"); return true; },
     maintainOverlayWindow: () => calls.push("maintain-overlays"),
   };
-  const activateSource = sourceBetween('app.on("activate"', "// Every exit path");
+  const activateSource = sourceBetween('app.on("activate"', "let hasPreparedDesktopShutdown");
   vm.runInNewContext(activateSource, context);
 
   const activate = handlers.get("activate");
@@ -192,7 +215,7 @@ test("macOS dock activation brings the main window back without disturbing a liv
   activate();
   assert.deepEqual(calls, []);
 
-  // Nothing on this path may reach the before-quit handler that ends the call.
+  // Nothing on this path may reach the before-quit connection cleanup.
   assert.doesNotMatch(activateSource, /quit\(|liveCallSession|stopLiveGatewayBridge|\.destroy\(/u);
 });
 
@@ -217,6 +240,7 @@ function buildApplicationMenu(language) {
     showDashboardWindow: () => { calls.push("show-dashboard"); return true; },
     showControllerWindow: () => { calls.push("show-controller"); return true; },
     showSubtitleOverlays: () => { calls.push("show-overlays"); return true; },
+    meetingCoachRuntime: { openPrep: () => calls.push("show-meeting-prep") },
     app: { quit: () => calls.push("QUIT") },
     // Same lookup the main process uses; the menu is not allowed to hard-code copy.
     translate: (key) => MESSAGES[language][key],
@@ -231,7 +255,7 @@ function buildApplicationMenu(language) {
   return { template, calls };
 }
 
-test("the application menu reaches all three surfaces and ends nothing", () => {
+test("the application menu reaches every surface including Meeting Prep and ends nothing", () => {
   const { template, calls } = buildApplicationMenu("en");
   assert.ok(template, "an application menu must be built");
 
@@ -239,6 +263,7 @@ test("the application menu reaches all three surfaces and ends nothing", () => {
   const byLabel = new Map(items.map((item) => [item.label, item]));
   // One place that can reach every surface, whatever state the others are in.
   assert.equal(byLabel.get("Show Main Window")?.accelerator, "CommandOrControl+Shift+M");
+  assert.equal(byLabel.get("Meeting Prep")?.accelerator, "CommandOrControl+Shift+P");
   assert.equal(byLabel.get("Show Caption Controller")?.accelerator, "CommandOrControl+Shift+C");
   assert.equal(byLabel.get("Show Subtitle Overlays")?.accelerator, "CommandOrControl+Shift+O");
   assert.ok(byLabel.has("Hide Caption Controller"));
@@ -247,7 +272,7 @@ test("the application menu reaches all three surfaces and ends nothing", () => {
 
   calls.length = 0;
   for (const item of byLabel.values()) item.click();
-  assert.deepEqual(calls, ["show-dashboard", "show-controller", "hide-controller", "show-overlays"]);
+  assert.deepEqual(calls, ["show-dashboard", "show-meeting-prep", "show-controller", "hide-controller", "show-overlays"]);
   assert.equal(calls.includes("QUIT"), false, "no menu item may reach the quit path that ends the Live Call");
 });
 
@@ -270,7 +295,7 @@ test("every main-window restore path goes through the shared show helper", () =>
   const secondInstance = sourceBetween('app.on("second-instance"', "// A malformed settings.json");
   assert.match(secondInstance, /showDashboardWindow\(\)/u);
   assert.doesNotMatch(secondInstance, /dashboardWindow\.show\(\)/u);
-  const restore = sourceBetween("function restoreDashboardAfterLiveCall", "async function terminateLiveCallForShutdown");
+  const restore = sourceBetween("function restoreDashboardAfterLiveCall", "async function detachLiveCallForShutdown");
   assert.match(restore, /isQuitting/u);
   assert.match(restore, /showDashboardWindow\(\)/u);
   assert.doesNotMatch(restore, /dashboardWindow\.show\(\)/u);

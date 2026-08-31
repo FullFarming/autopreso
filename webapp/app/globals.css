@@ -2,51 +2,141 @@
 @tailwind components;
 @tailwind utilities;
 
-/* Restrained editorial system. Live caption surfaces remain dark for
-   readability over video; the surrounding product chrome stays flat. */
+@font-face {
+  font-family: "Pretendard";
+  src: url("/fonts/Pretendard-Regular.woff2") format("woff2");
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "Pretendard";
+  src: url("/fonts/Pretendard-Medium.woff2") format("woff2");
+  font-style: normal;
+  font-weight: 500;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "Pretendard";
+  src: url("/fonts/Pretendard-SemiBold.woff2") format("woff2");
+  font-style: normal;
+  font-weight: 600;
+  font-display: swap;
+}
+
+/* Web chrome uses one background, one text color, and one action color.
+   Caption displays and semantic status colors retain their separate roles. */
 
 :root {
-  --brand-indigo: #1D1740;
+  --nova-web-background: #15151A;
+  --nova-web-text: #FFFFFF;
+  --nova-web-action: #0071E3;
+  --nova-surface-recessed: var(--nova-web-background);
+  --nova-surface-base: var(--nova-web-background);
+  --nova-surface-float: var(--nova-web-background);
+  --nova-brand-default: var(--nova-web-action);
+  --nova-brand-fg: var(--nova-web-text);
+  --nova-brand-subtle: color-mix(in srgb, var(--nova-web-action) 16%, transparent);
+  --nova-fg-disabled: color-mix(in srgb, var(--nova-web-text) 38%, transparent);
+  --brand-indigo: var(--nova-web-action);
   --brand-red: #E4002B;
-  --brand-grey: #545859;
-  --brand-grey-25: #D4D5D6;
-  --brand-grey-12: #EAEBEB;
-  --brand-blue: #0093AD;
+  --brand-grey: var(--nova-text-muted);
+  --brand-grey-25: var(--nova-text-muted);
+  --brand-grey-12: var(--nova-hairline);
+  --brand-blue: var(--nova-web-action);
   --brand-dark-red: #8E1000;
-  --brand-white: #FFFFFF;
-  --canvas: #f5f5f7;
-  --canvas-soft: #fafafa;
-  --ink: #0c0a09;
-  --body: #4e4e4e;
-  --muted: #777169;
-  --surface: #ffffff;
-  --surface-strong: #f0efed;
-  --hairline: #e7e5e4;
-  --hairline-strong: #d6d3d1;
-  --primary: #292524;          /* ink pill — primary CTA */
-  --primary-active: #0c0a09;
-  --on-primary: #ffffff;
+  --brand-white: var(--nova-web-text);
+  --canvas: var(--nova-web-background);
+  --canvas-soft: var(--nova-web-background);
+  --ink: var(--nova-web-text);
+  --body: var(--nova-web-text);
+  --muted: var(--nova-text-muted);
+  --surface: var(--nova-web-background);
+  --surface-strong: var(--nova-web-background);
+  --hairline: var(--nova-hairline);
+  --hairline-strong: var(--nova-hairline-strong);
+  --primary: var(--nova-web-action);          /* Shared primary action. */
+  --primary-active: var(--nova-blue-strong);
+  --on-primary: var(--nova-web-text);
   --lg-accent: #ff453a;        /* record affordance (iOS red) — record button only */
   --lg-accent-hover: #ff6961;
-  --dark: #0c0a09;             /* live subtitle surface */
-  --dark-elev: #1c1917;
-  --on-dark: #ffffff;
-  --on-dark-soft: #a8a29e;
-  --font-serif: "Pretendard", "Noto Sans KR", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-  --font-sans: "Pretendard", "Noto Sans KR", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-  color-scheme: light;
+  --dark: var(--nova-web-background);             /* Shared dark surface. */
+  --dark-elev: var(--nova-web-background);
+  --on-dark: var(--nova-web-text);
+  --on-dark-soft: var(--nova-text-muted);
+  --nova-font: "Pretendard", -apple-system, BlinkMacSystemFont, "Apple SD Gothic Neo", "Malgun Gothic", sans-serif;
+  --nova-ui-font-size: 16px;
+  --nova-ui-line-height: 1.5;
+  --nova-ui-font-weight: 400;
+  --nova-ui-letter-spacing: -0.02em;
+  --nova-ui-font: var(--nova-ui-font-weight) var(--nova-ui-font-size)/var(--nova-ui-line-height) var(--nova-font);
+  --font-serif: var(--nova-font);
+  --font-sans: var(--nova-font);
+  color-scheme: dark;
 }
 
 html { -webkit-text-size-adjust: 100%; }
+html:lang(ja) { --nova-font: "Pretendard", "Hiragino Sans", "Yu Gothic", sans-serif; }
+html:lang(zh-Hans) { --nova-font: "Pretendard", "PingFang SC", "Microsoft YaHei", sans-serif; }
+html:lang(zh-Hant) { --nova-font: "Pretendard", "PingFang TC", "Microsoft JhengHei", sans-serif; }
 
 body {
   min-height: 100dvh;
   color: var(--ink);
   background-color: var(--canvas);
   font-family: var(--font-sans);
-  letter-spacing: 0.16px;
   overscroll-behavior-y: none;
   -webkit-font-smoothing: antialiased;
+  font: var(--nova-ui-font);
+  letter-spacing: var(--nova-ui-letter-spacing);
+}
+
+/* Shared semantic alias layer for every dark NOVA surface. Defined ONCE here —
+   this block was previously copy-pasted (and drifting) in four places. Only
+   genuinely divergent tokens stay on the individual shells below. */
+.live-modal-root,
+.live-records-route,
+.live-host-shell,
+.live-host-translation-surface,
+.live-viewer-shell {
+  --nova-surface-base: var(--nova-surface);
+  --nova-surface-layered: var(--nova-surface-raised);
+  --nova-surface-float: var(--nova-surface-raised);
+  --nova-surface-hairline: var(--nova-hairline);
+  --nova-fg-primary: var(--nova-text-body);
+  --nova-fg-secondary: var(--nova-text-muted);
+  --nova-fg-tertiary: var(--nova-text-subtle);
+  --nova-system-default: var(--nova-blue);
+  --nova-status-error: var(--lg-accent);
+  --nova-radius-sm: var(--nova-r-sm);
+}
+.live-modal-root { --nova-radius-md: var(--nova-r-md); --nova-radius-lg: var(--nova-r-md); --nova-radius-pill: var(--nova-r-pill); }
+
+.live-records-route {
+  --nova-fg-disabled: var(--nova-text-muted);
+  --nova-brand-default: var(--nova-blue);
+  --nova-brand-fg: var(--nova-text);
+  --nova-radius-md: var(--nova-r-md);
+  min-height: 100dvh;
+  min-width: 0;
+  overflow-x: clip;
+  background: var(--nova-surface-base);
+}
+.live-records-undo { display: flex; width: min(100% - 32px, 920px); min-width: 0; margin: 16px auto 0; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 16px; border: 1px solid var(--nova-surface-hairline); border-radius: var(--nova-radius-md); background: var(--nova-surface-layered); color: var(--nova-fg-primary); }
+.live-records-undo button { min-height: 44px; flex: 0 0 auto; border: 2px solid transparent; border-radius: var(--nova-radius-sm); background: var(--nova-surface-float); color: var(--nova-fg-primary); padding: 0 16px; font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
+.live-records-undo button:focus-visible { outline: 2px solid var(--nova-system-default); outline-offset: 2px; }
+
+/* 2026-08-31 fix: Browser defaults make small/strong text drift from the
+   ordinary UI row. Display codes and headings retain their explicit styles. */
+:is(.live-host-shell, .live-viewer-shell, .live-modal-root, .live-records-route) {
+  font: var(--nova-ui-font);
+  letter-spacing: var(--nova-ui-letter-spacing);
+}
+:is(.live-host-shell, .live-viewer-shell, .live-modal-root, .live-records-route) :where(small, strong, b) {
+  font: inherit;
+  letter-spacing: inherit;
 }
 
 /* Fixed neutral canvas behind every route. */
@@ -70,12 +160,12 @@ body {
    Only long subtitle/lede sentences are allowed to wrap. */
 .nowrap { white-space: nowrap; }
 
-/* Restrained light surfaces ------------------------------------------------ */
+/* Shared web surfaces ------------------------------------------------------ */
 .glass {
   background: var(--surface);
   border: 1px solid var(--hairline);
   border-radius: 1.5rem;
-  box-shadow: 0 4px 18px rgba(12, 10, 9, 0.05);
+  box-shadow: none;
   color: var(--ink);
 }
 
@@ -83,15 +173,15 @@ body {
   background: var(--surface);
   border: 1px solid var(--hairline-strong);
   border-radius: 1.5rem;
-  box-shadow: 0 8px 28px rgba(12, 10, 9, 0.08);
+  box-shadow: none;
   color: var(--ink);
 }
 
 .glass-pill {
   background: var(--surface);
   border: 1px solid var(--hairline);
-  border-radius: 9999px;
-  box-shadow: 0 2px 10px rgba(12, 10, 9, 0.04);
+  border-radius: var(--nova-r-pill);
+  box-shadow: none;
 }
 
 /* Inputs / selects / textareas. 16px font prevents iOS zoom. */
@@ -102,16 +192,17 @@ body {
   border-radius: 0.875rem;
   color: var(--ink);
   padding: 0.625rem 0.875rem;
-  font-size: 16px;
   outline: none;
   transition: border-color 0.15s ease, box-shadow 0.15s ease;
+  font: var(--nova-ui-font);
+  letter-spacing: var(--nova-ui-letter-spacing);
 }
 
 .glass-input::placeholder { color: var(--muted); }
 
 .glass-input:focus {
-  border-color: var(--ink);
-  box-shadow: 0 0 0 3px rgba(12, 10, 9, 0.08);
+  border-color: var(--nova-web-action);
+  box-shadow: 0 0 0 3px var(--nova-system-subtle);
 }
 
 .glass-input:disabled { opacity: 0.5; cursor: not-allowed; }
@@ -119,35 +210,35 @@ body {
 select.glass-input {
   appearance: none;
   -webkit-appearance: none;
-  background-image: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath d='M1 1l5 5 5-5' stroke='%23777169' stroke-width='2' fill='none' stroke-linecap='round'/%3E%3C/svg%3E");
+  background-image: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath d='M1 1l5 5 5-5' stroke='%23FFFFFF' stroke-width='2' fill='none' stroke-linecap='round'/%3E%3C/svg%3E");
   background-repeat: no-repeat;
   background-position: right 0.875rem center;
   padding-right: 2.25rem;
 }
 
-select.glass-input option { background: #ffffff; color: #0c0a09; }
+select.glass-input option { background: var(--nova-web-background); color: var(--nova-web-text); }
 
 /* Secondary outline button */
 .glass-btn {
   background: transparent;
   border: 1px solid var(--hairline-strong);
-  border-radius: 9999px;
+  border-radius: var(--nova-r-pill);
   color: var(--ink);
   transition: background 0.15s ease, border-color 0.15s ease, transform 0.15s ease;
 }
 
 .glass-btn:hover:not(:disabled) {
-  background: rgba(12, 10, 9, 0.05);
+  background: var(--nova-hover);
   border-color: var(--ink);
 }
 
 .glass-btn:disabled { opacity: 0.4; cursor: not-allowed; }
 
-/* Primary CTA: ink pill (the only strong action color) */
+/* Primary action uses the shared blue and white text. */
 .accent-btn {
   background: var(--primary);
   color: var(--on-primary);
-  border-radius: 9999px;
+  border-radius: var(--nova-r-pill);
   border: 1px solid transparent;
   transition: background 0.15s ease, transform 0.15s ease;
 }
@@ -169,7 +260,7 @@ select.glass-input option { background: #ffffff; color: #0c0a09; }
 
 /* Dark live-subtitle strip (over video / atop the light canvas) */
 .subtitle-surface {
-  background: rgba(12, 10, 9, 0.88);
+  background: color-mix(in srgb, var(--nova-web-background) 88%, transparent);
   -webkit-backdrop-filter: blur(12px);
   backdrop-filter: blur(12px);
   border-radius: 1.125rem;
@@ -235,7 +326,7 @@ select.glass-input option { background: #ffffff; color: #0c0a09; }
   position: absolute;
   width: 7rem;
   height: 7rem;
-  border-radius: 9999px;
+  border-radius: var(--nova-r-pill);
   border: 2px solid var(--lg-accent);
   animation: rnw-ripple 2.4s ease-out infinite;
   pointer-events: none;
@@ -247,7 +338,7 @@ button:focus-visible,
 a:focus-visible,
 select:focus-visible,
 input:focus-visible {
-  outline: 2px solid var(--ink);
+  outline: 2px solid var(--nova-web-action);
   outline-offset: 3px;
 }
 
@@ -268,141 +359,149 @@ input:focus-visible {
 
 .live-host-header > div:first-child { min-width: 0; }
 .live-host-header h1 { margin: 5px 0 7px; font-size: clamp(2.25rem, 5vw, 4rem); }
-.live-host-header p { max-width: 670px; color: var(--body); font-size: 14px; line-height: 1.65; }
-.live-eyebrow { color: var(--muted); font-size: 10px; font-weight: 700; letter-spacing: .14em; text-transform: uppercase; white-space: nowrap; }
+.live-host-header p { max-width: 670px; color: var(--body); font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
+.live-eyebrow { color: var(--muted); text-transform: uppercase; white-space: nowrap; font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
 .live-host-status,
-.live-connection-state { display: inline-flex; align-items: center; gap: 8px; color: var(--body); font-size: 12px; font-weight: 600; white-space: nowrap; }
-.live-status-dot { width: 8px; height: 8px; flex: 0 0 auto; border-radius: 9999px; background: var(--hairline-strong); }
-.live-status-dot.is-live { background: #007C58; box-shadow: 0 0 0 4px rgba(0,124,88,.1); }
+.live-connection-state { display: inline-flex; align-items: center; gap: 8px; color: var(--body); white-space: nowrap; font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
+.live-status-dot { width: 8px; height: 8px; flex: 0 0 auto; border-radius: var(--nova-r-pill); background: var(--hairline-strong); }
+.live-status-dot.is-live { background: var(--nova-status-ok); box-shadow: 0 0 0 4px color-mix(in srgb, var(--nova-status-ok) 10%, transparent); }
 
-.live-error { margin: 12px 0; padding: 11px 14px; border: 1px solid #E3C3BF; border-radius: 12px; background: #F1E2E0; color: #8E1000; font-size: 13px; line-height: 1.45; }
+.live-error { margin: 12px 0; padding: 11px 14px; border: 1px solid var(--nova-status-error); border-radius: var(--nova-r-sm); background: color-mix(in srgb, var(--nova-status-error) 16%, var(--nova-surface-layered)); color: var(--nova-status-error); font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
 .live-host-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; margin-top: 16px; }
 .live-panel { min-width: 0; padding: 22px; }
 .live-wizard { margin-top: 16px; padding: 24px; }
-.live-wizard-progress { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 6px; margin-bottom: 20px; padding: 4px; border: 1px solid var(--hairline); border-radius: 9999px; background: rgba(255,255,255,.45); }
-.live-wizard-progress button { display: inline-flex; min-width: 0; min-height: 38px; align-items: center; justify-content: center; gap: 7px; border: 0; border-radius: 9999px; background: transparent; color: var(--body); font: 600 11px/1 var(--font-sans); }
-.live-wizard-progress button span { display: grid; width: 18px; height: 18px; place-items: center; border: 1px solid var(--hairline-strong); border-radius: 9999px; color: var(--muted); font-size: 9px; }
+.live-wizard-progress { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 6px; margin-bottom: 20px; padding: 4px; border: 1px solid var(--hairline); border-radius: var(--nova-r-pill); background: var(--nova-web-background); }
+.live-wizard-progress button { display: inline-flex; min-width: 0; min-height: 38px; align-items: center; justify-content: center; gap: 7px; border: 0; border-radius: var(--nova-r-pill); background: transparent; color: var(--body); font: 600 11px/1 var(--font-sans); }
+.live-wizard-progress button span { display: grid; width: 18px; height: 18px; place-items: center; border: 1px solid var(--hairline-strong); border-radius: var(--nova-r-pill); color: var(--muted); font-size: 9px; }
 .live-wizard-progress button.is-current { background: var(--primary); color: var(--on-primary); }
 .live-wizard-progress button.is-current span { border-color: var(--on-primary); color: var(--on-primary); }
 .live-wizard-body { display: grid; gap: 16px; min-height: 208px; }
-.live-schedule-grid { display: grid; grid-template-columns: 1.6fr minmax(150px, .7fr) minmax(130px, .55fr); gap: 10px; }
-.live-text-field { display: grid; gap: 7px; color: var(--body); font-size: 11px; font-weight: 600; }
-.live-text-field input { width: 100%; min-height: 46px; border: 1px solid var(--hairline-strong); border-radius: 8px; background: var(--surface); color: var(--ink); padding: 0 13px; font: 500 13px/1 var(--font-sans); }
-.live-text-field input:focus-visible { outline: 2px solid #0093AD; outline-offset: 2px; }
+.live-schedule-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
+.live-text-field { display: grid; min-width: 0; gap: 7px; color: var(--body); font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
+.live-text-field input, .live-text-field select, .live-text-field textarea { width: 100%; min-height: 46px; border: 1px solid var(--hairline-strong); border-radius: 8px; background: var(--surface); color: var(--ink); padding: 0 13px; font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
+.live-text-field textarea { min-height: 96px; padding-block: 12px; resize: vertical; overflow: auto; }
+.live-text-field input:focus-visible, .live-text-field select:focus-visible, .live-text-field textarea:focus-visible { outline: 2px solid var(--nova-system-default); outline-offset: 2px; }
+.live-context-panel { display: grid; gap: 12px; padding: 16px; border: 1px solid var(--hairline); border-radius: 12px; background: color-mix(in srgb, var(--surface) 88%, transparent); }
 .live-wizard-footer,
 .live-wizard-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 18px; }
 .live-wizard-footer button,
-.live-wizard-actions button { min-width: 96px; min-height: 40px; border-radius: 9999px; padding: 0 16px; font: 600 12px/1 var(--font-sans); }
+.live-wizard-actions button { min-width: 96px; min-height: 40px; border-radius: var(--nova-r-pill); padding: 0 16px; font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
 .live-mode-grid-two { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 .live-field-group { display: grid; gap: 9px; min-width: 0; }
 .live-field-group > strong,
 .live-field-label strong,
-.live-field-group label { color: var(--ink); font-size: 12px; font-weight: 600; }
+.live-field-group label { color: var(--ink); font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
 .live-field-group label,
 .live-field-label { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .live-field-group output,
 .live-field-group small,
-.live-field-label small { color: var(--muted); font-size: 10px; }
+.live-field-label small { color: var(--muted); font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
 .live-field-group input[type="range"] { width: 100%; accent-color: var(--ink); }
 .live-audience-settings { grid-template-columns: minmax(0, .55fr) minmax(0, 1.45fr); }
 .live-audience-settings .live-field-group:last-child { grid-column: 1 / -1; }
 .live-glossary-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
-.live-glossary-grid button { min-width: 0; min-height: 66px; padding: 11px; border: 1px solid var(--hairline); border-radius: 12px; background: rgba(255,255,255,.5); color: var(--ink); text-align: left; }
+.live-glossary-grid button { min-width: 0; min-height: 66px; padding: 11px; border: 1px solid var(--hairline); border-radius: 12px; background: var(--nova-web-background); color: var(--ink); text-align: left; }
 .live-glossary-grid button.is-selected { border-color: var(--ink); background: var(--surface); box-shadow: inset 0 -3px 0 var(--ink); }
 .live-glossary-grid button:disabled { cursor: not-allowed; opacity: .48; box-shadow: none; }
 .live-glossary-grid strong,
 .live-glossary-grid span { display: block; }
-.live-glossary-grid strong { font-size: 12px; }
-.live-glossary-grid span { margin-top: 4px; color: var(--muted); font-size: 10px; line-height: 1.35; }
-.live-consent-note { margin: 0; padding: 12px 14px; border: 1px solid var(--hairline); border-radius: 12px; background: rgba(255,255,255,.46); color: var(--body); font-size: 11px; line-height: 1.5; }
-.live-delivery-method-card { display: grid; grid-template-columns: minmax(180px, .7fr) minmax(0, 1.3fr); gap: 16px; align-items: center; padding: 14px; border: 1px solid #D4D5D6; border-radius: 8px; background: #FFFFFF; }
+.live-glossary-grid strong {
+  font: var(--nova-ui-font);
+  letter-spacing: var(--nova-ui-letter-spacing); }
+.live-glossary-grid span { margin-top: 4px; color: var(--muted); font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
+.live-consent-note { margin: 0; padding: 12px 14px; border: 1px solid var(--hairline); border-radius: 12px; background: var(--nova-web-background); color: var(--body); font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
+.live-delivery-method-card { display: grid; grid-template-columns: minmax(180px, .7fr) minmax(0, 1.3fr); gap: 16px; align-items: center; padding: 14px; border: 1px solid var(--nova-hairline); border-radius: 8px; background: var(--nova-web-background); }
 .live-delivery-method-card > div { display: grid; gap: 5px; }
-.live-delivery-method-card span { color: #7F8283; font-size: 10px; font-weight: 700; letter-spacing: .08em; }
-.live-delivery-method-card strong { color: #1D1740; font-size: 13px; }
-.live-delivery-method-card small { color: #545859; font-size: 10px; font-weight: 700; }
-.live-delivery-method-card p { margin: 0; color: #545859; font-size: 11px; line-height: 1.5; }
-.live-viewer-delivery-method { color: var(--body); font-size: 10px; font-weight: 700; white-space: nowrap; }
+.live-delivery-method-card span { color: var(--nova-text-muted); font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
+.live-delivery-method-card strong { color: var(--nova-web-text); font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
+.live-delivery-method-card small { color: var(--nova-text-muted); font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
+.live-delivery-method-card p { margin: 0; color: var(--nova-text-muted); font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
+.live-viewer-delivery-method { color: var(--body); white-space: nowrap; font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
 .live-review-list { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 8px; margin: 0; }
-.live-review-list div { min-width: 0; padding: 12px; border: 1px solid var(--hairline); border-radius: 12px; background: rgba(255,255,255,.48); }
-.live-review-list dt { color: var(--muted); font-size: 10px; }
-.live-review-list dd { margin: 5px 0 0; overflow: hidden; color: var(--ink); font-size: 12px; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
+.live-review-list div { min-width: 0; padding: 12px; border: 1px solid var(--hairline); border-radius: 12px; background: var(--nova-web-background); }
+.live-review-list dt { color: var(--muted); font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
+.live-review-list dd { margin: 5px 0 0; overflow: hidden; color: var(--ink); text-overflow: ellipsis; white-space: nowrap; font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
 .live-session-panel { margin-top: 16px; }
 .live-language-panel,
 .live-session-panel { min-height: 280px; }
 .live-section-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 18px; }
 .live-section-heading > div { display: flex; align-items: baseline; gap: 10px; min-width: 0; }
-.live-section-heading > div > span { color: var(--muted); font: 500 10px/1 var(--font-sans); letter-spacing: .12em; }
-.live-section-heading h2 { margin: 0; color: var(--ink); font: 500 15px/1.2 var(--font-sans); white-space: nowrap; }
-.live-section-heading small { color: var(--muted); font-size: 11px; white-space: nowrap; }
+.live-section-heading > div > span { color: var(--muted); font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
+.live-section-heading h2 { margin: 0; color: var(--ink); font: 600 var(--nova-font-size-t4)/var(--nova-line-height-t4) var(--nova-font); white-space: nowrap; }
+.live-section-heading small { color: var(--muted); white-space: nowrap; font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
 
 .live-mode-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
-.live-mode-card { min-width: 0; min-height: 118px; padding: 14px; text-align: left; border: 1px solid var(--hairline); border-radius: 16px; background: rgba(255,255,255,.55); color: var(--ink); transition: border-color .15s, background .15s, transform .15s; }
+.live-mode-card { min-width: 0; min-height: 118px; padding: 14px; text-align: left; border: 1px solid var(--hairline); border-radius: 16px; background: var(--nova-web-background); color: var(--ink); transition: border-color .15s, background .15s, transform .15s; }
 .live-mode-card:hover { transform: translateY(-1px); border-color: var(--hairline-strong); }
 .live-mode-card.is-selected { border-color: var(--ink); background: var(--surface); box-shadow: inset 0 -3px 0 var(--ink); }
-.live-mode-card strong { display: block; margin-bottom: 9px; font: 500 13px/1 var(--font-sans); white-space: nowrap; }
-.live-mode-card span { display: block; color: var(--body); font-size: 11px; line-height: 1.45; }
+.live-mode-card strong { display: block; margin-bottom: 9px; white-space: nowrap; font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
+.live-mode-card span { display: block; color: var(--body); font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
 
-.live-segmented { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); padding: 4px; border: 1px solid var(--hairline); border-radius: 9999px; background: rgba(255,255,255,.45); }
-.live-segmented button { min-width: 0; min-height: 37px; border: 0; border-radius: 9999px; background: transparent; color: var(--body); font: 500 12px/1 var(--font-sans); white-space: nowrap; }
-.live-segmented button.is-selected { background: var(--primary); color: var(--on-primary); box-shadow: 0 4px 12px rgba(12,10,9,.15); }
-.live-help { margin: 14px 1px 0; color: var(--muted); font-size: 11px; line-height: 1.5; }
+.live-segmented { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); padding: 4px; border: 1px solid var(--hairline); border-radius: var(--nova-r-pill); background: var(--nova-web-background); }
+.live-segmented button { min-width: 0; min-height: 37px; border: 0; border-radius: var(--nova-r-pill); background: transparent; color: var(--body); white-space: nowrap; font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
+.live-segmented button.is-selected { background: var(--primary); color: var(--on-primary); box-shadow: none; }
+.live-help { margin: 14px 1px 0; color: var(--muted); font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
 
 .live-language-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; }
-.live-language-grid button { display: flex; min-width: 0; flex-direction: column; align-items: flex-start; gap: 4px; min-height: 58px; padding: 11px; border: 1px solid var(--hairline); border-radius: 12px; background: rgba(255,255,255,.5); color: var(--ink); text-align: left; }
+.live-language-grid button { display: flex; width: 100%; min-width: 0; flex-direction: column; align-items: flex-start; gap: 4px; min-height: 58px; padding: 11px; border: 1px solid var(--hairline); border-radius: 12px; background: var(--nova-web-background); color: var(--ink); text-align: left; }
 .live-language-grid button.is-selected { border-color: var(--ink); background: var(--surface); }
 .live-language-grid button:disabled { opacity: .35; cursor: not-allowed; }
-.live-language-grid button span { max-width: 100%; overflow: hidden; font-size: 12px; font-weight: 500; text-overflow: ellipsis; white-space: nowrap; }
-.live-language-grid button small { color: var(--muted); font-size: 9px; letter-spacing: .08em; }
+.live-language-grid button span { min-width: 0; max-width: 100%; overflow-x: auto; text-overflow: clip; white-space: nowrap; font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
+.live-language-grid button small { white-space: nowrap; color: var(--muted); font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
 
-.live-primary-action { min-height: 46px; padding: 0 24px; border: 0; font: 600 13px/1 var(--font-sans); }
+.live-primary-action { min-height: 46px; padding: 0 24px; border: 0; font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
 .live-session-facts { display: grid; grid-template-columns: repeat(auto-fit, minmax(108px, 1fr)); gap: 8px; margin: 0; }
-.live-session-facts div { min-width: 0; padding: 12px; border: 1px solid var(--hairline); border-radius: 12px; background: rgba(255,255,255,.48); }
-.live-session-facts dt { color: var(--muted); font-size: 10px; }
-.live-session-facts dd { margin: 5px 0 0; overflow: hidden; color: var(--ink); font-size: 12px; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
+.live-session-facts div { min-width: 0; padding: 12px; border: 1px solid var(--hairline); border-radius: 12px; background: var(--nova-web-background); }
+.live-session-facts dt { color: var(--muted); font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
+.live-session-facts dd { margin: 5px 0 0; overflow: hidden; color: var(--ink); text-overflow: ellipsis; white-space: nowrap; font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
 .live-admission-code { display: grid; justify-items: center; margin-top: 12px; padding: 14px; border-radius: 16px; background: var(--dark); color: var(--on-dark); }
-.live-admission-code span { color: var(--on-dark-soft); font-size: 10px; }
+.live-admission-code span { color: var(--on-dark-soft); font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
 .live-admission-code strong { margin: 4px 0; font: 500 30px/1 var(--font-sans); letter-spacing: .22em; }
-.live-admission-code small { color: var(--on-dark-soft); font-size: 10px; }
+.live-admission-code small { color: var(--on-dark-soft); font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
 .live-invite-actions { display: flex; flex-wrap: wrap; justify-content: center; gap: 8px; margin-top: 12px; }
 .live-invite-actions button,
-.live-invite-actions a { display: inline-flex; min-height: 38px; align-items: center; justify-content: center; padding: 0 14px; border: 1px solid rgba(255,255,255,.22); border-radius: 9999px; background: var(--surface); color: var(--ink); font: 600 11px/1 var(--font-sans); text-decoration: none; white-space: nowrap; }
+.live-invite-actions a { display: inline-flex; min-height: 38px; align-items: center; justify-content: center; padding: 0 14px; border: 1px solid rgba(255,255,255,.22); border-radius: var(--nova-r-pill); background: var(--surface); color: var(--ink); text-decoration: none; white-space: nowrap; font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
 .live-invite-actions button:hover,
 .live-invite-actions a:hover { border-color: var(--surface); }
 .live-invite-share { display: grid; justify-items: center; gap: 10px; margin-top: 12px; }
 .live-invite-qr { display: grid; width: 196px; min-height: 202px; place-items: center; gap: 7px; margin: 0; padding: 10px; border-radius: 12px; background: var(--surface); color: var(--ink); }
 .live-invite-qr img { display: block; width: 176px; height: 176px; border-radius: 4px; }
-.live-invite-qr > span { max-width: 170px; color: var(--body); font-size: 11px; line-height: 1.45; text-align: center; }
-.live-invite-qr figcaption { color: var(--muted); font-size: 9px; }
-.live-invite-feedback { display: block; min-height: 14px; margin-top: 7px; color: var(--muted); font-size: 10px; text-align: center; }
+.live-invite-qr > span { max-width: 170px; color: var(--body); text-align: center; font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
+.live-invite-qr figcaption { color: var(--muted); font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
+.live-invite-feedback { display: block; min-height: 14px; margin-top: 7px; color: var(--muted); text-align: center; font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
 .live-action-row { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; }
-.live-action-row button { min-height: 38px; padding: 0 14px; font: 600 11px/1 var(--font-sans); white-space: nowrap; }
-.live-danger-button { border: 1px solid #C78880; border-radius: 9999px; background: transparent; color: #8E1000; }
+.live-action-row button { min-height: 38px; padding: 0 14px; white-space: nowrap; font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
+.live-danger-button { border: 1px solid var(--nova-status-error); border-radius: var(--nova-r-pill); background: transparent; color: var(--nova-status-error); }
 
 .live-monitor-panel { margin-top: 16px; }
 .live-monitor-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
 .live-language-statuses,
 .live-speaker-legend { display: grid; gap: 7px; }
 .live-language-statuses > div,
-.live-speaker-legend > div { display: flex; min-width: 0; align-items: center; gap: 8px; min-height: 40px; padding: 8px 11px; border: 1px solid var(--hairline); border-radius: 12px; background: rgba(255,255,255,.46); }
+.live-speaker-legend > div { display: flex; min-width: 0; align-items: center; gap: 8px; min-height: 40px; padding: 8px 11px; border: 1px solid var(--hairline); border-radius: 12px; background: var(--nova-web-background); }
 .live-language-statuses strong,
-.live-speaker-legend strong { overflow: hidden; color: var(--ink); font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
+.live-speaker-legend strong { overflow: hidden; color: var(--ink); text-overflow: ellipsis; white-space: nowrap; font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
 .live-language-statuses small,
-.live-speaker-legend small { margin-left: auto; color: var(--muted); font-size: 10px; white-space: nowrap; }
-.live-speaker-legend p { margin: 0; color: var(--muted); font-size: 11px; line-height: 1.5; }
-.live-speaker-dot { display: inline-block; width: 9px; height: 9px; flex: 0 0 auto; border: 2px solid rgba(255,255,255,.8); border-radius: 9999px; background: #0093AD; box-shadow: 0 0 0 1px currentColor; }
-.live-privacy-note { margin: 14px 4px 0; color: var(--muted); font-size: 10px; text-align: center; }
+.live-speaker-legend small { margin-left: auto; color: var(--muted); white-space: nowrap; font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
+.live-speaker-legend p { margin: 0; color: var(--muted); font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
+.live-speaker-dot { display: inline-block; width: 9px; height: 9px; flex: 0 0 auto; border: 2px solid var(--nova-fg-intense); border-radius: var(--nova-r-pill); background: var(--nova-system-default); box-shadow: 0 0 0 1px currentColor; }
+.live-privacy-note { margin: 14px 4px 0; color: var(--muted); text-align: center; font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
 
 /* Host live workspace uses the same focused black canvas as the approved
    guest experience. Configuration stays available without competing with
    the QR and Start Live sequence. */
-.live-host-shell { position: relative; color: #FFFFFF; }
-.live-host-shell::before { position: fixed; inset: 0; z-index: -1; background: #000000; content: ""; }
-.live-host-shell .glass { border-color: rgba(255,255,255,.12); border-radius: 8px; background: #000000; box-shadow: none; color: #FFFFFF; }
+.live-host-shell {
+  --nova-radius-pill: var(--nova-r-pill);
+  position: relative;
+  color: var(--nova-fg-primary);
+}
+.live-host-shell::before { position: fixed; inset: 0; z-index: -1; background: var(--nova-surface-base); content: ""; }
+.live-host-shell .glass { border-color: var(--nova-surface-hairline); border-radius: var(--nova-radius-sm); background: var(--nova-surface-base); box-shadow: none; color: var(--nova-fg-primary); }
 .live-host-shell .display,
 .live-host-shell .live-section-heading h2,
 .live-host-shell .live-field-group > strong,
 .live-host-shell .live-field-label strong,
-.live-host-shell .live-field-group label { color: #FFFFFF; }
+.live-host-shell .live-field-group label { color: var(--nova-fg-primary); }
 .live-host-shell .live-host-header { border-right: 0; border-left: 0; padding: 30px 0 26px; }
 .live-host-shell .live-host-header p,
 .live-host-shell .live-host-status,
@@ -411,20 +510,21 @@ input:focus-visible {
 .live-host-shell .live-field-group small,
 .live-host-shell .live-field-label small,
 .live-host-shell .live-section-heading small,
-.live-host-shell .live-privacy-note { color: rgba(255,255,255,.52); }
+.live-host-shell .live-privacy-note { color: var(--nova-fg-secondary); }
 .live-host-shell .live-wizard,
 .live-host-shell .live-panel,
 .live-host-shell .live-summary-panel { padding: 22px 0; border-right: 0; border-left: 0; }
 .live-host-shell .live-wizard-progress,
-.live-host-shell .live-segmented { border-color: rgba(255,255,255,.14); background: rgba(255,255,255,.05); }
+.live-host-shell .live-segmented { border-color: var(--nova-surface-hairline); background: var(--nova-overlay-100); }
 .live-host-shell .live-wizard-progress button,
-.live-host-shell .live-segmented button { color: rgba(255,255,255,.58); }
+.live-host-shell .live-segmented button { color: var(--nova-fg-secondary); }
 .live-host-shell .live-wizard-progress button.is-current,
-.live-host-shell .live-segmented button.is-selected { background: #FFFFFF; color: #000000; box-shadow: none; }
-.live-host-shell .live-wizard-progress button span { border-color: rgba(255,255,255,.24); color: inherit; }
-.live-host-shell .live-text-field { color: rgba(255,255,255,.62); }
-.live-host-shell .live-text-field input { border-color: rgba(255,255,255,.18); background: #000000; color: #FFFFFF; color-scheme: dark; }
+.live-host-shell .live-segmented button.is-selected { background: var(--nova-web-action); color: var(--nova-web-text); box-shadow: none; }
+.live-host-shell .live-wizard-progress button span { border-color: var(--nova-surface-hairline); color: inherit; }
+.live-host-shell .live-text-field { color: var(--nova-fg-secondary); }
+.live-host-shell .live-text-field input, .live-host-shell .live-text-field select, .live-host-shell .live-text-field textarea { border-color: var(--nova-surface-hairline); background: var(--nova-surface-base); color: var(--nova-fg-primary); color-scheme: dark; }
 .live-host-shell .live-mode-card,
+.live-host-shell .live-setting-row,
 .live-host-shell .live-glossary-grid button,
 .live-host-shell .live-language-grid button,
 .live-host-shell .live-review-list div,
@@ -432,158 +532,376 @@ input:focus-visible {
 .live-host-shell .live-language-statuses > div,
 .live-host-shell .live-speaker-legend > div,
 .live-host-shell .live-delivery-method-card,
-.live-host-shell .live-consent-note { border-color: rgba(255,255,255,.13); border-radius: 8px; background: rgba(255,255,255,.04); color: #FFFFFF; box-shadow: none; }
-.live-host-shell .live-mode-card:hover { border-color: rgba(255,255,255,.32); }
+.live-host-shell .live-consent-note { border-color: var(--nova-surface-hairline); border-radius: var(--nova-radius-sm); background: var(--nova-surface-base); color: var(--nova-fg-primary); box-shadow: none; }
+.live-host-shell .live-mode-card:hover,
+.live-host-shell .live-setting-row:hover { border-color: var(--nova-fg-tertiary); }
 .live-host-shell .live-mode-card.is-selected,
+.live-host-shell .live-setting-row.is-selected,
 .live-host-shell .live-glossary-grid button.is-selected,
-.live-host-shell .live-language-grid button.is-selected { border-color: #FFFFFF; background: rgba(255,255,255,.1); box-shadow: none; }
+.live-host-shell .live-language-grid button.is-selected { border-color: var(--nova-web-action); background: var(--nova-brand-subtle); box-shadow: none; }
 .live-host-shell .live-mode-card span,
+.live-host-shell .live-setting-row small,
 .live-host-shell .live-glossary-grid span,
+.live-host-shell .live-glossary-grid small,
 .live-host-shell .live-delivery-method-card p,
 .live-host-shell .live-consent-note,
-.live-host-shell .live-summary-hint { color: rgba(255,255,255,.58); }
+.live-host-shell .live-summary-hint { color: var(--nova-fg-secondary); }
 .live-host-shell .live-delivery-method-card strong,
 .live-host-shell .live-review-list dd,
 .live-host-shell .live-session-facts dd,
 .live-host-shell .live-language-statuses strong,
-.live-host-shell .live-speaker-legend strong { color: #FFFFFF; }
+.live-host-shell .live-speaker-legend strong { color: var(--nova-fg-primary); }
 .live-host-shell .live-delivery-method-card span,
 .live-host-shell .live-delivery-method-card small,
 .live-host-shell .live-review-list dt,
 .live-host-shell .live-session-facts dt,
 .live-host-shell .live-language-statuses small,
 .live-host-shell .live-speaker-legend small,
-.live-host-shell .live-speaker-legend p { color: rgba(255,255,255,.48); }
-.live-host-shell .live-admission-code { border: 1px solid rgba(255,255,255,.14); border-radius: 8px; background: #000000; }
-.live-host-shell .live-session-panel { display: grid; grid-template-columns: minmax(0, 1fr) minmax(260px, 340px); gap: 16px 24px; align-items: start; }
+.live-host-shell .live-speaker-legend p { color: var(--nova-fg-secondary); }
+.live-host-shell .live-admission-code { border: 1px solid var(--nova-surface-hairline); border-radius: var(--nova-radius-sm); background: var(--nova-surface-base); }
+/* 2026-08-22 PC layout: the invite surface is two explicit columns — packed
+   main column left, QR/access card right — so the tall QR no longer inflates
+   grid rows into an empty void. */
+.live-host-shell .live-session-panel { display: grid; grid-template-columns: minmax(0, 1fr) minmax(300px, 380px); gap: 20px 32px; align-items: start; }
 .live-host-shell .live-session-panel .live-section-heading { grid-column: 1 / -1; margin-bottom: 0; }
-.live-host-shell .live-session-panel .live-admission-code { grid-column: 2; grid-row: 2 / span 3; margin-top: 0; }
-.live-host-shell .live-session-panel .live-invite-feedback { grid-column: 2; }
-.live-host-shell .live-session-panel .live-action-row { grid-column: 1; }
-.live-host-shell .glass-btn { border-color: rgba(255,255,255,.22); background: transparent; color: #FFFFFF; }
-.live-host-shell .accent-btn { background: #FFFFFF; color: #000000; }
-.live-host-shell .live-danger-button { border-color: #C78880; color: #C78880; }
+.live-invite-main { display: grid; min-width: 0; gap: 18px; align-content: start; }
+.live-invite-main .live-session-facts { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+.live-invite-main .live-session-facts dd { white-space: normal; font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
+.live-host-shell .live-session-panel .live-admission-code { grid-column: 2; grid-row: 2; margin-top: 0; align-self: start; }
+.live-host-shell .glass-btn { border-color: var(--nova-surface-hairline); background: transparent; color: var(--nova-fg-primary); }
+.live-host-shell .accent-btn { background: var(--nova-web-action); color: var(--nova-web-text); }
+.live-host-shell .live-danger-button { border-color: var(--nova-status-error); color: var(--nova-status-error); }
 .live-host-shell { display: grid; width: 100%; min-height: 100dvh; grid-template-columns: 220px minmax(0, 1fr); margin: 0; padding: 0; }
-.live-host-rail { position: sticky; top: 0; display: flex; height: 100dvh; flex-direction: column; gap: 42px; padding: 38px 14px; border-right: 1px solid rgba(255,255,255,.16); background: #000; }
-.live-host-rail > strong { padding: 0 14px; color: #fff; font-size: 12px; font-weight: 600; letter-spacing: .22em; text-transform: uppercase; white-space: nowrap; }
+.live-host-rail { position: sticky; top: 0; display: flex; height: 100dvh; flex-direction: column; gap: 42px; padding: 38px 14px; border-right: 1px solid var(--nova-surface-hairline); background: var(--nova-surface-base); }
+.live-host-rail > strong { padding: 0 14px; color: var(--nova-fg-primary); font-size: 12px; font-weight: 600; letter-spacing: .22em; text-transform: uppercase; white-space: nowrap; }
 .live-host-rail nav { display: grid; gap: 10px; }
-.live-host-rail button { min-height: 58px; border: 0; border-radius: 8px; background: transparent; color: rgba(255,255,255,.55); padding: 0 18px; font: 500 15px/1 var(--font-sans); text-align: left; }
-.live-host-rail button.is-current { background: rgba(255,255,255,.1); color: #fff; }
+.live-host-rail button,
+.live-host-rail a { display: flex; min-height: 58px; align-items: center; border: 0; border-radius: var(--nova-radius-sm); background: transparent; color: var(--nova-fg-secondary); padding: 0 18px; text-align: left; text-decoration: none; font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
+.live-host-rail button.is-current { background: var(--nova-web-action); color: var(--nova-web-text); }
 .live-host-rail button:disabled { opacity: 1; }
-.live-host-workspace { width: min(1120px, calc(100% - 64px)); margin: 0 auto; padding: 34px 0 36px; }
+.live-host-rail a:focus-visible { outline: 2px solid var(--nova-system-default); outline-offset: 2px; }
+.live-host-rail .live-host-participant-link { margin-top: auto; padding: 0 14px; }
+.live-host-rail .live-host-participant-link a { padding: 0; font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
+.live-host-rail .live-join-credit { padding: 0 14px; }
+.live-host-workspace { width: min(1240px, calc(100% - 64px)); margin: 0 auto; padding: 34px 0 36px; }
 .live-host-page-heading { display: flex; min-height: 70px; align-items: flex-start; justify-content: space-between; gap: 28px; margin-bottom: 18px; }
-.live-host-page-heading h1 { margin: 0; color: #fff; font-size: clamp(26px, 3vw, 38px); line-height: 1.15; }
-.live-host-page-heading p { margin: 8px 0 0; color: rgba(255,255,255,.5); font-size: 14px; }
+.live-host-page-heading h1 { margin: 0; color: var(--nova-text); font-size: 30px; font-weight: 600; line-height: 40px; letter-spacing: -.02em; word-break: keep-all; overflow-wrap: anywhere; }
+.live-host-page-heading p { margin: 8px 0 0; color: var(--nova-fg-secondary); font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
 .live-host-page-heading .live-host-status { margin-top: 8px; }
-.live-host-shell .live-wizard { display: grid; grid-template-columns: minmax(0, 1fr) minmax(310px, .92fr); gap: 14px 42px; margin: 0; padding: 0; border: 0; }
+.live-host-shell .live-wizard { display: grid; grid-template-columns: minmax(0, 1fr) minmax(320px, 400px); gap: 14px 42px; margin: 0; padding: 0; border: 0; }
 .live-host-shell .live-wizard > .live-section-heading { grid-column: 1; margin: 0; }
 .live-host-shell .live-wizard-progress { display: none; }
 .live-host-shell .live-wizard-body { grid-column: 1; min-height: 0; }
-.live-host-shell .live-wizard-footer { grid-column: 1; padding-top: 18px; border-top: 1px solid rgba(255,255,255,.15); }
-.live-host-shell .live-wizard-footer button { min-height: 50px; border-radius: 8px; }
+.live-host-shell .live-wizard-footer { position: sticky; bottom: 0; z-index: 2; grid-column: 1; padding: 14px 0 0; border-top: 1px solid var(--nova-surface-hairline); background: var(--nova-surface-base); }
+.live-host-shell .live-wizard-footer button { min-width: 0; min-height: 50px; flex: 1 1 0; border-radius: 8px; overflow-x: auto; white-space: nowrap; }
 .live-host-shell .live-wizard-footer .accent-btn { flex: 1; }
 .live-setup-mobile-access { grid-column: 2; grid-row: 1 / span 4; display: flex; min-width: 0; flex-direction: column; gap: 14px; padding-left: 42px; border-left: 1px solid rgba(255,255,255,.18); }
 .live-setup-mobile-access h2 { margin: 0; color: #fff; font-size: 16px; }
-.live-setup-mobile-access > strong { color: rgba(255,255,255,.58); font-size: 14px; font-weight: 500; }
-.live-setup-mobile-access > p { margin: -4px 0 0; color: rgba(255,255,255,.46); font-size: 12px; line-height: 1.5; }
-.live-setup-mobile-access .live-invite-qr { width: min(100%, 340px); min-height: 312px; align-self: stretch; border: 1px solid rgba(255,255,255,.2); background: #000; }
+.live-setup-mobile-access > strong { color: rgba(255,255,255,.58); font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
+.live-setup-mobile-access > p { margin: -4px 0 0; color: rgba(255,255,255,.46); font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
+.live-setup-mobile-access .live-invite-qr { width: min(100%, 340px); min-height: 312px; align-self: stretch; border: 1px solid rgba(255,255,255,.2); background: var(--nova-web-background); }
 .live-setup-mobile-access .live-invite-qr img { width: min(250px, 80%); height: auto; }
-.live-qr-placeholder { display: grid; width: 100%; min-height: 310px; place-items: center; border: 1px solid rgba(255,255,255,.2); border-radius: 8px; background: #000; }
+.live-qr-placeholder { display: grid; width: 100%; min-height: 310px; place-items: center; border: 1px solid rgba(255,255,255,.2); border-radius: 8px; background: var(--nova-web-background); }
 .live-qr-placeholder span { display: grid; width: 82px; height: 82px; place-items: center; border: 1px solid rgba(255,255,255,.16); border-radius: 8px; color: rgba(255,255,255,.22); font: 500 34px/1 var(--font-serif); }
 .live-host-shell .live-schedule-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 .live-host-shell .live-schedule-grid .live-title-field { grid-column: 1 / -1; }
 .live-host-shell .live-mode-card { min-height: 86px; }
+.live-setting-row { display: grid; width: 100%; min-height: 52px; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 12px; padding: 0 14px; border: 1px solid var(--nova-surface-hairline); border-radius: var(--nova-radius-sm); background: var(--nova-surface-base); color: var(--nova-fg-primary); text-align: left; }
+.live-setting-row strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.live-setting-row small { color: var(--nova-fg-secondary); font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
+.live-capability-switch { cursor: pointer; }
+.live-capability-switch > span { display: grid; gap: 2px; }
+.live-capability-switch input { position: relative; width: 50px; height: 30px; margin: 0; appearance: none; border: 0; border-radius: var(--nova-radius-pill); background: var(--nova-surface-hairline); cursor: pointer; transition: background var(--nova-dur-color) ease-in-out, transform var(--nova-dur-press-in) var(--nova-ease-out); }
+.live-capability-switch input::after { position: absolute; top: 7px; left: 7px; width: 16px; height: 16px; border-radius: var(--nova-radius-pill); background: var(--nova-fg-intense, var(--nova-fg-primary)); content: ""; transition: transform 570ms var(--nova-ease-out), width var(--nova-dur-press-out) var(--nova-ease-out), height var(--nova-dur-press-out) var(--nova-ease-out); }
+.live-capability-switch input:checked { background: var(--nova-brand-default); }
+.live-capability-switch input:checked::after { width: 24px; height: 24px; transform: translate(12px, -4px); }
+.live-capability-switch input:active { transform: scale(.96); }
+.live-capability-switch input:focus-visible { outline: 2px solid var(--nova-system-default); outline-offset: 2px; }
+.live-host-preview { grid-column: 2; grid-row: 1 / span 4; display: grid; min-width: 0; align-self: start; place-items: center; padding-left: 42px; border-left: 1px solid var(--nova-surface-hairline); }
+.live-host-preview-card { display: grid; width: min(100%, 340px); gap: 16px; padding: 20px; border: 1px solid var(--nova-surface-hairline); border-radius: var(--nova-radius-md, 12px); background: var(--nova-surface-layered); color: var(--nova-fg-primary); }
+.live-host-preview-card > span { color: var(--nova-fg-secondary); text-transform: uppercase; font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
+.live-host-preview-card h2 { margin: 0; color: var(--nova-fg-primary); font-size: var(--nova-font-size-t4, 20px); line-height: var(--nova-line-height-t4, 29px); }
+.live-host-preview-card dl { display: grid; gap: 0; margin: 0; }
+.live-host-preview-card dl > div { display: flex; min-height: 44px; align-items: center; justify-content: space-between; gap: 16px; border-top: 1px solid var(--nova-surface-hairline); }
+.live-host-preview-card dt { color: var(--nova-fg-secondary); font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
+.live-host-preview-card dd { min-width: 0; margin: 0; overflow: hidden; color: var(--nova-fg-primary); text-align: right; text-overflow: ellipsis; white-space: nowrap; font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
 .live-host-shell .live-field-group { margin-top: 2px; }
 .live-host-shell .live-session-panel { margin-top: 0; }
-.live-access-code { display: grid; justify-items: center; gap: 5px; padding: 12px; border: 1px solid rgba(255,255,255,.17); border-radius: 8px; background: rgba(255,255,255,.04); color: #fff; }
-.live-access-code > span { color: rgba(255,255,255,.5); font-size: 10px; font-weight: 600; letter-spacing: .05em; text-transform: uppercase; }
+/* The event-context panel uses light-theme tokens at its base definition;
+   on the dark host shell it must resolve to NOVA dark tokens. */
+.live-host-shell .live-context-panel { border-color: var(--nova-surface-hairline); background: var(--nova-surface-base); }
+/* Mid-width screens (small laptops, half-snapped windows): collapse the
+   two-column compositions before the form columns get cramped. */
+@media (max-width: 1180px) {
+  .live-host-shell .live-wizard { grid-template-columns: minmax(0, 1fr); }
+  .live-host-shell .live-wizard > .live-section-heading,
+  .live-host-shell .live-wizard-body,
+  .live-host-shell .live-wizard-footer,
+  .live-host-preview,
+  .live-setup-mobile-access { grid-column: 1; grid-row: auto; }
+  .live-host-preview { padding: 20px 0 0; border-top: 1px solid var(--nova-surface-hairline); border-left: 0; }
+  .live-setup-mobile-access { padding: 20px 0 0; border-top: 1px solid rgba(255,255,255,.18); border-left: 0; }
+  .live-host-shell .live-session-panel { grid-template-columns: minmax(0, 1fr); }
+  .live-host-shell .live-session-panel .live-admission-code { grid-column: 1; grid-row: auto; }
+}
+.live-access-code { display: grid; justify-items: center; gap: 5px; padding: 12px; border: 1px solid rgba(255,255,255,.17); border-radius: 8px; background: var(--nova-web-background); color: #fff; }
+.live-access-code > span { color: rgba(255,255,255,.5); text-transform: uppercase; font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
 .live-access-code > strong { color: #fff; font-size: 28px; font-variant-numeric: tabular-nums; letter-spacing: .24em; }
-.live-access-code > small { color: rgba(255,255,255,.45); font-size: 10px; }
+.live-access-code > small { color: rgba(255,255,255,.45); font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
 .live-host-caption-stage,
 .live-participant-panel { margin: 0 0 26px; padding: 22px 0; border-top: 1px solid rgba(255,255,255,.16); border-bottom: 1px solid rgba(255,255,255,.16); }
 .live-host-caption-feed { display: grid; min-height: 230px; max-height: 430px; gap: 0; overflow-y: auto; }
-.live-host-caption-feed > p { margin: auto; color: rgba(255,255,255,.42); font-size: 14px; }
+.live-host-caption-feed > p { margin: auto; color: rgba(255,255,255,.42); font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
 .live-host-caption-feed article { padding: 16px 4px; border-bottom: 1px solid rgba(255,255,255,.1); }
 .live-host-caption-feed article:last-child { border-bottom: 0; }
-.live-host-caption-feed article header { display: flex; align-items: baseline; gap: 8px; color: rgba(255,255,255,.5); font-size: 11px; }
-.live-host-caption-feed article header strong { color: #fff; font-size: 13px; }
+.live-host-caption-feed article header { display: flex; align-items: baseline; gap: 8px; color: rgba(255,255,255,.5); font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
+.live-host-caption-feed article header strong { color: #fff; font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
 .live-host-caption-feed article header time { margin-left: auto; font-variant-numeric: tabular-nums; }
 .live-host-caption-feed article p { margin: 9px 0 0; color: #fff; font-size: clamp(18px, 2.1vw, 26px); line-height: 1.55; }
-.live-participant-table-wrap { overflow-x: auto; }
-.live-participant-table { width: 100%; border-collapse: collapse; color: #fff; font-size: 12px; text-align: left; }
-.live-participant-table th { padding: 10px 12px; border-bottom: 1px solid rgba(255,255,255,.22); color: rgba(255,255,255,.48); font-size: 10px; font-weight: 600; letter-spacing: .04em; text-transform: uppercase; white-space: nowrap; }
-.live-participant-table td { padding: 14px 12px; border-bottom: 1px solid rgba(255,255,255,.1); color: rgba(255,255,255,.72); white-space: nowrap; }
-.live-participant-table td:first-child { color: #fff; font-weight: 600; }
-.live-presence { display: inline-flex; align-items: center; gap: 6px; color: rgba(255,255,255,.46); }
-.live-presence::before { width: 6px; height: 6px; border-radius: 50%; background: rgba(255,255,255,.28); content: ""; }
-.live-presence.is-present { color: #fff; }
-.live-presence.is-present::before { background: #fff; }
+
+/* Host surface state contract */
+.live-host-workspace[data-host-surface] {
+  --live-host-surface: var(--dark);
+  --live-host-border: var(--nova-hairline, var(--hairline-strong));
+  --live-host-focus: var(--nova-blue, var(--brand-blue));
+  background: var(--live-host-surface);
+}
+
+.live-host-workspace [data-host-surface-panel] {
+  min-width: 0;
+  transition: opacity .15s ease;
+}
+
+.live-host-workspace[data-host-surface="ended"] .live-summary-panel {
+  width: min(100%, 760px);
+  margin-inline: auto;
+}
+
+.live-host-shell .live-invite-surface > .live-danger-zone,
+.live-host-shell .live-operation-surface > .live-danger-zone {
+  grid-column: 1 / -1;
+}
+
+.live-host-shell .live-operation-surface {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.live-host-shell .live-operation-surface > * {
+  grid-column: 1;
+}
+
+.live-surface-actions {
+  align-items: center;
+  border-top: 1px solid var(--live-host-border);
+  padding-top: 16px;
+}
+
+.live-surface-actions [data-host-primary] {
+  min-width: 148px;
+  margin-left: auto;
+}
+
+.live-audio-recovery {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  border: 1px solid var(--nova-system-default, var(--live-host-focus));
+  border-radius: var(--nova-radius-sm, 8px);
+  background: var(--nova-system-subtle, var(--surface));
+  color: var(--nova-fg-primary, var(--body));
+  padding: 12px 16px;
+}
+
+.live-audio-recovery > span {
+  min-width: 0;
+  word-break: keep-all;
+  font: var(--nova-ui-font);
+  letter-spacing: var(--nova-ui-letter-spacing);
+}
+
+.live-audio-recovery-action {
+  min-height: 44px;
+  flex: 0 0 auto;
+  transition: color .1s ease-in-out, opacity .1s ease-in-out;
+}
+
+.live-host-workspace [data-host-primary]:focus-visible,
+.live-host-workspace .live-audio-recovery-action:focus-visible {
+  outline: 2px solid var(--live-host-focus);
+  outline-offset: 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .live-host-workspace [data-host-surface-panel] { transition: none; }
+  .live-host-workspace .live-audio-recovery-action { transition: none; }
+}
+/* End host surface state contract */
+
+/* Host translation-first composition */
+.live-host-translation-surface {
+  --nova-fg-intense: var(--nova-text);
+  --nova-brand-default: var(--nova-blue);
+  --nova-brand-subtle: var(--nova-overlay-100);
+  --nova-radius-md: var(--nova-r-row);
+  --nova-radius-lg: var(--nova-r-md);
+  --nova-radius-pill: var(--nova-r-pill);
+  --nova-shadow-tiny: none;
+  --nova-shadow-medium: none;
+  display: grid;
+  min-width: 0;
+  gap: 16px;
+}
+
+.live-host-translation-surface > [aria-label="Host live translation controls"] { flex-wrap: wrap; }
+.live-host-current-status { margin-left: auto; color: var(--nova-fg-secondary); font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
+.live-host-immediate-controls { display: flex; align-items: center; gap: 8px; }
+.live-host-immediate-controls button { min-height: 44px; }
+.live-host-translation-composition { display: grid; min-width: 0; grid-template-columns: minmax(0, 1fr) minmax(280px, 360px); gap: 16px; }
+.live-host-translation-primary { display: flex; min-width: 0; min-height: 60vh; }
+.live-host-translation-primary > [data-translation-state] { min-height: 60vh; flex: 1 1 auto; }
+.live-host-inspector { width: 100%; max-width: 360px; min-width: 0; align-self: start; }
+.live-host-inspector details { border-bottom: 1px solid var(--nova-surface-hairline); }
+.live-host-inspector summary { min-height: 44px; padding: 12px 16px; color: var(--nova-fg-primary); cursor: pointer; }
+.live-host-inspector-body { display: grid; gap: 12px; padding: 0 16px 16px; color: var(--nova-fg-secondary); }
+.live-mic-picker { display: grid; gap: 6px; font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
+.live-mic-picker select { min-height: 44px; border: 1px solid var(--nova-surface-hairline); border-radius: var(--nova-radius-sm); background: var(--nova-surface-base); color: var(--nova-fg-primary); padding: 0 12px; font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
+.live-host-hidden-notice { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 0; border: 1px solid var(--nova-surface-hairline); border-radius: var(--nova-radius-md); background: var(--nova-surface-layered); color: var(--nova-fg-primary); padding: 10px 14px; font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
+.live-host-hidden-notice button { min-height: 32px; border: 1px solid var(--nova-surface-hairline); border-radius: var(--nova-radius-sm); background: transparent; color: var(--nova-fg-primary); padding: 0 12px; cursor: pointer; font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
+.live-host-inspector-body button,
+.live-host-inspector-body a { min-height: 44px; }
+.live-host-end-confirm { min-height: 44px; }
+.live-ai-health-rows { display: grid; gap: 8px; }
+.live-ai-health-row { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; align-items: center; gap: 8px; color: var(--nova-fg-secondary); }
+.live-ai-health-row strong { color: var(--nova-fg-primary); }
+.live-ai-health-row button { min-height: 44px; border: 1px solid var(--nova-surface-hairline); border-radius: var(--nova-radius-sm); background: var(--nova-surface-layered); color: var(--nova-fg-primary); padding-inline: 12px; }
+.live-ai-health-row button:focus-visible { outline: 2px solid var(--nova-system-default); outline-offset: 2px; }
+
+.live-participant-list { display: grid; gap: 8px; margin: 0; padding: 0; list-style: none; }
+.live-participant-row { min-width: 0; padding: 12px 0; border-bottom: 1px solid var(--nova-surface-hairline); }
+.live-participant-row > div { display: flex; min-width: 0; align-items: center; justify-content: space-between; gap: 8px; }
+.live-participant-row strong { min-width: 0; overflow-wrap: anywhere; color: var(--nova-fg-primary); }
+.live-participant-row dl { display: grid; gap: 4px; margin: 8px 0 0; }
+.live-participant-row dl > div { display: grid; grid-template-columns: 96px minmax(0, 1fr); gap: 8px; }
+.live-participant-row dt { color: var(--nova-fg-tertiary); }
+.live-participant-row dd { min-width: 0; margin: 0; overflow-wrap: anywhere; }
+
+.live-setup-advanced { border-top: 1px solid var(--nova-hairline); }
+.live-setup-advanced > summary { min-height: 44px; padding: 12px 0; cursor: pointer; }
+.live-setup-advanced-body { display: grid; gap: 16px; padding-top: 8px; }
+
+.live-host-translation-surface button:focus-visible,
+.live-host-translation-surface a:focus-visible,
+.live-host-translation-surface summary:focus-visible,
+.live-setup-advanced summary:focus-visible {
+  outline: 2px solid var(--nova-system-default, var(--nova-blue));
+  outline-offset: 2px;
+}
+
+@media (max-width: 1199px) {
+  .live-host-translation-composition { grid-template-columns: minmax(0, 1fr); }
+  .live-host-inspector { max-width: none; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .live-host-translation-surface *,
+  .live-setup-advanced * { transition: none; }
+}
+/* End host translation-first composition */
+
+.live-viewer-lane-health { display: flex; align-items: center; justify-content: space-between; gap: 12px; color: var(--nova-fg-primary); }
+.live-viewer-lane-health button,
+.live-topic-navigator a { min-height: 44px; }
+.live-viewer-lane-health button { border: 1px solid var(--nova-surface-hairline); border-radius: var(--nova-radius-sm); background: var(--nova-surface-layered); color: var(--nova-fg-primary); padding-inline: 16px; }
+.live-viewer-lane-health button:focus-visible,
+.live-topic-navigator a:focus-visible { outline: 2px solid var(--nova-system-default); outline-offset: 2px; }
+.live-topic-navigator { display: flex; gap: 8px; overflow-x: auto; padding-block: 2px; }
+.live-topic-navigator a { display: inline-flex; min-width: max-content; align-items: center; color: var(--nova-fg-primary); }
+.live-topic-navigator-select { display: grid; min-width: min(100%, 320px); gap: 4px; color: var(--nova-fg-secondary); }
+.live-topic-navigator-select select { min-height: 44px; border: 1px solid var(--nova-surface-hairline); border-radius: var(--nova-radius-sm); background: var(--nova-surface-layered); color: var(--nova-fg-primary); padding-inline: 12px; }
+.live-topic-navigator-select select:focus-visible { outline: 2px solid var(--nova-system-default); outline-offset: 2px; }
+.live-ai-health-announcement { position: absolute; width: 1px; height: 1px; margin: -1px; overflow: hidden; clip: rect(0 0 0 0); }
 
 /* Viewer stays dark because it is used over rooms, slides and video. */
 .live-viewer-shell { display: flex; min-height: 100dvh; flex-direction: column; gap: 12px; }
-.live-join-card { display: grid; width: min(390px, calc(100% - 40px)); gap: 14px; margin: auto; padding: 0; color: #fff; }
-.live-join-wordmark { margin: 0; color: #fff; font-size: 12px; font-weight: 600; letter-spacing: .22em; text-transform: uppercase; }
-.live-join-methods { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 3px; margin-bottom: 8px; padding: 3px; border: 1px solid rgba(255,255,255,.15); border-radius: 8px; background: rgba(255,255,255,.06); }
-.live-join-methods button { min-height: 38px; border: 0; border-radius: 6px; background: transparent; color: rgba(255,255,255,.55); font: 600 12px/1 var(--font-sans); }
-.live-join-methods button:only-child { grid-column: 1 / -1; }
-.live-join-methods button.is-selected { background: #fff; color: #000; }
+/* Join lobby (2026-08-22): the join screen is the MAIN surface for QR/invite
+   arrivals. PC gets a split lobby — identity panel left, join card right —
+   while mobile keeps one column with the form centred. Name field leads. */
+.live-join-lobby { display: grid; width: 100%; min-height: 100dvh; grid-template-columns: minmax(0, 1fr) minmax(0, 1.2fr); }
+.live-join-context { display: flex; min-width: 0; flex-direction: column; gap: 16px; padding: max(30px, env(safe-area-inset-top)) clamp(24px, 4.5vw, 64px) max(30px, env(safe-area-inset-bottom)); border-right: 1px solid var(--nova-hairline); }
+.live-join-context-body { display: grid; gap: 16px; margin: auto 0; }
+.live-join-context .live-join-brand,
+.live-join-context .live-join-admin,
+.live-join-context .live-join-credit { padding: 0; }
+.live-join-heading { margin: 0; font-size: clamp(2.5rem, 4.5vw, 4.2rem); line-height: 1.06; letter-spacing: -.01em; }
+.live-join-lede { margin: 0; max-width: 36ch; color: var(--nova-text-muted); word-break: keep-all; font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
+.live-join-card { display: grid; width: min(430px, calc(100% - 40px)); gap: 14px; align-self: center; justify-self: center; margin: 0; padding: clamp(24px, 4vh, 44px) 0; color: var(--nova-text); }
+.live-join-card > .live-join-invite-chip { display: flex; align-items: center; gap: 9px; margin: 0 0 8px; border: 1px solid var(--nova-hairline-strong); border-radius: var(--nova-r-pill); background: var(--nova-surface-raised); color: var(--nova-text); padding: 11px 16px; font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
+.live-join-card .live-name-input.live-join-name-hero { height: 66px; font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
+.live-join-wordmark { margin: 0; color: var(--nova-text); font-size: 12px; font-weight: 600; letter-spacing: .22em; text-transform: uppercase; }
 .live-join-card h1 { margin: 6px 0 10px; font-size: clamp(2.3rem, 8vw, 3.4rem); }
-.live-join-card > p { margin: 0 0 24px; color: var(--body); font-size: 13px; line-height: 1.6; }
-.live-join-card label { display: block; margin-bottom: 0; color: rgba(255,255,255,.58); font-size: 12px; font-weight: 600; }
-.live-join-card input { width: 100%; height: 62px; border: 1px solid var(--hairline-strong); border-radius: 16px; background: var(--surface); color: var(--ink); font: 600 28px/1 var(--font-sans); letter-spacing: .24em; text-align: center; }
-.live-join-card .live-name-input { height: 58px; border-color: rgba(255,255,255,.22); border-radius: 8px; background: #000; color: #fff; padding: 0 16px; font-size: 17px; letter-spacing: 0; text-align: left; }
-.live-join-card .live-name-input::placeholder { color: rgba(255,255,255,.34); }
-.live-join-card .live-name-input:focus-visible { outline: 2px solid #0093AD; outline-offset: 2px; }
-.live-join-card .live-code-input { height: 58px; border-color: rgba(255,255,255,.22); border-radius: 8px; background: #000; color: #fff; font-size: 22px; font-variant-numeric: tabular-nums; letter-spacing: .34em; }
-.live-join-card .live-code-input::placeholder { color: rgba(255,255,255,.22); }
-.live-join-card > small { display: block; margin: 8px 2px 20px; color: var(--muted); font-size: 10px; }
-.live-join-card .live-primary-action { width: 100%; min-height: 54px; margin-top: 4px; border: 0; border-radius: 8px; background: #fff; color: #000; font: 700 14px/1 var(--font-sans); }
+.live-join-card > p { margin: 0 0 24px; color: var(--body); font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
+.live-join-card label { display: block; margin-bottom: 0; color: var(--nova-text-muted); font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
+.live-join-card input { width: 100%; height: 62px; border: 1px solid var(--hairline-strong); border-radius: 16px; background: var(--surface); color: var(--ink); text-align: center; font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
+.live-join-card .live-name-input { height: 58px; border-color: var(--nova-hairline-strong); border-radius: var(--nova-r-sm); background: var(--nova-surface); color: var(--nova-text); padding: 0 16px; text-align: left; font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
+.live-join-card .live-name-input::placeholder { color: var(--nova-text-subtle); }
+.live-join-card .live-name-input:focus-visible { outline: 2px solid var(--nova-blue); outline-offset: 2px; }
+.live-join-card .live-code-input { height: 58px; border-color: var(--nova-hairline-strong); border-radius: var(--nova-r-sm); background: var(--nova-surface); color: var(--nova-text); font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); font-variant-numeric: tabular-nums; }
+.live-join-card .live-code-input::placeholder { color: var(--nova-text-subtle); }
+.live-join-card > small { display: block; margin: 8px 2px 20px; color: var(--muted); font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
+.live-join-card .live-primary-action { width: 100%; min-height: 54px; margin-top: 4px; border: 0; border-radius: var(--nova-r-sm); background: var(--nova-text); color: var(--nova-surface); font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
 .live-join-card .live-primary-action:disabled { opacity: .36; }
-.live-viewer-shell.is-join { box-sizing: border-box; display: grid; grid-template-rows: auto 1fr auto; width: 100%; min-height: 100dvh; max-width: none; padding: max(28px, env(safe-area-inset-top)) 0 max(36px, env(safe-area-inset-bottom)); background: var(--dark); color: var(--brand-white); }
+.live-viewer-shell.is-join { box-sizing: border-box; display: block; width: 100%; min-height: 100dvh; max-width: none; padding: 0; background: var(--dark); color: var(--brand-white); }
+@media (max-width: 959px) {
+  /* One column on phones: brand → title → form (centred) → admin → credit. */
+  .live-join-lobby { display: flex; flex-direction: column; padding: max(24px, env(safe-area-inset-top)) 0 max(32px, env(safe-area-inset-bottom)); }
+  .live-join-context { display: contents; }
+  .live-join-context .live-join-brand,
+  .live-join-context .live-join-admin,
+  .live-join-context .live-join-credit { padding: 0 20px; }
+  .live-join-brand { order: 0; }
+  .live-join-context-body { order: 1; display: grid; gap: 10px; margin: 0; padding: 16px 20px 0; }
+  .live-join-heading { font-size: clamp(2.1rem, 8vw, 2.8rem); }
+  .live-join-card { order: 2; margin: auto; align-self: auto; justify-self: auto; }
+  .live-join-admin { order: 3; }
+  .live-join-credit { order: 4; }
+}
 .live-join-brand { padding: 0 20px; }
-.live-join-credit { padding: 0 20px; color: rgba(255, 255, 255, 0.34); font-size: 11px; letter-spacing: .04em; text-align: left; }
+.live-join-credit { padding: 0 20px; color: var(--nova-fg-secondary, var(--on-dark-soft)); text-align: left; font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
+.live-join-admin { margin: 0; padding: 0 20px; color: var(--nova-fg-secondary, var(--on-dark-soft)); font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
+.live-join-admin a { display: inline-flex; min-height: 44px; align-items: center; color: inherit; text-decoration: underline; text-underline-offset: 3px; }
+.live-join-admin a:hover { color: var(--brand-white); }
 .live-viewer-shell.is-join .live-join-card { color: var(--brand-white); }
 .live-viewer-shell.is-join .live-join-card > .live-join-lede,
 .live-viewer-shell.is-join .live-join-card > .live-join-mic-note,
 .live-viewer-shell.is-join .live-join-card label { color: var(--brand-grey-25); }
-.live-viewer-shell.is-join .live-join-methods button { min-height: 44px; }
 .live-viewer-shell.is-join button:focus-visible { outline: 2px solid var(--brand-blue); outline-offset: 2px; }
 .live-qr-required,
-.live-viewer-closed { display: grid; place-items: center; color: rgba(255,255,255,.5); font-size: 13px; }
+.live-viewer-closed { display: grid; place-items: center; color: var(--nova-text-muted); font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
 .live-viewer-toolbar { display: flex; align-items: center; gap: 9px; min-height: 48px; padding: 6px 10px 6px 16px; }
-.live-viewer-toolbar > strong { margin-right: auto; font-size: 12px; white-space: nowrap; }
-.live-viewer-toolbar label { color: var(--muted); font-size: 10px; }
+.live-viewer-toolbar > strong { margin-right: auto; white-space: nowrap; font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
+.live-viewer-toolbar label { color: var(--muted); font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
 .live-viewer-toolbar select,
-.live-viewer-toolbar button { min-height: 34px; border: 1px solid var(--hairline-strong); border-radius: 9999px; background: var(--surface); color: var(--ink); padding: 0 12px; font: 500 11px/1 var(--font-sans); }
+.live-viewer-toolbar button { min-height: 34px; border: 1px solid var(--hairline-strong); border-radius: var(--nova-r-pill); background: var(--surface); color: var(--ink); padding: 0 12px; font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
 .live-viewer-toolbar button.is-selected { background: var(--primary); color: var(--on-primary); }
-.live-viewer-toolbar .live-leave-button { border-color: #C78880; color: #8E1000; }
-.live-text-size-button { min-width: 38px; padding: 0 9px !important; font-size: 13px !important; }
-.live-viewer-stage { display: flex; min-height: 0; flex: 1; flex-direction: column; padding: 20px; border: 1px solid rgba(255,255,255,.1); border-radius: 24px; background: rgba(12,10,9,.94); box-shadow: 0 18px 60px rgba(12,10,9,.25); color: var(--on-dark); }
+.live-viewer-toolbar .live-leave-button { border-color: var(--nova-status-error); color: var(--nova-status-error); }
+.live-text-size-button { min-width: 38px; padding: 0 9px !important; font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
+.live-viewer-stage { display: flex; min-height: 0; flex: 1; flex-direction: column; padding: 20px; border: 1px solid var(--nova-hairline); border-radius: var(--nova-r-md); background: var(--nova-surface); box-shadow: none; color: var(--nova-text); }
 .live-viewer-stage-header { display: flex; justify-content: space-between; gap: 12px; margin-bottom: 17px; }
-.live-viewer-stage .live-eyebrow { color: var(--on-dark-soft); }
-.live-viewer-stage .live-connection-state { color: var(--on-dark-soft); }
+.live-viewer-stage .live-eyebrow,
+.live-viewer-stage .live-connection-state { color: var(--nova-fg-secondary, var(--on-dark-soft)); }
 .live-caption-stack { display: flex; flex: 1; flex-direction: column; justify-content: flex-start; gap: 9px; min-height: 300px; overflow: hidden; }
-.live-caption-card { padding: 11px 14px; border: 1px solid rgba(255,255,255,.1); border-radius: 12px; background: rgba(255,255,255,.06); opacity: .62; transition: opacity .18s, background .18s, transform .18s; }
-.live-caption-card.is-active { background: rgba(255,255,255,.12); opacity: 1; transform: translateX(3px); }
+.live-caption-card { padding: 11px 14px; border: 1px solid rgba(255,255,255,.1); border-radius: 12px; background: rgba(255,255,255,.06); opacity: .62; transition: opacity var(--nova-dur-color) var(--nova-ease-out), background var(--nova-dur-color) var(--nova-ease-out); }
+.live-caption-card.is-active { background: rgba(255,255,255,.12); opacity: 1; }
 .live-caption-card.is-partial { opacity: .78; }
-.live-caption-speaker { display: flex; align-items: center; gap: 7px; color: var(--on-dark-soft); font-size: 10px; font-weight: 600; }
+.live-caption-speaker { display: flex; align-items: center; gap: 7px; color: var(--on-dark-soft); font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
 .live-speaker-line { height: 1px; min-width: 24px; flex: 1; opacity: .7; }
-.live-viewer-legend .live-speaker-line { width: 18px; min-width: 18px; height: 1px; flex: 0 0 18px; border-radius: 0; }
-.live-caption-state { margin-left: auto; font-weight: 400; }
+.live-caption-state { margin-left: auto; font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
 .live-caption-card p { margin: 5px 0 0; color: var(--on-dark); font-size: clamp(17px, 3vw, 25px); line-height: 1.38; word-break: keep-all; overflow-wrap: anywhere; }
-.live-empty-caption { margin: auto; color: var(--on-dark-soft); font-size: 13px; text-align: center; }
-.live-viewer-legend { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 14px; }
-.live-viewer-legend span { display: inline-flex; align-items: center; gap: 6px; border: 1px solid rgba(255,255,255,.12); border-radius: 9999px; padding: 6px 9px; color: var(--on-dark-soft); font-size: 10px; }
-.live-viewer-legend i { width: 7px; height: 7px; border-radius: 9999px; background: #0093AD; }
-.live-audio-only-state { display: grid; flex: 1; place-content: center; justify-items: center; text-align: center; }
-.live-audio-only-state strong { margin: 16px 0 7px; font: 300 clamp(28px, 5vw, 48px)/1.1 var(--font-serif); }
-.live-audio-only-state p { max-width: 430px; margin: 0; color: var(--on-dark-soft); font-size: 12px; line-height: 1.55; }
-.live-audio-consent-state { margin: 10px 0 0; color: var(--on-dark-soft); font-size: 10px; text-align: center; }
-.live-audio-bars { display: flex; align-items: center; gap: 5px; height: 38px; }
-.live-audio-bars i { width: 4px; border-radius: 9999px; background: var(--on-dark); animation: live-audio-bar 1.2s ease-in-out infinite alternate; }
-.live-audio-bars i:nth-child(1) { height: 14px; }.live-audio-bars i:nth-child(2) { height: 30px; animation-delay: -.4s; }.live-audio-bars i:nth-child(3) { height: 22px; animation-delay: -.7s; }.live-audio-bars i:nth-child(4) { height: 36px; animation-delay: -.2s; }
+.live-empty-caption { margin: auto; color: var(--on-dark-soft); text-align: center; font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
 @keyframes live-audio-bar { from { transform: scaleY(.45); opacity: .4; } to { transform: scaleY(1); opacity: 1; } }
-.live-viewer-footer { display: flex; justify-content: space-between; color: var(--muted); font-size: 10px; }
+.live-viewer-footer { display: flex; justify-content: space-between; color: var(--muted); font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
 
 /* Earnings-call style meeting feed */
 .live-meeting-feed { position: relative; display: flex; flex: 1; min-height: 0; flex-direction: column; }
@@ -592,106 +910,92 @@ input:focus-visible {
    partials, new paragraphs, Aa text-size reflow) and keep the newest line
    pinned into view. */
 .live-turn-scroll-content { display: flex; flex-direction: column; gap: 14px; }
-/* New paragraphs ease in instead of popping — the moment a new speaker
-   starts, their name · department · title header appears with this motion. */
-.live-turn-card { animation: live-turn-in .28s ease-out; }
 .live-turn-card.is-live header .live-speaking-waves { color: var(--brand-blue); }
-@keyframes live-turn-in { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
 .live-turn-card { border-bottom: 1px solid rgba(255,255,255,.07); padding: 2px 2px 14px; }
-.live-turn-card header { display: flex; align-items: center; gap: 8px; margin-bottom: 7px; color: var(--on-dark-soft); font-size: 11px; font-weight: 600; }
-.live-turn-card header time { margin-left: 2px; color: rgba(255,255,255,.38); font-size: 10px; font-weight: 400; font-variant-numeric: tabular-nums; }
+.live-turn-card header { display: flex; align-items: center; gap: 8px; margin-bottom: 7px; color: var(--on-dark-soft); font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
+.live-turn-card header time { margin-left: 2px; color: rgba(255,255,255,.38); font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); font-variant-numeric: tabular-nums; }
 .live-turn-card p { margin: 0; color: var(--on-dark); font-size: calc(clamp(15px, 2.4vw, 19px) * var(--live-caption-scale, 1)); line-height: 1.6; word-break: keep-all; overflow-wrap: anywhere; }
-.live-speaker-dot { display: inline-block; width: 8px; height: 8px; border-radius: 9999px; flex: none; }
+.live-speaker-dot { display: inline-block; width: 8px; height: 8px; border-radius: var(--nova-r-pill); flex: none; }
 /* Reference-app reading treatment: past sentences dim to gray; only the two
    most recently completed sentences render at full strength. */
-.live-turn-card p .live-turn-text { opacity: .42; transition: opacity .5s ease; }
+.live-turn-card p .live-turn-text { opacity: .42; transition: none; }
 .live-turn-card p .live-turn-text.is-recent { opacity: 1; }
-/* Reduced motion covers the paragraph entry and sentence contrast transition. */
-@media (prefers-reduced-motion: reduce) {
-  .live-turn-card { animation: none; }
-  .live-turn-card p .live-turn-text { transition: none; }
-}
-.live-jump-latest { position: absolute; bottom: 118px; left: 50%; transform: translateX(-50%); z-index: 2; border: 1px solid rgba(255,255,255,.2); border-radius: 9999px; background: rgba(20,18,16,.92); color: var(--on-dark); padding: 8px 16px; font-size: 11px; font-weight: 600; backdrop-filter: blur(8px); }
+.live-jump-latest { position: absolute; bottom: 118px; left: 50%; transform: translateX(-50%); z-index: 2; border: 1px solid rgba(255,255,255,.2); border-radius: var(--nova-r-pill); background: var(--nova-web-background); color: var(--on-dark); padding: 8px 16px; backdrop-filter: blur(8px); font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
 .live-now-sheet { position: relative; margin-top: 10px; border: 1px solid rgba(255,255,255,.12); border-radius: 18px; background: rgba(255,255,255,.07); padding: 18px 16px 14px; backdrop-filter: blur(14px); }
 /* Grab handle: tap to collapse the sheet to a slim speaker strip (broadcast
  * waiting-room pattern) so history can be read while the call continues. */
 .live-now-handle { position: absolute; top: -12px; left: 50%; transform: translateX(-50%); display: grid; place-items: center; width: 72px; height: 44px; border: 0; background: transparent; cursor: pointer; }
-.live-now-handle i { width: 36px; height: 4px; border-radius: 9999px; background: rgba(255,255,255,.28); transition: background .15s; }
+.live-now-handle i { width: 36px; height: 4px; border-radius: var(--nova-r-pill); background: rgba(255,255,255,.28); transition: background .15s; }
 .live-now-handle:hover i, .live-now-handle:focus-visible i { background: rgba(255,255,255,.55); }
 .live-now-sheet.is-collapsed { padding-bottom: 10px; }
-.live-now-speaker { display: flex; align-items: center; gap: 8px; color: var(--on-dark-soft); font-size: 11px; }
-.live-now-speaker strong { color: var(--on-dark); font-size: 12px; }
+.live-now-speaker { display: flex; align-items: center; gap: 8px; color: var(--on-dark-soft); font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
+.live-now-speaker strong { color: var(--on-dark); font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
 .live-now-text { margin: 8px 0 0; color: var(--on-dark); font-size: clamp(17px, 3.4vw, 24px); line-height: 1.45; word-break: keep-all; overflow-wrap: anywhere; }
 
-/* Speaking-floor bar */
-/* Copy-free floor control: the bar is one full-width press target. While
-   speaking only the button animates (recording pulse + live waveform); the
-   caption feed behind stays untouched. */
-.live-speak-bar { display: flex; min-height: 64px; align-items: center; justify-content: center; border: 1px solid var(--hairline-strong); border-radius: 9999px; background: var(--surface); padding: 6px; }
-.live-speak-bar .live-speak-button { width: 100%; }
-.live-speak-button.is-speaking { animation: live-speak-recording 1.6s ease-in-out infinite; }
-@keyframes live-speak-recording {
-  0%, 100% { box-shadow: 0 0 0 0 rgba(214, 45, 48, .45); }
-  50% { box-shadow: 0 0 0 8px rgba(214, 45, 48, 0); }
-}
-.live-floor-indicator { display: inline-flex; align-items: center; gap: 8px; color: var(--ink); font-size: 12px; font-weight: 600; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.live-floor-indicator.is-idle { color: var(--muted); font-weight: 400; }
-.live-speak-button { display: grid; width: 56px; min-width: 44px; min-height: 44px; height: 52px; flex: none; place-items: center; border: none; border-radius: 9999px; background: var(--brand-white); color: var(--brand-indigo); padding: 0; cursor: pointer; transition: background .18s, color .18s, transform .12s, width .18s; }
-.live-speak-button:active { transform: scale(.97); }
-.live-speak-button:disabled { opacity: .55; cursor: default; }
-.live-speak-button:focus-visible { outline: 2px solid var(--brand-blue); outline-offset: 2px; }
-.live-speak-button.is-starting { color: var(--brand-blue); }
-.live-speak-button.is-speaking { background: var(--brand-red); color: var(--brand-white); }
-.live-speak-microphone { width: 24px; height: 24px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
-.live-speak-connecting { display: inline-flex; align-items: center; gap: 3px; height: 18px; }
-.live-speak-connecting i { width: 4px; height: 4px; border-radius: 9999px; background: currentColor; animation: live-connect-dot .8s ease-in-out infinite alternate; }
-.live-speak-connecting i:nth-child(2) { animation-delay: -.25s; }
-.live-speak-connecting i:nth-child(3) { animation-delay: -.5s; }
-@keyframes live-connect-dot { from { opacity: .28; transform: translateY(2px); } to { opacity: 1; transform: translateY(-2px); } }
 .live-speaking-waves { display: inline-flex; align-items: flex-end; gap: 3px; height: 14px; }
 .live-speaking-waves { color: var(--brand-blue); }
-.live-speaking-waves i { width: 3px; border-radius: 9999px; background: currentColor; animation: live-audio-bar 1s ease-in-out infinite alternate; }
+.live-speaking-waves i { width: 3px; border-radius: var(--nova-r-pill); background: currentColor; animation: live-audio-bar 1s ease-in-out infinite alternate; }
 .live-speaking-waves i:nth-child(1) { height: 7px; }
 .live-speaking-waves i:nth-child(2) { height: 13px; animation-delay: -.35s; }
 .live-speaking-waves i:nth-child(3) { height: 9px; animation-delay: -.6s; }
 
 /* Meeting minutes (회의록) — shown when the host ends the session */
-.live-minutes { display: flex; flex: 1; min-height: 0; flex-direction: column; gap: 16px; overflow-y: auto; padding: 22px 18px calc(24px + env(safe-area-inset-bottom)); border: 1px solid rgba(255,255,255,.1); border-radius: 24px; background: #0c0a09; color: #fff; }
-.live-minutes-header { display: grid; justify-items: center; gap: 4px; padding: 10px 0 4px; text-align: center; }
-.live-minutes-ended-dot { width: 8px; height: 8px; border-radius: 9999px; background: #8E8E93; }
-.live-minutes-header strong { font-size: 16px; }
-.live-minutes-header p { margin: 0; color: rgba(255,255,255,.55); font-size: 12px; }
-.live-minutes .live-summary-card { border-color: rgba(255,255,255,.12); background: rgba(255,255,255,.05); color: #fff; }
+.live-minutes { display: flex; flex: 1; min-height: 0; flex-direction: column; gap: 16px; overflow: hidden; padding: 16px 18px calc(24px + env(safe-area-inset-bottom)); border: 1px solid var(--nova-surface-hairline, var(--nova-overlay-200)); border-radius: var(--nova-r-md); background: var(--nova-surface-base, var(--dark)); color: var(--nova-fg-primary, var(--brand-white)); }
+.live-minutes-tabs { display: grid; flex: none; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 4px; border-radius: var(--nova-r-pill); background: var(--nova-overlay-100); padding: 4px; }
+.live-minutes-tabs button { min-height: 44px; border: 0; border-radius: var(--nova-r-pill); background: transparent; color: var(--nova-text-muted); cursor: pointer; font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
+.live-minutes-tabs button.is-selected { background: var(--nova-surface-raised); color: var(--nova-text); }
+.live-minutes-tabs button:focus-visible { outline: 2px solid var(--nova-blue); outline-offset: 2px; }
+.live-minutes-panel { min-height: 0; overflow-y: auto; scrollbar-color: var(--nova-hairline-strong) var(--dark); scrollbar-width: thin; }
+.live-minutes-panel::-webkit-scrollbar { width: 6px; }
+.live-minutes-panel::-webkit-scrollbar-track { background: var(--dark); }
+.live-minutes-panel::-webkit-scrollbar-thumb { border-radius: var(--nova-r-pill); background: var(--nova-hairline-strong); }
+.live-minutes-empty { margin: 0; color: var(--nova-text-muted); font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
+.live-minutes .live-summary-card { border-color: var(--nova-surface-hairline); background: var(--nova-surface-layered); color: var(--nova-fg-primary); }
 .live-minutes .live-summary-card header time,
-.live-minutes .live-summary-section h3 { color: rgba(255,255,255,.5); }
+.live-minutes .live-summary-section h3 { color: var(--nova-fg-secondary); }
 .live-minutes .live-summary-section ol li p,
 .live-minutes .live-summary-speakers li span,
-.live-minutes .live-summary-overview { color: rgba(255,255,255,.82); }
-.live-minutes-pending { display: grid; gap: 10px; justify-items: start; border: 1px solid rgba(255,255,255,.12); border-radius: 18px; background: rgba(255,255,255,.05); padding: 16px; }
-.live-minutes-pending p { margin: 0; color: rgba(255,255,255,.6); font-size: 12px; line-height: 1.6; }
-.live-minutes-pending button { min-height: 38px; border: 1px solid rgba(255,255,255,.25); border-radius: 9999px; background: transparent; color: #fff; padding: 0 16px; font: 600 12px/1 var(--font-sans); }
+.live-minutes .live-summary-overview { color: var(--nova-fg-primary); }
+.live-minutes-pending,
+.live-recap-state { display: grid; gap: 10px; justify-items: start; border: 1px solid var(--nova-surface-hairline); border-radius: var(--nova-r-md); background: var(--nova-surface-layered); padding: 16px; }
+.live-minutes-pending p,
+.live-recap-state p { margin: 0; color: var(--nova-fg-secondary); font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
+.live-minutes-pending button,
+.live-recap-state button { min-height: 44px; border: 1px solid var(--nova-hairline-strong); border-radius: var(--nova-r-pill); background: transparent; color: var(--nova-text); padding: 0 16px; font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
+.live-recap-state button:focus-visible,
+.live-summary-actions button:focus-visible { outline: 2px solid var(--nova-system-default); outline-offset: 2px; }
+.live-minutes-loading { display: grid; grid-template-columns: auto 1fr; align-items: center; gap: 5px 12px; min-height: 52px; }
+.live-minutes-loading strong { color: var(--nova-text); font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
+.live-minutes-loading-dots { display: inline-flex; grid-row: 1 / span 2; width: 44px; height: 44px; align-items: center; justify-content: center; gap: 4px; }
+.live-minutes-loading-dots i { width: 5px; height: 5px; border-radius: var(--nova-r-pill); background: var(--nova-text); animation: live-minutes-dot 900ms ease-in-out infinite alternate; }
+.live-minutes-loading-dots i:nth-child(2) { animation-delay: 150ms; }
+.live-minutes-loading-dots i:nth-child(3) { animation-delay: 300ms; }
+.live-minutes-elapsed { color: var(--nova-text-muted); font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); font-variant-numeric: tabular-nums; }
+@keyframes live-minutes-dot { from { opacity: .3; transform: translateY(2px); } to { opacity: 1; transform: translateY(-2px); } }
 .live-minutes-record { display: grid; gap: 16px; }
-.live-minutes-record h3 { margin: 6px 0 0; color: rgba(255,255,255,.5); font-size: 11px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; }
-.live-minutes-record article { border-bottom: 1px solid rgba(255,255,255,.07); padding-bottom: 14px; }
-.live-minutes-record article header { display: flex; align-items: baseline; gap: 8px; margin-bottom: 6px; color: rgba(255,255,255,.6); font-size: 11px; font-weight: 600; }
-.live-minutes-record article header time { color: rgba(255,255,255,.35); font-size: 10px; font-variant-numeric: tabular-nums; }
-.live-minutes-record article p { margin: 0; color: #fff; font-size: 14.5px; line-height: 1.65; word-break: keep-all; overflow-wrap: anywhere; }
+.live-minutes-record article { border-bottom: 1px solid var(--nova-surface-hairline); padding-bottom: 14px; }
+.live-minutes-record article header { display: flex; align-items: baseline; gap: 8px; margin-bottom: 6px; color: var(--nova-fg-secondary); font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
+.live-minutes-record article header time { color: var(--nova-fg-secondary); font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); font-variant-numeric: tabular-nums; }
+.live-minutes-record article p { margin: 0; color: var(--nova-fg-primary); word-break: keep-all; overflow-wrap: anywhere; font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
+/* End meeting minutes */
 
 /* Meeting summary */
 .live-summary-panel { display: flex; flex-direction: column; gap: 14px; padding: 22px; }
-.live-summary-hint { margin: 0; color: var(--muted); font-size: 12px; line-height: 1.6; }
+.live-summary-hint { margin: 0; color: var(--muted); font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
 .live-summary-actions { display: flex; gap: 8px; }
-.live-summary-actions button { min-height: 40px; border: 1px solid var(--hairline-strong); border-radius: 9999px; background: var(--surface); color: var(--ink); padding: 0 18px; font: 600 12px/1 var(--font-sans); cursor: pointer; }
+.live-summary-actions button { min-height: 44px; border: 1px solid var(--nova-surface-hairline); border-radius: var(--nova-r-pill); background: var(--nova-surface-layered); color: var(--nova-fg-primary); padding: 0 18px; cursor: pointer; font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
 .live-summary-actions .accent-btn { border: none; }
 .live-summary-empty { display: grid; gap: 8px; justify-items: start; padding: 18px; border: 1px solid var(--hairline-strong); border-radius: 18px; background: var(--surface); }
-.live-summary-empty strong { font-size: 14px; }
-.live-summary-empty p { margin: 0; color: var(--muted); font-size: 12px; }
+.live-summary-empty strong {
+  font: var(--nova-ui-font);
+  letter-spacing: var(--nova-ui-letter-spacing); }
+.live-summary-empty p { margin: 0; color: var(--muted); font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
 .live-summary-card { display: flex; flex-direction: column; gap: 14px; padding: 20px; border: 1px solid var(--hairline-strong); border-radius: 18px; background: var(--surface); }
 .live-summary-card header h2 { margin: 4px 0 2px; font-size: 20px; line-height: 1.3; }
-.live-summary-card header time { color: var(--muted); font-size: 10px; }
-.live-summary-overview { margin: 0; font-size: 13px; line-height: 1.7; }
-.live-summary-section h3 { margin: 0 0 8px; color: var(--muted); font-size: 11px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; }
-.live-summary-section ol, .live-summary-section ul { display: grid; gap: 8px; margin: 0; padding-left: 18px; font-size: 12.5px; line-height: 1.6; }
+.live-summary-card header time { color: var(--muted); font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
+.live-summary-overview { margin: 0; font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
+.live-summary-section h3 { margin: 0 0 8px; color: var(--muted); font-size: 11px; font-weight: 600; letter-spacing: .06em; text-transform: uppercase; }
+.live-summary-section ol, .live-summary-section ul { display: grid; gap: 8px; margin: 0; padding-left: 18px; font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
 .live-summary-section ol li strong { display: block; margin-bottom: 2px; }
 .live-summary-section ol li p { margin: 0; color: var(--body); }
 .live-summary-speakers { list-style: none; padding-left: 0 !important; }
@@ -699,42 +1003,38 @@ input:focus-visible {
 .live-summary-speakers li span { color: var(--body); }
 
 /* Per-viewer language quick switch */
-.live-language-switch { display: inline-flex; gap: 3px; border: 1px solid var(--hairline-strong); border-radius: 9999px; background: var(--surface); padding: 3px; }
-.live-language-switch button { min-height: 28px; border: none; border-radius: 9999px; background: transparent; color: var(--muted); padding: 0 12px; font: 600 11px/1 var(--font-sans); cursor: pointer; }
+.live-language-switch { display: inline-flex; gap: 3px; border: 1px solid var(--hairline-strong); border-radius: var(--nova-r-pill); background: var(--surface); padding: 3px; }
+.live-language-switch button { min-height: 28px; border: none; border-radius: var(--nova-r-pill); background: transparent; color: var(--muted); padding: 0 12px; cursor: pointer; font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
 .live-language-switch button.is-selected { background: var(--primary); color: var(--on-primary); }
-.live-pip-body { margin: 0; padding: 8px; background: #0c0a09; }
-.live-pip-body .live-viewer-stage { min-height: calc(100vh - 16px); border-radius: 14px; }
 
-/* Pure-black mobile viewer (어닝콜 영상 레퍼런스): the screen IS the feed.
-   No cards, no borders — white text over #000, gray speaker meta, sticky
-   translucent toolbar, dark live sheet. */
+/* The mobile viewer keeps captions primary with the shared dark canvas,
+   subdued speaker metadata, and a sticky toolbar. */
 .live-viewer-shell.is-compact { position: fixed; inset: 0; display: grid; width: 100%; height: 100dvh; grid-template-rows: auto auto auto minmax(0, 1fr) auto auto; margin: 0; padding: 0; gap: 0; overflow: hidden; background: var(--dark); }
 .live-viewer-shell.is-compact > .live-join-card { max-height: 100dvh; overflow-y: auto; padding: max(24px, env(safe-area-inset-top)) 0 max(24px, env(safe-area-inset-bottom)); scrollbar-width: none; }
 .live-viewer-shell.is-compact .live-meeting-feed,
 .live-viewer-shell.is-compact .live-minutes { min-height: 0; }
 .live-viewer-shell.is-compact .live-viewer-toolbar { position: sticky; top: 0; z-index: 4; display: flex; grid-row: 1; flex-wrap: nowrap; gap: 4px 6px; min-height: calc(44px + env(safe-area-inset-top)); margin: 0; border: none; border-radius: 0; background: var(--dark); box-shadow: none; padding: calc(4px + env(safe-area-inset-top)) 12px 4px; }
-.live-viewer-shell.is-compact .live-viewer-toolbar > strong { grid-column: 1 / 4; grid-row: 1; min-width: 0; margin: 0; overflow: hidden; align-self: center; color: #fff; font-size: 11px; letter-spacing: .12em; text-overflow: ellipsis; text-transform: uppercase; }
+.live-viewer-shell.is-compact .live-viewer-toolbar > strong { grid-column: 1 / 4; grid-row: 1; min-width: 0; margin: 0; overflow: hidden; align-self: center; color: #fff; text-overflow: ellipsis; text-transform: uppercase; font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
 .live-viewer-shell.is-compact .live-viewer-delivery-method { color: rgba(255,255,255,.45); }
-.live-viewer-shell.is-compact .live-viewer-toolbar button { min-height: 44px; min-width: 44px; border-color: rgba(255,255,255,.2); background: transparent; color: #fff; padding: 0 8px; font-size: 10px; white-space: nowrap; }
-.live-viewer-shell.is-compact .live-viewer-toolbar button.is-selected { background: rgba(255,255,255,.16); }
+.live-viewer-shell.is-compact .live-viewer-toolbar button { min-height: 44px; min-width: 44px; border-color: rgba(255,255,255,.2); background: transparent; color: #fff; padding: 0 8px; white-space: nowrap; font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
+.live-viewer-shell.is-compact .live-viewer-toolbar button.is-selected { background: var(--nova-web-action); }
 .live-viewer-shell.is-compact .live-viewer-toolbar .live-leave-button { position: absolute; top: calc(2px + env(safe-area-inset-top)); right: 8px; width: 44px; min-width: 44px; border-color: transparent; color: var(--brand-grey-25); padding: 0; }
+.live-viewer-shell.is-compact .live-viewer-toolbar .live-end-label { position: absolute; top: calc(2px + env(safe-area-inset-top)); right: 60px; }
 .live-viewer-shell.is-compact .live-language-switch { flex: none; border-color: rgba(255,255,255,.16); background: rgba(255,255,255,.07); padding: 2px; }
 .live-viewer-shell.is-compact .live-language-switch button { min-width: 44px; min-height: 44px; color: rgba(255,255,255,.55); padding: 0 8px; }
-.live-viewer-shell.is-compact .live-language-switch button.is-selected { background: #fff; color: #000; }
+.live-viewer-shell.is-compact .live-language-switch button.is-selected { background: var(--nova-web-action); color: var(--nova-web-text); }
 .live-viewer-shell.is-compact .live-viewer-toolbar button:focus-visible,
 .live-viewer-shell.is-compact .live-language-switch button:focus-visible {
   outline: 2px solid var(--nova-blue);
   outline-offset: 2px;
 }
-.live-viewer-shell.is-compact .live-viewer-toolbar > button[aria-label^="Turn translated audio"],
-.live-viewer-shell.is-compact .live-viewer-toolbar > button[aria-label="Translated audio is on"],
 .live-viewer-session-context { grid-row: 2; padding: 8px 18px 7px; background: var(--dark); }
 .live-viewer-session-context h1 { margin: 0; color: #fff; font-size: 20px; line-height: 1.25; }
-.live-viewer-session-context p { margin: 5px 0 0; color: rgba(255,255,255,.48); font-size: 12px; }
+.live-viewer-session-context p { margin: 5px 0 0; color: rgba(255,255,255,.48); font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
 .live-viewer-shell.is-compact .live-viewer-stage { grid-row: 4; min-height: 0; border: none; border-radius: 0; background: var(--dark); box-shadow: none; padding: 6px 18px 0; overflow: hidden; }
 .live-viewer-shell.is-compact .live-viewer-stage-header { margin-bottom: 10px; }
 .live-viewer-shell.is-compact .live-viewer-stage .live-eyebrow,
-.live-viewer-shell.is-compact .live-viewer-stage .live-connection-state { color: rgba(255,255,255,.4); font-size: 10px; }
+.live-viewer-shell.is-compact .live-viewer-stage .live-connection-state { color: var(--nova-fg-secondary, var(--on-dark-soft)); font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
 .live-viewer-shell.is-compact .live-turn-card { border-bottom: none; padding: 0 0 4px; }
 .live-viewer-shell.is-compact .live-turn-card header { color: var(--brand-grey-25); }
 .live-viewer-shell.is-compact .live-turn-card p { font-size: calc(17px * var(--live-caption-scale, 1)); line-height: 1.68; color: #fff; }
@@ -745,40 +1045,34 @@ input:focus-visible {
 .live-viewer-shell .live-caption-card p { font-size: calc(1em * var(--live-caption-scale, 1)); }
 .live-viewer-shell.is-compact .live-turn-scroll { padding-top: 6px; scroll-padding-top: 6px; }
 .live-viewer-shell.is-compact .live-now-sheet { margin: 8px 0 0; border-color: rgba(255,255,255,.1); border-bottom: 0; border-radius: 18px 18px 0 0; background: var(--dark-elev); }
-.live-viewer-shell.is-compact .live-speak-bar { grid-row: 5; margin: 0 12px 6px; border-color: rgba(255,255,255,.14); background: var(--dark-elev); }
-.live-viewer-shell.is-compact .live-floor-indicator { color: #fff; }
-.live-viewer-shell.is-compact .live-floor-indicator.is-idle { color: rgba(255,255,255,.45); }
-.live-viewer-shell.is-compact .live-speak-button { background: var(--brand-white); color: var(--brand-indigo); }
-.live-viewer-shell.is-compact .live-speak-button.is-starting { color: var(--brand-blue); }
-.live-viewer-shell.is-compact .live-speak-button.is-speaking { background: var(--brand-red); color: var(--brand-white); }
-.live-viewer-shell.is-compact .live-viewer-footer { grid-row: 6; min-height: 0; max-height: calc(28px + env(safe-area-inset-bottom)); gap: 10px; overflow: hidden; padding: 5px 16px calc(5px + env(safe-area-inset-bottom)); color: var(--brand-grey-25); white-space: nowrap; }
+.live-viewer-shell.is-compact .live-viewer-footer { grid-row: 6; min-height: 0; max-height: none; gap: 10px; overflow: hidden; padding: 5px 16px calc(5px + env(safe-area-inset-bottom)); color: var(--brand-grey-25); white-space: nowrap; }
 .live-viewer-shell.is-compact .live-viewer-footer span { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .live-viewer-shell.is-compact .live-error { position: absolute; top: calc(88px + env(safe-area-inset-top)); right: 12px; left: 12px; z-index: 8; margin: 0; }
-.live-viewer-shell.is-compact .live-minutes { border: none; border-radius: 0; background: #000; scrollbar-color: var(--nova-hairline-strong) #000; scrollbar-width: thin; }
+.live-viewer-shell.is-compact .live-minutes { border: none; border-radius: 0; background: var(--nova-web-background); scrollbar-color: var(--nova-hairline-strong) var(--nova-web-background); scrollbar-width: thin; }
 .live-viewer-shell.is-compact .live-minutes::-webkit-scrollbar { width: 6px; }
-.live-viewer-shell.is-compact .live-minutes::-webkit-scrollbar-track { background: #000; }
+.live-viewer-shell.is-compact .live-minutes::-webkit-scrollbar-track { background: var(--nova-web-background); }
 .live-viewer-shell.is-compact .live-minutes::-webkit-scrollbar-thumb { border-radius: var(--nova-r-pill); background: var(--nova-hairline-strong); }
 .live-viewer-shell.is-compact .live-jump-latest { bottom: 132px; }
-.live-viewer-shell.is-compact .live-viewer-legend { display: none; }
-.live-viewer-shell.is-compact .live-viewer-delivery-method,
-.live-viewer-shell.is-compact .live-pip-button { display: none; }
-.live-viewer-shell.is-compact .live-viewer-stage:has(.live-now-sheet) + .live-speak-bar { margin: 0 18px 6px; border-top: 0; border-radius: 0 0 18px 18px; background: var(--dark-elev); padding: 6px 16px 10px; }
-.live-viewer-shell.is-compact .live-viewer-stage:has(.live-now-sheet) + .live-speak-bar .live-floor-indicator { display: none; }
-.live-viewer-shell.is-compact .live-viewer-stage:has(.live-now-sheet) + .live-speak-bar .live-speak-button { width: 100%; }
+.live-viewer-shell.is-compact .live-viewer-delivery-method { display: none; }
 
 @media (max-width: 760px) {
   .live-host-shell { display: block; width: 100%; }
-  .live-host-rail { position: static; width: 100%; height: auto; flex-direction: row; align-items: center; justify-content: space-between; gap: 12px; padding: 14px; border-right: 0; border-bottom: 1px solid rgba(255,255,255,.16); }
+  .live-host-rail { position: static; width: 100%; height: auto; flex-direction: row; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; padding: 14px; border-right: 0; border-bottom: 1px solid var(--nova-hairline); }
   .live-host-rail > strong { padding: 0; }
   .live-host-rail nav { display: flex; gap: 4px; }
-  .live-host-rail button { min-height: 34px; padding: 0 10px; font-size: 11px; }
+  .live-host-rail button,
+  .live-host-rail a { min-height: 44px; padding: 0 10px; font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
+  .live-host-rail .live-host-participant-link { flex-basis: 100%; margin: 0; padding: 0; }
+  .live-host-rail .live-join-credit { display: none; }
   .live-host-workspace { width: min(100% - 28px, 640px); padding-top: 24px; }
   .live-host-page-heading { min-height: 56px; }
   .live-host-shell .live-wizard { grid-template-columns: minmax(0, 1fr); }
   .live-host-shell .live-wizard > .live-section-heading,
   .live-host-shell .live-wizard-body,
   .live-host-shell .live-wizard-footer,
+  .live-host-preview,
   .live-setup-mobile-access { grid-column: 1; grid-row: auto; }
+  .live-host-preview { padding: 20px 0 0; border-top: 1px solid var(--nova-surface-hairline); border-left: 0; }
   .live-setup-mobile-access { padding: 20px 0 0; border-top: 1px solid rgba(255,255,255,.16); border-left: 0; }
   .live-host-shell,
   .live-viewer-shell { width: min(100% - 20px, 640px); padding-top: 10px; }
@@ -812,19 +1106,11 @@ input:focus-visible {
   .live-caption-card p { font-size: 18px; }
   .live-turn-scroll { min-height: 46dvh; }
   .live-viewer-shell.is-compact .live-turn-scroll { min-height: 0; }
-  /* The sticky Speak bar floats over the page scroll — reserve its height at
-     the bottom of the record so the newest paragraph is never hidden behind
-     it, at any Aa text size. */
-  .live-turn-scroll { padding-bottom: calc(84px + env(safe-area-inset-bottom)); }
-  .live-speak-bar { position: sticky; bottom: max(10px, env(safe-area-inset-bottom)); z-index: 3; box-shadow: 0 10px 34px rgba(12,10,9,.35); }
-  .live-speak-button { min-height: 52px; padding: 0 26px; font-size: 14px; }
+  .live-turn-scroll { padding-bottom: calc(24px + env(safe-area-inset-bottom)); }
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .live-audio-bars i { animation: none; }
   .live-speaking-waves i { animation: none; }
-  .live-speak-button-waves i,
-  .live-speak-connecting i { animation: none; }
   .live-caption-card { transition: none; }
 }
 @media (prefers-reduced-motion: reduce) {
@@ -839,141 +1125,190 @@ input:focus-visible {
 .live-caption-history.is-scrollable { display: flex; flex-direction: column; gap: 9px; max-height: 100%; overflow-y: auto; overscroll-behavior: contain; scrollbar-width: thin; }
 .live-caption-stack .live-jump-latest { bottom: 96px; }
 
-/* Speaker-change overlay (contract C5): transient identity card above the
-   captions when the floor holder changes. Gray/white on black. */
-.live-speaker-change-overlay { position: fixed; top: max(96px, calc(72px + env(safe-area-inset-top))); left: 50%; transform: translateX(-50%); z-index: 6; display: grid; gap: 2px; justify-items: center; min-width: 200px; max-width: min(86vw, 460px); border: 1px solid rgba(255,255,255,.16); border-radius: 14px; background: rgba(10,10,10,.94); padding: 12px 22px; text-align: center; backdrop-filter: blur(10px); animation: live-overlay-in .22s ease-out; }
-.live-speaker-change-overlay strong { color: #fff; font-size: 17px; line-height: 1.3; }
-.live-speaker-change-overlay span { color: rgba(255,255,255,.55); font-size: 12px; }
-@keyframes live-overlay-in { from { opacity: 0; transform: translate(-50%, -6px); } to { opacity: 1; transform: translate(-50%, 0); } }
-
 /* Viewer waiting screen (session preparing): pure black holding view. */
 .live-waiting-screen { position: relative; display: flex; flex: 1; flex-direction: column; align-items: center; justify-content: center; gap: 10px; min-height: 50dvh; background: #000; border-radius: 18px; padding: 32px 20px; text-align: center; overflow: hidden; isolation: isolate; }
 .live-waiting-cover { position: absolute; inset: 0; z-index: -2; width: 100%; height: 100%; object-fit: cover; }
-.live-waiting-scrim { position: absolute; inset: 0; z-index: -1; background: linear-gradient(180deg, rgba(0,0,0,.66) 0%, rgba(0,0,0,.52) 45%, rgba(0,0,0,.86) 100%); }
+.live-waiting-scrim { position: absolute; inset: 0; z-index: -1; background: rgba(0,0,0,.72); }
 .live-viewer-shell.is-compact .live-waiting-screen { grid-row: 4; min-height: 0; border-radius: 0; }
 .live-waiting-screen h2 { margin: 0; color: #fff; font-size: 22px; line-height: 1.3; }
-.live-waiting-screen .live-waiting-schedule { margin: 0; color: rgba(255,255,255,.48); font-size: 13px; }
-.live-waiting-screen strong { color: rgba(255,255,255,.85); font-size: 14px; letter-spacing: .08em; text-transform: uppercase; }
-.live-waiting-screen p { margin: 0; max-width: 340px; color: rgba(255,255,255,.45); font-size: 13px; line-height: 1.5; }
-.live-waiting-screen .live-leave-button { min-height: 44px; margin-top: 12px; border: 1px solid rgba(255,255,255,.24); border-radius: 9999px; background: transparent; color: rgba(255,255,255,.75); padding: 0 22px; }
-.live-waiting-pulse { width: 14px; height: 14px; border-radius: 9999px; background: #fff; opacity: .8; animation: live-waiting-pulse 1.6s ease-in-out infinite; }
+.live-waiting-screen .live-waiting-schedule { margin: 0; color: rgba(255,255,255,.48); font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
+.live-waiting-screen strong { color: rgba(255,255,255,.85); text-transform: uppercase; font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
+.live-waiting-screen p { margin: 0; max-width: 340px; color: rgba(255,255,255,.45); font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
+.live-waiting-screen .live-leave-button { min-height: 44px; margin-top: 12px; border: 1px solid rgba(255,255,255,.24); border-radius: var(--nova-r-pill); background: transparent; color: rgba(255,255,255,.75); padding: 0 22px; }
+.live-waiting-pulse { width: 14px; height: 14px; border-radius: var(--nova-r-pill); background: #fff; opacity: .8; animation: live-waiting-pulse 1.6s ease-in-out infinite; }
 @keyframes live-waiting-pulse { 0%, 100% { transform: scale(.7); opacity: .35; } 50% { transform: scale(1); opacity: .85; } }
 /* Contract C11: waiting-room countdown wrapped in an indeterminate loading
  * ring (YouTube-live style) — pure CSS, no dependencies. */
 .live-waiting-ring { position: relative; display: grid; place-items: center; width: 168px; height: 168px; }
-.live-loading-ring { position: absolute; inset: 0; border: 3px solid rgba(255,255,255,.14); border-top-color: rgba(255,255,255,.82); border-radius: 9999px; animation: live-loading-ring-spin 1.1s linear infinite; }
+.live-loading-ring { position: absolute; inset: 0; border: 3px solid rgba(255,255,255,.14); border-top-color: rgba(255,255,255,.82); border-radius: var(--nova-r-pill); animation: live-loading-ring-spin 1.1s linear infinite; }
 @keyframes live-loading-ring-spin { to { transform: rotate(360deg); } }
-.live-waiting-countdown { margin: 0; color: #fff; font-size: 30px; font-variant-numeric: tabular-nums; font-weight: 700; letter-spacing: .04em; }
-@media (prefers-reduced-motion: reduce) { .live-waiting-pulse { animation: none; } .live-speaker-change-overlay { animation: none; } .live-loading-ring { animation: none; opacity: .35; } }
+.live-waiting-countdown { margin: 0; color: #fff; font-size: 30px; font-variant-numeric: tabular-nums; font-weight: 600; letter-spacing: .04em; }
+@media (prefers-reduced-motion: reduce) { .live-waiting-pulse { animation: none; } .live-loading-ring { animation: none; opacity: .35; } }
 
 /* Paused banner for viewers (contract C4). */
-.live-paused-banner { display: flex; align-items: center; justify-content: center; gap: 8px; margin: 8px 12px 0; border: 1px solid rgba(255,255,255,.14); border-radius: 12px; background: rgba(255,255,255,.06); color: rgba(255,255,255,.75); padding: 10px 14px; font-size: 12px; }
+.live-paused-banner { display: flex; align-items: center; justify-content: center; gap: 8px; margin: 8px 12px 0; border: 1px solid rgba(255,255,255,.14); border-radius: 12px; background: rgba(255,255,255,.06); color: rgba(255,255,255,.75); padding: 10px 14px; font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
 .live-viewer-shell.is-compact .live-paused-banner { position: absolute; top: calc(84px + env(safe-area-inset-top)); right: 12px; left: 12px; z-index: 5; margin: 0; }
 
 /* Ended screen for new entrants hitting a finished session. */
 .live-session-ended-screen { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 10px; margin: auto; max-width: 380px; padding: 40px 24px; text-align: center; }
-.live-session-ended-screen strong { color: var(--heading, #fff); font-size: 18px; }
-.live-session-ended-screen p { margin: 0; color: var(--muted, rgba(255,255,255,.5)); font-size: 13px; line-height: 1.5; }
-.live-session-ended-screen button { min-height: 44px; border: 1px solid var(--hairline-strong, rgba(255,255,255,.24)); border-radius: 9999px; background: transparent; color: inherit; padding: 0 22px; cursor: pointer; }
+.live-session-ended-screen strong { color: var(--heading, #fff); font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
+.live-session-ended-screen p { margin: 0; color: var(--muted, rgba(255,255,255,.5)); font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
+.live-session-ended-screen button { min-height: 44px; border: 1px solid var(--hairline-strong, rgba(255,255,255,.24)); border-radius: var(--nova-r-pill); background: transparent; color: inherit; padding: 0 22px; cursor: pointer; }
 .live-ended-view { display: flex; min-height: 0; flex-direction: column; overflow: hidden; }
-.live-session-ended-banner { display: flex; align-items: center; gap: 10px; border-bottom: 1px solid rgba(255,255,255,.12); background: var(--dark); color: var(--brand-white); padding: 12px 18px; }
-.live-session-ended-banner > div { display: grid; min-width: 0; gap: 2px; }
-.live-session-ended-banner strong { font-size: 13px; }
-.live-session-ended-banner p { margin: 0; color: var(--brand-grey-25); font-size: 11px; }
+.live-end-label { display: inline-flex; min-height: 44px; align-items: center; color: var(--brand-red); animation: live-end-pulse 2.8s ease-in-out infinite; font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
+@keyframes live-end-pulse { 0%, 100% { opacity: .55; } 50% { opacity: 1; } }
 .live-viewer-shell.is-compact .live-ended-view { grid-row: 4 / 7; }
 
 /* Host: separated destructive area for End session. */
 .live-danger-zone { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; margin-top: 18px; border: 1px solid #C78880; border-radius: 14px; background: rgba(142,16,0,.06); padding: 14px 16px; }
 .live-danger-zone > div { display: grid; gap: 2px; }
-.live-danger-zone strong { color: #8E1000; font-size: 13px; }
+.live-danger-zone strong { color: #8E1000; font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
 .live-host-shell .live-danger-zone strong { color: #E8A79F; }
-.live-danger-zone p { margin: 0; color: var(--muted); font-size: 11px; max-width: 420px; }
-.live-danger-zone button { min-height: 40px; padding: 0 16px; font: 600 11px/1 var(--font-sans); cursor: pointer; }
+.live-danger-zone p { margin: 0; color: var(--muted); max-width: 420px; font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
+.live-danger-zone button { min-height: 40px; padding: 0 16px; cursor: pointer; font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
 .live-danger-confirm { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
-.live-danger-confirm span { color: var(--body); font-size: 12px; font-weight: 600; }
+.live-danger-confirm span { color: var(--body); font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
 
 /* Host: session recovery panel. */
 .live-recovery-list { display: grid; gap: 8px; margin: 12px 0 0; padding: 0; list-style: none; }
 .live-recovery-list li { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px; border: 1px solid var(--hairline-strong); border-radius: 12px; padding: 10px 14px; }
 .live-recovery-list li > div { display: grid; gap: 2px; }
-.live-recovery-list small { color: var(--muted); font-size: 11px; }
-.live-recovery-list button { min-height: 38px; padding: 0 16px; font: 600 11px/1 var(--font-sans); }
+.live-recovery-list small { color: var(--muted); font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
+.live-recovery-list button { min-height: 38px; padding: 0 16px; font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
 
 /* Action items with owner/due (contract C7). */
 .live-summary-actions-list li { display: grid; gap: 2px; }
-.live-summary-actions-list small { color: var(--muted); font-size: 11px; }
+.live-summary-actions-list small { color: var(--muted); font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
 
-/* Stage / countdown view (contract C8): pure black, host-only window. */
-.live-stage-shell { position: fixed; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 20px; background: #000; color: #fff; padding: 40px 24px; text-align: center; overflow-y: auto; }
-.live-stage-title { margin: 0; max-width: 80vw; font-size: clamp(26px, 4.5vw, 52px); line-height: 1.2; color: #fff; }
-.live-stage-countdown { margin: 0; font-variant-numeric: tabular-nums; font-size: clamp(56px, 14vw, 160px); font-weight: 700; letter-spacing: .04em; color: #fff; }
-.live-stage-state { display: inline-flex; align-items: center; gap: 12px; margin: 0; color: rgba(255,255,255,.72); font-size: clamp(22px, 4vw, 40px); font-weight: 600; letter-spacing: .06em; }
-.live-stage-state.is-live { color: #ff4d4d; text-transform: uppercase; }
-.live-stage-hint { margin: 0; color: rgba(255,255,255,.62); font-size: 14px; }
-.live-stage-error { margin: 0; color: #E8A79F; font-size: 15px; }
-.live-stage-access { display: flex; flex-wrap: wrap; align-items: center; justify-content: center; gap: 28px; margin-top: 8px; }
-.live-stage-access .live-invite-qr { background: #fff; border-radius: 14px; padding: 10px; }
+/* Stage B: one 16:9 broadcast frame, session context left and admission right. */
+.live-stage-shell { position: fixed; inset: 0; display: grid; place-items: center; background: var(--dark); color: var(--nova-text); padding: 32px; overflow: auto; }
+.live-stage-frame { position: relative; width: min(calc((100vh - 64px) * 16 / 9), calc(100vw - 64px), 1600px); aspect-ratio: 16 / 9; overflow: hidden; border: 1px solid var(--nova-hairline); border-radius: 16px; background: var(--dark); }
+.live-stage-grid { position: relative; z-index: 2; display: grid; min-height: 100%; grid-template-columns: minmax(0, 1.35fr) minmax(280px, .65fr); align-items: center; gap: 48px; padding: clamp(32px, 5vw, 80px); }
+.live-stage-session { display: grid; min-width: 0; justify-items: start; gap: 16px; text-align: left; }
+.live-stage-eyebrow { color: var(--nova-text-muted); font-size: 13px; font-weight: 600; letter-spacing: .16em; text-transform: uppercase; }
+.live-stage-title { margin: 0; max-width: 18ch; color: var(--nova-text); font-size: clamp(30px, 4vw, 64px); line-height: 1.15; text-wrap: balance; }
+.live-stage-countdown { margin: 0; color: var(--nova-text); font-variant-numeric: tabular-nums; font-size: clamp(34px, 4.8vw, 72px); font-weight: 600; letter-spacing: .04em; }
+.live-stage-state { display: inline-flex; align-items: center; gap: 12px; margin: 0; color: var(--nova-text-body); font-size: clamp(20px, 2.4vw, 36px); font-weight: 600; letter-spacing: .06em; }
+.live-stage-state.is-live { color: var(--nova-text); text-transform: uppercase; }
+.live-stage-state.is-ended { color: var(--brand-red); animation: live-end-pulse 2.8s ease-in-out infinite; }
+.live-stage-hint { margin: 0; color: var(--nova-text-muted); font-size: 14px; }
+.live-stage-error { margin: 0; color: var(--brand-red); font-size: 15px; }
+.live-stage-access { display: grid; min-width: 0; justify-items: center; gap: 16px; border-radius: 16px; background: color-mix(in srgb, var(--dark) 72%, transparent); padding: clamp(20px, 3vw, 36px); }
+.live-stage-access .live-invite-qr { margin: 0; background: var(--brand-white); border-radius: var(--nova-r-md); padding: 10px; }
+.live-stage-access .live-invite-qr svg { display: block; width: clamp(180px, 19vw, 300px); height: auto; aspect-ratio: 1; }
 .live-stage-access .live-invite-qr figcaption { display: none; }
 .live-stage-code { display: grid; gap: 6px; justify-items: center; }
-.live-stage-code span { color: rgba(255,255,255,.62); font-size: 12px; letter-spacing: .1em; text-transform: uppercase; }
-.live-stage-code strong { font-variant-numeric: tabular-nums; color: #fff; font-size: clamp(34px, 6vw, 64px); letter-spacing: .18em; }
-.live-stage-count { margin: 0; color: rgba(255,255,255,.55); font-size: 16px; }
+.live-stage-code span { color: var(--nova-text-muted); font-size: 12px; letter-spacing: .1em; text-transform: uppercase; }
+.live-stage-code strong { color: var(--nova-text); font-variant-numeric: tabular-nums; font-size: clamp(30px, 4vw, 56px); letter-spacing: .18em; }
+.live-stage-manual-url { display: grid; width: 100%; min-height: 44px; align-content: center; justify-items: center; gap: 4px; border-top: 1px solid var(--nova-hairline); color: var(--nova-text); padding-top: 14px; text-align: center; text-decoration: none; }
+.live-stage-manual-url span { color: var(--nova-text-muted); font-size: 12px; }
+.live-stage-manual-url strong { max-width: 100%; color: var(--nova-text-body); font-size: 13px; font-weight: 500; overflow-wrap: anywhere; }
+.live-stage-attendance { display: flex; min-height: 44px; align-items: center; gap: 14px; }
+.live-stage-avatar-stack { display: flex; align-items: center; padding-left: 4px; }
+.live-stage-avatar { display: grid; width: 40px; height: 40px; place-items: center; margin-left: -8px; border: 2px solid var(--dark); border-radius: var(--nova-r-pill); background: var(--nova-surface-raised); color: var(--nova-text); font-size: 12px; font-weight: 600; }
+.live-stage-avatar:first-child { margin-left: 0; }
+.live-stage-avatar.color-1 { background: var(--nova-blue); }
+.live-stage-avatar.color-2 { background: var(--brand-blue); }
+.live-stage-avatar.color-3 { background: var(--brand-red); }
+.live-stage-avatar.color-4 { background: var(--nova-text-muted); }
+.live-stage-avatar.color-5 { background: var(--nova-blue-strong); }
+.live-stage-avatar.is-overflow { background: var(--nova-surface-raised); }
+.live-stage-count { margin: 0; color: var(--nova-text-muted); font-size: 15px; }
+.live-stage-loader { display: inline-flex; min-width: 44px; min-height: 44px; align-items: center; justify-content: center; gap: 5px; }
+.live-stage-loader i { width: 6px; height: 6px; border-radius: var(--nova-r-pill); background: var(--nova-text); animation: live-stage-load 900ms ease-in-out infinite alternate; }
+.live-stage-loader i:nth-child(2) { animation-delay: 150ms; }
+.live-stage-loader i:nth-child(3) { animation-delay: 300ms; }
+@keyframes live-stage-load { from { opacity: .25; transform: translateY(2px); } to { opacity: 1; transform: translateY(-2px); } }
 /* Contract C10: host-side cover upload block. */
 .live-cover-upload { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; border: 1px solid var(--hairline); border-radius: 14px; padding: 12px 14px; }
 .live-cover-upload > div { flex: 1 1 240px; min-width: 0; }
-.live-cover-upload strong { font-size: 13px; }
-.live-cover-upload p { margin: 2px 0 0; color: var(--muted); font-size: 11px; line-height: 1.5; }
-/* Contract C10: cover image + scrim behind the stage content. The scrim is a
- * radial gradient that keeps the center readable over any photo. */
-.live-stage-cover { position: absolute; inset: 0; z-index: 0; width: 100%; height: 100%; object-fit: cover; opacity: 1; transition: opacity .6s ease; }
-.live-stage-cover.is-dimmed { opacity: .16; }
-.live-stage-scrim { position: absolute; inset: 0; z-index: 1; background: linear-gradient(180deg, rgba(0,0,0,.62) 0%, rgba(0,0,0,.5) 42%, rgba(0,0,0,.84) 100%); }
-.live-stage-content { position: relative; z-index: 2; display: flex; flex-direction: column; align-items: center; gap: 20px; }
+.live-cover-upload strong {
+  font: var(--nova-ui-font);
+  letter-spacing: var(--nova-ui-letter-spacing); }
+.live-cover-upload p { margin: 2px 0 0; color: var(--muted); font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
+/* Contract C10: cover image + flat scrim behind the stage content. */
+.live-stage-cover { position: absolute; inset: 0; z-index: 0; width: 100%; height: 100%; object-fit: cover; object-position: center; opacity: 0; transition: opacity var(--nova-dur-color) var(--nova-ease-out); }
+.live-stage-cover.is-loaded { opacity: 1; }
+.live-stage-cover.is-loaded.is-dimmed { opacity: .16; }
+.live-stage-cover-loading { position: absolute; inset: 0; z-index: 1; display: grid; place-items: center; background: var(--nova-surface); }
+.live-stage-scrim { position: absolute; inset: 0; z-index: 1; background: color-mix(in srgb, var(--dark) 62%, transparent); }
 /* Countdown wrapped in the shared indeterminate loading ring. */
-.live-stage-ring { position: relative; display: grid; place-items: center; width: clamp(240px, 34vw, 420px); height: clamp(240px, 34vw, 420px); }
-.live-stage-ring .live-stage-countdown { font-size: clamp(44px, 7vw, 92px); }
-.live-stage-ring .live-stage-state { font-size: clamp(17px, 2.4vw, 26px); }
+.live-stage-ring { position: relative; display: grid; width: clamp(220px, 25vw, 360px); height: clamp(220px, 25vw, 360px); place-items: center; }
+.live-stage-ring .live-stage-countdown { font-size: clamp(34px, 4.8vw, 72px); }
 /* Pre-live layers fade out (instead of unmounting) when the host starts. */
-.live-stage-access { transition: opacity .6s ease; }
-.live-stage-access.is-faded-out { opacity: 0; pointer-events: none; position: absolute; }
-@media (prefers-reduced-motion: reduce) { .live-stage-cover, .live-stage-access { transition: none; } }
+@media (max-width: 760px) {
+  .live-stage-shell { align-items: start; padding: 16px; }
+  .live-stage-frame { width: 100%; min-height: calc(100dvh - 32px); aspect-ratio: auto; }
+  .live-stage-grid { grid-template-columns: 1fr; gap: 24px; padding: 24px; }
+  .live-stage-access { width: 100%; }
+}
+
+/* Stage login minutes composition */
+.live-stage-translation { position: relative; z-index: 2; display: grid; min-height: 100%; grid-template-rows: auto minmax(0, 1fr); gap: 16px; padding: clamp(24px, 4vw, 56px); }
+.live-stage-translation-header { display: grid; grid-template-columns: minmax(0, 1fr) auto auto auto; align-items: center; gap: 24px; }
+.live-stage-translation-header .live-stage-title { max-width: 32ch; font-size: clamp(24px, 3vw, 44px); }
+/* 2026-08-22: the QR + access code stay on screen for the whole session so
+   latecomers can join mid-call — compact strip variant for the live header. */
+.live-stage-access.is-live { grid-template-columns: auto auto; align-items: center; gap: 14px; padding: 10px 14px; border: 1px solid var(--nova-hairline); border-radius: var(--nova-r-md); }
+.live-stage-access.is-live .live-invite-qr { padding: 6px; border-radius: var(--nova-r-sm); }
+.live-stage-access.is-live .live-invite-qr img { display: block; width: 92px; height: 92px; }
+.live-stage-access.is-live .live-stage-code { justify-items: start; gap: 2px; }
+.live-stage-access.is-live .live-stage-code span { font-size: 10px; }
+.live-stage-access.is-live .live-stage-code strong { font-size: clamp(20px, 2vw, 30px); letter-spacing: .14em; }
+.live-stage-translation > [data-translation-state] { min-height: 0; }
+.live-stage-complete { position: relative; z-index: 2; display: grid; min-height: 100%; place-content: center; justify-items: center; gap: 16px; padding: 48px; text-align: center; }
+.live-stage-complete .live-stage-title { max-width: 24ch; }
+
+.live-login-form { display: grid; gap: 16px; }
+.live-login-form > label { display: grid; gap: 8px; }
+.live-login-form .live-name-input {
+  font: var(--nova-ui-font);
+  letter-spacing: var(--nova-ui-letter-spacing); }
+
+.live-viewer-restoring { display: grid; min-height: 100dvh; place-content: center; background: var(--nova-surface); color: var(--nova-text-muted); }
+.live-viewer-restoring p { margin: 0; font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
+
+.live-minutes-reading { width: 100%; max-width: 920px; margin-inline: auto; }
+.live-minutes-reading .live-minutes-panel { max-width: 920px; }
+
+@media (max-width: 760px) {
+  .live-stage-translation { padding: 20px; }
+  .live-stage-translation-header { grid-template-columns: minmax(0, 1fr) auto; gap: 12px; }
+  .live-stage-translation-header .live-stage-attendance { grid-column: 1 / -1; }
+  .live-stage-translation-header .live-stage-access.is-live { grid-column: 1 / -1; justify-self: start; width: auto; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .live-stage-translation *,
+  .live-stage-complete *,
+  .live-login-shell *,
+  .live-minutes-reading * { transition: none; }
+}
+/* End stage login minutes composition */
+@media (prefers-reduced-motion: reduce) {
+  .live-stage-cover, .live-stage-access { transition: none; }
+  .live-end-label, .live-stage-state.is-ended { animation: none; opacity: 1; }
+  .live-stage-loader i, .live-minutes-loading-dots i { animation: none; opacity: .65; transform: none; }
+}
 
 /* Compact-mode touch targets: every tappable control is at least 44px tall. */
 .live-viewer-shell.is-compact .live-viewer-toolbar { min-height: calc(44px + env(safe-area-inset-top)); }
 .live-viewer-shell.is-compact .live-viewer-toolbar button { min-height: 44px; padding: 0 12px; }
 .live-viewer-shell.is-compact .live-language-switch button { min-height: 44px; min-width: 44px; padding: 0 12px; }
 .live-viewer-shell.is-compact .live-viewer-toolbar .live-leave-button { min-height: 44px; }
-.live-viewer-shell.is-compact .live-speak-bar { position: relative; bottom: auto; box-shadow: none; }
-.live-viewer-shell.is-compact .live-speak-button { min-height: 44px; padding: 0; }
 .live-viewer-shell.is-compact .live-jump-latest { min-height: 44px; }
 
-/* Join screen: pure-black broadcast styling matching the live viewer. */
-.live-join-heading { margin: 0; color: #fff; font-size: clamp(2rem, 7vw, 2.8rem); line-height: 1.1; }
-.live-join-lede { margin: 0 0 18px; color: rgba(255,255,255,.52); font-size: 13.5px; line-height: 1.6; }
-.live-join-card .live-primary-action { min-height: 56px; border: 0; border-radius: 9999px; background: #fff; color: #000; font: 700 16px/1 var(--font-sans); transition: transform .12s; }
+/* Participant entry shares the same web palette as the host. */
+.live-join-heading { margin: 0; color: var(--nova-text); font-size: clamp(2rem, 7vw, 2.8rem); line-height: 1.1; }
+.live-join-lede { margin: 0 0 18px; color: var(--nova-text-muted); font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
+.live-join-card .live-primary-action { min-height: 56px; border: 0; border-radius: var(--nova-r-pill); background: var(--nova-text); color: var(--nova-surface); transition: transform .12s; font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
 .live-join-card .live-primary-action:active { transform: scale(.98); }
 .live-join-card .live-primary-action:disabled { opacity: .45; }
-.live-join-card .live-code-input { border-color: rgba(255,255,255,.28); background: #000; color: #fff; font-variant-numeric: tabular-nums; }
-.live-join-mic-note { margin: 4px 0 0; color: rgba(255,255,255,.38); font-size: 11.5px; line-height: 1.5; text-align: center; }
+.live-join-card .live-code-input { border-color: var(--nova-hairline-strong); background: var(--nova-surface); color: var(--nova-text); font-variant-numeric: tabular-nums; }
+.live-join-mic-note { margin: 4px 0 0; color: var(--nova-text-muted); text-align: center; font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
 
 /* Brand wordmark: uppercase letterspaced everywhere (rail reference design). */
-.live-viewer-toolbar > strong { font-size: 11px; font-weight: 700; letter-spacing: .22em; text-transform: uppercase; }
-
-/* Speak button keeps its prominent pill in every state; while speaking the
-   label is replaced by a live waveform inside the button. */
-.live-speak-button-waves { display: inline-flex; align-items: center; justify-content: center; gap: 5px; height: 24px; }
-.live-speak-button-waves i { width: 4px; border-radius: 9999px; background: currentColor; animation: live-audio-bar 1.1s ease-in-out infinite alternate; }
-.live-speak-button-waves i:nth-child(1) { height: 10px; }
-.live-speak-button-waves i:nth-child(2) { height: 20px; animation-delay: -.35s; }
-.live-speak-button-waves i:nth-child(3) { height: 14px; animation-delay: -.6s; }
-.live-speak-button-waves i:nth-child(4) { height: 22px; animation-delay: -.15s; }
-.live-speak-button-waves i:nth-child(5) { height: 12px; animation-delay: -.5s; }
-.live-speak-button[data-level="0"] .live-speak-button-waves i { animation-play-state: paused; transform: scaleY(.35); }
-.live-speak-button[data-level="1"] .live-speak-button-waves i { transform: scaleY(.5); }
-.live-speak-button[data-level="2"] .live-speak-button-waves i { transform: scaleY(.7); }
-.live-speak-button[data-level="3"] .live-speak-button-waves i { transform: scaleY(.86); }
-.live-speak-button[data-level="4"] .live-speak-button-waves i { transform: scaleY(1); }
-.live-speak-button-waves i { transform-origin: center; transition: transform 80ms linear; }
+.live-viewer-toolbar > strong { text-transform: uppercase; font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
 
 /* Caption controls sit directly above the caption record: language first, then
    text size. Live Call is caption-first, so translated-audio controls are not
@@ -996,41 +1331,70 @@ input:focus-visible {
    the caption-controls row it fell back to the default dark ink — rgb(12,10,9),
    the exact shell background — so it rendered invisible. Style it here rather
    than by ancestry, and mirror the language pill so the two read as one group. */
-.live-caption-controls .live-text-size-button { min-height: 34px; min-width: 40px; border: 1px solid var(--hairline-strong); border-radius: 9999px; background: var(--surface); color: var(--body); font: 700 13px/1 var(--font-sans); cursor: pointer; }
+.live-caption-controls .live-text-size-button { min-height: 34px; min-width: 40px; border: 1px solid var(--hairline-strong); border-radius: var(--nova-r-pill); background: var(--surface); color: var(--body); cursor: pointer; font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
 .live-caption-controls .live-text-size-button[aria-expanded="true"] { background: var(--primary); color: var(--on-primary); border-color: transparent; }
 .live-viewer-shell.is-compact .live-caption-controls .live-text-size-button { min-height: 44px; min-width: 44px; border-color: rgba(255,255,255,.16); background: rgba(255,255,255,.07); color: #fff; }
-.live-viewer-shell.is-compact .live-caption-controls .live-text-size-button[aria-expanded="true"] { background: #fff; color: #000; }
+.live-viewer-shell.is-compact .live-caption-controls .live-text-size-button[aria-expanded="true"] { background: var(--nova-web-action); color: var(--nova-web-text); }
 
 /* ── NOVA component layer (Toss / TDS) ───────────────────────────────────────
-   Values from docs/TOSS_DESIGN_REFERENCE.md, which is derived from Toss's real
+   Layout values from docs/TOSS_DESIGN_REFERENCE.md, which is derived from Toss's real
    shipped npm packages. This is a component pass only: the dark viewer surface,
    the page composition and the information hierarchy are unchanged. Depth is
-   progressive lightening, never shadow; radius is anchored to component size;
+   separated with borders, not changing surface fills; radius follows component size;
    blue is rationed to one primary action per screen; only opacity/transform and
    colour animate, and a press releases slower than it depresses.
    Kept dark-only on purpose -- on the web the subtitle is the product. */
 :root {
-  --nova-surface: #14141a;
-  --nova-surface-raised: #1c1c24;
-  --nova-hairline: #26262f;
-  --nova-hairline-strong: #3c3c47;
-  --nova-text: #ffffff;
-  --nova-text-body: #c3c3c6;
-  --nova-text-muted: #9e9ea4;
-  --nova-text-subtle: #7e7e87;
-  --nova-blue: #3485fa;
-  --nova-blue-strong: #449bff;
-  --nova-overlay-100: rgba(255, 255, 255, 0.07);
-  --nova-overlay-200: rgba(255, 255, 255, 0.11);
+  --nova-surface: var(--nova-web-background);
+  --nova-surface-raised: var(--nova-web-background);
+  --nova-surface-layered: var(--nova-surface-raised);
+  --nova-hairline: color-mix(in srgb, var(--nova-web-text) 18%, transparent);
+  --nova-hairline-strong: color-mix(in srgb, var(--nova-web-text) 32%, transparent);
+  --nova-text: var(--nova-web-text);
+  --nova-fg-intense: var(--nova-text);
+  --nova-text-body: var(--nova-web-text);
+  --nova-text-muted: color-mix(in srgb, var(--nova-web-text) 72%, transparent);
+  --nova-text-subtle: color-mix(in srgb, var(--nova-web-text) 56%, transparent);
+  --nova-blue: var(--nova-web-action);
+  --nova-blue-strong: color-mix(in srgb, var(--nova-web-action) 90%, var(--nova-web-background));
+  --nova-system-default: var(--nova-blue);
+  --nova-status-ok: #03b26c;
+  --nova-status-error: #f04452;
+  --nova-overlay-100: color-mix(in srgb, var(--nova-web-text) 7%, transparent);
+  --nova-overlay-200: color-mix(in srgb, var(--nova-web-text) 11%, transparent);
   --nova-r-sm: 8px;
   --nova-r-row: 12px;
   --nova-r-md: 14px;
   --nova-r-pill: 999px;
   --nova-lh-list: 1.35;
   --nova-ease-out: cubic-bezier(0.25, 0.1, 0.25, 1);
+  --nova-ease-back: cubic-bezier(0.34, 1.56, 0.64, 1);
   --nova-dur-press-in: 200ms;
   --nova-dur-press-out: 350ms;
   --nova-dur-color: 300ms;
+  --nova-spring-rapid: 200ms;
+
+  /* Typography scale — DESIGN.md §6.3. These were referenced across the CSS
+     modules with no definition anywhere; an undefined custom property with no
+     fallback silently invalidates its declaration, so caption typography was
+     rendering with inherited sizes. Line-height rule: ≤17px → size×1.5. */
+  --nova-font-size-t4: 20px;   --nova-line-height-t4: 29px;
+  --nova-font-size-t5: 17px;   --nova-line-height-t5: 25.5px;
+  --nova-font-size-t6: 15px;   --nova-line-height-t6: 22.5px;
+  --nova-font-size-t7: 13px;   --nova-line-height-t7: 19.5px;
+  --nova-font-size-st13: 11px; --nova-line-height-st13: 16.5px;
+  /* Caption ramp (DESIGN.md §6.3): matches the fallbacks that were live. */
+  --nova-caption-size: 38px;
+  --nova-caption-size-compact: 22px;
+
+  /* Interaction, status and misc tokens (DESIGN.md §5) previously undefined. */
+  --nova-hover: color-mix(in srgb, var(--nova-web-text) 4%, transparent);
+  --nova-press: color-mix(in srgb, var(--nova-web-text) 8%, transparent);
+  --nova-radius-xs: 4px;
+  --nova-scrim: color-mix(in srgb, var(--nova-web-background) 72%, transparent);
+  --nova-status-live: #f04452;
+  --nova-status-warn: #ffc342;
+  --nova-system-subtle: color-mix(in srgb, var(--nova-web-action) 16%, transparent);
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -1040,45 +1404,33 @@ input:focus-visible {
 /* Primary action: TDS Button large -- radius 14, one per screen, and the only
    blue on it. The press scale releases slower than it depresses. */
 .live-viewer-shell .live-join-card .live-primary-action,
-.live-viewer-shell .live-primary-action {
+.live-viewer-shell .live-primary-action,
+.live-host-shell .accent-btn {
   border-radius: var(--nova-r-md);
   background: var(--nova-blue);
-  color: #ffffff;
-  font-weight: 600;
+  color: var(--nova-web-text);
   transition: background var(--nova-dur-color) var(--nova-ease-out),
     transform var(--nova-dur-press-out) var(--nova-ease-out);
+  font: var(--nova-ui-font);
+  letter-spacing: var(--nova-ui-letter-spacing);
 }
-.live-viewer-shell .live-primary-action:hover:not(:disabled) { background: var(--nova-blue-strong); }
-.live-viewer-shell .live-primary-action:active:not(:disabled) {
+.live-viewer-shell .live-primary-action:hover:not(:disabled),
+.live-host-shell .accent-btn:hover:not(:disabled) { background: var(--nova-blue-strong); }
+.live-viewer-shell .live-primary-action:active:not(:disabled),
+.live-host-shell .accent-btn:active:not(:disabled) {
   transform: scale(0.98);
   transition-duration: var(--nova-dur-press-in);
 }
-.live-viewer-shell .live-primary-action:disabled { background: var(--nova-overlay-200); color: var(--nova-text-subtle); opacity: 1; }
-
-/* Segmented control: TDS group radius 15, item radius 12, and the selected item
-   is a RAISED SURFACE rather than a pure-white slab. */
-.live-viewer-shell .live-join-methods {
-  border: 0;
-  border-radius: 15px;
-  background: var(--nova-overlay-100);
-  gap: 2px;
-  padding: 2px;
-}
-.live-viewer-shell .live-join-methods button {
-  border-radius: var(--nova-r-row);
-  color: var(--nova-text-muted);
-  font-weight: 600;
-  transition: background var(--nova-dur-color) var(--nova-ease-out), color var(--nova-dur-color) var(--nova-ease-out);
-}
-.live-viewer-shell .live-join-methods button.is-selected {
-  background: var(--nova-surface-raised);
-  color: var(--nova-text);
-}
+.live-viewer-shell .live-primary-action:disabled,
+.live-host-shell .accent-btn:disabled { background: var(--nova-overlay-200); color: var(--nova-text-subtle); opacity: 1; }
 
 /* TextField: TDS box radius 14 on a layered surface, with a real focus ring. */
 .live-viewer-shell .live-join-card input,
 .live-viewer-shell .live-join-card .live-name-input,
-.live-viewer-shell .live-join-card .live-code-input {
+.live-viewer-shell .live-join-card .live-code-input,
+.live-host-shell .live-text-field input,
+.live-host-shell .live-text-field select,
+.live-host-shell .live-text-field textarea {
   border: 1px solid var(--nova-hairline-strong);
   border-radius: var(--nova-r-md);
   background: var(--nova-surface);
@@ -1087,10 +1439,14 @@ input:focus-visible {
 }
 .live-viewer-shell .live-join-card input:focus-visible {
   border-color: var(--nova-blue);
-  outline: 2px solid color-mix(in srgb, var(--nova-blue) 45%, transparent);
+  outline: 2px solid var(--nova-blue);
   outline-offset: 1px;
 }
 .live-viewer-shell .live-join-card label { color: var(--nova-text-muted); }
+.live-host-shell :is(button, a, input, select, textarea, summary):focus-visible {
+  outline: 2px solid var(--nova-blue);
+  outline-offset: 2px;
+}
 
 /* Toolbar controls: pill chips on the overlay ramp, no shadow, colour-only hover. */
 .live-viewer-toolbar select,
@@ -1102,7 +1458,7 @@ input:focus-visible {
   transition: background var(--nova-dur-color) var(--nova-ease-out), color var(--nova-dur-color) var(--nova-ease-out);
 }
 .live-viewer-toolbar button:hover { background: var(--nova-overlay-200); color: var(--nova-text); }
-.live-viewer-toolbar button.is-selected { background: var(--nova-surface-float, #2c2c35); color: var(--nova-text); }
+.live-viewer-toolbar button.is-selected { background: var(--nova-surface-float); color: var(--nova-text); }
 
 /* Meeting feed turns read as TDS list rows: the tighter list line-height, and a
    hover underlay INSET inside the row so it never touches the divider. */
@@ -1112,8 +1468,9 @@ input:focus-visible {
      browser to skip paint/layout work for long off-screen meeting history. */
   content-visibility: auto;
   contain-intrinsic-size: auto 96px;
-  line-height: var(--nova-lh-list);
   position: relative;
+  font: var(--nova-ui-font);
+  letter-spacing: var(--nova-ui-letter-spacing);
 }
 .live-turn-card::after {
   background: transparent;
@@ -1132,4 +1489,352 @@ input:focus-visible {
   opacity: .82;
   text-decoration: underline dashed var(--nova-blue) 1px;
   text-underline-offset: .2em;
+}
+
+/* Participant translation-first composition. Shared translation components
+   inherit these semantic aliases until the global NOVA token migration lands. */
+.live-viewer-shell {
+  --nova-fg-intense: var(--nova-text);
+  --nova-brand-default: var(--nova-blue);
+  --nova-brand-subtle: var(--nova-overlay-100);
+  --nova-radius-md: var(--nova-r-row);
+  --nova-radius-lg: var(--nova-r-md);
+  --nova-radius-pill: var(--nova-r-pill);
+  --nova-shadow-tiny: none;
+  --nova-shadow-medium: none;
+}
+
+.live-viewer-translation-layout {
+  display: grid;
+  min-height: calc(100dvh - 64px);
+  grid-template-rows: auto minmax(70vh, 1fr);
+  gap: 16px;
+}
+
+/* 2026-08-31 feat: 승인된 연속 자막 시안은 라이브의 문단을 요약 카드로 교체하지 않는다. */
+.live-viewer-shell .viewer-notebook { --nova-radius-pill: 980px; box-sizing: border-box; padding: 24px; --nova-font-size-t1: 30px; --nova-line-height-t1: 40px; --nova-font-size-t3: 22px; --nova-line-height-t3: 31px; display: flex; flex-direction: column; width: min(100%, 760px); min-height: calc(100dvh - 48px); margin-inline: auto; gap: 24px; }
+.viewer-notebook > [role="toolbar"] { min-height: 56px; border-bottom: 1px solid var(--nova-surface-hairline); padding-bottom: 16px; }
+.viewer-notebook > [role="toolbar"] > strong { font-size: var(--nova-font-size-t3); }
+.viewer-session-status { color: var(--nova-system-default); }
+.viewer-notebook .live-mode-chip { margin-left: auto; }
+.viewer-meeting-heading { padding-block: 16px 24px; }
+.viewer-meeting-heading h1 { margin: 0 0 12px; font-size: var(--nova-font-size-t1); line-height: var(--nova-line-height-t1); font-weight: 600; letter-spacing: -.02em; color: var(--nova-web-text); overflow-wrap: anywhere; }
+.viewer-meeting-heading p { margin: 6px 0; color: var(--nova-fg-secondary); font: var(--nova-ui-font); }
+.viewer-access-notice { margin-top: 24px; }
+.viewer-notebook .live-viewer-caption-region,
+.viewer-notebook .live-viewer-caption-region > section:has(> [role="tablist"]) { min-height: 0; }
+.viewer-notebook .live-viewer-caption-region { flex: 1; }
+.viewer-reading-feed { position: relative; }
+.viewer-reading-scroll { max-height: 60dvh; min-height: 240px; overflow-y: auto; overscroll-behavior: contain; padding-block: 24px; scrollbar-gutter: stable; }
+.viewer-reading-scroll article { margin-bottom: 16px; }
+.viewer-reading-scroll article > header,
+.viewer-source-record header { display: flex; gap: 12px; color: var(--nova-fg-secondary); margin: 24px 0 8px; font: var(--nova-ui-font); }
+.viewer-caption-text { margin: 0; color: var(--nova-web-text); font-size: calc(var(--nova-font-size-t3) * var(--live-caption-scale, 1)); line-height: calc(var(--nova-line-height-t3) * var(--live-caption-scale, 1)); letter-spacing: -.02em; white-space: pre-wrap; word-break: keep-all; overflow-wrap: anywhere; }
+.viewer-reading-scroll [data-caption-state="partial"] .viewer-caption-text,
+.viewer-reading-scroll [data-caption-state="failed"] .viewer-caption-text,
+.viewer-caption-draft { color: var(--nova-fg-secondary); }
+.viewer-drafting-label { display: block; margin-top: 8px; }
+.viewer-muted { color: var(--nova-fg-secondary); font: var(--nova-ui-font); }
+.viewer-caption-original { color: var(--nova-fg-secondary); white-space: pre-wrap; word-break: keep-all; }
+.viewer-follow-button { position: absolute; right: 16px; bottom: 16px; min-height: 44px; padding-inline: 16px; border: 1px solid var(--nova-surface-hairline); border-radius: var(--nova-radius-pill); background: var(--nova-web-background); color: var(--nova-web-text); }
+.viewer-microphone-slot { min-height: 72px; padding-bottom: env(safe-area-inset-bottom); }
+.viewer-notebook .viewer-microphone-capsule,
+.viewer-notebook .viewer-recap-cta { display: flex; align-items: center; justify-content: center; width: 100%; min-height: 56px; padding: 12px 24px; background: var(--nova-web-action); color: var(--nova-web-text); border: 0; box-sizing: border-box; }
+.viewer-notebook .viewer-microphone-capsule { border-radius: var(--nova-radius-pill); }
+.viewer-notebook .viewer-recap-cta { border-radius: var(--nova-radius-sm); font: var(--nova-ui-font); }
+.viewer-notebook .viewer-recap-cta:disabled { opacity: .65; cursor: default; }
+.viewer-record-tabs { display: flex; gap: 24px; border-bottom: 1px solid var(--nova-surface-hairline); margin-bottom: 24px; }
+.viewer-record-tabs button { min-height: 48px; background: transparent; border: 0; border-bottom: 3px solid transparent; color: var(--nova-fg-secondary); padding-inline: 4px; font: var(--nova-ui-font); }
+.viewer-record-tabs button[aria-selected="true"] { color: var(--nova-web-text); border-bottom-color: var(--nova-web-action); }
+.viewer-source-record article { border-bottom: 1px solid var(--nova-surface-hairline); padding-bottom: 16px; }
+.viewer-source-record p { white-space: pre-wrap; word-break: keep-all; overflow-wrap: anywhere; color: var(--nova-web-text); font: var(--nova-ui-font); }
+.viewer-summary-record { color: var(--nova-web-text); font: var(--nova-ui-font); }
+.viewer-summary-record h2 { font-size: var(--nova-font-size-t4); font-weight: 600; }
+.viewer-summary-record h3 { margin-top: 32px; color: var(--nova-fg-secondary); font: var(--nova-ui-font); }
+.viewer-summary-record h4 { font: var(--nova-ui-font); font-weight: 600; margin: 0; }
+.viewer-summary-record li { padding-block: 12px; border-bottom: 1px solid var(--nova-surface-hairline); }
+.viewer-topic-summary { border-bottom: 1px solid var(--nova-surface-hairline); padding-block: 16px; }
+.viewer-topic-summary summary { gap: 12px; min-height: 44px; display: flex; align-items: center; color: var(--nova-fg-secondary); cursor: pointer; }
+.viewer-topic-summary summary > span:last-child { margin-left: auto; white-space: nowrap; }
+.viewer-recap-request { border-top: 1px solid var(--nova-surface-hairline); margin-top: 32px; padding-top: 16px; font: var(--nova-ui-font); }
+.viewer-recap-request p { margin: 8px 0; }
+.viewer-recap-request strong { margin-left: 12px; font-weight: 400; overflow-wrap: anywhere; }
+.viewer-recap-request .viewer-recap-cta { margin-top: 16px; }
+.viewer-text-button, .viewer-recovery-error button { min-height: 44px; background: transparent; border: 0; color: var(--nova-web-action); padding: 8px 12px; font: var(--nova-ui-font); }
+.viewer-recording-gaps { padding-block: 16px; border-bottom: 1px solid var(--nova-surface-hairline); font: var(--nova-ui-font); }
+.viewer-recording-gaps h3 { font: inherit; font-weight: 600; }
+.viewer-recording-gaps li { margin-block: 12px; overflow-wrap: anywhere; }
+.viewer-recording-gaps li span { display: block; color: var(--nova-fg-secondary); }
+.viewer-record-expired { min-height: 240px; padding-block: 24px; }
+@media (max-width: 767px) {
+  .live-viewer-shell .viewer-notebook { gap: 16px; }
+  .viewer-meeting-heading { padding-block: 8px 16px; }
+  .viewer-meeting-heading h1 { font-size: var(--nova-font-size-t3); line-height: var(--nova-line-height-t3); }
+  .viewer-reading-scroll { max-height: 58dvh; }
+  .viewer-notebook .live-mode-chip { display: none; }
+}
+
+.live-viewer-translation-layout > .live-error,
+.live-viewer-translation-layout > .live-paused-banner { grid-row: 2; align-self: start; z-index: 1; }
+.live-viewer-stage { display: flex; min-height: 0; flex-direction: column; }
+.live-viewer-stage > [data-translation-state] { min-height: 70vh; flex: 1 1 auto; }
+.live-viewer-text-scale { display: grid; min-height: 44px; gap: 8px; color: var(--nova-fg-secondary); }
+.live-viewer-text-scale input { min-height: 44px; accent-color: var(--nova-system-default); }
+
+.live-join-optional-profile { border-top: 1px solid var(--nova-surface-hairline, var(--hairline)); }
+.live-join-optional-profile summary { min-height: 44px; padding-block: 12px; cursor: pointer; }
+.live-join-optional-profile > div { display: grid; gap: 8px; padding-bottom: 16px; }
+.live-summary-consent { display: flex; min-height: 44px; align-items: center; gap: 12px; cursor: pointer; }
+.live-summary-consent input { width: 20px; height: 20px; accent-color: var(--nova-system-default, var(--nova-blue)); }
+
+.live-viewer-shell button:focus-visible,
+.live-viewer-shell a:focus-visible,
+.live-viewer-shell input:focus-visible,
+.live-viewer-shell select:focus-visible,
+.live-viewer-shell summary:focus-visible {
+  outline: 2px solid var(--nova-system-default);
+  outline-offset: 2px;
+}
+
+@media (max-width: 767px) {
+  .live-viewer-shell.is-compact,
+  .live-viewer-shell.is-compact .live-viewer-translation-layout,
+  .live-viewer-shell.is-compact .live-viewer-translation-layout > *,
+  .live-viewer-shell.is-compact .live-viewer-stage,
+  .live-viewer-shell.is-compact .live-viewer-caption-region {
+    box-sizing: border-box;
+    width: 100%;
+    min-width: 0;
+    max-width: 100%;
+  }
+  .live-viewer-shell.is-compact .live-viewer-translation-layout {
+    display: flex;
+    min-height: calc(100dvh - 24px);
+    flex-direction: column;
+  }
+  .live-viewer-shell.is-compact .live-viewer-stage { flex: 1 1 auto; }
+  .live-viewer-shell.is-compact .live-topic-demo-state-selector { min-width: 0; max-width: 100%; }
+  .live-viewer-shell.is-compact .live-viewer-stage > [data-translation-state] { min-height: 0; }
+}
+
+/* Viewer topic composition */
+.live-viewer-translation-layout > section:has(> [role="tablist"]) {
+  min-width: 0;
+  min-height: 70vh;
+}
+.live-viewer-caption-region {
+  min-width: 0;
+  min-height: 70vh;
+}
+.live-viewer-caption-region > section:has(> [role="tablist"]) {
+  min-height: 70vh;
+}
+.live-viewer-topic-flow {
+  display: grid;
+  min-width: 0;
+  min-height: 70vh;
+  align-content: start;
+  gap: 24px;
+  padding-block: 16px 24px;
+}
+.live-viewer-topic-flow summary,
+.live-viewer-topic-demo-states summary { min-height: 44px; }
+.live-viewer-topic-flow [data-utterance-key] { scroll-margin-block: 24px; }
+.live-viewer-topic-demo-states { display: grid; gap: 16px; padding-block: 24px; }
+.live-topic-demo-state-selector { display: grid; min-width: 140px; gap: 4px; color: var(--nova-fg-secondary); }
+.live-viewer-topic-demo [role="toolbar"] {
+  width: 100%;
+  min-width: 0;
+  max-width: 100%;
+  flex-wrap: wrap;
+  overflow: clip;
+}
+.live-viewer-topic-demo .live-topic-demo-state-selector { flex: 1 1 140px; }
+.live-topic-demo-state-selector select {
+  min-height: 44px;
+  border: 1px solid var(--nova-surface-hairline);
+  border-radius: var(--nova-radius-sm);
+  background: var(--nova-surface-layered);
+  color: var(--nova-fg-primary);
+  padding-inline: 12px;
+}
+.live-viewer-topic-flow :focus-visible,
+.live-viewer-topic-demo-states :focus-visible,
+.live-topic-demo-state-selector select:focus-visible {
+  outline: 2px solid var(--nova-system-default);
+  outline-offset: 2px;
+}
+
+@media (max-width: 767px) {
+  .live-viewer-shell.is-compact .live-viewer-translation-layout > section:has(> [role="tablist"]) {
+    min-height: 0;
+    flex: 1 1 auto;
+  }
+  .live-viewer-shell.is-compact .live-viewer-caption-region {
+    display: flex;
+    min-height: 0;
+    flex: 1 1 auto;
+  }
+  .live-viewer-shell.is-compact .live-viewer-caption-region > section:has(> [role="tablist"]) {
+    min-height: 0;
+    flex: 1 1 auto;
+  }
+  .live-viewer-shell.is-compact .live-viewer-topic-flow {
+    min-height: 100%;
+    padding-block: 8px calc(24px + env(safe-area-inset-bottom));
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .live-viewer-topic-flow *,
+  .live-viewer-topic-demo-states * { transition: none; }
+}
+
+/* Live speaking floor: the selected mobile reference is translated into a
+   single bottom sheet. The canvas is fed by actual microphone energy; it is a
+   live status surface, not playback or recorded media. */
+/* iOS-feel press physics: the press depresses fast on the standard curve and
+   RELEASES through a spring overshoot (ease-back), like a UIKit button. */
+.live-speak-trigger { display: inline-flex; min-width: 44px; min-height: 44px; align-items: center; justify-content: center; gap: 8px; border: 1px solid var(--nova-surface-hairline); border-radius: var(--nova-radius-pill); background: var(--nova-surface-layered); color: var(--nova-fg-primary); padding: 0 14px; transition: background 100ms ease-in-out, color 100ms ease-in-out, transform var(--nova-dur-press-out) var(--nova-ease-back); font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
+.live-speak-trigger:hover { background: var(--nova-surface-float); }
+.live-speak-trigger:active { transform: scale(.96); transition: background 100ms ease-in-out, color 100ms ease-in-out, transform var(--nova-dur-press-in) var(--nova-ease-out); }
+.live-speak-trigger.is-active { border-color: var(--nova-system-default); background: var(--nova-system-default); color: var(--nova-fg-intense); }
+/* Activation: the filled mic pops in with a spring, like the iOS record glyph. */
+.live-speak-trigger.is-active > svg { animation: nova-icon-pop var(--nova-dur-press-out) var(--nova-ease-back) both; }
+@keyframes nova-icon-pop { from { transform: scale(.7); opacity: .4; } 60% { transform: scale(1.12); opacity: 1; } to { transform: scale(1); } }
+.live-speak-trigger:disabled { color: var(--nova-fg-disabled, var(--nova-fg-tertiary)); cursor: not-allowed; opacity: .5; }
+.live-speak-trigger .live-voice-level { flex: 0 0 auto; }
+
+/* 1A: passive status chip for the global transcript display mode. The control
+   itself lives in the ControlDrawer; the chip only keeps the mode discoverable
+   without competing with the caption. */
+.live-mode-chip { display: inline-flex; min-height: 24px; align-items: center; border: 1px solid var(--nova-surface-hairline); border-radius: var(--nova-radius-pill); background: var(--nova-surface-layered); color: var(--nova-fg-secondary); padding: 0 10px; white-space: nowrap; font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
+.live-transcript-mode { display: grid; gap: 4px; border: 1px solid var(--nova-surface-hairline); border-radius: var(--nova-radius-md); padding: 12px 16px; }
+.live-transcript-mode legend { color: var(--nova-fg-secondary); padding-inline: 4px; font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
+.live-transcript-mode label { display: flex; min-height: 44px; align-items: center; gap: 10px; color: var(--nova-fg-primary); cursor: pointer; font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
+.live-transcript-mode input { accent-color: var(--nova-system-default); width: 18px; height: 18px; }
+
+.live-speak-scrim { position: fixed; inset: 0; z-index: 40; display: flex; align-items: flex-end; justify-content: center; background: color-mix(in srgb, var(--nova-surface-base) 62%, transparent); animation: live-speak-scrim-in var(--nova-dur-press-out) var(--nova-ease-out) both; }
+.live-speak-sheet { display: grid; width: min(100%, 640px); justify-items: center; gap: 24px; border: 1px solid var(--nova-surface-hairline); border-bottom: 0; border-radius: var(--nova-radius-lg) var(--nova-radius-lg) 0 0; background: var(--nova-surface-float); box-shadow: var(--nova-shadow-medium); color: var(--nova-fg-primary); padding: 10px 24px calc(28px + env(safe-area-inset-bottom)); animation: live-speak-sheet-in var(--nova-dur-press-out) var(--nova-ease-out) both; }
+.live-speak-sheet-handle { width: 64px; height: 5px; border-radius: var(--nova-radius-pill); background: var(--nova-fg-tertiary); }
+.live-speak-sheet header { display: flex; width: 100%; min-height: 44px; align-items: center; justify-content: space-between; gap: 16px; }
+.live-speak-sheet header > div { display: grid; min-width: 0; gap: 2px; }
+.live-speak-sheet header strong { overflow: hidden; color: var(--nova-fg-primary); text-overflow: ellipsis; white-space: nowrap; font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
+.live-speak-sheet header span { color: var(--nova-fg-secondary); font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
+.live-speak-sheet header > span { flex: 0 0 auto; }
+.live-voice-level { display: block; max-width: 100%; color: var(--nova-fg-primary); }
+.live-speak-sheet > p { margin: -8px 0 0; color: var(--nova-web-text); font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
+.live-speak-stop { display: grid; min-width: 112px; min-height: 88px; place-items: center; gap: 8px; border: 2px solid transparent; border-radius: var(--nova-radius-md); background: transparent; color: var(--nova-fg-primary); padding: 0 16px; font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
+/* Recording control morphs in like iOS Voice Memos: a small circle springs up
+   into the red stop control; pressing it squeezes and releases with overshoot. */
+.live-speak-stop > span { display: grid; width: 56px; height: 56px; place-items: center; border-radius: var(--nova-radius-pill); background: var(--nova-status-error); color: var(--nova-fg-intense); transition: transform var(--nova-dur-press-out) var(--nova-ease-back); animation: nova-record-in var(--nova-dur-press-out) var(--nova-ease-back) both; }
+.live-speak-stop:active > span { transform: scale(.9); transition: transform var(--nova-dur-press-in) var(--nova-ease-out); }
+@keyframes nova-record-in { from { transform: scale(.55); opacity: .3; } 65% { transform: scale(1.08); opacity: 1; } to { transform: scale(1); } }
+.live-speak-stop:focus-visible { outline: 2px solid var(--nova-system-default); outline-offset: 2px; }
+
+@keyframes live-speak-scrim-in { from { opacity: 0; } }
+@keyframes live-speak-sheet-in { from { opacity: 0; transform: translateY(24px); } }
+
+@media (max-width: 767px) {
+  .live-speak-trigger > span { max-width: 112px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .live-speak-trigger .live-voice-level { width: 42px !important; }
+  .live-speak-sheet { width: 100%; gap: 20px; padding-inline: 20px; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .live-speak-trigger,
+  .live-speak-trigger.is-active > svg,
+  .live-speak-stop > span,
+  .live-speak-scrim,
+  .live-speak-sheet { animation: none; transition: none; }
+}
+
+/* 2026-08-31 fix: Workspace zoom must change the scrollable layout, while
+   viewport-sized media queries must not squeeze the underlying form columns. */
+.live-host-shell:has(.live-workspace-viewport) { height: 100dvh; min-height: 0; overflow: hidden; }
+.live-workspace-viewport .live-host-workspace { box-sizing: border-box; width: calc(100% - 64px); max-width: 1240px; min-width: 1036px; padding: 24px 0 36px; }
+.live-host-shell .live-workspace-viewport .live-wizard { grid-template-columns: minmax(480px, 1fr) minmax(320px, 400px); }
+.live-host-shell .live-workspace-viewport .live-wizard > .live-section-heading,
+.live-host-shell .live-workspace-viewport .live-wizard-body,
+.live-host-shell .live-workspace-viewport .live-wizard-footer { grid-column: 1; grid-row: auto; }
+.live-workspace-viewport .live-host-preview,
+.live-workspace-viewport .live-setup-mobile-access { grid-column: 2; grid-row: 1 / span 4; padding: 0 0 0 32px; border-top: 0; border-left: 1px solid var(--nova-surface-hairline); }
+.live-host-shell .live-workspace-viewport .live-session-panel { grid-template-columns: minmax(480px, 1fr) minmax(300px, 380px); }
+.live-host-shell .live-workspace-viewport .live-session-panel .live-section-heading { grid-column: 1 / -1; }
+.live-host-shell .live-workspace-viewport .live-session-panel .live-admission-code { grid-column: 2; grid-row: 2; }
+.live-workspace-viewport .live-host-translation-composition { grid-template-columns: minmax(480px, 1fr) minmax(280px, 360px); }
+.live-workspace-viewport .live-host-inspector { max-width: 360px; }
+.live-workspace-viewport .live-mode-grid,
+.live-workspace-viewport .live-monitor-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.live-workspace-viewport .live-language-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+.live-workspace-viewport :is(.live-action-row, .live-invite-actions, .live-host-immediate-controls) { flex-wrap: nowrap; overflow-x: auto; padding-block: 4px; }
+.live-workspace-viewport :is(button, .live-invite-actions a) { flex-shrink: 0; white-space: nowrap; }
+.live-workspace-viewport :is(.live-surface-actions, .live-invite-actions) { display: grid; grid-auto-flow: column; grid-auto-columns: minmax(200px, 1fr); min-width: 0; max-width: 100%; justify-content: normal; }
+.live-workspace-viewport :is(.live-surface-actions, .live-invite-actions) > :is(button, a) { display: flex; min-width: 0; min-height: 44px; width: 100%; margin-inline: 0; align-items: center; justify-content: safe center; padding-inline: 16px; overflow-x: auto; white-space: nowrap; }
+.live-workspace-viewport .live-surface-actions [data-host-primary] { min-width: 0; margin-left: 0; }
+.live-workspace-viewport :is(.live-invite-share, .live-setting-row, .live-capability-switch > span) { min-width: 0; max-width: 100%; }
+.live-workspace-viewport :is(.live-text-field > span, .live-setting-row small, .live-field-label strong, .live-field-label small) { min-width: 0; overflow-x: auto; white-space: nowrap; }
+.live-workspace-viewport .live-setting-row:not(.live-capability-switch) { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.live-workspace-viewport .live-host-preview-card dl > div { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+
+.live-workspace-viewport :is(.live-host-page-heading h1, .live-review-list dd, .live-session-facts dd, .live-host-preview-card dd, .live-setting-row strong) { min-width: 0; overflow: auto; text-overflow: clip; white-space: nowrap; overflow-wrap: normal; }
+.live-workspace-viewport .live-host-page-heading > div { min-width: 0; }
+.live-viewer-shell.is-join { overflow: auto; }
+.live-viewer-shell.is-compact.is-join { position: static; display: block; height: auto; min-height: 100dvh; overflow: auto; }
+.live-viewer-shell.is-join :is(button, summary),
+.live-login-form label { white-space: nowrap; }
+.live-viewer-shell.is-join .live-join-card { min-width: 0; overflow-x: auto; padding-inline: 4px; }
+.live-speak-scrim { overflow: auto; }
+.live-speak-sheet { box-sizing: border-box; max-width: 100%; max-height: calc(100dvh - 16px); overflow: auto; }
+.live-speak-sheet > * { flex-shrink: 0; }
+.live-speak-sheet header { position: sticky; top: -10px; z-index: 1; background: var(--nova-surface-float); }
+.live-speak-sheet header strong { overflow-x: auto; text-overflow: clip; }
+
+@media (max-width: 760px) {
+  .live-host-shell:has(.live-workspace-viewport) { display: grid; grid-template-columns: minmax(0, 1fr); grid-template-rows: auto minmax(0, 1fr); }
+  .live-host-shell:has(.live-workspace-viewport) .live-host-rail { min-width: 0; flex-wrap: nowrap; overflow-x: auto; }
+  .live-host-shell:has(.live-workspace-viewport) .live-host-rail > * { flex-shrink: 0; }
+  .live-host-shell:has(.live-workspace-viewport) .live-host-participant-link { flex-basis: auto; }
+}
+
+
+/* 2026-08-31 fix: The notebook owns layout; legacy compact grids must not add scroll containers. */
+.live-viewer-shell[data-reading-state="live"],
+.live-viewer-shell[data-reading-state="ended"] { display: block; padding: 0; gap: 0; }
+.live-viewer-shell[data-reading-state="live"] { position: relative; height: 100dvh; min-height: 0; overflow: hidden; }
+.live-viewer-shell[data-reading-state="live"] .viewer-notebook { height: 100%; min-height: 0; overflow: hidden; }
+.live-viewer-shell[data-reading-state="live"] .viewer-notebook > :not(.live-viewer-caption-region) { flex-shrink: 0; }
+.live-viewer-shell[data-reading-state="live"] .live-viewer-caption-region { display: flex; flex-direction: column; flex: 1 1 0; min-height: 0; overflow: hidden; }
+.live-viewer-shell[data-reading-state="live"] .live-viewer-caption-region > section:has(> [role="tablist"]) { display: flex; flex-direction: column; flex: 1 1 0; min-height: 0; overflow: hidden; }
+.live-viewer-shell[data-reading-state="live"] .live-viewer-caption-region [role="tablist"] { flex-shrink: 0; }
+.live-viewer-shell[data-reading-state="live"] .live-viewer-caption-region [role="tabpanel"] { display: flex; flex: 1 1 0; min-height: 0; overflow: hidden; }
+.live-viewer-shell[data-reading-state="live"] .viewer-reading-feed { display: flex; flex-direction: column; flex: 1 1 0; min-height: 0; overflow: hidden; }
+.live-viewer-shell[data-reading-state="live"] .viewer-reading-scroll { flex: 1 1 0; min-height: 0; max-height: none; overflow-y: auto; overflow-x: hidden; padding-top: 0; scrollbar-width: thin; scrollbar-color: var(--nova-hairline-strong) var(--nova-web-background); }
+.live-viewer-shell[data-reading-state="live"] .viewer-microphone-slot { position: relative; flex: 0 0 auto; }
+.live-viewer-shell[data-reading-state="ended"] { position: relative; inset: auto; height: auto; min-height: 100dvh; overflow: visible; }
+.live-viewer-shell[data-reading-state="ended"] .viewer-notebook { height: auto; min-height: 100dvh; overflow: visible; }
+.live-viewer-shell[data-reading-state="ended"] .live-ended-view { min-height: 0; overflow: visible; }
+
+/* 2026-08-31 feat: 녹음·정지 아이콘은 실제 발언 상태만 표현하며 캡슐의 위치와 너비를 유지한다. */
+.viewer-notebook .viewer-microphone-capsule {
+  transition: background 100ms ease-in-out, transform var(--nova-spring-rapid) var(--nova-ease-back);
+  touch-action: manipulation;
+}
+.viewer-notebook .viewer-microphone-capsule > svg { flex: 0 0 auto; animation: viewer-record-icon-in var(--nova-spring-rapid) var(--nova-ease-out) both; }
+.viewer-notebook .viewer-microphone-capsule[data-speak-state="starting"] > svg { animation: viewer-record-wait calc(var(--nova-spring-med) * 2) linear infinite; }
+.viewer-notebook .viewer-microphone-capsule:focus-visible { outline: 2px solid var(--nova-web-action); outline-offset: 4px; }
+.viewer-notebook .viewer-microphone-capsule:not(:disabled):active { transform: scale(.97); transition-timing-function: var(--nova-ease-out); }
+.viewer-notebook .viewer-microphone-capsule:disabled { transform: none; }
+@media (hover: hover) and (pointer: fine) {
+  .viewer-notebook .viewer-microphone-capsule:not(:disabled):hover { background: color-mix(in srgb, var(--nova-web-action) 88%, var(--nova-web-text)); transform: translateY(-1px); }
+  .viewer-notebook .viewer-microphone-capsule:not(:disabled):hover:active { transform: scale(.97); }
+}
+@keyframes viewer-record-icon-in { from { opacity: .45; transform: scale(.8); } to { opacity: 1; transform: scale(1); } }
+@keyframes viewer-record-wait { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) {
+  .viewer-notebook .viewer-microphone-capsule,
+  .viewer-notebook .viewer-microphone-capsule > svg,
+  .viewer-notebook .viewer-microphone-capsule:not(:disabled):hover,
+  .viewer-notebook .viewer-microphone-capsule:not(:disabled):active,
+  .viewer-notebook .viewer-microphone-capsule:not(:disabled):hover:active { animation: none; transition: none; transform: none; }
 }

@@ -48,6 +48,11 @@ venv/
 .playwright-cli/
 .claude/agent-memory/
 .claude/worktrees/
+.codex-artifacts/
+.realtime-noel-dev/
+
+# Vercel CLI project link (machine-local)
+.vercel/
 
 # Design-QA and audit screenshots: regenerable artifacts, not sources.
 output/
@@ -57,3 +62,4 @@ output/
 .idea/
 .vscode/
 *.swp
+.gstack/

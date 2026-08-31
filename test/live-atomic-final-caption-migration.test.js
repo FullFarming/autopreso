@@ -35,8 +35,13 @@ test("combined RPC and publisher are service-only, single-call, and delivery-aft
   assert.match(adapter, /persist_live_final_caption_if_active/u);
   assert.doesNotMatch(adapter, /"\/rest\/v1\/rpc\/persist_live_snapshot_if_active"/u);
   assert.doesNotMatch(adapter, /"\/rest\/v1\/rpc\/persist_live_utterance_if_active"/u);
+  const publishStart = adapter.indexOf("async publish(");
+  const publishEnd = adapter.indexOf("\n  startTopicSession", publishStart);
+  assert.notEqual(publishStart, -1);
+  assert.ok(publishEnd > publishStart);
+  const publishBody = adapter.slice(publishStart, publishEnd);
   assert.ok(
-    adapter.indexOf("persist_live_final_caption_if_active") < adapter.indexOf("this.eventFanout(sessionId, language, event)"),
+    publishBody.indexOf("persist_live_final_caption_if_active") < publishBody.lastIndexOf("this.eventFanout(sessionId, language, event)"),
     "durable RPC must complete before final fanout/mirror",
   );
   assert.match(adapter, /failedDurableCaptionLanes\.add\(durableLaneKey\)[\s\S]*DURABLE_CAPTION_PERSIST_FAILED/iu);
@@ -51,5 +56,7 @@ test("fresh bootstrap contains the atomic migration byte-for-byte", async () => 
   const marker = `-- ${migrationName}`;
   const sectionStart = bootstrap.lastIndexOf(marker);
   assert.notEqual(sectionStart, -1);
-  assert.equal(bootstrap.slice(sectionStart + marker.length + 1), sql);
+  const contentStart = sectionStart + marker.length + 1;
+  const nextSection = bootstrap.indexOf("\n-- 202607", contentStart);
+  assert.equal(bootstrap.slice(contentStart, nextSection === -1 ? undefined : nextSection).trimEnd(), sql.trimEnd());
 });

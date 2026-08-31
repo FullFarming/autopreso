@@ -5,7 +5,9 @@
 import type { CaptionEvent } from "../live-contract";
 
 export const PIN_THRESHOLD_PX = 48;
-const COMMITTED_CAPTION_LIMIT = 5_000;
+// 2026-07-27 fix: Two hours at one committed sentence per second is 7,200
+// entries. Keep 66% recovery headroom without letting an abandoned tab grow forever.
+const COMMITTED_CAPTION_LIMIT = 12_000;
 
 /** Tracks which language histories have completed their first snapshot load.
  * Gateway subscription remains independent: a warm language still reconnects
@@ -89,7 +91,12 @@ export function isDisplayableCaption(
   const hasCanonicalLanguages = (caption.language === "en" || caption.language === "ko")
     && (caption.sourceLanguage === "en" || caption.sourceLanguage === "ko");
   if (!hasCanonicalLanguages) return false;
-  if (caption.origin === "source") return caption.language === caption.sourceLanguage;
+  // 2026-07-27 fix: Some canonical final paths omit the optional origin marker
+  // but identify the lane as verbatim. Requiring origin made the visible
+  // partial disappear the instant that final replaced it.
+  if (caption.origin === "source" || caption.translationStatus === "verbatim") {
+    return caption.language === caption.sourceLanguage;
+  }
   // 2026-07-26 fix: A translated web lane must have the same cross-language
   // provenance as the Electron caption it mirrors. Provider echoes and
   // uncorrelated intermediate output previously slipped into web history
@@ -116,6 +123,20 @@ function mergePartialCaption(current: CaptionEvent | null, incoming: CaptionEven
     return { ...incoming, text: current.text };
   }
   return incoming;
+}
+
+function mergeFinalCaption(current: CaptionEvent | undefined, incoming: CaptionEvent): CaptionEvent {
+  if (!current) return incoming;
+  const currentSpeaker = current.speaker;
+  const incomingSpeaker = incoming.speaker;
+  const speaker = currentSpeaker && incomingSpeaker
+    && currentSpeaker.speakerId === incomingSpeaker.speakerId
+    ? { ...currentSpeaker, ...incomingSpeaker }
+    : incomingSpeaker ?? currentSpeaker;
+  // 2026-07-27 fix: A reconnect snapshot is durable text authority, but its
+  // compact speaker shape may omit the participant profile received live.
+  // Merge the duplicate final instead of downgrading visible attribution.
+  return { ...current, ...incoming, speaker };
 }
 
 /** 2026-07-26 fix: Merge the canonical event stream into one language's visible record.
@@ -152,7 +173,7 @@ function mergeCaptionEvents(
   for (const event of incoming) {
     if (!normalizedCaptionText(event.text)) continue;
     if (event.isFinal) {
-      finalBySequence.set(event.seq, event);
+      finalBySequence.set(event.seq, mergeFinalCaption(finalBySequence.get(event.seq), event));
       latestFinalSequence = Math.max(latestFinalSequence, event.seq);
       // 2026-07-26 fix: An older snapshot may finish after a newer live partial.
       // Only the final that reaches that partial's sequence may commit it.

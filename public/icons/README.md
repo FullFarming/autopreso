@@ -1,7 +1,7 @@
 # Feather icons
 
 The SVG assets in this directory are unmodified copies of `radio`,
-`file-text`, `users`, and `settings` from the official Feather repository:
+`file-text`, `users`, `settings`, `globe`, `chevron-down`, and `check` from the official Feather repository:
 https://github.com/feathericons/feather
 
 Feather is distributed under the MIT License.

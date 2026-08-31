@@ -1,7 +1,16 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { createSpokenLanguageState, detectSourceLanguage, isTargetLanguageText, normalizeLanguageCode, resolveLanguageEvidence, toGeminiLanguageCode, toOpenAITranslationLanguageCode } from "./languageDetect";
+import { CAPTION_LANGUAGE_CODES } from "../../packages/caption-core/languages.js";
+import { LANGUAGE_CODES, LANGUAGE_LABELS, createSpokenLanguageState, detectSourceLanguage, isTargetLanguageText, normalizeLanguageCode, resolveLanguageEvidence, toGeminiLanguageCode } from "./languageDetect";
+
+test("webapp language codes mirror the caption-core canonical list exactly", () => {
+  // LANGUAGE_CODES stays a literal tuple so CanonicalLanguageCode remains a
+  // string-literal union; this pin keeps the tuple from drifting away from
+  // the caption-core source of truth.
+  assert.deepEqual([...LANGUAGE_CODES], [...CAPTION_LANGUAGE_CODES]);
+  assert.deepEqual(Object.keys(LANGUAGE_LABELS).sort(), [...CAPTION_LANGUAGE_CODES].sort());
+});
 
 test("source detection keeps English speech English when it contains a Korean name", () => {
   assert.equal(detectSourceLanguage("We met 김민수 at the Seoul office yesterday"), "en");
@@ -84,7 +93,6 @@ test("web language contract exposes fourteen canonical choices and provider mapp
   }
   assert.equal(toGeminiLanguageCode("ko"), "ko-KR");
   assert.equal(toGeminiLanguageCode("zh-Hant"), "zh-Hant");
-  assert.equal(toOpenAITranslationLanguageCode("zh-Hans"), "zh");
 });
 
 test("speaker boundary clears ambiguous fragments before the next speaker language", () => {

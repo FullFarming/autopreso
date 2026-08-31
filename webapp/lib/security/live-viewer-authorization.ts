@@ -3,7 +3,6 @@ import type { NextRequest } from "next/server";
 import {
   AuthenticationError,
   AuthorizationError,
-  getBearerToken,
   RECAP_GRANT_COOKIE,
   verifyRecapGrantToken,
   verifyViewerGrantToken,
@@ -13,12 +12,12 @@ import {
 import { SupabaseLiveAdmissionStore } from "./live-admission-store";
 
 export async function authorizeViewerRequest(
-  request: Pick<NextRequest, "headers" | "cookies">,
+  request: Pick<NextRequest, "cookies">,
   expectedSessionId: string,
   expectedLanguage: string,
   store: SupabaseLiveAdmissionStore = new SupabaseLiveAdmissionStore(),
 ): Promise<ViewerGrantClaims> {
-  const token = getBearerToken(request) ?? request.cookies.get(VIEWER_GRANT_COOKIE)?.value;
+  const token = request.cookies.get(VIEWER_GRANT_COOKIE)?.value;
   const claims = await verifyViewerGrantToken(token);
   if (claims.sessionId !== expectedSessionId) {
     throw new AuthorizationError("다른 라이브 세션의 입장권은 사용할 수 없습니다.");
@@ -28,12 +27,11 @@ export async function authorizeViewerRequest(
 }
 
 export async function authorizeParticipantRecordRequest(
-  request: Pick<NextRequest, "headers" | "cookies">,
+  request: { cookies: Pick<NextRequest["cookies"], "get"> },
   expectedSessionId: string,
   store: SupabaseLiveAdmissionStore = new SupabaseLiveAdmissionStore(),
 ): Promise<{ userId: string; access: "viewer" | "recap" }> {
-  const bearer = getBearerToken(request);
-  const viewerToken = bearer ?? request.cookies.get(VIEWER_GRANT_COOKIE)?.value;
+  const viewerToken = request.cookies.get(VIEWER_GRANT_COOKIE)?.value;
   if (viewerToken) {
     try {
       const claims = await verifyViewerGrantToken(viewerToken);
@@ -47,8 +45,8 @@ export async function authorizeParticipantRecordRequest(
       });
       return { userId: claims.userId, access };
     } catch (error: unknown) {
-      if (error instanceof AuthorizationError) throw error;
-      // 2026-07-23 feat: A 6-hour viewer credential may expire before recap access.
+      // 2026-08-31 fix: 저장소 장애와 권한 철회를 로그아웃 오류로 덮어쓰지 않는다.
+      if (!(error instanceof AuthenticationError)) throw error;
     }
   }
   const recapToken = request.cookies.get(RECAP_GRANT_COOKIE)?.value;

@@ -171,6 +171,28 @@ white initials.
 Toss's `greyOpacity` ramp exists precisely so one component composites correctly
 over any background in either mode. This is the mechanism, not a shortcut.
 
+### 5.7 Web interface — three-color palette
+
+The web app uses three primitives, including admin, participant entry, login,
+records, and dialogs. These web decisions override the older desktop surface
+and brand ramps above for product chrome.
+
+| Role | Token | Value |
+|---|---|---|
+| Background | `--nova-web-background` | `#15151A` |
+| Text | `--nova-web-text` | `#FFFFFF` |
+| Action / selection / focus | `--nova-web-action` | `#0071E3` |
+
+The page, rail, workspace, cards, input surfaces, dialog, and sticky footer
+share the background token. Separate areas with spacing and alpha-white
+borders rather than unrelated dark fills. Muted text, disabled controls, hover
+and selected-state tints derive only from these three primitives. Primary
+actions use white text on blue; secondary actions remain outlined.
+
+Error, warning, live/microphone status, and stable speaker identities retain
+their semantic colors. Captions and presentation surfaces keep their dark
+reading treatment; QR images retain the contrast required for scanning.
+
 ---
 
 ## 6. Typography
@@ -244,6 +266,27 @@ compact    → 22px / 1.4
 ```
 
 Sub-pixel steps `10.5 / 11.5 / 12.5 / 13.5px` in the current CSS all go.
+
+### 6.4 Web interface typography and aligned controls
+
+The web admin, participant entry, login, and dialogs use one ordinary-text row:
+
+| Token | Family | px | line-height | weight | letter-spacing |
+|---|---|---|---|---|---|
+| `--nova-ui-font` | self-hosted Pretendard with locale system fallback | 16 | 24 | 400 | -0.02em |
+
+Labels, values, help text, inputs, buttons, badges, and navigation all use this
+row. Page and section headings retain the heading scale and weight 600, using
+the same family. Status is communicated with color and placement rather than
+another font size or weight. The line-height token is unitless `1.5` (24px at
+16px), so inherited display text scales its line box with its size.
+User-adjustable captions, presentation access codes, countdowns, and icon
+geometry retain their own display rules.
+
+Peer fields and choices use equal-width `minmax(0, 1fr)` tracks. Session titles
+and multiline agendas can span a complete row. Long controls keep a single
+line and scroll within their available width; they do not enlarge one column.
+Workspace zoom and dialog-contained scrolling remain available on narrow views.
 
 ---
 

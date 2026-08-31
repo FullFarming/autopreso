@@ -1,6 +1,6 @@
 # Realtime Noel Web
 
-호스트 한 명의 오디오를 Cloud Run 미디어 게이트웨이로 보내고, 최대 3개 언어를 최대 50명의 웹·모바일·Chrome 시청자에게 공유하는 사내용 Live 화면입니다.
+호스트 한 명의 오디오를 Cloud Run 미디어 게이트웨이로 보내고, 최대 3개 언어를 최대 200명의 웹·모바일·Chrome 시청자에게 공유하는 사내용 Live 화면입니다.
 
 - `Presentation`: Gemini 3.5 Live Translate의 번역 자막과 선택적 native 번역 음성
 - `Meeting`: Cloud STT V2 화자 분리 후 화자 고정 자막과 선택적 Chirp 3 HD 통역 음성
@@ -25,12 +25,17 @@
 | `ALLOWED_ORIGINS` | 정확히 허용할 웹 origin 목록 |
 | `CHROME_EXTENSION_ORIGIN` | 조직 배포 후 확정된 `chrome-extension://<32자 ID>` |
 | `NEXT_PUBLIC_LIVE_GATEWAY_URL` | `/live`를 포함한 Cloud Run `wss://` 주소 |
+| `NEXT_PUBLIC_LIVE_GATEWAY_PREWARM_ENABLED` | 기본 활성. 열린 호스트 화면이 예약 시작 60분 전에 백업 웜업을 수행하며 `false`로만 비활성화 |
+| `LIVE_GATEWAY_URL` | 서버 예약 작업이 사용하는 동일한 Cloud Run `wss://` 주소 |
+| `CRON_SECRET` | 5분 주기 예약 기동 API용 32자 이상 Bearer secret |
 | `NEXT_PUBLIC_SUPABASE_URL` | Supabase 프로젝트 URL |
 | `NEXT_PUBLIC_SUPABASE_ANON_KEY` | 브라우저 anonymous auth용 현재 `sb_publishable` 공개 키(호환 변수명) |
 | `SUPABASE_SECRET_KEY` | 서버 전용 컴포넌트별 `sb_secret` REST/RPC 키 |
 | `SUPABASE_SERVICE_ROLE_KEY` | 임시 legacy fallback; 새 연결에는 사용하지 않음 |
 
 로컬 `next dev`에서만 약한 테스트 계정을 써야 할 때는 `.env.development.local`에 `LIVE_ALLOW_WEAK_TEST_LOGIN=true`, `LIVE_TEST_LOGIN_ID`, `LIVE_TEST_LOGIN_PASSWORD`를 명시합니다. production build/runtime에서는 이 경로가 거부됩니다.
+
+예약 세션이 시작 60분 이내로 들어오면 Vercel Cron이 5분마다 게이트웨이 `/health`를 호출합니다. Cloud Run `min=0`을 유지하면서 해당 준비 구간에만 인스턴스를 깨워 두며, 예약 세션이 없으면 요청하지 않습니다. 열린 호스트 화면의 웜업은 서버 작업이 지연될 때를 위한 백업입니다.
 
 예시는 `.env.example`을 참고합니다. 실제 secret은 저장소에 커밋하지 않습니다.
 

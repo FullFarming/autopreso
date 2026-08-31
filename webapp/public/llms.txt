@@ -1,0 +1,10 @@
+# NOVA
+
+> Real-time translated captions for live calls, with participant access designed for viewing rather than speaking.
+
+NOVA lets authorized hosts create live calls and share a link or QR code. Participants can join from a browser and read translated captions in their selected language.
+
+## Public pages
+
+- [Join a live call](/watch): Open the participant entry page for a shared live-call invitation.
+- [Host sign in](/login): Sign in as an authorized host to create and manage a live call.

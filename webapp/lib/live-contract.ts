@@ -1,8 +1,35 @@
+import type { LanguageObservation, SourceEvent, SourceDraftEvent, SourceDraftClearEvent } from "./live/source-contract";
+export type { LanguageObservation, SourceEvent, SourceSnapshot, SourceDraftEvent, SourceDraftClearEvent } from "./live/source-contract";
+
+import type {
+  LiveTopicMembership,
+  LiveTopicPublicMetadata,
+  LiveTopicSnapshot,
+  LiveTopicUpsertEvent,
+} from "./security/live-topic-validation";
+import type { BuiltinGlossaryId } from "./glossary-presets/types";
+
+export type {
+  LiveTopicMembership,
+  LiveTopicPublicMetadata,
+  LiveTopicSnapshot,
+  LiveTopicUpsertEvent,
+} from "./security/live-topic-validation";
+
 export type LiveSessionType = "presentation" | "meeting";
-export type LiveOutputMode = "captions" | "captions_audio" | "audio";
-export type LiveVoiceProvider = "gemini" | "openai";
+export type LiveOutputMode = "captions";
+export type LiveVoiceProvider = "gemini";
 export type GlossaryPack = "general_cre" | "hotel" | "fnb";
+export type { BuiltinGlossaryId } from "./glossary-presets/types";
+export type GlossarySourceKind = "builtin" | "host";
 export type VoiceStatus = "disabled" | "analyzing" | "ready" | "unavailable";
+export type LiveEventType = "earnings_call" | "investor_day" | "conference" | "other";
+export type LiveSessionSection = "prepared_remarks" | "qa" | "other";
+
+export interface LiveAgendaItem {
+  ordinal: number;
+  label: string;
+}
 
 export type LiveSessionStatus = "preparing" | "live" | "paused" | "stopped" | "failed";
 export type CaptionTranslationStatus = "verbatim" | "translated" | "failed";
@@ -13,7 +40,9 @@ export interface LiveSession {
   title: string;
   scheduledAt: string | null;
   sessionType: LiveSessionType;
+  /** @deprecated Stored-row compatibility only. All new sessions are captions-only. */
   outputMode: LiveOutputMode;
+  /** @deprecated Stored-row compatibility only. Caption contract v2 has no voice provider. */
   voiceProvider: LiveVoiceProvider;
   maxViewers: number;
   glossaryPack: GlossaryPack;
@@ -27,9 +56,57 @@ export interface LiveSession {
   /** Contract C10: true when a stage/waiting-room cover image was uploaded.
    *  Clients fetch it from GET /api/live-sessions/[id]/cover. */
   hasCoverImage?: boolean;
-  /** Content-hash version of the cover — clients append it as a cache key
-   *  so replacing the cover refreshes already-open stages and viewers. */
+  /** Opaque per-upload version — clients append it as a cache key so replacing
+   *  the cover refreshes already-open stages and viewers. */
   coverImageVersion?: string | null;
+  companyName?: string | null;
+  ticker?: string | null;
+  fiscalPeriod?: string | null;
+  eventType?: LiveEventType | null;
+  agenda?: LiveAgendaItem[];
+  activeSection?: LiveSessionSection;
+  sectionStartedAt?: string | null;
+  /** Host-owned pre-call capability. Viewers may request the shared floor only
+   * when this server-projected value is exactly true. */
+  participantSpeakingEnabled: boolean;
+  /** Server-owned gateway activation key for the CURRENT activation epoch
+   *  (written by the gateway's readiness RPC). A second host client that
+   *  presents the SAME key on `start` reattaches the live pipeline warm
+   *  (web↔Electron handover); a different key forces a cold restart. Host-only
+   *  data — viewer projections (admission store) never include it. */
+  activationKey?: string | null;
+}
+
+export interface LiveSessionGlossaryPin {
+  sessionId: string;
+  version: number;
+  pinnedGlossaryPresetId: string;
+  pinnedGlossaryVersion: number;
+  pinnedGlossaryFingerprint: string;
+  updatedAt: string;
+}
+
+export type LiveSessionGlossaryPinSelection = {
+  sourceKind: "builtin";
+  sourceId: BuiltinGlossaryId;
+  documentVersion?: 1;
+} | {
+  sourceKind: "host";
+  sourceId: string;
+  documentVersion: number;
+};
+
+export type LiveSessionGlossaryPinItem = LiveSessionGlossaryPinSelection & {
+  ordinal: number;
+  documentVersion: number;
+  fingerprint: string | null;
+};
+
+export interface LiveSessionGlossaryPins {
+  sessionId: string;
+  version: number;
+  glossaries: LiveSessionGlossaryPinItem[];
+  updatedAt: string;
 }
 
 export interface LiveParticipantIdentity {
@@ -38,12 +115,31 @@ export interface LiveParticipantIdentity {
   jobTitle: string;
 }
 
-export type JoinLiveSessionInput = LiveParticipantIdentity & {
+export interface LiveAttendeeSelfProfile {
+  email: string;
+  displayName: string;
+  company: string;
+  department: string;
+  jobTitle: string;
+  summaryConsent: boolean;
+}
+
+export type JoinLiveSessionInput = LiveAttendeeSelfProfile & {
   accessToken: string;
   deviceId: string;
-  inviteToken?: string;
-  admissionCode?: string;
-};
+} & ({
+  inviteToken: string;
+  accessCode?: never;
+} | {
+  inviteToken?: never;
+  accessCode: string;
+});
+
+export interface LiveHostParticipantActivity extends LiveParticipantActivity {
+  email: string | null;
+  company: string | null;
+  summaryConsentAt: string | null;
+}
 
 export interface LiveParticipantActivity extends LiveParticipantIdentity {
   participantId: string;
@@ -101,6 +197,7 @@ export interface CaptionEvent {
   /** Normalized language the utterance was recognized in, or null when the
    *  STT provider reported none. */
   sourceLanguage?: string | null;
+  languageObservation?: LanguageObservation;
   /** "verbatim": `text` is the original. "translated": `text` is a real
    *  translation of `sourceText`. "failed": translation failed and the
    *  original was published on this lane, so `text` is NOT in `language` —
@@ -136,6 +233,8 @@ export interface LiveSnapshot {
   lastSeq: number;
   captions: CaptionEvent[];
   speakers: SpeakerAssignment[];
+  topics: LiveTopicPublicMetadata[];
+  topicMemberships: LiveTopicMembership[];
 }
 
 export interface RecordingStatusEvent {
@@ -152,13 +251,13 @@ export type LiveControlEvent =
   | { type: "session-status"; sessionId: string; status: LiveSessionStatus; code?: string }
   | { type: "floor"; sessionId: string; holder: LiveFloorHolder | null }
   | { type: "language-status"; sessionId: string; language: string; status: "preparing" | "ready" | "unavailable"; code?: string }
-  | { type: "audio-control"; seq: number; sessionId: string; language: string; action: "clear" | "restart"; reason: "interrupted" | "queue_restart" }
   | { type: "speaker-legend"; sessionId: string; speakers: SpeakerAssignment[] }
   | { type: "language-removed"; sessionId: string; language: string; code: "LANGUAGE_REMOVED" }
+  | LiveTopicUpsertEvent
   | RecordingStatusEvent
   | { type: "error"; sessionId: string; code: string; message: string };
 
-export type LiveBroadcastEvent = CaptionEvent | LiveControlEvent;
+export type LiveBroadcastEvent = CaptionEvent | SourceEvent | SourceDraftEvent | SourceDraftClearEvent | LiveControlEvent;
 
 export type ApiSuccess<T> = { ok: true; data: T };
 export type ApiFailure = { ok: false; error: string; code: string };
@@ -169,10 +268,18 @@ export interface CreateLiveSessionInput {
   scheduledAt?: string | null;
   sessionType: LiveSessionType;
   languages: string[];
+  /** @deprecated Omit. Accepted temporarily only as the literal `captions`. */
   outputMode?: LiveOutputMode;
+  /** @deprecated Omit. Accepted temporarily only as the literal `gemini`. */
   voiceProvider?: LiveVoiceProvider;
   maxViewers?: number;
   glossaryPack?: GlossaryPack;
+  companyName?: string | null;
+  ticker?: string | null;
+  fiscalPeriod?: string | null;
+  eventType?: LiveEventType | null;
+  agenda?: string[];
+  participantSpeakingEnabled?: boolean;
 }
 
 export interface UpdateLiveSessionInput {
@@ -181,10 +288,18 @@ export interface UpdateLiveSessionInput {
   scheduledAt?: string | null;
   sessionType?: LiveSessionType;
   languages?: string[];
+  /** @deprecated Omit. Accepted temporarily only as the literal `captions`. */
   outputMode?: LiveOutputMode;
+  /** @deprecated Omit. Accepted temporarily only as the literal `gemini`. */
   voiceProvider?: LiveVoiceProvider;
   maxViewers?: number;
   glossaryPack?: GlossaryPack;
+  companyName?: string | null;
+  ticker?: string | null;
+  fiscalPeriod?: string | null;
+  eventType?: LiveEventType | null;
+  agenda?: string[];
+  participantSpeakingEnabled?: boolean;
 }
 
 export interface AudioChunkEvent {
