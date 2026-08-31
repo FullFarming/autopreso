@@ -20,7 +20,12 @@ import { createMoonshineTranscription as createDefaultMoonshineTranscription } f
 import { createOpenAITranscription as createDefaultOpenAITranscription } from "./openai-transcription.js";
 import { audioSecondsFromBase64Pcm16 } from "./session-cost.js";
 import { DEFAULT_SUBTITLE_SETTINGS, validateAgentInstructions, validateSubtitleSettings } from "./settings-store.js";
-import { generateGeminiText } from "./gemini-text-generation.js";
+import { generateGeminiText, generateGeminiTextWithModelFallback } from "./gemini-text-generation.js";
+
+// gemini-3.7-flash is the primary text workload model (caption polish,
+// transcript summaries). These are availability fallbacks only — one attempt
+// each when the primary is transiently unavailable, never a quality override.
+const SUBTITLE_POLISH_FALLBACK_MODELS = Object.freeze(["gemini-3.6-flash", "gemini-flash-lite-latest"]);
 import { GLOSSARY_PRESETS } from "./glossary-presets.js";
 import { createSessionTranscripts } from "./session-transcripts.js";
 import { createSubtitleChannelHub, isRetiredTranslatedAudioMessage } from "./subtitle-channels.js";
@@ -411,8 +416,16 @@ export async function startServer(options) {
     const polishOptions = selectSubtitlePolishOptions({ args, saved, env });
     if (!polishOptions) return args?.translatedText;
     const polisher = createSubtitlePolisher({
-      generateText: options.subtitleGeminiPolishGenerateText ?? ((request) => generateGeminiText({
+      // Availability routing (2026-08-31 outage): gemini-3.7-flash stays the
+      // primary text model, but a transient 5xx/hang on it must not turn every
+      // committed caption into TEXT_TRANSLATION_FAILED — one attempt per
+      // fallback model inside the polisher's own 6s deadline.
+      generateText: options.subtitleGeminiPolishGenerateText ?? ((request) => generateGeminiTextWithModelFallback({
         ...request,
+        models: [
+          polishOptions.modelId,
+          ...SUBTITLE_POLISH_FALLBACK_MODELS.filter((fallbackModel) => fallbackModel !== polishOptions.modelId),
+        ],
         apiKey: polishOptions.apiKey,
         fetchImpl: options.fetchImpl ?? globalThis.fetch,
       })),
@@ -512,10 +525,12 @@ export async function startServer(options) {
     const geminiKey = saved.apiKeys?.gemini || env.GEMINI_API_KEY || "";
     if (geminiKey) {
       const model = DEFAULT_SUBTITLE_SETTINGS.geminiPolishModel;
-      return (request) => generateGeminiText({
+      return (request) => generateGeminiTextWithModelFallback({
         ...request,
+        models: [model, ...SUBTITLE_POLISH_FALLBACK_MODELS.filter((fallbackModel) => fallbackModel !== model)],
         apiKey: geminiKey,
-        model,
+        // Summaries produce long output; give each model attempt a real window.
+        perAttemptTimeoutMs: 20_000,
         fetchImpl: options.fetchImpl ?? globalThis.fetch,
       });
     }

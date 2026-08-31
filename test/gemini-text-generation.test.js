@@ -119,3 +119,94 @@ test("generateGeminiText redacts identities and credentials immediately before p
   assert.match(calls[0].contents[0].parts[0].text, /매출 123456, 영업이익 987654/u);
   assert.equal(calls[0].systemInstruction.parts[0].text, "[CODE]");
 });
+
+// 2026-08-31 outage: generativelanguage returned intermittent 503/404 (and
+// occasional >25s hangs) on gemini-3.7-flash while gemini-3.6-flash stayed
+// healthy. One failed polish call turned EVERY committed caption into
+// TEXT_TRANSLATION_FAILED. The fallback chain keeps one attempt per model —
+// it is availability routing, not a blind retry.
+test("model fallback tries the next model on a transient failure and returns its text", async () => {
+  const { generateGeminiTextWithModelFallback } = await import("../src/gemini-text-generation.js");
+  const calls = [];
+  const result = await generateGeminiTextWithModelFallback({
+    apiKey: TEST_API_KEY,
+    models: ["gemini-3.7-flash", "gemini-3.6-flash"],
+    prompt: "polish this",
+    fetchImpl: async (url) => {
+      calls.push(String(url));
+      if (calls.length === 1) return { ok: false, status: 503, json: async () => ({}) };
+      return { ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text: "fallback line" }] } }] }) };
+    },
+  });
+  assert.equal(result.text, "fallback line");
+  assert.equal(calls.length, 2);
+  assert.match(calls[0], /gemini-3\.7-flash/u);
+  assert.match(calls[1], /gemini-3\.6-flash/u);
+});
+
+test("model fallback does not mask non-transient failures and stops on the first", async () => {
+  const { generateGeminiTextWithModelFallback } = await import("../src/gemini-text-generation.js");
+  const calls = [];
+  await assert.rejects(generateGeminiTextWithModelFallback({
+    apiKey: TEST_API_KEY,
+    models: ["gemini-3.7-flash", "gemini-3.6-flash"],
+    prompt: "polish this",
+    fetchImpl: async (url) => {
+      calls.push(String(url));
+      return { ok: false, status: 403, json: async () => ({}) };
+    },
+  }), /HTTP 403/u);
+  assert.equal(calls.length, 1, "an auth/config failure is identical on every model — never burn fallbacks on it");
+});
+
+test("model fallback escapes a hanging model via the per-attempt timeout", async () => {
+  const { generateGeminiTextWithModelFallback } = await import("../src/gemini-text-generation.js");
+  const calls = [];
+  const result = await generateGeminiTextWithModelFallback({
+    apiKey: TEST_API_KEY,
+    models: ["gemini-3.7-flash", "gemini-3.6-flash"],
+    prompt: "polish this",
+    perAttemptTimeoutMs: 30,
+    fetchImpl: (url, init) => {
+      calls.push(String(url));
+      if (calls.length === 1) {
+        return new Promise((_resolve, reject) => {
+          init.signal.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
+        });
+      }
+      return Promise.resolve({ ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text: "rescued" }] } }] }) });
+    },
+  });
+  assert.equal(result.text, "rescued");
+  assert.equal(calls.length, 2);
+});
+
+test("model fallback respects the caller's abort and never continues past it", async () => {
+  const { generateGeminiTextWithModelFallback } = await import("../src/gemini-text-generation.js");
+  const outer = new AbortController();
+  const calls = [];
+  const pending = generateGeminiTextWithModelFallback({
+    apiKey: TEST_API_KEY,
+    models: ["gemini-3.7-flash", "gemini-3.6-flash"],
+    prompt: "polish this",
+    abortSignal: outer.signal,
+    fetchImpl: (url, init) => {
+      calls.push(String(url));
+      return new Promise((_resolve, reject) => {
+        init.signal.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
+      });
+    },
+  });
+  outer.abort();
+  await assert.rejects(pending);
+  assert.equal(calls.length, 1, "the caller's deadline ends the whole chain, not just the attempt");
+});
+
+test("transient HTTP failures carry their status for fallback routing", async () => {
+  await assert.rejects(generateGeminiText({
+    apiKey: TEST_API_KEY,
+    model: "gemini-3.7-flash",
+    prompt: "polish this",
+    fetchImpl: async () => ({ ok: false, status: 503, json: async () => ({}) }),
+  }), (error) => error.status === 503 && /HTTP 503/u.test(error.message));
+});

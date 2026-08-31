@@ -116,12 +116,69 @@ async function generateGeminiTextRequest({
   });
 
   if (!response.ok) {
-    throw new Error(`Gemini text generation failed: HTTP ${response.status}`);
+    const failure = new Error(`Gemini text generation failed: HTTP ${response.status}`);
+    // @ts-expect-error status rides along for fallback routing.
+    failure.status = response.status;
+    throw failure;
   }
 
   const body = await response.json();
   const text = extractTextFromResponseBody(body).trim();
   return { text: text || "" };
+}
+
+// 2026-08-31 outage: generativelanguage intermittently answered gemini-3.7-flash
+// with 503 UNAVAILABLE ("high demand"), empty-body 404s, and >25s hangs while
+// gemini-3.6-flash stayed healthy the whole time. These statuses are provider
+// availability noise, not caller mistakes, so they may move to the next model.
+const TRANSIENT_GEMINI_TEXT_STATUSES = new Set([404, 408, 429, 500, 502, 503, 504]);
+const DEFAULT_PER_ATTEMPT_TIMEOUT_MS = 2_800;
+
+/**
+ * One attempt per model, first success wins. This is availability routing for
+ * latency-bound caption work, NOT a blind retry: a non-transient failure
+ * (auth, bad request) is identical on every model and rethrows immediately,
+ * and the caller's abort ends the whole chain.
+ *
+ * @param {GeminiTextOptions & {models?: readonly unknown[], perAttemptTimeoutMs?: number}} [options]
+ */
+export async function generateGeminiTextWithModelFallback({
+  apiKey,
+  models = [],
+  system = "",
+  prompt = "",
+  abortSignal,
+  fetchImpl = globalThis.fetch,
+  perAttemptTimeoutMs = DEFAULT_PER_ATTEMPT_TIMEOUT_MS,
+} = {}) {
+  const modelIds = [...new Set(models.map((value) => String(value ?? "").trim()).filter(Boolean))];
+  if (modelIds.length === 0) throw new Error("Gemini text model is required.");
+  let lastFailure = null;
+  for (const modelId of modelIds) {
+    if (abortSignal?.aborted) break;
+    const attemptController = new AbortController();
+    const abortAttempt = () => attemptController.abort();
+    abortSignal?.addEventListener("abort", abortAttempt, { once: true });
+    const attemptTimer = setTimeout(abortAttempt, perAttemptTimeoutMs);
+    try {
+      return await generateGeminiTextRequest({
+        apiKey, model: modelId, system, prompt, fetchImpl,
+        abortSignal: attemptController.signal,
+      });
+    } catch (error) {
+      lastFailure = error;
+      const status = error && typeof error === "object" ? /** @type {{status?: unknown}} */ (error).status : undefined;
+      const isTransientStatus = typeof status === "number" && TRANSIENT_GEMINI_TEXT_STATUSES.has(status);
+      const isAttemptTimeout = attemptController.signal.aborted && !abortSignal?.aborted;
+      const isNetworkFailure = status === undefined && !(abortSignal?.aborted);
+      if (!isTransientStatus && !isAttemptTimeout && !isNetworkFailure) throw error;
+      if (abortSignal?.aborted) throw error;
+    } finally {
+      clearTimeout(attemptTimer);
+      abortSignal?.removeEventListener("abort", abortAttempt);
+    }
+  }
+  throw lastFailure ?? new Error("Gemini text generation failed: no model attempt completed.");
 }
 
 /** @param {{system: string, prompt: string, generationConfig: GeminiGenerationConfig}} options */
