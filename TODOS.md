@@ -13,3 +13,7 @@
 ## 웹 호스트 리허설 실측 (2026-08-22 /plan-eng-review에서 승인)
 
 - [ ] **리허설 실측 (운영, ~30분)** — ① 브라우저 탭 백그라운드/화면 꺼짐 시 호스트 오디오 연속성(기기별: macOS Safari/Chrome, Windows Chrome) ② EC/NS/AGC=true가 행사장 마이크 STT 정확도에 주는 영향. 웹 호스트 갭 구현 완료 후 실제 기기에서. 결과에 따라 getUserMedia 제약 재검토.
+
+## 빌드 인프라 (2026-08-31 /ship 클린 워크트리 검증에서 발견)
+
+- [ ] **루트 npm ci 파손 — moonshine 사이드카 락파일 불일치 (P1)** — package.json optionalDependencies가 `@realtime-noel/moonshine-darwin-{arm64,x64}@0.1.1`(npm 레지스트리 404, 미공개)을 가리키는데 package-lock.json에 해당 `node_modules/...` 항목이 없어 npm 11에서 `npm ci`가 EUSAGE로 실패. main에도 동일한 선재 결함(락파일 항목 0개). 해결: 사이드카를 실제 npm에 공개하거나, 공개 전까지 optionalDependencies를 제거/file: 참조로 전환하고 release-please extra-files 흐름과 정합 확인. Files: package.json, package-lock.json, release-please-config.json

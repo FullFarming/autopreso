@@ -68,9 +68,12 @@ test("resolveMoonshineSidecarPath reports a clear error when no sidecar package 
 });
 
 test("resolveMoonshineSidecarPath falls back to packaged local sidecars", () => {
+  // fileExists is injected: the real binary under packages/*/bin is gitignored
+  // (built by build:moonshine-sidecars), so a clean clone must not fail here.
   const resolved = resolveMoonshineSidecarPath({
     platform: "darwin",
     arch: "arm64",
+    fileExists: (filePath) => !filePath.includes("app.asar.unpacked"),
     requireResolve: () => {
       const error = new Error("missing");
       error.code = "MODULE_NOT_FOUND";
