@@ -3,7 +3,7 @@ import crypto from "node:crypto";
 import test from "node:test";
 
 import { createCaptionPcmResampler } from "../src/caption-pcm-resampler.js";
-import { createGeminiTransport } from "../src/gemini-live-translate.js";
+import { createGeminiTranscribeTransport } from "../src/gemini-live-transcribe.js";
 
 function pcm16Buffer(samples) {
   const buffer = Buffer.alloc(samples.length * 2);
@@ -42,7 +42,7 @@ test("Gemini Caption-only transport uses the same shared FIR bytes", () => {
   const samples = Array.from({ length: 2_400 }, (_, index) => ((index * 97) % 20_000) - 10_000);
   const input = pcm16Buffer(samples);
   const expected = createCaptionPcmResampler()(input);
-  const payload = JSON.parse(createGeminiTransport().audioPayload(input.toString("base64")));
+  const payload = JSON.parse(createGeminiTranscribeTransport().audioPayload(input.toString("base64")));
 
   assert.deepEqual(Buffer.from(payload.realtimeInput.audio.data, "base64"), expected);
   assert.equal(payload.realtimeInput.audio.mimeType, "audio/pcm;rate=16000");

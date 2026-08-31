@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="ko" data-theme="dark">
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>NOVA Meeting Prep</title>
+    <link rel="stylesheet" href="/nova-core.css" />
+    <link rel="stylesheet" href="/meeting-coach.css" />
+  </head>
+  <body>
+    <main class="coach-shell" aria-labelledby="prep-title">
+      <header class="coach-topbar">
+        <div class="coach-title-group">
+          <span class="coach-wordmark" aria-label="NOVA">NOVA</span>
+          <span class="coach-title-rule" aria-hidden="true"></span>
+          <h1 id="prep-title" class="coach-title">APAC IT 미팅 준비</h1>
+          <span id="coach-status" class="coach-status" role="status" aria-live="polite">연결 확인</span>
+        </div>
+        <div class="coach-actions">
+          <button type="button" id="save-brief" class="coach-button secondary">저장</button>
+          <button type="button" id="freeze-brief" class="coach-button">확정</button>
+          <button type="button" id="open-live-windows" class="coach-button secondary">라이브 시작</button>
+        </div>
+      </header>
+      <section class="coach-main prep">
+        <section class="coach-panel prep-brief-panel" aria-labelledby="brief-preview-title">
+          <div class="coach-panel-header">
+            <span id="brief-preview-title" class="coach-label">회의 브리프</span>
+            <span id="brief-state" class="coach-badge is-warn">초안</span>
+          </div>
+          <div id="brief-state-surface" class="nova-state-host" role="status" aria-live="polite" aria-atomic="true" hidden></div>
+          <div class="prep-brief-scroll">
+            <form id="brief-form" class="coach-form" autocomplete="off">
+              <label class="coach-field">
+                <span class="coach-label">회의</span>
+                <input id="brief-title" class="coach-input" autocomplete="off" value="APAC IT Call" />
+              </label>
+              <label class="coach-field">
+                <span class="coach-label">상대</span>
+                <input id="brief-counterparty" class="coach-input" autocomplete="off" value="APAC IT Managers" />
+              </label>
+              <label class="coach-field">
+                <span class="coach-label">회의 배경</span>
+                <textarea id="brief-notes" class="coach-textarea tall">이번 달 한국 IT 현황, 랩탑 자산, 주요 전산 이슈를 공유합니다.</textarea>
+              </label>
+              <label class="coach-field">
+                <span class="coach-label">안건 · 한 줄씩</span>
+                <textarea id="brief-goals" class="coach-textarea">이번 달 특별 이슈 없음 여부 확인
+랩탑 자산 상태 공유
+글로벌 IT 이슈 확인</textarea>
+              </label>
+              <label class="coach-field">
+                <span class="coach-label">확인할 것 · 한 줄씩</span>
+                <textarea id="brief-contradictions" class="coach-textarea" placeholder="반납 대기 랩탑 수"></textarea>
+              </label>
+            </form>
+            <div class="brief-preview-heading coach-label">AI 정리</div>
+            <div id="brief-preview" class="brief-preview" aria-live="polite"></div>
+          </div>
+        </section>
+        <section class="coach-panel prep-conversation-panel" aria-labelledby="prep-conversation-title">
+          <div class="coach-panel-header">
+            <span id="prep-conversation-title" class="coach-label">AI 준비 대화</span>
+            <span id="interview-state" class="coach-badge">대기</span>
+          </div>
+          <div id="prep-state-surface" class="nova-state-host" role="status" aria-live="polite" aria-atomic="true" hidden></div>
+          <div id="prep-conversation" class="prep-conversation" role="log" aria-live="polite" aria-relevant="additions text" aria-label="AI 회의 준비 대화"></div>
+          <form id="interview-form" class="prep-composer" autocomplete="off">
+            <label class="sr-only" for="interview-message">AI에게 회의 정보 입력</label>
+            <textarea id="interview-message" class="coach-textarea" rows="3" placeholder="회의 정보"></textarea>
+            <button type="submit" id="send-interview" class="coach-button">보내기</button>
+          </form>
+        </section>
+      </section>
+    </main>
+    <script type="module" src="/meeting-coach-prep.js"></script>
+  </body>
+</html>

@@ -19,17 +19,14 @@ test("ingest stamps a monotonically increasing seq on subtitle line messages", (
   assert.equal(b.seq > a.seq, true);
 });
 
-test("ingest stamps translated audio and audio-control on the same monotonic sequence", () => {
+test("retired translated-audio messages are never delivered or assigned caption sequence numbers", () => {
   const hub = createSubtitleChannelHub();
   const audio = hub.ingest({ type: "subtitle:translated-audio", source: "mic", targetLanguage: "ko", audio: "AAAA", sampleRate: 24_000 });
   const clear = hub.ingest({ type: "subtitle:audio-control", source: "mic", targetLanguage: "ko", action: "clear", reason: "interrupted" });
-  const nextAudio = hub.ingest({ type: "subtitle:translated-audio", source: "mic", targetLanguage: "ko", audio: "AAAA", sampleRate: 24_000 });
-  assert.equal(Number.isSafeInteger(audio.seq), true);
-  assert.equal(typeof audio.streamId, "string");
-  assert.equal(clear.streamId, audio.streamId);
-  assert.equal(nextAudio.streamId, audio.streamId);
-  assert.equal(clear.seq, audio.seq + 1);
-  assert.equal(nextAudio.seq, clear.seq + 1);
+  assert.equal(audio.seq, undefined);
+  assert.equal(clear.seq, undefined);
+  assert.equal(hub.shouldSend({}, audio), false);
+  assert.equal(hub.shouldSend({}, clear), false);
 });
 
 test("clients receive everything until they subscribe", () => {

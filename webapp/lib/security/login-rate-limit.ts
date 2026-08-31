@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
-import { isIP } from "node:net";
+
+import { getRequestIp } from "./live-rate-limit";
 
 const DEFAULT_MAX_FAILURES = 4;
 const DEFAULT_WINDOW_MILLISECONDS = 15 * 60 * 1_000;
@@ -30,13 +31,7 @@ interface FailureBucket {
 }
 
 function clientKey(headers: HeaderReader): string {
-  const raw = headers.get("x-vercel-forwarded-for")
-    ?? headers.get("x-forwarded-for")
-    ?? headers.get("x-real-ip")
-    ?? "";
-  const candidate = raw.length <= 512 ? raw.split(",", 1)[0].trim() : "";
-  const normalized = isIP(candidate) ? candidate : "unknown";
-  return createHash("sha256").update(normalized).digest("hex");
+  return createHash("sha256").update(getRequestIp({ headers })).digest("hex");
 }
 
 function decision(bucket: FailureBucket | undefined, maxFailures: number, now: number): LoginRateLimitDecision {

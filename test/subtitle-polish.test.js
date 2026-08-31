@@ -56,7 +56,7 @@ test("business prompt encodes the register rules per target language", async () 
   await polisher.polish({ translatedText: "회의 시작", targetLanguage: "ko", tone: "business" });
   const koPrompt = `${calls[0].system ?? ""}\n${calls[0].prompt ?? ""}`;
   assert.match(koPrompt, /격식체|존댓말/);
-  assert.match(koPrompt, /proper noun/i);
+  assert.match(koPrompt, /explicit glossary preservation instruction/);
   assert.match(koPrompt, /meaning/i);
 
   await polisher.polish({ translatedText: "Start the meeting", targetLanguage: "en", tone: "business" });

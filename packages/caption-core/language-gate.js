@@ -144,6 +144,99 @@ export function sourceLaneMatches(text, sttLanguage, laneLanguage, options = {})
   return detected === lane;
 }
 
+const LATIN_LANGUAGES = new Set(["en", "es", "pt", "fr", "de", "it", "id", "vi"]);
+
+// 2026-08-31 fix: source observations never select a target lane. Script checks
+// are conservative evidence, not a calibrated language detector or probability.
+export function resolveSourceLanguageObservation(value, providerLanguage) {
+  const text = String(value ?? "").normalize("NFC").trim();
+  const rawProvider = typeof providerLanguage === "string" ? providerLanguage.trim() : "";
+  const providerLanguageCode = rawProvider.length <= 35 && /^[A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8})*$/u.test(rawProvider) ? rawProvider : null;
+  const provider = normalizeCaptionLanguage(providerLanguageCode) || null;
+  const observation = (state, languageCode, evidence, languages = []) => ({
+    state, languageCode, providerLanguageCode, evidence, languages,
+  });
+  if (rawProvider && (!providerLanguageCode || (!provider && rawProvider.toLowerCase() !== "und"))) {
+    return observation("unknown", "und", "conflict");
+  }
+  const letters = text.match(/\p{L}/gu) ?? [];
+  if (letters.length === 0 && /^[\p{N}\p{P}\p{Z}\p{Sm}\p{Sc}\s]+$/u.test(text)) {
+    return observation("unknown", "und", "neutral");
+  }
+  const scripts = [];
+  if (/\p{Script=Hangul}/u.test(text)) scripts.push("ko");
+  if (/\p{Script=Latin}/u.test(text)) scripts.push("latin");
+  if (/[\p{Script=Hiragana}\p{Script=Katakana}]/u.test(text)) scripts.push("ja");
+  else if (/\p{Script=Han}/u.test(text)) scripts.push("han");
+  if (/\p{Script=Cyrillic}/u.test(text)) scripts.push("ru");
+  if (/\p{Script=Devanagari}/u.test(text)) scripts.push("hi");
+  const candidates = scripts.map((script) => script === "latin"
+    ? (LATIN_LANGUAGES.has(provider) ? provider : "en")
+    : script === "han" ? (["ja", "zh-Hans", "zh-Hant"].includes(provider) ? provider : "zh-Hans") : script);
+  if (letters.some((letter) => !/[\p{Script_Extensions=Hangul}\p{Script_Extensions=Latin}\p{Script_Extensions=Hiragana}\p{Script_Extensions=Katakana}\p{Script_Extensions=Han}\p{Script_Extensions=Cyrillic}\p{Script_Extensions=Devanagari}]/u.test(letter))) {
+    return observation("unknown", "und", "conflict", candidates);
+  }
+  if (scripts.length > 1) return observation("mixed", "und", "script", [...new Set(candidates)]);
+  if (scripts.length !== 1 || letters.length < 4) return observation("unknown", "und", "insufficient", candidates);
+  const [script] = scripts;
+  if (script === "latin") {
+    const words = text.match(/[\p{Script=Latin}]+/gu) ?? [];
+    if (words.length < 2 || words.every((word) => /^[A-Z][A-Za-z]*$/u.test(word))) {
+      return observation("unknown", "und", "insufficient", candidates);
+    }
+    if (provider && (!LATIN_LANGUAGES.has(provider) || (provider === "en" && hasUnsupportedEnglishKoreanText(text)))) {
+      return observation("unknown", "und", "conflict", candidates);
+    }
+    return provider ? observation("single", provider, "provider-and-script", [provider])
+      : observation("unknown", "und", "insufficient", candidates);
+  }
+  const language = script === "han" ? (["ja", "zh-Hans", "zh-Hant"].includes(provider) ? provider : null) : script;
+  if (!language) return observation("unknown", "und", "insufficient", candidates);
+  if (provider && provider !== language) return observation("unknown", "und", "conflict", candidates);
+  return observation("single", language, provider ? "provider-and-script" : "script", [language]);
+}
+
+export function canPassThroughSourceObservation(observation, targetLanguage) {
+  return observation.evidence === "neutral"
+    || (observation.state === "single" && observation.languageCode === normalizeCaptionLanguage(targetLanguage));
+}
+
+// 2026-08-31 fix: target characters alone cannot validate an echoed foreign
+// clause. Only explicitly registered spellings may remain in Korean prose; this is a rejection guard,
+// not a claim that accepted translations are semantically correct.
+/** @param {unknown} value @param {unknown} targetLanguage @param {{protectedTerms?: readonly string[]}} [options] */
+export function isFixedTargetOutputSupported(value, targetLanguage, { protectedTerms = [] } = {}) {
+  const text = String(value ?? "").normalize("NFC").trim();
+  const target = normalizeCaptionLanguage(targetLanguage);
+  if (!text || !target) return false;
+  if (target === "ko") {
+    let remainder = text;
+    const terms = Array.isArray(protectedTerms) ? [...new Set(protectedTerms
+      .slice(0, 10_000)
+      .filter((term) => typeof term === "string")
+      .map((term) => term.normalize("NFC").trim()).filter((term) => term && term.length <= text.length))]
+      .sort((left, right) => right.length - left.length) : [];
+    for (const term of terms) {
+      const literal = term.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+      // Hangul particles may touch a registered name; Latin/digit/mark
+      // adjacency would instead grant an unregistered compound or substring.
+      const pattern = new RegExp(`(?<![\\p{Script=Latin}\\p{M}\\p{N}_])${literal}(?![\\p{Script=Latin}\\p{M}\\p{N}_])`, "gu");
+      remainder = remainder.replace(pattern, " ");
+    }
+    if (!remainder.trim()) return remainder !== text;
+    if (/\p{Script=Hangul}/u.test(remainder)) {
+      return !/[^\p{Script=Hangul}\p{N}\p{P}\p{Z}\p{S}\s]/u.test(remainder);
+    }
+    return resolveSourceLanguageObservation(remainder, target).evidence === "neutral";
+  }
+  if (!isOutputInTargetLanguage(text, target)) return false;
+  const hasLatin = /\p{Script=Latin}/u.test(text);
+  if (LATIN_LANGUAGES.has(target) && hasLatin && !/[^\p{Script=Latin}\p{M}\p{N}\p{P}\p{Z}\p{S}\s]/u.test(text)) return true;
+  const observation = resolveSourceLanguageObservation(text, target);
+  if (observation.evidence === "neutral" || observation.state === "single") return true;
+  return false;
+}
+
 export const languageGateContract = Object.freeze({
   koreanMixMinChars: 3,
   koreanMixMinRatio: 0.2,

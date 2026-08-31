@@ -185,19 +185,31 @@ desktop's own local engine; `electron/main.js` fans those to all renderers as
   rate limits. Nearly everything goes through `security definer` RPCs rather
   than table writes.
 
-### Why the desktop host connects from the MAIN process, not the renderer
+### Two supported HOST connection paths (do NOT tighten one to "fix" the other)
 
-Cloud Run rejects a browser WebSocket whose `Origin` is not in
-`LIVE_GATEWAY_ALLOWED_ORIGINS`, and the desktop renderer's origin is
-`http://127.0.0.1:<port>`. So the renderer never opens a gateway socket: it only
-captures the mic and pushes 1280-byte frames over `live-call:audio-frame` IPC,
-and `electron/main.js` holds the HOST socket itself. A Node client sends no
-`Origin` at all, which is the branch `isAllowedWebSocketUpgrade`
-(`media-gateway/src/gateway-security.js`) admits - but only with
-`LIVE_GATEWAY_ALLOW_TRUSTED_NON_BROWSER` enabled, the header
-`x-realtime-noel-client: desktop-main`, *and* a `Bearer` token that verifies to
-role `HOST`. Moving that socket into a renderer breaks the upgrade; adding the
-header from a renderer does not help, because a browser sends `Origin` anyway.
+The gateway upgrade (`isAllowedWebSocketUpgrade`,
+`media-gateway/src/gateway-security.js`) admits two host lanes, and both are
+production paths — `media-gateway/test/gateway-security.test.js` pins this
+contract:
+
+1. **Web host (browser)** — the webapp host dashboard connects as HOST from the
+   browser. The upgrade carries the webapp `Origin` (must be in
+   `LIVE_GATEWAY_ALLOWED_ORIGINS`); browsers cannot set bearer headers, so HOST
+   authentication happens post-upgrade via the `authenticate` message.
+   `webapp/components/live/live-audio-client.ts` owns capture, proactive token
+   refresh, and reconnects. Requiring the desktop-main marker for HOST would
+   silently kill this shipped path.
+2. **Electron desktop (main process)** — the desktop renderer's origin is
+   `http://127.0.0.1:<port>`, which is never allowlisted, so the renderer only
+   captures the mic and pushes 1280-byte frames over `live-call:audio-frame`
+   IPC while `electron/main.js` holds the HOST socket. A Node client sends no
+   `Origin`; that lane requires `LIVE_GATEWAY_ALLOW_TRUSTED_NON_BROWSER`, the
+   header `x-realtime-noel-client: desktop-main`, *and* a `Bearer` token that
+   verifies to role `HOST`.
+
+Host takeover between the two is last-wins: the gateway closes the losing
+socket with code 4410 (`REPLACED`), and warm pipeline reattach requires the
+same `activationKey` on both clients.
 
 ### Speaking floor contract (`media-gateway/src/gateway-server.js`)
 

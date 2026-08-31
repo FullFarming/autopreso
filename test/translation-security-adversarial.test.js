@@ -1,8 +1,6 @@
-// @ts-nocheck - the fake WebSocket intentionally implements only the surface used by the manager.
+// @ts-nocheck - adversarial fixtures intentionally include rejected boundary fields.
 import assert from "node:assert/strict";
-import { EventEmitter } from "node:events";
 import test from "node:test";
-import { WebSocket } from "ws";
 
 import {
   captionPolishContract,
@@ -18,7 +16,6 @@ import {
 } from "../packages/caption-core/index.js";
 import { normalizeCommittedCreCaption as gatewayNormalize } from "../media-gateway/src/glossary-corrections.js";
 import { generateGeminiText } from "../src/gemini-text-generation.js";
-import { createSubtitleRealtimeManager } from "../src/subtitle-realtime.js";
 
 const EN_KO = ["en", "ko"];
 
@@ -278,11 +275,11 @@ test("polish prompt bounds both draft and source transcript data", () => {
   assert.equal(userData.source.length, captionPolishContract.maximumInputCharacters);
 });
 
-test("Gemini 3.6 polish uses a fixed minimal-thinking budget and ignores caller generation overrides", async () => {
+test("Gemini 3.7 polish uses a fixed low-thinking budget and ignores caller generation overrides", async () => {
   const calls = [];
   await generateGeminiText({
     apiKey: ["test", "security", "marker"].join("-"),
-    model: "gemini-3.6-flash",
+    model: "gemini-3.7-flash",
     system: "fixed system",
     prompt: "fixed prompt",
     thinkingLevel: "high",
@@ -303,11 +300,38 @@ test("Gemini 3.6 polish uses a fixed minimal-thinking budget and ignores caller 
   });
 
   const body = JSON.parse(calls[0].init.body);
-  assert.deepEqual(body.generationConfig.thinkingConfig, { thinkingLevel: "minimal" });
+  assert.deepEqual(body.generationConfig.thinkingConfig, { thinkingLevel: "low" });
   assert.equal(body.generationConfig.candidateCount, undefined);
   assert.equal(body.generationConfig.temperature, undefined);
   assert.equal(body.generationConfig.topP, undefined);
   assert.equal(body.generationConfig.topK, undefined);
+});
+
+test("Gemini polish provider body contains no participant identity or credential markers", async () => {
+  const hostilePrompt = [
+    "noel@example.com",
+    "홍길동@회사.한국",
+    "인증 코드 123456",
+    ["headerpart", "payloadpart", "signaturepart"].join("."),
+    "grant:viewer:private-marker",
+    `invite_${"i".repeat(48)}`,
+    `AIza${"A".repeat(35)}`,
+    "NOI 123456",
+  ].join("\n");
+  let capturedBody = "";
+  await generateGeminiText({
+    apiKey: ["test", "security", "marker"].join("-"),
+    model: "gemini-3.7-flash",
+    system: "654321",
+    prompt: hostilePrompt,
+    fetchImpl: async (_url, init) => {
+      capturedBody = init.body;
+      return { ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text: "safe" }] } }] }) };
+    },
+  });
+
+  assert.doesNotMatch(capturedBody, /noel@example\.com|홍길동@회사\.한국|인증 코드 123456|654321|headerpart|grant:viewer|invite_|AIza/iu);
+  assert.match(JSON.parse(capturedBody).contents[0].parts[0].text, /NOI 123456/u);
 });
 
 test("selective policy keeps local alias repair on-device without sending a model request", async () => {
@@ -415,100 +439,4 @@ test("desktop polish errors never write API keys or service-role secrets to logs
   assert.equal(warnings.length, 1);
   assert.doesNotMatch(warnings[0], new RegExp(`${apiKey}|${serviceRole}`, "u"));
   assert.doesNotMatch(warnings[0], new RegExp(sensitiveTranscript, "u"));
-});
-
-class FakeSocket extends EventEmitter {
-  constructor(url, init) {
-    super();
-    this.url = url;
-    this.init = init;
-    this.sent = [];
-    this.readyState = WebSocket.OPEN;
-  }
-
-  send(message) {
-    this.sent.push(message);
-  }
-
-  close() {
-    if (this.closed) return;
-    this.closed = true;
-    this.emit("close", 1011, Buffer.from("language drift"));
-  }
-
-  terminate() {
-    this.close();
-  }
-}
-
-test("partial third-language output never renders or persists and repeated drift reconnects fresh", async () => {
-  const sockets = [];
-  const broadcasts = [];
-  const manager = createSubtitleRealtimeManager({
-    broadcast: (message) => broadcasts.push(message),
-    settingsStore: {
-      load: async () => ({
-        apiKeys: { gemini: "AIza-test-only" },
-        subtitle: {
-          inputMode: "mic",
-          translationLanguages: EN_KO,
-          translationProvider: "gemini",
-          tone: "natural",
-          glossary: "",
-          translationDomain: "",
-        },
-      }),
-    },
-    createWebSocket: (url, _protocols, init) => {
-      const socket = new FakeSocket(url, init);
-      sockets.push(socket);
-      return socket;
-    },
-    polish: async ({ translatedText }) => translatedText,
-  });
-
-  await manager.start({ sessionId: "security-adversarial-drift" });
-  const initialSocketCount = sockets.length;
-  const englishTarget = sockets[0];
-  englishTarget.emit("message", JSON.stringify({
-    sessionResumptionUpdate: { resumable: true, newHandle: "tainted-handle" },
-  }));
-
-  englishTarget.emit("message", JSON.stringify({
-    serverContent: {
-      inputTranscription: { text: "짧은 원문입니다.", languageCode: "ko" },
-      outputTranscription: { text: "はい" },
-    },
-  }));
-  englishTarget.emit("message", JSON.stringify({ serverContent: { turnComplete: true } }));
-
-  for (const index of [1, 2]) {
-    englishTarget.emit("message", JSON.stringify({
-      serverContent: {
-        inputTranscription: { text: `원문 ${index}번째 문장입니다.`, languageCode: "ko" },
-        outputTranscription: {
-          text: `Ở đây bạn có thể xem và chúng ta bắt đầu ${index}.`,
-          languageCode: index === 1 ? "und" : "vi-VN",
-        },
-      },
-    }));
-    englishTarget.emit("message", JSON.stringify({ serverContent: { turnComplete: true } }));
-  }
-
-  await new Promise((resolve) => setTimeout(resolve, 700));
-  const leaked = broadcasts.filter((message) =>
-    (message.type === "subtitle:partial" || message.type === "subtitle:committed")
-      && /Ở đây|chúng ta|はい|你好|Да/u.test(String(message.translatedText ?? message.text ?? "")));
-  assert.deepEqual(leaked, [], "unsupported partials/finals must not render or become durable record events");
-  assert.ok(broadcasts.some((message) =>
-    message.type === "subtitle:error" && message.code === "TRANSLATION_LANGUAGE_DRIFT"));
-  assert.ok(sockets.length > initialSocketCount, "two violations must reconnect the provider lane");
-
-  const replacement = sockets.slice(initialSocketCount)
-    .find((socket) => /generativelanguage\.googleapis\.com/u.test(socket.url));
-  assert.ok(replacement);
-  replacement.emit("open");
-  const setup = JSON.parse(replacement.sent[0]);
-  assert.deepEqual(setup.setup.sessionResumption, {}, "a drifted provider handle must never resume");
-  await manager.stop("security-adversarial-drift");
 });

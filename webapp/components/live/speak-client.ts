@@ -198,13 +198,18 @@ function buildPreparedCapture(
       let source: MediaStreamAudioSourceNode | null = null;
       let worklet: AudioWorkletNode | null = null;
       let processor: ScriptProcessorNode | null = null;
+      let analyser: AnalyserNode | null = null;
+      let analyserFrame: number | null = null;
 
       const stopNodes = () => {
         options.onLevel?.(0);
+        if (analyserFrame !== null) cancelAnimationFrame(analyserFrame);
+        analyserFrame = null;
         if (worklet) worklet.port.onmessage = null;
         if (processor) processor.onaudioprocess = null;
         try { worklet?.disconnect(); } catch { /* already disconnected */ }
         try { processor?.disconnect(); } catch { /* already disconnected */ }
+        try { analyser?.disconnect(); } catch { /* already disconnected */ }
         try { source?.disconnect(); } catch { /* already disconnected */ }
       };
       activeStop = stopNodes;
@@ -214,8 +219,26 @@ function buildPreparedCapture(
           if (isStopped || socket.readyState !== 1) return;
           if (Date.now() - recordedAt > MAX_FRAME_AGE_MILLISECONDS) return;
           if (pcm.byteLength !== LIVE_PCM_FRAME_BYTES) return;
-          options.onLevel?.(calculatePcmLevel(pcm));
+          if (!analyser) options.onLevel?.(calculatePcmLevel(pcm));
           socket.send(pcm);
+        };
+
+        const connectCaptureSource = (destination: AudioNode): {
+          source: MediaStreamAudioSourceNode;
+          analyser: AnalyserNode | null;
+        } => {
+          const nextSource = preparedContext.createMediaStreamSource(preparedStream);
+          const createAnalyser = preparedContext.createAnalyser;
+          if (typeof createAnalyser !== "function") {
+            nextSource.connect(destination);
+            return { source: nextSource, analyser: null };
+          }
+          const nextAnalyser = createAnalyser.call(preparedContext);
+          nextAnalyser.fftSize = 256;
+          nextAnalyser.smoothingTimeConstant = 0.78;
+          nextSource.connect(nextAnalyser);
+          nextAnalyser.connect(destination);
+          return { source: nextSource, analyser: nextAnalyser };
         };
 
         if (typeof preparedContext.audioWorklet?.addModule === "function") {
@@ -234,11 +257,12 @@ function buildPreparedCapture(
               if (!isWorkletChunk(event.data)) return;
               handlePcm(event.data.pcm, event.data.recordedAt);
             };
-            source = preparedContext.createMediaStreamSource(preparedStream);
-            source.connect(worklet);
+            ({ source, analyser } = connectCaptureSource(worklet));
           } catch {
             worklet?.disconnect();
             worklet = null;
+            analyser?.disconnect();
+            analyser = null;
             source?.disconnect();
             source = null;
           }
@@ -279,11 +303,26 @@ function buildPreparedCapture(
             }
             queue = merged.slice(offset);
           };
-          source = preparedContext.createMediaStreamSource(preparedStream);
-          source.connect(processor);
+          ({ source, analyser } = connectCaptureSource(processor));
           // ScriptProcessor must reach destination to receive callbacks. It
           // writes silence, so this does not play the microphone back.
           processor.connect(preparedContext.destination);
+        }
+
+        if (analyser && options.onLevel && typeof requestAnimationFrame === "function") {
+          const samples = new Uint8Array(analyser.frequencyBinCount);
+          const updateLevel = () => {
+            if (isStopped || !analyser) return;
+            analyser.getByteTimeDomainData(samples);
+            let sumSquares = 0;
+            for (const sample of samples) {
+              const normalized = (sample - 128) / 128;
+              sumSquares += normalized * normalized;
+            }
+            options.onLevel?.(Math.min(1, Math.sqrt(sumSquares / samples.length) * 3.2));
+            analyserFrame = requestAnimationFrame(updateLevel);
+          };
+          analyserFrame = requestAnimationFrame(updateLevel);
         }
       } catch (error) {
         await stopPrepared();

@@ -12,7 +12,6 @@ const DEFAULT_SUBTITLE = {
   opacity: 0.92,
   maxSubtitleLines: 2,
   verticalOffset: 48,
-  outputMode: "captions",
 };
 
 // Movie-style expiry: live hypotheses stay visible while translation is in
@@ -54,10 +53,6 @@ const channelLanguages = (new URLSearchParams(location.search).get("lang") || ""
 
 function isChannelLanguage(targetLanguage) {
   return channelLanguages.length === 0 || channelLanguages.includes(String(targetLanguage || "").toLowerCase());
-}
-
-function isAudioOnlyOutput() {
-  return settings.outputMode === "audio";
 }
 
 const overlay = document.getElementById("subtitle-overlay");
@@ -120,6 +115,9 @@ let activeSocket = null;
 let activeLiveCallSessionId = "";
 const hasTrustedLiveCallFloorBridge = typeof window.realtimeNoelDesktop?.onLiveCallFloor === "function";
 let allowsLegacySessionlessLiveCallEvents = !hasTrustedLiveCallFloorBridge;
+let activeLiveCallFloorOwner = "inactive";
+let activeLiveCallParticipantId = "";
+let lastAuthorizedLiveCallParticipantId = "";
 
 connect();
 initOverlayRestartControls();
@@ -141,13 +139,13 @@ function connect() {
   ws.addEventListener("message", (event) => {
     if (ws !== activeSocket) return;
     const message = JSON.parse(event.data);
-    adoptSubtitleStream(message);
-    if (message.type === "settings" && message.settings?.subtitle) applySettings(message.settings.subtitle);
+    if (message.type === "settings" && message.settings?.subtitle) {
+      adoptSubtitleStream(message);
+      applySettings(message.settings.subtitle);
+    }
     if (message.type === "subtitle:snapshot") {
-      if (isAudioOnlyOutput()) {
-        clearSubtitle();
-        return;
-      }
+      if (!acceptFloorOwnedSubtitleSnapshot(message)) return;
+      adoptSubtitleStream(message);
       const liveSnapshotResult = replaceLiveCallSubtitleSnapshot(message);
       if (liveSnapshotResult !== "not-live") {
         if (liveSnapshotResult === "accepted" && Number.isSafeInteger(message.seq)) {
@@ -155,9 +153,13 @@ function connect() {
         }
         return;
       }
+      if (hasTrustedLiveCallFloorBridge
+        && activeLiveCallSessionId
+        && activeLiveCallFloorOwner !== "host") return;
       if (Number.isSafeInteger(message.seq)) snapshotSeqFloor = Math.max(snapshotSeqFloor, message.seq);
       for (const line of Array.isArray(message.lanes) ? message.lanes : []) {
         if (!isChannelLanguage(line.targetLanguage)) continue;
+        if (!acceptFloorOwnedSubtitleMutation(line)) continue;
         if (line.type === "subtitle:committed") renderCommittedSubtitle(line, true);
         else renderPredictedSubtitle(line, true);
       }
@@ -176,9 +178,11 @@ function connect() {
         && (!activeLiveCallSessionId || message.liveSessionId !== activeLiveCallSessionId)) return;
       if (!hasCanonicalSessionId && !allowsLegacySessionlessLiveCallEvents && activeLiveCallSessionId) return;
     }
+    if (!acceptFloorOwnedSubtitleMutation(message)) return;
+    adoptSubtitleStream(message);
     if (message.type === "subtitle:clear") clearSubtitleLane(message.targetLanguage);
-    if (message.type === "subtitle:partial" && !isAudioOnlyOutput()) renderPredictedSubtitle(message);
-    if (message.type === "subtitle:committed" && !isAudioOnlyOutput()) renderCommittedSubtitle(message);
+    if (message.type === "subtitle:partial") renderPredictedSubtitle(message);
+    if (message.type === "subtitle:committed") renderCommittedSubtitle(message);
     if (message.type === "subtitle:input-status") {
       handleInputStatus(message);
       return;
@@ -206,26 +210,94 @@ function replaceLiveCallSubtitleSnapshot(message) {
     : [];
   const envelopeSessionId = typeof message?.liveSessionId === "string" ? message.liveSessionId : "";
   if (events.length === 0 && !envelopeSessionId) return "not-live";
+  if (hasTrustedLiveCallFloorBridge
+    && activeLiveCallSessionId
+    && activeLiveCallFloorOwner === "host") return "not-live";
   const snapshotSessionIds = new Set([envelopeSessionId, ...events.map((event) => event.liveSessionId)].filter(
     (sessionId) => typeof sessionId === "string" && sessionId.length > 0,
   ));
   if (snapshotSessionIds.size !== 1) return "rejected";
   const [snapshotSessionId] = snapshotSessionIds;
   if (!events.every((event) => event.liveSessionId === snapshotSessionId)) return "rejected";
+  if (hasTrustedLiveCallFloorBridge
+    && (!activeLiveCallSessionId || activeLiveCallFloorOwner !== "participant")) return "rejected";
   if (activeLiveCallSessionId && activeLiveCallSessionId !== snapshotSessionId) return "rejected";
+  const displayEvents = hasTrustedLiveCallFloorBridge
+    ? events.filter((event) => isAuthorizedLiveCallParticipantCaption(event, { allowLateFinal: false }))
+    : events;
+  if (hasTrustedLiveCallFloorBridge && events.length > 0 && displayEvents.length === 0) return "rejected";
   // A renderer can receive live broadcasts while its async settings snapshot is
   // still being prepared. Replacing the local model makes that interleaving
   // converge instead of additively duplicating a different sentence stack on
   // each monitor.
   clearSubtitle();
   activeLiveCallSessionId = snapshotSessionId;
-  events.sort((left, right) => (left.seq ?? 0) - (right.seq ?? 0));
-  for (const event of events) {
+  displayEvents.sort((left, right) => (left.seq ?? 0) - (right.seq ?? 0));
+  for (const event of displayEvents) {
     if (!isChannelLanguage(event.targetLanguage)) continue;
     if (event.type === "subtitle:committed") renderCommittedSubtitle(event, true);
     else if (event.type === "subtitle:partial") renderPredictedSubtitle(event, true);
   }
   return "accepted";
+}
+
+function acceptFloorOwnedSubtitleSnapshot(message) {
+  if (!hasTrustedLiveCallFloorBridge || !activeLiveCallSessionId) {
+    const hasLivePayload = typeof message?.liveSessionId === "string" && message.liveSessionId.length > 0
+      || (Array.isArray(message?.events) && message.events.some((event) => event?.source === "live-call"));
+    return !hasTrustedLiveCallFloorBridge || !hasLivePayload;
+  }
+  if (activeLiveCallFloorOwner === "unknown") return false;
+  if (activeLiveCallFloorOwner === "participant") {
+    const liveEvents = Array.isArray(message?.events)
+      ? message.events.filter((event) => event?.source === "live-call")
+      : [];
+    const envelopeSessionId = typeof message?.liveSessionId === "string" ? message.liveSessionId : "";
+    const snapshotSessionIds = new Set([envelopeSessionId, ...liveEvents.map((event) => event.liveSessionId)].filter(
+      (sessionId) => typeof sessionId === "string" && sessionId.length > 0,
+    ));
+    if (snapshotSessionIds.size !== 1 || !snapshotSessionIds.has(activeLiveCallSessionId)) return false;
+    if (!liveEvents.every((event) => event.liveSessionId === activeLiveCallSessionId)) return false;
+    return liveEvents.length === 0
+      || liveEvents.some((event) => isAuthorizedLiveCallParticipantCaption(event, { allowLateFinal: false }));
+  }
+  const localLanes = Array.isArray(message?.lanes)
+    ? message.lanes.filter((line) => line?.source !== "live-call")
+    : [];
+  const hasLiveEvents = Array.isArray(message?.events)
+    && message.events.some((event) => event?.source === "live-call");
+  return localLanes.length > 0 || !hasLiveEvents;
+}
+
+function acceptFloorOwnedSubtitleMutation(message) {
+  if (!hasTrustedLiveCallFloorBridge || !activeLiveCallSessionId) return true;
+  const isDisplayMutation = message.type === "subtitle:partial"
+    || message.type === "subtitle:committed"
+    || message.type === "subtitle:clear"
+    || (message.type === "subtitle:status" && message.status === "idle");
+  if (!isDisplayMutation) return true;
+  const isGatewayCaption = message.source === "live-call";
+  if (activeLiveCallFloorOwner === "host") {
+    if (!isGatewayCaption) return true;
+    return isAuthorizedLiveCallParticipantCaption(message, { allowLateFinal: true });
+  }
+  if (activeLiveCallFloorOwner !== "participant" || !isGatewayCaption) return false;
+  if (message.type === "subtitle:partial" || message.type === "subtitle:committed") {
+    return isAuthorizedLiveCallParticipantCaption(message, { allowLateFinal: false });
+  }
+  return true;
+}
+
+function isAuthorizedLiveCallParticipantCaption(message, { allowLateFinal }) {
+  if (message?.source !== "live-call" || message.liveCallSpeaker?.role !== "participant") return false;
+  const participantId = typeof message.liveCallSpeaker.participantId === "string"
+    ? message.liveCallSpeaker.participantId.trim()
+    : "";
+  if (!participantId) return false;
+  if (activeLiveCallFloorOwner === "participant") return participantId === activeLiveCallParticipantId;
+  return allowLateFinal === true
+    && message.type === "subtitle:committed"
+    && participantId === lastAuthorizedLiveCallParticipantId;
 }
 
 function adoptSubtitleStream(message) {
@@ -432,6 +504,9 @@ function handleLiveCallFloorBoundary(floor) {
   if (floor?.type === "live-call-ended") {
     if (!activeLiveCallSessionId || floor.sessionId !== activeLiveCallSessionId) return;
     activeLiveCallSessionId = "";
+    activeLiveCallFloorOwner = "inactive";
+    activeLiveCallParticipantId = "";
+    lastAuthorizedLiveCallParticipantId = "";
     clearSubtitle();
     return;
   }
@@ -440,7 +515,20 @@ function handleLiveCallFloorBoundary(floor) {
   if (isLegacyBoundary) allowsLegacySessionlessLiveCallEvents = true;
   if (floor !== undefined && !isLegacyBoundary) {
     if (floor?.type !== "floor" || typeof floor.sessionId !== "string" || !floor.sessionId) return;
+    if (activeLiveCallSessionId && floor.sessionId !== activeLiveCallSessionId) return;
+    const hasParticipant = floor.holder
+      && typeof floor.holder === "object"
+      && !Array.isArray(floor.holder)
+      && typeof floor.holder.participantId === "string"
+      && floor.holder.participantId.length > 0
+      && floor.holder.participantId !== "unavailable";
+    const nextFloorOwner = floor.holder === null ? "host" : hasParticipant ? "participant" : "unknown";
+    if (!activeLiveCallSessionId && nextFloorOwner === "unknown") return;
     activeLiveCallSessionId = floor.sessionId;
+    activeLiveCallFloorOwner = nextFloorOwner;
+    activeLiveCallParticipantId = nextFloorOwner === "participant" ? floor.holder.participantId : "";
+    if (activeLiveCallParticipantId) lastAuthorizedLiveCallParticipantId = activeLiveCallParticipantId;
+    if (nextFloorOwner === "unknown") return;
   }
   activeSourceLanguage = null;
   previousSourceLanguage = null;
@@ -646,7 +734,6 @@ function updateLiveCallSpeaker(message, lane) {
 }
 
 function renderCommittedSubtitle(message, fromSnapshot = false) {
-  if (isAudioOnlyOutput()) return;
   const lane = ensureLane(message.targetLanguage);
   if (!acceptLaneEvent(lane, message, fromSnapshot)) return;
   if (!acceptDirection(message)) return;
@@ -688,7 +775,6 @@ function renderCommittedSubtitle(message, fromSnapshot = false) {
 }
 
 function renderPredictedSubtitle(message, fromSnapshot = false) {
-  if (isAudioOnlyOutput()) return;
   if (!shouldRenderPredictedSubtitle(message)) return;
   const lane = ensureLane(message.targetLanguage);
   if (!acceptLaneEvent(lane, message, fromSnapshot)) return;
@@ -985,7 +1071,6 @@ function splitSubtitleSentences(text) {
 
 function applySettings(next = {}) {
   settings = { ...DEFAULT_SUBTITLE, ...next, subtitlePositions: { ...(next.subtitlePositions ?? {}) } };
-  if (isAudioOnlyOutput()) clearSubtitle();
   document.documentElement.style.setProperty("--subtitle-font-family", settings.fontFamily);
   document.documentElement.style.setProperty("--translation-font-size", `${settings.translationFontSize}px`);
   document.documentElement.style.setProperty("--source-font-size", `${settings.sourceFontSize}px`);

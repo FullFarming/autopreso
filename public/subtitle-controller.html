@@ -8,12 +8,13 @@
       // Anti-flash: adopt the stored UI language before the console renders.
       try {
         const stored = localStorage.getItem("realtime-noel-ui-language");
-        const lang = stored === "en" || stored === "ko" ? stored : "ko";
+        const lang = stored === "en" || stored === "ko" || stored === "ja" ? stored : "ko";
         document.documentElement.lang = lang;
         document.documentElement.dataset.uiLang = lang;
       } catch { /* storage optional */ }
     </script>
     <link rel="stylesheet" href="/subtitle.css" />
+    <link rel="stylesheet" href="/system-language-button.css" />
   </head>
   <body class="subtitle-controller-body">
     <!-- Mini-player console: one row, packed edge to edge like a music
@@ -102,6 +103,7 @@
             <span data-i18n="controller.allDisplays">모든 화면</span>
           </button>
         </div>
+        <div id="controller-system-language" class="system-language"></div>
       </div>
     </main>
     <script type="module" src="/subtitle-controller.js"></script>

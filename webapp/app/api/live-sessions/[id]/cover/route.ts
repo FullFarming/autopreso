@@ -25,6 +25,7 @@ import { LiveSessionService } from "@/lib/live/service";
 import { getLiveSessionStore } from "@/lib/live/store";
 import { parseSessionId } from "@/lib/live/validation";
 import { apiError, apiSuccess } from "@/lib/security/api-response";
+import { BoundedJsonBodyError, readBoundedJsonBody } from "@/lib/security/bounded-json-body";
 import { LIVE_ADMISSION_PEPPER } from "@/lib/security/config";
 import { hmacHex, timingSafeEqual } from "@/lib/security/hmac";
 import { LiveAdmissionError, SupabaseLiveAdmissionStore } from "@/lib/security/live-admission-store";
@@ -78,7 +79,7 @@ export async function POST(request: NextRequest, context: { params: Promise<{ id
       return apiError("종료된 세션에는 커버를 올릴 수 없습니다.", "SESSION_ENDED", 409);
     }
 
-    const parsed = coverActionSchema.safeParse(await request.json().catch(() => null));
+    const parsed = coverActionSchema.safeParse(await readBoundedJsonBody(request));
     if (!parsed.success) return apiError("커버 요청이 올바르지 않습니다.", "INVALID_COVER_REQUEST", 400);
 
     if (parsed.data.action === "prepare") {
@@ -144,6 +145,7 @@ export async function POST(request: NextRequest, context: { params: Promise<{ id
       throw error;
     }
   } catch (error: unknown) {
+    if (error instanceof BoundedJsonBodyError) return apiError(error.message, error.code, error.status);
     if (error instanceof AuthenticationError) return apiError(error.message, "HOST_AUTH_REQUIRED", 401);
     if (error instanceof LiveAdmissionError) return apiError(error.message, error.code, error.status);
     const failure = toLiveFailure(error);

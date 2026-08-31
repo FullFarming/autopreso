@@ -83,6 +83,10 @@ test("glossary presets restore exactly and expose accessible synced-preset contr
   assert.match(html, /id="confirm-delete-glossary-preset"/);
   assert.match(html, /id="cancel-delete-glossary-preset"/);
   assert.match(html, /id="glossary-preset-status"[^>]*role="status"[^>]*aria-live="polite"/);
+  assert.match(html, /id="glossary-session-selection"/);
+  assert.match(html, /id="glossary-selection-count"[^>]*aria-live="polite"/);
+  assert.match(html, /id="glossary-selection-builtins"/);
+  assert.match(html, /id="glossary-selection-users"/);
   assert.match(html, /<textarea name="glossary"[^>]*maxlength="40000"/,
     "the editor must accept every full built-in corpus allowed by local settings");
 
@@ -101,6 +105,11 @@ test("glossary presets restore exactly and expose accessible synced-preset contr
   assert.match(js, /invokeGlossaryPresetBridge\("updateGlossaryPreset"/);
   assert.match(js, /invokeGlossaryPresetBridge\("deleteGlossaryPreset"/);
   assert.match(js, /GLOSSARY_PRESET_VERSION_CONFLICT/);
+  assert.match(js, /glossaries: selectedGlossaries\(\)/u);
+  assert.match(js, /MAX_GLOSSARY_SELECTIONS = 5/u);
+  assert.match(js, /glossary\.selection\.targetIncompatible/u);
+  assertLocalized("glossary.selection.targetIncompatible", { ko: /현재 번역 언어/u });
+  assert.match(js, /GLOSSARY_SELECTION_CONFLICT|번역이 충돌/u);
   assert.match(js, /version < 1/);
   assert.match(js, /NETWORK_UNAVAILABLE/);
   assert.match(js, /HOST_LOGIN_REQUIRED/);
@@ -117,6 +126,8 @@ test("glossary presets restore exactly and expose accessible synced-preset contr
   assert.match(css, /\.glossary-preset-actions[\s\S]*?min-height: 44px/,
     "preset actions must keep a 44px touch target even when compact buttons are used");
   assert.match(css, /\.glossary-preset-editor[\s\S]*?display: grid/);
+  assert.match(css, /\.glossary-selection-option[\s\S]*?min-height:\s*44px/u);
+  assert.match(css, /\.glossary-selection-option input:focus-visible[\s\S]*?outline:\s*2px solid var\(--nova-system-default\)/u);
   assert.match(css, /@media \(prefers-reduced-motion: reduce\)[\s\S]*?\.glossary-preset-editor/);
   assert.match(js, /openGlossaryPresetDeleteConfirmation/);
   assert.match(js, /confirmDeleteGlossaryPresetButton\?\.focus\(\)/);
@@ -136,6 +147,11 @@ test("glossary presets restore exactly and expose accessible synced-preset contr
 test("subtitle dashboard exposes main controls, Gemma recording, and settings drawer", () => {
   const html = readFileSync(path.join(rootDir, "public", "subtitle.html"), "utf8");
   const js = readFileSync(path.join(rootDir, "public", "subtitle-dashboard.js"), "utf8");
+
+  for (const section of ["prepare", "meeting", "records", "settings"]) {
+    assert.match(html, new RegExp(`class="rail-nav-section"[^>]*data-rail-section="${section}"[^>]*role="group"[^>]*aria-labelledby="rail-nav-${section}-label"`, "u"));
+    assert.match(html, new RegExp(`id="rail-nav-${section}-label"[^>]*class="rail-nav-section-label"`, "u"));
+  }
   const captureJs = readFileSync(path.join(rootDir, "public", "subtitle-audio-capture.js"), "utf8");
   const workspaceJs = readFileSync(path.join(rootDir, "public", "subtitle-workspace.js"), "utf8");
   const controllerHtml = readFileSync(path.join(rootDir, "public", "subtitle-controller.html"), "utf8");
@@ -154,13 +170,7 @@ test("subtitle dashboard exposes main controls, Gemma recording, and settings dr
   assert.match(html, /name="translationLanguages"/);
   assert.match(html, /class="lang-pill"/);
   assert.match(html, /id="language-targets-label"/);
-  // Search-and-tag language picker: selected languages are removable chips;
-  // new ones are added via type-ahead search, not a full checkbox list.
-  assert.match(js, /language-search-input/);
-  assert.match(js, /language-suggestions/);
-  assert.match(js, /language-chip-remove/);
-  assert.match(js, /t\("language\.searchPlaceholder"\)/);
-  assertLocalized("language.searchPlaceholder", { ko: /언어 검색/ });
+  assert.doesNotMatch(js, /language-search-input|language-suggestions|language-chip-remove/);
   // Source ("원문") display was removed — no toggle, always translation-only.
   assert.doesNotMatch(html, /name="showSourceText"/);
   assert.doesNotMatch(html, /원문 같이 표시/);
@@ -217,11 +227,10 @@ test("subtitle dashboard exposes main controls, Gemma recording, and settings dr
   assert.match(workspaceJs, /contentType: file\.type/);
   assert.match(workspaceJs, /base64: window\.btoa\(binary\)/);
   assert.match(workspaceJs, /t\("live\.hostLoginRequired"\)/);
-  assertLocalized("live.hostLoginRequired", { en: /Open Settings and save the host authorization/ });
+  assertLocalized("live.hostLoginRequired", { en: /Open Settings and sign in/ });
   assert.doesNotMatch(workspaceJs, /Sign in once in the Live workspace window|login page|login screen/i);
   assert.doesNotMatch(html, /id="pt-voice-method-title"|data-i18n="output\.geminiVoice"/);
-  assert.doesNotMatch(html, /name="voiceProvider"[^>]+value="openai"/);
-  assert.match(html, /<input name="voiceProvider" type="hidden" value="gemini"\s*\/>/);
+  assert.doesNotMatch(html, /name="voiceProvider"/);
   // The Gemini-fixed explanation sentence was deleted; the fact remains as a
   // compact label + value note.
   assert.doesNotMatch(html, /자막 엔진은 Gemini 고정이며|pt-voice-method-help/);
@@ -265,8 +274,8 @@ test("subtitle dashboard exposes main controls, Gemma recording, and settings dr
   assert.match(js, /reconfigureRunningSession/);
   assert.match(js, /CHANNEL_REBUILD_CONTROLS/);
   assert.match(js, /type: "subtitle:start", sessionId: state\.sessionId/);
-  // Captions and translated audio stay on one Gemini contract. OpenAI key
-  // settings remain for unrelated whiteboard/agent/transcription features.
+  // Captions stay on one Gemini contract. OpenAI key settings remain for
+  // unrelated whiteboard/agent/transcription features.
   assert.match(html, /name="translationProvider"/);
   assert.match(html, /value="gemini"/);
   assert.doesNotMatch(html, /<select name="translationProvider">/);
@@ -274,7 +283,6 @@ test("subtitle dashboard exposes main controls, Gemma recording, and settings dr
   assertLocalized("output.engineNote", { ko: /자막 엔진/ });
   assertLocalized("output.engineNoteValue", { ko: /Gemini 고정/ });
   assert.match(js, /translationProvider: "gemini"/);
-  assert.match(js, /voiceProvider: "gemini"/);
   assert.doesNotMatch(js, /selectedVoiceProvider|OPENAI_REALTIME_TRANSLATION_LANGUAGES/);
   // Gemini API key entry with its own save button and status badge.
   assert.match(html, /<details class="settings-drawer">\s*<summary data-i18n="settings\.drawerAdvanced">/);
@@ -393,7 +401,7 @@ test("subtitle dashboard exposes main controls, Gemma recording, and settings dr
   assert.match(js, /adjustControllerFontSize/);
   assert.match(js, /setControllerSubtitlePosition/);
   assert.match(js, /persistControllerSubtitleSettings/);
-  assert.match(js, /const isVisible = state\.running && state\.settings\.outputMode !== "audio"/);
+  assert.match(js, /const isVisible = state\.running/);
   assert.match(js, /captionPlayerController\.hidden = !isVisible/);
   assert.match(js, /controllerRestartButton\?\.addEventListener\("click", restartCaptionsFromController\)/);
   assert.match(js, /controllerStopButton\?\.addEventListener\("click", stopSubtitles\)/);
@@ -407,7 +415,7 @@ test("subtitle dashboard exposes main controls, Gemma recording, and settings dr
   assert.match(js, /persistControllerOpacity/);
   assert.match(js, /syncControllerOpacity/);
   assert.match(js, /handleSubtitleControllerCommand/);
-  assert.match(js, /setControllerWindowVisible\(state\.running && !isAudioOnly\)/);
+  assert.match(js, /setControllerWindowVisible\(state\.running\)/);
   const stopSubtitlesBody = extractFunctionBody(js, "async function stopSubtitles()");
   assert.match(stopSubtitlesBody, /state\.running = false[\s\S]*syncRuntimeOutputVisibility\(\)/,
     "the stop path must hide the controller through the single runtime visibility rule");
@@ -564,7 +572,7 @@ test("desktop settings stay closed until the native summary is activated and non
     assert.match(match[1], /font-family:\s*var\(--ui-font-family\)/);
     assert.doesNotMatch(match[1], /var\(--subtitle-font-family\)/);
   }
-  assert.match(css, /\.pt-output-heading h2\s*\{[^}]*font-family:\s*var\(--ui-font-family\)/s);
+  assert.doesNotMatch(css, /\.pt-playback-options/);
   assert.doesNotMatch(css, /\.controller-group\s*\{[^}]*border-left:/s);
   assert.doesNotMatch(css, /radial-gradient/);
 });
@@ -583,8 +591,8 @@ test("desktop dashboard explains the optional Live handoff without a web launche
   assert.doesNotMatch(html, /live-handoff-modes/);
   assert.doesNotMatch(html, /Optional translated audio/);
   assert.doesNotMatch(html, /Townhall/);
-  assert.match(html, /data-i18n="live\.handoffFlow"/);
-  assertLocalized("live.handoffFlow", { en: /Create session → share QR or code → start Live Call/ });
+  assert.doesNotMatch(html, /data-i18n="live\.handoffFlow"/);
+  assert.match(html, /id="schedule-live-call"[^>]*data-i18n="live\.start"/);
   assert.match(html, /id="live-workspace-status"[^>]*role="status"[^>]*aria-live="polite"/);
   assert.match(html, /id="live-draft-cover-status"[^>]*role="status"[^>]*aria-live="polite"/);
   assert.doesNotMatch(html, /QR and a 6-digit access code are always created together/);
@@ -608,29 +616,29 @@ test("subtitle dashboard captures audio before opening realtime subtitle session
   assert.match(js, /state\.streams = captures\.map/);
 });
 
-test("the captions output mode survives settings persistence, and audio playback is hidden", async () => {
+test("desktop subtitle UI is captions-only and contains no translated-audio lane", async () => {
   const html = readFileSync(path.join(rootDir, "public", "subtitle.html"), "utf8");
   const js = readFileSync(path.join(rootDir, "public", "subtitle-dashboard.js"), "utf8");
-  // Two output modes remain: captions, or interpreted audio. The mixed mode is
-  // retired -- rejected by validateSubtitleSettings and migrated on read.
-  assert.match(html, /<input name="outputMode" type="radio" value="captions"/);
-  // Interpreted-audio playback is hidden for now, so the card carries a single
-  // captions radio and is itself hidden rather than showing a one-option control.
-  assert.doesNotMatch(html, /<input name="outputMode" type="radio" value="audio"/);
-  assert.doesNotMatch(html, /value="captions_audio"/);
+  const overlay = readFileSync(path.join(rootDir, "public", "subtitle-overlay.js"), "utf8");
+  const i18n = readFileSync(path.join(rootDir, "public", "subtitle-i18n.js"), "utf8");
 
-  const selectedOutputMode = new Function(
-    "form",
-    extractFunctionBody(js, "function selectedOutputMode()"),
-  );
+  assert.match(html, /<input name="outputMode" type="hidden" value="captions"\s*\/?>/);
+  assert.doesNotMatch(html, /pt-output-group|pt-playback-options|audioLanguage|audioVolume|voiceProvider/);
+  assert.doesNotMatch(html, /통역 음성|interpretation audio/iu);
+  assert.doesNotMatch(js, /subtitle-audio-player|subtitle:translated-audio|subtitle:audio-control/);
+  assert.doesNotMatch(js, /subtitleAudioPlayer|translatedAudioGuard|clearTranslatedAudioQueue|shouldGateTranslatedAudioInput/);
+  assert.doesNotMatch(js, /form\.elements\.(?:audioLanguage|audioVolume|voiceProvider)|\b(?:audioLanguage|audioVolume|voiceProvider)\s*:/);
+  assert.match(js, /RETIRED_SUBTITLE_SETTING_KEYS/);
+  assert.match(js, /geminiTranscribeModel: "gemini-3\.5-transcribe-live"/);
+  assert.doesNotMatch(js, /gemini-3\.5-live-translate-preview/);
+  assert.doesNotMatch(overlay, /outputMode|isAudioOnlyOutput/);
+  assert.doesNotMatch(i18n, /통역 음성|interpretation audio/iu);
+
   const form = {
-    querySelector: () => ({ value: "captions" }),
     elements: {
       inputMode: { value: "system_mic" },
       micDeviceId: { value: "" },
       translationProvider: { value: "gemini" },
-      audioLanguage: { value: "en" },
-      audioVolume: { value: "0.8" },
       fontFamily: { value: "Arial" },
       translationFontSize: { value: "38" },
       sourceFontSize: { value: "36" },
@@ -648,7 +656,6 @@ test("the captions output mode survives settings persistence, and audio playback
       verticalOffset: { value: "24" },
     },
   };
-  assert.equal(selectedOutputMode(form), "captions");
 
   const readSettingsFromForm = new Function(
     "form",
@@ -656,19 +663,21 @@ test("the captions output mode survives settings persistence, and audio playback
     "DEFAULT_SUBTITLE",
     "readNumber",
     "readTranslationLanguagesFromForm",
+    "readLiveCallLanguagesFromForm",
     "readSubtitlePositionsFromForm",
     "deriveLanguagePairFromTargets",
-    "selectedOutputMode",
+    "normalizeCaptionSettings",
     "selectedGlossaryPresetId",
     "selectedGlossaryPresetName",
+    "selectedGlossaries",
     extractFunctionBody(js, "function readSettingsFromForm()"),
   );
   const settings = readSettingsFromForm(
     form,
-    { settings: {} },
+    { settings: { model: "gemini-3.5-live-translate-preview", audioVolume: 0.8 } },
     {
+      geminiTranscribeModel: "gemini-3.5-transcribe-live",
       translationFontSize: 38,
-      audioVolume: 0.8,
       fontFamily: "Arial",
       maxWidth: 1500,
       opacity: 0.9,
@@ -680,14 +689,19 @@ test("the captions output mode survives settings persistence, and audio playback
     },
     (value, fallback) => Number(value) || fallback,
     () => ["en", "ko"],
+    () => [],
     () => ({ en: "bottom-center", ko: "bottom-center" }),
     () => ({ a: "en", b: "ko" }),
-    () => selectedOutputMode(form),
+    (value) => Object.fromEntries(Object.entries(value).filter(([key]) => !["model", "audioVolume"].includes(key))),
     () => "gemini",
     () => "default-cre-ai-en-ko",
-    () => "",
+    () => [{ sourceKind: "builtin", sourceId: "common_business" }],
   );
   assert.equal(settings.outputMode, "captions");
+  assert.equal(settings.geminiTranscribeModel, "gemini-3.5-transcribe-live");
+  assert.equal(Object.hasOwn(settings, "model"), false);
+  assert.equal(Object.hasOwn(settings, "audioVolume"), false);
+  assert.deepEqual(settings.glossaries, [{ sourceKind: "builtin", sourceId: "common_business" }]);
 
   /** @type {{ url: string, options: { method: string, body: string } } | null} */
   let request = null;
@@ -718,24 +732,29 @@ test("the captions output mode survives settings persistence, and audio playback
   assert.equal(request.url, "/api/settings");
   assert.equal(request.options.method, "PUT");
   assert.equal(JSON.parse(request.options.body).subtitle.outputMode, "captions");
+});
 
-  const previewPanel = { hidden: false };
-  const runtimeState = { running: true, settings: { outputMode: "audio" } };
-  const syncRuntimeOutputVisibility = new Function(
-    "state",
-    "previewPanel",
-    "syncCaptionPlayerController",
-    "setControllerWindowVisible",
-    extractFunctionBody(js, "function syncRuntimeOutputVisibility()"),
-  );
-  syncRuntimeOutputVisibility(runtimeState, previewPanel, () => {}, async () => {});
-  assert.equal(previewPanel.hidden, true, "audio-only mode hides the subtitle preview");
-  // Switching back to captions restores it. This pair used to be
-  // audio -> captions_audio, which only made sense while one mode emitted both;
-  // captions is now the only mode that produces something to preview.
-  runtimeState.settings.outputMode = "captions";
-  syncRuntimeOutputVisibility(runtimeState, previewPanel, () => {}, async () => {});
-  assert.equal(previewPanel.hidden, false, "captions mode shows the subtitle preview while running");
+test("desktop glossary checklist compares only the preset target and blocks mixed source languages", () => {
+  const js = readFileSync(path.join(rootDir, "public", "subtitle-dashboard.js"), "utf8");
+  const html = readFileSync(path.join(rootDir, "public", "subtitle.html"), "utf8");
+  // Host presets gate on their FULL target list (multi-target presets stay
+  // selectable for every covered language), falling back to languagePair.b.
+  assert.match(js, /hostTargetLanguages\(option\)\.some\(\(language\) => targetLanguages\.includes\(language\)\)/u);
+  assert.match(js, /\[option\.languagePair\?\.b\]/u);
+  assert.doesNotMatch(js, /targetLanguages\.includes\(option\.languagePair\?\.a\)\s*\|\|/u);
+  assert.match(js, /input\.dataset\.sourceLanguage/u);
+  assert.match(js, /new Set\(selectedInputs\.map\(\(selectedInput\) => selectedInput\.dataset\.sourceLanguage\)\)/u);
+  assert.match(js, /setGlossarySelectionStatus\("glossary\.selection\.mixedSources", "error"\)/u);
+  assertLocalized("glossary.selection.mixedSources", { ko: /서로 다른 원문 언어/u });
+  assert.match(js, /glossary\.selection\.checkConflicts/u);
+  assertLocalized("glossary.selection.checkConflicts", { ko: /적용할 때 번역 충돌을 확인합니다/u });
+  assert.doesNotMatch(js, /충돌이 발견되면 저장 전에|번역 충돌은 저장 전에/u);
+  assert.match(html, /적용할 때 번역 충돌을 확인합니다/u);
+  assert.doesNotMatch(html, /충돌이 발견되면 저장 전에|번역 충돌은 저장 전에/u);
+  assert.match(js, /selectedSourceLanguage/u);
+  assert.match(js, /isSelected \|\| \(isTargetCompatible && isSourceCompatible\)/u);
+  assert.match(js, /t\("glossary\.selection\.sourceIncompatible"\)/u);
+  assertLocalized("glossary.selection.sourceIncompatible", { ko: /선택한 용어집과 원문 언어가 다름/u });
 });
 
 test("subtitle dashboard cannot hang forever while checking audio inputs", () => {
@@ -814,31 +833,6 @@ test("subtitle dashboard aggregates resampled input into exact 100 ms Live API f
   assert.match(streamerSource, /close: async \(\) => \{[\s\S]*?chunker\.reset\(\);/);
 });
 
-test("translated playback isolates system loopback without suppressing microphone input", () => {
-  const js = readFileSync(path.join(rootDir, "public", "subtitle-dashboard.js"), "utf8");
-  const streamerStart = js.indexOf("async function startSubtitles");
-  const streamerEnd = js.indexOf("async function stopSubtitles", streamerStart);
-  const streamerSource = js.slice(streamerStart, streamerEnd);
-  const meterStart = js.indexOf("function startAudioLevelMeter");
-  const meterEnd = js.indexOf("function broadcastInputStatus", meterStart);
-  const meterSource = js.slice(meterStart, meterEnd);
-
-  assert.match(
-    streamerSource,
-    /shouldGateTranslatedAudioInput\([\s\S]*?state\.settings\.outputMode,[\s\S]*?subtitleAudioPlayer\.isInputSuppressionActive\(\),[\s\S]*?capture\.source,[\s\S]*?\)\) return;/,
-  );
-  assert.match(
-    meterSource,
-    /shouldGateTranslatedAudioInput\([\s\S]*?state\.settings\.outputMode,[\s\S]*?subtitleAudioPlayer\.isInputSuppressionActive\(\),[\s\S]*?sourceName,[\s\S]*?\);/,
-  );
-  assert.match(meterSource, /isFeedbackSuppressed \? t\("audio\.outputIsolated"\) : hasSignal \? t\("audio\.signal"\) : t\("audio\.noSignal"\)/);
-  assertLocalized("audio.outputIsolated", { en: /Output isolated/ });
-  assert.doesNotMatch(
-    streamerSource,
-    /shouldGateTranslatedAudioInput\(state\.settings\.outputMode, subtitleAudioPlayer\.isInputSuppressionActive\(\)\)\) return;/,
-  );
-});
-
 test("subtitle dashboard renders grouped translation history without flat-only records", () => {
   const html = readFileSync(path.join(rootDir, "public", "subtitle.html"), "utf8");
   const js = readFileSync(path.join(rootDir, "public", "subtitle-dashboard.js"), "utf8");
@@ -896,7 +890,7 @@ test("subtitle dashboard exposes source labels and level meter styles", () => {
   assert.match(css, /\.caption-player-controller/);
   assert.match(css, /Electron host dashboard/);
   assert.match(css, /\.subtitle-app-shell[\s\S]*?grid-template-columns: 220px minmax\(0, 1fr\)/);
-  assert.match(css, /\.subtitle-app-rail nav img[\s\S]*?width: 20px[\s\S]*?filter: invert\(1\)[\s\S]*?opacity: 0\.52/);
+  assert.match(css, /\.subtitle-app-rail nav img[\s\S]*?width: 20px[\s\S]*?filter: none[\s\S]*?opacity: 0\.72/);
   // The two-column track this used to pin was dead: .workspace-shell on the same
   // element sets display:block and wins. Both are gone.
   assert.doesNotMatch(css, /minmax\(400px, 430px\)/u);
@@ -918,9 +912,166 @@ test("subtitle dashboard exposes source labels and level meter styles", () => {
   assert.match(css, /\.controller-language-set/);
   assert.match(css, /\.controller-lang-option/);
   assert.match(css, /\.controller-opacity/);
-  assert.match(css, /\.subtitle-dashboard-body[\s\S]*?background: #f5f5f7/);
+  assert.match(css, /\.subtitle-dashboard-body[\s\S]*?background: var\(--nova-(?:surface-base|bg)\)/);
   assert.match(css, /\.controller-chip\.active/);
-  assert.match(css, /background: var\(--cw-blue\)/);
+  assert.match(css, /\.controller-chip\.active[\s\S]*?color: var\(--nova-fg-intense\)/);
+});
+
+test("desktop rail exposes Prepare, Meeting, Records, and Settings with independent meeting tools", () => {
+  const html = readFileSync(path.join(rootDir, "public", "subtitle.html"), "utf8");
+  const js = readFileSync(path.join(rootDir, "public", "subtitle-dashboard.js"), "utf8");
+
+  const prepareStart = html.indexOf('data-rail-section="prepare"');
+  const meetingPrep = html.indexOf('id="open-meeting-prep"');
+  const meetingStart = html.indexOf('data-rail-section="meeting"');
+  const captions = html.indexOf('data-workspace-nav="captions"');
+  const liveCall = html.indexOf('data-workspace-nav="livecall"');
+  const liveCoach = html.indexOf('id="open-live-coach"');
+  const liveInterpreter = html.indexOf('id="open-live-interpreter"');
+  const records = html.indexOf('data-rail-section="records"');
+  const settings = html.indexOf('data-rail-section="settings"');
+
+  assert.ok(prepareStart >= 0 && prepareStart < meetingPrep,
+    "Prepare must own the Meeting Prep launcher");
+  assert.ok(meetingPrep < meetingStart && meetingStart < captions && captions < liveCall
+    && liveCall < liveCoach && liveCoach < liveInterpreter,
+  "Meeting must expose Captions, Live Call, Live Coach, then Live Interpreter");
+  assert.ok(liveInterpreter < records && records < settings,
+    "Records and Settings remain top-level destinations after Meeting");
+
+  assert.match(html, /data-rail-icon="meeting-prep"/);
+  assert.match(html, /data-rail-icon="live-coach"/);
+  assert.match(html, /data-rail-icon="live-interpreter"/);
+  assert.doesNotMatch(html, /id="open-live-interpreter"[^>]*>[\s\S]{0,180}icons\/users\.svg/,
+    "Live Interpreter must not reuse the Live Call people icon");
+
+  for (const key of [
+    "nav.section.prepare", "nav.section.meeting", "nav.section.records", "nav.section.settings",
+    "nav.meetingPrep", "nav.liveCoach", "nav.liveInterpreter",
+  ]) assertLocalized(key);
+
+  assert.match(js, /meetingCoachOpenPrep/);
+  assert.match(js, /meetingCoachOpenLiveWindows/);
+  assert.match(js, /openLiveInterpreter/);
+  assert.match(js, /const railNavigationItems = \[\.\.\.document\.querySelectorAll\("\.subtitle-app-rail nav a, \.subtitle-app-rail nav button"\)\]/);
+  assert.match(js, /\["ArrowUp", "ArrowDown", "Home", "End"\]/);
+  assert.match(js, /availableItems\[nextIndex\]\?\.focus\(\)/);
+});
+
+test("Records filters search, type, and status across calendar meetings and local sessions", () => {
+  const html = readFileSync(path.join(rootDir, "public", "subtitle.html"), "utf8");
+  const js = readFileSync(path.join(rootDir, "public", "subtitle-dashboard.js"), "utf8");
+
+  assert.match(html, /id="records-search"[^>]*type="search"/u);
+  assert.match(html, /id="records-type-filter"[\s\S]*?value="all"[\s\S]*?value="captions"[\s\S]*?value="live-call"[\s\S]*?value="live-coach"[\s\S]*?value="live-interpreter"/u);
+  assert.match(html, /id="records-status-filter"[\s\S]*?value="all"[\s\S]*?value="completed"[\s\S]*?value="in-progress"/u);
+  assert.match(js, /function applySessionRecordFilters\(\)[\s\S]*?renderRecordsCalendar\([\s\S]*?renderSessionRecords\(/u,
+    "one filter pass must feed both the calendar and local rows");
+  assert.match(js, /records-search[\s\S]*?addEventListener\("input"/u);
+  assert.match(js, /records-type-filter[\s\S]*?addEventListener\("change"/u);
+  assert.match(js, /records-status-filter[\s\S]*?addEventListener\("change"/u);
+
+  const filterHelpers = [
+    "function normalizeRecordFilterText", "function isRecordObject", "function recordHasFeatureType",
+    "function isCompletedSessionRecord", "function matchesSessionRecordFilters",
+  ].map((signature) => extractBalancedStatement(js, signature)).join("\n");
+  const filtered = vm.runInNewContext(`${filterHelpers}; ({
+    coach: matchesSessionRecordFilters({ id: "it-call", kind: "live-call", endedAt: "2026-08-01T00:00:00.000Z", meetingCoach: {} }, { query: "IT-CALL", type: "live-coach", status: "completed" }),
+    active: matchesSessionRecordFilters({ id: "open", kind: "local", endedAt: "", isUnterminated: true }, { query: "", type: "captions", status: "in-progress" }),
+    wrongType: matchesSessionRecordFilters({ id: "caption", kind: "local", endedAt: "2026-08-01T00:00:00.000Z" }, { query: "", type: "live-call", status: "all" }),
+  })`);
+  assert.deepEqual({ ...filtered }, { coach: true, active: true, wrongType: false });
+
+  for (const key of [
+    "records.filtersLabel", "records.search", "records.type", "records.type.all", "records.type.captions",
+    "records.type.liveCall", "records.type.liveCoach", "records.type.liveInterpreter", "records.status",
+    "records.status.all", "records.status.completed", "records.status.inProgress", "records.noFilteredResults",
+  ]) assertLocalized(key);
+});
+
+test("Records Coach detail reads only matching optional history and uses an accessible roving tablist", () => {
+  const html = readFileSync(path.join(rootDir, "public", "subtitle.html"), "utf8");
+  const js = readFileSync(path.join(rootDir, "public", "subtitle-dashboard.js"), "utf8");
+
+  assert.match(html, /id="session-detail-tab-coach"[^>]*role="tab"[^>]*data-record-detail-tab="coach"[^>]*tabindex="-1"/u);
+  assert.match(html, /id="session-detail-panel-coach"[^>]*role="tabpanel"[^>]*data-record-detail-panel="coach"/u);
+  assert.match(js, /detail\.coach[\s\S]*?detail\.meetingCoach/u);
+  assert.match(js, /sourceSessionId[\s\S]*?sessionId/u,
+    "coach history with an explicit association must match the opened session");
+  assert.match(js, /usedAnswers[\s\S]*?unusedRecommendations/u);
+  assert.match(js, /renderSessionCoachHistory/u);
+  assert.match(js, /textContent =/u);
+  assert.doesNotMatch(extractFunctionBody(js, "function renderSessionCoachHistory(container, history)"), /innerHTML|insertAdjacentHTML/u);
+
+  assert.match(js, /function activateSessionDetailView[\s\S]{0,700}"coach"/u);
+  assert.match(js, /function activateSessionDetailView[\s\S]{0,900}tabIndex = isSelected \? 0 : -1/u);
+  assert.match(js, /\["ArrowLeft", "ArrowRight", "Home", "End"\]/u);
+  assert.match(js, /activateSessionDetailView\(tabs\[nextIndex\]\?\.dataset\.recordDetailTab, \{ focus: true \}\)/u);
+
+  const coachHelpers = [
+    "function normalizeRecordFilterText", "function isRecordObject", "function coachHistoryEntryText",
+    "function sessionCoachHistory",
+  ].map((signature) => extractBalancedStatement(js, signature)).join("\n");
+  const histories = vm.runInNewContext(`${coachHelpers}; ({
+    matching: sessionCoachHistory({ meetingCoach: { sourceSessionId: "session-a", usedAnswers: [{ english: "Yes", korean: "네" }], unusedRecommendations: ["Check inventory"] } }, "session-a"),
+    mismatched: sessionCoachHistory({ coach: { sourceSessionId: "session-b", usedAnswers: ["Must not render"] } }, "session-a"),
+    malformed: sessionCoachHistory({ coach: "unsafe" }, "session-a"),
+  })`);
+  assert.deepEqual([...histories.matching.usedAnswers], ["Yes\n네"]);
+  assert.deepEqual([...histories.matching.unusedRecommendations], ["Check inventory"]);
+  assert.deepEqual([...histories.mismatched.usedAnswers], []);
+  assert.deepEqual([...histories.malformed.unusedRecommendations], []);
+
+  for (const key of ["records.coach", "records.coachUsed", "records.coachUnused", "records.coachEmpty"]) {
+    assertLocalized(key);
+  }
+});
+
+test("Dashboard and Records keyboard model never leaves focus inside a hidden surface", () => {
+  const html = readFileSync(path.join(rootDir, "public", "subtitle.html"), "utf8");
+  const js = readFileSync(path.join(rootDir, "public", "subtitle-dashboard.js"), "utf8");
+
+  assert.match(html, /data-records-view="month"[^>]*aria-pressed="true"[^>]*tabindex="0"/u);
+  assert.match(html, /data-records-view="week"[^>]*aria-pressed="false"[^>]*tabindex="-1"/u);
+  assert.match(html, /data-records-view="day"[^>]*aria-pressed="false"[^>]*tabindex="-1"/u);
+  assert.match(js, /function activateRecordsCalendarView\(button, \{ focus = false \} = \{\}\)/u);
+  assert.match(js, /\["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "Home", "End"\]/u);
+  assert.match(js, /sibling\.setAttribute\("aria-pressed", String\(isSelected\)\)/u);
+  assert.match(js, /sibling\.tabIndex = isSelected \? 0 : -1/u);
+  assert.match(js, /records-search[\s\S]{0,900}event\.key !== "Enter"[\s\S]{0,120}event\.preventDefault\(\)/u,
+    "live search must not trigger the enclosing settings form submission");
+
+  assert.match(js, /listPanel: document\.getElementById\("session-records-panel"\)/u);
+  assert.match(js, /els\.listPanel\.hidden = true[\s\S]{0,220}els\.panel\.hidden = false[\s\S]{0,220}activateSessionDetailView\("summary", \{ focus: true \}\)/u,
+    "detail must become visible before its selected tab receives focus");
+  assert.match(js, /els\.listPanel\.hidden = false[\s\S]{0,500}nextFocus\?\.focus\(\)/u,
+    "Back must restore the originating record after the list is visible again");
+
+  assert.match(js, /refreshButton\.disabled = true[\s\S]{0,120}refreshButton\.setAttribute\("aria-busy", "true"\)/u);
+  assert.match(js, /refreshButton\.disabled = false[\s\S]{0,120}refreshButton\.removeAttribute\("aria-busy"\)/u);
+  assert.match(js, /button\.disabled = true[\s\S]{0,120}button\.setAttribute\("aria-busy", "true"\)/u,
+    "native feature launch buttons must be single-flight");
+  assert.match(js, /trigger\.disabled = true[\s\S]{0,120}trigger\.setAttribute\("aria-busy", "true"\)/u,
+    "record detail loading must be single-flight and expose its busy state");
+
+  for (const tab of ["summary", "transcript", "coach", "participants"]) {
+    assert.match(html, new RegExp(`id="session-detail-tab-${tab}"[^>]*aria-controls="session-detail-panel-${tab}"`, "u"));
+    assert.match(html, new RegExp(`id="session-detail-panel-${tab}"[^>]*aria-labelledby="session-detail-tab-${tab}"`, "u"));
+  }
+  assert.match(html, /id="settings-tab-general"[^>]*aria-selected="true"[^>]*tabindex="0"/u);
+  assert.match(html, /id="settings-tab-advanced"[^>]*aria-selected="false"[^>]*tabindex="-1"/u);
+});
+
+test("Records announces only concise finalized status, not every replaced result subtree", () => {
+  const html = readFileSync(path.join(rootDir, "public", "subtitle.html"), "utf8");
+  assert.match(html, /id="session-records-status"[^>]*role="status"[^>]*aria-live="polite"[^>]*aria-atomic="true"/u);
+  for (const id of ["records-cal-grid", "session-records-list", "session-detail-coach", "session-detail-participants"]) {
+    assert.doesNotMatch(html, new RegExp(`id="${id}"[^>]*aria-live=`, "u"), `${id} must not announce a whole replaced subtree`);
+  }
+  assert.match(html, /id="translation-log"[^>]*data-i18n-aria="history\.committedLabel"[^>]*aria-live="polite"/u,
+    "the finalized committed-caption log remains the only transcript live region");
+  assert.doesNotMatch(html, /class="subtitle-preview"[^>]*aria-live=/u,
+    "partial preview text must never be announced as finalized speech");
 });
 
 test("subtitle overlay defaults to the observed two-line rolling-caption layout", () => {
@@ -962,8 +1113,9 @@ test("subtitle overlay defaults to the observed two-line rolling-caption layout"
   assert.match(js, /LIVE_SUBTITLE_RECHECK_MS = 500/);
   assert.match(js, /subtitleLingerMs/);
   assert.match(js, /lane\.timer/);
-  assert.match(js, /message\.type === "subtitle:partial" && !isAudioOnlyOutput\(\)\) renderPredictedSubtitle\(message\)/);
-  assert.match(js, /message\.type === "subtitle:committed" && !isAudioOnlyOutput\(\)\) renderCommittedSubtitle\(message\)/);
+  assert.match(js, /message\.type === "subtitle:partial"\) renderPredictedSubtitle\(message\)/);
+  assert.match(js, /message\.type === "subtitle:committed"\) renderCommittedSubtitle\(message\)/);
+  assert.doesNotMatch(js, /isAudioOnlyOutput|outputMode/);
   assert.doesNotMatch(js, /subtitle:partial"\) renderSubtitle/);
   assert.match(js, /PREDICTED_SUBTITLE_MIN_CHARS = 4/);
   assert.match(js, /GEMINI_PREDICTED_SUBTITLE_MIN_CHARS = 10/);
@@ -1083,10 +1235,8 @@ test("subtitle overlay defaults to the observed two-line rolling-caption layout"
   assert.match(css, /transition: background 160ms ease/);
   assert.match(css, /rgba\(206, 211, 219, 0\.95\)/);
   assert.match(css, /translation-only \.source-line/);
-  assert.match(css, /--cw-indigo: #0c0a09/);
-  assert.match(css, /--cw-grey: #4e4e4e/);
-  assert.match(css, /--cw-blue: #0a84ff/);
-  assert.match(css, /rgb\(from var\(--cw-indigo\) r g b \/ var\(--subtitle-opacity\)\)/);
+  assert.match(css, /--nova-caption-plate: var\(--nova-surface-recessed\)/);
+  assert.match(css, /rgb\(from var\(--nova-caption-plate\) r g b \/ var\(--subtitle-opacity\)\)/);
   assert.match(css, /pointer-events: none/);
   assert.match(css, /position-bottom-center/);
   assert.doesNotMatch(css, /opacity: var\(--subtitle-opacity\)/);
@@ -1106,18 +1256,16 @@ test("Live Call partial and final plates keep the same configured opacity", () =
   );
 });
 
-test("subtitle styles use the editorial palette and carry no legacy brand colors", () => {
+test("subtitle styles use NOVA semantic tokens and carry no legacy brand colors", () => {
   const css = readFileSync(path.join(rootDir, "public", "subtitle.css"), "utf8");
   // De-branding guarantee: the retired Cushman brand hexes must never reappear.
   for (const banned of ["#1D1740", "#E4002B", "#0093AD", "#8E1000"]) {
     assert.ok(!css.includes(banned), `legacy brand color ${banned} must be removed`);
   }
-  // Editorial tokens present: ink, off-white canvas, iOS record red.
-  assert.match(css, /--cw-indigo: #0c0a09/);
-  assert.match(css, /--cw-grey-12: #f5f5f5/);
-  assert.match(css, /--cw-red: #FF453A/);
-  // Liquid-glass panels intentionally use translucent rgba fills.
-  assert.match(css, /backdrop-filter: blur/);
+  assert.match(css, /--nova-surface-base: var\(--nova-grey-950\)/);
+  assert.match(css, /--nova-fg-primary: var\(--nova-grey-100\)/);
+  assert.match(css, /--nova-status-live: var\(--nova-red-500\)/);
+  assert.doesNotMatch(css, /--cw-|filter:\s*invert|9999px/);
 });
 
 test("electron main creates always-on-top click-through overlay", () => {
@@ -1229,7 +1377,12 @@ test("live-call captions relay the opposite-language lane selected by main", () 
   assert.match(dashboard, /speakerDepartment/);
   assert.doesNotMatch(dashboard, /caption\.speaker\?\.isParticipant !== true/u,
     "gateway-canonical host captions must reach the desktop too");
-  assert.match(dashboard, /captionProducer: "gateway"/u);
+  // 2026-08-22: Live Call 기본은 gateway 단일 정본(로컬 엔진 미기동). hybrid는
+  // settings.liveCallLocalEngine=true opt-in으로만 선택된다 — 이중 번역 비용 방지.
+  assert.match(dashboard, /function resolveLiveCallProducerKind\(\)/u);
+  assert.match(dashboard, /liveCallLocalEngine === true \? "hybrid" : "gateway"/u);
+  assert.doesNotMatch(dashboard, /captionProducer: "hybrid",/u,
+    "hybrid must never be the unconditional producer kind");
   assert.doesNotMatch(dashboard, /hasAutoStartedCaptionsForLiveCall/u,
     "Live Call must not auto-start the independent local producer");
   assert.doesNotMatch(dashboard, /\$\{caption\.speaker[^}]*\}:/, "no Name: text prefix in relayed captions");
@@ -1250,21 +1403,53 @@ test("live-call captions relay the opposite-language lane selected by main", () 
     "unkeyed source pairing must use a bounded FIFO rather than unbounded Symbol keys");
 });
 
-test("Live Call uses one gateway translation producer across every floor state", () => {
+test("Live Call keeps local Caption Only independent from the Gateway relay", () => {
   const dashboard = readFileSync(path.join(rootDir, "public", "subtitle-dashboard.js"), "utf8");
+  const preflight = extractFunctionBody(dashboard, "async function handleLiveCallPreflight(request)");
   const syncBody = extractFunctionBody(dashboard, "async function syncLiveCallAudioBridge()");
+  const hybridStart = extractFunctionBody(dashboard, "async function startHybridCaptionSession(liveState)");
+  const capture = extractFunctionBody(dashboard, "function forwardLiveCallHostAudioPacket(packet, capture, sourceName)");
   const floorGate = extractFunctionBody(dashboard, "function applyLiveCallFloorGate(floor)");
+  const suppressLateLocal = extractFunctionBody(dashboard, "function shouldSuppressLocalLiveCallOutput(message)");
   const reconnect = extractFunctionBody(dashboard, "async function reconnectLiveCallTranslation()");
+  const reconfigure = extractFunctionBody(dashboard, "function reconfigureRunningSession()");
+  const reconfigureLive = extractFunctionBody(dashboard, "async function reconfigureLiveCallLocalProvider()");
 
-  assert.match(syncBody, /await startGatewayCaptionSession\(liveState\)/u);
+  assert.match(preflight, /await startLiveCallMicCapture\(\{ requestId \}\)/u);
+  assert.match(preflight, /await requestLocalSubtitlePreflight\(requestId, request\)/u);
+  assert.match(preflight, /await startHybridCaptionSession\(/u,
+    "preflight must start the local Caption Only provider before Go-Live succeeds");
+  assert.ok(preflight.indexOf("startLiveCallMicCapture") < preflight.indexOf("startHybridCaptionSession"),
+    "the captured stream must exist before the local provider starts");
+  assert.doesNotMatch(preflight.slice(0, preflight.indexOf("} catch")), /stopLiveCallAudioBridge/u,
+    "successful preflight must preserve its capture through armed-to-live transition");
+
+  assert.match(syncBody, /activeCaptionSessionOwner !== "live-call"[\s\S]*await startHybridCaptionSession\(liveState\)/u);
+  assert.match(syncBody, /liveState\.bridge\?\.floorSnapshot/u);
+  assert.match(syncBody, /applyLiveCallFloorGate\(floorSnapshot\)/u,
+    "initial/recovered sync must reuse the authoritative sanitized floor snapshot");
   assert.match(syncBody, /await bridge\.ensureLiveCallBridge\(\)/u);
-  assert.match(syncBody, /await startLiveCallMicCapture\(\)/u);
-  assert.doesNotMatch(syncBody, /startLocalLiveCallFallback|createAudioStreamer|subtitle:audio/u,
-    "Live Call must not send the host audio to a second local Gemini session");
+  assert.ok(syncBody.indexOf("startHybridCaptionSession") < syncBody.indexOf("await bridge.ensureLiveCallBridge()"),
+    "Gateway availability must never gate the local caption provider");
+  assert.match(hybridStart, /resolveLiveCallProducerKind\(\)/u);
+  assert.match(hybridStart, /activeCaptionProducer = startedProducerKind/u);
+  assert.match(capture, /type: "subtitle:audio"/u);
+  assert.match(capture, /sendLiveCallAudioFrame/u,
+    "the same captured frame must feed the independent Gateway host path");
+  assert.doesNotMatch(capture, /if \(isLiveParticipantFloorActive\) return false/u,
+    "participant floor must not stop local Caption Only PCM");
   assert.doesNotMatch(floorGate, /startLocalLiveCallFallback|restoreGatewayCaptionProducer|requestSubtitleStart|subtitle:audio/u,
-    "floor changes may gate host PCM but must never swap translation producers");
-  assert.doesNotMatch(reconnect, /activeCaptionProducer === "local"|restoreGatewayCaptionProducer/u,
-    "2-second recovery reconnects the gateway instead of promoting another producer");
+    "floor changes only select the visible producer; they never restart the local provider");
+  assert.match(suppressLateLocal, /isLiveParticipantFloorActive/u);
+  assert.match(suppressLateLocal, /message\.source !== "live-call"/u,
+    "local output is hidden only while a positively identified participant owns the floor");
+  assert.match(reconnect, /reconnectLiveCallTranslation/u,
+    "Gateway relay recovery remains separate from local caption rendering");
+  assert.match(reconfigure, /activeCaptionSessionOwner === "live-call"[\s\S]*reconfigureLiveCallLocalProvider/u);
+  assert.match(reconfigureLive, /captionProducer: "local"/u);
+  assert.match(reconfigureLive, /kind: "live-call"/u);
+  assert.match(reconfigureLive, /liveSessionId: activeLiveFloorSessionId/u,
+    "same-session settings reconfigure must retain hybrid relay ownership and meeting identity");
   assert.doesNotMatch(dashboard, /async function startLocalLiveCallFallback|async function restoreGatewayCaptionProducer|subtitle:producer-stop|subtitle:producer-stopped/u);
 });
 
@@ -1287,20 +1472,20 @@ test("Live Call polling leaves a caption-only local producer running", () => {
     "only a session owned by Live Call may be finalized when the call ends");
 });
 
-test("Live Call shutdown finalizes its gateway-only ownership", () => {
+test("Live Call shutdown finalizes its hybrid ownership", () => {
   const dashboard = readFileSync(path.join(rootDir, "public", "subtitle-dashboard.js"), "utf8");
   const sync = extractFunctionBody(dashboard, "async function syncLiveCallAudioBridge()");
-  const gateway = extractFunctionBody(dashboard, "async function startGatewayCaptionSession(liveState)");
+  const hybrid = extractFunctionBody(dashboard, "async function startHybridCaptionSession(liveState)");
   const stop = extractFunctionBody(dashboard, "async function stopSubtitles()");
   const endedCallBranch = sync.slice(
     sync.indexOf("if (!liveState?.armed || !liveState.live)"),
     sync.indexOf("if (isLiveBridgeStarting)"),
   );
 
-  assert.match(gateway, /activeCaptionSessionOwner = "live-call"/u,
-    "the gateway path must establish Live Call ownership");
+  assert.match(hybrid, /activeCaptionSessionOwner = "live-call"/u,
+    "the hybrid path must establish Live Call ownership");
   assert.match(endedCallBranch, /activeCaptionSessionOwner === "live-call"[\s\S]*await stopSubtitles\(\)/u,
-    "call end must finalize the gateway-owned session");
+    "call end must finalize the hybrid-owned session");
   assert.match(endedCallBranch, /stopLiveCallAudioBridge\("live call ended"\)/u);
   assert.match(stop, /activeCaptionSessionOwner = "none"/u,
     "stopping any caption session must clear stale ownership");
@@ -1351,7 +1536,7 @@ test("Live Call recovery keeps its controller and record while caption-only erro
   assert.match(reconnect, /const sessionId = state\.sessionId/u);
   assert.doesNotMatch(reconnect, /state\.sessionId = null|type: "subtitle:stop"|await stopSubtitles\(\)/u,
     "Live translation recovery must preserve the app session and committed transcript");
-  assert.match(reconnect, /clearTranslatedAudioQueue\(\)/u);
+  assert.doesNotMatch(reconnect, /translatedAudio|audio-control/u);
   assert.doesNotMatch(reconnect, /clearUncommittedPreview\(\)/u,
     "recovery must retain the latest partial until a snapshot or newer canonical event replaces it");
   assert.match(stop, /state\.sessionId = null/u,
@@ -1387,7 +1572,7 @@ test("Live Call requests one immediate recovery after two seconds of signalled i
   assert.deepEqual(recoveries, ["recover", "recover"], "participant floor or audio suppression must suspend recovery");
 
   assert.match(dashboard, /LIVE_TRANSLATION_STALL_MILLISECONDS = 2_000/u);
-  assert.match(dashboard, /noteInput\(\s*sourceName,\s*hasSignal,\s*now,[\s\S]{0,180}!isLiveHostAudioBlocked/u);
+  assert.match(dashboard, /noteInput\(\s*sourceName,\s*hasSignal,\s*now,[\s\S]{0,180}!isLiveParticipantFloorActive/u);
   assert.match(dashboard, /noteOutput\(performance\.now\(\)\)/u);
   assert.match(dashboard, /String\(message\.translatedText \?\? ""\)\.trim\(\)/u);
   assert.match(dashboard, /void reconnectLiveCallTranslation\(\)/u);
@@ -1416,7 +1601,10 @@ test("a local socket drop re-registers the same Live session without controller 
   assert.match(recover, /const sessionId = state\.sessionId/u);
   assert.match(recover, /await requestSubtitleStart/u);
   assert.match(recover, /sessionId,/u);
-  assert.match(recover, /captionProducer: "gateway"/u);
+  // 복구는 원래 시작과 같은 프로듀서 종류(기본 gateway, opt-in hybrid)로 재등록한다.
+  assert.match(recover, /resolveLiveCallProducerKind\(\)/u);
+  assert.match(recover, /captionProducer: recoveredProducerKind/u);
+  assert.match(recover, /activeCaptionProducer = recoveredProducerKind/u);
   assert.doesNotMatch(recover, /state\.sessionId = null|stopSubtitles\(|subtitle:stop/u);
 });
 
@@ -1439,9 +1627,17 @@ test("Live Call relay survives renderer socket stalls without losing finals or r
   let onCaption = () => { throw new Error("Live Call caption callback was not registered"); };
   const missingCaptionCallback = onCaption;
   const context = {
-    activeCaptionProducer: "gateway",
+    activeCaptionProducer: "hybrid",
     activeCaptionSessionOwner: "live-call",
     captionRuntimeState: "running",
+    activeLiveFloorSessionId: "live-stall",
+    activeLiveParticipantId: "viewer-1",
+    // The relay authorizes a participant caption against the last floor holder
+    // so a final that lands after the turn ends is still delivered.
+    lastAuthorizedLiveParticipantId: "viewer-1",
+    isLiveParticipantFloorActive: true,
+    liveFloorGateRevision: 1,
+    appliedLiveFloorGateRevision: 1,
     liveCallCaptionRelayFlushTimer: null,
     liveCallCaptionRelayQueue: [],
     liveCallFinalizedCaptionKeys: new Map(),
@@ -1480,6 +1676,8 @@ test("Live Call relay survives renderer socket stalls without losing finals or r
     text: "draft",
     isFinal: false,
     translationStatus: "translated",
+    speakerRole: "participant",
+    speaker: { isParticipant: true, participantId: "viewer-1" },
     ...overrides,
   });
 
@@ -1532,10 +1730,12 @@ test("Live Call reconnect flushes queued captions only after producer recovery i
   const dashboard = readFileSync(path.join(rootDir, "public", "subtitle-dashboard.js"), "utf8");
   const recover = extractFunctionBody(dashboard, "async function recoverLiveCaptionSocket()");
   const acknowledgement = recover.indexOf("await requestSubtitleStart(");
+  const localAcknowledgement = recover.indexOf('captionProducer: "local"');
   const snapshot = recover.indexOf("liveState.captionSnapshot");
   const flush = recover.indexOf("flushLiveCallCaptionRelayQueue()");
   assert.ok(acknowledgement >= 0, "gateway producer recovery must await its matching start acknowledgement");
   assert.ok(snapshot > acknowledgement, "the acknowledged recovery must consume the producer snapshot");
+  assert.ok(snapshot > localAcknowledgement, "snapshot relay must also wait for local provider recovery");
   assert.ok(flush > snapshot, "snapshot captions must enter the relay before queued events flush");
   assert.ok(flush > acknowledgement, "queued captions may flush only after producer recovery succeeds");
 });
@@ -1552,9 +1752,12 @@ test("Live Call relay bounds partial memory without discarding finals during a l
     send(payload) { received.push(JSON.parse(payload)); },
   };
   const context = {
-    activeCaptionProducer: "gateway",
+    activeCaptionProducer: "hybrid",
     activeCaptionSessionOwner: "live-call",
     captionRuntimeState: "running",
+    activeLiveParticipantId: "viewer-1",
+    liveFloorGateRevision: 1,
+    appliedLiveFloorGateRevision: 1,
     liveCallCaptionRelayFlushTimer: null,
     liveCallCaptionRelayQueue: [],
     liveCallFinalizedCaptionKeys: new Map(),
@@ -1637,6 +1840,10 @@ test("Live Call relay refuses captions when gateway ownership is inactive", () =
     activeCaptionProducer: "local",
     activeCaptionSessionOwner: "live-call",
     captionRuntimeState: "running",
+    activeLiveFloorSessionId: "live-inactive",
+    activeLiveParticipantId: "viewer-1",
+    liveFloorGateRevision: 1,
+    appliedLiveFloorGateRevision: 1,
     liveCallCaptionRelayFlushTimer: null,
     liveCallCaptionRelayQueue: [],
     liveCallFinalizedCaptionKeys: new Map(),
@@ -1672,8 +1879,10 @@ test("Live Call relay refuses captions when gateway ownership is inactive", () =
     text: "caption received outside gateway ownership",
     isFinal: true,
     translationStatus: "translated",
+    speakerRole: "participant",
+    speaker: { isParticipant: true, participantId: "viewer-1" },
   });
-  context.activeCaptionProducer = "gateway";
+  context.activeCaptionProducer = "hybrid";
   relay.flushLiveCallCaptionRelayQueue();
   assert.deepEqual(received, [], "inactive gateway ownership must not leak delayed captions");
 });
@@ -1689,9 +1898,12 @@ test("Live Call recovery merges an older snapshot before newer queued IPC captio
     send(payload) { received.push(JSON.parse(payload)); },
   };
   const context = {
-    activeCaptionProducer: "gateway",
+    activeCaptionProducer: "hybrid",
     activeCaptionSessionOwner: "live-call",
     captionRuntimeState: "reconnecting",
+    activeLiveParticipantId: "viewer-1",
+    liveFloorGateRevision: 1,
+    appliedLiveFloorGateRevision: 1,
     liveCallCaptionRelayFlushTimer: null,
     liveCallCaptionRelayQueue: [],
     liveCallFinalizedCaptionKeys: new Map(),
@@ -1791,7 +2003,12 @@ test("Live Call preflight proves renderer capture and local subtitle readiness b
   assert.match(cancel, /requestId !== liveBridgePreflightRequestId/u);
   assert.match(cancel, /if \(liveState\?\.live\) return/u);
   assert.match(cancel, /stopLiveCallAudioBridge\("preflight cancelled"\)/u);
-  assert.doesNotMatch(cancel, /stopSubtitles\(|state\.sessionId = null/u);
+  // Preflight now starts the local Caption Only provider before Go-Live is
+  // allowed to spend money, so cancelling must stop it again — otherwise an
+  // aborted start leaves a caption session running with no call behind it. The
+  // session id itself is still owned by the normal stop path.
+  assert.match(cancel, /if \(activeCaptionSessionOwner === "live-call"\) await stopSubtitles\(\)/u);
+  assert.doesNotMatch(cancel, /state\.sessionId = null/u);
   assert.match(sync, /if \(!liveBridgeCapture\)/u,
     "the running bridge must reuse a capture held by successful preflight");
 });

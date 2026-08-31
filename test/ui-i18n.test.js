@@ -60,11 +60,11 @@ function createRoot(elements) {
 
 test.afterEach(() => { setLanguage(DEFAULT_UI_LANGUAGE); });
 
-test("the UI dictionary covers every key in both supported languages", () => {
-  assert.deepEqual(SUPPORTED_UI_LANGUAGES, ["en", "ko"]);
+test("the UI dictionary covers every key in all three supported languages", () => {
+  assert.deepEqual(SUPPORTED_UI_LANGUAGES, ["ko", "en", "ja"]);
   assert.ok(SUPPORTED_UI_LANGUAGES.includes(DEFAULT_UI_LANGUAGE));
   const keySets = SUPPORTED_UI_LANGUAGES.map((language) => Object.keys(MESSAGES[language]).sort());
-  assert.deepEqual(keySets[0], keySets[1], "en and ko must declare exactly the same keys");
+  for (const keys of keySets) assert.deepEqual(keys, keySets[0], "all languages must declare exactly the same keys");
   for (const language of SUPPORTED_UI_LANGUAGES) {
     for (const [key, value] of Object.entries(MESSAGES[language])) {
       assert.equal(typeof value, "string", `${language}.${key} must be a string`);
@@ -94,7 +94,7 @@ test("normalizeLanguage accepts only the supported set", () => {
   assert.equal(normalizeLanguage("en"), "en");
   assert.equal(normalizeLanguage("KO"), "ko");
   assert.equal(normalizeLanguage("ko-KR"), "ko");
-  assert.equal(normalizeLanguage("ja"), null);
+  assert.equal(normalizeLanguage("ja"), "ja");
   assert.equal(normalizeLanguage(""), null);
   assert.equal(normalizeLanguage(undefined), null);
 });

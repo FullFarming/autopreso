@@ -1,4 +1,5 @@
 import { createServer } from "node:http";
+import { createHash, createHmac, randomUUID } from "node:crypto";
 
 import { WebSocket, WebSocketServer } from "ws";
 
@@ -12,10 +13,19 @@ import {
 } from "./gateway-security.js";
 import { GatewayMetrics } from "./metrics.js";
 import { verifyLiveToken } from "./token-verifier.js";
+import { ViewerTicketReplayGuard } from "./viewer-ticket-replay-guard.js";
+import { ViewerAuthorizationBatcher } from "./viewer-authorization-batcher.js";
+import { MediaDemandCoordinator } from "./media-demand-coordinator.js";
 
 const AUTH_TIMEOUT_MILLISECONDS = 5_000;
 const AUTHORIZATION_CADENCE_MILLISECONDS = 2_500;
 const AUTHORIZATION_CACHE_MILLISECONDS = 5_000;
+/** 발언권(participant speaking)은 세션 단위 설정이다. 주기 재검사에서 뷰어마다
+ *  개별 RPC를 쏘면 발언 가능 뷰어 200명 × ~4.25s = 2시간에 ~34만 회가 되므로,
+ *  주기 경로만 세션 스코프 리스로 합친다(회수 반영 지연 ≤ 이 값). grant 자체의
+ *  유효성은 같은 사이클의 배치 grant 재인증이 담보하고, speak-start와
+ *  subscribe는 리스를 거치지 않는 즉시 검사로 남는다. */
+const SPEAKING_REAUTHORIZATION_LEASE_MILLISECONDS = 10_000;
 const INPUT_FRAME_BYTES = AUDIO_CONFIG.inputSampleRate * 2 * AUDIO_CONFIG.chunkMilliseconds / 1_000;
 const TAGGED_AUDIO_HEADER_BYTES = 4;
 const TAGGED_AUDIO_FRAME_BYTES = TAGGED_AUDIO_HEADER_BYTES + INPUT_FRAME_BYTES;
@@ -36,10 +46,223 @@ const DEFAULT_FLOOR_IDLE_RELEASE_MILLISECONDS = 8_000;
  *  Sized well above a normal replay round-trip so healthy sessions never hit
  *  it, and far below anything that would matter for memory over a long call. */
 const MAX_REPLAY_BUFFER_EVENTS = 500;
-const DEFAULT_DURABLE_RECOVERY_RETRY_DELAYS_MILLISECONDS = [1_000, 2_000, 4_000, 8_000, 16_000, 20_000];
-const DEFAULT_DURABLE_RECOVERY_ATTEMPT_TIMEOUT_MILLISECONDS = 10_000;
-const DEFAULT_RECOVERY_AUDIO_SPOOL_MILLISECONDS = 30_000;
 const DEFAULT_MAX_BUFFERED_HOST_CAPTIONS = 512;
+const DEFAULT_VIEWER_AUTHORIZATION_LEASE_MILLISECONDS = 4_000;
+const DEFAULT_VIEWER_AUTHORIZATION_JITTER_MILLISECONDS = 500;
+const DEFAULT_VIEWER_AUTHORIZATION_CONCURRENCY = 4;
+const DEFAULT_VIEWER_AUTHORIZATION_LEASE_ENTRIES = 10_000;
+const DEFAULT_VIEWER_AUTHORIZATION_BATCH_WINDOW_MILLISECONDS = 100;
+const DEFAULT_VIEWER_AUTHORIZATION_BATCH_SIZE = 50;
+const DEFAULT_PARTICIPANT_PROFILE_CACHE_ENTRIES = 10_000;
+const DEFAULT_PARTICIPANT_PROFILE_TTL_MILLISECONDS = 5 * 60_000;
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
+
+export class ViewerAuthorizationLeaseManager {
+  #leases = new Map();
+  #queue = [];
+  #active = 0;
+
+  constructor({
+    authorize,
+    batchAuthorize = null,
+    now = Date.now,
+    leaseMilliseconds = DEFAULT_VIEWER_AUTHORIZATION_LEASE_MILLISECONDS,
+    maxConcurrent = DEFAULT_VIEWER_AUTHORIZATION_CONCURRENCY,
+    maxEntries = DEFAULT_VIEWER_AUTHORIZATION_LEASE_ENTRIES,
+  }) {
+    if (typeof authorize !== "function") throw new Error("INVALID_VIEWER_AUTHORIZER");
+    if (batchAuthorize !== null && typeof batchAuthorize !== "function") throw new Error("INVALID_VIEWER_BATCH_AUTHORIZER");
+    if (!Number.isFinite(leaseMilliseconds) || leaseMilliseconds <= 0) throw new Error("INVALID_VIEWER_AUTHORIZATION_LEASE");
+    if (!Number.isSafeInteger(maxConcurrent) || maxConcurrent < 1) throw new Error("INVALID_VIEWER_AUTHORIZATION_CONCURRENCY");
+    if (!Number.isSafeInteger(maxEntries) || maxEntries < 1) throw new Error("INVALID_VIEWER_AUTHORIZATION_LEASE_CAPACITY");
+    this.authorizeRequest = authorize;
+    this.batchAuthorize = batchAuthorize;
+    this.now = now;
+    this.leaseMilliseconds = leaseMilliseconds;
+    this.maxConcurrent = maxConcurrent;
+    this.maxEntries = maxEntries;
+  }
+
+  get size() {
+    return this.#leases.size;
+  }
+
+  async authorize(claims, sessionId, language, { signal, force = false } = {}) {
+    if (claims?.role !== "VIEWER"
+      || claims.sessionId !== sessionId
+      || typeof claims.grantId !== "string"
+      || !claims.grantId
+      || typeof claims.userId !== "string"
+      || !claims.userId
+      || typeof language !== "string"
+      || !language) return false;
+    const key = authorizationLeaseKey(claims, sessionId, language);
+    const existing = this.#leases.get(key);
+    if (!force && existing?.authorizedUntil > this.now()) {
+      this.#leases.delete(key);
+      this.#leases.set(key, existing);
+      return true;
+    }
+    if (existing?.flight) return existing.flight;
+    if (!existing) this.#makeCapacity();
+    const lease = existing ?? { authorizedUntil: 0, flight: null };
+    const authorization = this.batchAuthorize
+      ? this.batchAuthorize({ sessionId, grantId: claims.grantId, userId: claims.userId, language }, { signal })
+      : this.#runLimited(() => this.authorizeRequest(claims, sessionId, language, { signal }), signal);
+    const flight = authorization.then((isAuthorized) => {
+      if (isAuthorized !== true) {
+        if (this.#leases.get(key) === lease) this.#leases.delete(key);
+        return false;
+      }
+      lease.authorizedUntil = this.now() + this.leaseMilliseconds;
+      return true;
+    }).finally(() => {
+      if (lease.flight === flight) lease.flight = null;
+    });
+    lease.flight = flight;
+    this.#leases.set(key, lease);
+    return flight;
+  }
+
+  deleteGrant(claims, sessionId, language) {
+    if (!claims || typeof claims.grantId !== "string" || typeof claims.userId !== "string") return;
+    this.#leases.delete(authorizationLeaseKey(claims, sessionId, language));
+  }
+
+  deleteSession(sessionId) {
+    const prefix = `${sessionId}\u0000`;
+    for (const key of this.#leases.keys()) {
+      if (key.startsWith(prefix)) this.#leases.delete(key);
+    }
+  }
+
+  clear() {
+    this.#leases.clear();
+  }
+
+  #makeCapacity() {
+    if (this.#leases.size < this.maxEntries) return;
+    const timestamp = this.now();
+    for (const [key, lease] of this.#leases) {
+      if (!lease.flight && lease.authorizedUntil <= timestamp) this.#leases.delete(key);
+    }
+    while (this.#leases.size >= this.maxEntries) {
+      const candidate = [...this.#leases].find(([, lease]) => !lease.flight);
+      if (!candidate) throw new Error("VIEWER_AUTHORIZATION_CAPACITY");
+      this.#leases.delete(candidate[0]);
+    }
+  }
+
+  #runLimited(task, signal) {
+    if (signal?.aborted) return Promise.reject(abortReason(signal, "GRANT_CHECK_CANCELLED"));
+    return new Promise((resolve, reject) => {
+      const entry = { task, signal, resolve, reject, onAbort: null };
+      if (signal) {
+        entry.onAbort = () => {
+          const index = this.#queue.indexOf(entry);
+          if (index < 0) return;
+          this.#queue.splice(index, 1);
+          reject(abortReason(signal, "GRANT_CHECK_CANCELLED"));
+        };
+        signal.addEventListener("abort", entry.onAbort, { once: true });
+      }
+      this.#queue.push(entry);
+      this.#drain();
+    });
+  }
+
+  #drain() {
+    while (this.#active < this.maxConcurrent && this.#queue.length > 0) {
+      const entry = this.#queue.shift();
+      if (entry.signal?.aborted) {
+        entry.reject(abortReason(entry.signal, "GRANT_CHECK_CANCELLED"));
+        continue;
+      }
+      if (entry.onAbort) entry.signal.removeEventListener("abort", entry.onAbort);
+      this.#active += 1;
+      Promise.resolve()
+        .then(entry.task)
+        .then(entry.resolve, entry.reject)
+        .finally(() => {
+          this.#active -= 1;
+          this.#drain();
+        });
+    }
+  }
+}
+
+export class ParticipantProfileCache {
+  #entries = new Map();
+
+  constructor({
+    maxEntries = DEFAULT_PARTICIPANT_PROFILE_CACHE_ENTRIES,
+    ttlMilliseconds = DEFAULT_PARTICIPANT_PROFILE_TTL_MILLISECONDS,
+    now = Date.now,
+  } = {}) {
+    if (!Number.isSafeInteger(maxEntries) || maxEntries < 1) throw new Error("INVALID_PARTICIPANT_PROFILE_CACHE_SIZE");
+    if (!Number.isFinite(ttlMilliseconds) || ttlMilliseconds <= 0) throw new Error("INVALID_PARTICIPANT_PROFILE_CACHE_TTL");
+    this.maxEntries = maxEntries;
+    this.ttlMilliseconds = ttlMilliseconds;
+    this.now = now;
+  }
+
+  get size() {
+    return this.#entries.size;
+  }
+
+  get(sessionId, participantId) {
+    const key = participantProfileKey(sessionId, participantId);
+    const entry = this.#entries.get(key);
+    if (!entry || entry.expiresAt <= this.now()) {
+      if (entry) this.#entries.delete(key);
+      return { hit: false, value: null };
+    }
+    this.#entries.delete(key);
+    this.#entries.set(key, entry);
+    return { hit: true, value: entry.value };
+  }
+
+  set(sessionId, participantId, value) {
+    const key = participantProfileKey(sessionId, participantId);
+    this.#entries.delete(key);
+    while (this.#entries.size >= this.maxEntries) {
+      const oldestKey = this.#entries.keys().next().value;
+      if (oldestKey === undefined) break;
+      this.#entries.delete(oldestKey);
+    }
+    this.#entries.set(key, { value, expiresAt: this.now() + this.ttlMilliseconds });
+  }
+
+  deleteSession(sessionId) {
+    const prefix = `${sessionId}\u0000`;
+    for (const key of this.#entries.keys()) {
+      if (key.startsWith(prefix)) this.#entries.delete(key);
+    }
+  }
+
+  clear() {
+    this.#entries.clear();
+  }
+}
+
+function authorizationLeaseKey(claims, sessionId, language) {
+  return `${sessionId}\u0000${claims.grantId}\u0000${claims.userId}\u0000${language}`;
+}
+
+function participantProfileKey(sessionId, participantId) {
+  return `${sessionId}\u0000${participantId}`;
+}
+
+function viewerAuthorizationJitter(claims, maximumMilliseconds) {
+  if (maximumMilliseconds <= 0) return 0;
+  const value = `${claims.sessionId}\u0000${claims.grantId}\u0000${claims.userId}`;
+  let hash = 2_166_136_261;
+  for (const character of value) {
+    hash ^= character.codePointAt(0);
+    hash = Math.imul(hash, 16_777_619) >>> 0;
+  }
+  return hash % maximumMilliseconds;
+}
 
 export function decodeHostAudioFrame(data) {
   const frame = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
@@ -69,52 +292,70 @@ export function createGatewayServer({
   now = Date.now,
   setTimeoutFn = setTimeout,
   clearTimeoutFn = clearTimeout,
+  setViewerAuthorizationBatchTimeoutFn = setTimeout,
+  clearViewerAuthorizationBatchTimeoutFn = clearTimeout,
   setReauthorizeIntervalFn = setInterval,
   clearReauthorizeIntervalFn = clearInterval,
   setHostLeaseIntervalFn = setInterval,
   clearHostLeaseIntervalFn = clearInterval,
+  serializeJson = JSON.stringify,
   viewerAuthorizeTimeoutMilliseconds = 5_000,
+  viewerAuthorizationLeaseMilliseconds = DEFAULT_VIEWER_AUTHORIZATION_LEASE_MILLISECONDS,
+  viewerAuthorizationJitterMilliseconds = DEFAULT_VIEWER_AUTHORIZATION_JITTER_MILLISECONDS,
+  viewerAuthorizationMaxConcurrent = DEFAULT_VIEWER_AUTHORIZATION_CONCURRENCY,
+  viewerAuthorizationBatchWindowMilliseconds = DEFAULT_VIEWER_AUTHORIZATION_BATCH_WINDOW_MILLISECONDS,
+  viewerAuthorizationBatchSize = DEFAULT_VIEWER_AUTHORIZATION_BATCH_SIZE,
   hostStartTimeoutMilliseconds = 10_000,
   maxQueuedHostOperations = 8,
   slowConsumerPredicate = (viewer) => viewer.bufferedAmount >= 750_000,
   securityPolicy = readGatewaySecurityPolicy(),
   connectionLimiter = new GatewayConnectionLimiter({ now }),
+  viewerTicketReplayGuard = new ViewerTicketReplayGuard({ now }),
   audioBurstMilliseconds = 2_000,
-  maxSessionAudioMilliseconds = 6 * 60 * 60 * 1_000,
-  maxSessionAudioBytes = INPUT_BYTES_PER_SECOND * 6 * 60 * 60,
+  maxSessionAudioMilliseconds = 2 * 60 * 60 * 1_000,
+  maxSessionAudioBytes = INPUT_BYTES_PER_SECOND * 2 * 60 * 60,
   maxSessionAudioEntries = 1_000,
   floorTakeCooldownMilliseconds = DEFAULT_FLOOR_TAKE_COOLDOWN_MILLISECONDS,
   floorResumeCooldownMilliseconds = null,
   floorIdleReleaseMilliseconds = DEFAULT_FLOOR_IDLE_RELEASE_MILLISECONDS,
   hostReconnectGraceMilliseconds = 90_000,
   fetchFloorParticipant = null,
+  participantProfileCacheMaxEntries = DEFAULT_PARTICIPANT_PROFILE_CACHE_ENTRIES,
+  participantProfileCacheTtlMilliseconds = DEFAULT_PARTICIPANT_PROFILE_TTL_MILLISECONDS,
+  releaseGeminiSession = async () => {},
   replayUtterances = null,
   replayTimeoutMilliseconds = 5_000,
-  durableRecoveryRetryDelaysMilliseconds = DEFAULT_DURABLE_RECOVERY_RETRY_DELAYS_MILLISECONDS,
-  durableRecoveryAttemptTimeoutMilliseconds = DEFAULT_DURABLE_RECOVERY_ATTEMPT_TIMEOUT_MILLISECONDS,
-  recoveryAudioSpoolMilliseconds = DEFAULT_RECOVERY_AUDIO_SPOOL_MILLISECONDS,
   maxBufferedHostCaptions = DEFAULT_MAX_BUFFERED_HOST_CAPTIONS,
+  mediaDemandStore = null,
+  mediaDemandPollMilliseconds = 5_000,
 }) {
   if (!Number.isFinite(heartbeatIntervalMilliseconds) || heartbeatIntervalMilliseconds <= 0) throw new Error("INVALID_HEARTBEAT_INTERVAL");
+  if (typeof viewerTicketReplayGuard?.consume !== "function") throw new Error("INVALID_VIEWER_TICKET_REPLAY_GUARD");
+  if (typeof viewerAuthorizer?.authorizeBatch !== "function") throw new Error("INVALID_VIEWER_BATCH_AUTHORIZER");
   if (!Number.isFinite(viewerAuthorizeTimeoutMilliseconds) || viewerAuthorizeTimeoutMilliseconds <= 0) throw new Error("INVALID_VIEWER_AUTHORIZE_TIMEOUT");
+  if (typeof serializeJson !== "function") throw new Error("INVALID_JSON_SERIALIZER");
+  if (!Number.isFinite(viewerAuthorizationLeaseMilliseconds)
+    || viewerAuthorizationLeaseMilliseconds <= 0
+    || viewerAuthorizationLeaseMilliseconds > AUTHORIZATION_CACHE_MILLISECONDS) throw new Error("INVALID_VIEWER_AUTHORIZATION_LEASE");
+  if (!Number.isSafeInteger(viewerAuthorizationJitterMilliseconds) || viewerAuthorizationJitterMilliseconds < 0) throw new Error("INVALID_VIEWER_AUTHORIZATION_JITTER");
+  if (viewerAuthorizationLeaseMilliseconds
+    + viewerAuthorizationJitterMilliseconds
+    + viewerAuthorizationBatchWindowMilliseconds > AUTHORIZATION_CACHE_MILLISECONDS) {
+    throw new Error("INVALID_VIEWER_AUTHORIZATION_REVALIDATION_SLA");
+  }
+  if (!Number.isSafeInteger(viewerAuthorizationMaxConcurrent) || viewerAuthorizationMaxConcurrent < 1) throw new Error("INVALID_VIEWER_AUTHORIZATION_CONCURRENCY");
+  if (!Number.isFinite(viewerAuthorizationBatchWindowMilliseconds)
+    || viewerAuthorizationBatchWindowMilliseconds < 0
+    || viewerAuthorizationBatchWindowMilliseconds > 1_000) throw new Error("INVALID_VIEWER_AUTHORIZATION_BATCH_WINDOW");
+  if (!Number.isSafeInteger(viewerAuthorizationBatchSize)
+    || viewerAuthorizationBatchSize < 1
+    || viewerAuthorizationBatchSize > DEFAULT_VIEWER_AUTHORIZATION_BATCH_SIZE) throw new Error("INVALID_VIEWER_AUTHORIZATION_BATCH_SIZE");
   if (!Number.isFinite(hostStartTimeoutMilliseconds) || hostStartTimeoutMilliseconds <= 0) throw new Error("INVALID_HOST_START_TIMEOUT");
   if (!Number.isFinite(replayTimeoutMilliseconds) || replayTimeoutMilliseconds <= 0) throw new Error("INVALID_REPLAY_TIMEOUT");
-  if (!Array.isArray(durableRecoveryRetryDelaysMilliseconds)
-    || durableRecoveryRetryDelaysMilliseconds.length === 0
-    || durableRecoveryRetryDelaysMilliseconds.some((delay) => !Number.isFinite(delay) || delay < 0 || delay > 20_000)) {
-    throw new Error("INVALID_DURABLE_RECOVERY_RETRY_DELAYS");
-  }
-  if (!Number.isFinite(durableRecoveryAttemptTimeoutMilliseconds)
-    || durableRecoveryAttemptTimeoutMilliseconds <= 0
-    || durableRecoveryAttemptTimeoutMilliseconds > 60_000) {
-    throw new Error("INVALID_DURABLE_RECOVERY_ATTEMPT_TIMEOUT");
-  }
-  if (!Number.isFinite(recoveryAudioSpoolMilliseconds)
-    || recoveryAudioSpoolMilliseconds < AUDIO_CONFIG.chunkMilliseconds
-    || recoveryAudioSpoolMilliseconds > DEFAULT_RECOVERY_AUDIO_SPOOL_MILLISECONDS) {
-    throw new Error("INVALID_RECOVERY_AUDIO_SPOOL_WINDOW");
-  }
   if (!Number.isSafeInteger(maxQueuedHostOperations) || maxQueuedHostOperations < 0) throw new Error("INVALID_HOST_QUEUE_LIMIT");
+  if (!Number.isSafeInteger(participantProfileCacheMaxEntries) || participantProfileCacheMaxEntries < 1) throw new Error("INVALID_PARTICIPANT_PROFILE_CACHE_SIZE");
+  if (!Number.isFinite(participantProfileCacheTtlMilliseconds) || participantProfileCacheTtlMilliseconds <= 0) throw new Error("INVALID_PARTICIPANT_PROFILE_CACHE_TTL");
+  if (typeof releaseGeminiSession !== "function") throw new Error("INVALID_GEMINI_SESSION_RELEASER");
   if (!Number.isFinite(audioBurstMilliseconds) || audioBurstMilliseconds < AUDIO_CONFIG.chunkMilliseconds) throw new Error("INVALID_AUDIO_BURST");
   if (!Number.isFinite(maxSessionAudioMilliseconds) || maxSessionAudioMilliseconds <= 0) throw new Error("INVALID_SESSION_AUDIO_DURATION");
   if (!Number.isSafeInteger(maxSessionAudioBytes) || maxSessionAudioBytes < INPUT_FRAME_BYTES) throw new Error("INVALID_SESSION_AUDIO_BYTES");
@@ -138,25 +379,106 @@ export function createGatewayServer({
     throw new Error("INVALID_HOST_RECONNECT_GRACE");
   }
   const hostSessions = new Map();
+  const failedHostSessions = new Map();
+  const demand = mediaDemandStore ? new MediaDemandCoordinator({
+    store: mediaDemandStore,
+    now,
+    pollMilliseconds: mediaDemandPollMilliseconds,
+    onIdle: async (sessionId, epoch, reason) => {
+      const current = hostSessions.get(sessionId);
+      if (current && current.demandEpoch !== epoch) return;
+      if (current) current.isDetaching = true;
+      let drained = true;
+      let drainTimer;
+      try {
+        if (current) {
+          await Promise.race([(async () => {
+            await drainHostAudioLanes(current);
+            await current.pipeline.gracefulDrain?.({ timeoutMilliseconds: 10_000 });
+          })(), new Promise((_, reject) => {
+            drainTimer = setTimeoutFn(() => reject(new Error("MEDIA_DRAIN_TIMEOUT")), 10_000);
+          })]);
+          await detachOwnedHostSession(sessionId, current.webSocket);
+        }
+      } catch {
+        drained = false;
+        metrics.increment("media_idle_drain_failures_total");
+        if (current) {
+          current.pipeline.abortMedia?.();
+          void detachOwnedHostSession(sessionId, current.webSocket).catch(() => undefined);
+        }
+      } finally {
+        clearTimeoutFn(drainTimer);
+        for (const socket of authenticatedSessionSockets.get(sessionId) ?? []) {
+          if (socket.demandEpoch !== epoch) continue;
+          sendJson(socket, { type: "media-idle", sessionId, epoch, reason: drained ? reason : "MEDIA_DRAIN_FAILED" });
+          socket.immediateTeardown = true;
+          if (socket.readyState === WebSocket.OPEN) socket.close(1000, "media idle");
+        }
+      }
+      return { drained };
+    },
+  }) : null;
   const hostOperationTails = new Map();
   const hostOperationCounts = new Map();
   const floorOperationTails = new Map();
   const successfullyClosedPipelines = new WeakSet();
   const pipelineCloseFlights = new WeakMap();
   const pipelinesPendingClose = new Set();
+  const pipelineSessionIds = new WeakMap();
+  const sessionCleanupFailures = new Map();
   const viewerTopics = new Map();
   const viewerMetadata = new WeakMap();
+  const authenticatedSessionSockets = new Map();
   const floorHolders = new Map();
+  const floorRevisions = new Map();
   const floorTakeAttempts = new Map();
-  const participantProfiles = new Map();
+  const participantProfiles = new ParticipantProfileCache({
+    maxEntries: participantProfileCacheMaxEntries,
+    ttlMilliseconds: participantProfileCacheTtlMilliseconds,
+    now,
+  });
   const connectionCleanup = new Map();
   const sessionAudioUsage = new Map();
+  /** sessionId -> { value, expiresAt, inFlight } — 주기 발언권 재검사 리스. */
+  const speakingAuthorizationLeases = new Map();
+  const leasedParticipantSpeakingAuthorization = (sessionId, check) => {
+    const cached = speakingAuthorizationLeases.get(sessionId);
+    if (cached?.inFlight) return cached.inFlight;
+    if (cached && cached.expiresAt > now()) return Promise.resolve(cached.value);
+    const inFlight = Promise.resolve()
+      .then(check)
+      .then((value) => {
+        speakingAuthorizationLeases.set(sessionId, {
+          value,
+          expiresAt: now() + SPEAKING_REAUTHORIZATION_LEASE_MILLISECONDS,
+          inFlight: null,
+        });
+        return value;
+      })
+      .catch((error) => {
+        speakingAuthorizationLeases.delete(sessionId);
+        throw error;
+      });
+    speakingAuthorizationLeases.set(sessionId, { value: false, expiresAt: 0, inFlight });
+    return inFlight;
+  };
   const shutdownAbortController = new AbortController();
   let isShuttingDown = false;
   const audioBurstBytes = INPUT_BYTES_PER_SECOND * audioBurstMilliseconds / 1_000;
-  const recoveryAudioSpoolMaxBytes = INPUT_BYTES_PER_SECOND * recoveryAudioSpoolMilliseconds / 1_000;
+  const releaseGeminiSessionOnce = async (state) => {
+    if (state.geminiSessionReleased) return;
+    state.geminiSessionReleased = true;
+    try {
+      await releaseGeminiSession(state.settings.sessionId);
+    } catch {
+      metrics.increment("gemini_session_release_failures_total");
+    }
+  };
+  const getFloorRevision = (sessionId) => floorRevisions.get(sessionId) ?? 0;
   const createHostOutput = (webSocket) => ({
     webSocket,
+    clientKind: webSocket.gatewayClientKind,
     bufferedFinals: [],
     bufferedPartials: new Map(),
     finalSeqByLanguage: new Map(),
@@ -193,7 +515,8 @@ export function createGatewayServer({
       metrics.increment("host_caption_buffer_finals_dropped_total");
     }
   };
-  const sendHostEvent = (hostOutput, event) => {
+  const sendHostEvent = (hostOutput, event, { isPublishedEvent = false } = {}) => {
+    if (event?.type === "caption" && hostOutput.clientKind === "browser" && !isPublishedEvent) return;
     if (event?.type !== "caption") {
       sendJson(hostOutput.webSocket, event);
       return;
@@ -267,9 +590,23 @@ export function createGatewayServer({
       .then(() => {
         successfullyClosedPipelines.add(pipeline);
         pipelinesPendingClose.delete(pipeline);
+        const sessionId = pipelineSessionIds.get(pipeline);
+        const failures = sessionCleanupFailures.get(sessionId);
+        if (failures?.delete(pipeline) && failures.size === 0) {
+          sessionCleanupFailures.delete(sessionId);
+          const failure = failedHostSessions.get(sessionId);
+          if (failure) failure.cleanupComplete = true;
+        }
       })
       .catch((error) => {
         pipelinesPendingClose.add(pipeline);
+        const sessionId = pipelineSessionIds.get(pipeline);
+        if (sessionId) {
+          const failures = sessionCleanupFailures.get(sessionId) ?? new Set();
+          failures.add(pipeline);
+          sessionCleanupFailures.set(sessionId, failures);
+          failedHostSessions.set(sessionId, { cleanupComplete: false });
+        }
         throw error;
       })
       .finally(() => {
@@ -307,7 +644,8 @@ export function createGatewayServer({
     });
     return result;
   };
-  const authorizeViewer = (claims, sessionId, language, abortController) => new Promise((resolve, reject) => {
+  const authorizeViewerBatchRequest = (requests, { signal: outerSignal }) => new Promise((resolve, reject) => {
+    const abortController = new AbortController();
     const { signal } = abortController;
     let isSettled = false;
     let timeout = null;
@@ -316,24 +654,42 @@ export function createGatewayServer({
       isSettled = true;
       if (timeout) clearTimeoutFn(timeout);
       signal?.removeEventListener("abort", onAbort);
+      outerSignal?.removeEventListener("abort", onOuterAbort);
       callback(value);
     };
     const onAbort = () => settle(
       reject,
       signal.reason instanceof Error ? signal.reason : new Error("GRANT_CHECK_CANCELLED"),
     );
+    const onOuterAbort = () => abortController.abort(abortReason(outerSignal, "GRANT_CHECK_CANCELLED"));
     timeout = setTimeoutFn(
       () => abortController.abort(new Error("GRANT_CHECK_TIMEOUT")),
       Math.min(AUTHORIZATION_CADENCE_MILLISECONDS, viewerAuthorizeTimeoutMilliseconds),
     );
-    if (signal?.aborted) {
+    if (outerSignal?.aborted) {
+      onOuterAbort();
       onAbort();
       return;
     }
+    outerSignal?.addEventListener("abort", onOuterAbort, { once: true });
     signal?.addEventListener("abort", onAbort, { once: true });
     Promise.resolve()
-      .then(() => viewerAuthorizer.authorize(claims, sessionId, language, { signal }))
+      .then(() => viewerAuthorizer.authorizeBatch(requests, { signal }))
       .then((value) => settle(resolve, value), (error) => settle(reject, error));
+  });
+  const viewerAuthorizationBatcher = new ViewerAuthorizationBatcher({
+    authorizeBatch: authorizeViewerBatchRequest,
+    batchWindowMilliseconds: viewerAuthorizationBatchWindowMilliseconds,
+    maxBatchSize: viewerAuthorizationBatchSize,
+    setTimeoutFn: setViewerAuthorizationBatchTimeoutFn,
+    clearTimeoutFn: clearViewerAuthorizationBatchTimeoutFn,
+  });
+  const viewerAuthorizationLeases = new ViewerAuthorizationLeaseManager({
+    authorize: (claims, sessionId, language, options) => viewerAuthorizer.authorize(claims, sessionId, language, options),
+    batchAuthorize: (request, options) => viewerAuthorizationBatcher.authorize(request, options),
+    now,
+    leaseMilliseconds: viewerAuthorizationLeaseMilliseconds,
+    maxConcurrent: viewerAuthorizationMaxConcurrent,
   });
   const authorizeHost = (claims, settings, abortController, options) => new Promise((resolve, reject) => {
     const { signal } = abortController;
@@ -405,10 +761,9 @@ export function createGatewayServer({
   };
   // JSON live-events funnel through here so a viewer that is replaying missed
   // captions buffers concurrent live events instead of receiving them early.
-  const deliverEvent = (sessionId, language, payload) => deliverToAuthorizedViewers(
-    sessionId,
-    language,
-    (viewer) => {
+  const deliverEvent = (sessionId, language, payload) => {
+    const serialized = serializeJson({ type: "live-event", payload });
+    return deliverToAuthorizedViewers(sessionId, language, (viewer) => {
       const metadata = viewerMetadata.get(viewer);
       if (metadata?.replayBuffer) {
         // Bounded on purpose. This buffer exists only to hold live events for
@@ -422,29 +777,44 @@ export function createGatewayServer({
           metrics.increment("replay_buffer_overflow_total");
           metadata.replayBuffer = null;
         } else {
-          metadata.replayBuffer.push(payload);
+          metadata.replayBuffer.push({ payload, serialized });
           return;
         }
       }
-      sendJson(viewer, { type: "live-event", payload });
-    },
-  );
+      deliverSerializedEvent(viewer, payload, serialized);
+    });
+  };
+  const deliverSerializedEvent = (viewer, payload, serialized) => {
+    if (slowConsumerPredicate(viewer)) {
+      if ((payload?.type === "caption" && payload.isFinal !== true) || payload?.type === "source-draft") {
+        metrics.increment("json_partials_dropped_total");
+        return true;
+      }
+      metrics.increment("slow_consumers_terminated_total");
+      closeWithError(viewer, "SLOW_CONSUMER", "실시간 자막이 네트워크 속도를 따라가지 못해 연결을 종료합니다.", 4408);
+      return false;
+    }
+    if (viewer.readyState !== WebSocket.OPEN) return false;
+    viewer.send(serialized);
+    return true;
+  };
   const lookupParticipantProfile = async (sessionId, participantId) => {
     if (typeof fetchFloorParticipant !== "function") return null;
-    const cacheKey = `${sessionId}\u0000${participantId}`;
-    if (participantProfiles.has(cacheKey)) return participantProfiles.get(cacheKey);
+    const cached = participantProfiles.get(sessionId, participantId);
+    if (cached.hit) return cached.value;
     let profile = null;
     try {
       profile = await fetchFloorParticipant(sessionId, participantId) ?? null;
     } catch {
       profile = null; // identity enrichment is best-effort
     }
-    if (profile !== null || participantProfiles.size < 10_000) participantProfiles.set(cacheKey, profile);
+    participantProfiles.set(sessionId, participantId, profile);
     return profile;
   };
   const createFloorPayload = (sessionId, holder) => ({
     type: "floor",
     sessionId,
+    floorRevision: getFloorRevision(sessionId),
     holder: holder
       ? {
         participantId: holder.participantId,
@@ -455,6 +825,7 @@ export function createGatewayServer({
       : null,
   });
   const broadcastFloor = async (sessionId, holder) => {
+    floorRevisions.set(sessionId, getFloorRevision(sessionId) + 1);
     const state = hostSessions.get(sessionId);
     const payload = createFloorPayload(sessionId, holder);
     if (state) sendJson(state.webSocket, payload);
@@ -464,8 +835,18 @@ export function createGatewayServer({
   const broadcastSessionStatus = async (sessionId, status) => {
     const state = hostSessions.get(sessionId);
     const payload = { type: "session-status", sessionId, status };
+    if (state?.hostOutput.clientKind === "browser") sendHostEvent(state.hostOutput, payload);
     const languages = state?.settings.languages ?? [];
     await Promise.all(languages.map((language) => deliverEvent(sessionId, language, payload)));
+  };
+  const closeAuthenticatedSessionSockets = (sessionId, ownerSocket) => {
+    const sockets = authenticatedSessionSockets.get(sessionId) ?? new Set();
+    authenticatedSessionSockets.delete(sessionId);
+    for (const candidate of sockets) {
+      if (candidate !== ownerSocket && candidate.readyState === WebSocket.OPEN) {
+        candidate.close(1000, "session stopped");
+      }
+    }
   };
   const getHostAudioLane = (state, source) => {
     const key = source ?? "legacy";
@@ -479,177 +860,50 @@ export function createGatewayServer({
   const drainHostAudioLanes = (state) => Promise.all(
     [...state.audioLanes.values()].map((lane) => lane.tail.catch(() => undefined)),
   );
-  const spoolRecoveryAudio = (state, frame, capturedAt, capturedFloorSpeaker, frameOrder, source = null) => {
-    const cutoff = capturedAt - recoveryAudioSpoolMilliseconds;
-    while (state.recoveryAudioSpool.length > 0
-      && (state.recoveryAudioSpool[0].capturedAt < cutoff
-        || state.recoveryAudioSpoolBytes + frame.byteLength > recoveryAudioSpoolMaxBytes)) {
-      const dropped = state.recoveryAudioSpool.shift();
-      state.recoveryAudioSpoolBytes -= dropped.frame.byteLength;
-      metrics.increment("durable_recovery_audio_frames_dropped_total");
-    }
-    if (frame.byteLength > recoveryAudioSpoolMaxBytes) {
-      metrics.increment("durable_recovery_audio_frames_dropped_total");
-      return false;
-    }
-    state.recoveryAudioSpool.push({
-      frame: Uint8Array.from(frame),
-      capturedAt,
-      capturedFloorSpeaker,
-      frameOrder,
-      source,
-    });
-    state.recoveryAudioSpool.sort((left, right) => left.frameOrder - right.frameOrder);
-    state.recoveryAudioSpoolBytes += frame.byteLength;
-    metrics.increment("durable_recovery_audio_frames_spooled_total");
-    return true;
-  };
-  const drainRecoveryAudio = async (state, candidate) => {
-    const cutoff = now() - recoveryAudioSpoolMilliseconds;
-    while (state.recoveryAudioSpool.length > 0
-      && state.recoveryAudioSpool[0].capturedAt < cutoff) {
-      const dropped = state.recoveryAudioSpool.shift();
-      state.recoveryAudioSpoolBytes -= dropped.frame.byteLength;
-      metrics.increment("durable_recovery_audio_frames_dropped_total");
-    }
-    while (state.recoveryAudioSpool.length > 0) {
-      const sourceQueues = new Map();
-      while (state.recoveryAudioSpool.length > 0) {
-        const queued = state.recoveryAudioSpool.shift();
-        state.recoveryAudioSpoolBytes -= queued.frame.byteLength;
-        const sourceKey = queued.source ?? "legacy";
-        const sourceQueue = sourceQueues.get(sourceKey) ?? [];
-        sourceQueue.push(queued);
-        sourceQueues.set(sourceKey, sourceQueue);
-      }
-      await Promise.all([...sourceQueues.values()].map(async (sourceQueue) => {
-        for (const queued of sourceQueue) {
-          // 2026-07-26 fix: preserve order inside one capture source while
-          // allowing an initializing or stalled sibling source to drain
-          // independently. The replacement owns fresh provider streams, so
-          // delivery time is re-stamped for the normal stale-frame guard.
-          await candidate.acceptAudio(queued.frame, now(), queued.capturedFloorSpeaker, queued.source);
-        }
-      }));
-      // Frames can arrive while candidate.acceptAudio awaits. Re-read the
-      // bounded spool until it is empty; the caller switches routing in the
-      // same microtask, so no frame can land between this check and the swap.
-    }
-  };
-  const requestPipelineRecovery = (sessionId, failedPipeline, error) => {
+  const failOwnedPipeline = (sessionId, failedPipeline) => {
     const state = hostSessions.get(sessionId);
     if (!state || state.pipeline !== failedPipeline) return Promise.resolve();
-    if (state.recoveryFlight) return state.recoveryFlight;
-    // Quarantine immediately. The failed pipeline may have consumed a seq whose
-    // commit outcome is ambiguous; no later audio may enter it while the
-    // durable reconciliation/replacement loop is running.
-    const shouldRestorePaused = failedPipeline.isPaused === true;
-    try { failedPipeline.pause?.(); } catch { /* the audio gates below remain authoritative */ }
-    state.recoveryDirectRouting = false;
-    const recoveryAbortController = new AbortController();
-    state.recoveryAbortController = recoveryAbortController;
-    const recoveryFlight = (async () => {
-      let failureCount = 0;
-      while (!recoveryAbortController.signal.aborted && !isShuttingDown) {
-        const didRecover = await withHostSessionLock(sessionId, async () => {
-          const current = hostSessions.get(sessionId);
-          if (!current || current !== state || current.pipeline !== failedPipeline) return true;
-          let candidate = null;
-          const attemptAbortController = new AbortController();
-          current.recoveryAttemptAbortController = attemptAbortController;
-          const abortAttempt = () => attemptAbortController.abort(
-            recoveryAbortController.signal.reason ?? new Error("DURABLE_RECOVERY_CANCELLED"),
-          );
-          recoveryAbortController.signal.addEventListener("abort", abortAttempt, { once: true });
-          const attemptTimer = setTimeoutFn(
-            () => attemptAbortController.abort(new Error("DURABLE_RECOVERY_ATTEMPT_TIMEOUT")),
-            durableRecoveryAttemptTimeoutMilliseconds,
-          );
-          attemptTimer?.unref?.();
-          try {
-            const factoryPromise = Promise.resolve().then(() => pipelineFactory(
-              current.settings,
-              failedPipeline,
-              (event) => sendHostEvent(current.hostOutput, event),
-              {
-                signal: attemptAbortController.signal,
-                recoveryReason: "durable-caption",
-                onFatalError: (fatalError) => requestPipelineRecovery(sessionId, candidate, fatalError),
-              },
-            ));
-            void factoryPromise.then((lateCandidate) => {
-              if (attemptAbortController.signal.aborted) {
-                return closePipelineOnce(lateCandidate).catch(() => undefined);
-              }
-              return undefined;
-            }, () => undefined);
-            candidate = await waitForAbort(
-              factoryPromise,
-              attemptAbortController.signal,
-            );
-            await waitForAbort(
-              candidate.start({ signal: attemptAbortController.signal }),
-              attemptAbortController.signal,
-            );
-            const holder = floorHolders.get(sessionId);
-            if (holder) {
-              candidate.setFloorSpeaker?.({
-                participantId: holder.participantId,
-                displayName: holder.displayName,
-                department: holder.department,
-                jobTitle: holder.jobTitle,
-              });
-            }
-            if (shouldRestorePaused) candidate.pause?.();
-            const activeHolder = floorHolders.get(sessionId);
-            await Promise.all([
-              drainHostAudioLanes(current),
-              activeHolder?.audioTail?.catch(() => undefined),
-            ]);
-            await drainRecoveryAudio(current, candidate);
-            current.pipeline = candidate;
-            metrics.increment("durable_caption_recoveries_total");
-            await closePipelineOnce(failedPipeline).catch(() => {
-              metrics.increment("pipeline_close_failures_total");
-            });
-            // The failed SDK close may consume its full bounded deadline. Audio
-            // arriving during that close was spooled after the first drain, so
-            // drain once more before atomically returning to direct routing.
-            await drainRecoveryAudio(current, candidate);
-            current.recoveryDirectRouting = true;
-            return true;
-          } catch {
-            metrics.increment("durable_caption_recovery_failures_total");
-            await closePipelineOnce(candidate).catch(() => undefined);
-            return false;
-          } finally {
-            clearTimeoutFn(attemptTimer);
-            recoveryAbortController.signal.removeEventListener("abort", abortAttempt);
-            if (current.recoveryAttemptAbortController === attemptAbortController) {
-              current.recoveryAttemptAbortController = null;
-            }
-          }
-        }, { bypassQueueLimit: true });
-        if (didRecover || recoveryAbortController.signal.aborted || isShuttingDown) return;
-        const delay = durableRecoveryRetryDelaysMilliseconds[Math.min(
-          failureCount,
-          durableRecoveryRetryDelaysMilliseconds.length - 1,
-        )];
-        failureCount += 1;
-        if (!await waitForDelay(delay, recoveryAbortController.signal, setTimeoutFn, clearTimeoutFn)) return;
+    if (state.failureFlight) return state.failureFlight;
+    // 2026-08-31 fix: 공급자·원문 오류 후 자동 재접속이 유료 세션을 다시 만들지 못하게 한다.
+    // 인증된 호스트의 명시 restart만 영구 저장 순서를 재검증한 뒤 이 실패 표시를 해제한다.
+    const failure = { cleanupComplete: false };
+    failedHostSessions.set(sessionId, failure);
+    state.isDetaching = true;
+    stopHostLease(state);
+    if (state.graceTimer) {
+      clearTimeoutFn(state.graceTimer);
+      state.graceTimer = null;
+    }
+    metrics.increment("pipeline_restart_required_total");
+    try { failedPipeline.abortMedia?.(); } catch { /* close remains required */ }
+    state.failureFlight = withHostSessionLock(sessionId, async () => {
+      if (typeof failedPipeline.abortMedia !== "function") {
+        try { await failedPipeline.pause?.(); } catch { metrics.increment("pipeline_pause_failures_total"); }
       }
-    })();
-    state.recoveryFlight = recoveryFlight.finally(() => {
-      const current = hostSessions.get(sessionId);
-      if (current === state && current.recoveryFlight === state.recoveryFlight) {
-        current.recoveryFlight = null;
-        current.recoveryAbortController = null;
-        current.recoveryDirectRouting = false;
+      await releaseFloor(sessionId, { reason: "pipeline-failed" }).catch(() => undefined);
+      try {
+        await closePipelineOnce(failedPipeline);
+        failure.cleanupComplete = true;
+        await releaseGeminiSessionOnce(state);
+      } catch {
+        metrics.increment("pipeline_close_failures_total");
+      }
+      if (hostSessions.get(sessionId) === state) hostSessions.delete(sessionId);
+      metrics.set("host_sessions", hostSessions.size);
+    }, { bypassQueueLimit: true }).finally(async () => {
+      if (demand && state.demandEpoch !== null) {
+        await demand.fail(sessionId, state.demandEpoch).catch(() => {
+          metrics.increment("media_failure_fence_failures_total");
+        });
       }
     });
-    return state.recoveryFlight;
+    closePipelineSocket(state.webSocket, new Error("PIPELINE_RESTART_REQUIRED"));
+    return state.failureFlight;
   };
-  const releaseFloor = (sessionId, { grantId = null, reason = "ended", notifyHolder = true } = {}) => withFloorSessionLock(sessionId, async () => {
+  const releaseFloor = (
+    sessionId,
+    { grantId = null, reason = "ended", notifyHolder = true, broadcast = true } = {},
+  ) => withFloorSessionLock(sessionId, async () => {
     const holder = floorHolders.get(sessionId);
     if (!holder) return;
     if (grantId !== null && holder.grantId !== grantId) return;
@@ -665,35 +919,77 @@ export function createGatewayServer({
       // A stopped pipeline must not block clearing the floor.
     }
     if (notifyHolder) sendJson(holder.webSocket, { type: "speak-ended", sessionId, reason });
-    await broadcastFloor(sessionId, null);
+    if (broadcast) await broadcastFloor(sessionId, null);
   });
   const stopOwnedHostSession = async (sessionId, webSocket) => withHostSessionLock(sessionId, async () => {
     const current = hostSessions.get(sessionId);
     if (!current) return false;
     if (current.webSocket !== webSocket) throw new Error("SESSION_NOT_STARTED");
     stopHostLease(current);
-    current.recoveryAbortController?.abort(new Error("SESSION_ENDED"));
-    current.recoveryAttemptAbortController?.abort(new Error("SESSION_ENDED"));
     if (current.graceTimer) {
       clearTimeoutFn(current.graceTimer);
       current.graceTimer = null;
     }
-    await releaseFloor(sessionId, { reason: "session-ended" }).catch(() => undefined);
-    try {
-      // Keep ownership until the provider is actually closed. A new start for
-      // this session queues behind the same lock, so two provider pipelines
-      // cannot overlap after an intentional host stop.
-      await closePipelineOnce(current.pipeline);
-    } catch {
+    await releaseFloor(sessionId, {
+      reason: "session-ended",
+      notifyHolder: false,
+      broadcast: false,
+    }).catch(() => undefined);
+    // Keep ownership until provider resources are actually released. A new
+    // start queues behind this lock, so two provider pipelines cannot overlap.
+    await closePipelineOnce(current.pipeline).catch(() => {
       metrics.increment("pipeline_close_failures_total");
-      throw new Error("PIPELINE_STOP_FAILED");
-    }
+      throw new Error("PIPELINE_CLEANUP_FAILED");
+    });
+    await current.pipeline.completeTopicsOnSessionEnd?.().catch(() => {
+      metrics.increment("topic_session_end_failures_total");
+    });
+    await releaseGeminiSessionOnce(current);
+    await broadcastSessionStatus(sessionId, "stopped").catch(() => {
+      metrics.increment("session_status_broadcast_failures_total");
+    });
+    closeAuthenticatedSessionSockets(sessionId, webSocket);
     hostSessions.delete(sessionId);
+    failedHostSessions.delete(sessionId);
+    floorRevisions.delete(sessionId);
+    participantProfiles.deleteSession(sessionId);
+    viewerAuthorizationLeases.deleteSession(sessionId);
+    viewerAuthorizationBatcher.deleteSession(sessionId);
+    speakingAuthorizationLeases.delete(sessionId);
+    sessionAudioUsage.delete(sessionId);
+    metrics.set("host_sessions", hostSessions.size);
+    return true;
+  }, { bypassQueueLimit: true });
+  const detachOwnedHostSession = async (sessionId, webSocket) => withHostSessionLock(sessionId, async () => {
+    const current = hostSessions.get(sessionId);
+    if (!current) return false;
+    if (current.webSocket !== webSocket) throw new Error("SESSION_NOT_STARTED");
+    current.isDetaching = true;
+    stopHostLease(current);
+    if (current.graceTimer) {
+      clearTimeoutFn(current.graceTimer);
+      current.graceTimer = null;
+    }
+    // 2026-08-31 fix: Leaving the host app releases paid streams without ending
+    // the durable meeting or its viewers. Keep the host lock through provider
+    // drain so a returning host cannot overlap two provider pipelines.
+    await releaseFloor(sessionId, { reason: "host-detached", broadcast: false }).catch(() => undefined);
+    await broadcastFloor(sessionId, null).catch(() => undefined);
+    hostSessions.delete(sessionId);
+    participantProfiles.deleteSession(sessionId);
+    viewerAuthorizationLeases.deleteSession(sessionId);
+    viewerAuthorizationBatcher.deleteSession(sessionId);
+    speakingAuthorizationLeases.delete(sessionId);
+    await closePipelineOnce(current.pipeline).catch(() => {
+      metrics.increment("pipeline_close_failures_total");
+      throw new Error("PIPELINE_CLEANUP_FAILED");
+    });
+    await releaseGeminiSessionOnce(current);
     metrics.set("host_sessions", hostSessions.size);
     return true;
   }, { bypassQueueLimit: true });
   const server = createServer((request, response) => {
-    if (request.url === "/health" || request.url === "/healthz") {
+    if (request.method === "GET" && (request.url === "/health" || request.url === "/healthz")) {
       response.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
       response.end(JSON.stringify({ ok: true }));
       return;
@@ -721,7 +1017,7 @@ export function createGatewayServer({
   heartbeatTimer.unref();
   const tickTimer = setInterval(() => {
     for (const state of hostSessions.values()) {
-      void state.pipeline.tick().catch((error) => closePipelineSocket(state.webSocket, error));
+      if (!state.isDetaching) void state.pipeline.tick().catch(() => failOwnedPipeline(state.settings.sessionId, state.pipeline));
     }
     // Release a floor that has gone silent. Host audio is dropped outright while
     // ANY participant holds the floor, so a holder whose client died without
@@ -757,6 +1053,8 @@ export function createGatewayServer({
     }
     try {
       webSockets.handleUpgrade(request, socket, head, (webSocket) => {
+        webSocket.gatewayClientKind = typeof request.headers.origin === "string" ? "browser" : "desktop-main";
+        webSocket.promoteGatewayConnection = releaseConnection.promote;
         webSocket.once("close", releaseConnection);
         webSockets.emit("connection", webSocket);
       });
@@ -770,6 +1068,7 @@ export function createGatewayServer({
     webSocket.isAlive = true;
     let claims = null;
     let topic = null;
+    let demandConnection = null;
     let reauthorizeTimer = null;
     let reauthorizeInFlight = null;
     let reauthorizeGeneration = 0;
@@ -777,16 +1076,37 @@ export function createGatewayServer({
     let replayGeneration = 0;
     let tokenExpiryTimer = null;
     const authorizationControllers = new Set();
+    const pendingHostControllers = new Set();
+    const assertHostSocketActive = (signal = null) => {
+      if (signal?.aborted) throw signal.reason ?? new Error("HOST_CONNECTION_CLOSED");
+      if (isShuttingDown) throw new Error("GATEWAY_SHUTTING_DOWN");
+      if (webSocket.readyState !== WebSocket.OPEN) throw new Error("HOST_CONNECTION_CLOSED");
+    };
     const cancelReplay = () => {
       replayGeneration += 1;
       replayAbortController?.abort(new Error("REPLAY_CANCELLED"));
       replayAbortController = null;
     };
-    const runViewerAuthorization = async (sessionId, language) => {
+    const runViewerAuthorization = async (sessionId, language, { force = false } = {}) => {
       const abortController = new AbortController();
       authorizationControllers.add(abortController);
       try {
-        return await authorizeViewer(claims, sessionId, language, abortController);
+        return await viewerAuthorizationLeases.authorize(claims, sessionId, language, {
+          signal: abortController.signal,
+          force,
+        });
+      } finally {
+        authorizationControllers.delete(abortController);
+      }
+    };
+    const runParticipantSpeakingAuthorization = async (sessionId) => {
+      if (typeof viewerAuthorizer.authorizeSpeaking !== "function") return false;
+      const abortController = new AbortController();
+      authorizationControllers.add(abortController);
+      try {
+        return await viewerAuthorizer.authorizeSpeaking(claims, sessionId, {
+          signal: abortController.signal,
+        }) === true;
       } finally {
         authorizationControllers.delete(abortController);
       }
@@ -797,13 +1117,28 @@ export function createGatewayServer({
       if (!force && now() - metadata.lastAuthorizedAt < AUTHORIZATION_CACHE_MILLISECONDS) return true;
       if (reauthorizeInFlight) return reauthorizeInFlight;
       const generation = reauthorizeGeneration;
-      const authorization = runViewerAuthorization(metadata.sessionId, metadata.language);
+      const authorization = runViewerAuthorization(metadata.sessionId, metadata.language, { force });
       const inFlight = authorization
-        .then((isAuthorized) => {
+        .then(async (isAuthorized) => {
           if (generation !== reauthorizeGeneration) return false;
           if (!isAuthorized) {
             closeWithError(webSocket, "GRANT_REVOKED", "시청 권한이 만료되었습니다.", 4403);
             return false;
+          }
+          if (metadata.capabilities.participantSpeakingEnabled) {
+            const isSpeakingStillAuthorized = await leasedParticipantSpeakingAuthorization(
+              metadata.sessionId,
+              () => runParticipantSpeakingAuthorization(metadata.sessionId),
+            );
+            if (generation !== reauthorizeGeneration) return false;
+            if (!isSpeakingStillAuthorized) {
+              metadata.capabilities.participantSpeakingEnabled = false;
+              await releaseFloor(metadata.sessionId, {
+                grantId: claims.grantId,
+                reason: "disabled",
+              });
+              metrics.increment("participant_speaking_revocations_total");
+            }
           }
           metadata.lastAuthorizedAt = now();
           return true;
@@ -828,13 +1163,22 @@ export function createGatewayServer({
       reauthorizeGeneration += 1;
       cancelReplay();
       viewerMetadata.delete(webSocket);
+      if (claims?.sessionId) {
+        const sessionSockets = authenticatedSessionSockets.get(claims.sessionId);
+        sessionSockets?.delete(webSocket);
+        if (sessionSockets?.size === 0) authenticatedSessionSockets.delete(claims.sessionId);
+      }
       for (const abortController of authorizationControllers) abortController.abort();
       authorizationControllers.clear();
+      // 2026-08-31 fix: 연결 종료 후 완료된 준비 작업이 유료 파이프라인 소유권을 되살리지 못하게 한다.
+      for (const controller of pendingHostControllers) controller.abort(new Error("HOST_CONNECTION_CLOSED"));
+      pendingHostControllers.clear();
       metrics.increment("connection_cleanups_total");
     });
     connectionCleanup.set(webSocket, cleanupTimers);
     webSocket.on("pong", () => {
       webSocket.isAlive = true;
+      if (claims) demand?.markAlive(claims.sessionId, demandConnection);
       metrics.increment("heartbeat_pongs_total");
     });
     metrics.increment("connections_total");
@@ -846,41 +1190,45 @@ export function createGatewayServer({
           if (isBinary) throw new Error("UNAUTHORIZED");
           const message = parseJson(data);
           if (message.type !== "authenticate" || typeof message.token !== "string") throw new Error("UNAUTHORIZED");
-          claims = verifyLiveToken(message.token, { gatewaySecret, viewerSecret, now });
+          const verifiedClaims = verifyLiveToken(message.token, { gatewaySecret, viewerSecret, now });
+          if (verifiedClaims.role === "VIEWER") {
+            if (viewerTicketReplayGuard.consume(verifiedClaims) !== true) throw new Error("UNAUTHORIZED");
+            if (webSocket.promoteGatewayConnection?.(authenticatedViewerConnectionKey(verifiedClaims, gatewaySecret)) !== true) {
+              throw new Error("CONNECTION_LIMIT");
+            }
+          }
+          claims = verifiedClaims;
           clearTimeoutFn(authTimer);
-          const expiresAt = claims.role === "HOST" ? claims.exp * 1_000 : claims.expiresAt;
-          tokenExpiryTimer = setTimeoutFn(
-            () => closeWithError(webSocket, "TOKEN_EXPIRED", "게이트웨이 인증이 만료되었습니다.", 4401),
-            Math.max(0, expiresAt - now()),
-          );
+          const sessionSockets = authenticatedSessionSockets.get(claims.sessionId) ?? new Set();
+          sessionSockets.add(webSocket);
+          authenticatedSessionSockets.set(claims.sessionId, sessionSockets);
+          if (claims.role === "HOST") {
+            tokenExpiryTimer = setTimeoutFn(
+              () => closeWithError(webSocket, "TOKEN_EXPIRED", "게이트웨이 인증이 만료되었습니다.", 4401),
+              Math.max(0, claims.exp * 1_000 - now()),
+            );
+          }
           sendJson(webSocket, { type: "authenticated", role: claims.role });
           return;
         }
         if (claims.role === "HOST") {
           if (isBinary) {
             const state = hostSessions.get(claims.sessionId);
-            if (!state || state.webSocket !== webSocket) throw new Error("SESSION_NOT_STARTED");
+            if (!state || state.webSocket !== webSocket || state.isDetaching) throw new Error("SESSION_NOT_STARTED");
             const decoded = decodeHostAudioFrame(data);
             if (floorHolders.has(claims.sessionId)) {
               // A participant holds the speaking floor: their audio wins.
               metrics.increment("dropped_audio_frames_total");
               return;
             }
-            consumeAudioBudget(claims.sessionId, decoded.pcm.byteLength);
-            const capturedAt = now();
-            const frameOrder = ++state.nextAudioFrameOrder;
-            if (state.recoveryFlight && !state.recoveryDirectRouting) {
-              spoolRecoveryAudio(
-                state,
-                decoded.pcm,
-                capturedAt,
-                null,
-                frameOrder,
-                decoded.source,
-              );
-              metrics.increment("audio_frames_total");
+            if (state.pipeline?.isPaused === true) {
+              // The pipeline drops paused frames anyway; dropping here keeps
+              // paused streaming from silently burning the 2h byte budget.
+              metrics.increment("dropped_audio_frames_total");
               return;
             }
+            consumeAudioBudget(claims.sessionId, decoded.pcm.byteLength);
+            const capturedAt = now();
             const audioLane = getHostAudioLane(state, decoded.source);
             if (audioLane.pendingFrames * AUDIO_CONFIG.chunkMilliseconds >= AUDIO_CONFIG.staleFrameMilliseconds) {
               metrics.increment("dropped_audio_frames_total");
@@ -889,17 +1237,7 @@ export function createGatewayServer({
             audioLane.pendingFrames += 1;
             audioLane.tail = audioLane.tail
               .then(async () => {
-                if (state.recoveryFlight && !state.recoveryDirectRouting) {
-                  spoolRecoveryAudio(
-                    state,
-                    decoded.pcm,
-                    capturedAt,
-                    null,
-                    frameOrder,
-                    decoded.source,
-                  );
-                  return;
-                }
+                if (state.isDetaching) return;
                 return state.pipeline.acceptAudio(
                   decoded.pcm,
                   capturedAt,
@@ -907,7 +1245,7 @@ export function createGatewayServer({
                   decoded.source,
                 );
               })
-              .catch((error) => closePipelineSocket(webSocket, error))
+              .catch(() => failOwnedPipeline(claims.sessionId, state.pipeline))
               .finally(() => { audioLane.pendingFrames -= 1; });
             metrics.increment("audio_frames_total");
             return;
@@ -934,11 +1272,32 @@ export function createGatewayServer({
               sendJson(webSocket, { type: "error", code: "SESSION_NOT_STARTED", message: gatewayMessage("SESSION_NOT_STARTED") });
               return;
             }
-            if (message.type === "pause") await active.pipeline.pause?.();
-            else await active.pipeline.resume?.();
-            const status = message.type === "pause" ? "paused" : "live";
-            sendJson(webSocket, { type: message.type === "pause" ? "paused" : "resumed", sessionId: claims.sessionId });
-            await broadcastSessionStatus(claims.sessionId, status);
+            try {
+              await withHostSessionLock(claims.sessionId, async () => {
+                if (hostSessions.get(claims.sessionId) !== active || active.isDetaching) throw new Error("SESSION_NOT_STARTED");
+                assertHostSocketActive();
+                if (message.type === "pause") await active.pipeline.pause?.();
+                else await active.pipeline.resume?.();
+                assertHostSocketActive();
+                if (hostSessions.get(claims.sessionId) !== active || active.isDetaching) throw new Error("SESSION_NOT_STARTED");
+                const status = message.type === "pause" ? "paused" : "live";
+                sendJson(webSocket, { type: message.type === "pause" ? "paused" : "resumed", sessionId: claims.sessionId });
+                await broadcastSessionStatus(claims.sessionId, status);
+              });
+            } catch (error) {
+              if (error?.message === "SESSION_NOT_STARTED" || error?.message === "HOST_CONNECTION_CLOSED") {
+                sendJson(webSocket, { type: "error", code: error.message, message: gatewayMessage(error.message) });
+              } else {
+                await failOwnedPipeline(claims.sessionId, active.pipeline);
+              }
+            }
+            return;
+          }
+          if (message.type === "detach") {
+            webSocket.immediateTeardown = true;
+            await detachOwnedHostSession(claims.sessionId, webSocket);
+            sendJson(webSocket, { type: "detached", sessionId: claims.sessionId });
+            if (webSocket.readyState === WebSocket.OPEN) webSocket.close(1000, "host detached");
             return;
           }
           if (message.type === "stop") {
@@ -950,33 +1309,45 @@ export function createGatewayServer({
             if (stopped) metrics.increment("host_intentional_stops_total");
             else metrics.increment("host_stop_idempotent_total");
             sendJson(webSocket, { type: "stopped", sessionId: claims.sessionId });
+            if (webSocket.readyState === WebSocket.OPEN) webSocket.close(1000, "session stopped");
             return;
           }
           if (!["start", "update", "restart"].includes(message.type)
             || message.sessionId !== claims.sessionId
             || !Number.isSafeInteger(message.version)) throw new Error("INVALID_START");
+          if (message.demandEnabled === true && !demand) throw new Error("MEDIA_DEMAND_DISABLED");
           const normalizedSettings = validateLiveSettings(message);
           const hostMessage = {
             ...message,
             ...normalizedSettings,
             sessionId: claims.sessionId,
           };
-          // A hung reconciliation/factory attempt must not sit in front of a
-          // host reattach, explicit restart, or settings update on the session
-          // lock. Cancelling only the current attempt keeps the recovery
-          // coordinator alive when the same detached session reattaches.
-          hostSessions.get(claims.sessionId)?.recoveryAttemptAbortController?.abort(
-            new Error("HOST_OPERATION_PREEMPT"),
-          );
           try {
             const prepared = await withHostSessionLock(claims.sessionId, async () => {
               if (shutdownAbortController.signal.aborted) throw shutdownAbortController.signal.reason;
+              assertHostSocketActive();
               const previous = hostSessions.get(claims.sessionId);
+              const priorFailure = failedHostSessions.get(claims.sessionId);
+              if (sessionCleanupFailures.has(claims.sessionId)) throw new Error("PIPELINE_CLEANUP_FAILED");
+              if (priorFailure && message.type !== "restart") throw new Error("PIPELINE_RESTART_REQUIRED");
+              if (priorFailure && !priorFailure.cleanupComplete) throw new Error("PIPELINE_CLEANUP_FAILED");
+              if (!priorFailure && failedHostSessions.size >= maxSessionAudioEntries) throw new Error("PIPELINE_RESTART_REQUIRED");
               // Host reconnect within the grace window (contract C3): the same
               // host re-authenticating with unchanged settings reattaches the
               // detached pipeline — seq counters and the speaking floor survive.
-              if (message.type === "start" && previous?.detached && isSameHostSettings(previous.settings, hostMessage)) {
+              if (message.type === "start"
+                && previous
+                && !previous.isDetaching
+                && isSameHostSettings(previous.settings, hostMessage)
+                && ((previous.detached
+                  && (previous.activationKey === null || previous.activationKey === message.activationKey))
+                  || (!previous.detached
+                    && previous.activationKey !== null
+                    && previous.activationKey === message.activationKey))) {
                 const reattachAbortController = new AbortController();
+                pendingHostControllers.add(reattachAbortController);
+                const abortReattachForShutdown = () => reattachAbortController.abort(new Error("GATEWAY_SHUTTING_DOWN"));
+                shutdownAbortController.signal.addEventListener("abort", abortReattachForShutdown, { once: true });
                 const reattachTimer = setTimeoutFn(
                   () => reattachAbortController.abort(new Error("HOST_START_TIMEOUT")),
                   hostStartTimeoutMilliseconds,
@@ -987,22 +1358,39 @@ export function createGatewayServer({
                     compareVersion: false,
                   });
                   if (!isAuthorized) throw new Error("SESSION_REVOKED");
+                  assertHostSocketActive(reattachAbortController.signal);
+                  if (hostSessions.get(claims.sessionId) !== previous || previous.isDetaching) {
+                    throw new Error("SESSION_NOT_STARTED");
+                  }
                 } finally {
                   clearTimeoutFn(reattachTimer);
+                  pendingHostControllers.delete(reattachAbortController);
+                  shutdownAbortController.signal.removeEventListener("abort", abortReattachForShutdown);
                 }
+                const replacedWebSocket = previous.webSocket;
                 if (previous.graceTimer) {
                   clearTimeoutFn(previous.graceTimer);
                   previous.graceTimer = null;
                 }
                 previous.detached = false;
                 previous.webSocket = webSocket;
+                webSocket.demandEpoch = previous.demandEpoch;
                 // 2026-07-26 fix: the preserved pipeline owns a mutable output sink. Updating
                 // it makes captions follow the newly attached host instead of
                 // continuing to write to the closed pre-reconnect socket.
                 previous.hostOutput.webSocket = webSocket;
-                previous.settings.version = hostMessage.version;
+                if (previous.hostOutput.clientKind !== webSocket.gatewayClientKind) {
+                  previous.hostOutput.bufferedFinals.length = 0;
+                  previous.hostOutput.bufferedPartials.clear();
+                  previous.hostOutput.finalSeqByLanguage.clear();
+                  previous.hostOutput.nextBufferedOrder = 0;
+                }
+                previous.hostOutput.clientKind = webSocket.gatewayClientKind;
                 stopHostLease(previous);
                 startHostLease(previous, claims);
+                if (replacedWebSocket !== webSocket && replacedWebSocket.readyState === WebSocket.OPEN) {
+                  replacedWebSocket.close(4410, "REPLACED");
+                }
                 metrics.increment("host_reattaches_total");
                 return {
                   reattached: true,
@@ -1011,12 +1399,23 @@ export function createGatewayServer({
                   voiceProvider: previous.settings.voiceProvider,
                   maxViewers: previous.settings.maxViewers,
                   glossaryPack: previous.settings.glossaryPack,
+                  version: previous.settings.version,
                   hostOutput: previous.hostOutput,
                 };
               }
               let candidate = null;
+              const pipelineGeneration = randomUUID();
+              let factoryAttempted = false;
+              let factoryFinished = false;
+              let startFailure = null;
+              let demandEpoch = null;
+              const hasActivationKey = message.activationKey !== undefined;
+              const usesReadinessActivation = ["start", "restart"].includes(message.type)
+                && typeof hostAuthorizer.activate === "function"
+                && hasActivationKey;
               const hostOutput = createHostOutput(webSocket);
               const operationAbortController = new AbortController();
+              pendingHostControllers.add(operationAbortController);
               const abortForShutdown = () => operationAbortController.abort(
                 shutdownAbortController.signal.reason ?? new Error("GATEWAY_SHUTTING_DOWN"),
               );
@@ -1026,54 +1425,136 @@ export function createGatewayServer({
                 hostStartTimeoutMilliseconds,
               );
               try {
-                const isAuthorized = await authorizeHost(claims, hostMessage, operationAbortController, {
-                  requireLive: true,
-                  compareVersion: true,
-                });
-                if (!isAuthorized) throw new Error("SESSION_REVOKED");
+                if (hasActivationKey && (typeof message.activationKey !== "string" || !UUID_PATTERN.test(message.activationKey))) {
+                  throw new Error("INVALID_ACTIVATION_KEY");
+                }
+                if (hasActivationKey && (message.type === "update" || (message.type === "restart" && !usesReadinessActivation))) {
+                  throw new Error("INVALID_ACTIVATION_KEY");
+                }
+                const authorization = await authorizeHost(claims, hostMessage, operationAbortController, usesReadinessActivation
+                  ? { readinessStart: true, compareVersion: true }
+                  : { requireLive: true, compareVersion: true });
+                if (!authorization) throw new Error("SESSION_REVOKED");
+                demandEpoch = demand ? (await demand.read(claims.sessionId))?.epoch ?? null : null;
+                webSocket.demandEpoch = demandEpoch;
+                if (demandEpoch !== null) await demand.prepare(claims.sessionId, operationAbortController.signal);
+                assertHostSocketActive(operationAbortController.signal);
+                const pinnedGlossaryFingerprint = usesReadinessActivation
+                  ? authorization.pinnedGlossaryFingerprint
+                  : null;
+                const readinessMode = usesReadinessActivation ? authorization.readinessMode : null;
+                if (usesReadinessActivation
+                  && (!["activate", "resume-live"].includes(readinessMode)
+                    || !(pinnedGlossaryFingerprint === null
+                      || /^sha256:[a-f0-9]{64}$/u.test(pinnedGlossaryFingerprint)))) {
+                  throw new Error("SESSION_REVOKED");
+                }
+                factoryAttempted = true;
                 const factoryPromise = Promise.resolve().then(() => pipelineFactory(
                   hostMessage,
                   previous?.pipeline ?? null,
                   (event) => sendHostEvent(hostOutput, event),
                   {
                     signal: operationAbortController.signal,
-                    onFatalError: (error) => requestPipelineRecovery(claims.sessionId, candidate, error),
+                    pipelineGeneration,
+                    requireDurableSeed: demandEpoch !== null || priorFailure !== undefined,
+                    // 2026-08-31 fix: 준비 상태에서는 원문 쓰기가 불가능하고 live 전용 조정 RPC도 거부된다.
+                    // 서버가 확인한 preparing 재시작은 엄격한 저장 순서 조회 후 활성화 CAS를 실행한다.
+                    ...(priorFailure && !(usesReadinessActivation && authorization.sessionStatus === "preparing")
+                      ? { recoveryReason: "durable-caption" } : {}),
+                    mediaFence: demandEpoch === null ? null : { epoch: demandEpoch, ownerId: demand.ownerId },
+                    onFatalError: () => failOwnedPipeline(claims.sessionId, candidate),
                   },
                 ));
                 void factoryPromise.then((lateCandidate) => {
+                  factoryFinished = true;
+                  pipelineSessionIds.set(lateCandidate, claims.sessionId);
                   if (operationAbortController.signal.aborted) {
-                    return closePipelineOnce(lateCandidate).catch(() => undefined);
+                    return closePipelineOnce(lateCandidate).then(() => {
+                      if (startFailure) startFailure.cleanupComplete = true;
+                    }).catch(() => undefined);
                   }
                   return undefined;
-                }, () => undefined);
+                }, () => {
+                  factoryFinished = true;
+                  if (startFailure) startFailure.cleanupComplete = true;
+                });
                 candidate = await waitForAbort(factoryPromise, operationAbortController.signal);
+                assertHostSocketActive(operationAbortController.signal);
                 await waitForAbort(
                   Promise.resolve().then(() => candidate.start({ signal: operationAbortController.signal })),
                   operationAbortController.signal,
                 );
-                const isStillAuthorized = await authorizeHost(claims, hostMessage, operationAbortController, {
-                  requireLive: true,
-                  compareVersion: true,
-                });
-                if (!isStillAuthorized) throw new Error("SESSION_REVOKED");
-                if (isShuttingDown || webSocket.readyState !== WebSocket.OPEN) {
+                let authoritativeVersion = hostMessage.version;
+                if (usesReadinessActivation && readinessMode === "activate") {
+                  const readinessSettings = {
+                    sessionId: claims.sessionId,
+                    version: hostMessage.version,
+                    activationKey: message.activationKey,
+                    sessionType: hostMessage.sessionType,
+                    outputMode: hostMessage.outputMode,
+                    voiceProvider: hostMessage.voiceProvider,
+                    languages: [...hostMessage.languages],
+                    maxViewers: hostMessage.maxViewers,
+                    glossaryPack: hostMessage.glossaryPack,
+                    pinnedGlossaryFingerprint,
+                  };
+                  readinessSettings.gatewaySettingsFingerprint = fingerprintGatewaySettings(readinessSettings);
+                  const activated = await waitForAbort(
+                    Promise.resolve().then(() => hostAuthorizer.activate(claims, readinessSettings, {
+                      signal: operationAbortController.signal,
+                    })),
+                    operationAbortController.signal,
+                  );
+                  if (activated?.sessionId !== claims.sessionId
+                    || activated?.status !== "live"
+                    || activated?.version !== hostMessage.version + 1) {
+                    throw new Error("INVALID_GATEWAY_READINESS_RESPONSE");
+                  }
+                  authoritativeVersion = activated.version;
+                } else {
+                  const isStillAuthorized = await authorizeHost(claims, hostMessage, operationAbortController, {
+                    requireLive: true,
+                    compareVersion: true,
+                  });
+                  if (!isStillAuthorized) throw new Error("SESSION_REVOKED");
+                }
+                if (isShuttingDown) {
                   throw new Error("GATEWAY_SHUTTING_DOWN");
                 }
+                if (demand) await demand.ready(claims.sessionId, demandEpoch);
+                assertHostSocketActive(operationAbortController.signal);
+                hostMessage.authoritativeVersion = authoritativeVersion;
               } catch (error) {
-                await closePipelineOnce(candidate).catch(() => undefined);
+                let cleanupComplete = false;
+                try {
+                  await closePipelineOnce(candidate);
+                  cleanupComplete = candidate !== null || factoryFinished;
+                } catch { metrics.increment("pipeline_close_failures_total"); }
+                if (factoryAttempted && !previous
+                  && !["HOST_CONNECTION_CLOSED", "GATEWAY_SHUTTING_DOWN", "MEDIA_DEMAND_LOST"].includes(error?.message)) {
+                  startFailure = { cleanupComplete };
+                  failedHostSessions.set(claims.sessionId, startFailure);
+                }
+                if (demand && demandEpoch !== null) {
+                  setTimeoutFn(() => { void demand.fail(claims.sessionId, demandEpoch).catch(() => undefined); }, 0);
+                }
                 throw error;
               } finally {
                 clearTimeoutFn(startTimer);
+                pendingHostControllers.delete(operationAbortController);
                 shutdownAbortController.signal.removeEventListener("abort", abortForShutdown);
               }
               const state = {
                 pipeline: candidate,
+                pipelineGeneration,
+                demandEpoch,
                 webSocket,
                 hostOutput,
                 audioLanes: new Map(),
                 settings: {
                   sessionId: claims.sessionId,
-                  version: hostMessage.version,
+                  version: hostMessage.authoritativeVersion,
                   sessionType: hostMessage.sessionType,
                   outputMode: hostMessage.outputMode,
                   voiceProvider: hostMessage.voiceProvider,
@@ -1094,24 +1575,30 @@ export function createGatewayServer({
                 leaseInFlight: null,
                 detached: false,
                 graceTimer: null,
-                recoveryFlight: null,
-                recoveryAbortController: null,
-                recoveryAttemptAbortController: null,
-                recoveryDirectRouting: false,
-                recoveryAudioSpool: [],
-                recoveryAudioSpoolBytes: 0,
-                nextAudioFrameOrder: 0,
+                failureFlight: null,
+                geminiSessionReleased: false,
+                activationKey: usesReadinessActivation ? message.activationKey : null,
               };
               hostSessions.set(claims.sessionId, state);
+              failedHostSessions.delete(claims.sessionId);
               startHostLease(state, claims);
               if (previous) {
-                previous.recoveryAbortController?.abort(new Error("PIPELINE_REPLACED"));
+
                 stopHostLease(previous);
                 if (previous.graceTimer) {
                   clearTimeoutFn(previous.graceTimer);
                   previous.graceTimer = null;
                 }
-                await closePipelineOnce(previous.pipeline).catch(() => undefined);
+                try { await closePipelineOnce(previous.pipeline); }
+                catch {
+                  state.isDetaching = true;
+                  try { candidate.abortMedia?.(); } catch { /* close remains required */ }
+                  await closePipelineOnce(candidate).catch(() => undefined);
+                  hostSessions.delete(claims.sessionId);
+                  metrics.set("host_sessions", hostSessions.size);
+                  closePipelineSocket(previous.webSocket, new Error("PIPELINE_CLEANUP_FAILED"));
+                  throw new Error("PIPELINE_CLEANUP_FAILED");
+                }
               }
               if (previous?.webSocket !== webSocket) previous?.webSocket.close(4410, "REPLACED");
               metrics.set("host_sessions", hostSessions.size);
@@ -1121,6 +1608,7 @@ export function createGatewayServer({
                 voiceProvider: hostMessage.voiceProvider,
                 maxViewers: hostMessage.maxViewers,
                 glossaryPack: hostMessage.glossaryPack,
+                version: hostMessage.authoritativeVersion,
               };
             });
             sendJson(webSocket, {
@@ -1131,6 +1619,7 @@ export function createGatewayServer({
               voiceProvider: prepared.voiceProvider,
               maxViewers: prepared.maxViewers,
               glossaryPack: prepared.glossaryPack,
+              version: prepared.version,
               languages: hostMessage.languages,
               audio: { sampleRate: AUDIO_CONFIG.inputSampleRate, channels: 1, chunkMilliseconds: AUDIO_CONFIG.chunkMilliseconds },
             });
@@ -1172,43 +1661,47 @@ export function createGatewayServer({
             ));
           } catch (error) {
             const code = error instanceof Error ? error.message : "PIPELINE_START_FAILED";
-            sendJson(webSocket, { type: "error", code, message: gatewayMessage(code) });
+            sendJson(webSocket, {
+              type: "error", code, message: gatewayMessage(code),
+              ...(failedHostSessions.has(claims.sessionId) ? { requiresManualRestart: true } : {}),
+            });
           }
           return;
         }
         if (isBinary) {
+          const metadata = viewerMetadata.get(webSocket);
           const holder = floorHolders.get(claims.sessionId);
-          if (!holder || holder.webSocket !== webSocket) {
-            // Frames race speak-ended after a preemption; dropping them keeps
-            // the viewer connection (and their captions) alive.
+          if (!metadata?.capabilities.participantSpeakingEnabled) {
+            throw new Error("VIEWER_MEDIA_FORBIDDEN");
+          }
+          if (!holder
+            || holder.webSocket !== webSocket
+            || holder.grantId !== claims.grantId) {
+            // Audio can race a preemption or speak-ended acknowledgement. A
+            // once-valid speaker becomes receive-only immediately, while the
+            // caption socket stays connected.
             metrics.increment("dropped_audio_frames_total");
             return;
           }
           const state = hostSessions.get(claims.sessionId);
-          if (!state) throw new Error("SESSION_NOT_STARTED");
+          if (!state || state.isDetaching) throw new Error("SESSION_NOT_STARTED");
           if (data.byteLength !== INPUT_FRAME_BYTES) throw new Error("INVALID_AUDIO_FRAME");
+          if (state.pipeline?.isPaused === true) {
+            // Same paused-drop as host frames: never charge the byte budget
+            // for audio the pipeline is guaranteed to discard.
+            metrics.increment("dropped_audio_frames_total");
+            return;
+          }
           consumeAudioBudget(claims.sessionId, data.byteLength);
           holder.lastFrameAt = now();
           const capturedAt = now();
-          const frameOrder = ++state.nextAudioFrameOrder;
           const capturedFloorSpeaker = {
             participantId: holder.participantId,
             displayName: holder.displayName,
             department: holder.department,
             jobTitle: holder.jobTitle,
           };
-          if (state.recoveryFlight && !state.recoveryDirectRouting) {
-            spoolRecoveryAudio(
-              state,
-              new Uint8Array(data.buffer, data.byteOffset, data.byteLength),
-              capturedAt,
-              capturedFloorSpeaker,
-              frameOrder,
-              "participant",
-            );
-            metrics.increment("floor_audio_frames_total");
-            return;
-          }
+          const frame = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
           if (holder.pendingFrames * AUDIO_CONFIG.chunkMilliseconds >= AUDIO_CONFIG.staleFrameMilliseconds) {
             metrics.increment("dropped_audio_frames_total");
             return;
@@ -1216,140 +1709,148 @@ export function createGatewayServer({
           holder.pendingFrames += 1;
           holder.audioTail = holder.audioTail
             .then(async () => {
-              if (state.recoveryFlight && !state.recoveryDirectRouting) {
-                spoolRecoveryAudio(
-                  state,
-                  new Uint8Array(data.buffer, data.byteOffset, data.byteLength),
-                  capturedAt,
-                  capturedFloorSpeaker,
-                  frameOrder,
-                  "participant",
-                );
-                return;
-              }
+              if (state.isDetaching) return;
               return state.pipeline.acceptAudio(
-                new Uint8Array(data.buffer, data.byteOffset, data.byteLength),
+                frame,
                 capturedAt,
                 capturedFloorSpeaker,
                 "participant",
               );
             })
-            .catch(() => releaseFloor(claims.sessionId, { reason: "error" }))
+            .catch(() => failOwnedPipeline(claims.sessionId, state.pipeline))
             .finally(() => { holder.pendingFrames -= 1; });
           metrics.increment("floor_audio_frames_total");
           return;
         }
         const message = parseJson(data);
         if (message.type === "speak-start") {
+          const metadata = viewerMetadata.get(webSocket);
+          if (!metadata || !await runParticipantSpeakingAuthorization(claims.sessionId)) {
+            throw new Error("VIEWER_CONTROL_FORBIDDEN");
+          }
+          metadata.capabilities.participantSpeakingEnabled = true;
           await withFloorSessionLock(claims.sessionId, async () => {
             const speakStartReceivedAt = now();
             if (!floorController) throw new Error("FLOOR_UNAVAILABLE");
-            if (!viewerMetadata.get(webSocket)) throw new Error("INVALID_SUBSCRIPTION");
             const state = hostSessions.get(claims.sessionId);
-            if (!state) {
-              sendJson(webSocket, { type: "error", code: "SESSION_NOT_STARTED", message: gatewayMessage("SESSION_NOT_STARTED") });
+            if (!state || state.isDetaching) {
+              sendJson(webSocket, {
+                type: "error",
+                code: "SESSION_NOT_STARTED",
+                message: gatewayMessage("SESSION_NOT_STARTED"),
+              });
               return;
             }
             const activeHolder = floorHolders.get(claims.sessionId);
-          if (activeHolder?.webSocket === webSocket && activeHolder.grantId === claims.grantId) {
-            // A Speak button may be tapped again while the client reconciles
-            // UI state. The existing grant is sticky until another holder or
-            // the host preempts it; never call take/release on self-repeats.
+            if (activeHolder?.webSocket === webSocket && activeHolder.grantId === claims.grantId) {
+              sendJson(webSocket, {
+                type: "speak-started",
+                sessionId: claims.sessionId,
+                displayName: activeHolder.displayName,
+                audio: {
+                  sampleRate: AUDIO_CONFIG.inputSampleRate,
+                  channels: 1,
+                  chunkMilliseconds: AUDIO_CONFIG.chunkMilliseconds,
+                },
+              });
+              metrics.increment("floor_idempotent_starts_total");
+              return;
+            }
+            const floorAttemptKey = `${claims.sessionId}\u0000${claims.grantId}`;
+            const timestamp = now();
+            const previousAttemptAt = floorTakeAttempts.get(floorAttemptKey);
+            const applicableCooldown = activeHolder
+              ? floorTakeCooldownMilliseconds
+              : resumeCooldownMilliseconds;
+            if (previousAttemptAt !== undefined && timestamp - previousAttemptAt < applicableCooldown) {
+              sendJson(webSocket, {
+                type: "error",
+                code: "FLOOR_RATE_LIMITED",
+                message: gatewayMessage("FLOOR_RATE_LIMITED"),
+              });
+              metrics.increment("floor_rate_limit_rejections_total");
+              return;
+            }
+            floorTakeAttempts.set(floorAttemptKey, timestamp);
+            if (floorTakeAttempts.size > 10_000) {
+              for (const [key, attemptedAt] of floorTakeAttempts) {
+                if (timestamp - attemptedAt >= floorTakeCooldownMilliseconds) floorTakeAttempts.delete(key);
+              }
+            }
+            const result = await floorController.take(claims.sessionId, claims.grantId);
+            if (result?.ok !== true) {
+              const code = typeof result?.code === "string" ? result.code : "FLOOR_DENIED";
+              sendJson(webSocket, { type: "error", code, message: gatewayMessage(code) });
+              return;
+            }
+            const participantId = typeof result.participantId === "string" && result.participantId
+              ? result.participantId
+              : claims.grantId;
+            const profile = await lookupParticipantProfile(claims.sessionId, participantId);
+            const previous = floorHolders.get(claims.sessionId);
+            const holder = {
+              webSocket,
+              grantId: claims.grantId,
+              participantId,
+              displayName: typeof result.displayName === "string" && result.displayName.trim()
+                ? result.displayName.trim()
+                : "참가자",
+              department: profile?.department ?? "",
+              jobTitle: profile?.jobTitle ?? "",
+              pendingFrames: 0,
+              audioTail: Promise.resolve(),
+              lastFrameAt: now(),
+            };
+            floorHolders.set(claims.sessionId, holder);
+            if (previous && previous.webSocket !== webSocket) {
+              sendJson(previous.webSocket, {
+                type: "speak-ended",
+                sessionId: claims.sessionId,
+                reason: "preempted",
+              });
+            }
+            try {
+              state.pipeline.setFloorSpeaker?.({
+                participantId: holder.participantId,
+                displayName: holder.displayName,
+                department: holder.department,
+                jobTitle: holder.jobTitle,
+              });
+            } catch {
+              // The database grant is authoritative; attribution enrichment is
+              // allowed to recover independently with the pipeline.
+            }
+            metrics.increment("floor_takes_total");
             sendJson(webSocket, {
               type: "speak-started",
               sessionId: claims.sessionId,
-              displayName: activeHolder.displayName,
+              displayName: holder.displayName,
               audio: {
                 sampleRate: AUDIO_CONFIG.inputSampleRate,
                 channels: 1,
                 chunkMilliseconds: AUDIO_CONFIG.chunkMilliseconds,
               },
             });
-            metrics.increment("floor_idempotent_starts_total");
-            return;
-          }
-          const floorAttemptKey = `${claims.sessionId}\u0000${claims.grantId}`;
-          const timestamp = now();
-          const previousAttemptAt = floorTakeAttempts.get(floorAttemptKey);
-          // Self-repeats already returned above, so a holder still present here
-          // means this take would cut that speaker off. An unowned floor cuts
-          // nobody off -- charging preemption's cooldown for it stalls the
-          // common churn case (speaker -> host -> same speaker answers back).
-          const applicableCooldown = activeHolder
-            ? floorTakeCooldownMilliseconds
-            : resumeCooldownMilliseconds;
-          if (previousAttemptAt !== undefined && timestamp - previousAttemptAt < applicableCooldown) {
-            sendJson(webSocket, {
-              type: "error",
-              code: "FLOOR_RATE_LIMITED",
-              message: gatewayMessage("FLOOR_RATE_LIMITED"),
-            });
-            metrics.increment("floor_rate_limit_rejections_total");
-            return;
-          }
-          floorTakeAttempts.set(floorAttemptKey, timestamp);
-          if (floorTakeAttempts.size > 10_000) {
-            for (const [key, attemptedAt] of floorTakeAttempts) {
-              if (timestamp - attemptedAt >= floorTakeCooldownMilliseconds) floorTakeAttempts.delete(key);
-            }
-          }
-          const result = await floorController.take(claims.sessionId, claims.grantId);
-          if (result?.ok !== true) {
-            const code = typeof result?.code === "string" ? result.code : "FLOOR_DENIED";
-            sendJson(webSocket, { type: "error", code, message: gatewayMessage(code) });
-            return;
-          }
-          const participantId = typeof result.participantId === "string" && result.participantId
-            ? result.participantId
-            : claims.grantId;
-          const profile = await lookupParticipantProfile(claims.sessionId, participantId);
-          const previous = floorHolders.get(claims.sessionId);
-          const holder = {
-            webSocket,
-            grantId: claims.grantId,
-            participantId,
-            displayName: typeof result.displayName === "string" && result.displayName.trim() ? result.displayName.trim() : "참가자",
-            department: profile?.department ?? "",
-            jobTitle: profile?.jobTitle ?? "",
-            pendingFrames: 0,
-            audioTail: Promise.resolve(),
-            // Idle-release watchdog input. A client that holds the floor streams
-            // continuously (the worklet pumps every 40ms whether or not anyone is
-            // speaking), so a long gap means the client is gone, not quiet.
-            lastFrameAt: now(),
-          };
-          floorHolders.set(claims.sessionId, holder);
-          if (previous && previous.webSocket !== webSocket) {
-            sendJson(previous.webSocket, { type: "speak-ended", sessionId: claims.sessionId, reason: "preempted" });
-          }
-          try {
-            state.pipeline.setFloorSpeaker?.({
-              participantId: holder.participantId,
-              displayName: holder.displayName,
-              department: holder.department,
-              jobTitle: holder.jobTitle,
-            });
-          } catch {
-            // Pipeline attribution is best-effort; the floor grant already succeeded.
-          }
-          metrics.increment("floor_takes_total");
-          sendJson(webSocket, {
-            type: "speak-started",
-            sessionId: claims.sessionId,
-            displayName: holder.displayName,
-            audio: { sampleRate: AUDIO_CONFIG.inputSampleRate, channels: 1, chunkMilliseconds: AUDIO_CONFIG.chunkMilliseconds },
-          });
-          await broadcastFloor(claims.sessionId, holder);
+            await broadcastFloor(claims.sessionId, holder);
             metrics.observe("floor_broadcast_latency_ms", Math.max(0, now() - speakStartReceivedAt));
           });
           return;
         }
         if (message.type === "speak-end") {
+          const holder = floorHolders.get(claims.sessionId);
+          if (!holder || holder.webSocket !== webSocket || holder.grantId !== claims.grantId) {
+            throw new Error("VIEWER_CONTROL_FORBIDDEN");
+          }
           await releaseFloor(claims.sessionId, { grantId: claims.grantId });
           return;
         }
+        if (message.type !== "subscribe" && message.type !== "unsubscribe") {
+          throw new Error("VIEWER_CONTROL_FORBIDDEN");
+        }
         if (message.type === "unsubscribe") {
           await releaseFloor(claims.sessionId, { grantId: claims.grantId });
+          if (demand) await demand.disconnect(claims.sessionId, demandConnection);
+          demandConnection = null;
           removeViewer(topic, webSocket, viewerTopics);
           topic = null;
           if (reauthorizeTimer) clearReauthorizeIntervalFn(reauthorizeTimer);
@@ -1366,14 +1867,23 @@ export function createGatewayServer({
         // zh-Hant) or admits regioned codes like ko-KR, which would key a
         // topic the pipeline — publishing on normalized lanes — never feeds.
         const language = normalizeLiveLanguage(message.language);
+        const activeSession = hostSessions.get(message.sessionId);
         if (message.type !== "subscribe"
           || message.sessionId !== claims.sessionId
           || typeof message.language !== "string"
           || !language
+          || (activeSession && !activeSession.settings.languages.includes(language))
           || (message.lastSeq !== undefined && (!Number.isSafeInteger(message.lastSeq) || message.lastSeq < 0))) {
           throw new Error("INVALID_SUBSCRIPTION");
         }
         if (!await runViewerAuthorization(message.sessionId, language)) throw new Error("GRANT_REVOKED");
+        const participantSpeakingEnabled = await runParticipantSpeakingAuthorization(message.sessionId);
+        if (demand && !demandConnection) demandConnection = await demand.connect(claims, message);
+        if (demandConnection) webSocket.demandEpoch = demandConnection.epoch;
+        if (webSocket.readyState !== WebSocket.OPEN) {
+          if (demand) await demand.disconnect(claims.sessionId, demandConnection);
+          return;
+        }
         cancelReplay();
         const currentReplayGeneration = replayGeneration;
         removeViewer(topic, webSocket, viewerTopics);
@@ -1384,6 +1894,11 @@ export function createGatewayServer({
         const shouldReplay = message.lastSeq !== undefined && typeof replayUtterances === "function";
         const metadata = {
           claims,
+          role: claims.role,
+          capabilities: {
+            liveEvents: true,
+            participantSpeakingEnabled,
+          },
           sessionId: message.sessionId,
           language,
           lastAuthorizedAt: now(),
@@ -1394,13 +1909,20 @@ export function createGatewayServer({
         };
         viewerMetadata.set(webSocket, metadata);
         metrics.set("viewer_connections", [...viewerTopics.values()].reduce((sum, topicViewers) => sum + topicViewers.size, 0));
-        sendJson(webSocket, { type: "subscribed", sessionId: message.sessionId, language });
+        sendJson(webSocket, {
+          type: "subscribed",
+          sessionId: message.sessionId,
+          language,
+          capabilities: { participantSpeakingEnabled },
+        });
         if (reauthorizeTimer) clearReauthorizeIntervalFn(reauthorizeTimer);
         reauthorizeGeneration += 1;
         const currentReauthorizeGeneration = reauthorizeGeneration;
+        const reauthorizationDelay = viewerAuthorizationLeaseMilliseconds
+          + viewerAuthorizationJitter(claims, viewerAuthorizationJitterMilliseconds);
         reauthorizeTimer = setReauthorizeIntervalFn(() => {
           if (currentReauthorizeGeneration === reauthorizeGeneration) void ensureViewerAuthorization({ force: true });
-        }, AUTHORIZATION_CADENCE_MILLISECONDS);
+        }, reauthorizationDelay);
         if (shouldReplay) {
           let replayedThroughSeq = message.lastSeq;
           const abortController = new AbortController();
@@ -1425,8 +1947,10 @@ export function createGatewayServer({
               for (const row of Array.isArray(rows) ? rows : []) {
                 if (webSocket.readyState !== WebSocket.OPEN) break;
                 const payload = { ...row, replay: true };
-                sendJson(webSocket, { type: "live-event", payload });
+                const serialized = serializeJson({ type: "live-event", payload });
+                const canContinue = deliverSerializedEvent(webSocket, payload, serialized);
                 if (Number.isFinite(payload.seq)) replayedThroughSeq = Math.max(replayedThroughSeq, payload.seq);
+                if (!canContinue) return;
               }
               if (!Array.isArray(rows) || rows.length < 200) break;
               if (replayedThroughSeq <= pageStartSeq) throw new Error("REPLAY_NOT_ADVANCING");
@@ -1448,9 +1972,9 @@ export function createGatewayServer({
           if (currentReplayGeneration !== replayGeneration || viewerMetadata.get(webSocket) !== metadata) return;
           const buffered = metadata.replayBuffer ?? [];
           metadata.replayBuffer = null;
-          for (const payload of buffered) {
+          for (const { payload, serialized } of buffered) {
             if (payload.type === "caption" && Number.isFinite(payload.seq) && payload.seq <= replayedThroughSeq) continue;
-            sendJson(webSocket, { type: "live-event", payload });
+            deliverSerializedEvent(webSocket, payload, serialized);
           }
         }
       } catch (error) {
@@ -1463,6 +1987,11 @@ export function createGatewayServer({
       cleanupTimers();
       connectionCleanup.delete(webSocket);
       removeViewer(topic, webSocket, viewerTopics);
+      if (demand && claims && demandConnection) {
+        await demand.disconnect(claims.sessionId, demandConnection).catch(() => {
+          metrics.increment("media_presence_release_failures_total");
+        });
+      }
       if (claims && claims.role !== "HOST" && floorHolders.get(claims.sessionId)?.webSocket === webSocket) {
         await releaseFloor(claims.sessionId, { grantId: claims.grantId, notifyHolder: false }).catch(() => undefined);
       }
@@ -1474,7 +2003,7 @@ export function createGatewayServer({
             const current = hostSessions.get(claims.sessionId);
             if (current !== state || current.webSocket !== webSocket) return;
             stopHostLease(current);
-            current.recoveryAbortController?.abort(new Error("SESSION_ENDED"));
+
             if (current.graceTimer) {
               clearTimeoutFn(current.graceTimer);
               current.graceTimer = null;
@@ -1483,7 +2012,13 @@ export function createGatewayServer({
             // needs the session's language list to reach the viewers.
             await releaseFloor(claims.sessionId, { reason: "session-ended" }).catch(() => undefined);
             hostSessions.delete(claims.sessionId);
+            floorRevisions.delete(claims.sessionId);
+            participantProfiles.deleteSession(claims.sessionId);
+            viewerAuthorizationLeases.deleteSession(claims.sessionId);
+            viewerAuthorizationBatcher.deleteSession(claims.sessionId);
+            sessionAudioUsage.delete(claims.sessionId);
             await closePipelineOnce(current.pipeline).catch(() => undefined);
+            await releaseGeminiSessionOnce(current);
             metrics.set("host_sessions", hostSessions.size);
           }, { bypassQueueLimit: true });
         };
@@ -1500,10 +2035,6 @@ export function createGatewayServer({
           state.graceTimer?.unref?.();
           metrics.increment("host_grace_detachments_total");
         } else if (ownsSession) {
-          // Abort before teardown queues behind the session lock. Otherwise a
-          // never-settling reconciliation owns that lock and session removal
-          // can never reach its in-lock cleanup.
-          state.recoveryAbortController?.abort(new Error("SESSION_ENDED"));
           await teardownHostSession();
         }
       }
@@ -1521,26 +2052,45 @@ export function createGatewayServer({
       return viewerTopics.get(`${sessionId}:${language}`)?.size ?? 0;
     },
     async broadcastEvent(sessionId, language, event) {
+      const state = hostSessions.get(sessionId);
+      if (state?.hostOutput.clientKind === "browser"
+        && event?.type === "caption"
+        && event.sessionId === sessionId
+        && event.language === language
+        && state.settings.languages.includes(language)) {
+        sendHostEvent(state.hostOutput, event, { isPublishedEvent: true });
+      }
       await deliverEvent(sessionId, language, event);
     },
-    async broadcastAudio(sessionId, language, frame) {
-      await deliverToAuthorizedViewers(sessionId, language, (viewer) => {
-        if (viewer.readyState !== WebSocket.OPEN) return;
-        if (slowConsumerPredicate(viewer)) {
-          metrics.increment("slow_consumers_terminated_total");
-          closeWithError(viewer, "SLOW_CONSUMER", "오디오 재생이 네트워크 속도를 따라가지 못해 연결을 종료합니다.", 4408);
-          return;
-        }
-        viewer.send(frame, { binary: true });
-      });
+    async broadcastSourceEvent(event, context = {}) {
+      if (!["source", "source-draft", "source-draft-clear"].includes(event?.type)
+        || !UUID_PATTERN.test(String(event.sessionId ?? ""))) throw new Error("INVALID_SOURCE_EVENT");
+      const sessionId = event.sessionId;
+      const serialized = serializeJson({ type: "live-event", payload: event });
+      const owner = hostSessions.get(sessionId);
+      const canDeliver = () => owner && hostSessions.get(sessionId) === owner
+        && context.pipelineGeneration === owner.pipelineGeneration
+        && !owner.isDetaching && owner.pipeline.isPaused !== true
+        && (context.mediaFence == null
+          ? owner.demandEpoch === null
+          : owner.demandEpoch === context.mediaFence.epoch && demand?.ownerId === context.mediaFence.ownerId);
+      if (!canDeliver()) return;
+      sendHostEvent(owner.hostOutput, event);
+      // 2026-08-31 feat: 원문 구독은 언어별 번역 토픽과 분리하되 기존 참여자 권한을 재검증한다.
+      // 인증만 한 소켓과 교체된 호스트에는 발송하지 않으며 snapshot의 source cursor가 재접속을 복구한다.
+      await Promise.all([...(authenticatedSessionSockets.get(sessionId) ?? [])].map(async (socket) => {
+        const metadata = viewerMetadata.get(socket);
+        if (socket.readyState !== WebSocket.OPEN || metadata?.sessionId !== sessionId) return;
+        if (!await metadata.ensureAuthorized()) return;
+        if (viewerMetadata.get(socket) !== metadata || !canDeliver()) return;
+        deliverSerializedEvent(socket, event, serialized);
+      }));
     },
     async close() {
       if (isShuttingDown) return;
       isShuttingDown = true;
+      demand?.close();
       shutdownAbortController.abort(new Error("GATEWAY_SHUTTING_DOWN"));
-      for (const state of hostSessions.values()) {
-        state.recoveryAbortController?.abort(new Error("GATEWAY_SHUTTING_DOWN"));
-      }
       clearInterval(tickTimer);
       clearInterval(heartbeatTimer);
       await Promise.all([...hostOperationTails.values()]);
@@ -1549,6 +2099,7 @@ export function createGatewayServer({
       // handlers must not observe and close a pipeline already owned by shutdown.
       const ownedHostStates = [...hostSessions.values()];
       hostSessions.clear();
+      failedHostSessions.clear();
       metrics.set("host_sessions", 0);
       for (const state of ownedHostStates) {
         stopHostLease(state);
@@ -1557,6 +2108,7 @@ export function createGatewayServer({
           state.graceTimer = null;
         }
         await closePipelineOnce(state.pipeline).catch(() => undefined);
+        await releaseGeminiSessionOnce(state);
       }
       for (const pipeline of [...pipelinesPendingClose]) await closePipelineOnce(pipeline).catch(() => undefined);
       for (const client of webSockets.clients) {
@@ -1565,6 +2117,9 @@ export function createGatewayServer({
       }
       connectionCleanup.clear();
       sessionAudioUsage.clear();
+      participantProfiles.clear();
+      viewerAuthorizationLeases.clear();
+      viewerAuthorizationBatcher.close();
       await new Promise((resolve) => webSockets.close(resolve));
       if (server.listening) await new Promise((resolve) => server.close(resolve));
     },
@@ -1592,6 +2147,17 @@ function parseJson(data) {
   const value = JSON.parse(data.toString("utf8"));
   if (!value || typeof value !== "object") throw new Error("INVALID_MESSAGE");
   return value;
+}
+
+function authenticatedViewerConnectionKey(claims, secret) {
+  return createHmac("sha256", secret)
+    .update("gateway-authenticated-viewer\0")
+    .update(String(claims.sessionId))
+    .update("\0")
+    .update(String(claims.grantId))
+    .update("\0")
+    .update(String(claims.userId))
+    .digest("hex");
 }
 
 function rejectUpgrade(socket, status, reason) {
@@ -1632,28 +2198,14 @@ function waitForAbort(promise, signal) {
   });
 }
 
-function waitForDelay(milliseconds, signal, setTimeoutFn, clearTimeoutFn) {
-  if (signal.aborted) return Promise.resolve(false);
-  return new Promise((resolve) => {
-    let timer = null;
-    const settle = (didFinish) => {
-      if (timer !== null) clearTimeoutFn(timer);
-      signal.removeEventListener("abort", onAbort);
-      resolve(didFinish);
-    };
-    const onAbort = () => settle(false);
-    signal.addEventListener("abort", onAbort, { once: true });
-    timer = setTimeoutFn(() => settle(true), milliseconds);
-    timer?.unref?.();
-  });
-}
-
 function isSameHostSettings(previousSettings, message) {
   return previousSettings.sessionType === message.sessionType
     && previousSettings.outputMode === message.outputMode
     && previousSettings.voiceProvider === message.voiceProvider
     && previousSettings.maxViewers === message.maxViewers
-    && previousSettings.glossaryPack === message.glossaryPack
+    // glossaryPack is deliberately NOT compared: it never reaches a prompt or
+    // adapter, and captionConfigFingerprint already covers real config drift —
+    // comparing it only forced needless pipeline rebuilds on reattach.
     // Without these three, editing the desktop glossary / tone / domain and
     // restarting reused the running pipeline with the OLD values, so the edit
     // silently did nothing until a brand-new session.
@@ -1672,18 +2224,40 @@ function removeViewer(topic, webSocket, topics) {
   if (viewers?.size === 0) topics.delete(topic);
 }
 
+function fingerprintGatewaySettings(settings) {
+  const canonical = JSON.stringify({
+    sessionType: settings.sessionType,
+    outputMode: settings.outputMode,
+    voiceProvider: settings.voiceProvider,
+    languages: settings.languages,
+    maxViewers: settings.maxViewers,
+    glossaryPack: settings.glossaryPack,
+    pinnedGlossaryFingerprint: settings.pinnedGlossaryFingerprint,
+  });
+  return `sha256:${createHash("sha256").update(canonical, "utf8").digest("hex")}`;
+}
+
 function gatewayMessage(code) {
   if (code === "GRANT_REVOKED") return "시청 권한이 만료되었거나 회수되었습니다.";
   if (code === "UNAUTHORIZED") return "게이트웨이 인증에 실패했습니다.";
   if (code === "TOKEN_EXPIRED") return "게이트웨이 인증이 만료되었습니다.";
+  if (code === "VIEWER_MEDIA_FORBIDDEN") return "참여자는 음성을 전송할 수 없습니다.";
+  if (code === "VIEWER_CONTROL_FORBIDDEN") return "참여자는 자막 구독 외 미디어 제어를 사용할 수 없습니다.";
   if (code === "SESSION_REVOKED" || code === "SESSION_STOPPED") return "라이브 세션이 종료되었거나 설정이 변경되었습니다.";
   if (code === "PIPELINE_STOP_FAILED") return "라이브 미디어 연결을 종료하지 못했습니다. 다시 시도해주세요.";
+  if (code === "PIPELINE_RESTART_REQUIRED") return "음성 또는 원문 처리에 오류가 발생해 중지했습니다. 호스트가 다시 시작을 눌러주세요.";
+  if (code === "PIPELINE_CLEANUP_FAILED") return "이전 음성 연결을 종료하지 못했습니다. 새 연결을 시작할 수 없습니다.";
   if (code === "SLOW_CONSUMER") return "오디오 재생이 네트워크 속도를 따라가지 못해 연결을 종료합니다.";
   if (code === "FLOOR_DENIED" || code === "SESSION_NOT_LIVE") return "지금은 발언권을 가져올 수 없습니다.";
   if (code === "FLOOR_RATE_LIMITED") return "발언 요청이 너무 빠릅니다. 잠시 후 다시 시도해 주세요.";
   if (code === "GRANT_INVALID") return "발언 권한이 확인되지 않았습니다. 다시 입장해 주세요.";
   if (code === "FLOOR_UNAVAILABLE") return "이 게이트웨이에서는 발언 기능을 사용할 수 없습니다.";
   if (code === "SESSION_NOT_STARTED") return "라이브 세션이 아직 시작되지 않았습니다.";
+  if (code === "INVALID_ACTIVATION_KEY") return "라이브 시작 요청 식별자가 올바르지 않습니다.";
+  if (code === "GATEWAY_READINESS_CONFLICT" || code === "GATEWAY_READINESS_FAILED"
+    || code === "INVALID_GATEWAY_READINESS_INPUT" || code === "INVALID_GATEWAY_READINESS_RESPONSE") {
+    return "라이브 시작 상태가 변경되었습니다. 세션 정보를 새로고침해 주세요.";
+  }
   if (code === "QUEUE_LATENCY_EXCEEDED") return "지연된 음성 작업을 건너뛰고 자동으로 재시작했습니다.";
   return "미디어 게이트웨이 요청을 처리할 수 없습니다.";
 }

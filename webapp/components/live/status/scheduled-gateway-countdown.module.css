@@ -1,0 +1,48 @@
+.root {
+  display: grid;
+  min-width: 0;
+  gap: 8px;
+  padding: 16px;
+  border: 1px solid var(--nova-surface-hairline);
+  border-radius: var(--nova-radius-sm);
+  background: var(--nova-surface-layered);
+  color: var(--nova-fg-primary);
+}
+
+.root > div:first-child {
+  display: flex;
+  min-width: 0;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px 16px;
+}
+
+.root span,
+.root p { color: var(--nova-fg-secondary); font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
+.root strong { font-size: 22px; font-weight: 600; line-height: 28px; font-variant-numeric: tabular-nums; }
+.root p { margin: 0; }
+.root[data-state="action-required"] { border-color: var(--nova-status-warn); }
+
+.actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.actions button {
+  min-height: 44px;
+  padding: 0 14px;
+  border: 1px solid var(--nova-surface-hairline);
+  border-radius: var(--nova-radius-sm);
+  background: var(--nova-surface-float);
+  color: var(--nova-fg-primary);
+  cursor: pointer;
+  font: var(--nova-ui-font);
+  letter-spacing: var(--nova-ui-letter-spacing);
+}
+.actions button:focus-visible { outline: 2px solid var(--nova-system-default); outline-offset: 2px; }
+
+@media (max-width: 480px) {
+  .root { width: 100%; max-width: 100%; }
+  .actions button { flex: 1 1 132px; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .root, .actions button { scroll-behavior: auto; transition: none; }
+}

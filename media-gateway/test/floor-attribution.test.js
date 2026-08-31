@@ -5,24 +5,26 @@ import { LiveMediaPipeline } from "../src/live-media-pipeline.js";
 
 function makeDependencies() {
   const events = [];
+  let sourceSeq = 0;
   return {
     events,
     dependencies: {
-      // Meeting captions run on Gemini Live Translate sessions (2026-07-24
-      // provider split); these tests inject finals directly, so the session
-      // only needs to exist.
-      liveTranslate: { async open() { return { async sendAudio() {}, async audioStreamEnd() {}, async close() {} }; } },
-      openaiLiveTranslate: { async open() { throw new Error("UNUSED"); } },
       speechToText: {
         async open() {
           return { async sendAudio() {}, async close() {}, async getFinalWords() { return []; } };
         },
       },
       textTranslate: { async translate({ text, language }) { return `${language}:${text}`; } },
-      textToSpeech: { async *synthesizeStream() { yield new Uint8Array(6_000); } },
       publisher: {
         async publish(_sessionId, _language, event) { events.push(event); },
-        async publishAudio() {},
+        async persistAuthoritativeSource() {
+          sourceSeq += 1;
+          return {
+            sourceUtteranceId: `00000000-0000-4000-8000-${String(sourceSeq).padStart(12, "0")}`,
+            sourceSeq,
+            idempotent: false,
+          };
+        },
       },
     },
   };

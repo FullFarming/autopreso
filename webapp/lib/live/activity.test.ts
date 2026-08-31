@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { buildParticipantActivity } from "./activity";
+import { buildParticipantActivity, buildParticipantRoster } from "./activity";
 
 test("participant activity joins retained identity with speaker-attributed utterances", async () => {
   const fetchFn: typeof fetch = async (input) => {
@@ -9,7 +9,10 @@ test("participant activity joins retained identity with speaker-attributed utter
     if (url.includes("/rpc/read_live_participant_roster")) {
       return Response.json([{
         participant_id: "grant-1",
-        display_name: "Noel Kim",
+        display_name: "n***@example.com",
+        email: "noel@example.com",
+        company: "Cushman",
+        summary_consent_at: "2026-07-23T00:00:00.000Z",
         department: "Strategy",
         job_title: "Director",
         joined_at: "2026-07-23T00:00:00.000Z",
@@ -60,7 +63,10 @@ test("participant activity joins retained identity with speaker-attributed utter
 
   assert.deepEqual(activity.participants, [{
     participantId: "grant-1",
-    displayName: "Noel Kim",
+    displayName: "n***@example.com",
+    email: "noel@example.com",
+    company: "Cushman",
+    summaryConsentAt: "2026-07-23T00:00:00.000Z",
     department: "Strategy",
     jobTitle: "Director",
     joinedAt: "2026-07-23T00:00:00.000Z",
@@ -73,6 +79,7 @@ test("participant activity joins retained identity with speaker-attributed utter
   assert.equal(activity.recentSpeeches.length, 2);
   assert.equal(activity.recentSpeeches[1]?.department, "Strategy");
   assert.equal(activity.recentSpeeches[1]?.jobTitle, "Director");
+  assert.equal(JSON.stringify(activity.recentSpeeches).includes("noel@example.com"), false);
 });
 
 test("participant duration rejects invalid or implausibly long timestamp ranges", async () => {
@@ -82,6 +89,9 @@ test("participant duration rejects invalid or implausibly long timestamp ranges"
       return Response.json([{
         participant_id: "grant-1",
         display_name: "Noel Kim",
+        email: null,
+        company: null,
+        summary_consent_at: null,
         department: "Strategy",
         job_title: "Director",
         joined_at: "2026-07-23T00:00:00.000Z",
@@ -127,6 +137,9 @@ test("participant activity accepts nullable optional identity and a 100 characte
         {
           participant_id: "grant-1",
           display_name: "Noel Kim",
+          email: null,
+          company: null,
+          summary_consent_at: null,
           department: null,
           job_title: null,
           joined_at: "2026-07-23T00:00:00.000Z",
@@ -139,6 +152,9 @@ test("participant activity accepts nullable optional identity and a 100 characte
         {
           participant_id: "grant-2",
           display_name: "Mina Lee",
+          email: null,
+          company: null,
+          summary_consent_at: null,
           department: "Strategy",
           job_title: longJobTitle,
           joined_at: "2026-07-23T00:00:00.000Z",
@@ -167,5 +183,80 @@ test("participant activity accepts nullable optional identity and a 100 characte
   assert.equal(activity.participants.length, 2);
   assert.equal(activity.participants[0]?.department, "");
   assert.equal(activity.participants[0]?.jobTitle, "");
+  assert.equal(activity.participants[0]?.email, null);
+  assert.equal(activity.participants[0]?.company, null);
+  assert.equal(activity.participants[0]?.summaryConsentAt, null);
   assert.equal(activity.participants[1]?.jobTitle, longJobTitle);
+});
+
+test("participant activity rejects malformed host-only email without leaking it into speech events", async () => {
+  const fetchFn: typeof fetch = async (input) => String(input).includes("/rpc/read_live_participant_roster")
+    ? Response.json([{
+        participant_id: "grant-1",
+        display_name: "forged-label",
+        email: "private@example.com",
+        company: "Cushman",
+        summary_consent_at: null,
+        department: null,
+        job_title: null,
+        joined_at: "2026-07-23T00:00:00.000Z",
+        last_seen_at: "2026-07-23T00:10:00.000Z",
+        left_at: null,
+        utterance_count: 0,
+        speaking_seconds: 0,
+        last_spoke_at: null,
+      }])
+    : Response.json([]);
+
+  const activity = await buildParticipantActivity(
+    "0192d0f4-9f72-7a36-91f5-6a76ef736f41",
+    "host-1",
+    "en",
+    fetchFn,
+    {
+      baseUrl: "https://dev-ref.supabase.co",
+      credential: { key: `sb_secret_${"a".repeat(24)}`, kind: "secret" },
+    },
+  );
+  assert.deepEqual(activity.participants, []);
+  assert.equal(JSON.stringify(activity).includes("private@example.com"), false);
+});
+
+test("participant roster reads only the bounded host roster without duplicating utterance reads", async () => {
+  const fetchFn: typeof fetch = async (input, init) => {
+    const url = String(input);
+    assert.equal(init?.signal instanceof AbortSignal, true);
+    if (url.includes("/rpc/read_live_participant_roster")) {
+      return Response.json([{
+        participant_id: "grant-1",
+        display_name: "n***@example.com",
+        email: "noel@example.com",
+        company: "Cushman",
+        summary_consent_at: "2026-07-23T00:00:00.000Z",
+        department: "Strategy",
+        job_title: "Director",
+        joined_at: "2026-07-23T00:00:00.000Z",
+        last_seen_at: "2026-07-23T00:10:00.000Z",
+        left_at: null,
+        utterance_count: 2,
+        speaking_seconds: 7,
+        last_spoke_at: "2026-07-23T00:00:11.000Z",
+      }]);
+    }
+    throw new Error(`Unexpected duplicate read: ${url}`);
+  };
+
+  const participants = await buildParticipantRoster(
+    "0192d0f4-9f72-7a36-91f5-6a76ef736f41",
+    "host-1",
+    fetchFn,
+    {
+      baseUrl: "https://dev-ref.supabase.co",
+      credential: { key: `sb_secret_${"a".repeat(24)}`, kind: "secret" },
+    },
+    { signal: new AbortController().signal },
+  );
+
+  assert.equal(participants.length, 1);
+  assert.equal(participants[0]?.displayName, "n***@example.com");
 });

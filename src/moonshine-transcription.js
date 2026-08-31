@@ -1,9 +1,12 @@
 import { spawn } from "node:child_process";
+import { existsSync } from "node:fs";
 import { createRequire } from "node:module";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 const require = createRequire(import.meta.url);
 const SAMPLE_RATE = 24000;
+const SOURCE_DIR = path.dirname(fileURLToPath(import.meta.url));
 const LEGACY_PACKAGE_SCOPE = `@${["auto", "preso"].join("")}`;
 const LEGACY_BINARY_NAME = `${["auto", "preso"].join("")}-moonshine`;
 const SIDECAR_PACKAGES_BY_PLATFORM = new Map([
@@ -30,6 +33,8 @@ export function resolveMoonshineSidecarPath({
   platform = process.platform,
   arch = process.arch,
   requireResolve = require.resolve,
+  localPackageRoot = path.join(SOURCE_DIR, "..", "packages"),
+  fileExists = existsSync,
 } = {}) {
   if (env.REALTIME_NOEL_MOONSHINE_BIN) return env.REALTIME_NOEL_MOONSHINE_BIN;
 
@@ -45,7 +50,19 @@ export function resolveMoonshineSidecarPath({
       if (error.code !== "MODULE_NOT_FOUND") throw error;
     }
   }
+  const localBinary = resolveLocalSidecarBinary(localPackageRoot, packages[0], fileExists);
+  if (localBinary) return localBinary;
   throw new Error(`Cannot find Moonshine sidecar package for ${platform}/${arch}.`);
+}
+
+function resolveLocalSidecarBinary(localPackageRoot, candidate, fileExists) {
+  if (!localPackageRoot) return null;
+  const packageDir = candidate.packageName.split("/").pop();
+  const binaryPath = path.join(localPackageRoot, packageDir, "bin", candidate.binaryName);
+  const unpackedBinaryPath = binaryPath.replace(`${path.sep}app.asar${path.sep}`, `${path.sep}app.asar.unpacked${path.sep}`);
+  if (fileExists(unpackedBinaryPath)) return unpackedBinaryPath;
+  if (fileExists(binaryPath)) return binaryPath;
+  return null;
 }
 
 export function createMoonshineTranscription({

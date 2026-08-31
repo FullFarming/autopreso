@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
 import { WebSocket } from "ws";
@@ -39,6 +40,927 @@ async function openSocket(url) {
   });
   return socket;
 }
+
+function wait(milliseconds = 25) {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+function deferred() {
+  /** @type {(value?: unknown) => void} */
+  let resolve = () => {};
+  const promise = new Promise((next) => { resolve = next; });
+  return { promise, resolve };
+}
+
+function createSubtitleManagerHarness({ failStart = false } = {}) {
+  const starts = [];
+  const stops = [];
+  const audio = [];
+  const inputSignals = [];
+  let broadcast = (_message) => {};
+  return {
+    starts,
+    stops,
+    audio,
+    inputSignals,
+    emit(message) { broadcast(message); },
+    factory(options) {
+      broadcast = options.broadcast;
+      return {
+        async start(args) {
+          starts.push(args);
+          if (failStart) throw new Error("LOCAL_PROVIDER_START_FAILED");
+        },
+        async stop(sessionId) { stops.push(sessionId); },
+        sendAudio(packet) { audio.push(packet); },
+        async restartChannels() {},
+        noteInputSignal(signal) { inputSignals.push(signal); },
+        close() {},
+      };
+    },
+  };
+}
+
+test("Live Call hybrid audio accepts local PCM without a Gateway floor", async () => {
+  const harness = createSubtitleManagerHarness();
+  const { httpServer, url } = await startServer({
+    host: "127.0.0.1",
+    port: 0,
+    env: {},
+    createTranscription: () => ({ ready: async () => {}, sendAudio: () => {}, stop: () => {}, close: () => {} }),
+    createSubtitleRealtimeManager: (options) => harness.factory(options),
+  });
+  const producer = await openSocket(url);
+  try {
+    const started = waitForMessage(producer, (message) => (
+      message.type === "subtitle:started" && message.captionProducer === "hybrid"
+    ));
+    producer.send(JSON.stringify({
+      type: "subtitle:start",
+      captionProducer: "hybrid",
+      sessionId: "bounded-audio",
+      settings: {},
+      meeting: { kind: "live-call", liveSessionId: "call-bounded-audio" },
+    }));
+    await started;
+    const sendAudio = (source, audio) => producer.send(JSON.stringify({
+      type: "subtitle:audio",
+      sessionId: "bounded-audio",
+      source,
+      audio,
+    }));
+    sendAudio("mic", "AAAA");
+    sendAudio("participant", Buffer.alloc(4_800).toString("base64"));
+    const exactFrame = Buffer.alloc(4_800, 7).toString("base64");
+    for (let frame = 0; frame < 21; frame += 1) sendAudio("mic", exactFrame);
+    await wait(30);
+    assert.equal(harness.audio.length, 20, "the 21st immediate 100 ms frame exceeds the two-second burst budget");
+    assert.ok(harness.audio.every((packet) => packet.audio === exactFrame && packet.source === "mic"));
+  } finally {
+    producer.close();
+    httpServer.closeAllConnections?.();
+    await new Promise((resolve) => httpServer.close(resolve));
+  }
+});
+
+test("Live Call keeps local Caption Only independent from Gateway floor routing", async () => {
+  const harness = createSubtitleManagerHarness();
+  const { httpServer, url, applyLiveCallFloorSnapshot } = await startServer({
+    host: "127.0.0.1",
+    port: 0,
+    env: {},
+    createTranscription: () => ({
+      ready: async () => {},
+      sendAudio: () => {},
+      stop: () => {},
+      close: () => {},
+    }),
+    createSubtitleRealtimeManager: (options) => harness.factory(options),
+  });
+  const sockets = [];
+  try {
+    const producer = await openSocket(url);
+    sockets.push(producer);
+
+    const hybridStarted = waitForMessage(
+      producer,
+      (message) => message.type === "subtitle:started" && message.captionProducer === "hybrid",
+    );
+    producer.send(JSON.stringify({
+      type: "subtitle:start",
+      captionProducer: "hybrid",
+      sessionId: "live-hybrid",
+      settings: { inputMode: "mic", translationProvider: "gemini" },
+      meeting: { kind: "live-call", liveSessionId: "call-hybrid" },
+    }));
+    await hybridStarted;
+    assert.equal(harness.starts.length, 1, "the local realtime provider starts once for the initial local half");
+
+    const localReconfigured = waitForMessage(
+      producer,
+      (message) => message.type === "subtitle:started" && message.captionProducer === "local",
+    );
+    producer.send(JSON.stringify({
+      type: "subtitle:start",
+      captionProducer: "local",
+      sessionId: "live-hybrid",
+      settings: { inputMode: "mic", translationProvider: "gemini", fontSize: 32 },
+      meeting: { kind: "live-call", liveSessionId: "call-hybrid" },
+    }));
+    await localReconfigured;
+    assert.equal(harness.starts.length, 2, "same-session local start keeps the settings reconfigure contract");
+
+    const observed = [];
+    producer.on("message", (raw) => observed.push(JSON.parse(raw.toString("utf8"))));
+    const beforeFloorCaption = waitForMessage(producer,
+      (message) => message.type === "subtitle:committed" && message.translatedText === "floor 확인 전 로컬 자막");
+    harness.emit({
+      type: "subtitle:committed",
+      source: "mic",
+      targetLanguage: "ko",
+      translatedText: "floor 확인 전 로컬 자막",
+    });
+    await beforeFloorCaption;
+    assert.equal(observed.some((message) => message.translatedText === "floor 확인 전 로컬 자막"), true,
+      `local Caption Only output must not depend on a Gateway floor ACK: ${JSON.stringify(observed)}`);
+
+    assert.deepEqual(applyLiveCallFloorSnapshot({
+      type: "floor",
+      sessionId: "call-hybrid",
+      floorRevision: 1,
+      holder: null,
+    }), {
+      ok: true,
+      mode: "host",
+      liveSessionId: "call-hybrid",
+      floorRevision: 1,
+      holder: null,
+    });
+    const hostFloor = waitForMessage(
+      producer,
+      (message) => message.type === "subtitle:live-call-floor-applied" && message.floorRevision === 1,
+    );
+    producer.send(JSON.stringify({
+      type: "subtitle:live-call-floor",
+      sessionId: "live-hybrid",
+      liveSessionId: "call-hybrid",
+      floorRevision: 1,
+      holder: null,
+    }));
+    assert.equal((await hostFloor).mode, "host");
+
+    const localCaption = waitForMessage(
+      producer,
+      (message) => message.type === "subtitle:committed" && message.translatedText === "호스트 로컬 자막",
+    );
+    harness.emit({
+      type: "subtitle:partial",
+      source: "mic",
+      targetLanguage: "ko",
+      sourceLanguage: "en",
+      sourceText: "Host local",
+      translatedText: "호스트 로컬",
+    });
+    harness.emit({
+      type: "subtitle:committed",
+      source: "mic",
+      targetLanguage: "ko",
+      sourceLanguage: "en",
+      sourceText: "Host local caption",
+      translatedText: "호스트 로컬 자막",
+    });
+    await localCaption;
+    const localConnecting = waitForMessage(
+      producer,
+      (message) => message.type === "subtitle:status" && message.status === "connecting",
+    );
+    harness.emit({ type: "subtitle:status", source: "mic", status: "connecting" });
+    await localConnecting;
+    const lateViewer = new WebSocket(`${url.replace("http:", "ws:")}/ws`, { headers: { Origin: url } });
+    sockets.push(lateViewer);
+    const liveSnapshot = waitForMessage(lateViewer, (message) => message.type === "subtitle:snapshot");
+    await new Promise((resolve, reject) => {
+      lateViewer.once("open", resolve);
+      lateViewer.once("error", reject);
+    });
+    assert.equal((await liveSnapshot).liveSessionId, "call-hybrid",
+      "local reconnect health must not erase the canonical Live Call snapshot identity");
+
+    producer.send(JSON.stringify({
+      type: "subtitle:audio",
+      sessionId: "live-hybrid",
+      source: "mic",
+      audio: Buffer.alloc(4_800, 1).toString("base64"),
+    }));
+    producer.send(JSON.stringify({
+      type: "subtitle:input-status",
+      sessionId: "live-hybrid",
+      source: "mic",
+      status: "signal",
+      level: 0.8,
+    }));
+    await wait();
+    assert.equal(harness.audio.length, 1, "host PCM reaches the local provider");
+    assert.equal(harness.inputSignals.length, 1, "the local manager owns the host-side stall watchdog");
+
+    applyLiveCallFloorSnapshot({
+      type: "floor",
+      sessionId: "call-hybrid",
+      floorRevision: 2,
+      holder: { participantId: "viewer-1" },
+    });
+    const participantFloor = waitForMessage(
+      producer,
+      (message) => message.type === "subtitle:live-call-floor-applied" && message.floorRevision === 2,
+    );
+    producer.send(JSON.stringify({
+      type: "subtitle:live-call-floor",
+      sessionId: "live-hybrid",
+      liveSessionId: "call-hybrid",
+      floorRevision: 2,
+      holder: { participantId: "viewer-1" },
+    }));
+    assert.equal((await participantFloor).mode, "participant");
+
+    harness.emit({
+      type: "subtitle:committed",
+      source: "mic",
+      targetLanguage: "ko",
+      translatedText: "늦게 도착한 호스트 로컬 자막",
+    });
+    harness.emit({ type: "subtitle:status", source: "mic", status: "reconnecting" });
+    producer.send(JSON.stringify({
+      type: "subtitle:audio",
+      sessionId: "live-hybrid",
+      source: "mic",
+      audio: Buffer.alloc(4_800, 2).toString("base64"),
+    }));
+    producer.send(JSON.stringify({
+      type: "subtitle:input-status",
+      sessionId: "live-hybrid",
+      source: "mic",
+      status: "signal",
+      level: 0.8,
+    }));
+    await wait();
+    assert.equal(observed.some((message) => message.translatedText === "늦게 도착한 호스트 로컬 자막"), true,
+      "participant floor is presentation routing and must not stop the local provider");
+    assert.equal(observed.some((message) => message.type === "subtitle:status" && message.status === "reconnecting"), true,
+      "local provider health remains observable while participant presentation is active");
+    assert.equal(harness.audio.length, 2, "participant floor does not stop local Caption Only PCM");
+    assert.equal(harness.inputSignals.length, 2, "participant floor does not disable the local watchdog");
+
+    const participantCaption = waitForMessage(
+      producer,
+      (message) => message.type === "subtitle:committed" && message.translatedText === "참가자 게이트웨이 자막",
+    );
+    producer.send(JSON.stringify({
+      type: "subtitle:live-call-caption",
+      sessionId: "call-hybrid",
+      partial: false,
+      targetLanguage: "ko",
+      speaker: "Participant",
+      speakerRole: "participant",
+      translatedText: "참가자 게이트웨이 자막",
+    }));
+    await participantCaption;
+
+    applyLiveCallFloorSnapshot({
+      type: "floor",
+      sessionId: "call-hybrid",
+      floorRevision: 3,
+      holder: null,
+    });
+    const hostReturn = waitForMessage(
+      producer,
+      (message) => message.type === "subtitle:live-call-floor-applied" && message.floorRevision === 3,
+    );
+    producer.send(JSON.stringify({
+      type: "subtitle:live-call-floor",
+      sessionId: "live-hybrid",
+      liveSessionId: "call-hybrid",
+      floorRevision: 3,
+      holder: null,
+    }));
+    assert.equal((await hostReturn).mode, "host");
+    producer.send(JSON.stringify({
+      type: "subtitle:audio",
+      sessionId: "live-hybrid",
+      source: "mic",
+      audio: Buffer.alloc(4_800, 3).toString("base64"),
+    }));
+    await wait();
+    assert.equal(harness.audio.length, 3, "host floor acknowledgement does not recreate or restart the local provider");
+
+    applyLiveCallFloorSnapshot({
+      type: "floor",
+      sessionId: "call-hybrid",
+      floorRevision: 4,
+      holder: { participantId: "viewer-1" },
+    });
+    const participantStopFloor = waitForMessage(
+      producer,
+      (message) => message.type === "subtitle:live-call-floor-applied" && message.floorRevision === 4,
+    );
+    producer.send(JSON.stringify({
+      type: "subtitle:live-call-floor",
+      sessionId: "live-hybrid",
+      liveSessionId: "call-hybrid",
+      floorRevision: 4,
+      holder: { participantId: "viewer-1" },
+    }));
+    await participantStopFloor;
+    const stopped = waitForMessage(
+      producer,
+      (message) => message.type === "subtitle:stopped" && message.sessionId === "live-hybrid",
+    );
+    producer.send(JSON.stringify({ type: "subtitle:stop", sessionId: "live-hybrid" }));
+    await stopped;
+    assert.deepEqual(harness.stops, ["live-hybrid"], "one stop closes the local provider once");
+
+    const relayRejected = waitForMessage(
+      producer,
+      (message) => message.code === "LIVE_CALL_CAPTION_PRODUCER_MISMATCH",
+    );
+    producer.send(JSON.stringify({
+      type: "subtitle:live-call-caption",
+      sessionId: "call-hybrid",
+      partial: false,
+      targetLanguage: "ko",
+      translatedText: "종료 후 자막",
+    }));
+    await relayRejected;
+  } finally {
+    for (const socket of sockets) socket.close();
+    httpServer.closeAllConnections?.();
+    await new Promise((resolve) => httpServer.close(resolve));
+  }
+});
+
+test("subtitle:stopped is emitted only after provider release and permits the next start", async () => {
+  const stopGate = deferred();
+  const starts = [];
+  const stops = [];
+  const { httpServer, url } = await startServer({
+    host: "127.0.0.1",
+    port: 0,
+    env: {},
+    createTranscription: () => ({ ready: async () => {}, sendAudio: () => {}, stop: () => {}, close: () => {} }),
+    createSubtitleRealtimeManager: () => ({
+      async start(args) { starts.push(args); },
+      async stop(sessionId) {
+        stops.push(sessionId);
+        await stopGate.promise;
+      },
+      sendAudio() {},
+      async restartChannels() {},
+      noteInputSignal() {},
+      close() {},
+    }),
+  });
+  const producer = await openSocket(url);
+  try {
+    const firstStarted = waitForMessage(producer, (message) => (
+      message.type === "subtitle:started" && message.sessionId === "handoff-old"
+    ));
+    producer.send(JSON.stringify({
+      type: "subtitle:start",
+      captionProducer: "hybrid",
+      sessionId: "handoff-old",
+      settings: {},
+      meeting: { kind: "live-call", liveSessionId: "handoff-call" },
+    }));
+    await firstStarted;
+
+    const messages = [];
+    producer.on("message", (raw) => messages.push(JSON.parse(raw.toString("utf8"))));
+    const stopped = waitForMessage(producer, (message) => (
+      message.type === "subtitle:stopped" && message.sessionId === "handoff-old"
+    ));
+    producer.send(JSON.stringify({ type: "subtitle:stop", sessionId: "handoff-old" }));
+    await wait();
+    assert.equal(messages.some((message) => message.type === "subtitle:stopped"), false);
+    assert.deepEqual(stops, ["handoff-old"]);
+
+    stopGate.resolve();
+    await stopped;
+    const nextStarted = waitForMessage(producer, (message) => (
+      message.type === "subtitle:started" && message.sessionId === "handoff-new"
+    ));
+    producer.send(JSON.stringify({
+      type: "subtitle:start",
+      sessionId: "handoff-new",
+      settings: {},
+    }));
+    await nextStarted;
+    assert.deepEqual(starts.map((entry) => entry.sessionId), ["handoff-old", "handoff-new"]);
+  } finally {
+    stopGate.resolve();
+    producer.close();
+    httpServer.closeAllConnections?.();
+    await new Promise((resolve) => httpServer.close(resolve));
+  }
+});
+
+test("configured Live Call producer capability protects hybrid control and participant ingress", async () => {
+  const harness = createSubtitleManagerHarness();
+  const producerCapability = "test-live-call-producer-capability-32";
+  const { httpServer, url, applyLiveCallFloorSnapshot } = await startServer({
+    host: "127.0.0.1",
+    port: 0,
+    env: {},
+    liveCallProducerCapability: producerCapability,
+    createTranscription: () => ({ ready: async () => {}, sendAudio: () => {}, stop: () => {}, close: () => {} }),
+    createSubtitleRealtimeManager: (options) => harness.factory(options),
+  });
+  const producer = await openSocket(url);
+  try {
+    const preflightDenied = waitForMessage(producer, (message) => (
+      message.type === "subtitle:preflight-failed" && message.requestId === "capability-preflight-denied"
+    ));
+    producer.send(JSON.stringify({
+      type: "subtitle:preflight",
+      requestId: "capability-preflight-denied",
+      settings: {},
+      meeting: { kind: "live-call", liveSessionId: "capability-call" },
+    }));
+    await preflightDenied;
+    const preflightReady = waitForMessage(producer, (message) => (
+      message.type === "subtitle:preflight-ready" && message.requestId === "capability-preflight-ready"
+    ));
+    producer.send(JSON.stringify({
+      type: "subtitle:preflight",
+      requestId: "capability-preflight-ready",
+      producerCapability,
+      settings: {},
+      meeting: { kind: "live-call", liveSessionId: "capability-call" },
+    }));
+    await preflightReady;
+
+    const denied = waitForMessage(producer, (message) => (
+      message.type === "subtitle:error" && message.code === "SUBTITLE_START_FAILED"
+    ));
+    producer.send(JSON.stringify({
+      type: "subtitle:start",
+      captionProducer: "hybrid",
+      sessionId: "capability-live",
+      settings: {},
+      meeting: { kind: "live-call", liveSessionId: "capability-call" },
+    }));
+    await denied;
+    assert.equal(harness.starts.length, 0);
+
+    const started = waitForMessage(producer, (message) => (
+      message.type === "subtitle:started" && message.sessionId === "capability-live"
+    ));
+    producer.send(JSON.stringify({
+      type: "subtitle:start",
+      captionProducer: "hybrid",
+      producerCapability,
+      sessionId: "capability-live",
+      settings: {},
+      meeting: { kind: "live-call", liveSessionId: "capability-call" },
+    }));
+    await started;
+
+    applyLiveCallFloorSnapshot({
+      type: "floor",
+      sessionId: "capability-call",
+      floorRevision: 1,
+      holder: { participantId: "participant-capability" },
+    });
+    const floorDenied = waitForMessage(producer, (message) => (
+      message.type === "subtitle:error" && message.code === "LIVE_CALL_PRODUCER_CAPABILITY_INVALID"
+    ));
+    producer.send(JSON.stringify({
+      type: "subtitle:live-call-floor",
+      producerCapability: `${producerCapability}-wrong`,
+      sessionId: "capability-live",
+      liveSessionId: "capability-call",
+      floorRevision: 1,
+      holder: { participantId: "participant-capability" },
+    }));
+    await floorDenied;
+
+    const ingressDenied = waitForMessage(producer, (message) => (
+      message.type === "subtitle:error" && message.code === "LIVE_CALL_PRODUCER_CAPABILITY_INVALID"
+    ));
+    producer.send(JSON.stringify({
+      type: "subtitle:live-call-caption",
+      producerCapability: "wrong-equal-length-capability-value",
+      sessionId: "capability-call",
+      partial: false,
+      targetLanguage: "ko",
+      translatedText: "보이면 안 되는 참가자 자막",
+    }));
+    await ingressDenied;
+
+    const accepted = waitForMessage(producer, (message) => (
+      message.type === "subtitle:committed" && message.translatedText === "검증된 참가자 자막"
+    ));
+    producer.send(JSON.stringify({
+      type: "subtitle:live-call-caption",
+      producerCapability,
+      sessionId: "capability-call",
+      partial: false,
+      targetLanguage: "ko",
+      speaker: "Participant",
+      speakerRole: "participant",
+      translatedText: "검증된 참가자 자막",
+    }));
+    await accepted;
+  } finally {
+    producer.close();
+    httpServer.closeAllConnections?.();
+    await new Promise((resolve) => httpServer.close(resolve));
+  }
+});
+
+test("renderer floor claims stay validated without gating the local provider", async () => {
+  const harness = createSubtitleManagerHarness();
+  const { httpServer, url, applyLiveCallFloorSnapshot } = await startServer({
+    host: "127.0.0.1",
+    port: 0,
+    env: {},
+    createTranscription: () => ({ ready: async () => {}, sendAudio: () => {}, stop: () => {}, close: () => {} }),
+    createSubtitleRealtimeManager: (options) => harness.factory(options),
+  });
+  const producer = await openSocket(url);
+  try {
+    const started = waitForMessage(
+      producer,
+      (message) => message.type === "subtitle:started" && message.captionProducer === "hybrid",
+    );
+    producer.send(JSON.stringify({
+      type: "subtitle:start",
+      captionProducer: "hybrid",
+      sessionId: "live-floor-fence",
+      settings: { inputMode: "mic", translationProvider: "gemini" },
+      meeting: { kind: "live-call", liveSessionId: "call-floor-fence" },
+    }));
+    await started;
+    applyLiveCallFloorSnapshot({
+      type: "floor",
+      sessionId: "call-floor-fence",
+      floorRevision: 5,
+      holder: { participantId: "viewer-5" },
+    });
+    const participantAck = waitForMessage(producer, (message) => (
+      message.type === "subtitle:live-call-floor-applied" && message.floorRevision === 5
+    ));
+    producer.send(JSON.stringify({
+      type: "subtitle:live-call-floor",
+      sessionId: "live-floor-fence",
+      liveSessionId: "call-floor-fence",
+      floorRevision: 5,
+      holder: { participantId: "viewer-5" },
+    }));
+    await participantAck;
+
+    assert.deepEqual(applyLiveCallFloorSnapshot({
+      type: "floor",
+      sessionId: "different-call",
+      floorRevision: 6,
+      holder: null,
+    }), {
+      ok: false,
+      mode: "participant",
+      liveSessionId: "call-floor-fence",
+      floorRevision: 5,
+      holder: { participantId: "viewer-5" },
+    }, "an in-process stale session cannot replace the active authoritative floor");
+
+    const forgedHostError = waitForMessage(
+      producer,
+      (message) => message.code === "LIVE_CALL_FLOOR_AUTHORITY_MISMATCH",
+    );
+    producer.send(JSON.stringify({
+      type: "subtitle:live-call-floor",
+      sessionId: "live-floor-fence",
+      liveSessionId: "call-floor-fence",
+      floorRevision: 500,
+      holder: null,
+    }));
+    await forgedHostError;
+
+    producer.send(JSON.stringify({
+      type: "subtitle:audio",
+      sessionId: "live-floor-fence",
+      source: "mic",
+      audio: Buffer.alloc(4_800, 4).toString("base64"),
+    }));
+    harness.emit({
+      type: "subtitle:committed",
+      source: "mic",
+      targetLanguage: "ko",
+      translatedText: "위조된 host floor 뒤 로컬 자막",
+    });
+    await wait();
+    assert.equal(harness.audio.length, 1, "local PCM continues independently of a forged floor claim");
+
+    const malformedError = waitForMessage(producer, (message) => message.code === "LIVE_CALL_FLOOR_INVALID");
+    producer.send(JSON.stringify({
+      type: "subtitle:live-call-floor",
+      sessionId: "live-floor-fence",
+      liveSessionId: "call-floor-fence",
+      floorRevision: 501,
+      holder: {},
+    }));
+    await malformedError;
+
+    const observed = [];
+    producer.on("message", (raw) => observed.push(JSON.parse(raw.toString("utf8"))));
+    harness.emit({
+      type: "subtitle:committed",
+      source: "mic",
+      targetLanguage: "ko",
+      translatedText: "열리면 안 되는 로컬 자막",
+    });
+    await wait();
+    assert.equal(observed.some((message) => message.translatedText === "열리면 안 되는 로컬 자막"), true);
+
+    applyLiveCallFloorSnapshot({
+      type: "floor",
+      sessionId: "call-floor-fence",
+      floorRevision: 7,
+      holder: null,
+    });
+    const hugeRevisionError = waitForMessage(producer, (message) => (
+      message.code === "LIVE_CALL_FLOOR_AUTHORITY_MISMATCH"
+    ));
+    producer.send(JSON.stringify({
+      type: "subtitle:live-call-floor",
+      sessionId: "live-floor-fence",
+      liveSessionId: "call-floor-fence",
+      floorRevision: Number.MAX_SAFE_INTEGER,
+      holder: null,
+    }));
+    await hugeRevisionError;
+    const hostAck = waitForMessage(producer, (message) => (
+      message.type === "subtitle:live-call-floor-applied" && message.floorRevision === 7
+    ));
+    producer.send(JSON.stringify({
+      type: "subtitle:live-call-floor",
+      sessionId: "live-floor-fence",
+      liveSessionId: "call-floor-fence",
+      floorRevision: 7,
+      holder: null,
+    }));
+    assert.equal((await hostAck).mode, "host");
+    producer.send(JSON.stringify({
+      type: "subtitle:audio",
+      sessionId: "live-floor-fence",
+      source: "mic",
+      audio: Buffer.alloc(4_800, 5).toString("base64"),
+    }));
+    await wait();
+    assert.equal(harness.audio.length, 2, "valid floor acknowledgement leaves the existing local provider running");
+  } finally {
+    producer.close();
+    httpServer.closeAllConnections?.();
+    await new Promise((resolve) => httpServer.close(resolve));
+  }
+});
+
+test("a failed local half of Live Call compensates both provider and gateway relay ownership", async () => {
+  const harness = createSubtitleManagerHarness({ failStart: true });
+  const { httpServer, url } = await startServer({
+    host: "127.0.0.1",
+    port: 0,
+    env: {},
+    createTranscription: () => ({ ready: async () => {}, sendAudio: () => {}, stop: () => {}, close: () => {} }),
+    createSubtitleRealtimeManager: (options) => harness.factory(options),
+  });
+  const sockets = [];
+  try {
+    const producer = await openSocket(url);
+    sockets.push(producer);
+    const gatewayStarted = waitForMessage(producer, (message) => (
+      message.type === "subtitle:started" && message.captionProducer === "gateway"
+    ));
+    producer.send(JSON.stringify({
+      type: "subtitle:start",
+      captionProducer: "gateway",
+      sessionId: "live-start-fails",
+      settings: {},
+      meeting: { kind: "live-call", liveSessionId: "call-start-fails" },
+    }));
+    await gatewayStarted;
+
+    const failed = waitForMessage(producer, (message) => message.code === "SUBTITLE_START_FAILED");
+    producer.send(JSON.stringify({
+      type: "subtitle:start",
+      captionProducer: "local",
+      sessionId: "live-start-fails",
+      settings: {},
+      meeting: { kind: "live-call", liveSessionId: "call-start-fails" },
+    }));
+    await failed;
+    assert.deepEqual(harness.stops, ["live-start-fails"], "a partial local open is explicitly compensated");
+
+    const rejected = waitForMessage(producer, (message) => message.code === "LIVE_CALL_CAPTION_PRODUCER_MISMATCH");
+    producer.send(JSON.stringify({
+      type: "subtitle:live-call-caption",
+      sessionId: "call-start-fails",
+      partial: false,
+      targetLanguage: "ko",
+      translatedText: "orphan relay",
+    }));
+    await rejected;
+
+    const replacement = await openSocket(url);
+    sockets.push(replacement);
+    const replacementStarted = waitForMessage(replacement, (message) => (
+      message.type === "subtitle:started" && message.captionProducer === "gateway"
+    ));
+    replacement.send(JSON.stringify({
+      type: "subtitle:start",
+      captionProducer: "gateway",
+      sessionId: "replacement",
+      settings: {},
+      meeting: { kind: "live-call", liveSessionId: "call-start-fails" },
+    }));
+    await replacementStarted;
+  } finally {
+    for (const socket of sockets) socket.close();
+    httpServer.closeAllConnections?.();
+    await new Promise((resolve) => httpServer.close(resolve));
+  }
+});
+
+test("closing a hybrid Live Call owner releases both the local provider and relay for recovery", async () => {
+  const harness = createSubtitleManagerHarness();
+  const { httpServer, url, applyLiveCallFloorSnapshot } = await startServer({
+    host: "127.0.0.1",
+    port: 0,
+    env: {},
+    createTranscription: () => ({ ready: async () => {}, sendAudio: () => {}, stop: () => {}, close: () => {} }),
+    createSubtitleRealtimeManager: (options) => harness.factory(options),
+  });
+  const sockets = [];
+  try {
+    applyLiveCallFloorSnapshot({
+      type: "floor",
+      sessionId: "call-recover",
+      floorRevision: 1,
+      holder: { participantId: "viewer-recover" },
+    });
+    const first = await openSocket(url);
+    sockets.push(first);
+    const started = waitForMessage(first, (message) => (
+      message.type === "subtitle:started" && message.captionProducer === "hybrid"
+    ));
+    first.send(JSON.stringify({
+      type: "subtitle:start",
+      captionProducer: "hybrid",
+      sessionId: "live-recover",
+      settings: {},
+      meeting: { kind: "live-call", liveSessionId: "call-recover" },
+    }));
+    await started;
+    first.close();
+    for (let attempt = 0; attempt < 20 && harness.stops.length === 0; attempt += 1) await wait(10);
+    assert.deepEqual(harness.stops, ["live-recover"]);
+
+    const replacement = await openSocket(url);
+    sockets.push(replacement);
+    const replacementStarted = waitForMessage(replacement, (message) => (
+      message.type === "subtitle:started" && message.captionProducer === "hybrid"
+    ));
+    replacement.send(JSON.stringify({
+      type: "subtitle:start",
+      captionProducer: "hybrid",
+      sessionId: "live-recover",
+      settings: {},
+      meeting: { kind: "live-call", liveSessionId: "call-recover" },
+    }));
+    await replacementStarted;
+    const recoveredFloor = waitForMessage(replacement, (message) => (
+      message.type === "subtitle:live-call-floor-applied" && message.floorRevision === 1
+    ));
+    replacement.send(JSON.stringify({
+      type: "subtitle:live-call-floor",
+      sessionId: "live-recover",
+      liveSessionId: "call-recover",
+      floorRevision: 1,
+      holder: { participantId: "viewer-recover" },
+    }));
+    assert.equal((await recoveredFloor).mode, "participant",
+      "Main authority must survive renderer socket replacement");
+  } finally {
+    for (const socket of sockets) socket.close();
+    httpServer.closeAllConnections?.();
+    await new Promise((resolve) => httpServer.close(resolve));
+  }
+});
+
+test("keyed Live Call source staging evicts the oldest entry at its explicit memory cap", async () => {
+  const transcriptsDir = await fs.mkdtemp(path.join(os.tmpdir(), "live-source-cap-"));
+  const { httpServer, url } = await startServer({
+    host: "127.0.0.1",
+    port: 0,
+    env: {},
+    log: { warn() {} },
+    transcriptsDir,
+    transcriptPersistDelayMs: 1_000,
+    createTranscription: () => ({ ready: async () => {}, sendAudio: () => {}, stop: () => {}, close: () => {} }),
+  });
+  const producer = await openSocket(url);
+  try {
+    const started = waitForMessage(producer, (message) => (
+      message.type === "subtitle:started" && message.captionProducer === "gateway"
+    ));
+    producer.send(JSON.stringify({
+      type: "subtitle:start",
+      captionProducer: "gateway",
+      sessionId: "bounded-keyed-sources",
+      settings: {},
+      meeting: { kind: "live-call", liveSessionId: "call-bounded-sources" },
+    }));
+    await started;
+
+    for (let index = 0; index <= 500; index += 1) {
+      producer.send(JSON.stringify({
+        type: "subtitle:live-call-caption",
+        sessionId: "call-bounded-sources",
+        recordOnly: true,
+        partial: false,
+        targetLanguage: "ko",
+        utteranceKey: `source-${index}`,
+        translatedText: `원문 ${index}`,
+      }));
+    }
+
+    let detail = null;
+    for (let attempt = 0; attempt < 60; attempt += 1) {
+      const response = await fetch(new URL("/api/subtitles/sessions/bounded-keyed-sources", url));
+      const body = await response.json();
+      if (body.ok && body.data?.lines?.length >= 1) {
+        detail = body.data;
+        break;
+      }
+      await wait(10);
+    }
+    assert.ok(detail, "the oldest keyed source was not evicted into the transcript");
+    assert.equal(detail.lines[0].sourceText, "원문 0");
+    assert.equal(detail.lines.length, 1, "only the oldest overflow is evicted before session stop");
+    const stopped = waitForMessage(producer, (message) => message.type === "subtitle:sessions");
+    producer.send(JSON.stringify({ type: "subtitle:stop", sessionId: "bounded-keyed-sources" }));
+    await stopped;
+  } finally {
+    producer.close();
+    httpServer.closeAllConnections?.();
+    await new Promise((resolve) => httpServer.close(resolve));
+    await fs.rm(transcriptsDir, { recursive: true, force: true });
+  }
+});
+
+test("participant Live Call captions normalize and bound display and record text", async () => {
+  const { httpServer, url } = await startServer({
+    host: "127.0.0.1",
+    port: 0,
+    env: {},
+    createTranscription: () => ({ ready: async () => {}, sendAudio: () => {}, stop: () => {}, close: () => {} }),
+  });
+  const producer = await openSocket(url);
+  try {
+    const started = waitForMessage(producer, (message) => message.type === "subtitle:started");
+    producer.send(JSON.stringify({
+      type: "subtitle:start",
+      captionProducer: "gateway",
+      sessionId: "bounded-live-caption",
+      settings: {},
+      meeting: { kind: "live-call", liveSessionId: "call-bounded-live-caption" },
+    }));
+    await started;
+
+    const committedPromise = waitForMessage(
+      producer,
+      (message) => message.type === "subtitle:committed" && message.liveSessionId === "call-bounded-live-caption",
+    );
+    producer.send(JSON.stringify({
+      type: "subtitle:live-call-caption",
+      sessionId: "call-bounded-live-caption",
+      partial: false,
+      targetLanguage: "ko",
+      sourceLanguage: "en",
+      speaker: "Participant",
+      speakerRole: "participant",
+      translatedText: ` e\u0301\u0000   ${"번".repeat(2_100)}`,
+      sourceText: ` source\u0007   ${"x".repeat(2_100)}`,
+    }));
+    const committed = await committedPromise;
+    assert.equal(committed.translatedText.length, 2_000);
+    assert.equal(committed.sourceText.length, 2_000);
+    assert.match(committed.translatedText, /^é /u);
+    assert.equal(/[\u0000-\u001f\u007f]/u.test(committed.translatedText), false);
+    assert.equal(/[\u0000-\u001f\u007f]/u.test(committed.sourceText), false);
+  } finally {
+    producer.close();
+    httpServer.closeAllConnections?.();
+    await new Promise((resolve) => httpServer.close(resolve));
+  }
+});
 
 test("an accepted gateway-caption stop broadcasts idle and removes the late-join subtitle snapshot", async () => {
   const { httpServer, url } = await startServer({
@@ -313,7 +1235,67 @@ test("desktop terminal paths clear caption text and speaker state without treati
   assert.ok(reconnectStart >= 0 && reconnectEnd > reconnectStart);
   assert.doesNotMatch(dashboard.slice(reconnectStart, reconnectEnd), /clearActiveSubtitleSurface\(\)/u);
 
-  assert.match(overlay, /floor\?\.type === "live-call-ended"[\s\S]{0,220}clearSubtitle\(\)/u);
+  assert.match(overlay, /floor\?\.type === "live-call-ended"[\s\S]{0,360}clearSubtitle\(\)/u);
   assert.match(main, /currentStatus === "stopped"[\s\S]{0,460}type: "live-call-ended"[\s\S]{0,120}sessionId: armedSession\.sessionId/u);
   assert.match(main, /liveCallSession = null;[\s\S]{0,260}type: "live-call-ended"[\s\S]{0,120}sessionId: endingSession\.sessionId/u);
+});
+
+
+test("desktop logout gate refuses preflight and start without opening a subtitle provider", async () => {
+  const harness = createSubtitleManagerHarness();
+  const server = await startServer({
+    host: "127.0.0.1", port: 0, env: {}, canStartSubtitleSession: () => false,
+    createTranscription: () => ({ ready: async () => {}, sendAudio() {}, stop() {}, close() {} }),
+    createSubtitleRealtimeManager: (options) => harness.factory(options),
+  });
+  const socket = await openSocket(server.url);
+  try {
+    for (const [type, reply] of [["subtitle:preflight", "subtitle:preflight-failed"], ["subtitle:start", "subtitle:error"]]) {
+      const response = waitForMessage(socket, (message) => message.type === reply);
+      socket.send(JSON.stringify({ type, requestId: "logged-out", sessionId: "blocked", settings: {} }));
+      assert.equal((await response).message, "HOST_LOGIN_REQUIRED");
+    }
+    assert.equal(harness.starts.length, 0);
+    assert.equal(server.hasActiveSubtitleSession(), false);
+  } finally {
+    socket.close();
+    server.httpServer.closeAllConnections?.();
+    await new Promise((resolve) => server.httpServer.close(resolve));
+  }
+});
+
+test("rejecting a start while logout checks an active producer does not clear its current session", async () => {
+  let canStart = true;
+  const startBarrier = deferred();
+  const entered = deferred();
+  const harness = createSubtitleManagerHarness();
+  const server = await startServer({
+    host: "127.0.0.1", port: 0, env: {}, canStartSubtitleSession: () => canStart,
+    createTranscription: () => ({ ready: async () => {}, sendAudio() {}, stop() {}, close() {} }),
+    createSubtitleRealtimeManager: (options) => ({ ...harness.factory(options), start: async () => { entered.resolve(); await startBarrier.promise; } }),
+  });
+  const socket = await openSocket(server.url);
+  try {
+    const started = waitForMessage(socket, (message) => message.type === "subtitle:started");
+    socket.send(JSON.stringify({ type: "subtitle:start", sessionId: "existing", settings: {} }));
+    await entered.promise;
+    assert.equal(server.hasActiveSubtitleSession(), true, "pending provider start blocks logout");
+    startBarrier.resolve();
+    await started;
+    canStart = false;
+    const denied = waitForMessage(socket, (message) => message.type === "subtitle:error");
+    socket.send(JSON.stringify({ type: "subtitle:start", sessionId: "existing", settings: {} }));
+    assert.equal((await denied).message, "HOST_LOGIN_REQUIRED");
+    assert.equal(server.hasActiveSubtitleSession(), true);
+    assert.equal(harness.stops.length, 0);
+    const stopped = waitForMessage(socket, (message) => message.type === "subtitle:stopped");
+    socket.send(JSON.stringify({ type: "subtitle:stop", sessionId: "existing" }));
+    await stopped;
+    assert.equal(server.hasActiveSubtitleSession(), false);
+  } finally {
+    startBarrier.resolve();
+    socket.close();
+    server.httpServer.closeAllConnections?.();
+    await new Promise((resolve) => server.httpServer.close(resolve));
+  }
 });

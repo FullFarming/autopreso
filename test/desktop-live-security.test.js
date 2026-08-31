@@ -13,6 +13,7 @@ import {
   geminiCaptionConfigFingerprint,
 } from "../packages/caption-core/index.js";
 import { createSubtitleChannelHub } from "../src/subtitle-channels.js";
+import { resolveLiveCallLanguages } from "../src/subtitle-languages.js";
 
 
 const mainSource = readFileSync(new URL("../electron/main.js", import.meta.url), "utf8");
@@ -26,9 +27,10 @@ const gatewaySource = readFileSync(new URL("../media-gateway/src/gateway-server.
 
 test("local provider close and replacement start share one serialized transition", () => {
   assert.match(serverSource, /let subtitleProducerTransitionTail = Promise\.resolve\(\)/u);
-  assert.match(serverSource, /queueSubtitleProducerTransition\(\(\) => subtitles\.stop\(orphanedSessionId\)\)/u);
+  assert.match(serverSource, /const stopSubtitleProviderSafely = async[\s\S]{0,500}queueSubtitleProducerTransition\(\(\) => subtitles\.stop\(sessionId\)\)/u);
+  assert.match(serverSource, /stopSubtitleProviderSafely\(orphanedSessionId, "owner_closed"\)/u);
   assert.match(serverSource, /queueSubtitleProducerTransition\(\(\) => subtitles\.start\(/u);
-  assert.match(serverSource, /didStartLocalProvider[\s\S]{0,900}queueSubtitleProducerTransition\(\(\) => subtitles\.stop\(requestedSessionId\)\)/u);
+  assert.match(serverSource, /didAttemptLocalProviderStart[\s\S]{0,2500}stopSubtitleProviderSafely\(requestedSessionId, "start_failed"\)/u);
 });
 
 test("Live Call desktop renders exactly one opposite-language lane for participant speech", () => {
@@ -52,31 +54,17 @@ test("Live Call desktop renders exactly one opposite-language lane for participa
   }
 });
 
-// The desktop screen is owned by the LOCAL captions-only engine, which hears
-// the host microphone directly. The gateway translates the same host audio a
-// second time for the web app, and mirroring that copy back onto the overlay
-// is what forced every relay/ordering/direction correction layer. Host-origin
-// gateway captions therefore never reach the screen; participant speech, which
-// the local engine cannot hear, still does.
-test("Live Call desktop drops host-origin gateway captions and keeps participant ones", () => {
-  const hostCaption = { language: "en", sourceLanguage: "ko", speakerRole: "host", speakerName: "Host" };
-  assert.equal(shouldDisplayLiveCaption(hostCaption, "ko"), false);
-  // A meeting caption with no floor holder is host speech even without the
-  // explicit role field (presentation sessions omit speaker metadata).
-  assert.equal(shouldDisplayLiveCaption(
-    { language: "en", sourceLanguage: "ko", speaker: null, speakerRole: "host" },
-    "ko",
-  ), false);
-  // Participant speech keeps the existing behavior in every form the pipeline
-  // emits it: explicit role, or the nested speaker identity.
-  assert.equal(shouldDisplayLiveCaption(
-    { language: "en", sourceLanguage: "ko", speakerRole: "participant", speakerName: "김노엘" },
-    "ko",
-  ), true);
-  assert.equal(shouldDisplayLiveCaption(
-    { language: "en", sourceLanguage: "ko", speaker: { isParticipant: true } },
-    "ko",
-  ), true);
+test("Live Call desktop drops duplicate host gateway captions and keeps participant captions", () => {
+  for (const sourceLanguage of ["ko", "en"]) {
+    const language = sourceLanguage === "ko" ? "en" : "ko";
+    assert.equal(shouldDisplayLiveCaption({ language, sourceLanguage, speakerRole: "host" }, language), false);
+    assert.equal(shouldDisplayLiveCaption({ language, sourceLanguage, speakerRole: "participant" }, language), true);
+    assert.equal(shouldDisplayLiveCaption({
+      language,
+      sourceLanguage,
+      speaker: { isParticipant: true, participantId: "viewer-1" },
+    }, language), true);
+  }
 });
 
 test("Live Call display rejects source, failed, and same-language events while allowing status-less meeting translations", () => {
@@ -107,7 +95,7 @@ function sourceBetween(start, end) {
 test("one-button Live Call never opens a login page and requires an invite before Stage", () => {
   const startHandler = sourceBetween(
     'ipcMain.handle("live-call:start"',
-    'ipcMain.handle("live-call:save-host-login"',
+    'ipcMain.handle("glossary-presets:list"',
   );
   assert.doesNotMatch(startHandler, /openLiveWorkspace\(/u);
   const inviteFailure = startHandler.indexOf("if (!invite.ok)");
@@ -120,7 +108,7 @@ test("one-button Live Call never opens a login page and requires an invite befor
 test("failed invite creation compensates the already-created session", () => {
   const startHandler = sourceBetween(
     'ipcMain.handle("live-call:start"',
-    'ipcMain.handle("live-call:save-host-login"',
+    'ipcMain.handle("glossary-presets:list"',
   );
   assert.match(startHandler, /if \(!invite\.ok\)[\s\S]*return failPreparedLiveSession\(/u);
   const cleanup = sourceBetween(
@@ -131,15 +119,12 @@ test("failed invite creation compensates the already-created session", () => {
   assert.match(cleanup, /encodeURIComponent\(sessionId\)/u);
 });
 
-test("desktop host password is encrypted at rest and never returned to a renderer", () => {
-  assert.match(mainSource, /\bsafeStorage\b/u);
-  assert.match(mainSource, /safeStorage\.encryptString\(/u);
-  assert.match(mainSource, /safeStorage\.decryptString\(/u);
-  const statusHandler = sourceBetween(
-    'ipcMain.handle("live-call:get-host-login-status"',
-    'ipcMain.handle("live-call:get-state"',
-  );
-  assert.doesNotMatch(statusHandler, /return\s*\{[^}]*\b(?:hostPassword|hostPasswordEncrypted)\s*:/u);
+test("desktop session IPC exposes verified metadata without credential storage or submission", () => {
+  assert.doesNotMatch(mainSource, /safeStorage|silentHostLogin|hostPassword|\/api\/login/u);
+  const sessionHandlers = sourceBetween('ipcMain.handle("host-session:get"', 'ipcMain.handle("system:open-screen-recording-settings"');
+  assert.match(sessionHandlers, /ensureDesktopHostSession/u);
+  assert.match(sessionHandlers, /desktopHostSession.logout\(\)/u);
+  assert.doesNotMatch(sessionHandlers, /password|token|cookie:/iu);
 });
 
 test("Live Call IPC accepts a bounded cover payload and validates decoded image signatures", () => {
@@ -149,11 +134,15 @@ test("Live Call IPC accepts a bounded cover payload and validates decoded image 
   );
   assert.match(sanitizer, /typeof source\.title === "string"/u);
   assert.match(sanitizer, /Number\.isInteger\(source\.maxViewers\)/u);
-  assert.match(sanitizer, /Array\.isArray\(subtitleSettings\.translationLanguages\)/u);
+  // Live Call languages come from their own setting with a subtitle fallback.
+  assert.match(sanitizer, /resolveLiveCallLanguages\(subtitleSettings\)/u);
   assert.match(sanitizer, /Array\.isArray\(configuredLanguages\)/u);
   assert.match(sanitizer, /displayLanguage: sanitizeLiveCaptionDisplayLanguage\(source\.displayLanguage\)/u);
+  assert.match(sanitizer, /outputMode: "captions"/u);
+  assert.doesNotMatch(sanitizer, /outputMode: subtitleSettings\.outputMode === "audio"|voiceProvider: "gemini"|audioLanguage/u);
   assert.match(mainSource, /function toLiveCallApiInput/u);
   assert.doesNotMatch(sourceBetween("function toLiveCallApiInput", "async function openLiveStageOverlay"), /displayLanguage/u);
+  assert.doesNotMatch(sourceBetween("function toLiveCallApiInput", "async function openLiveStageOverlay"), /voiceProvider|outputMode/u);
   assert.match(workspaceSource, /MAX_COVER_IMAGE_BYTES = 20 \* 1024 \* 1024/u);
   assert.match(workspaceSource, /new Set\(\["image\/jpeg", "image\/png", "image\/webp"\]\)/u);
   assert.match(workspaceSource, /file\.size <= 0 \|\| file\.size > MAX_COVER_IMAGE_BYTES/u);
@@ -227,14 +216,15 @@ test("signed cover URL validation rejects non-Supabase, cross-session, and query
 
 test("Live Call IPC uses exact origin checks for read and mutation channels", () => {
   const handlers = sourceBetween(
-    'ipcMain.handle("live-workspace:get-enabled"',
+    'ipcMain.handle("host-session:get"',
     'ipcMain.handle("subtitle-overlay:get-enabled"',
   );
   for (const channel of [
     "live-workspace:get-enabled",
     "live-call:start",
-    "live-call:save-host-login",
-    "live-call:get-host-login-status",
+    "host-session:get",
+    "host-session:open-login",
+    "host-session:logout",
     "live-call:get-state",
     "live-call:go-live",
     "live-call:audio-failed",
@@ -294,7 +284,7 @@ test("Live Call failure responses and logs do not expose stored credentials", ()
   assert.doesNotMatch(api, /hostPassword|\bpassword\s*:/u);
   const startHandler = sourceBetween(
     'ipcMain.handle("live-call:start"',
-    'ipcMain.handle("live-call:save-host-login"',
+    'ipcMain.handle("glossary-presets:list"',
   );
   assert.doesNotMatch(startHandler, /hostPassword/u);
 });
@@ -310,6 +300,7 @@ test("Live Call preflight preserves the complete 40k glossary for the gateway", 
       validateSubtitleSettings: () => {},
       createGeminiCaptionConfig,
       geminiCaptionConfigFingerprint,
+      resolveLiveCallLanguages,
       String,
     },
   );
@@ -331,7 +322,7 @@ test("Live Call preflight preserves the complete 40k glossary for the gateway", 
   assert.equal(armedSession.gatewaySettings.translationTone, "business");
   assert.equal(armedSession.gatewaySettings.domainText, "Commercial real estate");
   assert.equal(armedSession.gatewaySettings.captionConfig.glossary, glossary);
-  assert.match(armedSession.gatewaySettings.captionConfigFingerprint, /^gemini-caption-v1-[a-f0-9]{16}$/u);
+  assert.match(armedSession.gatewaySettings.captionConfigFingerprint, /^gemini-caption-v2-[a-f0-9]{16}$/u);
   assert.equal(armedSession.gatewaySettings.existing, true);
 });
 
@@ -349,6 +340,7 @@ function loadLiveBridgeReconnect(overrides = {}) {
   const logs = [];
   const context = {
     liveGatewayBridge: null,
+    liveDemandController: null,
     liveBridgeReconnectTimer: null,
     liveBridgeReconnectAttempts: 0,
     liveBridgeCredentialRefreshTimer: null,
@@ -519,14 +511,15 @@ test("live call state reports gateway health so a dead bridge is not hidden behi
   assert.doesNotMatch(mainSource, /GATEWAY_RECONNECT_EXHAUSTED/u);
   // The unbounded hardcoded retry is gone.
   assert.doesNotMatch(mainSource, /setTimeout\(\(\) => \{ void ensureLiveGatewayBridge\(\); \}, 3_000\)/u);
-  const closeHandler = sourceBetween('socket.on("close"', "return { ok: true, streaming: false }");
+  const closeHandler = sourceBetween('socket.on("close"', "const readinessTimer");
   assert.match(closeHandler, /scheduleLiveGatewayReconnect\(armedSession\)/u);
   const getState = sourceBetween('ipcMain.handle("live-call:get-state"', 'ipcMain.handle("live-call:host-speak"');
   assert.match(getState, /bridge: liveBridgeStatus\(\)/u);
   // A live pipeline resets the backoff so a drop hours in gets the full budget.
+  const readiness = sourceBetween("async function confirmLiveGatewayStarted", "async function ensureLiveGatewayBridgeOnce");
+  assert.match(readiness, /liveBridgeReconnectAttempts = 0/u);
+  assert.match(readiness, /clearLiveBridgeAlert\(\)/u);
   const messageHandler = sourceBetween('message.type === "started"', 'message.type === "caption"');
-  assert.match(messageHandler, /liveBridgeReconnectAttempts = 0/u);
-  assert.match(messageHandler, /clearLiveBridgeAlert\(\)/u);
   assert.match(messageHandler, /message\.type === "language-status"/u);
   assert.match(messageHandler, /message\.sessionId !== armedSession\.sessionId/u);
   assert.match(messageHandler, /bridge\.languageStatuses\.set\(message\.language, message\.status\)/u);
@@ -587,7 +580,7 @@ test("only the exact dashboard renderer may request a Live Call translation rest
     "controller and overlay renderers must not be able to restart the translation pipeline");
 });
 
-test("only the exact dashboard renderer may drive the host audio bridge", () => {
+test("only the exact dashboard renderer may drive the host bridge controls", () => {
   const handlers = [
     {
       name: "ensure",
@@ -596,7 +589,7 @@ test("only the exact dashboard renderer may drive the host audio bridge", () => 
     },
     {
       name: "audio failure",
-      source: sourceBetween('ipcMain.handle("live-call:audio-failed"', 'ipcMain.on("live-call:audio-frame"'),
+      source: sourceBetween('ipcMain.handle("live-call:audio-failed"', 'ipcMain.handle("live-call:end"'),
       protectedAction: "liveCallSession",
     },
     {
@@ -614,6 +607,25 @@ test("only the exact dashboard renderer may drive the host audio bridge", () => 
     assert.ok(dashboardGuard >= 0 && dashboardGuard < protectedAction,
       `${handler.name} rejects controller and overlay senders before touching the host bridge`);
   }
+  assert.match(preloadSource, /sendLiveCallAudioFrame: \(packet\) => ipcRenderer\.send\("live-call:audio-frame", packet\)/u);
+});
+
+test("the per-boot Live Call producer capability is exposed only to the exact dashboard", () => {
+  assert.match(mainSource, /randomBytes\(32\)\.toString\("base64url"\)/u);
+  assert.match(mainSource, /liveCallProducerCapability,/u,
+    "both local-server starts must receive the same per-boot capability");
+  const handler = sourceBetween(
+    'ipcMain.handle("live-call:get-producer-capability"',
+    'ipcMain.handle("live-call:bridge-ensure"',
+  );
+  const originGuard = handler.indexOf("isAllowedOrigin(event.sender.getURL(), new Set([localAppOrigin]))");
+  const dashboardGuard = handler.indexOf("event.sender !== dashboardWindow.webContents");
+  const capabilityReturn = handler.indexOf("liveCallProducerCapability");
+  assert.ok(originGuard >= 0 && originGuard < dashboardGuard);
+  assert.ok(dashboardGuard >= 0 && dashboardGuard < capabilityReturn);
+  assert.match(preloadSource, /getLiveCallProducerCapability: \(\) => ipcRenderer\.invoke\("live-call:get-producer-capability"\)/u);
+  const getState = sourceBetween('ipcMain.handle("live-call:get-state"', 'ipcMain.handle("live-call:host-speak"');
+  assert.doesNotMatch(getState, /liveCallProducerCapability|producerCapability/u);
 });
 
 test("host gateway credentials rotate at least eight times in a two-hour fake clock without replacing the Live Call session", () => {
@@ -665,7 +677,7 @@ test("gateway connection consumes token expiry and successful starts arm control
   const fetchConnection = sourceBetween("async function fetchGatewayConnection", "function trustedGatewayHeaders");
   assert.match(fetchConnection, /expiresAt:\s*tokenResult\.data\?\.expiresAt/u);
   const bridge = sourceBetween("async function ensureLiveGatewayBridge", "function hostSpeakViaGateway");
-  assert.match(bridge, /scheduleLiveGatewayCredentialRefresh\(bridge, connection\.expiresAt\)/u);
+  assert.match(mainSource, /scheduleLiveGatewayCredentialRefresh\(bridge, bridge\.expiresAt\)/u);
   assert.match(bridge, /message\.type === "started" \|\| message\.type === "restarted"/u);
   const stop = sourceBetween("async function stopLiveGatewayBridge", "async function ensureLiveGatewayBridgeOnce");
   assert.match(stop, /clearLiveBridgeCredentialRefresh\(\)/u);
@@ -683,6 +695,7 @@ test("active bridge host-speak is single-flight and does not leak listeners acro
     hostSpeakInFlight: null,
     WebSocket: { OPEN: 1 },
     JSON,
+    LIVE_GATEWAY_SOCKET_OPEN_TIMEOUT_MS: 20_000,
     setTimeout,
     clearTimeout,
   };
@@ -725,12 +738,11 @@ test("desktop floor state is accepted only from the active authenticated bridge 
   assert.match(floorBlock, /message\.sessionId[^\n]*armedSession\.sessionId/u);
   assert.match(floorBlock, /shouldBlockLiveHostAudioForFloor\(message, armedSession\.sessionId\)/u);
   const blockDecision = floorBlock.indexOf("shouldBlockLiveHostAudioForFloor");
-  const adapterReset = floorBlock.indexOf("liveBridgeAudioAdapters.clear()");
   const malformedGate = floorBlock.indexOf("if (!bridge.floorKnown)");
-  assert.ok(blockDecision >= 0 && blockDecision < adapterReset && adapterReset < malformedGate,
-    "participant or malformed floor state must discard pending host PCM before renderer notification");
+  assert.ok(blockDecision >= 0 && blockDecision < malformedGate,
+    "participant or malformed floor state must close the host gate before renderer notification");
   assert.match(floorBlock, /if \(!bridge\.floorKnown\) \{[\s\S]*bridge\.lastFloorMessage = \{[\s\S]*sessionId: armedSession\.sessionId[\s\S]*participantId: "unavailable"[\s\S]*relayLiveCallFloorToRenderers\(bridge\.lastFloorMessage\)[\s\S]*return;/u);
-  assert.match(floorBlock, /relayLiveCallFloorToRenderers\(message\)/u);
+  assert.match(floorBlock, /relayLiveCallFloorToRenderers\(floorSnapshot\)/u);
   assert.doesNotMatch(mainSource, /ipcMain\.(?:on|handle)\("live-call:(?:set-|update-)?floor"/u);
 });
 
@@ -741,13 +753,14 @@ test("malformed or cross-session floor payloads fail closed", () => {
   );
   const shouldBlock = vm.runInNewContext(`${source}; shouldBlockLiveHostAudioForFloor`, { String });
   const sessionId = "session-1";
-  assert.equal(shouldBlock({ type: "floor", sessionId, holder: null }, sessionId), false);
-  assert.equal(shouldBlock({ type: "floor", sessionId, holder: { participantId: "grant-1", name: "Guest" } }, sessionId), true);
+  assert.equal(shouldBlock({ type: "floor", sessionId, floorRevision: 0, holder: null }, sessionId), false);
+  assert.equal(shouldBlock({ type: "floor", sessionId, floorRevision: 1, holder: { participantId: "grant-1", name: "Guest" } }, sessionId), true);
   for (const payload of [
     null,
     {},
     { type: "floor", sessionId: "session-2", holder: null },
     { type: "floor", sessionId },
+    { type: "floor", sessionId, floorRevision: -1, holder: null },
     { type: "floor", sessionId, holder: false },
     { type: "floor", sessionId, holder: {} },
     { type: "floor", sessionId, holder: { participantId: "", name: "Guest" } },
@@ -757,29 +770,35 @@ test("malformed or cross-session floor payloads fail closed", () => {
   }
 });
 
-test("participant floor blocks local host frames before resampling and non-local renderers stay forbidden", () => {
-  const handler = sourceBetween(
-    'ipcMain.on("live-call:audio-frame"',
-    'ipcMain.handle("live-call:end"',
+// Dual path: the gateway translates the host's own PCM for the web app, and the
+// local Caption Only engine translates the same audio for the screen. Relaying
+// the local caption TEXT to the gateway as well would write the same utterance
+// to the web record twice, so that relay must not exist in any form.
+test("participant floor blocks host PCM on the wire and no caption text is relayed", () => {
+  const handler = sourceBetween('ipcMain.on("live-call:audio-frame"', 'ipcMain.handle("live-call:end"');
+  // The gateway is the final authority on frame drops; blocking here just keeps
+  // a muted host off the wire entirely.
+  assert.match(handler, /if \(!bridge\.floorKnown \|\| bridge\.isHostAudioBlocked\) return;/u);
+  assert.match(handler, /adaptCaptionPcmForGateway/u);
+  assert.match(preloadSource, /sendLiveCallAudioFrame/u);
+  assert.doesNotMatch(
+    mainSource,
+    /type: "host-caption"|host-caption-accepted|host-caption-rejected|relayLiveCallHostCaption|onLiveCallLocalCaption/u,
+    "the local caption text must never be forwarded to the gateway",
   );
-  const originGuard = handler.indexOf("isAllowedOrigin(event.sender.getURL(), new Set([localAppOrigin]))");
-  const floorGate = handler.indexOf("bridge.isHostAudioBlocked");
-  const resample = handler.indexOf("adaptCaptionPcmForGateway");
-  const send = handler.indexOf("bridge.socket.send");
-  assert.ok(originGuard >= 0 && originGuard < floorGate, "remote renderers must fail the exact-origin guard first");
-  assert.ok(floorGate >= 0 && floorGate < resample, "blocked audio must not enter stateful resampling");
-  assert.ok(resample >= 0 && resample < send, "only allowed and validated PCM may reach the gateway socket");
 });
 
 test("new, stopped, and disconnected bridges prefer temporary mute over host-audio leakage", () => {
   const ensure = sourceBetween("async function ensureLiveGatewayBridgeOnce", "async function ensureLiveGatewayBridge()");
   assert.match(ensure, /const bridge = \{[^}]*isHostAudioBlocked:\s*true/u);
-  const stop = sourceBetween("async function stopLiveGatewayBridge", "function adaptCaptionPcmForGateway");
-  assert.match(stop, /liveBridgeAudioAdapters\.clear\(\)/u);
+  const stop = sourceBetween("async function stopLiveGatewayBridge", "async function ensureLiveGatewayBridgeOnce");
+  assert.match(stop, /applyAuthoritativeLiveCallFloorSnapshot\(null\)/u);
   const closeStart = ensure.indexOf('socket.on("close"');
   assert.notEqual(closeStart, -1);
   const closeBlock = ensure.slice(closeStart);
   assert.match(closeBlock, /liveGatewayBridge\s*=\s*null/u);
+  // A dropped bridge invalidates the resampler carry: a frame captured before
+  // the drop must not be completed and sent after the reconnect.
   assert.match(closeBlock, /liveBridgeAudioAdapters\.clear\(\)/u);
 });
 
@@ -1029,6 +1048,6 @@ test("a malformed settings file is quarantined and boot never rejects silently",
   assert.match(resilientLoad, /createSettingsStore\(\{ filePath: SETTINGS_PATH \}\)[\s\S]*freshStore\.load\(\)/u);
   assert.match(mainSource, /title: "Settings were reset"/u);
   // Last-resort: every other boot failure gets a dialog instead of dying.
-  assert.match(mainSource, /app\.whenReady\(\)\.then\(createApp\)\.catch\(/u);
+  assert.match(mainSource, /app\.whenReady\(\)\.then\(createApp\)[\s\S]{0,100}\.catch\(/u);
   assert.match(mainSource, /dialog\.showErrorBox\(\s*\n?\s*"NOVA could not start"/u);
 });

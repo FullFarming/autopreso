@@ -13,6 +13,10 @@ async function makeStorageDir() {
   return fs.mkdtemp(path.join(os.tmpdir(), "rn-transcripts-"));
 }
 
+function sameOriginHeaders(url, headers = {}) {
+  return { origin: new URL(url).origin, ...headers };
+}
+
 test("records timestamped source and translated lines inside a session", async () => {
   const storageDir = await makeStorageDir();
   let tick = 0;
@@ -289,12 +293,67 @@ test("caption sessions record committed lines start-to-stop and auto-summarize o
     assert.equal(detailBody.data.lines[0].sourceText, "안녕하세요 여러분");
     assert.equal(detailBody.data.summary.title, "자동 요약");
 
-    const regenResponse = await fetch(`${url}/api/subtitles/sessions/caption-session/summary`, { method: "POST" });
+    const regenResponse = await fetch(`${url}/api/subtitles/sessions/caption-session/summary`, {
+      method: "POST",
+      headers: sameOriginHeaders(url),
+    });
     const regenBody = await regenResponse.json();
     assert.equal(regenBody.ok, true);
     assert.equal(regenBody.data.title, "자동 요약");
   } finally {
     ws?.close();
+    await new Promise((resolve) => httpServer.close(resolve));
+  }
+});
+
+test("transcript summary is unavailable without Gemini and never falls back to OpenAI", async () => {
+  const transcriptsDir = await makeStorageDir();
+  await fs.writeFile(path.join(transcriptsDir, "openai-only.json"), JSON.stringify({
+    id: "openai-only",
+    title: "OpenAI-only transcript",
+    startedAt: "2026-08-15T00:00:00.000Z",
+    endedAt: "2026-08-15T00:05:00.000Z",
+    lines: [{ at: "2026-08-15T00:01:00.000Z", sourceText: "요약 대상 발화", translatedText: "Line to summarize" }],
+    summary: null,
+  }));
+
+  let providerDispatchCount = 0;
+  const { httpServer, url } = await startServer({
+    host: "127.0.0.1",
+    port: 0,
+    moonshineModel: "medium",
+    openaiApiKey: "test",
+    env: { OPENAI_API_KEY: "sk-openai-only", GEMINI_API_KEY: "" },
+    transcriptsDir,
+    fetchImpl: async (requestUrl) => {
+      providerDispatchCount += 1;
+      return {
+        ok: false,
+        status: 500,
+        json: async () => ({ error: `raw provider detail ${requestUrl}` }),
+      };
+    },
+    createTranscription: () => ({ ready: async () => {}, sendAudio: () => {}, stop: () => {}, close: () => {} }),
+  });
+
+  try {
+    const response = await fetch(`${url}/api/subtitles/sessions/openai-only/summary`, {
+      method: "POST",
+      headers: sameOriginHeaders(url),
+    });
+    const body = await response.json();
+    assert.equal(response.status, 503);
+    assert.deepEqual(body, {
+      ok: false,
+      error: "AI 요약을 사용하려면 Gemini API 키를 설정해 주세요.",
+      code: "TRANSCRIPT_SUMMARY_UNAVAILABLE",
+    });
+    assert.equal(providerDispatchCount, 0);
+    assert.equal(JSON.stringify(body).includes("sk-openai-only"), false);
+    assert.equal(JSON.stringify(body).includes("gpt"), false);
+    assert.equal(JSON.stringify(body).includes("generativelanguage.googleapis.com"), false);
+    assert.equal(JSON.stringify(body).includes("raw provider detail"), false);
+  } finally {
     await new Promise((resolve) => httpServer.close(resolve));
   }
 });

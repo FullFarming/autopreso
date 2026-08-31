@@ -1,7 +1,7 @@
 // Browser audio capture pipeline: getUserMedia / getDisplayMedia →
 // Web Audio downmix to mono → fixed-ratio linear resample → PCM16 LE base64
-// chunks. The capture rate is 24 kHz (OpenAI realtime); the Gemini transport
-// continuously resamples and packetizes exact 100ms frames (see geminiChannel.ts).
+// chunks. The capture rate is 24 kHz; provider-compatible paths can resample
+// the PCM stream to 16 kHz without exposing a browser-side provider transport.
 
 export const OPENAI_SAMPLE_RATE = 24000;
 export const GEMINI_SAMPLE_RATE = 16000;

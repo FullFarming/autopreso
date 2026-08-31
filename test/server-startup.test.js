@@ -11,6 +11,10 @@ import path from "node:path";
 import { DEFAULT_AGENT_TIMEOUT_MS, runWhiteboardAgent, selectSubtitlePolishOptions, startServer, whiteboardSystemPrompt } from "../src/server.js";
 import { createSettingsStore, MAX_SUBTITLE_GLOSSARY_CHARS } from "../src/settings-store.js";
 
+function sameOriginHeaders(url, headers = {}) {
+  return { origin: new URL(url).origin, ...headers };
+}
+
 test("default whiteboard agent timeout is 90 seconds", () => {
   assert.equal(DEFAULT_AGENT_TIMEOUT_MS, 90_000);
 });
@@ -102,7 +106,6 @@ test("desktop subtitle static assets are always revalidated instead of surviving
     for (const asset of [
       "subtitle.html",
       "subtitle-dashboard.js",
-      "subtitle-audio-player.js",
       "subtitle.css",
       "subtitle-overlay.html",
       "subtitle-overlay.js",
@@ -289,7 +292,7 @@ test("subtitle second-pass polish uses separated provider keys", () => {
       },
       env: {},
     }),
-    { provider: "gemini", apiKey: "AIza-finalizer", modelId: "gemini-3.5-flash" },
+    { provider: "gemini", apiKey: "AIza-finalizer", modelId: "gemini-3.7-flash" },
   );
 
   assert.deepEqual(
@@ -307,7 +310,7 @@ test("subtitle second-pass polish uses separated provider keys", () => {
       },
       env: {},
     }),
-    { provider: "gemini", apiKey: "AIza-finalizer", modelId: "gemini-3.5-flash" },
+    { provider: "gemini", apiKey: "AIza-finalizer", modelId: "gemini-3.7-flash" },
   );
 
   assert.deepEqual(
@@ -319,7 +322,7 @@ test("subtitle second-pass polish uses separated provider keys", () => {
       },
       env: {},
     }),
-    { provider: "gemini", apiKey: "AIza-live", modelId: "gemini-3.5-flash" },
+    { provider: "gemini", apiKey: "AIza-live", modelId: "gemini-3.7-flash" },
   );
 
   assert.equal(
@@ -337,7 +340,7 @@ test("subtitle second-pass polish uses separated provider keys", () => {
       saved: { apiKeys: { gemini: "AIza-live" }, subtitle: {} },
       env: {},
     }),
-    { provider: "gemini", apiKey: "AIza-live", modelId: "gemini-3.6-flash" },
+    { provider: "gemini", apiKey: "AIza-live", modelId: "gemini-3.7-flash" },
   );
 });
 
@@ -525,7 +528,7 @@ test("history exports as Excel-compatible CSV with a UTF-8 BOM", async () => {
   }
 });
 
-test("server rejects cross-origin mutating HTTP and websocket requests", async () => {
+test("server requires exact local origin for mutating HTTP and websocket requests", async () => {
   const { httpServer, url } = await startServer({
     host: "127.0.0.1",
     port: 0,
@@ -540,6 +543,22 @@ test("server rejects cross-origin mutating HTTP and websocket requests", async (
   });
 
   try {
+    const sameOriginResponse = await fetch(`${url}/api/session/reset`, {
+      method: "POST",
+      headers: sameOriginHeaders(url),
+    });
+    assert.equal(sameOriginResponse.status, 200);
+
+    const missingOriginResponse = await fetch(`${url}/api/session/reset`, {
+      method: "POST",
+    });
+    assert.equal(missingOriginResponse.status, 403);
+    assert.deepEqual(await missingOriginResponse.json(), {
+      ok: false,
+      error: "허용되지 않은 요청 출처입니다.",
+      code: "INVALID_ORIGIN",
+    });
+
     const response = await fetch(`${url}/api/session/reset`, {
       method: "POST",
       headers: { origin: "https://example.test" },
@@ -550,6 +569,19 @@ test("server rejects cross-origin mutating HTTP and websocket requests", async (
       error: "허용되지 않은 요청 출처입니다.",
       code: "INVALID_ORIGIN",
     });
+
+    const localOrigin = new URL(url).origin;
+    for (const origin of [
+      `${localOrigin}.evil.test`,
+      `${localOrigin}/forged-path`,
+      localOrigin.replace(/:\d+$/u, ":444"),
+    ]) {
+      const confused = await fetch(`${url}/api/session/reset`, {
+        method: "POST",
+        headers: { origin },
+      });
+      assert.equal(confused.status, 403, origin);
+    }
 
     await assert.rejects(
       new Promise((resolve, reject) => {
@@ -592,7 +624,7 @@ test("server validates OpenAI Realtime transcription keys before saving", async 
   try {
     const response = await fetch(`${url}/api/subtitles/openai/validate`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: sameOriginHeaders(url, { "content-type": "application/json" }),
       body: JSON.stringify({ apiKey: "sk-test" }),
     });
     assert.equal(response.status, 200);
@@ -639,7 +671,7 @@ test("server returns a sanitized OpenAI validation error", async () => {
   try {
     const response = await fetch(`${url}/api/subtitles/openai/validate`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: sameOriginHeaders(url, { "content-type": "application/json" }),
       body: JSON.stringify({ apiKey: "sk-secret-value" }),
     });
     assert.equal(response.status, 400);
@@ -678,13 +710,13 @@ test("server validates Gemini keys through text generation before saving", async
   try {
     const response = await fetch(`${url}/api/subtitles/gemini/validate`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: sameOriginHeaders(url, { "content-type": "application/json" }),
       body: JSON.stringify({ apiKey: "AIza-test" }),
     });
     assert.equal(response.status, 200);
     assert.deepEqual(await response.json(), { ok: true, data: { status: "valid" } });
     assert.match(fetchCalls[0].url, /generativelanguage\.googleapis\.com/);
-    assert.match(fetchCalls[0].url, /gemini-3\.6-flash/u);
+    assert.match(fetchCalls[0].url, /gemini-3\.7-flash/u);
     assert.equal(fetchCalls[0].init.headers["x-goog-api-key"], "AIza-test");
     assert.match(JSON.parse(fetchCalls[0].init.body).contents[0].parts[0].text, /ok/);
   } finally {
@@ -710,7 +742,7 @@ test("server returns a sanitized Gemini validation error", async () => {
   try {
     const response = await fetch(`${url}/api/subtitles/gemini/validate`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: sameOriginHeaders(url, { "content-type": "application/json" }),
       body: JSON.stringify({ apiKey: "AIza-secret" }),
     });
     assert.equal(response.status, 400);

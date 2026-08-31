@@ -6,15 +6,17 @@
 // 6-digit code; joined participant count. The countdown reaching zero never
 // auto-starts the session — the host must press Go-Live in Electron.
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
-import type { ApiResponse, LiveParticipantActivity, LiveSession } from "@/lib/live-contract";
+import type {
+  ApiResponse,
+  LiveParticipantActivity,
+  LiveSession,
+  LiveSpeechActivity,
+} from "@/lib/live-contract";
 import { InviteQrCode } from "./LiveHostDashboard";
-
-interface StageInvite {
-  url: string;
-  admissionCode: string;
-}
+import { CaptionEntry, TranslationViewport } from "./translation";
+import { getCurrentStageInvite, hasOpenStageAdmission, type HostInvitation } from "./invite-share";
 
 function StageLoader({ label }: { label: string }) {
   return (
@@ -36,19 +38,21 @@ async function readResponse<T>(response: Response): Promise<T> {
   return payload.data;
 }
 
-function readInviteFromHash(): StageInvite | null {
+function readInviteFromHash(sessionId: string): HostInvitation | null {
   const fragment = window.location.hash.startsWith("#") ? window.location.hash.slice(1) : window.location.hash;
   const params = new URLSearchParams(fragment);
   const url = params.get("invite");
   const admissionCode = params.get("code");
-  if (!url || !admissionCode || !/^\d{6}$/u.test(admissionCode)) return null;
+  const expiresAt = params.get("expiresAt");
+  if (!url || !admissionCode || !/^\d{6}$/u.test(admissionCode)
+    || !expiresAt || !Number.isFinite(Date.parse(expiresAt))) return null;
   try {
     const parsed = new URL(url, window.location.origin);
     if (parsed.origin !== window.location.origin) return null;
   } catch {
     return null;
   }
-  return { url, admissionCode };
+  return { sessionId, url, admissionCode, expiresAt };
 }
 
 import { formatCountdown } from "@/lib/live/countdown";
@@ -56,8 +60,10 @@ export { formatCountdown };
 
 export default function LiveStageView({ sessionId }: { sessionId: string }) {
   const [session, setSession] = useState<LiveSession | null>(null);
-  const [invite, setInvite] = useState<StageInvite | null>(null);
+  const [invite, setInvite] = useState<HostInvitation | null>(null);
+  const latestSessionRef = useRef<LiveSession | null>(null);
   const [participants, setParticipants] = useState<LiveParticipantActivity[]>([]);
+  const [recentSpeeches, setRecentSpeeches] = useState<LiveSpeechActivity[]>([]);
   const [coverState, setCoverState] = useState<"idle" | "loading" | "loaded" | "failed">("idle");
   const [error, setError] = useState<"" | "auth" | "generic">("");
   const [now, setNow] = useState(() => Date.now());
@@ -72,31 +78,40 @@ export default function LiveStageView({ sessionId }: { sessionId: string }) {
         cache: "no-store",
       });
       if (response.status === 401 || response.status === 403) {
+        latestSessionRef.current = null;
+        setInvite(null);
         setError("auth");
         return;
       }
       const latest = await readResponse<LiveSession>(response);
+      if (latestSessionRef.current?.id === latest.id && latestSessionRef.current.version > latest.version) return;
+      latestSessionRef.current = latest;
       setSession(latest);
       setError("");
       try {
-        const activity = await readResponse<{ participants: LiveParticipantActivity[] }>(
+        const activity = await readResponse<{
+          participants: LiveParticipantActivity[];
+          recentSpeeches: LiveSpeechActivity[];
+        }>(
           await fetch(`/api/live-sessions/${sessionId}/participants`, { method: "GET", cache: "no-store" }),
         );
         setParticipants(activity.participants.filter((participant) => participant.isPresent));
+        setRecentSpeeches(activity.recentSpeeches);
       } catch {
         // Keep the last successful stack while participant polling recovers.
       }
     } catch {
+      latestSessionRef.current = null;
       setError("generic");
     }
   }, [sessionId]);
 
   useEffect(() => {
-    setInvite(readInviteFromHash());
+    setInvite(readInviteFromHash(sessionId));
     void refreshSession();
     const poll = window.setInterval(() => { void refreshSession(); }, 5_000);
     return () => window.clearInterval(poll);
-  }, [refreshSession]);
+  }, [refreshSession, sessionId]);
 
   // Fast path: the dashboard broadcasts status changes over a same-origin
   // BroadcastChannel, so Start flips this screen instantly instead of after
@@ -114,33 +129,41 @@ export default function LiveStageView({ sessionId }: { sessionId: string }) {
     return () => channel.close();
   }, [refreshSession, sessionId]);
 
-  // When the dashboard did not hand over the invite via the URL hash,
-  // request one. The 6-digit admission code is deterministic per session,
-  // so this never changes the code guests already have.
+  // Stage reads the code without minting an invite: minting would rotate the
+  // single persisted token and invalidate the dashboard's shared invitation.
   useEffect(() => {
-    if (invite || !session || session.status === "stopped" || session.status === "failed") return;
+    const activeSession = latestSessionRef.current;
+    if (!activeSession || error || !hasOpenStageAdmission(activeSession, Date.now())
+      || getCurrentStageInvite(invite, activeSession, Date.now())) return;
+    const admissionOpenUntil = activeSession.admissionOpenUntil;
     let isDisposed = false;
+    const controller = new AbortController();
     void (async () => {
       try {
-        const result = await readResponse<{ inviteToken: string; admissionCode: string }>(
+        const result = await readResponse<{ admissionCode: string; admissionOpenUntil: string }>(
           await fetch(`/api/live-sessions/${sessionId}/invites`, {
             method: "POST",
             headers: { "content-type": "application/json" },
-            body: JSON.stringify({ action: "create" }),
+            body: JSON.stringify({ action: "read-if-open" }),
+            signal: controller.signal,
           }),
         );
-        if (!isDisposed) {
-          setInvite({
-            url: `${window.location.origin}/m/watch#invite=${encodeURIComponent(result.inviteToken)}`,
-            admissionCode: result.admissionCode,
-          });
+        const candidate = {
+          sessionId,
+          url: `${window.location.origin}/watch`,
+          admissionCode: result.admissionCode,
+          expiresAt: result.admissionOpenUntil,
+        };
+        if (!isDisposed && Date.parse(result.admissionOpenUntil) === Date.parse(admissionOpenUntil ?? "")
+          && getCurrentStageInvite(candidate, latestSessionRef.current, Date.now())) {
+          setInvite(candidate);
         }
       } catch {
         // The stage still works without a QR; the dashboard shows one.
       }
     })();
-    return () => { isDisposed = true; };
-  }, [invite, session, sessionId]);
+    return () => { isDisposed = true; controller.abort(); };
+  }, [error, invite, session?.id, session?.status, session?.admissionOpenUntil, sessionId]);
 
   useEffect(() => {
     const tick = window.setInterval(() => setNow(Date.now()), 1_000);
@@ -183,77 +206,113 @@ export default function LiveStageView({ sessionId }: { sessionId: string }) {
   const isCountingDown = session.status === "preparing" && countdownMs !== null && countdownMs > 0;
   const isPrelive = session.status === "preparing";
   const isEnded = session.status === "stopped" || session.status === "failed";
-  const stateLine = session.status === "live"
-    ? "LIVE"
-    : session.status === "paused"
-      ? "Paused"
-      : isEnded
-        ? "END"
-        : countdownMs !== null && countdownMs <= 0
-          ? "Ready — waiting for host to start"
-          : "Waiting for host";
+  const currentInvite = error ? null : getCurrentStageInvite(invite, session, now);
+  const stateLine = countdownMs !== null && countdownMs <= 0
+    ? "Ready — waiting for host to start"
+    : "Waiting for host";
 
   const visibleParticipants = participants.slice(0, 5);
   const joinedCount = Math.max(session.viewerCount, participants.length);
   const overflowCount = Math.max(0, joinedCount - visibleParticipants.length);
-  const manualJoinUrl = new URL("/watch", window.location.origin).toString();
-  const manualJoinLabel = manualJoinUrl.replace(/^https?:\/\//u, "").replace(/\/$/u, "");
+  const manualJoinLabel = new URL("/watch", window.location.origin).toString()
+    .replace(/^https?:\/\//u, "")
+    .replace(/\/$/u, "");
+  const attendance = (
+    <div className="live-stage-attendance" aria-label={`${joinedCount} joined`}>
+      <div className="live-stage-avatar-stack">
+        {visibleParticipants.map((participant) => (
+          <span key={participant.participantId} className={`live-stage-avatar color-${participantColorIndex(participant.participantId)}`}
+            aria-label={participant.displayName} title={participant.displayName}>
+            {Array.from(participant.displayName.trim())[0]?.toUpperCase() ?? ""}
+          </span>
+        ))}
+        {overflowCount > 0 && <span className="live-stage-avatar is-overflow" aria-label={`${overflowCount} more participants`}>+{overflowCount}</span>}
+      </div>
+      <span className="live-stage-count" aria-live="polite">{joinedCount} joined</span>
+    </div>
+  );
 
   return (
     <main className="live-stage-shell" aria-label="Session stage">
       <div className="live-stage-frame">
-        {session.hasCoverImage && coverState !== "failed" && (
+        {!isEnded && session.hasCoverImage && coverState !== "failed" && (
           <img className={`live-stage-cover ${coverState === "loaded" ? "is-loaded" : ""} ${isPrelive ? "" : "is-dimmed"}`}
             src={`/api/live-sessions/${sessionId}/cover${session.coverImageVersion ? `?v=${session.coverImageVersion}` : ""}`}
             alt="" aria-hidden="true" onLoad={() => setCoverState("loaded")} onError={() => setCoverState("failed")} />
         )}
-        {coverState === "loading" && <div className="live-stage-cover-loading"><StageLoader label="Loading cover" /></div>}
+        {!isEnded && coverState === "loading" && <div className="live-stage-cover-loading"><StageLoader label="Loading cover" /></div>}
         <div className="live-stage-scrim" aria-hidden="true" />
-        <div className="live-stage-grid">
-          <section className="live-stage-session" aria-labelledby="live-stage-title">
-            <span className="live-stage-eyebrow">Live Call</span>
+        {isEnded ? (
+          <section className="live-stage-complete" aria-labelledby="live-stage-title">
+            <span className="live-stage-eyebrow">Session complete</span>
             <h1 id="live-stage-title" className="live-stage-title">{session.title}</h1>
-            {isCountingDown ? (
-              <div className="live-stage-ring">
-                <span className="live-loading-ring" aria-hidden="true" />
-              <p className="live-stage-countdown" role="timer" aria-label="Time until the scheduled start">
-                {formatCountdown(countdownMs)}
-              </p>
-              </div>
-            ) : (
-              <p className={`live-stage-state ${session.status === "live" ? "is-live" : ""} ${isEnded ? "is-ended" : ""}`} role="status">
-                {session.status === "live" && <span className="live-status-dot is-live" aria-hidden="true" />}
-                {stateLine}
-              </p>
-            )}
-            {isCountingDown && <p className="live-stage-hint">Starts at {new Date(session.scheduledAt ?? "").toLocaleTimeString("en", { hour: "2-digit", minute: "2-digit" })} · the host starts the session manually.</p>}
-            <div className="live-stage-attendance" aria-label={`${joinedCount} joined`}>
-              <div className="live-stage-avatar-stack">
-                {visibleParticipants.map((participant) => (
-                  <span key={participant.participantId} className={`live-stage-avatar color-${participantColorIndex(participant.participantId)}`}
-                    aria-label={participant.displayName} title={participant.displayName}>
-                    {Array.from(participant.displayName.trim())[0]?.toUpperCase() ?? ""}
-                  </span>
-                ))}
-                {overflowCount > 0 && <span className="live-stage-avatar is-overflow" aria-label={`${overflowCount} more participants`}>+{overflowCount}</span>}
-              </div>
-              <span className="live-stage-count" aria-live="polite">{joinedCount} joined</span>
-            </div>
+            <p className="live-stage-state is-ended" role="status">The Live Call has ended</p>
           </section>
-          {invite && (
-            <aside className={`live-stage-access ${isPrelive ? "" : "is-faded-out"}`} aria-hidden={!isPrelive} aria-label="Guest access">
-              <InviteQrCode value={invite.url} />
-              <div className="live-stage-code">
-                <span>6-digit access code</span>
-                <strong>{invite.admissionCode}</strong>
-              </div>
-              <a className="live-stage-manual-url" href={manualJoinUrl} target="_blank" rel="noreferrer">
-                <span>Join manually</span>
-                <strong>{manualJoinLabel}</strong>
-              </a>
-            </aside>
-          )}
-        </div>
+        ) : isPrelive ? (
+          <div className="live-stage-grid">
+            <section className="live-stage-session" aria-labelledby="live-stage-title">
+              <span className="live-stage-eyebrow">Live Call</span>
+              <h1 id="live-stage-title" className="live-stage-title">{session.title}</h1>
+              {isCountingDown ? (
+                <div className="live-stage-ring">
+                  <span className="live-loading-ring" aria-hidden="true" />
+                  <p className="live-stage-countdown" role="timer" aria-label="Time until the scheduled start">
+                    {formatCountdown(countdownMs)}
+                  </p>
+                </div>
+              ) : <p className="live-stage-state" role="status">{stateLine}</p>}
+              {isCountingDown && <p className="live-stage-hint">Starts at {new Date(session.scheduledAt ?? "").toLocaleTimeString("en", { hour: "2-digit", minute: "2-digit" })} · the host starts the session manually.</p>}
+              {attendance}
+            </section>
+            {isPrelive && currentInvite && (
+              <aside className="live-stage-access" aria-label="Guest access">
+                <InviteQrCode value={currentInvite.url} />
+                <div className="live-stage-code">
+                  <span>6-digit access code</span>
+                  <strong>{currentInvite.admissionCode}</strong>
+                </div>
+                <div className="live-stage-manual-url">
+                  <span>Join manually</span>
+                  <strong>{manualJoinLabel}</strong>
+                </div>
+              </aside>
+            )}
+          </div>
+        ) : (
+          <div className="live-stage-translation" data-stage-surface="caption-first">
+            <header className="live-stage-translation-header">
+              <div><span className="live-stage-eyebrow">Live Call</span><h1 id="live-stage-title" className="live-stage-title">{session.title}</h1></div>
+              <p className="live-stage-state is-live" role="status">{session.status === "paused" ? "Paused" : "Live"}</p>
+              {attendance}
+              {!isEnded && currentInvite && (
+                <aside className="live-stage-access is-live" aria-label="Guest access">
+                  <InviteQrCode value={currentInvite.url} />
+                  <div className="live-stage-code">
+                    <span>Access code</span>
+                    <strong>{currentInvite.admissionCode}</strong>
+                  </div>
+                </aside>
+              )}
+            </header>
+            <TranslationViewport
+              state={session.status === "paused" ? "paused" : "live"}
+              statusLabel={session.status === "paused" ? "Captions paused" : undefined}
+              statusDescription={`${joinedCount} joined`}
+              captionFirstPreview={recentSpeeches.at(-1)?.text ?? ""}
+              previewLabel="Stage caption preview"
+              finalAnnouncement={recentSpeeches.at(-1)?.text}
+              emptyLabel="Translations will appear here"
+              ariaLabel="Stage translations"
+              listLabel="Stage caption list"
+              density="comfortable"
+            >
+              {recentSpeeches.map((speech) => (
+                <CaptionEntry key={`${speech.participantId ?? "host"}-${speech.seq}`}
+                  text={speech.text} speakerLabel={speech.displayName} isFinal />
+              ))}
+            </TranslationViewport>
+          </div>
+        )}
       </div>
     </main>
   );

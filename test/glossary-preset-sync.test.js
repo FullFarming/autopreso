@@ -154,15 +154,23 @@ test("Electron exposes cookie-authenticated custom preset CRUD without renderer 
     main.indexOf("async function liveCallApiWithHostSession"),
     main.indexOf("function sanitizeLiveCallDraft"),
   );
-  assert.match(authenticatedApi, /const first = await liveCallApi/u);
-  assert.match(authenticatedApi, /first\.code !== "HOST_LOGIN_REQUIRED"/u);
-  assert.match(authenticatedApi, /silentHostLogin\(baseUrl\)/u);
-  assert.match(authenticatedApi, /return glossaryPresetFailure\(login\)/u);
-  assert.equal((authenticatedApi.match(/liveCallApi\(baseUrl, pathname, options\)/gu) ?? []).length, 2);
-  assert.equal((authenticatedApi.match(/return liveCallApi\(baseUrl, pathname, options\)/gu) ?? []).length, 1);
+  assert.match(authenticatedApi, /ensureDesktopHostSession\(baseUrl\)/u);
+  assert.doesNotMatch(authenticatedApi, /silentHostLogin|\/api\/login|retry/u);
+  assert.equal((authenticatedApi.match(/liveCallApi\(baseUrl, pathname, options\)/gu) ?? []).length, 1);
   assert.match(handlers, /method: "POST"/u);
-  assert.match(handlers, /method: "PATCH"/u);
+  // Update is document-v1 now: save a new version then activate it — the
+  // webapp rejects the legacy PATCH with 405.
+  assert.doesNotMatch(handlers, /method: "PATCH"/u);
+  assert.match(handlers, /\/versions\?presetVersion=/u);
+  assert.match(handlers, /\/activate/u);
   assert.match(handlers, /method: "DELETE"/u);
+  // Delete body uses the exact-keys webapp schema { presetVersion }.
+  assert.match(handlers, /body: \{ presetVersion: value\.version \}/u);
+  // Both create and update convert the flat desktop input into a
+  // glossary-document/v1 body before POSTing.
+  assert.match(main, /function buildGlossaryDocumentFromLegacyInput/u);
+  assert.match(main, /convertLegacyGlossaryTextToDocumentV1/u);
+  assert.equal((handlers.match(/buildGlossaryDocumentFromLegacyInput\(/gu) ?? []).length, 2);
   assert.match(handlers, /NETWORK_UNAVAILABLE/u);
   assert.match(handlers, /code: "FORBIDDEN"/u);
   assert.doesNotMatch(handlers, /hostPassword|password/u);

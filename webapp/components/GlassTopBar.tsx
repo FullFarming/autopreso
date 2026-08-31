@@ -1,9 +1,15 @@
 "use client";
 
+import { useSystemText } from "@/components/system-language/SystemLanguageProvider";
+import { recordsMessages } from "@/lib/system-language/records-messages";
+
 // Floating compact glass pill: app name, session status dot, settings gear,
 // logout icon. Replaces the old full-width branded header.
 
 import { useRouter } from "next/navigation";
+import { useRef, useState } from "react";
+import { logoutHostSession } from "@/lib/auth/host-session-client";
+import { authMessages } from "@/lib/system-language/auth-messages";
 
 const STATUS_LABELS: Record<string, string> = {
   idle: "대기",
@@ -23,20 +29,34 @@ export default function GlassTopBar({
   status: string;
   onOpenSettings: () => void;
 }) {
+  const t = useSystemText(recordsMessages);
   const router = useRouter();
+  const ta = useSystemText(authMessages);
+  const [logoutError, setLogoutError] = useState(false);
+  const [isLoggingOut, setIsLoggingOut] = useState(false);
+  const logoutPending = useRef(false);
   const active = status !== "idle";
-  const label = STATUS_LABELS[status] ?? status;
+  const label = t(STATUS_LABELS[status] ?? status);
 
   async function handleLogout() {
+    if (logoutPending.current) return;
+    logoutPending.current = true;
+    setIsLoggingOut(true);
+    setLogoutError(false);
     try {
-      await fetch("/api/logout", { method: "POST" });
-    } finally {
+      await logoutHostSession();
       router.push("/login");
       router.refresh();
+    } catch {
+      setLogoutError(true);
+    } finally {
+      logoutPending.current = false;
+      setIsLoggingOut(false);
     }
   }
 
   return (
+    <>
     <div className="pt-safe px-safe sticky top-0 z-40 flex justify-center px-3 pt-3">
       <div className="glass-pill flex w-full max-w-[640px] items-center gap-2 px-4 py-2">
         <span className="nowrap text-xs font-semibold tracking-wide text-cw-ink">NOVA</span>
@@ -52,7 +72,7 @@ export default function GlassTopBar({
           <button
             type="button"
             onClick={onOpenSettings}
-            aria-label="설정"
+            aria-label={t("설정")}
             className="rounded-full p-2 text-cw-grey75 transition-colors hover:bg-black/5 hover:text-cw-ink"
           >
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
@@ -63,7 +83,9 @@ export default function GlassTopBar({
           <button
             type="button"
             onClick={handleLogout}
-            aria-label="로그아웃"
+            disabled={isLoggingOut}
+            aria-busy={isLoggingOut}
+            aria-label={t("로그아웃")}
             className="rounded-full p-2 text-cw-grey75 transition-colors hover:bg-black/5 hover:text-cw-ink"
           >
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
@@ -75,5 +97,7 @@ export default function GlassTopBar({
         </div>
       </div>
     </div>
+    {logoutError ? <p className="live-error" role="alert">{ta("logoutFailed")}</p> : null}
+    </>
   );
 }

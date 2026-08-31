@@ -2,9 +2,13 @@ import {
   applyDocumentLanguage,
   applyTranslations,
   initLanguage,
+  readStoredLanguage,
+  setLanguage,
   subscribe as subscribeToLanguage,
   t,
 } from "./subtitle-i18n.js";
+import { mountSystemLanguageButton } from "./system-language-button.js";
+import { SYSTEM_LANGUAGE_STORAGE_KEY } from "./system-language.js";
 
 const DEFAULT_SUBTITLE = {
   translationLanguages: ["en", "ko"],
@@ -34,6 +38,7 @@ const translationHealth = {
   socketState: "connecting",
   bridgeState: "idle",
   isLive: false,
+  mediaWaiting: false,
   lastEventAt: null,
   lastCaptionAt: null,
   signalSinceAt: null,
@@ -43,13 +48,13 @@ const translationHealth = {
 let lastRenderedHealthState = "";
 let isLiveActionStatusLocked = false;
 
-// The dashboard owns the language choice; this window reads the same key and
-// repaints its own labels whenever it changes.
 initLanguage();
 applyDocumentLanguage(document);
 applyTranslations(document);
 window.addEventListener("storage", (event) => {
-  if (event?.key === "realtime-noel-ui-language") initLanguage();
+  if (event.key !== SYSTEM_LANGUAGE_STORAGE_KEY && event.key !== null) return;
+  if (event.storageArea && event.storageArea !== window.localStorage) return;
+  setLanguage(readStoredLanguage());
 });
 subscribeToLanguage(() => {
   applyDocumentLanguage(document);
@@ -57,6 +62,11 @@ subscribeToLanguage(() => {
   renderSettings();
   renderOverlayDisplayState(overlayDisplayState);
   renderTranslationHealth();
+});
+mountSystemLanguageButton(document.getElementById("controller-system-language"), {
+  onOpenChange(isOpen) {
+    document.querySelector(".caption-controller-window")?.classList.toggle("is-language-menu-open", isOpen);
+  },
 });
 
 document.getElementById("controller-restart")?.addEventListener("click", () => sendControl({ command: "restart" }));
@@ -381,6 +391,10 @@ function translationHealthDetail(state, now = Date.now()) {
 function renderTranslationHealth(now = Date.now()) {
   if (isLiveActionStatusLocked) return;
   if (!translationHealth.isLive || !liveCallStatus || !healthLabel) return;
+  if (translationHealth.mediaWaiting) {
+    setControllerStatus("controller.waitingForParticipants", "waiting");
+    return;
+  }
   const state = translationHealthState(now);
   const key = `controller.health.${state}`;
   if (state !== lastRenderedHealthState) {
@@ -398,6 +412,7 @@ function renderTranslationHealth(now = Date.now()) {
 function syncLiveBridgeStatus(state) {
   const wasLive = translationHealth.isLive;
   translationHealth.isLive = Boolean(state?.armed && state.live);
+  translationHealth.mediaWaiting = Boolean(state?.mediaWaiting);
   translationHealth.bridgeState = String(state?.bridge?.state ?? "idle");
   // A new call must earn its own healthy state; a recent event from the prior
   // session would otherwise make dead audio look healthy for several seconds.
@@ -454,9 +469,10 @@ if (window.realtimeNoelDesktop?.getLiveCallState && liveCallGroup && goLiveButto
       liveCallGroup.hidden = !state?.armed;
       if (state?.armed) {
         goLiveButton.disabled = Boolean(state.live);
-        goLiveButton.dataset.i18n = state.live ? "controller.live" : "controller.goLive";
+        goLiveButton.dataset.i18n = state.live && state.mediaWaiting
+          ? "controller.waitingForParticipants" : state.live ? "controller.live" : "controller.goLive";
         goLiveButton.textContent = t(goLiveButton.dataset.i18n);
-        goLiveButton.classList.toggle("is-live", Boolean(state.live));
+        goLiveButton.classList.toggle("is-live", Boolean(state.live && !state.mediaWaiting));
         // Host Speak only matters once the call is live and a guest may be
         // holding the speaking floor.
         if (hostSpeakButton) hostSpeakButton.hidden = !state.live;

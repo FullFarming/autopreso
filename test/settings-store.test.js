@@ -37,8 +37,10 @@ test("createSettingsStore returns defaults when file is missing and env is empty
   assert.equal(settings.subtitle.translateAllLanguages, false);
   assert.deepEqual(settings.subtitle.translationLanguages, ["en", "ko"]);
   assert.equal(settings.subtitle.outputMode, "captions");
-  assert.equal(settings.subtitle.audioLanguage, "en");
-  assert.equal(settings.subtitle.audioVolume, 0.8);
+  assert.equal(settings.subtitle.geminiTranscribeModel, "gemini-3.5-transcribe-live");
+  for (const retiredKey of ["audioLanguage", "audioVolume", "voiceProvider", "model", "geminiModel"]) {
+    assert.equal(Object.hasOwn(settings.subtitle, retiredKey), false);
+  }
   assert.equal(settings.subtitle.recordProvider, "ollama");
   assert.equal(settings.subtitle.ollamaModel, "gemma3n:e2b");
   assert.equal(settings.subtitle.tone, "natural");
@@ -46,26 +48,25 @@ test("createSettingsStore returns defaults when file is missing and env is empty
   // The second Gemini project key is a first-class slot (parallel 3-language
   // translation), so it defaults to an empty string rather than being absent.
   assert.equal(settings.apiKeys.geminiSecondary, "");
-  assert.equal(settings.subtitle.geminiPolishModel, "gemini-3.6-flash");
+  assert.equal(settings.subtitle.geminiPolishModel, "gemini-3.7-flash");
 });
 
-test("createSettingsStore persists and validates interpreted audio settings", async () => {
+test("createSettingsStore normalizes retired interpreted audio settings to captions", async () => {
   const filePath = await tempPath();
-  const store = createSettingsStore({ filePath, env: {}, readCodexAuth: noCodexAuth });
-  await store.load();
-  await store.save({
+  await fs.writeFile(filePath, JSON.stringify({
     subtitle: {
       translationLanguages: ["en", "ko", "ja"],
       outputMode: "audio",
       audioLanguage: "ja",
       audioVolume: 0.35,
     },
-  });
+  }));
+  const store = createSettingsStore({ filePath, env: {}, readCodexAuth: noCodexAuth });
 
   const saved = await store.load();
-  assert.equal(saved.subtitle.outputMode, "audio");
-  assert.equal(saved.subtitle.audioLanguage, "ja");
-  assert.equal(saved.subtitle.audioVolume, 0.35);
+  assert.equal(saved.subtitle.outputMode, "captions");
+  assert.equal(Object.hasOwn(saved.subtitle, "audioLanguage"), false);
+  assert.equal(Object.hasOwn(saved.subtitle, "audioVolume"), false);
 
   await assert.rejects(
     () => store.save({ subtitle: { outputMode: "video" } }),
@@ -74,14 +75,6 @@ test("createSettingsStore persists and validates interpreted audio settings", as
   await assert.rejects(
     () => store.save({ subtitle: { audioVolume: 1.01 } }),
     /audioVolume/,
-  );
-  await assert.rejects(
-    () => store.save({ subtitle: { audioLanguage: "zh" } }),
-    /audioLanguage/,
-  );
-  await assert.rejects(
-    () => store.save({ subtitle: { translationLanguages: ["en", "ko"] } }),
-    /audioLanguage/,
   );
 });
 
@@ -250,47 +243,55 @@ test("createSettingsStore retains a synchronized custom preset snapshot for offl
   assert.equal((await store.load()).subtitle.glossaryPresetName, "");
 });
 
-test("createSettingsStore fixes both captions and interpreted audio to Gemini", async () => {
+test("createSettingsStore persists the exact plural glossary pin contract and rejects unsafe selections", async () => {
+  const filePath = await tempPath();
+  const store = createSettingsStore({ filePath, env: {}, readCodexAuth: noCodexAuth });
+  await store.load();
+  const glossaries = [
+    { sourceKind: "builtin", sourceId: "common_business" },
+    { sourceKind: "host", sourceId: "0192d0f4-9f72-7a36-91f5-6a76ef736f41", documentVersion: 2 },
+  ];
+  assert.deepEqual((await store.save({ subtitle: { glossaries } })).subtitle.glossaries, glossaries);
+  await assert.rejects(() => store.save({ subtitle: { glossaries: [] } }), /between 1 and 5/u);
+  await assert.rejects(() => store.save({ subtitle: { glossaries: Array.from({ length: 6 }, () => ({ sourceKind: "builtin", sourceId: "common_business" })) } }), /between 1 and 5/u);
+  await assert.rejects(() => store.save({ subtitle: { glossaries: [{ sourceKind: "builtin", sourceId: "unknown" }] } }), /valid glossary selections/u);
+});
+
+test("createSettingsStore migrates Live Translate and voice settings to caption-only Transcribe", async () => {
   const filePath = await tempPath();
   await fs.writeFile(filePath, JSON.stringify({
     subtitle: { translationProvider: "openai", voiceProvider: "openai" },
   }));
   const store = createSettingsStore({ filePath, env: {}, readCodexAuth: noCodexAuth });
   const settings = await store.load();
-  // Gemini is the default translation engine.
   assert.equal(settings.subtitle.translationProvider, "gemini");
-  assert.equal(settings.subtitle.geminiModel, "gemini-3.5-live-translate-preview");
-
-  assert.equal(settings.subtitle.voiceProvider, "gemini");
-  await assert.rejects(() => store.save({ subtitle: { voiceProvider: "openai" } }), /voiceProvider/u);
-  assert.equal(settings.subtitle.geminiPolishModel, "gemini-3.6-flash");
+  assert.equal(settings.subtitle.geminiTranscribeModel, "gemini-3.5-transcribe-live");
+  assert.equal(Object.hasOwn(settings.subtitle, "geminiModel"), false);
+  assert.equal(Object.hasOwn(settings.subtitle, "voiceProvider"), false);
+  await assert.rejects(() => store.save({ subtitle: { voiceProvider: "gemini" } }), /retired/u);
+  assert.equal(settings.subtitle.geminiPolishModel, "gemini-3.7-flash");
 
   await assert.rejects(() => store.save({ subtitle: { translationProvider: "openai" } }), /translationProvider/u);
 
-  await store.save({ subtitle: { voiceProvider: "gemini" } });
-  const reloaded = createSettingsStore({ filePath, env: {}, readCodexAuth: noCodexAuth });
-  assert.equal((await reloaded.load()).subtitle.voiceProvider, "gemini");
-
-  await assert.rejects(
-    () => store.save({ subtitle: { voiceProvider: "claude" } }),
-    /voiceProvider/u,
-  );
   await assert.rejects(() => store.save({ subtitle: { translationProvider: "claude" } }), /translationProvider/u);
 });
 
-test("createSettingsStore migrates the released 3.5 polish default without changing Live Translate", async () => {
-  const filePath = await tempPath();
-  await fs.writeFile(filePath, JSON.stringify({
-    subtitle: {
-      geminiModel: "gemini-3.5-live-translate-preview",
-      geminiPolishModel: "gemini-3.5-flash",
-    },
-  }));
+test("createSettingsStore migrates released polish and Live Translate defaults", async () => {
+  for (const geminiPolishModel of ["gemini-3.5-flash", "gemini-3.6-flash"]) {
+    const filePath = await tempPath();
+    await fs.writeFile(filePath, JSON.stringify({
+      subtitle: {
+        geminiModel: "gemini-3.5-live-translate-preview",
+        geminiPolishModel,
+      },
+    }));
 
-  const store = createSettingsStore({ filePath, env: {}, readCodexAuth: noCodexAuth });
-  const settings = await store.load();
-  assert.equal(settings.subtitle.geminiModel, "gemini-3.5-live-translate-preview");
-  assert.equal(settings.subtitle.geminiPolishModel, "gemini-3.6-flash");
+    const store = createSettingsStore({ filePath, env: {}, readCodexAuth: noCodexAuth });
+    const settings = await store.load();
+    assert.equal(settings.subtitle.geminiTranscribeModel, "gemini-3.5-transcribe-live");
+    assert.equal(Object.hasOwn(settings.subtitle, "geminiModel"), false);
+    assert.equal(settings.subtitle.geminiPolishModel, "gemini-3.7-flash");
+  }
 });
 
 test("getSanitized strips the gemini key but reports registration status", async () => {
@@ -356,7 +357,7 @@ test("createSettingsStore.save persists subtitle settings", async () => {
   assert.equal(settings.subtitle.micDeviceId, "input-device-1");
   assert.equal(settings.subtitle.translationFontSize, 44);
   assert.equal(settings.subtitle.sourceFontSize, 42);
-  assert.equal(settings.subtitle.model, DEFAULT_SUBTITLE_SETTINGS.model);
+  assert.equal(settings.subtitle.geminiTranscribeModel, DEFAULT_SUBTITLE_SETTINGS.geminiTranscribeModel);
   assert.equal(settings.subtitle.displayMode, "translation_only");
   assert.equal(settings.subtitle.overlayEnabled, true);
 });
@@ -720,20 +721,16 @@ test("validateApiKeys accepts an absent section and active slots only", () => {
 test("the retired captions_audio output mode is rejected on write", () => {
   assert.throws(
     () => validateSubtitleSettings({ outputMode: "captions_audio" }),
-    /outputMode must be captions or audio/u,
+    /outputMode must be captions/u,
   );
-  // The two surviving modes still validate.
   validateSubtitleSettings({ outputMode: "captions" });
-  validateSubtitleSettings({
-    outputMode: "audio",
-    translationProvider: "gemini",
-    translationLanguages: ["en", "ko"],
-    audioLanguage: "en",
-    audioVolume: 0.5,
-  });
+  assert.throws(
+    () => validateSubtitleSettings({ outputMode: "audio" }),
+    /outputMode must be captions/u,
+  );
 });
 
-test("an existing captions_audio settings file migrates to captions instead of failing to load", async () => {
+test("an existing audio settings file migrates to caption-only Transcribe instead of failing to load", async () => {
   const filePath = await tempPath();
   await fs.writeFile(filePath, JSON.stringify({
     subtitle: { outputMode: "captions_audio", translationLanguages: ["en", "ko"], audioLanguage: "ko" },
@@ -742,6 +739,8 @@ test("an existing captions_audio settings file migrates to captions instead of f
   const store = createSettingsStore({ filePath, env: {}, readCodexAuth: noCodexAuth });
   const loaded = await store.load();
   assert.equal(loaded.subtitle.outputMode, "captions", "the mixed mode degrades to captions, the safe half");
+  assert.equal(loaded.subtitle.geminiTranscribeModel, "gemini-3.5-transcribe-live");
+  assert.equal(Object.hasOwn(loaded.subtitle, "audioLanguage"), false);
 
   // And the migration is durable: saving afterwards must not throw on the value
   // it just read.

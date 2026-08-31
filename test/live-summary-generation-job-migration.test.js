@@ -20,7 +20,10 @@ test("summary generation job migration is additive and registered in the root te
     readFile(new URL("../package.json", import.meta.url), "utf8"),
   ]);
   assert.doesNotMatch(sql, /\bdrop\s+(?:table|column|type|function)\b|\bdelete\s+from\b|\btruncate\b/iu);
-  assert.equal(JSON.parse(packageSource).scripts.test, 'node --test "test/**/*.test.js"');
+  assert.equal(
+    JSON.parse(packageSource).scripts.test,
+    'node --test "test/**/*.test.js" "packages/gemini-server/*.test.js"',
+  );
 });
 
 test("private job table has one immutable generation identity per session language", async () => {

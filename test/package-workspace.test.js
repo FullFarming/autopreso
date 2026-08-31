@@ -17,6 +17,7 @@ test("root package keeps platform sidecars as optional published packages, not l
     "electron/",
     "LICENSE",
     "packages/caption-core/",
+    "packages/gemini-server/",
     "public/",
     "src/",
   ]);
@@ -24,6 +25,7 @@ test("root package keeps platform sidecars as optional published packages, not l
   assert.equal(rootPackage.main, "electron/main.js");
   assert.equal(rootPackage.scripts.dev, "node ./src/cli.js");
   assert.equal(rootPackage.scripts.desktop, "node ./scripts/start-desktop.js");
+  assert.match(rootPackage.scripts.test, /packages\/gemini-server\/\*\.test\.js/);
   assert.equal(rootPackage.scripts["dist:mac"], "electron-builder --mac dmg --arm64 --publish never");
   assert.equal(rootPackage.scripts["dist:mac:x64"], "electron-builder --mac dmg --x64 --publish never");
   assert.equal(rootPackage.scripts["dist:win"], "electron-builder --win portable --x64 --publish never");

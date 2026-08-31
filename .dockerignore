@@ -8,3 +8,5 @@
 !packages/
 !packages/caption-core/
 !packages/caption-core/**
+!packages/gemini-server/
+!packages/gemini-server/**

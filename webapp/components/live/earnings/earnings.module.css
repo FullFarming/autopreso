@@ -1,0 +1,23 @@
+.context { display: grid; box-sizing: border-box; width: 100%; min-width: 0; max-width: 100%; gap: 8px; padding: 12px; border: 1px solid var(--nova-surface-hairline); border-radius: var(--nova-radius-md); background: var(--nova-surface-raised); }
+.header { display: flex; width: 100%; min-width: 0; max-width: 100%; align-items: center; justify-content: space-between; gap: 12px; color: var(--nova-fg-primary); }
+.header > div { display: flex; min-width: 0; max-width: 100%; flex-wrap: wrap; align-items: baseline; gap: 8px; }
+.header strong, .header span, .status { max-width: 100%; overflow-wrap: anywhere; }
+.eyebrow, .header span, .status { color: var(--nova-fg-secondary); font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
+.status { margin: 0; }
+.sectionNav { min-width: 0; max-width: 100%; }
+.sectionNav ol { display: flex; min-width: 0; max-width: 100%; flex-wrap: wrap; gap: 8px; margin: 0; padding: 0; list-style: none; }
+.sectionNav a, .sectionNav li > span, .search summary, .glossary summary, .postCallIndex a, .postCallIndex button { display: inline-flex; min-height: 44px; max-width: 100%; align-items: center; gap: 6px; padding-inline: 12px; border-radius: var(--nova-radius-sm); color: var(--nova-fg-primary); }
+.sectionNav small { color: var(--nova-fg-secondary); font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
+.sectionNav a[aria-current] { background: var(--nova-brand-subtle); color: var(--nova-fg-primary); }
+.search, .glossary { max-height: 30vh; overflow: auto; color: var(--nova-fg-primary); }
+.search label, .search input { display: block; width: 100%; }
+.search input { min-height: 44px; border: 1px solid var(--nova-surface-hairline); border-radius: var(--nova-radius-sm); background: var(--nova-surface-base); color: var(--nova-fg-primary); }
+.search ol, .glossary ul { margin: 8px 0 0; padding-inline-start: 24px; }
+.glossary li { display: grid; grid-template-columns: 1fr 1fr auto; gap: 8px; }
+.postCallIndex { color: var(--nova-fg-primary); }
+.postCallIndex ul { display: grid; gap: 4px; padding: 0; list-style: none; }
+.sectionNav a:focus-visible, .search summary:focus-visible, .search input:focus-visible, .glossary summary:focus-visible, .postCallIndex a:focus-visible, .postCallIndex button:focus-visible { outline: 2px solid var(--nova-system-default); outline-offset: 2px; }
+@media (max-width: 1023px) { .context { grid-template-columns: 1fr; } }
+@media (max-width: 767px) { .header { align-items: flex-start; flex-direction: column; } .search { max-height: 30vh; } }
+@media (max-width: 359px) { .context { padding: 8px; } .sectionNav ol { display: grid; grid-template-columns: 1fr; } }
+@media (prefers-reduced-motion: reduce) { .context * { scroll-behavior: auto; transition-duration: 0.01ms; } }

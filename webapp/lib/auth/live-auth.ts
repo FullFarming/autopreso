@@ -7,8 +7,13 @@ import { hmacHex, timingSafeEqual } from "../security/hmac";
 export const VIEWER_GRANT_COOKIE = "rnw_viewer_grant";
 export const RECAP_GRANT_COOKIE = "rnw_recap_grant";
 const VIEWER_GRANT_TTL_MS = 6 * 60 * 60 * 1000;
-const RECAP_GRANT_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+// 2026-08-31 fix: 이 TTL은 신원 복구 봉투다. 기록 권한은 DB의 종료 시각+6시간으로 별도 검증한다.
+export const RECAP_GRANT_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const GATEWAY_TOKEN_TTL_MS = 15 * 60 * 1000;
+const VIEWER_GATEWAY_TICKET_TTL_SECONDS = 60;
+const DATABASE_UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
+const RANDOM_UUID_V4_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
+const VIEWER_GATEWAY_TICKET_KEYS = ["aud", "exp", "grantId", "iat", "jti", "role", "sessionId", "sub"];
 
 export interface ViewerGrantClaims {
   role: "VIEWER";
@@ -24,6 +29,17 @@ export interface GatewayClaims {
   sub: string;
   sessionId: string;
   aud: "media-gateway";
+  iat: number;
+  exp: number;
+}
+
+export interface ViewerGatewayTicketClaims {
+  role: "VIEWER";
+  sub: string;
+  grantId: string;
+  sessionId: string;
+  aud: "live-gateway-viewer";
+  jti: string;
   iat: number;
   exp: number;
 }
@@ -83,8 +99,8 @@ function isViewerGrantClaims(value: unknown): value is ViewerGrantClaims {
     && typeof claims.grantId === "string"
     && typeof claims.sessionId === "string"
     && typeof claims.userId === "string"
-    && typeof claims.issuedAt === "number"
-    && typeof claims.expiresAt === "number";
+    && Number.isSafeInteger(claims.issuedAt)
+    && Number.isSafeInteger(claims.expiresAt);
 }
 
 function isGatewayClaims(value: unknown): value is GatewayClaims {
@@ -98,14 +114,34 @@ function isGatewayClaims(value: unknown): value is GatewayClaims {
     && typeof claims.exp === "number";
 }
 
+function isViewerGatewayTicketClaims(value: unknown): value is ViewerGatewayTicketClaims {
+  if (!value || typeof value !== "object") return false;
+  const claims = value as Record<string, unknown>;
+  const keys = Object.keys(claims).sort();
+  return keys.length === VIEWER_GATEWAY_TICKET_KEYS.length
+    && keys.every((key, index) => key === VIEWER_GATEWAY_TICKET_KEYS[index])
+    && claims.role === "VIEWER"
+    && claims.aud === "live-gateway-viewer"
+    && typeof claims.sub === "string"
+    && DATABASE_UUID_PATTERN.test(claims.sub)
+    && typeof claims.grantId === "string"
+    && DATABASE_UUID_PATTERN.test(claims.grantId)
+    && typeof claims.sessionId === "string"
+    && DATABASE_UUID_PATTERN.test(claims.sessionId)
+    && typeof claims.jti === "string"
+    && RANDOM_UUID_V4_PATTERN.test(claims.jti)
+    && Number.isSafeInteger(claims.iat)
+    && Number.isSafeInteger(claims.exp);
+}
+
 function isRecapGrantClaims(value: unknown): value is RecapGrantClaims {
   if (!value || typeof value !== "object") return false;
   const claims = value as Record<string, unknown>;
   return claims.role === "RECAP"
     && typeof claims.sessionId === "string"
     && typeof claims.userId === "string"
-    && typeof claims.issuedAt === "number"
-    && typeof claims.expiresAt === "number";
+    && Number.isSafeInteger(claims.issuedAt)
+    && Number.isSafeInteger(claims.expiresAt);
 }
 
 export function getBearerToken(request: Pick<NextRequest, "headers">): string | null {
@@ -135,8 +171,51 @@ export async function verifyViewerGrantToken(
   if (!token) throw new AuthenticationError("시청자 인증이 필요합니다.");
   const value = await verifySignedClaims(LIVE_VIEWER_TOKEN_SECRET, token);
   if (!isViewerGrantClaims(value)) throw new AuthenticationError("시청자 인증 정보가 올바르지 않습니다.");
-  if (value.issuedAt > now + 30_000 || value.expiresAt <= now || value.expiresAt - value.issuedAt > VIEWER_GRANT_TTL_MS) {
+  if (value.issuedAt > now + 30_000 || value.expiresAt <= now || value.expiresAt <= value.issuedAt
+    || value.expiresAt - value.issuedAt > VIEWER_GRANT_TTL_MS) {
     throw new AuthenticationError("시청자 인증이 만료되었습니다.");
+  }
+  return value;
+}
+
+export async function createViewerGatewayTicket(
+  input: Pick<ViewerGrantClaims, "grantId" | "sessionId" | "userId">,
+  now: number = Date.now(),
+): Promise<{ token: string; claims: ViewerGatewayTicketClaims }> {
+  if (!DATABASE_UUID_PATTERN.test(input.grantId)
+    || !DATABASE_UUID_PATTERN.test(input.sessionId)
+    || !DATABASE_UUID_PATTERN.test(input.userId)) {
+    throw new AuthenticationError("시청자 게이트웨이 인증 정보가 올바르지 않습니다.");
+  }
+  const issuedAt = Math.floor(now / 1_000);
+  const claims: ViewerGatewayTicketClaims = {
+    role: "VIEWER",
+    sub: input.userId,
+    grantId: input.grantId,
+    sessionId: input.sessionId,
+    aud: "live-gateway-viewer",
+    jti: crypto.randomUUID(),
+    iat: issuedAt,
+    exp: issuedAt + VIEWER_GATEWAY_TICKET_TTL_SECONDS,
+  };
+  return { token: await signClaims(LIVE_VIEWER_TOKEN_SECRET, claims), claims };
+}
+
+export async function verifyViewerGatewayTicket(
+  token: string | null | undefined,
+  now: number = Date.now(),
+): Promise<ViewerGatewayTicketClaims> {
+  if (!token) throw new AuthenticationError("시청자 게이트웨이 인증이 필요합니다.");
+  const value = await verifySignedClaims(LIVE_VIEWER_TOKEN_SECRET, token);
+  if (!isViewerGatewayTicketClaims(value)) {
+    throw new AuthenticationError("시청자 게이트웨이 인증 정보가 올바르지 않습니다.");
+  }
+  const nowSeconds = Math.floor(now / 1_000);
+  if (value.iat > nowSeconds + 30
+    || value.exp <= nowSeconds
+    || value.exp <= value.iat
+    || value.exp - value.iat > VIEWER_GATEWAY_TICKET_TTL_SECONDS) {
+    throw new AuthenticationError("시청자 게이트웨이 인증이 만료되었습니다.");
   }
   return value;
 }
@@ -163,6 +242,7 @@ export async function verifyRecapGrantToken(
   if (!isRecapGrantClaims(value)) throw new AuthenticationError("회의록 인증 정보가 올바르지 않습니다.");
   if (value.issuedAt > now + 30_000
     || value.expiresAt <= now
+    || value.expiresAt <= value.issuedAt
     || value.expiresAt - value.issuedAt > RECAP_GRANT_TTL_MS) {
     throw new AuthenticationError("회의록 인증이 만료되었습니다.");
   }

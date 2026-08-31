@@ -34,7 +34,9 @@ test("caption-only realtime delegates language gating, source consensus, and ech
   const source = await readFile(new URL("../src/subtitle-realtime.js", import.meta.url), "utf8");
   assert.match(source, /createCrossChannelEchoDeduper\(\)/);
   assert.match(source, /createSourceLanguageConsensus\(\)/);
-  assert.match(source, /return isOutputInTargetLanguage\(translatedText, targetLanguage\)/);
+  assert.match(source, /isFixedTargetOutputSupported\(text, targetLanguage,\s*\{\s*protectedTerms: termRetriever\.getProtectedTerms/s);
+  assert.match(source, /!isTargetOutputSupported\(corrected\)/);
+  assert.match(source, /!isTargetOutputSupported\(translatedText\)/);
   assert.match(source, /return detectCaptionSourceLanguage\(value, options\)/);
   assert.doesNotMatch(source, /const SOURCE_VOTE_WINDOW_MS\s*=/);
   assert.doesNotMatch(source, /function normalizeCrossChannelText\s*\(/);

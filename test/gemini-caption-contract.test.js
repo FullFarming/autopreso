@@ -7,8 +7,10 @@ import {
   createLocalTermRetriever,
   geminiCaptionConfigFingerprint,
   GEMINI_CAPTION_ENGINE_CONTRACT,
+  GEMINI_WORKLOAD_MODEL_MATRIX,
   isOutputInTargetLanguage,
   preparePolishRequest,
+  redactGeminiSensitiveText,
 } from "../packages/caption-core/index.js";
 import { createCaptionPolisher } from "../media-gateway/src/caption-polish.js";
 import { createSubtitlePolisher } from "../src/subtitle-polish.js";
@@ -37,8 +39,8 @@ function createModeInputs(overrides = {}) {
     glossaryPresetName: "CRE Professional",
     tone: "business",
     languages: ["ko", "en"],
-    geminiModel: "gemini-3.5-live-translate-preview",
-    geminiPolishModel: "gemini-3.6-flash",
+    geminiModel: "gemini-3.5-transcribe-live",
+    geminiPolishModel: "gemini-3.7-flash",
     ...overrides,
   };
   return {
@@ -75,7 +77,9 @@ test("Caption Only and Live Call canonicalize every Gemini caption setting to on
 
   assert.deepEqual(liveCall, desktop);
   assert.equal(desktop.provider, "gemini");
-  assert.equal(desktop.voiceProvider, "gemini");
+  assert.equal(desktop.voiceProvider, null);
+  assert.equal(desktop.outputMode, "captions");
+  assert.equal(Object.hasOwn(desktop, "audioLanguage"), false);
   assert.deepEqual(desktop.directions, [
     Object.freeze({ sourceLanguage: "ko", targetLanguage: "en" }),
     Object.freeze({ sourceLanguage: "en", targetLanguage: "ko" }),
@@ -88,9 +92,74 @@ test("Caption Only and Live Call canonicalize every Gemini caption setting to on
   assert.equal(GEMINI_CAPTION_ENGINE_CONTRACT.fallback.translationProvider, null);
   assert.equal(GEMINI_CAPTION_ENGINE_CONTRACT.fallback.voiceProvider, null);
   const defaults = createGeminiCaptionConfig();
-  assert.equal(defaults.models.live, "gemini-3.5-live-translate-preview");
-  assert.equal(defaults.models.polish, "gemini-3.6-flash");
+  assert.deepEqual(defaults.models, {
+    transcription: "gemini-3.5-transcribe-live",
+    polish: "gemini-3.7-flash",
+  });
+  assert.equal(defaults.models.polish, "gemini-3.7-flash");
   assert.equal(defaults.polishPolicy.mode, "selective");
+});
+
+test("Gemini workload models are fixed and shared redaction preserves ordinary business figures", () => {
+  assert.deepEqual(GEMINI_WORKLOAD_MODEL_MATRIX, {
+    transcription: "gemini-3.5-transcribe-live",
+    glossaryExtraction: "gemini-3.7-flash",
+    topic: "gemini-3.7-flash",
+    translation: "gemini-3.7-flash",
+    polish: "gemini-3.7-flash",
+    recap: "gemini-3.7-flash",
+  });
+  assert.throws(() => createGeminiCaptionConfig({ geminiModel: "browser-choice" }), /GEMINI_MODEL_OVERRIDE_FORBIDDEN/u);
+  assert.throws(() => createGeminiCaptionConfig({ geminiPolishModel: "session-choice" }), /GEMINI_MODEL_OVERRIDE_FORBIDDEN/u);
+  assert.throws(() => createGeminiCaptionConfig({ models: { topic: "gemini-3.7-flash" } }), /GEMINI_MODEL_OVERRIDE_FORBIDDEN/u);
+  assert.throws(() => createGeminiCaptionConfig({ geminiTextModel: "gemini-3.7-flash" }), /GEMINI_MODEL_OVERRIDE_FORBIDDEN/u);
+  const redacted = redactGeminiSensitiveText("매출 123456, 인증 코드 123456, 담당자 user@회사.한국");
+  assert.match(redacted, /매출 123456/u);
+  assert.doesNotMatch(redacted, /인증 코드 123456|user@회사\.한국/u);
+  assert.equal(redactGeminiSensitiveText("123456"), "[CODE]");
+  assert.equal(redactGeminiSensitiveText("  123456  "), "[CODE]");
+  assert.equal(redactGeminiSensitiveText("매출 123456"), "매출 123456");
+  const googleApiKey = `AIza${"A".repeat(35)}`;
+  assert.equal(redactGeminiSensitiveText(googleApiKey), "[TOKEN]");
+  assert.equal(redactGeminiSensitiveText(`key=${googleApiKey}.`), "key=[TOKEN].");
+  for (const ordinary of [
+    `AIza${"A".repeat(34)}`,
+    `XAIza${"A".repeat(35)}`,
+    `AIza${"A".repeat(35)}X`,
+    "AIza Pacific Holdings",
+    "CRE-ASSET-CODE-123456",
+  ]) assert.equal(redactGeminiSensitiveText(ordinary), ordinary);
+});
+
+test("legacy model input accepts only empty or the exact fixed transcription model", () => {
+  assert.equal(createGeminiCaptionConfig({ model: "" }).models.transcription, "gemini-3.5-transcribe-live");
+  assert.equal(
+    createGeminiCaptionConfig({ model: "gemini-3.5-transcribe-live" }).models.transcription,
+    "gemini-3.5-transcribe-live",
+  );
+  for (const model of ["gemini-3.5-live-translate-preview", "gemini-live", "caller-model"]) {
+    assert.throws(() => createGeminiCaptionConfig({ model }), /GEMINI_MODEL_OVERRIDE_FORBIDDEN/u);
+  }
+});
+
+test("caption config deletes audio semantics and exposes the Transcribe Live event contract", () => {
+  const config = createGeminiCaptionConfig({
+    outputMode: "audio",
+    audioLanguage: "ja",
+    outputSampleRate: 24_000,
+    languages: ["en", "ja"],
+  });
+
+  assert.equal(config.outputMode, "captions");
+  assert.equal(config.voiceProvider, null);
+  assert.equal(Object.hasOwn(config, "audioLanguage"), false);
+  assert.equal(Object.hasOwn(config.streamingPolicy, "outputSampleRate"), false);
+  assert.equal(GEMINI_CAPTION_ENGINE_CONTRACT.transcription.model, "gemini-3.5-transcribe-live");
+  assert.deepEqual(GEMINI_CAPTION_ENGINE_CONTRACT.transcription.responseModalities, ["TEXT"]);
+  assert.equal(GEMINI_CAPTION_ENGINE_CONTRACT.transcription.interimField, "interimInputTranscription");
+  assert.equal(GEMINI_CAPTION_ENGINE_CONTRACT.transcription.authoritativeField, "inputTranscription");
+  assert.equal(GEMINI_CAPTION_ENGINE_CONTRACT.transcription.maximumCustomVocabularyEntries, 100);
+  assert.equal(GEMINI_CAPTION_ENGINE_CONTRACT.transcription.apiMaximumCustomVocabularyEntries, 1_000);
 });
 
 test("the canonical config keeps a 40k structured glossary byte-for-byte, including a relevant late entry", () => {
@@ -191,7 +260,7 @@ test("Caption Only and Live Call return the same Gemini final for both translati
     ["ko", "본 거래는 내부수익률 기준을 충족합니다."],
   ]);
   const desktop = createSubtitlePolisher({
-    model: "gemini-3.6-flash",
+    model: "gemini-3.7-flash",
     async generateText(request) {
       requests.push({ mode: "desktop", ...request });
       const target = request.prompt.includes(" en ") || request.prompt.includes("English") ? "en" : "ko";
@@ -208,7 +277,7 @@ test("Caption Only and Live Call return the same Gemini final for both translati
       },
     },
   };
-  const liveCall = createCaptionPolisher({ client: gatewayClient, model: "gemini-3.6-flash" });
+  const liveCall = createCaptionPolisher({ client: gatewayClient, model: "gemini-3.7-flash" });
   const cases = [
     {
       translatedText: "The deal meets the IRR hurdle.",

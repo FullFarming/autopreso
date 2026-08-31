@@ -39,7 +39,7 @@ class FakeSocket extends EventEmitter {
   }
 }
 
-test("a source-language switch finalizes the on-screen partial as a committed line", async () => {
+test("a finalized Transcribe segment remains committed when the source language switches", async () => {
   const sockets = [];
   const broadcasts = [];
   const manager = createSubtitleRealtimeManager({
@@ -55,33 +55,38 @@ test("a source-language switch finalizes the on-screen partial as a committed li
       sockets.push(socket);
       return socket;
     },
+    partialTranslationDebounceMs: 1,
+    polish: async ({ sourceText, targetLanguage }) => {
+      if (targetLanguage === "ko" && sourceText.startsWith("We will")) return "올해 시장 전망에 대해 말씀드리겠습니다.";
+      if (targetLanguage === "en") return "Hello everyone, we will begin today's presentation.";
+      return "";
+    },
   });
 
   await manager.start({ sessionId: "active" });
-  const koreanTarget = sockets[1];
+  const transcribeSocket = sockets[0];
+  transcribeSocket.emit("open");
+  transcribeSocket.emit("message", JSON.stringify({ setupComplete: {} }));
 
-  // English speech translated into Korean; the partial is on screen.
-  koreanTarget.emit("message", JSON.stringify({
+  transcribeSocket.emit("message", JSON.stringify({
     serverContent: {
       inputTranscription: { text: "We will now discuss the market outlook for this year.", languageCode: "en" },
-      outputTranscription: { text: "올해 시장 전망에 대해 말씀드리겠습니다." },
     },
   }));
-
-  const partials = broadcasts.filter((message) => message.type === "subtitle:partial" && message.targetLanguage === "ko");
-  assert.equal(partials.length >= 1, true, "the Korean translation partial must be on screen first");
+  await new Promise((resolve) => setTimeout(resolve, 10));
 
   // The speaker switches to Korean mid-flow. The Korean channel's source is now
   // its own target language — the old behavior wiped the on-screen sentence.
   // It must instead be finalized as a committed line before the lane clears.
-  koreanTarget.emit("message", JSON.stringify({
+  transcribeSocket.emit("message", JSON.stringify({
     serverContent: {
       inputTranscription: { text: "안녕하세요 여러분 오늘 발표를 시작하겠습니다", languageCode: "ko" },
     },
   }));
 
   const committed = broadcasts.filter((message) => message.type === "subtitle:committed" && message.targetLanguage === "ko");
-  assert.equal(committed.length, 1, "the on-screen sentence is committed at the switch");
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(committed.length, 1, "the finalized English segment remains committed across the switch");
   assert.equal(committed[0].translatedText, "올해 시장 전망에 대해 말씀드리겠습니다.");
   assert.equal(committed[0].sourceLanguage, "en", "the committed line keeps the direction it was translated in");
 
@@ -372,12 +377,9 @@ test("sticky consensus has a bounded long-term fallback when its sibling channel
   }
 });
 
-// KO -> EN -> KO in one session. Two behaviours used to be asserted together
-// under the mixed caption+audio mode: captions must not pin the source language
-// to the first segment, and the stale interpreted-audio queue must be dropped at
-// the boundary. That mode is retired, so the scenario runs once per surviving
-// mode and each asserts the half that mode can actually produce.
-async function runDirectionSwitchScenario(outputMode) {
+// KO -> EN -> KO in one Transcribe session. Final source segments are independent,
+// so the middle English utterance cannot pin either surrounding Korean segment.
+async function runDirectionSwitchScenario() {
   const sockets = [];
   const broadcasts = [];
   const manager = createSubtitleRealtimeManager({
@@ -389,8 +391,6 @@ async function runDirectionSwitchScenario(outputMode) {
           translationProvider: "gemini",
           inputMode: "mic",
           languagePair: { a: "en", b: "ko" },
-          outputMode,
-          audioLanguage: "en",
         },
       }),
     },
@@ -399,56 +399,44 @@ async function runDirectionSwitchScenario(outputMode) {
       sockets.push(socket);
       return socket;
     },
+    polish: async ({ sourceText, targetLanguage }) => {
+      if (targetLanguage === "en" && sourceText.startsWith("처음에는")) return "First, we explain the market in Korean.";
+      if (targetLanguage === "en" && sourceText.startsWith("다시")) return "We return to Korean to explain the hotel investment strategy.";
+      if (targetLanguage === "ko") return "다음 섹션은 영어로 진행합니다.";
+      return "";
+    },
   });
 
   await manager.start({ sessionId: "provider-tail-switch" });
-  const englishTarget = sockets[0];
+  const transcribeSocket = sockets[0];
+  transcribeSocket.emit("open");
+  transcribeSocket.emit("message", JSON.stringify({ setupComplete: {} }));
 
-  englishTarget.emit("message", JSON.stringify({
+  transcribeSocket.emit("message", JSON.stringify({
     serverContent: { inputTranscription: { text: "처음에는 한국어로 시장을 설명합니다", languageCode: "ko" } },
   }));
-  englishTarget.emit("message", JSON.stringify({
-    serverContent: { outputTranscription: { text: "First, we explain the market in Korean." } },
-  }));
 
-  englishTarget.emit("message", JSON.stringify({
+  transcribeSocket.emit("message", JSON.stringify({
     serverContent: { inputTranscription: { text: "We now switch to English for the next section", languageCode: "en" } },
   }));
-  englishTarget.emit("message", JSON.stringify({
-    serverContent: { outputTranscription: { text: "We now switch to English for the next section." } },
-  }));
 
-  englishTarget.emit("message", JSON.stringify({
+  transcribeSocket.emit("message", JSON.stringify({
     serverContent: { inputTranscription: { text: "다시 한국어로 호텔 투자 전략을 설명합니다", languageCode: "ko" } },
   }));
-  englishTarget.emit("message", JSON.stringify({
-    serverContent: { outputTranscription: { text: "We return to Korean to explain the hotel investment strategy." } },
-  }));
-
+  await new Promise((resolve) => setTimeout(resolve, 20));
   await manager.stop();
   return broadcasts;
 }
 
 test("Gemini provider codes do not make cumulative source text pin KO to EN to KO switching", async () => {
-  const broadcasts = await runDirectionSwitchScenario("captions");
-  const englishPartials = broadcasts.filter((message) => message.type === "subtitle:partial" && message.targetLanguage === "en");
-  assert.equal(englishPartials.length >= 2, true);
-  assert.equal(englishPartials.at(-1).sourceLanguage, "ko");
-  assert.equal(englishPartials.at(-1).sourceText, "다시 한국어로 호텔 투자 전략을 설명합니다");
+  const broadcasts = await runDirectionSwitchScenario();
+  const englishFinals = broadcasts.filter((message) => message.type === "subtitle:committed" && message.targetLanguage === "en");
+  assert.equal(englishFinals.length, 2);
+  assert.equal(englishFinals.at(-1).sourceLanguage, "ko");
+  assert.equal(englishFinals.at(-1).sourceText, "다시 한국어로 호텔 투자 전략을 설명합니다");
   assert.equal(
-    englishPartials.some((message) => message.sourceLanguage === "en"),
+    englishFinals.some((message) => message.sourceLanguage === "en"),
     false,
     "same-language EN target output must never be emitted during the middle English segment",
-  );
-});
-
-test("the stale interpreted-audio queue is cleared at a direction boundary", async () => {
-  const broadcasts = await runDirectionSwitchScenario("audio");
-  assert.equal(
-    broadcasts.some((message) => message.type === "subtitle:audio-control"
-      && message.targetLanguage === "en"
-      && message.reason === "source_language_changed"),
-    true,
-    "the stale interpreted-audio queue is cleared at the direction boundary",
   );
 });

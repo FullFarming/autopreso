@@ -19,6 +19,8 @@ function sameLanguageSourceFallback(sourceText, sourceLanguage, targetLanguage) 
 // partial은 호출부에 남기고 committed caption만 이 단일 경로로 확정한다.
 /**
  * @param {{
+ *   sessionId?: string,
+ *   compiledGlossary?: unknown,
  *   config?: {
  *     provider: string,
  *     glossary: string,
@@ -37,9 +39,17 @@ function sameLanguageSourceFallback(sourceText, sourceLanguage, targetLanguage) 
  *   }) => Promise<unknown>) | null,
  * }} [options]
  */
-export function createCommittedCaptionFinalizer({ config, polish = null } = {}) {
+export function createCommittedCaptionFinalizer({
+  sessionId = "",
+  compiledGlossary = undefined,
+  config,
+  polish = null,
+} = {}) {
   if (!config || config.provider !== "gemini") throw new Error("GEMINI_CAPTION_CONFIG_REQUIRED");
-  const termRetriever = createLocalTermRetriever(config.glossary);
+  // A pinned document is loaded and fingerprint-verified by the server. Raw
+  // host settings are a legacy-only input and must not compete with it.
+  const legacyGlossary = compiledGlossary === undefined ? config.glossary : "";
+  const termRetriever = createLocalTermRetriever(legacyGlossary, { sessionId, compiledGlossary });
 
   /** @param {{sourceText?: unknown, translatedText?: unknown, sourceLanguage?: unknown, targetLanguage?: unknown, hasPriorTextModelCall?: unknown}} [input] */
   async function finalize({ sourceText = "", translatedText = "", sourceLanguage = "", targetLanguage = "", hasPriorTextModelCall = false } = {}) {
@@ -58,7 +68,7 @@ export function createCommittedCaptionFinalizer({ config, polish = null } = {}) 
       isFinal: true,
     });
     const locallyCorrectedDraft = applyGlossaryCorrections(repairedDraft, {
-      glossary: config.glossary,
+      glossary: legacyGlossary,
       sourceText: repairedSourceText,
       targetLanguage: targetLanguageCode,
     });
@@ -72,7 +82,7 @@ export function createCommittedCaptionFinalizer({ config, polish = null } = {}) 
     });
     const selectedGlossary = termEvidence.hasSourceTerm
       ? termEvidence.selectedGlossary
-      : selectRelevantGlossary(config.glossary, {
+      : selectRelevantGlossary(legacyGlossary, {
         sourceText: repairedSourceText,
         translatedText: locallyCorrectedDraft,
       });
@@ -116,7 +126,7 @@ export function createCommittedCaptionFinalizer({ config, polish = null } = {}) 
       if (!polishedText) return null;
     }
     const correctedText = applyGlossaryCorrections(polishedText, {
-      glossary: config.glossary,
+      glossary: legacyGlossary,
       sourceText: repairedSourceText,
       targetLanguage: targetLanguageCode,
     });
@@ -135,5 +145,9 @@ export function createCommittedCaptionFinalizer({ config, polish = null } = {}) 
     });
   }
 
-  return Object.freeze({ finalize, termRetriever });
+  function release() {
+    termRetriever.release();
+  }
+
+  return Object.freeze({ finalize, termRetriever, release });
 }

@@ -4,18 +4,10 @@ export function sanitizeLiveCaptionDisplayLanguage(value) {
   return LIVE_CAPTION_DISPLAY_LANGUAGES.has(value) ? value : "ko";
 }
 
-/** Host speech is translated twice during a Live Call: once by the LOCAL
- *  captions-only engine, which owns the desktop screen and hears the host
- *  microphone directly, and once by the gateway for the web app's captions and
- *  records. Only the participant half of the gateway stream belongs on screen —
- *  the local engine cannot hear participants. Mirroring the host half back was
- *  what required the relay ordering, direction, and retention corrections; the
- *  screen now takes it straight from the engine that produces it. */
-/*  Requires POSITIVE host evidence rather than "no participant identity". The
- *  gateway stamps speakerRole on every meeting caption, and meeting is the only
- *  session type that mirrors to the desktop at all, so a caption with no role
- *  is not a host caption — it is a shape this path never receives, and guessing
- *  host there would silently blank the screen. */
+// The local Caption Only engine owns host speech on the desktop. The gateway
+// still translates that same host PCM for the web transcript, but replaying it
+// locally would duplicate or race the local result. Positive host metadata is
+// required so an unknown payload fails visible instead of being guessed away.
 export function isHostOriginLiveCaption(caption) {
   if (!caption || typeof caption !== "object") return false;
   if (caption.speakerRole !== "host") return false;

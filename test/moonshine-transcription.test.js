@@ -56,6 +56,7 @@ test("resolveMoonshineSidecarPath reports a clear error when no sidecar package 
     () => resolveMoonshineSidecarPath({
       platform: "darwin",
       arch: "arm64",
+      localPackageRoot: null,
       requireResolve: () => {
         const error = new Error("missing");
         error.code = "MODULE_NOT_FOUND";
@@ -64,6 +65,36 @@ test("resolveMoonshineSidecarPath reports a clear error when no sidecar package 
     }),
     /Cannot find Moonshine sidecar package for darwin\/arm64/,
   );
+});
+
+test("resolveMoonshineSidecarPath falls back to packaged local sidecars", () => {
+  const resolved = resolveMoonshineSidecarPath({
+    platform: "darwin",
+    arch: "arm64",
+    requireResolve: () => {
+      const error = new Error("missing");
+      error.code = "MODULE_NOT_FOUND";
+      throw error;
+    },
+  });
+
+  assert.match(resolved, /packages\/moonshine-darwin-arm64\/bin\/realtime-noel-moonshine$/);
+});
+
+test("resolveMoonshineSidecarPath points app.asar binaries at app.asar.unpacked", () => {
+  const resolved = resolveMoonshineSidecarPath({
+    platform: "darwin",
+    arch: "arm64",
+    localPackageRoot: "/Applications/NOVA.app/Contents/Resources/app.asar/packages",
+    fileExists: (filePath) => filePath.includes("app.asar.unpacked"),
+    requireResolve: () => {
+      const error = new Error("missing");
+      error.code = "MODULE_NOT_FOUND";
+      throw error;
+    },
+  });
+
+  assert.match(resolved, /app\.asar\.unpacked\/packages\/moonshine-darwin-arm64\/bin\/realtime-noel-moonshine$/);
 });
 
 test("resolveMoonshineSidecarPath prefers an explicit binary override", () => {

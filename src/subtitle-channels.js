@@ -17,8 +17,12 @@ import { randomUUID } from "node:crypto";
 import { isSupportedSubtitleLanguage, normalizeSubtitleLanguageCode } from "./subtitle-languages.js";
 
 const LANE_MESSAGE_TYPES = new Set(["subtitle:partial", "subtitle:committed"]);
-const ORDERED_MEDIA_MESSAGE_TYPES = new Set(["subtitle:translated-audio", "subtitle:audio-control"]);
+const RETIRED_TRANSLATED_AUDIO_MESSAGE_TYPES = new Set(["subtitle:translated-audio", "subtitle:audio-control"]);
 const LIVE_CALL_DISPLAY_HISTORY_LIMIT = 8;
+
+export function isRetiredTranslatedAudioMessage(message) {
+  return RETIRED_TRANSLATED_AUDIO_MESSAGE_TYPES.has(message?.type);
+}
 
 function laneKey(message) {
   return `${message.source ?? ""}\u0000${message.targetLanguage ?? ""}`;
@@ -79,10 +83,6 @@ export function createSubtitleChannelHub({
         }
         return { ...message, seq, streamId };
       }
-      if (ORDERED_MEDIA_MESSAGE_TYPES.has(message.type)) {
-        seq += 1;
-        return { ...message, seq, streamId };
-      }
       if (message.type === "subtitle:status" && (message.status === "idle" || message.status === "connecting")) {
         lanes.clear();
         liveCallDisplayTimeline.length = 0;
@@ -93,6 +93,9 @@ export function createSubtitleChannelHub({
 
     // Whether this client should receive this (already-ingested) message.
     shouldSend(client, message) {
+      // Caption contract v2 has no translated-audio lane. Keep this fail-closed
+      // guard while old desktop processes can still reconnect during upgrade.
+      if (isRetiredTranslatedAudioMessage(message)) return false;
       const targetLanguage = message?.targetLanguage;
       if (typeof targetLanguage !== "string" || !targetLanguage) return true;
       const subscribed = subscriptions.get(client);

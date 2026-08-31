@@ -3,17 +3,25 @@ export class GatewayConnectionLimiter {
   #clients = new Map();
 
   constructor({
-    maxConnections = 200,
-    maxConnectionsPerClient = 8,
-    attemptsPerMinute = 30,
+    maxConnections = 256,
+    maxConnectionsPerClient = 224,
+    maxAuthenticatedConnectionsPerClient = 2,
+    attemptsPerMinute = 300,
     maxClientBuckets = 10_000,
     now = Date.now,
   } = {}) {
-    for (const [name, value] of Object.entries({ maxConnections, maxConnectionsPerClient, attemptsPerMinute, maxClientBuckets })) {
+    for (const [name, value] of Object.entries({
+      maxConnections,
+      maxConnectionsPerClient,
+      maxAuthenticatedConnectionsPerClient,
+      attemptsPerMinute,
+      maxClientBuckets,
+    })) {
       if (!Number.isSafeInteger(value) || value < 1) throw new Error(`INVALID_${name.toUpperCase()}`);
     }
     this.maxConnections = maxConnections;
     this.maxConnectionsPerClient = maxConnectionsPerClient;
+    this.maxAuthenticatedConnectionsPerClient = maxAuthenticatedConnectionsPerClient;
     this.attemptsPerMinute = attemptsPerMinute;
     this.maxClientBuckets = maxClientBuckets;
     this.now = now;
@@ -40,15 +48,37 @@ export class GatewayConnectionLimiter {
     state.active += 1;
     this.#activeConnections += 1;
     let isReleased = false;
-    return () => {
+    let currentKey = clientKey;
+    const release = () => {
       if (isReleased) return;
       isReleased = true;
       this.#activeConnections = Math.max(0, this.#activeConnections - 1);
-      const current = this.#clients.get(clientKey);
+      const current = this.#clients.get(currentKey);
       if (!current) return;
       current.active = Math.max(0, current.active - 1);
       current.lastSeenAt = this.now();
     };
+    release.promote = (authenticatedKey) => {
+      if (isReleased || typeof authenticatedKey !== "string" || !/^[0-9a-f]{64}$/u.test(authenticatedKey)) return false;
+      const nextKey = `authenticated:${authenticatedKey}`;
+      if (currentKey === nextKey) return true;
+      let next = this.#clients.get(nextKey);
+      if (!next && this.#clients.size >= this.maxClientBuckets) this.#prune(this.now());
+      if (!next && this.#clients.size >= this.maxClientBuckets) return false;
+      next ??= { active: 0, tokens: this.attemptsPerMinute, refilledAt: this.now(), lastSeenAt: this.now() };
+      if (next.active >= this.maxAuthenticatedConnectionsPerClient) return false;
+      const current = this.#clients.get(currentKey);
+      if (current) {
+        current.active = Math.max(0, current.active - 1);
+        current.lastSeenAt = this.now();
+      }
+      next.active += 1;
+      next.lastSeenAt = this.now();
+      this.#clients.set(nextKey, next);
+      currentKey = nextKey;
+      return true;
+    };
+    return release;
   }
 
   #prune(timestamp) {

@@ -1,0 +1,160 @@
+<!doctype html>
+<html lang="ko" data-theme="dark">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Live Interpreter | NOVA</title>
+    <link rel="stylesheet" href="/nova-core.css">
+    <link rel="stylesheet" href="/live-interpreter.css">
+  </head>
+  <body>
+    <div class="interpreter-shell">
+      <header class="topbar">
+        <div class="title-group">
+          <span class="wordmark" aria-label="NOVA">NOVA</span>
+          <span class="topbar-rule" aria-hidden="true"></span>
+          <h1>Live Interpreter</h1>
+        </div>
+        <div class="status-cluster">
+          <span id="latency-chip" class="status-chip nova-status-chip">
+            <span class="status-dot status-dot-neutral" aria-hidden="true"></span>
+            <span>Audio</span>
+            <output id="latency-value">-- ms</output>
+          </span>
+          <span id="connection-status" class="status-chip nova-status-chip" role="status" aria-live="polite">
+            <span class="status-dot status-dot-neutral" aria-hidden="true"></span>
+            <span class="status-label">대기</span>
+          </span>
+        </div>
+      </header>
+
+      <main class="workspace">
+        <aside class="transcript-column" aria-labelledby="transcript-title">
+          <header class="transcript-header">
+            <h2 id="transcript-title">실시간 통역</h2>
+            <button id="clear-transcript" type="button" class="weak-button">지우기</button>
+          </header>
+          <div class="transcript-wrap">
+            <div id="transcript-log" class="transcript-log" role="log" aria-live="polite" aria-relevant="additions text"></div>
+            <button id="jump-to-latest" type="button" class="jump-button" hidden>최신으로</button>
+          </div>
+        </aside>
+
+        <section class="control-column" aria-label="통역 제어">
+          <div class="config-strip">
+            <div class="segmented-control nova-segmented" role="tablist" aria-label="회의 방식">
+              <button id="mode-online" type="button" role="tab" aria-selected="true" aria-controls="online-panel" data-mode="ONLINE">온라인 회의</button>
+              <button id="mode-in-person" type="button" role="tab" aria-selected="false" aria-controls="in-person-panel" data-mode="IN_PERSON">대면 회의</button>
+            </div>
+            <label class="field nova-field compact-field" for="user-language">
+              <span>내 언어</span>
+              <select id="user-language"></select>
+            </label>
+            <button id="swap-languages" type="button" class="icon-button nova-button" aria-label="언어 교체">⇄</button>
+            <label class="field nova-field compact-field" for="other-language">
+              <span>상대 언어</span>
+              <select id="other-language"></select>
+            </label>
+            <button id="preflight-button" type="button" class="weak-button nova-button">사전 점검</button>
+          </div>
+
+          <div id="live-settings-summary" class="live-settings-summary" role="status" hidden>
+            <span class="status-dot status-dot-live" aria-hidden="true"></span>
+            <span id="live-settings-summary-text">온라인 회의 · 한국어→English</span>
+          </div>
+
+          <section id="preflight-checklist" class="preflight-checklist" aria-label="실행 전 점검">
+            <div class="preflight-check" data-preflight-check="languages"><span>언어</span><strong data-preflight-status="languages">확인 필요</strong></div>
+            <div class="preflight-check" data-preflight-check="microphone"><span>마이크</span><strong data-preflight-status="microphone">확인 필요</strong></div>
+            <div class="preflight-check" data-preflight-check="system"><span>시스템 오디오</span><strong data-preflight-status="system">확인 필요</strong></div>
+            <div class="preflight-check" data-preflight-check="blackhole"><span>BlackHole 2ch</span><strong data-preflight-status="blackhole">확인 필요</strong></div>
+          </section>
+
+          <div id="recovery-bar" class="recovery-bar" role="alert" hidden>
+            <span id="recovery-message">복구 필요</span>
+            <button id="recovery-action" type="button" class="nova-button">다시 시도</button>
+          </div>
+
+          <section id="online-panel" class="mode-panel" role="tabpanel" aria-labelledby="mode-online">
+            <article class="lane-card" data-lane-card="inbound">
+              <header class="lane-header">
+                <div>
+                  <span class="lane-kicker">INBOUND</span>
+                  <h2>상대방→나</h2>
+                </div>
+                <div class="lane-actions">
+                  <button type="button" class="icon-button mute-button" data-mute-lane="inbound" aria-label="상대방 입력 음소거" aria-pressed="false">Mute</button>
+                  <button type="button" class="weak-button reconnect-button" data-reconnect-lane="inbound">재연결</button>
+                </div>
+              </header>
+              <div class="lane-route" aria-label="상대방 통역 경로">
+                <label class="field nova-field" for="online-system-input"><span>입력</span><select id="online-system-input"><option value="system">시스템 오디오</option></select></label>
+                <span class="route-arrow" aria-hidden="true">→</span>
+                <label class="field nova-field" for="online-local-output"><span>출력</span><select id="online-local-output"></select></label>
+              </div>
+              <div class="lane-footer">
+                <span class="lane-state"><span class="status-dot status-dot-neutral" aria-hidden="true"></span><span data-lane-status="inbound">대기</span></span>
+                <label class="volume-control" for="inbound-volume"><span>Volume</span><input id="inbound-volume" type="range" min="0" max="100" value="80" data-volume-lane="inbound"><output>80</output></label>
+              </div>
+            </article>
+
+            <article class="lane-card" data-lane-card="outbound">
+              <header class="lane-header">
+                <div>
+                  <span class="lane-kicker">OUTBOUND</span>
+                  <h2>나→상대방</h2>
+                </div>
+                <div class="lane-actions">
+                  <button type="button" class="icon-button mute-button" data-mute-lane="outbound" aria-label="마이크 음소거" aria-pressed="false">Mute</button>
+                  <button type="button" class="weak-button reconnect-button" data-reconnect-lane="outbound">재연결</button>
+                </div>
+              </header>
+              <div class="lane-route" aria-label="내 통역 경로">
+                <label class="field nova-field" for="online-mic-input"><span>입력</span><select id="online-mic-input"></select></label>
+                <span class="route-arrow" aria-hidden="true">→</span>
+                <label class="field nova-field" for="online-virtual-output"><span>출력 · BlackHole</span><select id="online-virtual-output"></select></label>
+              </div>
+              <label class="confirmation-row" for="virtual-mic-confirmed">
+                <input id="virtual-mic-confirmed" type="checkbox">
+                <span>회의 앱 마이크 · BlackHole 2ch</span>
+              </label>
+              <div class="lane-footer">
+                <span class="lane-state"><span class="status-dot status-dot-neutral" aria-hidden="true"></span><span data-lane-status="outbound">대기</span></span>
+                <label class="volume-control" for="outbound-volume"><span>Volume</span><input id="outbound-volume" type="range" min="0" max="100" value="80" data-volume-lane="outbound"><output>80</output></label>
+              </div>
+            </article>
+          </section>
+
+          <section id="in-person-panel" class="mode-panel in-person-panel" role="tabpanel" aria-labelledby="mode-in-person" hidden>
+            <div class="in-person-devices">
+              <label class="field nova-field" for="in-person-mic-input"><span>입력</span><select id="in-person-mic-input"></select></label>
+              <label class="field nova-field" for="in-person-output"><span>출력</span><select id="in-person-output"></select></label>
+            </div>
+            <div class="ptt-grid">
+              <button id="ptt-user" type="button" class="ptt-button" data-ptt-lane="user" aria-pressed="false">
+                <span class="lane-kicker">USER</span><span>내가 말하기→상대 언어</span>
+              </button>
+              <button id="ptt-other" type="button" class="ptt-button" data-ptt-lane="other" aria-pressed="false">
+                <span class="lane-kicker">OTHER</span><span>상대방 말하기→내 언어</span>
+              </button>
+            </div>
+            <div class="lane-footer in-person-footer">
+              <span class="lane-state"><span class="status-dot status-dot-neutral" aria-hidden="true"></span><span id="ptt-status">대기</span></span>
+              <label class="volume-control" for="in-person-volume"><span>Volume</span><input id="in-person-volume" type="range" min="0" max="100" value="80" data-volume-lane="in-person"><output>80</output></label>
+            </div>
+          </section>
+
+          <footer class="transport-bar">
+            <button id="mute-all-button" type="button" class="weak-button" aria-pressed="false">전체 음소거</button>
+            <div class="transport-actions">
+              <button id="stop-button" type="button" class="weak-button" disabled>중지</button>
+              <button id="start-button" type="button" class="primary-button">시작</button>
+            </div>
+          </footer>
+        </section>
+
+      </main>
+    </div>
+    <script type="module" src="/live-interpreter.js"></script>
+  </body>
+</html>

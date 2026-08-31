@@ -8,7 +8,7 @@ import { geminiCaptionConfigFingerprint } from "../../packages/caption-core/inde
 function gatewayEnvironment() {
   return {
     GEMINI_API_KEY: "test-key",
-    GEMINI_LIVE_MODEL: "live-model",
+    GEMINI_TRANSCRIBE_MODEL: "gemini-3.5-transcribe-live",
     GOOGLE_CLOUD_PROJECT: "dev-project",
     SUPABASE_URL: "https://dev-ref.supabase.co",
     SUPABASE_SECRET_KEY: "sb_secret_primary",
@@ -20,10 +20,9 @@ function gatewayEnvironment() {
   };
 }
 
-test("live audio settings use the documented audio-only envelope", () => {
+test("live input audio uses the documented PCM envelope", () => {
   assert.deepEqual(AUDIO_CONFIG, {
     inputSampleRate: 16_000,
-    outputSampleRate: 24_000,
     channels: 1,
     chunkMilliseconds: 40,
     prerollMilliseconds: 300,
@@ -37,6 +36,28 @@ test("gateway config exposes no retired OpenAI translation language registry", (
   assert.equal("OPENAI_REALTIME_TRANSLATION_LANGUAGES" in gatewayConfig, false);
 });
 
+test("gateway environment cannot select arbitrary Gemini workload models", () => {
+  assert.equal(readGatewayEnvironment({ ...gatewayEnvironment(), GEMINI_TRANSCRIBE_MODEL: undefined }).geminiTranscribeModel, "gemini-3.5-transcribe-live");
+  assert.equal(readGatewayEnvironment({ ...gatewayEnvironment(), GEMINI_TEXT_MODEL: undefined }).geminiTextModel, "gemini-3.7-flash");
+  assert.throws(() => readGatewayEnvironment({ ...gatewayEnvironment(), GEMINI_TRANSCRIBE_MODEL: "attacker-model" }), /고정 workload matrix/u);
+  assert.throws(() => readGatewayEnvironment({ ...gatewayEnvironment(), GEMINI_TEXT_MODEL: "attacker-model" }), /고정 workload matrix/u);
+});
+
+test("live settings normalize every legacy audio output mode to captions-only", () => {
+  for (const outputMode of ["captions", "captions_audio", "audio"]) {
+    const settings = validateLiveSettings({ sessionType: "meeting", outputMode, languages: ["ko"] });
+    assert.equal(settings.outputMode, "captions");
+    assert.equal(settings.captionConfig.outputMode, "captions");
+  }
+});
+
+test("gateway accepts one to three valid BCP-47 STT language candidates", () => {
+  assert.deepEqual(readGatewayEnvironment({ ...gatewayEnvironment(), STT_LANGUAGE_CODES: "ko-KR" }).sttLanguageCodes, ["ko-KR"]);
+  assert.deepEqual(readGatewayEnvironment({ ...gatewayEnvironment(), STT_LANGUAGE_CODES: "ko-KR,en-US,ja-JP" }).sttLanguageCodes, ["ko-KR", "en-US", "ja-JP"]);
+  assert.throws(() => readGatewayEnvironment({ ...gatewayEnvironment(), STT_LANGUAGE_CODES: "ko-KR,ko-KR" }), /STT_LANGUAGE_CODES/u);
+  assert.throws(() => readGatewayEnvironment({ ...gatewayEnvironment(), STT_LANGUAGE_CODES: "ko-KR,../../secret" }), /STT_LANGUAGE_CODES/u);
+});
+
 test("live settings accept one to three unique languages", () => {
   const validated = validateLiveSettings({ sessionType: "meeting", languages: ["ko-KR", "en-US"] });
   const { captionConfig, captionConfigFingerprint, ...settings } = validated;
@@ -44,27 +65,28 @@ test("live settings accept one to three unique languages", () => {
     sessionType: "meeting",
     languages: ["ko", "en"],
     outputMode: "captions",
-    voiceProvider: "gemini",
-    maxViewers: 50,
+    voiceProvider: null,
+    maxViewers: 200,
     glossaryPack: "general_cre",
     glossaryText: "",
     translationTone: "natural",
     domainText: "",
   });
   assert.equal(captionConfig.provider, "gemini");
-  assert.equal(captionConfig.voiceProvider, "gemini");
-  assert.match(captionConfigFingerprint, /^gemini-caption-v1-[a-f0-9]{16}$/u);
+  assert.equal(captionConfig.voiceProvider, null);
+  assert.match(captionConfigFingerprint, /^gemini-caption-v2-[a-f0-9]{16}$/u);
   const legacyTownhall = validateLiveSettings({ mode: "townhall", languages: ["ko"], voiceOutputMode: "auto_voice" });
   assert.equal(legacyTownhall.sessionType, "meeting");
-  assert.equal(legacyTownhall.outputMode, "audio");
-  assert.equal(validateLiveSettings({ sessionType: "presentation", outputMode: "captions_audio", languages: ["ko"] }).outputMode, "captions_audio");
-  assert.equal(validateLiveSettings({ sessionType: "presentation", outputMode: "captions_audio", voiceProvider: "openai", languages: ["ko"] }).voiceProvider, "gemini");
-  assert.equal(validateLiveSettings({ sessionType: "presentation", outputMode: "audio", voiceProvider: "openai", languages: ["it"] }).voiceProvider, "gemini");
+  assert.equal(legacyTownhall.outputMode, "captions");
+  assert.equal(validateLiveSettings({ sessionType: "presentation", outputMode: "captions_audio", languages: ["ko"] }).outputMode, "captions");
+  assert.equal(validateLiveSettings({ sessionType: "presentation", outputMode: "captions_audio", voiceProvider: "openai", languages: ["ko"] }).voiceProvider, null);
+  assert.equal(validateLiveSettings({ sessionType: "presentation", outputMode: "audio", voiceProvider: "openai", languages: ["it"] }).voiceProvider, null);
   assert.throws(() => validateLiveSettings({ sessionType: "presentation", outputMode: "audio", voiceProvider: "unknown", languages: ["ko"] }), /음성 공급자/u);
-  assert.equal(validateLiveSettings({ sessionType: "presentation", outputMode: "captions", voiceProvider: "openai", languages: ["ko"] }).voiceProvider, "gemini");
-  assert.equal(validateLiveSettings({ sessionType: "meeting", outputMode: "audio", voiceProvider: "openai", languages: ["ko"] }).voiceProvider, "gemini");
+  assert.equal(validateLiveSettings({ sessionType: "presentation", outputMode: "captions", voiceProvider: "openai", languages: ["ko"] }).voiceProvider, null);
+  assert.equal(validateLiveSettings({ sessionType: "meeting", outputMode: "audio", voiceProvider: "openai", languages: ["ko"] }).voiceProvider, null);
   assert.throws(() => validateLiveSettings({ sessionType: "meeting", outputMode: "clone_voice", languages: ["ko"] }), /음성 출력/u);
-  assert.throws(() => validateLiveSettings({ sessionType: "meeting", maxViewers: 51, languages: ["ko"] }), /50명/u);
+  assert.equal(validateLiveSettings({ sessionType: "meeting", maxViewers: 200, languages: ["ko"] }).maxViewers, 200);
+  assert.throws(() => validateLiveSettings({ sessionType: "meeting", maxViewers: 201, languages: ["ko"] }), /200명/u);
   assert.throws(() => validateLiveSettings({ sessionType: "meeting", glossaryPack: "unknown", languages: ["ko"] }), /용어집/u);
   assert.throws(() => validateLiveSettings({ sessionType: "meeting", languages: [] }), /1개 이상/);
   assert.throws(() => validateLiveSettings({ sessionType: "meeting", languages: ["ko", "en", "ja", "fr"] }), /3개 이하/);
@@ -86,8 +108,7 @@ test("non-default Live Call settings round-trip through one canonical Gemini con
     translationTone: "business",
     domainText: "Hospitality investment",
   });
-  assert.equal(settings.captionConfig.audioLanguage, "en");
-  assert.equal(settings.captionConfig.outputMode, "audio");
+  assert.equal(settings.captionConfig.outputMode, "captions");
   assert.equal(settings.captionConfig.preset.id, "hotel");
   assert.equal(settings.captionConfig.glossary, "순영업소득 = NOI");
   assert.equal(settings.captionConfig.tone, "business");

@@ -66,6 +66,8 @@ function buildManager({ broadcasts = [], sockets = [], watchdog, now, subtitle =
       return socket;
     },
     log: { warn() {} },
+    polish: async () => "This is a translated caption.",
+    partialTranslationDebounceMs: 0,
     ...(now ? { now } : {}),
     ...(watchdog ? { stallWatchdog: watchdog } : {}),
   });
@@ -87,7 +89,7 @@ test("restartChannels rebuilds translation channels while keeping the session al
   assert.equal(manager._state.active, true);
 
   // Audio continues to flow into the NEW channels under the same session id.
-  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setTimeout(resolve, 5));
   for (const socket of sockets.slice(initialCount)) {
     socket.emit("message", JSON.stringify({ setupComplete: {} }));
   }
@@ -177,18 +179,17 @@ test("subtitle output re-arms the two-second stall window during continuous spee
 
   await manager.start({ sessionId: "output-rearms-window" });
   const initialCount = sockets.length;
-  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setTimeout(resolve, 5));
   sockets[0].emit("message", JSON.stringify({ setupComplete: {} }));
   manager.noteInputSignal({ sessionId: "output-rearms-window" });
 
   now = 21_900;
   sockets[0].emit("message", JSON.stringify({
     serverContent: {
-      inputTranscription: { text: "오늘 회의를 시작하겠습니다.", languageCode: "ko" },
-      outputTranscription: { text: "We will begin today's meeting." },
+      interimInputTranscription: { text: "오늘 회의를 시작하겠습니다.", languageCode: "ko" },
     },
   }));
-  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setTimeout(resolve, 5));
   assert.ok(broadcasts.some((message) => message.type === "subtitle:partial"), "test setup must produce visible output");
 
   now = 23_899;
@@ -224,11 +225,10 @@ test("system output cannot hide a simultaneous stalled microphone source", async
   now = 31_900;
   sockets[0].emit("message", JSON.stringify({
     serverContent: {
-      inputTranscription: { text: "오늘 시스템 오디오 번역은 정상입니다.", languageCode: "ko" },
-      outputTranscription: { text: "System audio translation remains healthy." },
+      interimInputTranscription: { text: "오늘 시스템 오디오 번역은 정상입니다.", languageCode: "ko" },
     },
   }));
-  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setTimeout(resolve, 5));
   assert.ok(broadcasts.some((message) => message.type === "subtitle:partial" && message.source === "system"));
 
   now = 32_000;
@@ -297,7 +297,7 @@ test("a delayed restart cannot tear down a newer session", async () => {
   const delayedRestart = manager.restartChannels({ reason: "delayed" });
   await new Promise((resolve) => setImmediate(resolve));
   await manager.start({ sessionId: "new-session" });
-  const newSessionSockets = sockets.slice(-2);
+  const newSessionSockets = sockets.slice(-1);
 
   releaseDelayedLoad(saved);
   assert.equal(await delayedRestart, false, "the obsolete restart must abort after its awaited load");
@@ -330,8 +330,7 @@ test("stall watchdog stays quiet while subtitles are flowing or nobody speaks", 
     manager.noteInputSignal({ sessionId: "active" });
     sockets[0].emit("message", JSON.stringify({
       serverContent: {
-        inputTranscription: { text: `안녕하세요 오늘 발표를 시작하겠습니다 ${outputSequence}`, languageCode: "ko" },
-        outputTranscription: { text: `Hello, let us begin today ${outputSequence}.` },
+        interimInputTranscription: { text: `안녕하세요 오늘 발표를 시작하겠습니다 ${outputSequence}`, languageCode: "ko" },
       },
     }));
   }, 10);

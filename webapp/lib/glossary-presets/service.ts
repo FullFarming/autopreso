@@ -1,58 +1,144 @@
+import { validateGlossaryDocumentV1 } from "../../../packages/caption-core/index.js";
+
 import { GlossaryPresetError } from "./errors";
-import { MAX_GLOSSARY_PRESETS_PER_HOST, type CreateGlossaryPresetInput } from "./schema";
 import { SupabaseGlossaryPresetStore, type GlossaryPresetStore } from "./store";
-import type { GlossaryPreset } from "./types";
+import type {
+  ActivatedGlossaryDocumentVersion,
+  GlossaryDocumentRecord,
+  GlossaryDocumentV1,
+  GlossaryDocumentVersion,
+  GlossaryPreset,
+  SavedGlossaryDocumentVersion,
+} from "./types";
+
+export interface ValidatedGlossaryDocument {
+  readonly document: GlossaryDocumentV1;
+  readonly fingerprint: string;
+}
 
 export class GlossaryPresetService {
   private readonly store: GlossaryPresetStore;
+  private readonly now: () => number;
 
-  constructor(store: GlossaryPresetStore) {
+  constructor(
+    store: GlossaryPresetStore,
+    now: () => number = Date.now,
+  ) {
     this.store = store;
+    this.now = now;
   }
 
   list(hostId: string): Promise<GlossaryPreset[]> {
     return this.store.list(hostId);
   }
 
-  async create(hostId: string, input: CreateGlossaryPresetInput): Promise<GlossaryPreset> {
-    const current = await this.store.list(hostId);
-    if (current.length >= MAX_GLOSSARY_PRESETS_PER_HOST) {
-      throw new GlossaryPresetError("용어집은 최대 50개까지 저장할 수 있습니다.", "GLOSSARY_PRESET_LIMIT_REACHED", 409);
+  validate(input: unknown): ValidatedGlossaryDocument {
+    const result = validateGlossaryDocumentV1(input);
+    if (!result.ok) throw invalidDocument();
+    return {
+      document: result.document,
+      fingerprint: result.fingerprint,
+    };
+  }
+
+  async create(hostId: string, input: unknown): Promise<GlossaryPreset> {
+    const validated = this.validate(input);
+    try {
+      return await this.store.create(hostId, validated.document, validated.fingerprint);
+    } catch (error) {
+      if (!isGlossaryError(error, "GLOSSARY_PRESET_NAME_CONFLICT")) throw error;
+      const existing = (await this.store.list(hostId)).find((preset) => (
+        preset.name === validated.document.name
+        && preset.activeDocumentFingerprint === validated.fingerprint
+      ));
+      if (existing) return existing;
+      throw error;
     }
-    assertNameAvailable(current, input.name);
-    return this.store.create(hostId, input);
   }
 
-  async update(
+  listVersions(hostId: string, presetId: string): Promise<GlossaryDocumentVersion[]> {
+    return this.store.listVersions(hostId, presetId);
+  }
+
+  async exportVersion(hostId: string, presetId: string, version: number): Promise<GlossaryDocumentRecord> {
+    const record = await this.store.readVersion(hostId, presetId, version);
+    if (!record) throw versionNotFound();
+    return record;
+  }
+
+  async saveVersion(
     hostId: string,
-    id: string,
-    expectedVersion: number,
-    input: CreateGlossaryPresetInput,
+    presetId: string,
+    expectedPresetVersion: number,
+    input: unknown,
+  ): Promise<SavedGlossaryDocumentVersion> {
+    const validated = this.validate(input);
+    try {
+      return await this.store.saveVersion(
+        hostId,
+        presetId,
+        expectedPresetVersion,
+        validated.document,
+        validated.fingerprint,
+      );
+    } catch (error) {
+      if (!isGlossaryError(error, "GLOSSARY_DOCUMENT_FINGERPRINT_CONFLICT")
+        && !isGlossaryError(error, "GLOSSARY_PRESET_VERSION_CONFLICT")) throw error;
+      const [presets, versions] = await Promise.all([
+        this.store.list(hostId),
+        this.store.listVersions(hostId, presetId),
+      ]);
+      const preset = presets.find((candidate) => candidate.id === presetId);
+      const existing = versions.find((candidate) => candidate.fingerprint === validated.fingerprint);
+      if (preset && existing) return { ...existing, presetVersion: preset.version };
+      throw error;
+    }
+  }
+
+  async activateVersion(
+    hostId: string,
+    presetId: string,
+    expectedPresetVersion: number,
+    documentVersion: number,
+  ): Promise<ActivatedGlossaryDocumentVersion> {
+    try {
+      return await this.store.activateVersion(hostId, presetId, expectedPresetVersion, documentVersion);
+    } catch (error) {
+      if (!isGlossaryError(error, "GLOSSARY_PRESET_VERSION_CONFLICT")) throw error;
+      const preset = (await this.store.list(hostId)).find((candidate) => candidate.id === presetId);
+      if (!preset || preset.activeDocumentVersion !== documentVersion || !preset.activeDocumentFingerprint) throw error;
+      return {
+        presetId,
+        presetVersion: preset.version,
+        activeDocumentVersion: documentVersion,
+        activeDocumentFingerprint: preset.activeDocumentFingerprint,
+        updatedAt: preset.updatedAt,
+      };
+    }
+  }
+
+  async duplicate(
+    hostId: string,
+    sourcePresetId: string,
+    sourceDocumentVersion: number,
+    name: string,
   ): Promise<GlossaryPreset> {
-    const current = await this.store.list(hostId);
-    const existing = current.find((preset) => preset.id === id);
-    if (!existing) throw notFound();
-    if (existing.version !== expectedVersion) throw versionConflict();
-    assertNameAvailable(current, input.name, id);
-    const updated = await this.store.update(id, hostId, expectedVersion, input);
-    if (updated) return updated;
-    return this.classifyMutationMiss(hostId, id, expectedVersion);
+    const source = await this.store.readVersion(hostId, sourcePresetId, sourceDocumentVersion);
+    if (!source) throw versionNotFound();
+    const timestamp = new Date(this.now()).toISOString();
+    const duplicate = this.validate({
+      ...source.document,
+      name,
+      version: 1,
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    });
+    return this.store.create(hostId, duplicate.document, duplicate.fingerprint);
   }
 
-  async delete(hostId: string, id: string, expectedVersion: number): Promise<string> {
-    const current = await this.store.list(hostId);
-    const existing = current.find((preset) => preset.id === id);
-    if (!existing) throw notFound();
-    if (existing.version !== expectedVersion) throw versionConflict();
-    if (await this.store.delete(id, hostId, expectedVersion)) return id;
-    return this.classifyMutationMiss(hostId, id, expectedVersion);
-  }
-
-  private async classifyMutationMiss(hostId: string, id: string, expectedVersion: number): Promise<never> {
-    const current = (await this.store.list(hostId)).find((preset) => preset.id === id);
-    if (!current) throw notFound();
-    if (current.version !== expectedVersion) throw versionConflict();
-    throw new GlossaryPresetError("용어집을 변경할 수 없습니다.", "GLOSSARY_PRESET_VERSION_CONFLICT", 409);
+  async delete(hostId: string, presetId: string, expectedPresetVersion: number): Promise<string> {
+    if (await this.store.delete(presetId, hostId, expectedPresetVersion)) return presetId;
+    throw new GlossaryPresetError("용어집을 삭제할 수 없습니다.", "GLOSSARY_PRESET_VERSION_CONFLICT", 409);
   }
 }
 
@@ -60,18 +146,14 @@ export function getGlossaryPresetService(): GlossaryPresetService {
   return new GlossaryPresetService(new SupabaseGlossaryPresetStore());
 }
 
-function assertNameAvailable(presets: GlossaryPreset[], name: string, excludedId?: string): void {
-  const normalized = name.normalize("NFC").toLocaleLowerCase("en-US");
-  if (presets.some((preset) => preset.id !== excludedId
-    && preset.name.normalize("NFC").toLocaleLowerCase("en-US") === normalized)) {
-    throw new GlossaryPresetError("같은 이름의 용어집이 이미 있습니다.", "GLOSSARY_PRESET_NAME_CONFLICT", 409);
-  }
+function invalidDocument(): GlossaryPresetError {
+  return new GlossaryPresetError("용어집 내용이 올바르지 않습니다.", "INVALID_GLOSSARY_DOCUMENT", 400);
 }
 
-function notFound(): GlossaryPresetError {
-  return new GlossaryPresetError("용어집을 찾을 수 없습니다.", "GLOSSARY_PRESET_NOT_FOUND", 404);
+function versionNotFound(): GlossaryPresetError {
+  return new GlossaryPresetError("용어집 버전을 찾을 수 없습니다.", "GLOSSARY_DOCUMENT_VERSION_NOT_FOUND", 404);
 }
 
-function versionConflict(): GlossaryPresetError {
-  return new GlossaryPresetError("용어집이 다른 곳에서 변경되었습니다. 다시 불러오세요.", "GLOSSARY_PRESET_VERSION_CONFLICT", 409);
+function isGlossaryError(error: unknown, code: string): error is GlossaryPresetError {
+  return error instanceof GlossaryPresetError && error.code === code;
 }

@@ -36,7 +36,7 @@ test("local E2E gateway accepts only an explicit loopback Supabase opt-in", () =
   }
 });
 
-test("deterministic pipeline publishes canonical KO/EN identity for host and participant PCM", async () => {
+test("deterministic pipeline publishes canonical KO/EN identity for HOST PCM only", async () => {
   const published = [];
   const publisher = {
     async publish(sessionId, language, event, options) {
@@ -59,7 +59,6 @@ test("deterministic pipeline publishes canonical KO/EN identity for host and par
   });
 
   await pipeline.acceptAudio(Uint8Array.of(1, 0));
-  pipeline.setFloorSpeaker({ participantId: "00000000-0000-4000-8000-000000000002", displayName: "테스트 참여자" });
   now += 1_000;
   await pipeline.acceptAudio(Uint8Array.of(2, 0));
 
@@ -68,13 +67,13 @@ test("deterministic pipeline publishes canonical KO/EN identity for host and par
   ]), [
     ["ko", 8, "호스트 테스트 문장 1", "00000000-0000-4000-8000-000000000001:local-e2e:host:1", null],
     ["en", 12, "Host test sentence 1", "00000000-0000-4000-8000-000000000001:local-e2e:host:1", null],
-    ["ko", 9, "참여자 테스트 문장 2", "00000000-0000-4000-8000-000000000001:local-e2e:participant:2", "participant:00000000-0000-4000-8000-000000000002"],
-    ["en", 13, "Participant test sentence 2", "00000000-0000-4000-8000-000000000001:local-e2e:participant:2", "participant:00000000-0000-4000-8000-000000000002"],
+    ["ko", 9, "호스트 테스트 문장 2", "00000000-0000-4000-8000-000000000001:local-e2e:host:2", null],
+    ["en", 13, "Host test sentence 2", "00000000-0000-4000-8000-000000000001:local-e2e:host:2", null],
   ]);
   assert.equal(published[0].event.origin, "source");
   assert.equal(published[1].event.sourceText, "호스트 테스트 문장 1");
   assert.equal(published[2].event.origin, undefined);
-  assert.equal(published[2].event.sourceText, "Participant test sentence 2");
+  assert.equal(published[2].event.sourceText, "Host test sentence 2");
   assert.equal(published[2].event.sourceLanguage, "en");
   assert.equal(published[2].event.translationStatus, "translated");
   assert.equal(published[3].event.origin, "source");

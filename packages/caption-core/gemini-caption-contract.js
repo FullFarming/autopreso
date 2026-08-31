@@ -1,26 +1,44 @@
 import { localTermRetrievalContract } from "./local-term-retrieval.js";
 import { CAPTION_LANGUAGE_CODES, normalizeCaptionLanguage } from "./languages.js";
 import { captionPolishContract } from "./polish-policy.js";
+import { geminiTranscriptionVocabularyContract } from "./gemini-transcription-vocabulary.js";
 
 const MAX_GLOSSARY_CHARACTERS = localTermRetrievalContract.maximumGlossaryCharacters;
 const MAX_DOMAIN_CHARACTERS = 2_000;
 const MAX_PRESET_ID_CHARACTERS = 128;
 const MAX_PRESET_NAME_CHARACTERS = 80;
-const DEFAULT_LIVE_MODEL = "gemini-3.5-live-translate-preview";
-const DEFAULT_POLISH_MODEL = "gemini-3.6-flash";
+const DEFAULT_TRANSCRIPTION_MODEL = "gemini-3.5-transcribe-live";
+const DEFAULT_POLISH_MODEL = "gemini-3.7-flash";
 const DEFAULT_PARTIAL_STABILITY_MILLISECONDS = 140;
 const DEFAULT_PARTIAL_MAX_HOLD_MILLISECONDS = 500;
 const DEFAULT_COMMIT_SILENCE_MILLISECONDS = 1_200;
 const DEFAULT_INPUT_SAMPLE_RATE = 16_000;
-const DEFAULT_OUTPUT_SAMPLE_RATE = 24_000;
 const VALID_POLISH_POLICIES = new Set(["off", "selective", "full"]);
 
+export const GEMINI_WORKLOAD_MODEL_MATRIX = deepFreeze({
+  transcription: DEFAULT_TRANSCRIPTION_MODEL,
+  glossaryExtraction: DEFAULT_POLISH_MODEL,
+  topic: DEFAULT_POLISH_MODEL,
+  translation: DEFAULT_POLISH_MODEL,
+  polish: DEFAULT_POLISH_MODEL,
+  recap: DEFAULT_POLISH_MODEL,
+});
+
 export const GEMINI_CAPTION_ENGINE_CONTRACT = deepFreeze({
-  version: 1,
+  version: 2,
   provider: "gemini",
-  voiceProvider: "gemini",
+  voiceProvider: null,
+  workloadModels: GEMINI_WORKLOAD_MODEL_MATRIX,
   maximumGlossaryCharacters: MAX_GLOSSARY_CHARACTERS,
   maximumDomainCharacters: MAX_DOMAIN_CHARACTERS,
+  transcription: {
+    model: DEFAULT_TRANSCRIPTION_MODEL,
+    responseModalities: ["TEXT"],
+    interimField: "interimInputTranscription",
+    authoritativeField: "inputTranscription",
+    maximumCustomVocabularyEntries: geminiTranscriptionVocabularyContract.defaultMaximumEntries,
+    apiMaximumCustomVocabularyEntries: geminiTranscriptionVocabularyContract.apiMaximumEntries,
+  },
   retrieval: {
     engine: "local-session-index",
     maximumPromptCharacters: localTermRetrievalContract.maximumPromptCharacters,
@@ -46,7 +64,6 @@ export const GEMINI_CAPTION_ENGINE_CONTRACT = deepFreeze({
   },
   streaming: {
     inputSampleRate: DEFAULT_INPUT_SAMPLE_RATE,
-    outputSampleRate: DEFAULT_OUTPUT_SAMPLE_RATE,
     partialStabilityMilliseconds: DEFAULT_PARTIAL_STABILITY_MILLISECONDS,
     partialMaximumHoldMilliseconds: DEFAULT_PARTIAL_MAX_HOLD_MILLISECONDS,
     commitSilenceMilliseconds: DEFAULT_COMMIT_SILENCE_MILLISECONDS,
@@ -59,6 +76,7 @@ export const GEMINI_CAPTION_ENGINE_CONTRACT = deepFreeze({
  * downstream code reads only the canonical names.
  */
 export function createGeminiCaptionConfig(input = {}) {
+  assertAllowedModelInput(input);
   const glossary = normalizedBoundedString(
     input.glossary ?? input.glossaryText,
     MAX_GLOSSARY_CHARACTERS,
@@ -82,10 +100,17 @@ export function createGeminiCaptionConfig(input = {}) {
     provider: GEMINI_CAPTION_ENGINE_CONTRACT.provider,
     voiceProvider: GEMINI_CAPTION_ENGINE_CONTRACT.voiceProvider,
     outputMode: normalizeOutputMode(input.outputMode),
-    audioLanguage: normalizeAudioLanguage(input.audioLanguage, languages),
     models: {
-      live: normalizedModel(input.geminiModel ?? input.liveModel ?? input.models?.live, DEFAULT_LIVE_MODEL),
-      polish: normalizedModel(input.geminiPolishModel ?? input.polishModel ?? input.models?.polish, DEFAULT_POLISH_MODEL),
+      transcription: fixedModel(
+        input.geminiTranscribeModel
+          ?? input.transcriptionModel
+          ?? input.transcribeModel
+          ?? input.geminiModel
+          ?? input.liveModel
+          ?? input.models?.transcription,
+        DEFAULT_TRANSCRIPTION_MODEL,
+      ),
+      polish: fixedModel(input.geminiPolishModel ?? input.polishModel ?? input.models?.polish, DEFAULT_POLISH_MODEL),
     },
     preset: {
       id: boundedMetadata(input.glossaryPresetId ?? input.presetId ?? input.glossaryPack ?? input.preset?.id, MAX_PRESET_ID_CHARACTERS),
@@ -105,13 +130,30 @@ export function createGeminiCaptionConfig(input = {}) {
     fallbackPolicy: { ...GEMINI_CAPTION_ENGINE_CONTRACT.fallback },
     streamingPolicy: {
       inputSampleRate: positiveInteger(input.inputSampleRate ?? input.streamingPolicy?.inputSampleRate, DEFAULT_INPUT_SAMPLE_RATE),
-      outputSampleRate: positiveInteger(input.outputSampleRate ?? input.streamingPolicy?.outputSampleRate, DEFAULT_OUTPUT_SAMPLE_RATE),
       partialStabilityMilliseconds: positiveInteger(input.partialStabilityMilliseconds ?? input.streamingPolicy?.partialStabilityMilliseconds, DEFAULT_PARTIAL_STABILITY_MILLISECONDS),
       partialMaximumHoldMilliseconds: positiveInteger(input.partialMaximumHoldMilliseconds ?? input.streamingPolicy?.partialMaximumHoldMilliseconds, DEFAULT_PARTIAL_MAX_HOLD_MILLISECONDS),
       commitSilenceMilliseconds: positiveInteger(input.commitSilenceMilliseconds ?? input.streamingPolicy?.commitSilenceMilliseconds, DEFAULT_COMMIT_SILENCE_MILLISECONDS),
     },
   };
   return deepFreeze(config);
+}
+
+function assertAllowedModelInput(input) {
+  if (!input || typeof input !== "object" || Array.isArray(input)) throw new Error("INVALID_GEMINI_CAPTION_CONFIG");
+  if (Object.hasOwn(input, "model")) {
+    if (typeof input.model !== "string") throw new Error("GEMINI_MODEL_OVERRIDE_FORBIDDEN");
+    const legacyModel = input.model.trim();
+    if (legacyModel && legacyModel !== DEFAULT_TRANSCRIPTION_MODEL) throw new Error("GEMINI_MODEL_OVERRIDE_FORBIDDEN");
+  }
+  if (input.models !== undefined) {
+    if (!input.models || typeof input.models !== "object" || Array.isArray(input.models)
+      || Object.keys(input.models).some((key) => !["transcription", "polish"].includes(key))) {
+      throw new Error("GEMINI_MODEL_OVERRIDE_FORBIDDEN");
+    }
+  }
+  for (const key of ["topicModel", "translationModel", "recapModel", "geminiTextModel"]) {
+    if (Object.hasOwn(input, key)) throw new Error("GEMINI_MODEL_OVERRIDE_FORBIDDEN");
+  }
 }
 
 export function geminiCaptionConfigFingerprint(configOrInput = {}) {
@@ -144,13 +186,7 @@ function buildDirections(languages) {
 }
 
 function normalizeOutputMode(value) {
-  if (value === "audio" || value === "captions_audio") return value;
   return "captions";
-}
-
-function normalizeAudioLanguage(value, languages) {
-  const language = normalizeCaptionLanguage(value);
-  return languages.includes(language) ? language : languages[0];
 }
 
 function positiveInteger(value, fallback) {
@@ -168,9 +204,26 @@ function boundedMetadata(value, maximumCharacters) {
   return String(value ?? "").normalize("NFC").trim().slice(0, maximumCharacters);
 }
 
-function normalizedModel(value, fallback) {
+function fixedModel(value, fallback) {
   const normalized = String(value ?? "").trim();
-  return normalized || fallback;
+  if (normalized && normalized !== fallback) throw new Error("GEMINI_MODEL_OVERRIDE_FORBIDDEN");
+  return fallback;
+}
+
+export function redactGeminiSensitiveText(value) {
+  if (typeof value !== "string") return "";
+  const normalized = value.normalize("NFC");
+  if (/^\s*\d{6}\s*$/u.test(normalized)) return "[CODE]";
+  return normalized
+    .replace(/\b(?:https?:\/\/|www\.)\S+/giu, "[URL]")
+    .replace(/[\p{L}\p{N}._%+-]+@[\p{L}\p{N}.-]+\.[\p{L}]{2,}/gu, "[EMAIL]")
+    .replace(/\b[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/gu, "[TOKEN]")
+    .replace(/\b[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\b/giu, "[UUID]")
+    .replace(/\bgrant(?:[_:-][A-Za-z0-9_-]+)+\b/giu, "[GRANT]")
+    .replace(/(?<![A-Za-z0-9_-])AIza[A-Za-z0-9_-]{35}(?![A-Za-z0-9_-])/gu, "[TOKEN]")
+    .replace(/\b[A-Za-z0-9_-]{43,}\b/gu, "[TOKEN]")
+    .replace(/(?<![A-Za-z0-9_-])(?:code|access|invite)(?:\s+code)?\s*[:#-]?\s*\d{6}\b/giu, "[CODE]")
+    .replace(/(?:인증(?:\s*코드)?|초대(?:\s*코드)?|참여\s*코드)\s*[:#-]?\s*\d{6}/gu, "[CODE]");
 }
 
 function isCanonicalConfig(value) {

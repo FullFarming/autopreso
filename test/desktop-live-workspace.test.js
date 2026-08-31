@@ -416,6 +416,8 @@ function loadOverlayWindows({ displays, overlayEnabled = true, overlaysMuted = f
     // supply it or maintainOverlayWindow throws on a bare reference.
     overlaysMuted,
     isQuitting,
+    isDesktopAuthenticated: true,
+    isHostLogoutPending: false,
     overlayUrl: "http://127.0.0.1:3210",
     OVERLAY_TOP_LEVEL: "screen-saver",
     // Recovery and top-level re-assertion are covered by their own tests.

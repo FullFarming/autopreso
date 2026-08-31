@@ -1,8 +1,7 @@
-import { createGeminiCaptionConfig, geminiCaptionConfigFingerprint } from "../../packages/caption-core/index.js";
+import { CAPTION_LANGUAGE_CODES, createGeminiCaptionConfig, geminiCaptionConfigFingerprint, GEMINI_WORKLOAD_MODEL_MATRIX } from "../../packages/caption-core/index.js";
 
 export const AUDIO_CONFIG = Object.freeze({
   inputSampleRate: 16_000,
-  outputSampleRate: 24_000,
   channels: 1,
   chunkMilliseconds: 40,
   prerollMilliseconds: 300,
@@ -12,18 +11,22 @@ export const AUDIO_CONFIG = Object.freeze({
 });
 
 export const STT_CONFIG = Object.freeze({
-  rolloverMilliseconds: 270_000,
+  // Gemini Live Transcribe has a hard ten-minute session limit. Rolling at
+  // nine minutes leaves bounded time for overlap replay and stream replacement.
+  rolloverMilliseconds: 540_000,
   overlapMilliseconds: 2_000,
   minSpeakers: 2,
   maxSpeakers: 6,
 });
 
+const BCP_47_LANGUAGE_CODE = /^[a-z]{2,3}(?:-[a-z0-9]{2,8})*$/iu;
+
 export const SESSION_TYPES = Object.freeze(["presentation", "meeting"]);
-export const OUTPUT_MODES = Object.freeze(["captions", "captions_audio", "audio"]);
+export const OUTPUT_MODES = Object.freeze(["captions"]);
 const ACCEPTED_VOICE_PROVIDER_INPUTS = Object.freeze(["gemini", "openai"]);
-export const LIVE_TRANSLATION_LANGUAGES = Object.freeze([
-  "en", "ko", "ja", "zh-Hans", "zh-Hant", "es", "pt", "fr", "de", "ru", "hi", "id", "vi", "it",
-]);
+// Derived from caption-core so every surface shares one canonical code list
+// (pinned by test/live-language-contract.test.js at the repo root).
+export const LIVE_TRANSLATION_LANGUAGES = Object.freeze([...CAPTION_LANGUAGE_CODES]);
 export const GLOSSARY_PACKS = Object.freeze(["general_cre", "hotel", "fnb"]);
 
 /** @type {Array<[string, string]>} */
@@ -56,19 +59,19 @@ export function validateLiveSettings(value) {
   if (new Set(languages).size !== languages.length) throw new Error("중복 언어를 선택할 수 없습니다.");
   let outputMode = value.outputMode;
   if (outputMode === undefined) {
-    if (isLegacyTownhall || value.voiceOutputMode === "fixed_voice" || value.voiceOutputMode === "auto_voice") outputMode = "audio";
-    else outputMode = "captions";
+    outputMode = "captions";
+  } else if (outputMode === "captions_audio" || outputMode === "audio") {
+    outputMode = "captions";
   }
   if (!OUTPUT_MODES.includes(outputMode)) throw new Error("지원하지 않는 음성 출력 모드입니다.");
   if (value.voiceProvider !== undefined && !ACCEPTED_VOICE_PROVIDER_INPUTS.includes(value.voiceProvider)) {
     throw new Error("지원하지 않는 음성 공급자입니다.");
   }
-  // Existing snapshots may still say "openai". Runtime normalization keeps
-  // them loadable while guaranteeing that caption translation and interpreted
-  // audio share the same Gemini Live session in every mode.
-  const voiceProvider = "gemini";
-  const maxViewers = value.maxViewers ?? 50;
-  if (!Number.isSafeInteger(maxViewers) || maxViewers < 1 || maxViewers > 50) throw new Error("최대 시청자는 1명 이상 50명 이하여야 합니다.");
+  // Existing snapshots may still contain a voice provider. Keep them readable,
+  // but captions-only runtime state never promotes that legacy field.
+  const voiceProvider = null;
+  const maxViewers = value.maxViewers ?? 200;
+  if (!Number.isSafeInteger(maxViewers) || maxViewers < 1 || maxViewers > 200) throw new Error("최대 시청자는 1명 이상 200명 이하여야 합니다.");
   const glossaryPack = value.glossaryPack ?? "general_cre";
   if (!GLOSSARY_PACKS.includes(glossaryPack)) throw new Error("지원하지 않는 용어집입니다.");
   // Free-form glossary text mirrored from the desktop subtitle settings so
@@ -95,8 +98,8 @@ export function validateLiveSettings(value) {
     translationTone,
     languages,
     outputMode,
-    audioLanguage: value.audioLanguage ?? languages[0],
     geminiModel: value.geminiModel,
+    geminiTranscribeModel: value.geminiTranscribeModel,
     geminiPolishModel: value.geminiPolishModel,
     captionPolishPolicy: value.captionPolishPolicy,
   });
@@ -126,9 +129,10 @@ export function validateLiveSettings(value) {
 }
 
 export function readGatewayEnvironment(environment = process.env) {
+  const participantDemandValue = environment.LIVE_PARTICIPANT_DEMAND_ENABLED ?? "false";
+  if (!["true", "false"].includes(participantDemandValue)) throw new Error("INVALID_PARTICIPANT_DEMAND_ENABLED");
   const required = [
     "GEMINI_API_KEY",
-    "GEMINI_LIVE_MODEL",
     "GOOGLE_CLOUD_PROJECT",
     "SUPABASE_URL",
     "LIVE_GATEWAY_TOKEN_SECRET",
@@ -140,6 +144,12 @@ export function readGatewayEnvironment(environment = process.env) {
     if (typeof environment[name] !== "string" || !environment[name].trim()) {
       throw new Error(`${name} 환경변수가 필요합니다.`);
     }
+  }
+  const configuredTranscribeModel = String(environment.GEMINI_TRANSCRIBE_MODEL ?? "").trim();
+  const configuredTextModel = String(environment.GEMINI_TEXT_MODEL ?? "").trim();
+  if ((configuredTranscribeModel && configuredTranscribeModel !== GEMINI_WORKLOAD_MODEL_MATRIX.transcription)
+    || (configuredTextModel && configuredTextModel !== GEMINI_WORKLOAD_MODEL_MATRIX.translation)) {
+    throw new Error("Gemini 모델은 서버의 고정 workload matrix와 일치해야 합니다.");
   }
   const supabaseSecretKey = typeof environment.SUPABASE_SECRET_KEY === "string"
     ? environment.SUPABASE_SECRET_KEY.trim()
@@ -188,7 +198,12 @@ export function readGatewayEnvironment(environment = process.env) {
     throw new Error("허용된 개발 Supabase 프로젝트와 일치하지 않습니다.");
   }
   const sttLanguageCodes = String(environment.STT_LANGUAGE_CODES ?? "ko-KR,en-US,ja-JP").split(",").map((value) => value.trim()).filter(Boolean);
-  if (sttLanguageCodes.length < 1 || sttLanguageCodes.length > 3) throw new Error("STT_LANGUAGE_CODES는 1개 이상 3개 이하여야 합니다.");
+  if (sttLanguageCodes.length < 1
+    || sttLanguageCodes.length > 3
+    || sttLanguageCodes.some((languageCode) => !BCP_47_LANGUAGE_CODE.test(languageCode))
+    || new Set(sttLanguageCodes.map((languageCode) => languageCode.toLowerCase())).size !== sttLanguageCodes.length) {
+    throw new Error("STT_LANGUAGE_CODES는 서로 다른 BCP-47 코드 1개 이상 3개 이하여야 합니다.");
+  }
   const hostReconnectGraceMilliseconds = Number(environment.LIVE_HOST_RECONNECT_GRACE_MS ?? 90_000);
   if (!Number.isFinite(hostReconnectGraceMilliseconds) || hostReconnectGraceMilliseconds < 0) {
     throw new Error("LIVE_HOST_RECONNECT_GRACE_MS가 올바르지 않습니다.");
@@ -212,8 +227,8 @@ export function readGatewayEnvironment(environment = process.env) {
     port: Number(environment.PORT ?? 8080),
     host: isExactLocalSupabase && canUseLocalSupabase ? "127.0.0.1" : "0.0.0.0",
     geminiApiKey: environment.GEMINI_API_KEY,
-    geminiLiveModel: environment.GEMINI_LIVE_MODEL,
-    geminiTextModel: String(environment.GEMINI_TEXT_MODEL ?? "gemini-3.6-flash").trim() || "gemini-3.6-flash",
+    geminiTranscribeModel: GEMINI_WORKLOAD_MODEL_MATRIX.transcription,
+    geminiTextModel: GEMINI_WORKLOAD_MODEL_MATRIX.translation,
     projectId: environment.GOOGLE_CLOUD_PROJECT,
     baseUrl: supabaseUrl.origin,
     supabaseApiKey: supabaseSecretKey || legacyServiceRoleKey,
@@ -222,6 +237,7 @@ export function readGatewayEnvironment(environment = process.env) {
     viewerSecret: environment.LIVE_VIEWER_TOKEN_SECRET.trim(),
     sttLanguageCodes,
     hostReconnectGraceMilliseconds,
+    participantDemandEnabled: participantDemandValue === "true",
     captionPolishPolicyWeights,
     externalEnvironment: "development",
   };

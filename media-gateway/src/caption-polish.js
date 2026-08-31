@@ -1,5 +1,7 @@
 import {
   preparePolishRequest,
+  redactGeminiSensitiveText,
+  GEMINI_WORKLOAD_MODEL_MATRIX,
   selectRelevantGlossary,
 } from "../../packages/caption-core/index.js";
 
@@ -42,7 +44,8 @@ export function safeProviderErrorIdentifier(error, fallbackCode = "PROVIDER_ERRO
  *   defaultDomain?: string,
  * }} [options]
  */
-export function createCaptionPolisher({ client, model = "gemini-3.6-flash", timeoutMs = DEFAULT_TIMEOUT_MS, defaultDomain = "" } = {}) {
+export function createCaptionPolisher({ client, model = "gemini-3.7-flash", timeoutMs = DEFAULT_TIMEOUT_MS, defaultDomain = "" } = {}) {
+  if (model !== GEMINI_WORKLOAD_MODEL_MATRIX.polish) throw new Error("GEMINI_MODEL_OVERRIDE_FORBIDDEN");
   const fallbackDomain = String(defaultDomain ?? "").trim();
   /**
    * @param {{
@@ -60,25 +63,33 @@ export function createCaptionPolisher({ client, model = "gemini-3.6-flash", time
     if (!client?.models?.generateContent || !model) return translatedText;
 
     let timeoutHandle;
+    const abortController = new AbortController();
     try {
       const response = await Promise.race([
         client.models.generateContent({
           model,
-          contents: [{ role: "user", parts: [{ text: prepared.prompt }] }],
+          contents: [{ role: "user", parts: [{ text: redactGeminiSensitiveText(prepared.prompt) }] }],
           config: {
-            systemInstruction: prepared.system,
-            thinkingConfig: { thinkingLevel: "minimal" },
+            abortSignal: abortController.signal,
+            systemInstruction: redactGeminiSensitiveText(prepared.system),
             maxOutputTokens: 1_024,
           },
         }),
         new Promise((_, reject) => {
-          timeoutHandle = setTimeout(() => reject(new Error("CAPTION_POLISH_TIMEOUT")), timeoutMs);
+          timeoutHandle = setTimeout(() => {
+            abortController.abort(new Error("CAPTION_POLISH_TIMEOUT"));
+            reject(new Error("CAPTION_POLISH_TIMEOUT"));
+          }, timeoutMs);
         }),
       ]).finally(() => clearTimeout(timeoutHandle));
       const polished = String(response?.text
         ?? response?.candidates?.[0]?.content?.parts?.map((part) => part?.text ?? "").join("")
         ?? "").trim();
-      return polished || translatedText;
+      if (!polished
+        || polished !== polished.normalize("NFC")
+        || /[<>\p{Cc}\p{Cf}]/u.test(polished)
+        || Array.from(polished).length > 4_000) return translatedText;
+      return polished;
     } catch (error) {
       console.warn(`[caption-polish] failed, using raw translation: ${safeProviderErrorIdentifier(error, "CAPTION_POLISH_FAILED")}`);
       return translatedText;

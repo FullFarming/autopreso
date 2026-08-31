@@ -18,56 +18,103 @@ const GLOSSARY = [
   "운영사 = operator",
 ].join("\n");
 
+const COMPILED_GLOSSARY = Object.freeze({
+  schemaVersion: 1,
+  fingerprint: `sha256:${"d".repeat(64)}`,
+  version: 3,
+  sourceLanguage: "en",
+  targetLanguages: Object.freeze(["ko"]),
+  domain: "Commercial real estate",
+  terms: Object.freeze([Object.freeze({
+    id: "compiled-cushman",
+    source: "Cushman",
+    translations: Object.freeze({ ko: "쿠시먼" }),
+    aliases: Object.freeze(["Kushiman"]),
+    pronunciation: null,
+    doNotTranslate: false,
+    forbiddenTranslations: Object.freeze([]),
+    context: null,
+    examples: Object.freeze([]),
+    tags: Object.freeze([]),
+    priority: 80,
+    provenance: Object.freeze({ kind: "manual", label: null }),
+  })]),
+  lookupEntries: Object.freeze([
+    Object.freeze({ termId: "compiled-cushman", kind: "source", value: "Cushman", normalizedValue: "cushman", priority: 80 }),
+    Object.freeze({ termId: "compiled-cushman", kind: "alias", value: "Kushiman", normalizedValue: "kushiman", priority: 80 }),
+  ]),
+  translationRules: Object.freeze([Object.freeze({
+    termId: "compiled-cushman",
+    source: "Cushman",
+    targetLanguage: "ko",
+    target: "쿠시먼",
+    forbiddenTranslations: Object.freeze([]),
+    priority: 80,
+  })]),
+  doNotTranslate: Object.freeze([]),
+  contextEntries: Object.freeze([]),
+});
+
 function createPipelineHarness({
   glossaryText = GLOSSARY,
+  compiledGlossary,
   translationTone = "natural",
   domainText = "",
+  translatedText = "쿠쉬먼앤드웨이크필드가 발표했습니다.",
 } = {}) {
   const events = [];
   const hostEvents = [];
-  const liveSessions = [];
-  const polishCalls = [];
-  const dependencies = {
-    liveTranslate: {
-      async open(options) {
-        const session = {
-          ...options,
-          async sendAudio() {},
-          async audioStreamEnd() {},
-          async close() {},
-        };
-        liveSessions.push(session);
-        return session;
-      },
-    },
-    captionPolish: {
-      async polish(input) {
-        polishCalls.push(input);
-        return input.translatedText;
-      },
-    },
-    publisher: {
-      async publish(_sessionId, _language, event, { onLiveEvent } = {}) {
-        await onLiveEvent?.(event);
-        events.push(event);
-      },
-      async publishAudio() {},
-      async markLive() {},
-    },
-  };
+  const speechSessions = [];
+  const translationCalls = [];
+  let sourceSeq = 0;
   const pipeline = new LiveMediaPipeline({
     sessionId: "local-term-session",
     sessionType: "meeting",
     outputMode: "captions",
     languages: ["en", "ko"],
     glossaryText,
+    compiledGlossary,
     translationTone,
     domainText,
     captionPolishPolicy: "full",
-    dependencies,
+    dependencies: {
+      speechToText: {
+        async open(options) {
+          const session = {
+            ...options,
+            async sendAudio() {},
+            async close() {},
+            async getFinalWords() { return []; },
+          };
+          speechSessions.push(session);
+          return session;
+        },
+      },
+      textTranslate: {
+        async translate(input) {
+          translationCalls.push(input);
+          return translatedText;
+        },
+      },
+      publisher: {
+        async persistAuthoritativeSource() {
+          sourceSeq += 1;
+          return {
+            sourceUtteranceId: `00000000-0000-4000-8000-${String(sourceSeq).padStart(12, "0")}`,
+            sourceSeq,
+            idempotent: false,
+          };
+        },
+        async publish(_sessionId, _language, event, { onLiveEvent } = {}) {
+          await onLiveEvent?.(event);
+          events.push(event);
+        },
+        async markLive() {},
+      },
+    },
     onHostEvent: (event) => hostEvents.push(event),
   });
-  return { pipeline, events, hostEvents, liveSessions, polishCalls };
+  return { pipeline, events, hostEvents, speechSessions, translationCalls };
 }
 
 async function settleProviderCallbacks() {
@@ -75,118 +122,110 @@ async function settleProviderCallbacks() {
   await new Promise((resolve) => setImmediate(resolve));
 }
 
-test("live source and translation records share exact-partial and fuzzy-final canonical terms", async () => {
+test("source and translated captions share the same canonical terminology", async () => {
   const harness = createPipelineHarness();
   await harness.pipeline.start();
-  const inputSession = harness.liveSessions[0];
-  const koreanSession = harness.liveSessions.find((session) => session.language === "ko");
+  harness.pipeline.setFloorSpeaker({ participantId: "p-term-parity", displayName: "참가자" });
 
-  await inputSession.onInputCaption({
-    text: "Kushi presented.",
-    isFinal: false,
-    languageCode: "en-US",
-    utteranceKey: "turn-1",
-  });
-  await koreanSession.onCaption({
-    text: "쿠쉬먼앤드웨이크필드가 발표했습니다.",
-    isFinal: false,
-    utteranceKey: "turn-1",
+  harness.speechSessions[0].onPartialTranscript({ text: "Kushi presented.", sourceLanguage: "en-US" });
+  await settleProviderCallbacks();
+  const sourcePartial = harness.events.find((event) => event.origin === "source" && !event.isFinal);
+  assert.equal(sourcePartial?.text, "Cushman & Wakefield presented.");
+  assert.equal(harness.translationCalls.length, 0, "partials stay on the source lane without model calls");
+
+  await harness.speechSessions[0].onFinalUtterance({
+    speakerLabel: "1",
+    text: "Kushimann presented.",
+    sourceLanguage: "en-US",
+    sourceEndedAt: "2026-08-27T00:00:00.000Z",
   });
   await settleProviderCallbacks();
-
-  const sourcePartial = harness.events.find((event) => event.origin === "source" && !event.isFinal);
-  const translationPartial = harness.events.find((event) => event.type === "caption" && event.language === "ko" && !event.isFinal);
-  assert.equal(sourcePartial.text, "Cushman & Wakefield presented.");
-  assert.ok(translationPartial, JSON.stringify(harness.events));
-  assert.equal(translationPartial.text, "쿠시먼앤드웨이크필드가 발표했습니다.");
-  assert.equal(harness.polishCalls.length, 0, "partials never retrieve or polish");
-
-  await inputSession.onInputCaption({
-    text: "Kushimann presented.",
-    isFinal: true,
-    languageCode: "en-US",
-    utteranceKey: "turn-1",
-  });
-  await koreanSession.onCaption({
-    text: "쿠쉬먼앤드웨이크필드가 발표했습니다.",
-    isFinal: true,
-    sourceText: "Kushimann presented.",
-    sourceLanguage: "en-US",
-    utteranceKey: "turn-1",
-  });
-
   const sourceFinal = harness.events.find((event) => event.origin === "source" && event.isFinal);
   const translationFinal = harness.events.find((event) => event.language === "ko" && event.isFinal);
-  assert.equal(sourceFinal.text, "Cushman & Wakefield presented.");
-  assert.equal(translationFinal.sourceText, sourceFinal.text);
-  assert.equal(translationFinal.utteranceKey, sourceFinal.utteranceKey);
-  assert.equal(translationFinal.text, "쿠시먼앤드웨이크필드가 발표했습니다.");
+  assert.equal(sourceFinal?.text, "Cushman & Wakefield presented.");
+  assert.equal(translationFinal?.sourceText, sourceFinal?.text);
+  assert.equal(translationFinal?.text, "쿠시먼앤드웨이크필드가 발표했습니다.");
   assert.deepEqual(
     harness.hostEvents.find((event) => event.language === "ko" && event.isFinal),
     translationFinal,
-    "the host mirror and persisted translation use the same repaired record",
   );
-  assert.equal(harness.polishCalls.length, 1);
-  assert.match(harness.polishCalls[0].glossary, /Kushi \/ Kushiman = Cushman & Wakefield/u);
-  assert.doesNotMatch(
-    harness.polishCalls[0].glossary,
-    /Mirai Asst/u,
-    "Live Call must send only the term evidence relevant to this cue",
-  );
+  assert.match(harness.translationCalls[0]?.glossaryText ?? "", /Kushi \/ Kushiman = Cushman & Wakefield/u);
+  assert.doesNotMatch(harness.translationCalls[0]?.glossaryText ?? "", /Mirai Asst/u);
   await harness.pipeline.close();
 });
 
-test("explicit full policy still sends only a bounded relevant glossary slice", async () => {
-  const unrelatedTail = Array.from(
-    { length: 300 },
-    (_, index) => `무관용어-${index} = unrelated-term-${index}`,
-  ).join("\n");
-  const glossaryText = `${GLOSSARY}\n[무관 섹션]\n${unrelatedTail}`;
+test("full policy sends only a bounded relevant glossary slice", async () => {
+  const unrelatedTail = Array.from({ length: 300 }, (_, index) => `무관용어-${index} = unrelated-term-${index}`).join("\n");
   const harness = createPipelineHarness({
-    glossaryText,
+    glossaryText: `${GLOSSARY}\n[무관 섹션]\n${unrelatedTail}`,
     translationTone: "business",
     domainText: "Commercial real estate",
+    translatedText: "회의를 시작하겠습니다.",
   });
   await harness.pipeline.start();
-  const koreanSession = harness.liveSessions.find((session) => session.language === "ko");
-  await koreanSession.onCaption({
-    text: "회의를 시작하겠습니다.",
-    sourceText: "We will start the meeting now.",
+  await harness.pipeline.acceptFinalUtterance({
+    speakerLabel: "1",
+    text: "We will start the meeting with Kushi now.",
     sourceLanguage: "en-US",
-    utteranceKey: "ordinary-full-final",
-    isFinal: true,
+    sourceEndedAt: "2026-08-27T00:00:00.000Z",
   });
-
-  assert.equal(harness.polishCalls.length, 1);
-  assert.equal(harness.polishCalls[0].tone, "business");
-  assert.equal(harness.polishCalls[0].domain, "Commercial real estate");
-  assert.match(harness.polishCalls[0].glossary, /등록된 용어가 실제 문맥에 있을 때만 적용/u);
-  assert.doesNotMatch(harness.polishCalls[0].glossary, /무관용어-0/u);
-  assert.ok(harness.polishCalls[0].glossary.length <= localTermRetrievalContract.maximumPromptCharacters);
+  const glossary = harness.translationCalls[0]?.glossaryText ?? "";
+  assert.match(glossary, /Kushi \/ Kushiman/u);
+  assert.doesNotMatch(glossary, /무관용어-0/u);
+  assert.ok(glossary.length <= localTermRetrievalContract.maximumPromptCharacters);
   await harness.pipeline.close();
 });
 
-test("live source repair leaves numeric notation and ordinary vocabulary unchanged", async () => {
+test("source repair leaves numeric notation and ordinary vocabulary unchanged", async () => {
   const harness = createPipelineHarness();
   await harness.pipeline.start();
-  await harness.liveSessions[0].onInputCaption({
+  await harness.pipeline.acceptFinalUtterance({
+    speakerLabel: "1",
     text: "운영사에서 3,000억 원을 검토했습니다.",
-    isFinal: true,
-    languageCode: "ko-KR",
-    utteranceKey: "ordinary-1",
+    sourceLanguage: "ko-KR",
+    sourceEndedAt: "2026-08-27T00:00:00.000Z",
   });
   const source = harness.events.find((event) => event.origin === "source" && event.isFinal);
-  assert.equal(source.text, "운영사에서 3,000억 원을 검토했습니다.");
+  assert.equal(source?.text, "운영사에서 3,000억 원을 검토했습니다.");
   await harness.pipeline.close();
 });
 
-test("Gemini text fallback isolates glossary instructions and enforces shared prompt/query caps", async () => {
+test("compiled session glossary changes only committed source finals", async () => {
+  const harness = createPipelineHarness({ glossaryText: "", compiledGlossary: COMPILED_GLOSSARY });
+  await harness.pipeline.start();
+  harness.speechSessions[0].onPartialTranscript({ text: "Kushiman presented.", sourceLanguage: "en-US" });
+  await settleProviderCallbacks();
+  assert.equal(
+    harness.events.find((event) => event.origin === "source" && !event.isFinal)?.text,
+    "Kushiman presented.",
+  );
+
+  await harness.speechSessions[0].onFinalUtterance({
+    speakerLabel: "1",
+    text: "Kushiman presented.",
+    sourceLanguage: "en-US",
+    sourceEndedAt: "2026-08-27T00:00:00.000Z",
+  });
+  await settleProviderCallbacks();
+  const sourceFinal = harness.events.find((event) => event.origin === "source" && event.isFinal);
+  assert.equal(sourceFinal?.text, "Cushman presented.");
+  await harness.pipeline.close();
+  assert.equal(
+    harness.pipeline.termRetriever.retrieve({ sourceText: "Cushman", targetLanguage: "ko", isFinal: true }),
+    "",
+    "pipeline close must evict its compiled session index",
+  );
+});
+
+test("Gemini text translation isolates glossary instructions and enforces prompt/query caps", async () => {
   const requests = [];
   const client = {
     models: {
       async generateContent(request) {
         requests.push(request);
-        return { text: "Translated business caption." };
+        const digits = String(JSON.parse(request.contents[0].parts[0].text.split("\n")[2]).utterance ?? "")
+          .match(/\d[\d,.]*/gu) ?? [];
+        return { text: `Translated business caption ${digits.join(" ")}`.trim() };
       },
     },
   };
@@ -202,14 +241,7 @@ test("Gemini text fallback isolates glossary instructions and enforces shared pr
   ].join("\n");
   const sourceText = terms.map((_, index) => `Registered Company ${index}`).join(" ");
 
-  await adapter.translate({
-    text: sourceText,
-    language: "en",
-    sourceLanguage: "ko",
-    glossaryText,
-    intent: "final",
-  });
-
+  await adapter.translate({ text: sourceText, language: "en", sourceLanguage: "ko", glossaryText, intent: "final" });
   const first = requests[0];
   assert.match(first.config.systemInstruction, /SECURITY BOUNDARY/u);
   const promptLines = first.contents[0].parts[0].text.split("\n");

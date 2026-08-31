@@ -11,31 +11,50 @@ import { LiveMediaPipeline } from "../src/live-media-pipeline.js";
 import { resolvePipelineInitialSequences } from "../src/server.js";
 
 const INPUT_FRAME_BYTES = AUDIO_CONFIG.inputSampleRate * 2 * AUDIO_CONFIG.chunkMilliseconds / 1_000;
+const SESSION_ID = "11111111-1111-4111-8111-111111111111";
+const GRANT_ID = "22222222-2222-4222-8222-222222222222";
+const VIEWER_ID = "33333333-3333-4333-8333-333333333333";
 
 function signToken(secret, claims) {
   const encoded = Buffer.from(JSON.stringify(claims)).toString("base64url");
   return `${encoded}.${createHmac("sha256", secret).update(encoded).digest("hex")}`;
 }
 
-function hostToken(secret) {
+function hostToken(secret, sessionId = SESSION_ID) {
   const nowSeconds = Math.floor(Date.now() / 1_000);
   return signToken(secret, {
-    role: "HOST", sub: "host-1", sessionId: "session-1", aud: "media-gateway",
+    role: "HOST", sub: "host-1", sessionId, aud: "media-gateway",
     iat: nowSeconds, exp: nowSeconds + 900,
   });
 }
 
 function viewerToken(secret) {
-  const now = Date.now();
+  const nowSeconds = Math.floor(Date.now() / 1_000);
   return signToken(secret, {
-    role: "VIEWER", grantId: "grant-1", userId: "participant-1", sessionId: "session-1",
-    issuedAt: now, expiresAt: now + 60_000,
+    role: "VIEWER",
+    sub: VIEWER_ID,
+    grantId: GRANT_ID,
+    sessionId: SESSION_ID,
+    aud: "live-gateway-viewer",
+    jti: "44444444-4444-4444-8444-444444444444",
+    iat: nowSeconds,
+    exp: nowSeconds + 60,
   });
 }
 
-async function nextJson(webSocket) {
-  const [data] = await once(webSocket, "message");
-  return JSON.parse(data.toString("utf8"));
+function nextJson(webSocket, predicate = () => true) {
+  return new Promise((resolve, reject) => {
+    const cleanup = () => { webSocket.off("message", onMessage); webSocket.off("close", onClose); };
+    const onClose = () => { cleanup(); reject(new Error("SOCKET_CLOSED_BEFORE_EXPECTED_MESSAGE")); };
+    const onMessage = (data) => {
+      const message = JSON.parse(data.toString("utf8"));
+      if (!predicate(message)) return;
+      cleanup();
+      resolve(message);
+    };
+    webSocket.on("message", onMessage);
+    webSocket.once("close", onClose);
+  });
 }
 
 async function waitFor(predicate) {
@@ -47,24 +66,26 @@ async function waitFor(predicate) {
 }
 
 function pipelineDependencies() {
-  const sessions = [];
   return {
-    sessions,
     dependencies: {
-      liveTranslate: {
-        async open(options) {
-          const session = {
-            ...options,
-            async sendAudio() {}, async audioStreamEnd() {}, async close() {},
-          };
-          sessions.push(session);
-          return session;
+      speechToText: {
+        async open() {
+          return { async sendAudio() {}, async close() {}, async getFinalWords() { return []; } };
         },
       },
-      openaiLiveTranslate: { async open() { throw new Error("UNUSED"); } },
-      textTranslate: { async translate() { throw new Error("UNUSED"); } },
-      textToSpeech: { async *synthesizeStream() {} },
+      textTranslate: {
+        async translate({ language }) {
+          return language === "ko" ? "저장 실패 자막" : "A caption that cannot persist";
+        },
+      },
       publisher: {
+        async persistAuthoritativeSource() {
+          return {
+            sourceUtteranceId: "00000000-0000-4000-8000-000000000001",
+            sourceSeq: 1,
+            idempotent: false,
+          };
+        },
         async publish(_sessionId, _language, event) {
           if (event.type === "caption") throw new Error("DURABLE_CAPTION_PERSIST_FAILED");
         },
@@ -87,367 +108,166 @@ test("a pipeline reports concurrent durable caption failures exactly once", asyn
   });
   await pipeline.start();
 
-  await Promise.allSettled(state.sessions.map((session) => session.onCaption({
-    text: session.language === "ko" ? "저장 실패 자막" : "A caption that cannot persist",
-    isFinal: true,
-  })));
+  await pipeline.acceptFinalUtterance({
+    speakerLabel: "1",
+    text: "저장 실패 자막",
+    sourceLanguage: "ko",
+    sourceEndedAt: "2026-08-27T00:00:00.000Z",
+  });
 
   assert.equal(fatalErrors.length, 1);
   assert.equal(fatalErrors[0].message, "DURABLE_CAPTION_PERSIST_FAILED");
   await pipeline.close();
 });
 
-test("durable failure swaps one pipeline while preserving socket, session, and speaking floor", async (context) => {
+async function createFailureHarness(context, { rejectRestart = false, rejectClose = false, failInitialStart = false } = {}) {
   const pipelines = [];
-  let recoveryAttempts = 0;
+  let allowRestart = !rejectRestart;
   const gateway = createGatewayServer({
-    gatewaySecret: "gateway-secret",
-    viewerSecret: "viewer-secret",
-    hostAuthorizer: { async authorize() { return true; } },
-    viewerAuthorizer: { async authorize() { return true; } },
-    floorTakeCooldownMilliseconds: 0,
-    durableRecoveryRetryDelaysMilliseconds: [50],
-    durableRecoveryAttemptTimeoutMilliseconds: 5,
-    recoveryAudioSpoolMilliseconds: 800,
-    floorController: {
-      async take() { return { ok: true, participantId: "participant-1", displayName: "참여자" }; },
-      async release() { return true; },
-    },
-    async pipelineFactory(settings, previous, onHostEvent, options = {}) {
-      if (options.recoveryReason === "durable-caption") {
-        recoveryAttempts += 1;
-        if (recoveryAttempts === 1) {
-          return new Promise((resolve, reject) => {
-            options.signal.addEventListener(
-              "abort",
-              () => reject(options.signal.reason),
-              { once: true },
-            );
-          });
-        }
-      }
+    gatewaySecret: "gateway-secret", viewerSecret: "viewer-secret",
+    hostAuthorizer: { async authorize(_claims, settings) { return settings.type !== "restart" || allowRestart; } },
+    viewerAuthorizer: { async authorizeBatch(requests) { return new Map(requests.map(({ key }) => [key, true])); } },
+    async pipelineFactory(settings, previous, _onHostEvent, options) {
       const pipeline = {
-        settings,
-        previous,
-        options,
-        closed: 0,
-        paused: 0,
-        frames: [],
-        hostEvents: [],
-        floorSpeakers: [],
-        async start() {}, async tick() {}, async endAudioStream() {},
-        async acceptAudio(frame) {
-          this.frames.push(frame[0]);
-          const event = { type: "caption", sessionId: settings.sessionId, language: "ko", seq: 6, text: "복구 후 자막", isFinal: true };
-          this.hostEvents.push(event);
-          onHostEvent(event);
-        },
-        pause() { this.paused += 1; },
-        setFloorSpeaker(speaker) { this.floorSpeakers.push(speaker); },
-        async close() { this.closed += 1; },
-      };
-      pipelines.push(pipeline);
-      return pipeline;
-    },
-  });
-  await new Promise((resolve) => gateway.server.listen(0, "127.0.0.1", resolve));
-  context.after(async () => gateway.close());
-  const { port } = gateway.server.address();
-
-  const host = new WebSocket(`ws://127.0.0.1:${port}/live`);
-  const participant = new WebSocket(`ws://127.0.0.1:${port}/live`);
-  context.after(() => host.terminate());
-  context.after(() => participant.terminate());
-  await Promise.all([once(host, "open"), once(participant, "open")]);
-
-  let received = nextJson(host);
-  host.send(JSON.stringify({ type: "authenticate", token: hostToken("gateway-secret") }));
-  assert.equal((await received).type, "authenticated");
-  received = nextJson(host);
-  host.send(JSON.stringify({
-    type: "start", sessionId: "session-1", version: 1,
-    sessionType: "meeting", outputMode: "captions", languages: ["ko", "en"],
-  }));
-  assert.equal((await received).type, "started");
-
-  received = nextJson(participant);
-  participant.send(JSON.stringify({ type: "authenticate", token: viewerToken("viewer-secret") }));
-  assert.equal((await received).type, "authenticated");
-  received = nextJson(participant);
-  participant.send(JSON.stringify({ type: "subscribe", sessionId: "session-1", language: "ko" }));
-  assert.equal((await received).type, "subscribed");
-  received = nextJson(participant);
-  participant.send(JSON.stringify({ type: "speak-start", sessionId: "session-1" }));
-  assert.equal((await received).type, "speak-started");
-
-  const failure = new Error("DURABLE_CAPTION_PERSIST_FAILED");
-  pipelines[0].options.onFatalError(failure);
-  pipelines[0].options.onFatalError(new Error("DURABLE_CAPTION_LANE_FAILED"));
-  for (let index = 0; index < 25; index += 1) {
-    const frame = Buffer.alloc(INPUT_FRAME_BYTES);
-    frame[0] = index;
-    participant.send(frame);
-  }
-  await waitFor(() => pipelines.length === 2);
-  await waitFor(() => pipelines[0].closed === 1);
-
-  assert.equal(host.readyState, WebSocket.OPEN);
-  assert.equal(participant.readyState, WebSocket.OPEN);
-  assert.equal(pipelines.length, 2, "concurrent failures must coalesce into one replacement");
-  assert.equal(recoveryAttempts, 2, "the one recovery flight retries replacement, not the failed final");
-  assert.equal(pipelines[0].paused, 1, "the ambiguous pipeline is quarantined before reconciliation");
-  assert.equal(pipelines[1].previous, pipelines[0]);
-  assert.equal(pipelines[1].options.recoveryReason, "durable-caption");
-  assert.equal(pipelines[1].settings.sessionId, "session-1");
-  assert.equal(pipelines[1].floorSpeakers.at(-1)?.participantId, "participant-1");
-
-  await waitFor(() => pipelines[1].frames.length === 20);
-  assert.deepEqual(pipelines[0].frames, []);
-  assert.deepEqual(
-    pipelines[1].frames,
-    Array.from({ length: 20 }, (_, index) => index + 5),
-    "the rolling 800ms cap evicts oldest frames but preserves retained order",
-  );
-  assert.equal(pipelines[1].hostEvents.at(-1)?.text, "복구 후 자막");
-});
-
-test("audio arriving while the failed provider closes is drained before recovery returns to direct routing", async (context) => {
-  const pipelines = [];
-  let releaseFailedClose;
-  let markFailedCloseStarted;
-  const failedCloseStarted = new Promise((resolve) => { markFailedCloseStarted = resolve; });
-  const failedCloseGate = new Promise((resolve) => { releaseFailedClose = resolve; });
-  const gateway = createGatewayServer({
-    gatewaySecret: "gateway-secret",
-    viewerSecret: "viewer-secret",
-    hostAuthorizer: { async authorize() { return true; } },
-    viewerAuthorizer: { async authorize() { return true; } },
-    audioBurstMilliseconds: 30_000,
-    durableRecoveryRetryDelaysMilliseconds: [0],
-    durableRecoveryAttemptTimeoutMilliseconds: 1_000,
-    recoveryAudioSpoolMilliseconds: 2_000,
-    async pipelineFactory(_settings, _previous, _onHostEvent, options = {}) {
-      const isFailedPipeline = pipelines.length === 0;
-      const pipeline = {
-        options,
-        frames: [],
-        async start() {}, async tick() {}, async endAudioStream() {},
+        settings, previous, options, frames: [], closed: 0, paused: 0,
+        async start() { if (failInitialStart && pipelines[0] === this) throw new Error("PROVIDER_START_FAILED"); }, async tick() {}, async endAudioStream() {},
         async acceptAudio(frame) { this.frames.push(frame[0]); },
-        pause() {},
-        async close() {
-          if (!isFailedPipeline) return;
-          markFailedCloseStarted();
-          await failedCloseGate;
-        },
+        async pause() { this.paused += 1; },
+        async close() { this.closed += 1; if (rejectClose) throw new Error("PROVIDER_CLOSE_FAILED"); },
       };
       pipelines.push(pipeline);
       return pipeline;
     },
   });
   await new Promise((resolve) => gateway.server.listen(0, "127.0.0.1", resolve));
-  context.after(async () => gateway.close());
-  const host = new WebSocket(`ws://127.0.0.1:${gateway.server.address().port}/live`);
-  context.after(() => host.terminate());
-  await once(host, "open");
-  let received = nextJson(host);
-  host.send(JSON.stringify({ type: "authenticate", token: hostToken("gateway-secret") }));
-  assert.equal((await received).type, "authenticated");
-  received = nextJson(host);
-  host.send(JSON.stringify({
-    type: "start", sessionId: "session-1", version: 1,
-    sessionType: "meeting", outputMode: "captions", languages: ["ko", "en"],
-  }));
-  assert.equal((await received).type, "started");
+  context.after(() => gateway.close());
+  const port = gateway.server.address().port;
+  async function connect() {
+    const socket = new WebSocket(`ws://127.0.0.1:${port}/live`);
+    context.after(() => socket.terminate());
+    await once(socket, "open");
+    const received = nextJson(socket);
+    socket.send(JSON.stringify({ type: "authenticate", token: hostToken("gateway-secret") }));
+    assert.equal((await received).type, "authenticated");
+    return socket;
+  }
+  async function command(socket, type = "start") {
+    const received = nextJson(socket, (message) => message.type === "error" || message.type === (type === "restart" ? "restarted" : type === "update" ? "updated" : "started"));
+    socket.send(JSON.stringify({ type, sessionId: SESSION_ID, version: 1,
+      sessionType: "meeting", outputMode: "captions", languages: ["ko", "en"] }));
+    return received;
+  }
+  const host = await connect();
+  assert.equal((await command(host)).type, failInitialStart ? "error" : "started");
+  return { gateway, pipelines, host, connect, command, allowRestart() { allowRestart = true; } };
+}
 
-  pipelines[0].options.onFatalError(new Error("AUDIO_LANE_TIMEOUT"));
-  const beforeClose = Buffer.alloc(INPUT_FRAME_BYTES);
-  beforeClose[0] = 1;
-  host.send(beforeClose);
-  await failedCloseStarted;
-  const duringClose = Buffer.alloc(INPUT_FRAME_BYTES);
-  duringClose[0] = 2;
-  host.send(duringClose);
-  await waitFor(() => /durable_recovery_audio_frames_spooled_total 2/u.test(gateway.metrics.render()));
-  releaseFailedClose();
+for (const code of ["DURABLE_CAPTION_PERSIST_FAILED", "AUTHORITATIVE_SOURCE_PERSIST_FAILED", "TRANSLATION_LANGUAGE_DRIFT"]) {
+  test(`${code} closes the paid pipeline once and blocks automatic reconnect without a new factory`, async (context) => {
+    const { pipelines, host, connect, command } = await createFailureHarness(context);
+    const failure = nextJson(host, (message) => message.type === "error");
+    const closed = once(host, "close");
+    pipelines[0].options.onFatalError(new Error(code));
+    pipelines[0].options.onFatalError(new Error(code));
+    assert.equal((await failure).code, "PIPELINE_RESTART_REQUIRED");
+    await closed;
+    await waitFor(() => pipelines[0].closed === 1);
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const reconnect = await connect();
+      assert.equal((await command(reconnect)).code, "PIPELINE_RESTART_REQUIRED");
+      reconnect.close();
+    }
+    assert.equal(pipelines.length, 1, "reconnect cannot reset a paid recovery budget");
+    assert.equal(pipelines[0].closed, 1);
+    assert.deepEqual(pipelines[0].frames, []);
+  });
+}
 
-  await waitFor(() => pipelines[1].frames.length === 2);
-  const afterRecovery = Buffer.alloc(INPUT_FRAME_BYTES);
-  afterRecovery[0] = 3;
-  host.send(afterRecovery);
-  await waitFor(() => pipelines[1].frames.length === 3);
-  assert.deepEqual(pipelines[1].frames, [1, 2, 3]);
+test("ordinary detach cleanup failure also prevents a new paid pipeline", async (context) => {
+  const { pipelines, host, connect, command } = await createFailureHarness(context, { rejectClose: true });
+  const response = nextJson(host, (message) => message.type === "error");
+  host.send(JSON.stringify({ type: "detach" }));
+  assert.equal((await response).code, "PIPELINE_CLEANUP_FAILED");
+  const reconnect = await connect();
+  assert.equal((await command(reconnect)).code, "PIPELINE_CLEANUP_FAILED");
+  assert.equal((await command(reconnect, "restart")).code, "PIPELINE_CLEANUP_FAILED");
+  assert.equal(pipelines.length, 1);
 });
 
-test("removing the host session cancels a pending durable recovery retry", async () => {
-  let recoveryAttempts = 0;
-  let firstPipeline = null;
-  const gateway = createGatewayServer({
-    gatewaySecret: "gateway-secret",
-    viewerSecret: "viewer-secret",
-    hostAuthorizer: { async authorize() { return true; } },
-    viewerAuthorizer: { async authorize() { return true; } },
-    hostReconnectGraceMilliseconds: 0,
-    durableRecoveryRetryDelaysMilliseconds: [10_000],
-    async pipelineFactory(_settings, _previous, _onHostEvent, options = {}) {
-      if (options.recoveryReason === "durable-caption") {
-        recoveryAttempts += 1;
-        throw new Error("RECONCILIATION_UNAVAILABLE");
-      }
-      firstPipeline = {
-        options,
-        async start() {}, async tick() {}, async acceptAudio() {}, async endAudioStream() {},
-        pause() {}, async close() {},
-      };
-      return firstPipeline;
-    },
-  });
-  await new Promise((resolve) => gateway.server.listen(0, "127.0.0.1", resolve));
-  const host = new WebSocket(`ws://127.0.0.1:${gateway.server.address().port}/live`);
-  await once(host, "open");
-  let received = nextJson(host);
-  host.send(JSON.stringify({ type: "authenticate", token: hostToken("gateway-secret") }));
-  assert.equal((await received).type, "authenticated");
-  received = nextJson(host);
-  host.send(JSON.stringify({
-    type: "start", sessionId: "session-1", version: 1,
-    sessionType: "meeting", outputMode: "captions", languages: ["ko", "en"],
-  }));
-  assert.equal((await received).type, "started");
+test("a replacement closes its new candidate if the old paid provider cannot be released", async (context) => {
+  const { pipelines, host, connect, command } = await createFailureHarness(context, { rejectClose: true });
+  assert.equal((await command(host, "restart")).code, "PIPELINE_CLEANUP_FAILED");
+  assert.equal(pipelines.length, 2);
+  assert.equal(pipelines[1].closed, 1, "a prepared replacement cannot keep running after old cleanup fails");
+  const reconnect = await connect();
+  assert.equal((await command(reconnect)).code, "PIPELINE_CLEANUP_FAILED");
+  assert.equal(pipelines.length, 2);
+});
 
-  firstPipeline.options.onFatalError(new Error("DURABLE_CAPTION_PERSIST_FAILED"));
-  await waitFor(() => recoveryAttempts === 1);
+test("resume acknowledges only after provider readiness and a failed resume requires manual restart", async (context) => {
+  const { pipelines, host, connect, command } = await createFailureHarness(context);
+  let resolveResume;
+  let entered = false;
+  const resumeGate = new Promise((resolve) => { resolveResume = resolve; });
+  pipelines[0].resume = async () => { entered = true; await resumeGate; throw new Error("STT_RESUME_FAILED"); };
+  const messages = [];
+  host.on("message", (data) => messages.push(JSON.parse(data.toString())));
+  host.send(JSON.stringify({ type: "resume" }));
+  await waitFor(() => entered);
+  assert.equal(messages.some((message) => message.type === "resumed"), false);
   const closed = once(host, "close");
-  host.close();
+  resolveResume();
   await closed;
-  await new Promise((resolve) => setTimeout(resolve, 20));
-  assert.equal(recoveryAttempts, 1, "session removal must cancel the scheduled retry");
-  await gateway.close();
+  assert.equal(messages.some((message) => message.type === "resumed"), false);
+  assert.equal(messages.some((message) => message.code === "PIPELINE_RESTART_REQUIRED"), true);
+  const reconnect = await connect();
+  assert.equal((await command(reconnect)).code, "PIPELINE_RESTART_REQUIRED");
+  assert.equal(pipelines.length, 1);
 });
 
-test("a reattaching host preempts a hung recovery attempt without losing the preserved session", async (context) => {
-  let initialPipeline = null;
-  let recoveryAttempts = 0;
-  const gateway = createGatewayServer({
-    gatewaySecret: "gateway-secret",
-    viewerSecret: "viewer-secret",
-    hostAuthorizer: { async authorize() { return true; } },
-    viewerAuthorizer: { async authorize() { return true; } },
-    hostReconnectGraceMilliseconds: 45_000,
-    durableRecoveryRetryDelaysMilliseconds: [20_000],
-    durableRecoveryAttemptTimeoutMilliseconds: 10_000,
-    async pipelineFactory(_settings, _previous, _onHostEvent, options = {}) {
-      if (options.recoveryReason === "durable-caption") {
-        recoveryAttempts += 1;
-        return new Promise((resolve, reject) => {
-          options.signal.addEventListener("abort", () => reject(options.signal.reason), { once: true });
-        });
-      }
-      initialPipeline = {
-        options,
-        async start() {}, async tick() {}, async acceptAudio() {}, async endAudioStream() {},
-        pause() {}, async close() {},
-      };
-      return initialPipeline;
-    },
-  });
-  await new Promise((resolve) => gateway.server.listen(0, "127.0.0.1", resolve));
-  context.after(async () => gateway.close());
-  const url = `ws://127.0.0.1:${gateway.server.address().port}/live`;
-  const startMessage = {
-    type: "start", sessionId: "session-1", version: 1,
-    sessionType: "meeting", outputMode: "captions", languages: ["ko", "en"],
-  };
-  const first = new WebSocket(url);
-  await once(first, "open");
-  let received = nextJson(first);
-  first.send(JSON.stringify({ type: "authenticate", token: hostToken("gateway-secret") }));
-  assert.equal((await received).type, "authenticated");
-  received = nextJson(first);
-  first.send(JSON.stringify(startMessage));
-  assert.equal((await received).type, "started");
-  initialPipeline.options.onFatalError(new Error("DURABLE_CAPTION_PERSIST_FAILED"));
-  await waitFor(() => recoveryAttempts === 1);
-  const firstClosed = once(first, "close");
-  first.terminate();
-  await firstClosed;
-
-  const second = new WebSocket(url);
-  context.after(() => second.terminate());
-  await once(second, "open");
-  received = nextJson(second);
-  second.send(JSON.stringify({ type: "authenticate", token: hostToken("gateway-secret") }));
-  assert.equal((await received).type, "authenticated");
-  received = nextJson(second);
-  second.send(JSON.stringify(startMessage));
-  assert.equal((await received).type, "started");
-  assert.equal(initialPipeline.options.onFatalError instanceof Function, true);
+test("initial provider startup failure cannot be retried by automatic start messages", async (context) => {
+  const { pipelines, host, connect, command } = await createFailureHarness(context, { failInitialStart: true });
+  assert.equal(pipelines[0].closed, 1);
+  assert.equal((await command(host)).code, "PIPELINE_RESTART_REQUIRED");
+  host.close();
+  const reconnect = await connect();
+  assert.equal((await command(reconnect)).code, "PIPELINE_RESTART_REQUIRED");
+  assert.equal(pipelines.length, 1);
+  assert.equal((await command(reconnect, "restart")).type, "restarted");
+  assert.equal(pipelines.length, 2);
 });
 
-test("recovery drops spooled audio that aged past the bounded window while the room was silent", async (context) => {
-  let clock = Date.now();
-  let rejectFirstRecovery;
-  let recoveryAttempts = 0;
-  const pipelines = [];
-  const gateway = createGatewayServer({
-    gatewaySecret: "gateway-secret",
-    viewerSecret: "viewer-secret",
-    hostAuthorizer: { async authorize() { return true; } },
-    viewerAuthorizer: { async authorize() { return true; } },
-    now: () => clock,
-    audioBurstMilliseconds: 30_000,
-    recoveryAudioSpoolMilliseconds: 800,
-    durableRecoveryRetryDelaysMilliseconds: [0],
-    durableRecoveryAttemptTimeoutMilliseconds: 1_000,
-    async pipelineFactory(_settings, _previous, _onHostEvent, options = {}) {
-      if (options.recoveryReason === "durable-caption") {
-        recoveryAttempts += 1;
-        if (recoveryAttempts === 1) {
-          return new Promise((resolve, reject) => { rejectFirstRecovery = reject; });
-        }
-      }
-      const pipeline = {
-        options,
-        frames: [],
-        async start() {}, async tick() {}, async endAudioStream() {},
-        async acceptAudio(frame) { this.frames.push(frame[0]); },
-        pause() {}, async close() {},
-      };
-      pipelines.push(pipeline);
-      return pipeline;
-    },
-  });
-  await new Promise((resolve) => gateway.server.listen(0, "127.0.0.1", resolve));
-  context.after(async () => gateway.close());
-  const host = new WebSocket(`ws://127.0.0.1:${gateway.server.address().port}/live`);
-  context.after(() => host.terminate());
-  await once(host, "open");
-  let received = nextJson(host);
-  host.send(JSON.stringify({ type: "authenticate", token: hostToken("gateway-secret") }));
-  assert.equal((await received).type, "authenticated");
-  received = nextJson(host);
-  host.send(JSON.stringify({
-    type: "start", sessionId: "session-1", version: 1,
-    sessionType: "meeting", outputMode: "captions", languages: ["ko", "en"],
-  }));
-  assert.equal((await received).type, "started");
-
+test("only an authorized explicit restart clears the failure tombstone and reconciles persisted sequences", async (context) => {
+  const { pipelines, host, connect, command, allowRestart } = await createFailureHarness(context, { rejectRestart: true });
+  const closed = once(host, "close");
   pipelines[0].options.onFatalError(new Error("DURABLE_CAPTION_PERSIST_FAILED"));
-  await waitFor(() => recoveryAttempts === 1 && typeof rejectFirstRecovery === "function");
-  for (let index = 0; index < 3; index += 1) {
-    const frame = Buffer.alloc(INPUT_FRAME_BYTES);
-    frame[0] = index;
-    host.send(frame);
-  }
-  await waitFor(() => /durable_recovery_audio_frames_spooled_total 3/u.test(gateway.metrics.render()));
-  clock += 1_000;
-  rejectFirstRecovery(new Error("RECONCILIATION_TEMPORARILY_UNAVAILABLE"));
-  await waitFor(() => pipelines.length === 2);
-  assert.deepEqual(pipelines[1].frames, []);
-  assert.match(gateway.metrics.render(), /durable_recovery_audio_frames_dropped_total 3/u);
+  await closed;
+  await waitFor(() => pipelines[0].closed === 1);
+  const reconnect = await connect();
+  assert.equal((await command(reconnect, "update")).code, "PIPELINE_RESTART_REQUIRED");
+  assert.equal((await command(reconnect, "restart")).code, "SESSION_REVOKED");
+  assert.equal(pipelines.length, 1);
+  allowRestart();
+  assert.equal((await command(reconnect, "restart")).type, "restarted");
+  assert.equal(pipelines.length, 2);
+  assert.equal(pipelines[1].options.recoveryReason, "durable-caption");
+  assert.equal(pipelines[1].options.requireDurableSeed, true);
+  assert.equal(pipelines[0].closed, 1);
+});
+
+test("failed provider cleanup keeps explicit restart blocked instead of overlapping paid resources", async (context) => {
+  const { pipelines, host, connect, command } = await createFailureHarness(context, { rejectClose: true });
+  const closed = once(host, "close");
+  pipelines[0].options.onFatalError(new Error("DURABLE_CAPTION_PERSIST_FAILED"));
+  await closed;
+  await waitFor(() => pipelines[0].closed >= 1);
+  const reconnect = await connect();
+  assert.equal((await command(reconnect, "restart")).code, "PIPELINE_CLEANUP_FAILED");
+  assert.equal(pipelines.length, 1);
 });
 
 test("durable recovery seeds only from reconciled persisted maxima", async () => {
-  const message = { sessionId: "session-1", languages: ["ko", "en"] };
+  const message = { sessionId: SESSION_ID, languages: ["ko", "en"] };
   const previousPipeline = { lastSequences: { ko: 9, en: 10 } };
   const reconciled = [];
   const publisher = {
@@ -461,17 +281,49 @@ test("durable recovery seeds only from reconciled persisted maxima", async () =>
   assert.deepEqual(await resolvePipelineInitialSequences({
     publisher, message, previousPipeline, recoveryReason: "durable-caption",
   }), { ko: 7, en: 3 });
-  assert.deepEqual(reconciled, [["session-1", "ko"], ["session-1", "en"]]);
+  assert.deepEqual(reconciled, [[SESSION_ID, "ko"], [SESSION_ID, "en"]]);
   assert.deepEqual(await resolvePipelineInitialSequences({
     publisher, message, previousPipeline,
   }), { ko: 9, en: 10 });
+});
+
+test("a pipeline seed resets the authoritative-source latch only after reconciliation succeeds", async () => {
+  const message = { sessionId: SESSION_ID, languages: ["ko", "en"] };
+  const resets = [];
+  const publisher = {
+    async fetchLastUtteranceSeqs() { return { ko: 7, en: 3 }; },
+    async reconcileCaptionLane(_sessionId, language) { return language === "ko" ? 7 : 3; },
+    resetAuthoritativeSourceLane(sessionId) { resets.push(sessionId); },
+  };
+
+  await resolvePipelineInitialSequences({
+    publisher, message, recoveryReason: "durable-caption",
+  });
+  assert.deepEqual(resets, [SESSION_ID]);
+
+  await resolvePipelineInitialSequences({ publisher, message });
+  assert.deepEqual(resets, [SESSION_ID, SESSION_ID]);
+
+  const failingResets = [];
+  await assert.rejects(
+    resolvePipelineInitialSequences({
+      publisher: {
+        async reconcileCaptionLane() { throw new Error("REQUEST_TIMEOUT"); },
+        resetAuthoritativeSourceLane(sessionId) { failingResets.push(sessionId); },
+      },
+      message,
+      recoveryReason: "durable-caption",
+    }),
+    /DURABLE_CAPTION_RECOVERY_SEED_FAILED/,
+  );
+  assert.deepEqual(failingResets, []);
 });
 
 test("durable recovery fails closed when persisted maxima cannot be reconciled", async () => {
   await assert.rejects(
     resolvePipelineInitialSequences({
       publisher: { async reconcileCaptionLane() { throw new Error("REQUEST_TIMEOUT"); } },
-      message: { sessionId: "session-1", languages: ["ko", "en"] },
+      message: { sessionId: SESSION_ID, languages: ["ko", "en"] },
       previousPipeline: { lastSequences: { ko: 9, en: 10 } },
       recoveryReason: "durable-caption",
     }),
@@ -480,7 +332,7 @@ test("durable recovery fails closed when persisted maxima cannot be reconciled",
   await assert.rejects(
     resolvePipelineInitialSequences({
       publisher: { async reconcileCaptionLane(_sessionId, language) { return language === "ko" ? 4 : undefined; } },
-      message: { sessionId: "session-1", languages: ["ko", "en"] },
+      message: { sessionId: SESSION_ID, languages: ["ko", "en"] },
       previousPipeline: { lastSequences: { ko: 9, en: 10 } },
       recoveryReason: "durable-caption",
     }),
@@ -496,7 +348,7 @@ test("durable recovery fails closed when persisted maxima cannot be reconciled",
         });
       },
     },
-    message: { sessionId: "session-1", languages: ["ko", "en"] },
+    message: { sessionId: SESSION_ID, languages: ["ko", "en"] },
     recoveryReason: "durable-caption",
     signal: abortController.signal,
   });

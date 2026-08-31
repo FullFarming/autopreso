@@ -4,6 +4,7 @@ import {
   createCommittedCaptionFinalizer,
   createGeminiCaptionConfig,
   geminiCaptionConfigFingerprint,
+  GEMINI_WORKLOAD_MODEL_MATRIX,
 } from "../../packages/caption-core/index.js";
 import { LiveMediaPipeline } from "../src/live-media-pipeline.js";
 
@@ -21,28 +22,26 @@ const QUALITY_CASES = Object.freeze([
     sourceLanguage: "en",
     targetLanguage: "ko",
     sourceText: "Cushman & Wakefield uses NOEL.",
-    translatedText: "쿠시먼앤웨이크필드는 노엘을 사용합니다.",
+    translatedText: "쿠시먼앤드웨이크필드는 노엘을 사용합니다.",
     requiredTerms: Object.freeze(["쿠시먼앤드웨이크필드", "노엘"]),
   }),
   Object.freeze({
     sourceLanguage: "ko",
     targetLanguage: "en",
     sourceText: "쿠시먼앤드웨이크필드는 노엘을 사용합니다.",
-    translatedText: "Cushman and Wakefield uses NOEL.",
+    translatedText: "Cushman & Wakefield uses NOEL.",
     requiredTerms: Object.freeze(["Cushman & Wakefield", "NOEL"]),
   }),
 ]);
 
 /**
- * Runs a 60-second-equivalent, no-network Gemini caption/audio contract check.
- * It deliberately injects provider outputs: CI validates our shared engine and
- * Live callback wiring without credentials, quota use, or external side effects.
+ * Runs a 60-second-equivalent, no-network caption contract check. Provider
+ * results are injected so CI validates Transcribe Live -> Gemini text
+ * translation -> terminology repair without credentials or quota use.
  */
 export async function runGeminiCaptionQualityCheck() {
   const config = createGeminiCaptionConfig({
     translationLanguages: ["en", "ko"],
-    outputMode: "captions_audio",
-    audioLanguage: "en",
     glossaryPresetId: "quality-fixture",
     glossaryPresetName: "Gemini quality fixture",
     glossary: QUALITY_GLOSSARY,
@@ -69,11 +68,12 @@ export async function runGeminiCaptionQualityCheck() {
     finalized += 1;
   }
 
-  const liveMetrics = await runLiveCallbackCheck(config);
+  const liveMetrics = await runLiveCaptionCheck(config, utteranceCount);
   const metrics = Object.freeze({
     code: "OK",
     provider: config.provider,
-    voiceProvider: config.voiceProvider,
+    transcriptionModel: config.models.transcription,
+    textModel: config.models.polish,
     configFingerprint: geminiCaptionConfigFingerprint(config),
     simulatedAudioMilliseconds: SIMULATED_AUDIO_MILLISECONDS,
     utterances: utteranceCount,
@@ -82,75 +82,83 @@ export async function runGeminiCaptionQualityCheck() {
     bidirectionalDirections: config.directions.length,
     ...liveMetrics,
   });
-  if (metrics.provider !== "gemini" || metrics.voiceProvider !== "gemini") throw new Error("QUALITY_NON_GEMINI_PROVIDER");
-  if (metrics.finalized !== utteranceCount || metrics.polishCalls !== utteranceCount) throw new Error("QUALITY_FINALIZER_INCOMPLETE");
-  if (metrics.translatedAudioChunks !== 1 || metrics.sameLanguageAudioChunks !== 0) throw new Error("QUALITY_AUDIO_ROUTING_FAILED");
+  if (metrics.provider !== "gemini") throw new Error("QUALITY_NON_GEMINI_PROVIDER");
+  if (metrics.transcriptionModel !== GEMINI_WORKLOAD_MODEL_MATRIX.transcription
+    || metrics.textModel !== GEMINI_WORKLOAD_MODEL_MATRIX.translation) {
+    throw new Error("QUALITY_MODEL_MATRIX_MISMATCH");
+  }
+  if (metrics.finalized !== utteranceCount || metrics.polishCalls !== utteranceCount) {
+    throw new Error("QUALITY_FINALIZER_INCOMPLETE");
+  }
+  if (metrics.committedCaptions !== utteranceCount * config.languages.length
+    || metrics.translatedCaptions !== utteranceCount) {
+    throw new Error("QUALITY_CAPTION_ROUTING_FAILED");
+  }
   return metrics;
 }
 
-async function runLiveCallbackCheck(config) {
-  const sessions = [];
-  const publishedAudioLanguages = [];
+async function runLiveCaptionCheck(config, utteranceCount) {
+  const published = [];
+  let transcriptionSessions = 0;
+  let sourceSequence = 0;
   const pipeline = new LiveMediaPipeline({
     sessionId: "gemini-quality-fixture",
     sessionType: "meeting",
-    outputMode: config.outputMode,
-    voiceProvider: config.voiceProvider,
     languages: config.languages,
     captionConfig: config,
     captionConfigFingerprint: geminiCaptionConfigFingerprint(config),
     dependencies: {
-      liveTranslate: {
-        async open(callbacks) {
-          sessions.push(callbacks);
+      speechToText: {
+        async open() {
+          transcriptionSessions += 1;
           return {
             async sendAudio() {},
-            async audioStreamEnd() {},
             async close() {},
           };
+        },
+      },
+      textTranslate: {
+        async translate({ text, language }) {
+          const qualityCase = QUALITY_CASES.find((entry) => entry.sourceText === text && entry.targetLanguage === language);
+          if (!qualityCase) throw new Error("QUALITY_TRANSLATION_FIXTURE_MISSING");
+          return qualityCase.translatedText;
         },
       },
       captionPolish: { async polish({ translatedText }) { return translatedText; } },
       publisher: {
         async markLive() {},
-        async publish() {},
-        async publishAudio(_sessionId, language) { publishedAudioLanguages.push(language); },
+        async persistAuthoritativeSource() {
+          sourceSequence += 1;
+          return { sourceUtteranceId: `source-${sourceSequence}`, sourceSeq: sourceSequence, idempotent: false };
+        },
+        async publish(_sessionId, _language, event) {
+          published.push(event);
+        },
       },
     },
   });
   await pipeline.start();
   try {
-    const englishLane = sessions.find((session) => session.language === "en");
-    if (!englishLane) throw new Error("QUALITY_ENGLISH_LANE_MISSING");
-    await englishLane.onInputObservation({
-      text: "쿠시먼앤드웨이크필드는 노엘을 사용합니다.",
-      languageCode: "ko",
-      isFinal: true,
-    });
-    await englishLane.onAudio({
-      pcm: new Uint8Array(480),
-      sampleRate: 24_000,
-      sourceLanguage: "ko",
-    });
-    const translatedAudioChunks = publishedAudioLanguages.length;
-    await englishLane.onInputObservation({
-      text: "Cushman & Wakefield uses NOEL.",
-      languageCode: "en",
-      isFinal: true,
-    });
-    await englishLane.onAudio({
-      pcm: new Uint8Array(480),
-      sampleRate: 24_000,
-      sourceLanguage: "en",
-    });
-    return {
-      liveSessions: sessions.length,
-      translatedAudioChunks,
-      sameLanguageAudioChunks: publishedAudioLanguages.length - translatedAudioChunks,
-    };
+    for (let index = 0; index < utteranceCount; index += 1) {
+      const qualityCase = QUALITY_CASES[index % QUALITY_CASES.length];
+      await pipeline.acceptFinalUtterance({
+        speakerLabel: "Host",
+        text: qualityCase.sourceText,
+        sourceLanguage: qualityCase.sourceLanguage,
+        sourceStartOffsetMs: index * UTTERANCE_MILLISECONDS,
+        sourceEndOffsetMs: (index + 1) * UTTERANCE_MILLISECONDS,
+        sourceEndedAt: new Date(index * UTTERANCE_MILLISECONDS).toISOString(),
+      });
+    }
   } finally {
     await pipeline.close();
   }
+  const committed = published.filter((event) => event.type === "caption" && event.isFinal === true);
+  return {
+    transcriptionSessions,
+    committedCaptions: committed.length,
+    translatedCaptions: committed.filter((event) => event.translationStatus === "translated").length,
+  };
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {

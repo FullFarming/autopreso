@@ -1,13 +1,18 @@
 "use client";
 
-import { createClient, type SupabaseClient } from "@supabase/supabase-js";
-import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
-import { createPortal } from "react-dom";
+import { useSystemText, useSystemLanguage } from "@/components/system-language/SystemLanguageProvider";
+import { formatViewerSystemStatus, viewerMessages } from "@/lib/system-language/viewer-messages";
+import { formatSystemText, SYSTEM_LOCALES, type SystemLanguage } from "@/lib/system-language";
 
-import { decodeAudioChunk } from "@/lib/live-contract";
+
+import { createClient, type SupabaseClient } from "@supabase/supabase-js";
+import type { RecordingGap } from "@/lib/live-recap/contract";
+import { Stop } from "@phosphor-icons/react";
+import { useCallback, useEffect, useMemo, useReducer, useRef, useState, type CSSProperties } from "react";
+
+import { ParticipantSpeakButton } from "./ParticipantSpeakButton";
 import { LANGUAGE_LABELS } from "@/lib/languageDetect";
 import type {
-  ApiResponse,
   CaptionEvent,
   LiveBroadcastEvent,
   LiveFloorHolder,
@@ -16,7 +21,7 @@ import type {
   LiveSessionStatus,
   LiveSessionType,
   LiveSnapshot,
-  RecordingStatusEvent,
+  LiveTopicPublicMetadata,
   SpeakerAssignment,
 } from "@/lib/live-contract";
 import {
@@ -26,206 +31,117 @@ import {
   withAbortTimeout,
 } from "./connection-resilience";
 import type { MeetingSummary } from "@/lib/live/summary";
-import MeetingMinutes, {
-  startSummaryPollLoop,
-  type SummaryPollingState,
-  type TranscriptEntry,
-} from "./MeetingMinutes";
+import { type TranscriptEntry } from "./MeetingMinutes";
+import { ParticipantMeetingMinutes } from "./ParticipantMeetingMinutes";
+import { ViewerReadingFeed } from "./ViewerReadingFeed";
+import { createViewerSourceDraftState, reduceViewerSourceDraft, loadViewerSourceSnapshot, mergeViewerSourceLedger, presentViewerSourceEvent } from "./viewer-source-ledger";
+import type { SourceEvent } from "../../lib/live/source-contract";
+import { loadViewerSourceRecord } from "./viewer-source-record";
+import { isRecordsAccessExpired, parseViewerRecordsSession } from "./viewer-records-recovery";
+import { formatMinuteTime } from "./meeting-minutes-model";
+import { startSummaryPollLoop, type SummaryPollingState } from "./meeting-summary-polling";
 import {
   getCachedLanguageCaptions,
   isDisplayableCaption,
-  isPinnedToLatest as isPinnedNearTop,
   LanguageSnapshotRegistry,
   loadLanguageSnapshotOnce,
   mergeLanguageCaptionCache,
-  newestFirst,
 } from "@/lib/live/caption-feed";
 import { countdownMsUntil, formatCountdown } from "@/lib/live/countdown";
-import MeetingTurnFeed from "./MeetingTurnFeed";
 import {
   requestForegroundRecovery,
   type ForegroundRecoveryEvent,
   type ForegroundRecoveryState,
 } from "./foreground-recovery";
 import { buildViewerSurfaceUrl, getViewerSurfaceRedirect } from "./viewer-surface-routing";
+import { parseAdmissionLinkHash } from "./admission-link";
+import { applyLiveTopicUpsert, createLiveTopicState, mergeLiveTopicSnapshot, type LiveTopicState } from "@/lib/live/topic-state";
+import {
+  clearViewerRecoveryContext,
+  readViewerRecoveryContext,
+  resolveViewerRecoverySelection,
+  writeViewerRecoveryContext,
+} from "./viewer-session-recovery";
+import {
+  CaptionEntry,
+  ControlDrawer,
+  TranslationToolbar,
+  TranslationViewport,
+  buildTranslationLanes,
+  projectCaptionLane,
+  type CaptionLaneInput,
+  type TranslationLanePresentation,
+} from "./translation";
+import { resolveViewerSpeakerColor } from "./SpeakerCaption";
+import { ViewerLiveSurface } from "./quality/ViewerLiveSurface";
+import { type EarningsEventPresentation } from "./earnings";
+import {
+  ApiRequestError,
+  getJoinErrorMessage,
+  isRecord,
+  isRecordingStatus,
+  isViewerJoinData,
+  mergeViewerSnapshot,
+  normalizeEmail,
+  normalizeProfileField,
+  parseBroadcastEvent,
+  readApi,
+  settleRequest,
+  type ViewerJoinData,
+  type ViewerState,
+} from "./viewer-controller-contract";
+import { useViewerRecovery } from "./useViewerRecovery";
+import { getSafeSummaryErrorMessage, getSafeTranscriptErrorMessage } from "./useHostSummaryLifecycle";
+import {
+  connectViewerGatewayOnce,
+  createViewerGatewayConnectionGate,
+  isCurrentViewerGatewayRequest,
+  isViewerGatewayTicketData,
+  resetViewerGatewayConnectionGate,
+  resolveViewerGatewayStatusDecision,
+  shouldConnectViewerGateway,
+  type ViewerGatewayStatusDecision,
+  type ViewerGatewayTicketData,
+} from "./viewer-gateway-lifecycle";
+import { GatewayConnectionStatus } from "./status";
+import { ParticipantConsentFields, PARTICIPANT_CONSENT_NOTICES } from "./consent";
+import { transitionGatewayConnectionState } from "@/lib/live/gateway-connection-state";
 import {
   prepareSpeakCapture,
   SpeakCaptureError,
   type PreparedSpeakCapture,
   type SpeakSession,
 } from "./speak-client";
-import SpeakerCaption, { resolveSpeakerColor, speakerMetaLine } from "./SpeakerCaption";
 
 const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL ?? "";
 const SUPABASE_ANON_KEY = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY ?? "";
 const LIVE_GATEWAY_URL = process.env.NEXT_PUBLIC_LIVE_GATEWAY_URL ?? "";
 const DEVICE_STORAGE_KEY = "rnw-live-viewer-device-v1";
+const LEGACY_VIEWER_AUTH_STORAGE_KEY = "rnw-live-viewer-auth-v1";
 /** Caption text-size range, as a multiplier on the base caption size. 1 is the
  *  designed default; the ceiling keeps roughly two lines of Korean readable on a
  *  375px viewport rather than allowing an unusable zoom. */
 const CAPTION_SCALE_MIN = 1;
 const CAPTION_SCALE_MAX = 2;
-const inviteTokenPattern = /^[A-Za-z0-9_-]{43}$/u;
-const MAX_INTERPRETATION_QUEUE_SECONDS = 30;
-const MAX_INTERPRETATION_QUEUE_BYTES = 24_000 * 2 * MAX_INTERPRETATION_QUEUE_SECONDS;
-const MAX_INTERPRETATION_PLAYBACK_RATE = 1.6;
-const MAX_PLAYBACK_RATE_RISE_PER_CHUNK = 0.08;
-const MAX_PLAYBACK_RATE_FALL_PER_CHUNK = 0.04;
 
 function languageLabel(code: string): string {
   return LANGUAGE_LABELS[code] ?? code;
 }
 
-function getAdaptiveInterpretationPlaybackRate(queueAheadSeconds: number, previousRate: number): number {
-  const queueAhead = Math.max(0, Number.isFinite(queueAheadSeconds) ? queueAheadSeconds : 0);
-  const currentRate = Math.max(1, Math.min(MAX_INTERPRETATION_PLAYBACK_RATE,
-    Number.isFinite(previousRate) ? previousRate : 1));
-  let targetRate = 1;
-  if (queueAhead >= 10) targetRate = MAX_INTERPRETATION_PLAYBACK_RATE;
-  else if (queueAhead > 4) targetRate = 1.25 + ((queueAhead - 4) / 6) * 0.2;
-  else if (queueAhead > 1) targetRate = 1 + ((queueAhead - 1) / 3) * 0.25;
-  const delta = targetRate - currentRate;
-  if (delta > 0) return Math.min(MAX_INTERPRETATION_PLAYBACK_RATE, currentRate + Math.min(delta, MAX_PLAYBACK_RATE_RISE_PER_CHUNK));
-  return Math.max(1, currentRate + Math.max(delta, -MAX_PLAYBACK_RATE_FALL_PER_CHUNK));
+class ViewerGatewayWaitingError extends Error {}
+
+async function requestViewerGatewayTicket(sessionId: string): Promise<ViewerGatewayTicketData> {
+  const result = await readApi<unknown>(await fetch(
+    `/api/live-sessions/${sessionId}/viewer-gateway-ticket`,
+    { method: "POST" },
+  ));
+  if (isRecord(result) && result.status === "HOST_WAITING") throw new ViewerGatewayWaitingError("호스트 연결을 기다리고 있어요.");
+  if (!isViewerGatewayTicketData(result)) throw new Error("The live gateway ticket response is invalid.");
+  return result;
 }
 
-interface ViewerJoinData {
-  viewerToken: string;
-  grant: { id: string; sessionId: string; userId: string; expiresAt: string };
-  session: {
-    id: string;
-    title: string;
-    scheduledAt: string | null;
-    sessionType: LiveSessionType;
-    outputMode: LiveOutputMode;
-    maxViewers: number;
-    languages: string[];
-    expiresAt: string;
-    /** Mirrors the wire type. Narrowing this to the joinable states meant the
-     *  snapshot merge could not carry status through at all, which silently
-     *  disabled the snapshot-failure guard that reads it. */
-    status?: LiveSessionStatus;
-    hasCoverImage?: boolean;
-    coverImageVersion?: string | null;
-  };
-  viewerCount: number;
-}
-
-interface ViewerState extends ViewerJoinData {
-  accessToken: string;
-  displayName: string;
-  department: string;
-  jobTitle: string;
-}
-
-interface PipFrame {
-  sessionType: LiveSessionType;
-  outputMode: LiveOutputMode;
-  captions: CaptionEvent[];
-  status: string;
-}
-
-interface FallbackPip {
-  video: HTMLVideoElement;
-  stream: MediaStream;
-  timer: number;
-}
-
-// 2026-07-27 fix: Keep a valid invite in a canonical fragment so the browser's
-// share action reuses the QR credential. Canonicalization strips every other
-// fragment field before sharing; cookies and per-viewer grants remain local.
-function readInviteTokenFromHash(): string | null {
-  const fragment = window.location.hash.startsWith("#") ? window.location.hash.slice(1) : window.location.hash;
-  const inviteToken = new URLSearchParams(fragment).get("invite");
-  if (inviteToken === null) return null;
-  if (!inviteTokenPattern.test(inviteToken)) {
-    window.history.replaceState(null, "", `${window.location.pathname}${window.location.search}`);
-    return "";
-  }
-  const canonicalHash = `#invite=${inviteToken}`;
-  if (window.location.hash !== canonicalHash) {
-    window.history.replaceState(null, "", `${window.location.pathname}${window.location.search}${canonicalHash}`);
-  }
-  return inviteToken;
-}
-
-function drawWrappedText(context: CanvasRenderingContext2D, text: string, x: number, y: number, maxWidth: number, lineHeight: number): void {
-  const words = Array.from(text);
-  let line = "";
-  let row = 0;
-  for (const word of words) {
-    const candidate = line + word;
-    if (line && context.measureText(candidate).width > maxWidth) {
-      context.fillText(line, x, y + row * lineHeight);
-      line = word;
-      row += 1;
-      if (row >= 3) break;
-    } else {
-      line = candidate;
-    }
-  }
-  if (line && row < 3) context.fillText(line, x, y + row * lineHeight);
-}
-
-function drawFallbackPipFrame(context: CanvasRenderingContext2D, frame: PipFrame): void {
-  const width = context.canvas.width;
-  const height = context.canvas.height;
-  context.fillStyle = "#0c0a09";
-  context.fillRect(0, 0, width, height);
-  context.fillStyle = "#a8a29e";
-  context.font = "500 24px Pretendard, sans-serif";
-  const isAudioOnly = frame.outputMode === "audio";
-  const outputLabel = frame.outputMode === "captions"
-    ? "Captions"
-    : frame.outputMode === "captions_audio" ? "Captions + translated audio" : "Translated audio";
-  context.fillText(`${frame.sessionType.toUpperCase()} · ${outputLabel} · ${frame.status}`, 56, 62);
-
-  if (isAudioOnly) {
-    context.fillStyle = "#ffffff";
-    context.font = "600 58px Pretendard, sans-serif";
-    context.fillText("Translated audio is playing", 56, 330);
-    return;
-  }
-
-  const caption = frame.captions.at(-1);
-  if (!caption) {
-    context.fillStyle = "#a8a29e";
-    context.font = "500 34px Inter, sans-serif";
-    context.fillText("Waiting for captions.", 56, 330);
-    return;
-  }
-  const speakerColor = resolveSpeakerColor(caption.speaker);
-  context.fillStyle = speakerColor;
-  context.fillRect(56, 132, 8, 456);
-  context.beginPath();
-  context.arc(91, 163, 9, 0, Math.PI * 2);
-  context.fill();
-  context.fillStyle = "#a8a29e";
-  context.font = "600 25px Inter, sans-serif";
-  context.fillText(speakerMetaLine(caption.speaker), 116, 171);
-  context.fillStyle = "#ffffff";
-  context.font = "600 50px Inter, sans-serif";
-  drawWrappedText(context, caption.text, 88, 264, width - 144, 74);
-}
-
-function mergeViewerSnapshot(current: ViewerState, snapshot: LiveSnapshot): ViewerState {
-  return {
-    ...current,
-    viewerCount: snapshot.session.viewerCount,
-    session: {
-      id: snapshot.session.id,
-      title: snapshot.session.title,
-      scheduledAt: snapshot.session.scheduledAt,
-      sessionType: snapshot.session.sessionType,
-      outputMode: snapshot.session.outputMode,
-      status: snapshot.session.status,
-      maxViewers: snapshot.session.maxViewers,
-      languages: snapshot.session.languages,
-      expiresAt: snapshot.session.expiresAt,
-      hasCoverImage: snapshot.session.hasCoverImage,
-      coverImageVersion: snapshot.session.coverImageVersion,
-    },
-  };
+function isSpeakFlowIdle(readState: () => string): boolean {
+  return readState() === "idle";
 }
 
 function makeDeviceId(): string {
@@ -236,477 +152,226 @@ function makeDeviceId(): string {
   return next;
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
-}
-
-function isLiveSessionType(value: unknown): value is LiveSessionType {
-  return value === "presentation" || value === "meeting";
-}
-
-function isLiveOutputMode(value: unknown): value is LiveOutputMode {
-  return value === "captions" || value === "captions_audio" || value === "audio";
-}
-
-function getSpeakerVoiceStatus(speaker: SpeakerAssignment, outputMode: LiveOutputMode): string {
-  if (outputMode === "captions") return "Captions only";
-  const voiceStatus: unknown = speaker.voiceStatus;
-  if (voiceStatus === undefined) return speaker.voiceName ? `Voice ready · ${speaker.voiceName}` : "Analyzing voice";
-  if (voiceStatus === "ready") return speaker.voiceName ? `Voice ready · ${speaker.voiceName}` : "Voice ready";
-  if (voiceStatus === "unavailable") return "Unavailable";
-  if (voiceStatus === "disabled") return "Captions only";
-  return "Analyzing voice";
-}
-
-function getDeliveryMethod(sessionType: LiveSessionType, outputMode: LiveOutputMode): { title: string; description: string } {
-  if (sessionType === "presentation") {
-    return outputMode === "captions"
-      ? { title: "Live captions", description: "Captions appear in your selected language while the host speaks." }
-      : { title: "Live captions + audio", description: "Translated audio plays as each sentence is completed." };
-  }
-  return outputMode === "captions"
-    ? { title: "Speaker captions", description: "Translated captions are grouped by speaker." }
-    : { title: "Speaker captions + audio", description: "Translated audio follows each completed turn." };
-}
-
-export function SpeakControlIcon({ state }: { state: "idle" | "starting" | "speaking" }) {
-  if (state === "speaking") {
-    return <span className="live-speak-button-waves" aria-hidden="true"><i /><i /><i /><i /><i /></span>;
-  }
-  if (state === "starting") {
-    return <span className="live-speak-connecting" aria-hidden="true"><i /><i /><i /></span>;
-  }
-  return (
-    <svg className="live-speak-microphone" viewBox="0 0 24 24" aria-hidden="true">
-      <path d="M12 3.75a3 3 0 0 0-3 3v5.5a3 3 0 1 0 6 0v-5.5a3 3 0 0 0-3-3Z" />
-      <path d="M6.75 11.75v.5a5.25 5.25 0 0 0 10.5 0v-.5M12 17.5v2.75M9.25 20.25h5.5" />
-    </svg>
-  );
-}
-
 function captionConnectionLabel(status: LiveSessionStatus | "ready"): string {
-  if (status === "live" || status === "ready") return "Live";
-  if (status === "preparing") return "Preparing captions";
-  if (status === "paused") return "Paused by host";
-  if (status === "stopped") return "Live ended";
-  return "Check connection";
+  if (status === "live" || status === "ready") return "실시간";
+  if (status === "preparing") return "자막 준비 중";
+  if (status === "paused") return "호스트가 일시 정지함";
+  if (status === "stopped") return "라이브 종료";
+  return "연결 확인 필요";
 }
 
-function isViewerJoinData(value: unknown): value is ViewerJoinData {
-  if (!isRecord(value) || !isRecord(value.grant) || !isRecord(value.session)) return false;
-  return typeof value.viewerToken === "string"
-    && typeof value.grant.id === "string"
-    && typeof value.grant.sessionId === "string"
-    && typeof value.grant.userId === "string"
-    && typeof value.grant.expiresAt === "string"
-    && typeof value.session.id === "string"
-    && typeof value.session.title === "string"
-    && (value.session.scheduledAt === null || typeof value.session.scheduledAt === "string")
-    && isLiveSessionType(value.session.sessionType)
-    && isLiveOutputMode(value.session.outputMode)
-    && Number.isInteger(value.session.maxViewers)
-    && Number(value.session.maxViewers) >= 1
-    && Number(value.session.maxViewers) <= 50
-    && Array.isArray(value.session.languages)
-    && value.session.languages.length >= 1
-    && value.session.languages.length <= 3
-    && value.session.languages.every((language) => typeof language === "string")
-    && new Set(value.session.languages).size === value.session.languages.length
-    && typeof value.session.expiresAt === "string"
-    && typeof value.viewerCount === "number"
-    && Number.isInteger(value.viewerCount)
-    && value.viewerCount >= 0
-    && value.viewerCount <= Number(value.session.maxViewers);
-}
-
-function isCaptionEvent(value: unknown): value is CaptionEvent {
-  if (!isRecord(value)) return false;
-  return value.type === "caption"
-    && Number.isSafeInteger(value.seq)
-    && Number(value.seq) >= 0
-    && typeof value.sessionId === "string"
-    && typeof value.language === "string"
-    && (value.speaker === null || isSpeaker(value.speaker))
-    && typeof value.text === "string"
-    && typeof value.isFinal === "boolean"
-    // Provenance fields are optional so older gateways keep validating, but a
-    // present value must be well-typed — it is rendered into the DOM.
-    && (value.sourceText === undefined || value.sourceText === null || typeof value.sourceText === "string")
-    && (value.sourceLanguage === undefined || value.sourceLanguage === null || typeof value.sourceLanguage === "string")
-    && (value.translationStatus === undefined || value.translationStatus === "verbatim"
-      || value.translationStatus === "translated" || value.translationStatus === "failed")
-    && (value.origin === undefined || value.origin === "source")
-    && typeof value.sourceEndedAt === "string"
-    && typeof value.emittedAt === "string";
-}
-
-function isSpeaker(value: unknown): value is SpeakerAssignment {
-  return isRecord(value)
-    && typeof value.speakerId === "string"
-    && typeof value.label === "string"
-    && typeof value.colorToken === "string"
-    && (typeof value.voiceName === "string" || value.voiceName === null)
-    && typeof value.lastSeenAt === "string"
-    // Identity fields are optional on the wire but ARE rendered into the DOM by
-    // speakerMetaLine, which calls .trim() on each. A non-string here threw
-    // inside render and blanked the whole viewer, so validate them for the same
-    // reason the provenance fields are validated.
-    && (value.name === undefined || value.name === null || typeof value.name === "string")
-    && (value.department === undefined || value.department === null || typeof value.department === "string")
-    && (value.jobTitle === undefined || value.jobTitle === null || typeof value.jobTitle === "string")
-    && (value.voiceStatus === undefined || value.voiceStatus === "disabled" || value.voiceStatus === "analyzing"
-      || value.voiceStatus === "ready" || value.voiceStatus === "unavailable");
-}
-
-function isControlEvent(value: unknown): value is Exclude<LiveBroadcastEvent, CaptionEvent | RecordingStatusEvent> {
-  if (!isRecord(value) || typeof value.sessionId !== "string" || typeof value.type !== "string") return false;
-  if (value.type === "session-status") {
-    return value.status === "preparing" || value.status === "live" || value.status === "paused"
-      || value.status === "stopped" || value.status === "failed";
-  }
-  if (value.type === "language-status") {
-    return typeof value.language === "string"
-      && (value.status === "preparing" || value.status === "ready" || value.status === "unavailable")
-      && (value.code === undefined || typeof value.code === "string");
-  }
-  if (value.type === "speaker-legend") {
-    return Array.isArray(value.speakers) && value.speakers.every(isSpeaker);
-  }
-  if (value.type === "floor") {
-    // Contract C5: holder now carries { participantId, name, department,
-    // jobTitle }; older gateways send { displayName }. Accept both.
-    return value.holder === null
-      || (isRecord(value.holder)
-        && (typeof value.holder.displayName === "string" || typeof value.holder.name === "string")
-        && (value.holder.participantId === undefined || typeof value.holder.participantId === "string")
-        && (value.holder.department === undefined || typeof value.holder.department === "string")
-        && (value.holder.jobTitle === undefined || typeof value.holder.jobTitle === "string"));
-  }
-  if (value.type === "language-removed") {
-    return typeof value.language === "string" && value.code === "LANGUAGE_REMOVED";
-  }
-  if (value.type === "audio-control") {
-    return Number.isSafeInteger(value.seq)
-      && Number(value.seq) >= 0
-      && typeof value.language === "string"
-      && (value.action === "clear" || value.action === "restart")
-      && (value.reason === "interrupted" || value.reason === "queue_restart");
-  }
-  return value.type === "error" && typeof value.code === "string" && typeof value.message === "string";
-}
-
-function isRecordingStatusEvent(value: unknown): value is RecordingStatusEvent {
-  return isRecord(value)
-    && value.type === "recording-status"
-    && typeof value.sessionId === "string"
-    && typeof value.language === "string"
-    && value.status === "error"
-    && value.code === "UTTERANCE_PERSIST_FAILED"
-    && Number.isSafeInteger(value.seq)
-    && Number(value.seq) >= 0
-    && typeof value.message === "string";
-}
-
-function parseBroadcastEvent(value: unknown): LiveBroadcastEvent | null {
-  if (isCaptionEvent(value)) return value;
-  if (isRecordingStatusEvent(value)) return value;
-  return isControlEvent(value) ? value : null;
-}
-
-async function readApi<T>(response: Response): Promise<T> {
-  const payload = await response.json() as ApiResponse<T>;
-  if (!payload.ok) throw new ApiRequestError(payload.error, payload.code);
-  return payload.data;
-}
-
-type SettledRequest<T> = { ok: true; value: T } | { ok: false; error: unknown };
-
-async function settleRequest<T>(request: Promise<T>): Promise<SettledRequest<T>> {
-  try {
-    return { ok: true, value: await request };
-  } catch (error: unknown) {
-    return { ok: false, error };
-  }
-}
-
-class ApiRequestError extends Error {
-  constructor(message: string, readonly code: string) {
-    super(message);
-  }
-}
-
-function normalizeDisplayName(value: string): string {
-  return value.normalize("NFC").trim();
-}
-
-function normalizeProfileField(value: string): string {
-  return value.normalize("NFC").trim().replace(/\s+/gu, " ");
-}
-
-function getJoinErrorMessage(error: unknown): string {
-  if (!(error instanceof ApiRequestError)) return error instanceof Error ? error.message : "Unable to join the live session.";
-  if (error.code === "CAPACITY_REACHED" || error.code === "SESSION_FULL") {
-    return "This meeting is full.";
-  }
-  if (error.code === "INVITE_EXPIRED") {
-    return "Guest entry is closed or this QR invite has expired.";
-  }
-  return error.message;
-}
-
-export function floorHolderName(holder: LiveFloorHolder | null): string | null {
-  if (!holder) return null;
-  return holder.name?.trim() || holder.displayName?.trim() || null;
+function isRecordingStatusEvent(value: unknown): boolean {
+  return isRecordingStatus(value);
 }
 
 export function formatProfileMetadata(...parts: Array<string | null | undefined>): string {
   return parts.map((part) => part?.trim()).filter((part): part is string => Boolean(part)).join(" · ");
 }
 
-function useLiveInterpretationAudio(onQueueRestart: () => void, onPlaybackBlocked: () => void) {
-  const contextRef = useRef<AudioContext | null>(null);
-  const nextStartRef = useRef(0);
-  const queuedPcmBytesRef = useRef(0);
-  const playbackRateRef = useRef(1);
-  const isEnabledRef = useRef(false);
-  const scheduledSourcesRef = useRef(new Set<AudioBufferSourceNode>());
-  const sourceByteLengthsRef = useRef(new Map<AudioBufferSourceNode, number>());
-  const [isEnabled, setIsEnabled] = useState(false);
-
-  const stopScheduledSources = useCallback(() => {
-    for (const source of scheduledSourcesRef.current) {
-      try {
-        source.stop();
-      } catch {
-        // 이미 종료된 소스는 onended에서 같은 정리 경로를 따릅니다.
-      }
-      source.disconnect();
-    }
-    scheduledSourcesRef.current.clear();
-    sourceByteLengthsRef.current.clear();
-    queuedPcmBytesRef.current = 0;
-    playbackRateRef.current = 1;
-  }, []);
-
-  const restartQueue = useCallback(() => {
-    stopScheduledSources();
-    nextStartRef.current = contextRef.current?.currentTime ?? 0;
-    playbackRateRef.current = 1;
-  }, [stopScheduledSources]);
-
-  const clear = useCallback(() => {
-    const context = contextRef.current;
-    contextRef.current = null;
-    nextStartRef.current = 0;
-    isEnabledRef.current = false;
-    setIsEnabled(false);
-    stopScheduledSources();
-    if (context) void context.close();
-  }, [stopScheduledSources]);
-
-  const enable = useCallback(async () => {
-    const context = contextRef.current ?? new AudioContext({ sampleRate: 24_000 });
-    contextRef.current = context;
-    await context.resume();
-    if (context.state !== "running") throw new Error("Audio permission is required. Choose Audio On again.");
-    nextStartRef.current = context.currentTime;
-    isEnabledRef.current = true;
-    setIsEnabled(true);
-  }, []);
-
-  const enqueue = useCallback((pcmBytes: ArrayBuffer, sampleRate: number) => {
-    const context = contextRef.current;
-    if (!context || !isEnabledRef.current) return;
-    if (context.state !== "running") {
-      restartQueue();
-      isEnabledRef.current = false;
-      setIsEnabled(false);
-      onPlaybackBlocked();
-      return;
-    }
-    if (sampleRate !== 24_000 || pcmBytes.byteLength === 0 || pcmBytes.byteLength % 2 !== 0) return;
-    const pcm = new Int16Array(pcmBytes);
-    const buffer = context.createBuffer(1, pcm.length, sampleRate);
-    const isQueueIdle = scheduledSourcesRef.current.size === 0;
-    const queueAhead = Math.max(0, nextStartRef.current - context.currentTime);
-    let playbackRate = isQueueIdle
-      ? 1
-      : getAdaptiveInterpretationPlaybackRate(queueAhead + buffer.duration, playbackRateRef.current);
-    const projectedQueueDuration = queueAhead + buffer.duration / playbackRate;
-    if (projectedQueueDuration > MAX_INTERPRETATION_QUEUE_SECONDS
-      || queuedPcmBytesRef.current + pcmBytes.byteLength > MAX_INTERPRETATION_QUEUE_BYTES) {
-      restartQueue();
-      onQueueRestart();
-      playbackRate = 1;
-    }
-    const channel = buffer.getChannelData(0);
-    for (let index = 0; index < pcm.length; index += 1) channel[index] = pcm[index] / 32_768;
-    const source = context.createBufferSource();
-    scheduledSourcesRef.current.add(source);
-    sourceByteLengthsRef.current.set(source, pcmBytes.byteLength);
-    queuedPcmBytesRef.current += pcmBytes.byteLength;
-    source.addEventListener("ended", () => {
-      scheduledSourcesRef.current.delete(source);
-      const byteLength = sourceByteLengthsRef.current.get(source) ?? 0;
-      sourceByteLengthsRef.current.delete(source);
-      queuedPcmBytesRef.current = Math.max(0, queuedPcmBytesRef.current - byteLength);
-      source.disconnect();
-      if (scheduledSourcesRef.current.size === 0) playbackRateRef.current = 1;
-    }, { once: true });
-    source.buffer = buffer;
-    source.playbackRate.value = playbackRate;
-    source.connect(context.destination);
-    const startAt = Math.max(context.currentTime, nextStartRef.current);
-    source.start(startAt);
-    playbackRateRef.current = playbackRate;
-    nextStartRef.current = startAt + buffer.duration / playbackRate;
-  }, [onPlaybackBlocked, onQueueRestart, restartQueue]);
-
-  useEffect(() => clear, [clear]);
-  return { clear, enable, enqueue, isEnabled, restartQueue };
-}
-
-export function ViewerStage({ sessionType, outputMode, captions, speakers, status, sessionStatus = "live", isAudioEnabled, floorHolder = null }: {
-  sessionType: LiveSessionType;
-  outputMode: LiveOutputMode;
+export function ViewerStage({ captions, status, sessionStatus = "live" }: {
   captions: CaptionEvent[];
-  speakers: SpeakerAssignment[];
   status: string;
   sessionStatus?: LiveSessionStatus;
-  isAudioEnabled: boolean;
-  floorHolder?: string | null;
 }) {
-  // Newest-first feed: the live edge is the TOP of the history and older
-  // captions push downward. Scrolling down reads history without losing the
-  // place; a floating jump control returns to the live edge (top).
-  const historyRef = useRef<HTMLDivElement>(null);
-  const [isPinnedToLatest, setIsPinnedToLatest] = useState(true);
-  // The web record shows the complete selected language lane. Source speech is
-  // valid history in its own lane; a failed translation is the only caption
-  // hidden because it does not reliably belong to the selected language.
+  const t = useSystemText(viewerMessages);
   const displayCaptions = useMemo(() => captions.filter(isDisplayableCaption), [captions]);
-  const orderedCaptions = newestFirst(displayCaptions);
-  const latestCaption = displayCaptions.at(-1);
-
-  useEffect(() => {
-    if (!isPinnedToLatest) return;
-    const history = historyRef.current;
-    if (history) history.scrollTop = 0;
-  }, [isPinnedToLatest, latestCaption?.seq, latestCaption?.text]);
-
-  const handleHistoryScroll = useCallback(() => {
-    const history = historyRef.current;
-    if (!history) return;
-    setIsPinnedToLatest(isPinnedNearTop(history.scrollTop));
-  }, []);
-
-  const returnToLatest = useCallback(() => {
-    const history = historyRef.current;
-    if (history) history.scrollTop = 0;
-    setIsPinnedToLatest(true);
-  }, []);
-  const isAudioOnly = outputMode === "audio";
-  const hasAudio = outputMode !== "captions";
-  const deliveryMethod = getDeliveryMethod(sessionType, outputMode);
+  const latestFinal = displayCaptions.findLast((caption) => caption.isFinal);
   const lifecycleLabel = sessionStatus === "live"
-    ? "Live now"
-    : sessionStatus === "paused" ? "Paused by host" : "Live unavailable";
+    ? "실시간"
+    : sessionStatus === "paused" ? "호스트가 일시 정지함" : "라이브를 사용할 수 없음";
   return (
     <div className="live-viewer-stage">
       <div className="live-viewer-stage-header">
-        <span className="live-eyebrow">{sessionType === "presentation" ? "Presentation" : "Meeting"} · {outputMode === "captions"
-          ? "Captions"
-          : outputMode === "captions_audio" ? "Captions + translated audio" : "Translated audio"}</span>
+        <span className="live-eyebrow">{t("실시간 번역")}</span>
         <span className="live-connection-state" role="status" aria-live="polite">
           <span className={`live-status-dot ${sessionStatus === "live" ? "is-live" : ""}`} aria-hidden="true" />
-          {lifecycleLabel}
-          <span className="sr-only"> · Connection: {status}</span>
+          {t(lifecycleLabel)}
+          <span className="sr-only"> {t("· 연결 상태:")} {formatViewerSystemStatus(status, t)}</span>
         </span>
       </div>
-      {isAudioOnly ? (
-        <div className="live-audio-only-state">
-          <span className="live-audio-bars" aria-hidden="true"><i /><i /><i /><i /></span>
-          <strong>{isAudioEnabled ? `${deliveryMethod.title} playing` : `${deliveryMethod.title} ready`}</strong>
-          <p>{deliveryMethod.description} Audio stays muted until you choose Audio On.</p>
-        </div>
-      ) : sessionType === "meeting" ? (
-        <MeetingTurnFeed captions={displayCaptions} floorHolder={floorHolder}
-          emptyMessage="Speaker chapters will appear here when the meeting starts." />
-      ) : (
-        <div className="live-caption-stack">
-          {orderedCaptions.length === 0
-            ? <p className="live-empty-caption">Waiting for the host to start.</p>
-            : null}
-          <div ref={historyRef} className="live-caption-history is-scrollable" aria-live="polite"
-            aria-relevant="additions text" onScroll={handleHistoryScroll}>
-            {orderedCaptions.map((caption, index) => (
-              <SpeakerCaption key={`caption-${caption.seq}`} caption={caption} active={index === 0} />
-            ))}
-          </div>
-          {!isPinnedToLatest && (
-            <button type="button" className="live-jump-latest" onClick={returnToLatest}
-              aria-label="Return to the latest caption">
-              최신으로
-            </button>
-          )}
-        </div>
-      )}
-      {hasAudio && !isAudioOnly && <p className="live-audio-consent-state" role="status">{isAudioEnabled ? "Translated audio is on." : "Choose Audio On to hear translated audio."}</p>}
-      {speakers.length > 0 && sessionType === "meeting" && (
-        <div className="live-viewer-legend" aria-label="Speaker legend">
-          {speakers.map((speaker) => <span key={speaker.speakerId}>
-            <i style={{ backgroundColor: resolveSpeakerColor(speaker) }} aria-hidden="true" />
-            {speaker.label}<i className="live-speaker-line" style={{ backgroundColor: resolveSpeakerColor(speaker) }} aria-hidden="true" />
-            <small>Audio · {getSpeakerVoiceStatus(speaker, outputMode)}</small>
-          </span>)}
-        </div>
-      )}
+      <TranslationViewport
+        state={sessionStatus === "paused" ? "paused" : sessionStatus === "live" ? "live" : "disconnected"}
+        statusLabel={sessionStatus === "live" ? undefined : t(lifecycleLabel)}
+        captionFirstPreview={displayCaptions.at(-1)?.text ?? ""}
+        previewLabel={t("현재 자막")}
+        finalAnnouncement={latestFinal?.text}
+        listLabel={t("실시간 번역 자막 목록")}
+      >
+        {displayCaptions.map((caption, index) => (
+          <CaptionEntry
+            key={`${caption.language}-${caption.seq}`}
+            text={caption.text}
+            speakerLabel={caption.speaker?.name?.trim() || caption.speaker?.label?.trim() || t("호스트")}
+            timestamp={new Date(caption.emittedAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
+            isFinal={caption.isFinal}
+            translationStatus={caption.translationStatus}
+            sourceText={caption.sourceText}
+            isActive={index === displayCaptions.length - 1}
+          />
+        ))}
+      </TranslationViewport>
     </div>
   );
 }
 
-export function formatSessionSchedule(scheduledAt: string | null): string {
-  if (!scheduledAt) return "Live now";
+export function formatSessionSchedule(scheduledAt: string | null, systemLanguage: SystemLanguage = "ko"): string {
+  if (!scheduledAt) return formatSystemText(viewerMessages, systemLanguage, "지금 시작");
   const timestamp = Date.parse(scheduledAt);
-  if (!Number.isFinite(timestamp)) return "Live now";
+  if (!Number.isFinite(timestamp)) return formatSystemText(viewerMessages, systemLanguage, "지금 시작");
   // 2026-07-24 fix: Use the product's fixed KST session clock. Locale formatters
   // emit engine-specific punctuation and previously broke WebKit hydration.
   const date = new Date(timestamp + 9 * 60 * 60 * 1_000);
-  const months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
   const hours = date.getUTCHours();
-  const displayHours = hours % 12 || 12;
   const minutes = String(date.getUTCMinutes()).padStart(2, "0");
-  const period = hours < 12 ? "AM" : "PM";
-  return `${months[date.getUTCMonth()]} ${date.getUTCDate()} · ${displayHours}:${minutes} ${period}`;
+  const clock = `${String(hours).padStart(2, "0")}:${minutes}`;
+  if (systemLanguage === "en") return `${date.getUTCMonth() + 1}/${date.getUTCDate()} · ${clock} KST`;
+  if (systemLanguage === "ja") return `${date.getUTCMonth() + 1}月${date.getUTCDate()}日 · ${clock}`;
+  return `${date.getUTCMonth() + 1}월 ${date.getUTCDate()}일 · ${clock}`;
 }
 
 export function ViewerSessionContext({ title, scheduledAt }: { title: string; scheduledAt: string | null }) {
+  const t = useSystemText(viewerMessages);
+  const { language: systemLanguage } = useSystemLanguage();
   return (
-    <section className="live-viewer-session-context" aria-label="Session details">
+    <section className="live-viewer-session-context" aria-label={t("세션 정보")}>
       <h1>{title}</h1>
-      <p>{formatSessionSchedule(scheduledAt)}</p>
+      <p>{formatSessionSchedule(scheduledAt, systemLanguage)}</p>
     </section>
   );
 }
 
+function captionLaneInput(caption: CaptionEvent, index: number, total: number): CaptionLaneInput {
+  return {
+    id: caption.utteranceKey ?? `${caption.language}:${caption.seq}`,
+    utteranceKey: caption.utteranceKey,
+    language: caption.language,
+    sourceLanguage: caption.sourceLanguage,
+    languageObservation: caption.languageObservation,
+    origin: caption.origin,
+    text: caption.text,
+    speakerLabel: caption.speaker?.name?.trim() || caption.speaker?.label?.trim() || "",
+    // 5B: the contract already ships a per-speaker colorToken; the viewer used
+    // to drop it. Name text carries identity, color only reinforces it.
+    speakerColor: resolveViewerSpeakerColor(caption.speaker),
+    timestamp: formatMinuteTime(caption.emittedAt),
+    isFinal: caption.isFinal,
+    translationStatus: caption.translationStatus,
+    sourceText: caption.sourceText,
+    isActive: index === total - 1,
+  };
+}
+
+function VoiceLevelCanvas({ level, compact = false }: { level: number; compact?: boolean }) {
+  const t = useSystemText(viewerMessages);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const displayedLevelRef = useRef(0);
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const width = compact ? 52 : 296;
+    const height = compact ? 24 : 96;
+    const pixelRatio = Math.min(window.devicePixelRatio || 1, 2);
+    canvas.width = width * pixelRatio;
+    canvas.height = height * pixelRatio;
+    canvas.style.width = `${width}px`;
+    canvas.style.height = `${height}px`;
+    const context = canvas.getContext("2d");
+    if (!context) return;
+    context.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0);
+    const style = getComputedStyle(canvas);
+    const activeColor = style.getPropertyValue("--nova-system-default").trim();
+    const restingColor = style.getPropertyValue("--nova-fg-primary").trim();
+    const isReducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    displayedLevelRef.current = isReducedMotion
+      ? level
+      : displayedLevelRef.current * 0.68 + level * 0.32;
+    const energy = Math.max(0.06, Math.min(1, displayedLevelRef.current * 4.2));
+    const barCount = compact ? 7 : 25;
+    const gap = compact ? 3 : 5;
+    const barWidth = compact ? 3 : 6;
+    const totalWidth = barCount * barWidth + (barCount - 1) * gap;
+    const startX = (width - totalWidth) / 2;
+    context.clearRect(0, 0, width, height);
+    for (let index = 0; index < barCount; index += 1) {
+      const distance = Math.abs(index - (barCount - 1) / 2) / (barCount / 2);
+      const envelope = 1 - distance * 0.56;
+      const cadence = 0.56 + ((index * 7) % 11) / 20;
+      const barHeight = Math.max(3, height * energy * envelope * cadence);
+      const x = startX + index * (barWidth + gap);
+      const y = (height - barHeight) / 2;
+      context.fillStyle = index % 4 === 0 ? activeColor : restingColor;
+      context.beginPath();
+      context.roundRect(x, y, barWidth, barHeight, barWidth / 2);
+      context.fill();
+    }
+  }, [compact, level]);
+
+  return <canvas ref={canvasRef} className={`live-voice-level ${compact ? "is-compact" : ""}`}
+    role="img" aria-label={t("현재 목소리 세기")} />;
+}
+
 export default function LiveViewer({ compact = false }: { compact?: boolean }) {
+  const t = useSystemText(viewerMessages);
+  const { language: systemLanguage } = useSystemLanguage();
+  const systemLocale = SYSTEM_LOCALES[systemLanguage];
+  const [email, setEmail] = useState("");
   const [displayName, setDisplayName] = useState("");
+  const [company, setCompany] = useState("");
   const [department, setDepartment] = useState("");
   const [jobTitle, setJobTitle] = useState("");
+  const [privacyConsent, setPrivacyConsent] = useState(false);
+  const [summaryDeliveryConsent, setSummaryDeliveryConsent] = useState(false);
+  const [marketingConsent, setMarketingConsent] = useState(false);
   const [admissionCode, setAdmissionCode] = useState("");
   const [viewer, setViewer] = useState<ViewerState | null>(null);
   const [language, setLanguage] = useState("");
   const languageRef = useRef("");
-  const [captions, setCaptions] = useState<CaptionEvent[]>([]);
-  const [speakers, setSpeakers] = useState<SpeakerAssignment[]>([]);
-  const [status, setStatus] = useState("Not connected");
-  const [floorHolder, setFloorHolder] = useState<LiveFloorHolder | null>(null);
+  const [sourceLedger, setSourceLedger] = useState<SourceEvent[]>([]);
+  const [sourceDraftState, setSourceDraftState] = useState(createViewerSourceDraftState);
+  const sourceLedgerRef = useRef<SourceEvent[]>([]);
+  const sourceSnapshotAbortRef = useRef<AbortController | null>(null);
+  const isSourceHydratedRef = useRef(false);
+  const [sourceError, setSourceError] = useState("");
+  const [isSourceLoading, setIsSourceLoading] = useState(false);
+  const captionsByLanguageRef = useRef<Record<string, CaptionEvent[]>>({});
+  const [captionsByLanguage, setCaptionsByLanguage] = useState(captionsByLanguageRef.current);
+  const replaceCaptionCache = useCallback((nextCache: Record<string, CaptionEvent[]>) => {
+    // 2026-08-31 fix: 원문은 모든 언어의 캐시를 읽으므로 비선택 언어의 늦은 응답도 화면을 갱신해야 한다.
+    captionsByLanguageRef.current = nextCache;
+    setCaptionsByLanguage(nextCache);
+  }, []);
+  const [topicState, setTopicState] = useState<LiveTopicState | null>(null);
+  const [unavailableLanguages, setUnavailableLanguages] = useState<string[]>([]);
+  const [incompleteLanguages, setIncompleteLanguages] = useState<string[]>([]);
+  const [selectedLaneId, setSelectedLaneId] = useState("source");
+  const selectedLaneIdRef = useRef("source");
+  const [expandedTopicIds, setExpandedTopicIds] = useState<string[]>([]);
+  const expandedTopicIdsRef = useRef<string[]>([]);
+  const anchorUtteranceKeyRef = useRef("");
+  const anchorsByLaneRef = useRef<Record<string, string>>({});
+  const pendingRecoveryAnchorRef = useRef("");
+  const [status, setStatus] = useState("연결되지 않음");
   const [sessionStatus, setSessionStatus] = useState<LiveSessionStatus>("live");
+  const sessionStatusRef = useRef<LiveSessionStatus>("live");
+  const [gatewayConnectionState, dispatchGatewayConnection] = useReducer(transitionGatewayConnectionState, "idle");
+  const updateSessionStatus = useCallback((nextStatus: LiveSessionStatus) => {
+    sessionStatusRef.current = nextStatus;
+    if (nextStatus !== "live") setSourceDraftState((current) => ({ ...current, draft: null }));
+    setSessionStatus(nextStatus);
+    dispatchGatewayConnection({ type: "viewer-session", status: nextStatus });
+  }, []);
   const [isWaitingCoverUnavailable, setIsWaitingCoverUnavailable] = useState(false);
   const [joinEndedNotice, setJoinEndedNotice] = useState(false);
   const [isSessionEnded, setIsSessionEnded] = useState(false);
+  const [recordsExpiresAt, setRecordsExpiresAt] = useState<string | null>(null);
+  const [isRecordsExpired, setIsRecordsExpired] = useState(false);
+  const [recoveryError, setRecoveryError] = useState("");
   const [summaryRecord, setSummaryRecord] = useState<{ summary: MeetingSummary; createdAt: string } | null>(null);
   const [transcript, setTranscript] = useState<TranscriptEntry[]>([]);
+  const [recordingGaps, setRecordingGaps] = useState<RecordingGap[]>([]);
+  const [transcriptTopics, setTranscriptTopics] = useState<LiveTopicPublicMetadata[]>([]);
+  const [minutesEvent, setMinutesEvent] = useState<EarningsEventPresentation | null>(null);
   const [isTranscriptLoaded, setIsTranscriptLoaded] = useState(false);
   const [summaryError, setSummaryError] = useState("");
   const [transcriptError, setTranscriptError] = useState("");
@@ -717,14 +382,17 @@ export default function LiveViewer({ compact = false }: { compact?: boolean }) {
   const minutesLoadGenerationRef = useRef(0);
   const isSessionEndedRef = useRef(false);
   const markSessionEndedRef = useRef<() => void>(() => {});
+  const markSessionFailedRef = useRef<() => void>(() => {});
+  const [floorHolder, setFloorHolder] = useState<LiveFloorHolder | null>(null);
   const [speakState, setSpeakState] = useState<"idle" | "starting" | "speaking">("idle");
-  const [isSpeakGatewayReady, setIsSpeakGatewayReady] = useState(false);
+  const [speakLevel, setSpeakLevel] = useState(0);
+  const [activeSpeakerName, setActiveSpeakerName] = useState("");
   const speakStateRef = useRef<"idle" | "starting" | "speaking">("idle");
-  const speakButtonRef = useRef<HTMLButtonElement>(null);
+  const speakSocketRef = useRef<WebSocket | null>(null);
   const speakSessionRef = useRef<SpeakSession | null>(null);
   const preparedSpeakCaptureRef = useRef<PreparedSpeakCapture | null>(null);
   const speakStartTimerRef = useRef<number | null>(null);
-  const speakSocketMessageRef = useRef<(event: Record<string, unknown>) => void>(() => {});
+  const speakStopButtonRef = useRef<HTMLButtonElement>(null);
   const [error, setError] = useState("");
   const [isBusy, setIsBusy] = useState(false);
   const [pendingInviteToken, setPendingInviteToken] = useState("");
@@ -734,18 +402,52 @@ export default function LiveViewer({ compact = false }: { compact?: boolean }) {
   // classes only had CSS under `.is-compact`, so the control silently did
   // nothing on the desktop /watch route.
   const [captionScale, setCaptionScale] = useState(1);
-  const [isTextSizeOpen, setIsTextSizeOpen] = useState(false);
-  const [pipWindow, setPipWindow] = useState<Window | null>(null);
   // Contract C11: waiting-room countdown clock. Ticks only while the session
   // is still preparing; reaching zero never auto-starts anything.
   const [waitingClockMs, setWaitingClockMs] = useState(() => Date.now());
-  const pipWindowRef = useRef<Window | null>(null);
-  const fallbackPipRef = useRef<FallbackPip | null>(null);
-  const pipFrameRef = useRef<PipFrame>({ sessionType: "presentation", outputMode: "captions", captions: [], status: "Not connected" });
+  const [gatewayLifecycleRevision, setGatewayLifecycleRevision] = useState(0);
+  const [runtimePermission, setRuntimePermission] = useState<boolean | null>(null);
   const requestedLanguageRef = useRef("");
   const foregroundRecoveryStateRef = useRef<ForegroundRecoveryState>({ inFlight: null });
+  const clearViewerPrivateState = useCallback(() => {
+    clearViewerRecoveryContext(localStorage);
+    localStorage.removeItem(LEGACY_VIEWER_AUTH_STORAGE_KEY);
+    setEmail("");
+    setCompany("");
+    setDepartment("");
+    setJobTitle("");
+    setPrivacyConsent(false);
+    setSummaryDeliveryConsent(false);
+    setMarketingConsent(false);
+    setAdmissionCode("");
+    setTopicState(null);
+    setFloorHolder(null);
+    setRuntimePermission(null); setRecordsExpiresAt(null); setIsRecordsExpired(false); setIsSessionEnded(false); isSessionEndedRef.current = false;
+    setTranscript([]); setRecordingGaps([]); setTranscriptTopics([]); setSummaryRecord(null);
+    selectedLaneIdRef.current = "source";
+    setSelectedLaneId("source");
+    expandedTopicIdsRef.current = [];
+    setExpandedTopicIds([]);
+    sourceSnapshotAbortRef.current?.abort();
+    sourceSnapshotAbortRef.current = null;
+    replaceCaptionCache({});
+    sourceLedgerRef.current = [];
+    setSourceLedger([]);
+    setSourceDraftState(createViewerSourceDraftState());
+    setSourceError("");
+    setIsSourceLoading(false);
+    setIncompleteLanguages([]);
+    isSourceHydratedRef.current = false;
+    anchorUtteranceKeyRef.current = "";
+    anchorsByLaneRef.current = {};
+    pendingRecoveryAnchorRef.current = "";
+    viewerSessionIdRef.current = null;
+    gatewayReconnectAwaitingStatusRef.current = false;
+    dispatchGatewayConnection({ type: "reset" });
+  }, [replaceCaptionCache]);
 
   useEffect(() => {
+    localStorage.removeItem(LEGACY_VIEWER_AUTH_STORAGE_KEY);
     const target = getViewerSurfaceRedirect(
       window.location.pathname,
       window.navigator.userAgent,
@@ -764,13 +466,14 @@ export default function LiveViewer({ compact = false }: { compact?: boolean }) {
     return () => window.clearInterval(tick);
   }, [viewer, isSessionEnded, sessionStatus]);
   const supabaseRef = useRef<SupabaseClient | null>(null);
-  const audioSocketRef = useRef<WebSocket | null>(null);
-  const audioPendingSocketRef = useRef<WebSocket | null>(null);
-  const audioReconnectTimerRef = useRef<number | null>(null);
-  const audioProactiveTimerRef = useRef<number | null>(null);
-  const audioConnectionGenerationRef = useRef(0);
-  const lastAudioSeqRef = useRef(-1);
-  const minimumAudioSeqRef = useRef(-1);
+  const gatewaySocketRef = useRef<WebSocket | null>(null);
+  const gatewayPendingSocketRef = useRef<WebSocket | null>(null);
+  const gatewayReconnectTimerRef = useRef<number | null>(null);
+  const gatewayProactiveTimerRef = useRef<number | null>(null);
+  const gatewayConnectionGenerationRef = useRef(0);
+  const gatewayConnectionGateRef = useRef(createViewerGatewayConnectionGate());
+  const gatewayReconnectAwaitingStatusRef = useRef(false);
+  const viewerSessionIdRef = useRef<string | null>(null);
   // Contract C1/C2: caption sequences are monotonic per (session, language)
   // starting at 1. Track lastSeq per language so a reconnect or language
   // toggle can ask the gateway to replay exactly the missed gap.
@@ -781,7 +484,6 @@ export default function LiveViewer({ compact = false }: { compact?: boolean }) {
   // which read as "the record was lost and is being rebuilt". The cache keeps
   // what this viewer has already received per language; the snapshot then tops
   // it up rather than being the only source.
-  const captionsByLanguageRef = useRef<Record<string, CaptionEvent[]>>({});
   const captionCacheSessionIdRef = useRef("");
   const snapshotRegistryRef = useRef(new LanguageSnapshotRegistry());
   const getLastSeq = useCallback((forLanguage: string): number => lastSeqByLanguageRef.current[forLanguage] ?? 0, []);
@@ -789,7 +491,6 @@ export default function LiveViewer({ compact = false }: { compact?: boolean }) {
     const current = lastSeqByLanguageRef.current[forLanguage] ?? 0;
     if (seq > current) lastSeqByLanguageRef.current[forLanguage] = seq;
   }, []);
-  const outputModeRef = useRef<LiveOutputMode>("captions");
   const handleEventRef = useRef<(event: LiveBroadcastEvent) => void>(() => {});
   const setCaptionSnapshot = useCallback((snapshot: LiveSnapshot) => {
     // A delayed snapshot from a previous QR/session cannot repopulate the
@@ -803,177 +504,77 @@ export default function LiveViewer({ compact = false }: { compact?: boolean }) {
       snapshot.language,
       snapshot.captions.filter((caption) => caption.isFinal),
     );
-    captionsByLanguageRef.current = nextCache;
+    replaceCaptionCache(nextCache);
+    setTopicState((current) => {
+      const base = current?.sessionId === snapshot.session.id
+        ? current
+        : createLiveTopicState(snapshot.session.id);
+      try {
+        return mergeLiveTopicSnapshot(base, {
+          topics: snapshot.topics,
+          topicMemberships: snapshot.topicMemberships,
+        });
+      } catch {
+        window.queueMicrotask(() => setError("주제 정보를 확인할 수 없습니다. 실시간 자막은 계속 표시됩니다."));
+        return base;
+      }
+    });
     // 2026-07-26 fix: A slow snapshot may warm only its own language cache.
-    // It must not replace captions, speakers, or lifecycle state selected while
+    // It must not replace captions or lifecycle state selected while
     // that request was in flight.
     setLastSeq(snapshot.language, snapshot.lastSeq);
     if (snapshot.language !== languageRef.current) return;
-    setCaptions(nextCache[snapshot.language] ?? []);
-    setSpeakers(snapshot.speakers);
-    setSessionStatus(snapshot.session.status);
-  }, [setLastSeq]);
-  const handleAudioQueueRestart = useCallback(() => {
-    setStatus("Audio restored · receiving live");
-    setError("");
+    updateSessionStatus(snapshot.session.status);
+  }, [replaceCaptionCache, setLastSeq, updateSessionStatus]);
+  const mergeSourceEvents = useCallback((events: readonly SourceEvent[]) => {
+    const next = mergeViewerSourceLedger(sourceLedgerRef.current, events);
+    sourceLedgerRef.current = next;
+    setSourceLedger(next);
   }, []);
-  const handleAudioPlaybackBlocked = useCallback(() => {
-    setStatus("Audio permission needed");
-    setError("Your browser paused audio. Choose Audio On again.");
-  }, []);
-  const {
-    clear: clearInterpretationAudio,
-    enable: enableInterpretationAudio,
-    enqueue: enqueueInterpretationAudio,
-    isEnabled: isInterpretationAudioEnabled,
-    restartQueue: restartInterpretationAudio,
-  } = useLiveInterpretationAudio(handleAudioQueueRestart, handleAudioPlaybackBlocked);
-
-  const updateSpeakLevel = useCallback((level: number) => {
-    const button = speakButtonRef.current;
-    if (button) button.dataset.level = String(Math.min(4, Math.ceil(level * 8)));
-  }, []);
-
-  const stopSpeakCapture = useCallback(() => {
-    const session = speakSessionRef.current;
-    speakSessionRef.current = null;
-    const prepared = preparedSpeakCaptureRef.current;
-    preparedSpeakCaptureRef.current = null;
-    updateSpeakLevel(0);
-    const stopping = session?.stop() ?? prepared?.stop();
-    if (stopping) void stopping.catch(() => {
-      console.warn("[live-speak] capture cleanup failed");
-    });
-  }, [updateSpeakLevel]);
-
-  const endSpeaking = useCallback(async (sendEnd: boolean) => {
-    if (speakStartTimerRef.current !== null) window.clearTimeout(speakStartTimerRef.current);
-    speakStartTimerRef.current = null;
-    speakStateRef.current = "idle";
-    setSpeakState("idle");
-    const socket = audioSocketRef.current;
+  const synchronizeSourceLedger = useCallback(async (sessionId: string, afterSourceSeq: number) => {
+    sourceSnapshotAbortRef.current?.abort();
+    const controller = new AbortController();
+    sourceSnapshotAbortRef.current = controller;
+    setIsSourceLoading(true);
     try {
-      if (sendEnd && socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ type: "speak-end" }));
-    } finally {
-      // Release the shared floor before browser audio cleanup. AudioContext.close
-      // may never settle on a suspended mobile browser, but that must not leave
-      // every other participant blocked behind this viewer.
-      stopSpeakCapture();
-    }
-  }, [stopSpeakCapture]);
-
-  speakSocketMessageRef.current = (event) => {
-    if (event.type === "speak-started") {
-      if (speakStateRef.current !== "starting") {
-        const lateSocket = audioSocketRef.current;
-        if (lateSocket?.readyState === WebSocket.OPEN) {
-          lateSocket.send(JSON.stringify({ type: "speak-end" }));
-        }
-        return;
-      }
-      if (speakStartTimerRef.current !== null) window.clearTimeout(speakStartTimerRef.current);
-      speakStartTimerRef.current = null;
-      const socket = audioSocketRef.current;
-      if (!socket || socket.readyState !== WebSocket.OPEN) {
-        void endSpeaking(true);
-        return;
-      }
-      const prepared = preparedSpeakCaptureRef.current;
-      if (!prepared) {
-        setError("The microphone was not prepared. Choose Speak again.");
-        void endSpeaking(true);
-        return;
-      }
-      void prepared.start(socket, { onLevel: updateSpeakLevel }).then((session) => {
-        if (preparedSpeakCaptureRef.current === prepared) preparedSpeakCaptureRef.current = null;
-        if (speakStateRef.current !== "starting") {
-          void session.stop();
-          return;
-        }
-        speakSessionRef.current = session;
-        speakStateRef.current = "speaking";
-        setSpeakState("speaking");
-      }).catch((captureError: unknown) => {
-        if (preparedSpeakCaptureRef.current === prepared) preparedSpeakCaptureRef.current = null;
-        if (speakStateRef.current !== "starting") return;
-        setError(captureError instanceof SpeakCaptureError
-          ? captureError.message
-          : "The browser could not start microphone audio.");
-        void endSpeaking(true);
+      const events = await withAbortTimeout(async (timeoutSignal) => {
+        const cancel = () => controller.abort(timeoutSignal.reason);
+        timeoutSignal.addEventListener("abort", cancel, { once: true });
+        try { return await loadViewerSourceSnapshot(sessionId, afterSourceSeq, controller.signal); }
+        finally { timeoutSignal.removeEventListener("abort", cancel); }
       });
-      return;
-    }
-    if (event.type === "speak-ended") {
-      const wasActive = speakStateRef.current !== "idle";
-      void endSpeaking(false);
-      if (wasActive && event.reason === "preempted") setError("Another guest started speaking, so your turn ended.");
-      // Synthesized locally by the socket close handler. The gateway releases
-      // the floor on close without notifying, and the capture is bound to the
-      // dead socket, so without this the button keeps pulsing while every
-      // frame is silently dropped.
-      if (wasActive && event.reason === "disconnected") setError("Your speaking turn ended when the connection dropped.");
-    }
-  };
-
-  const toggleSpeak = useCallback(async () => {
-    if (speakStateRef.current !== "idle") return;
-    const socket = audioSocketRef.current;
-    if (!socket || socket.readyState !== WebSocket.OPEN) {
-      setError("Join the live session before speaking.");
-      return;
-    }
-    setError("");
-    speakStateRef.current = "starting";
-    setSpeakState("starting");
-    try {
-      const prepared = await prepareSpeakCapture();
-      if (speakStateRef.current !== "starting") {
-        await prepared.stop();
-        return;
+      if (controller.signal.aborted || sessionId !== viewerSessionIdRef.current) return;
+      mergeSourceEvents(events);
+      isSourceHydratedRef.current = true;
+      setSourceError("");
+    } catch {
+      if (sourceSnapshotAbortRef.current === controller && sessionId === viewerSessionIdRef.current) {
+        setSourceError("원문 기록을 불러오지 못했어요. 기존 원문은 유지됩니다.");
       }
-      preparedSpeakCaptureRef.current = prepared;
-    } catch (captureError: unknown) {
-      speakStateRef.current = "idle";
-      setSpeakState("idle");
-      setError(captureError instanceof SpeakCaptureError
-        ? captureError.message
-        : "The browser could not prepare microphone audio.");
-      return;
-    }
-    socket.send(JSON.stringify({ type: "speak-start" }));
-    speakStartTimerRef.current = window.setTimeout(() => {
-      if (speakStateRef.current === "starting") {
-        setError("Could not start your turn. Try again.");
-        // sendEnd MUST be true here. This is the one abort path where the
-        // client cannot know whether the gateway took the floor: if
-        // take_live_floor succeeded but speak-started was lost, the gateway
-        // still holds this grant and has already broadcast `floor`. Without
-        // an explicit speak-end the room shows "X is speaking" forever and
-        // host audio stays gated off, so the whole meeting goes silent.
-        void endSpeaking(true);
+    } finally {
+      if (sourceSnapshotAbortRef.current === controller) {
+        sourceSnapshotAbortRef.current = null;
+        setIsSourceLoading(false);
       }
-    }, 5_000);
-  }, [endSpeaking]);
+    }
+  }, [mergeSourceEvents]);
 
   const loadMinutes = useCallback(async (
     requestedLanguage: string = languageRef.current,
     resource: "both" | "summary" | "transcript" = "both",
   ): Promise<boolean> => {
-    if (!viewer || !requestedLanguage) return false;
+    if (!viewer || !requestedLanguage || isRecordsExpired) return false;
     const generation = minutesLoadGenerationRef.current + 1;
     minutesLoadGenerationRef.current = generation;
     setIsMinutesLoading(true);
-    const headers = { authorization: `Bearer ${viewer.viewerToken}` };
     const language = encodeURIComponent(requestedLanguage);
-    const fetchMinutesResource = async <T,>(path: string): Promise<T> => readApi<T>(await fetch(path, { headers }));
+    const fetchMinutesResource = async <T,>(path: string): Promise<T> => readApi<T>(await fetch(path));
     try {
       const [summaryResult, transcriptResult] = await Promise.all([
         resource === "transcript" ? Promise.resolve(null) : settleRequest(fetchMinutesResource<{ summary: MeetingSummary; createdAt: string }>(
           `/api/live-sessions/${viewer.session.id}/summary?language=${language}`,
         )),
-        resource === "summary" ? Promise.resolve(null) : settleRequest(fetchMinutesResource<{ utterances: TranscriptEntry[] }>(
-          `/api/live-sessions/${viewer.session.id}/transcript?language=${language}`,
-        )),
+        resource === "summary" ? Promise.resolve(null) : settleRequest(loadViewerSourceRecord(viewer.session.id)),
       ]);
       // A late EN response must never replace the KO record selected while it
       // was in flight. The same generation guard covers manual retries.
@@ -990,31 +591,40 @@ export default function LiveViewer({ compact = false }: { compact?: boolean }) {
         shouldContinuePolling = true;
       } else if (summaryResult) {
         setSummaryRecord(null);
-        setSummaryError("Unable to load the AI summary. Check again.");
+        setSummaryError(getSafeSummaryErrorMessage(
+          summaryResult.error instanceof ApiRequestError ? summaryResult.error.code : undefined,
+        ));
         setMinutesPollingState("failed");
         hasFatalSummaryError = true;
       }
       if (transcriptResult?.ok) {
         setTranscript(transcriptResult.value.utterances);
+        setRecordingGaps(transcriptResult.value.recordingGaps);
+        setTranscriptTopics([]);
+        setMinutesEvent(null);
         setIsTranscriptLoaded(true);
         setTranscriptError("");
       } else if (transcriptResult) {
-        setTranscript([]);
+        setTranscript([]); setRecordingGaps([]);
+        setTranscriptTopics([]);
+        setMinutesEvent(null);
         setIsTranscriptLoaded(false);
-        setTranscriptError("Unable to load the transcript. Check again.");
+        setTranscriptError(getSafeTranscriptErrorMessage(
+          transcriptResult.error instanceof ApiRequestError ? transcriptResult.error.code : undefined,
+        ));
         if (!hasFatalSummaryError) shouldContinuePolling = true;
       }
       return shouldContinuePolling;
     } finally {
       if (generation === minutesLoadGenerationRef.current) setIsMinutesLoading(false);
     }
-  }, [viewer]);
+  }, [viewer, isRecordsExpired]);
 
   // Contract C7: summaries are generated automatically after End. While the
   // record is not ready (SUMMARY_NOT_READY), share the host's bounded polling
   // cadence (2s → 20s plus up to 25% jitter, capped at 25s).
   useEffect(() => {
-    if (!isSessionEnded) return;
+    if (!isSessionEnded || isRecordsExpired) return;
     if (summaryRecord && isTranscriptLoaded) {
       setMinutesPollingState("idle");
       return;
@@ -1033,41 +643,77 @@ export default function LiveViewer({ compact = false }: { compact?: boolean }) {
       onExhausted: () => setMinutesPollingState("exhausted"),
       onError: () => {
         setMinutesPollingState("failed");
-        setSummaryError("Unable to load the AI summary. Check again.");
+        setSummaryError(getSafeSummaryErrorMessage(undefined));
       },
     });
-  }, [isSessionEnded, isTranscriptLoaded, loadMinutes, minutesPollingRound, summaryError, summaryRecord]);
+  }, [isSessionEnded, isRecordsExpired, isTranscriptLoaded, loadMinutes, minutesPollingRound, summaryError, summaryRecord]);
 
   // 호스트가 라이브를 종료하면 뷰어는 에러가 아니라 회의록 화면으로 전환합니다.
   markSessionEndedRef.current = () => {
     if (isSessionEndedRef.current) return;
     isSessionEndedRef.current = true;
     setIsSessionEnded(true);
-    setFloorHolder(null);
     setError("");
-    setStatus("Live ended");
+    setStatus("라이브 종료");
+    updateSessionStatus("stopped");
     setMinutesPollingState("polling");
     setMinutesPollingStartedAt(Date.now());
-    void endSpeaking(false);
-    disconnectGateway();
+    stopGatewayLifecycle();
     void loadMinutes(languageRef.current);
   };
 
-  const resolveViewerDisconnect = useCallback(async (currentViewer: ViewerState) => {
+  markSessionFailedRef.current = () => {
+    updateSessionStatus("failed");
+    setError("");
+    setStatus("라이브 세션 종료 · 기존 자막 유지");
+    stopGatewayLifecycle();
+  };
+
+  const resolveViewerGatewayStatus = useCallback(async (
+    currentViewer: ViewerState,
+    expectedGeneration: number,
+  ): Promise<ViewerGatewayStatusDecision | "stale"> => {
+    const sessionId = currentViewer.session.id;
+    if (!isCurrentViewerGatewayRequest(
+      expectedGeneration,
+      gatewayConnectionGenerationRef.current,
+      sessionId,
+      viewerSessionIdRef.current,
+    )) return "stale";
     try {
       const result = await readApi<{ status: string }>(await fetch(
-        `/api/live-sessions/${currentViewer.session.id}/status`,
-        { headers: { authorization: `Bearer ${currentViewer.viewerToken}` }, cache: "no-store" },
+        `/api/live-sessions/${sessionId}/status`,
+        { cache: "no-store" },
       ));
-      if (result.status === "stopped") {
+      if (!isCurrentViewerGatewayRequest(
+        expectedGeneration,
+        gatewayConnectionGenerationRef.current,
+        sessionId,
+        viewerSessionIdRef.current,
+      )) return "stale";
+      const decision = resolveViewerGatewayStatusDecision(result.status);
+      if (decision === "ended") {
         markSessionEndedRef.current();
-        return true;
+        return decision;
       }
+      if (decision === "failed") {
+        markSessionFailedRef.current();
+        return decision;
+      }
+      if (result.status === "live" || result.status === "paused" || result.status === "preparing") {
+        updateSessionStatus(result.status);
+      }
+      return decision;
     } catch {
-      // 상태 확인 실패는 기존 권한 만료 안내로 폴백합니다.
+      if (!isCurrentViewerGatewayRequest(
+        expectedGeneration,
+        gatewayConnectionGenerationRef.current,
+        sessionId,
+        viewerSessionIdRef.current,
+      )) return "stale";
+      return "wait";
     }
-    return false;
-  }, []);
+  }, [updateSessionStatus]);
 
   // Lifecycle fallback poll: gateway broadcasts can be missed across
   // reconnects, which stranded viewers on the waiting screen after Go-Live
@@ -1076,7 +722,7 @@ export default function LiveViewer({ compact = false }: { compact?: boolean }) {
   // While waiting for go-live the poll tightens to 2.5s so viewers who missed
   // the gateway's session-status push still enter within a couple of seconds.
   useEffect(() => {
-    if (!viewer) return;
+    if (!viewer || sessionStatus === "failed") return;
     // Stop once the session has ended. `viewer` is deliberately kept after the
     // end so the minutes screen can read it, so without this guard the poll ran
     // forever — and every tick re-issued the 30-day recap cookie and burned a
@@ -1084,18 +730,32 @@ export default function LiveViewer({ compact = false }: { compact?: boolean }) {
     // made thousands of pointless requests.
     if (isSessionEnded) return;
     const poll = window.setInterval(() => {
+      // 백그라운드 탭은 폴링을 건너뛴다. 대기실 200명 × 2.5s가 이 폴의 최대
+      // 트래픽원인데, 숨겨진 탭은 복귀 시 foreground-recovery가 즉시 상태를
+      // 복원하므로 놓치는 것이 없다.
+      if (document.visibilityState === "hidden") return;
       void (async () => {
         try {
           const result = await readApi<{ status: string }>(await fetch(
             `/api/live-sessions/${viewer.session.id}/status`,
-            { headers: { authorization: `Bearer ${viewer.viewerToken}` }, cache: "no-store" },
+            { cache: "no-store" },
           ));
+          if (viewerSessionIdRef.current !== viewer.session.id) return;
           if (result.status === "stopped") {
             markSessionEndedRef.current();
             return;
           }
+          if (result.status === "failed") {
+            markSessionFailedRef.current();
+            return;
+          }
           if (result.status === "live" || result.status === "paused" || result.status === "preparing") {
-            setSessionStatus((current) => current === result.status ? current : result.status as "live" | "paused" | "preparing");
+            if (sessionStatusRef.current !== result.status) updateSessionStatus(result.status);
+            if (gatewayReconnectAwaitingStatusRef.current
+              && resolveViewerGatewayStatusDecision(result.status) === "reconnect") {
+              gatewayReconnectAwaitingStatusRef.current = false;
+              setGatewayLifecycleRevision((revision) => revision + 1);
+            }
           }
         } catch {
           // Transient failures fall back to the next tick; the gateway path
@@ -1104,66 +764,264 @@ export default function LiveViewer({ compact = false }: { compact?: boolean }) {
       })();
     }, sessionStatus === "preparing" ? 2_500 : 10_000);
     return () => window.clearInterval(poll);
-  }, [viewer, sessionStatus, isSessionEnded]);
+  }, [viewer, sessionStatus, isSessionEnded, updateSessionStatus]);
 
   const sessionType = viewer?.session.sessionType ?? "presentation";
   const outputMode = viewer?.session.outputMode ?? "captions";
-  const hasAudio = outputMode !== "captions";
-  const deliveryMethod = getDeliveryMethod(sessionType, outputMode);
   const languages = viewer?.session.languages ?? [];
-  outputModeRef.current = outputMode;
-  pipFrameRef.current = { sessionType, outputMode, captions, status };
 
   const disconnectGateway = useCallback(() => {
-    audioConnectionGenerationRef.current += 1;
-    if (audioReconnectTimerRef.current !== null) window.clearTimeout(audioReconnectTimerRef.current);
-    if (audioProactiveTimerRef.current !== null) window.clearTimeout(audioProactiveTimerRef.current);
-    audioReconnectTimerRef.current = null;
-    audioProactiveTimerRef.current = null;
-    const socket = audioSocketRef.current;
-    audioSocketRef.current = null;
-    setIsSpeakGatewayReady(false);
-    const pendingSocket = audioPendingSocketRef.current;
-    audioPendingSocketRef.current = null;
+    dispatchGatewayConnection({ type: "socket-closed", sessionStatus: sessionStatusRef.current });
+    gatewayConnectionGenerationRef.current += 1;
+    sourceSnapshotAbortRef.current?.abort();
+    sourceSnapshotAbortRef.current = null;
+    setIsSourceLoading(false);
+    setSourceDraftState(createViewerSourceDraftState());
+    if (gatewayReconnectTimerRef.current !== null) window.clearTimeout(gatewayReconnectTimerRef.current);
+    if (gatewayProactiveTimerRef.current !== null) window.clearTimeout(gatewayProactiveTimerRef.current);
+    gatewayReconnectTimerRef.current = null;
+    gatewayProactiveTimerRef.current = null;
+    const socket = gatewaySocketRef.current;
+    gatewaySocketRef.current = null;
+    const pendingSocket = gatewayPendingSocketRef.current;
+    gatewayPendingSocketRef.current = null;
     pendingSocket?.close(1000, "language changed");
-    if (socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ type: "unsubscribe" }));
+    // The speaking floor uses a dedicated socket so language changes can swap
+    // caption subscriptions without interrupting the participant's live turn.
+    // `unsubscribe` releases by grant, not by socket, so skip it while active.
+    if (speakStateRef.current === "idle" && socket?.readyState === WebSocket.OPEN) {
+      socket.send(JSON.stringify({ type: "unsubscribe" }));
+    }
     socket?.close(1000, "language changed");
-    lastAudioSeqRef.current = -1;
-    minimumAudioSeqRef.current = -1;
-    clearInterpretationAudio();
-  }, [clearInterpretationAudio]);
+  }, []);
+
+  const stopSpeakCapture = useCallback(() => {
+    const session = speakSessionRef.current;
+    speakSessionRef.current = null;
+    const prepared = preparedSpeakCaptureRef.current;
+    preparedSpeakCaptureRef.current = null;
+    setSpeakLevel(0);
+    const stopping = session?.stop() ?? prepared?.stop();
+    if (stopping) void stopping.catch(() => console.warn("[live-speak] capture cleanup failed"));
+  }, []);
+
+  const endSpeaking = useCallback((sendEnd: boolean, reason?: "preempted" | "disconnected") => {
+    if (speakStartTimerRef.current !== null) window.clearTimeout(speakStartTimerRef.current);
+    speakStartTimerRef.current = null;
+    speakStateRef.current = "idle";
+    setSpeakState("idle");
+    setActiveSpeakerName("");
+    const socket = speakSocketRef.current;
+    speakSocketRef.current = null;
+    try {
+      if (sendEnd && socket?.readyState === WebSocket.OPEN) {
+        socket.send(JSON.stringify({ type: "speak-end" }));
+      }
+      socket?.close(1000, "speaking ended");
+    } finally {
+      stopSpeakCapture();
+    }
+    if (reason === "preempted") setError("다른 참여자에게 발언이 넘어갔습니다.");
+    if (reason === "disconnected") setError("연결이 끊겨 발언이 종료되었습니다. 다시 눌러 주세요.");
+  }, [stopSpeakCapture]);
+
+  const toggleSpeak = useCallback(async () => {
+    if (!viewer || viewer.session.participantSpeakingEnabled !== true || sessionStatusRef.current !== "live") return;
+    if (speakStateRef.current !== "idle") {
+      endSpeaking(true);
+      return;
+    }
+    if (gatewaySocketRef.current?.readyState !== WebSocket.OPEN || !LIVE_GATEWAY_URL) {
+      setError("실시간 연결 후 발언을 시작해 주세요.");
+      return;
+    }
+    setError("");
+    speakStateRef.current = "starting";
+    setSpeakState("starting");
+    try {
+      const prepared = await prepareSpeakCapture();
+      if (speakStateRef.current !== "starting") {
+        await prepared.stop();
+        return;
+      }
+      preparedSpeakCaptureRef.current = prepared;
+      const ticketData = await requestViewerGatewayTicket(viewer.session.id);
+      const { ticket } = ticketData;
+      if (speakStateRef.current !== "starting") {
+        if (preparedSpeakCaptureRef.current === prepared) {
+          preparedSpeakCaptureRef.current = null;
+          await prepared.stop();
+        }
+        return;
+      }
+      const socket = new WebSocket(LIVE_GATEWAY_URL);
+      speakSocketRef.current = socket;
+      socket.binaryType = "arraybuffer";
+      socket.addEventListener("message", (message) => {
+        if (typeof message.data !== "string") return;
+        try {
+          const event: unknown = JSON.parse(message.data);
+          if (!isRecord(event)) return;
+          if (event.type === "authenticated") {
+            socket.send(JSON.stringify({
+              type: "subscribe",
+              sessionId: viewer.session.id,
+              ...(ticketData.connectionId ? { connectionId: ticketData.connectionId, epoch: ticketData.epoch } : {}),
+              language: languageRef.current,
+              lastSeq: getLastSeq(languageRef.current),
+            }));
+            return;
+          }
+          if (event.type === "subscribed") {
+            socket.send(JSON.stringify({ type: "speak-start" }));
+            return;
+          }
+          if (event.type === "live-event") {
+            const liveEvent = parseBroadcastEvent(event.payload ?? event.event);
+            if (liveEvent && !["source", "source-draft", "source-draft-clear"].includes(liveEvent.type)) handleEventRef.current(liveEvent);
+            return;
+          }
+          if (event.type === "speak-started") {
+            if (speakStartTimerRef.current !== null) window.clearTimeout(speakStartTimerRef.current);
+            speakStartTimerRef.current = null;
+            setActiveSpeakerName(typeof event.displayName === "string" ? event.displayName : viewer.self.email);
+            const activePrepared = preparedSpeakCaptureRef.current;
+            if (!activePrepared || speakStateRef.current !== "starting") {
+              endSpeaking(true);
+              return;
+            }
+            void activePrepared.start(socket, { onLevel: setSpeakLevel }).then((session) => {
+              if (preparedSpeakCaptureRef.current === activePrepared) preparedSpeakCaptureRef.current = null;
+              if (speakStateRef.current !== "starting") {
+                void session.stop();
+                return;
+              }
+              speakSessionRef.current = session;
+              speakStateRef.current = "speaking";
+              setSpeakState("speaking");
+            }).catch((captureError: unknown) => {
+              if (preparedSpeakCaptureRef.current === activePrepared) preparedSpeakCaptureRef.current = null;
+              if (speakStateRef.current !== "starting") return;
+              setError(captureError instanceof SpeakCaptureError
+                ? captureError.message
+                : "마이크를 시작하지 못했습니다. 다시 눌러 주세요.");
+              endSpeaking(true);
+            });
+            return;
+          }
+          if (event.type === "speak-ended") {
+            endSpeaking(false, event.reason === "preempted" ? "preempted" : undefined);
+            return;
+          }
+          if (event.type === "error") {
+            setError(event.code === "FLOOR_RATE_LIMITED"
+              ? "잠시 후 다시 발언을 눌러 주세요."
+              : "발언을 시작하지 못했습니다. 다시 눌러 주세요.");
+            endSpeaking(false);
+          }
+        } catch {
+          setError("발언 연결을 확인할 수 없습니다. 다시 눌러 주세요.");
+          endSpeaking(false);
+        }
+      });
+      socket.addEventListener("close", () => {
+        if (speakSocketRef.current === socket && speakStateRef.current !== "idle") {
+          endSpeaking(false, "disconnected");
+        }
+      });
+      await waitForSocketOpen(socket);
+      if (speakSocketRef.current !== socket || speakStateRef.current !== "starting") {
+        socket.close(1000, "speaking cancelled");
+        return;
+      }
+      socket.send(JSON.stringify({ type: "authenticate", token: ticket }));
+      speakStartTimerRef.current = window.setTimeout(() => {
+        if (speakStateRef.current !== "idle") {
+          setError("발언 연결이 지연되고 있습니다. 다시 눌러 주세요.");
+          endSpeaking(true);
+        }
+      }, 8_000);
+    } catch (captureError: unknown) {
+      // 2026-08-22 fix: The user can cancel while either awaited setup step is
+      // pending. Read through a callback so TypeScript does not reuse its
+      // pre-await narrowing.
+      if (isSpeakFlowIdle(() => speakStateRef.current)) return;
+      setError(captureError instanceof SpeakCaptureError
+        ? captureError.message
+        : "마이크를 준비하지 못했습니다. 다시 눌러 주세요.");
+      endSpeaking(false);
+    }
+  }, [endSpeaking, getLastSeq, viewer]);
 
   const connectGateway = useCallback(async (currentViewer: ViewerState, nextLanguage: string) => {
     if (!LIVE_GATEWAY_URL) throw new Error("The live gateway is not configured.");
-    const generation = audioConnectionGenerationRef.current;
+    const generation = gatewayConnectionGenerationRef.current;
     let reconnectAttempt = 0;
     let connectionPromise: Promise<void> | null = null;
     let hasConnected = false;
 
     const reportConnectionError = (connectionError: unknown) => {
-      setError(connectionError instanceof Error ? connectionError.message : "Unable to reconnect to the live session.");
+      if (connectionError instanceof ViewerGatewayWaitingError) {
+        setRuntimePermission(false); waitForAuthoritativeStatus(); setError("");
+        setStatus("호스트 연결을 기다리고 있어요.");
+        return;
+      }
+      dispatchGatewayConnection({ type: "recoverable-error" });
+      setError("실시간 자막에 연결하지 못했습니다. 잠시 후 다시 시도해 주세요.");
+    };
+
+    const waitForAuthoritativeStatus = () => {
+      gatewayReconnectAwaitingStatusRef.current = true;
+      resetViewerGatewayConnectionGate(gatewayConnectionGateRef.current);
+      disconnectGateway();
+      setStatus("세션 상태 확인 중 · 기존 자막 유지");
     };
 
     const scheduleReconnect = () => {
-      if (generation !== audioConnectionGenerationRef.current
-        || audioReconnectTimerRef.current !== null
+      if (generation !== gatewayConnectionGenerationRef.current
+        || gatewayReconnectTimerRef.current !== null
         || connectionPromise !== null) return;
       const delayMilliseconds = getReconnectDelayMilliseconds(reconnectAttempt);
       reconnectAttempt += 1;
+      dispatchGatewayConnection({ type: "retry" });
       setStatus(getReconnectStatus(delayMilliseconds));
-      audioReconnectTimerRef.current = window.setTimeout(() => {
-        audioReconnectTimerRef.current = null;
-        void installConnection().catch((connectionError: unknown) => {
-          reportConnectionError(connectionError);
-          scheduleReconnect();
-        });
+      gatewayReconnectTimerRef.current = window.setTimeout(() => {
+        gatewayReconnectTimerRef.current = null;
+        void resolveViewerGatewayStatus(currentViewer, generation)
+          .then((decision) => {
+            if (decision === "ended" || decision === "failed" || decision === "stale") return;
+            if (decision === "wait") {
+              waitForAuthoritativeStatus();
+              return;
+            }
+            if (decision === "reconnect" && isCurrentViewerGatewayRequest(
+              generation,
+              gatewayConnectionGenerationRef.current,
+              currentViewer.session.id,
+              viewerSessionIdRef.current,
+            )) {
+              void installConnection().catch((connectionError: unknown) => {
+                reportConnectionError(connectionError);
+                scheduleReconnect();
+              });
+            }
+          })
+          .catch(() => waitForAuthoritativeStatus());
       }, delayMilliseconds);
     };
 
     const openConnection = async (): Promise<void> => {
+      const afterSourceSeq = isSourceHydratedRef.current ? sourceLedgerRef.current.at(-1)?.sourceSeq ?? 0 : 0;
+      const ticketData = await requestViewerGatewayTicket(currentViewer.session.id);
+      const { ticket } = ticketData;
+      if (!isCurrentViewerGatewayRequest(
+        generation,
+        gatewayConnectionGenerationRef.current,
+        currentViewer.session.id,
+        viewerSessionIdRef.current,
+      )) return;
       const candidate = new WebSocket(LIVE_GATEWAY_URL);
-      audioPendingSocketRef.current = candidate;
-      candidate.binaryType = "arraybuffer";
+      gatewayPendingSocketRef.current = candidate;
       try {
         await waitForSocketOpen(candidate);
         const subscribed = new Promise<void>((resolve, reject) => {
@@ -1176,23 +1034,7 @@ export default function LiveViewer({ compact = false }: { compact?: boolean }) {
             reject(new Error("Unable to connect to the live gateway."));
           }, { once: true });
           candidate.addEventListener("message", (message) => {
-            if (message.data instanceof ArrayBuffer) {
-              if (outputModeRef.current === "captions") return;
-              // 내 발언이 통역되는 동안에는 재생하지 않습니다(에코 방지).
-              if (speakStateRef.current !== "idle") return;
-              try {
-                const event = decodeAudioChunk(message.data);
-                if (event.header.sessionId === currentViewer.session.id && event.header.language === nextLanguage) {
-                  if (event.header.seq <= minimumAudioSeqRef.current || event.header.seq <= lastAudioSeqRef.current) return;
-                  lastAudioSeqRef.current = event.header.seq;
-                  enqueueInterpretationAudio(event.pcm, event.header.sampleRate);
-                }
-              } catch {
-                setError("Unable to read the translated audio stream.");
-              }
-              return;
-            }
-            if (typeof message.data !== "string") return;
+            if (typeof message.data !== "string" || generation !== gatewayConnectionGenerationRef.current) return;
             try {
               const event: unknown = JSON.parse(message.data);
               if (!isRecord(event)) return;
@@ -1203,8 +1045,17 @@ export default function LiveViewer({ compact = false }: { compact?: boolean }) {
                   type: "subscribe",
                   sessionId: currentViewer.session.id,
                   language: nextLanguage,
+                  ...(ticketData.connectionId ? { connectionId: ticketData.connectionId, epoch: ticketData.epoch } : {}),
                   lastSeq: getLastSeq(nextLanguage),
                 }));
+              }
+              if (event.type === "media-idle" && event.sessionId === currentViewer.session.id
+                && (ticketData.epoch === undefined || event.epoch === ticketData.epoch)) {
+                setRuntimePermission(false);
+                setSourceDraftState((current) => ({ ...current, draft: null }));
+                waitForAuthoritativeStatus();
+                setStatus("호스트 연결을 기다리고 있어요.");
+                return;
               }
               if (event.type === "subscribed") {
                 window.clearTimeout(timeout);
@@ -1214,29 +1065,32 @@ export default function LiveViewer({ compact = false }: { compact?: boolean }) {
                 const liveEvent = parseBroadcastEvent(event.payload ?? event.event);
                 if (liveEvent) handleEventRef.current(liveEvent);
               }
-              if (event.type === "speak-started" || event.type === "speak-ended") speakSocketMessageRef.current(event);
-              if (event.type === "error" && typeof event.message === "string") setError(event.message);
+              if (event.type === "error") setError("실시간 자막 연결을 확인하고 있습니다. 원문 자막은 계속 유지됩니다.");
             } catch {
-              setError("Unable to read a live connection message.");
+              setError("실시간 자막 메시지를 확인할 수 없습니다. 다시 연결해 주세요.");
             }
           });
         });
-        candidate.send(JSON.stringify({ type: "authenticate", token: currentViewer.viewerToken }));
+        candidate.send(JSON.stringify({ type: "authenticate", token: ticket }));
         await subscribed;
         if (candidate.readyState !== WebSocket.OPEN) throw new Error("The live connection closed unexpectedly.");
-        if (generation !== audioConnectionGenerationRef.current) {
-          if (audioPendingSocketRef.current === candidate) audioPendingSocketRef.current = null;
+        if (generation !== gatewayConnectionGenerationRef.current) {
+          if (gatewayPendingSocketRef.current === candidate) gatewayPendingSocketRef.current = null;
           candidate.close(1000, "stale connection");
           return;
         }
-        if (hasConnected) {
+        void synchronizeSourceLedger(currentViewer.session.id, afterSourceSeq);
+        // 2026-08-22 비용 가드: 재접속 시 이미 이 언어의 히스토리를 들고 있으면
+        // 게이트웨이가 lastSeq부터 replay로 공백을 메우므로 REST 스냅샷
+        // (Supabase 7회 왕복)을 건너뛴다. 히스토리가 전무할 때만 fallback.
+        if (hasConnected && getLastSeq(nextLanguage) === 0) {
           try {
             // 2026-07-26 fix: Snapshot is a reconnect fallback, not a connection gate.
             // A timed-out history read must not close a socket that already
             // authenticated, subscribed, and can receive buffered replay.
             const snapshot = await withAbortTimeout(async (signal) => readApi<LiveSnapshot>(await fetch(
               `/api/live-sessions/${currentViewer.session.id}/snapshot?language=${encodeURIComponent(nextLanguage)}`,
-              { headers: { authorization: `Bearer ${currentViewer.viewerToken}` }, signal },
+              { signal },
             )));
             if (snapshot.lastSeq >= getLastSeq(nextLanguage)) {
               setCaptionSnapshot(snapshot);
@@ -1250,72 +1104,56 @@ export default function LiveViewer({ compact = false }: { compact?: boolean }) {
           }
         }
         hasConnected = true;
-        const previous = audioSocketRef.current;
-        if (audioPendingSocketRef.current === candidate) audioPendingSocketRef.current = null;
-        audioSocketRef.current = candidate;
-        // OPEN alone is insufficient: Speak is safe only after the viewer token
-        // was authenticated and its language subscription was acknowledged.
-        setIsSpeakGatewayReady(true);
+        const previous = gatewaySocketRef.current;
+        if (gatewayPendingSocketRef.current === candidate) gatewayPendingSocketRef.current = null;
+        gatewaySocketRef.current = candidate;
         previous?.close(1000, "connection refreshed");
-        setStatus(outputModeRef.current !== "captions"
-          ? "Connected · translated audio"
-          : "Connected · live captions");
+        dispatchGatewayConnection({ type: "socket-opened", sessionStatus: sessionStatusRef.current });
+        setStatus("연결됨 · 실시간 자막 수신 중");
         // A transient pre-connect failure must not keep the error banner up
         // once the live pipeline is actually flowing.
         setError("");
         const connectedAt = Date.now();
         candidate.addEventListener("close", (event) => {
-          if (generation !== audioConnectionGenerationRef.current || audioSocketRef.current !== candidate) return;
-          setIsSpeakGatewayReady(false);
-          // A closed socket ends the turn no matter why it closed — including
-          // the 50-minute proactive refresh below, which closes the socket out
-          // from under an active speaker. speak-client binds capture to one
-          // socket and drops every frame once it is not OPEN, so the state must
-          // be reset here or the mic goes dead while the UI still says live.
-          if (speakStateRef.current !== "idle") {
-            speakSocketMessageRef.current({ type: "speak-ended", reason: "disconnected" });
+          if (generation !== gatewayConnectionGenerationRef.current || gatewaySocketRef.current !== candidate) return;
+          gatewaySocketRef.current = null;
+          dispatchGatewayConnection({ type: "socket-closed", sessionStatus: sessionStatusRef.current });
+          if (gatewayProactiveTimerRef.current !== null) {
+            window.clearTimeout(gatewayProactiveTimerRef.current);
+            gatewayProactiveTimerRef.current = null;
           }
           if (event.code === 4401 || event.code === 4403) {
-            audioSocketRef.current = null;
-            restartInterpretationAudio();
             // 권한 만료가 아니라 호스트가 종료한 경우라면 회의록 화면으로 넘어갑니다.
-            void resolveViewerDisconnect(currentViewer).then((didEnd) => {
-              if (didEnd) return;
-              setStatus("Viewing access expired");
-              setError("Your viewing access expired. Scan the host QR code again.");
-            });
+            void resolveViewerGatewayStatus(currentViewer, generation).then((decision) => {
+              if (decision === "ended" || decision === "failed" || decision === "stale") return;
+              if (decision === "wait") {
+                waitForAuthoritativeStatus();
+                return;
+              }
+              setStatus("시청 권한이 만료되었습니다");
+              setError("시청 권한이 만료되었습니다. 호스트의 QR 코드를 다시 스캔해 주세요.");
+            }).catch(() => waitForAuthoritativeStatus());
             return;
           }
           if (Date.now() - connectedAt >= 30_000) reconnectAttempt = 0;
-          if (event.code === 4408 || event.reason.includes("SLOW_CONSUMER")) {
-            minimumAudioSeqRef.current = lastAudioSeqRef.current;
-            restartInterpretationAudio();
-            setStatus("Restoring audio · reconnecting");
-            audioSocketRef.current = null;
-            scheduleReconnect();
-            return;
-          }
-          audioSocketRef.current = null;
-          scheduleReconnect();
+          const isSlowConsumer = event.code === 4408 || event.reason.includes("SLOW_CONSUMER");
+          void resolveViewerGatewayStatus(currentViewer, generation).then((decision) => {
+            if (decision === "ended" || decision === "failed" || decision === "stale") return;
+            if (decision === "reconnect") {
+              if (isSlowConsumer) setStatus("자막 복구 중 · 다시 연결 중");
+              scheduleReconnect();
+              return;
+            }
+            waitForAuthoritativeStatus();
+          }).catch(() => waitForAuthoritativeStatus());
         });
-        if (audioProactiveTimerRef.current !== null) window.clearTimeout(audioProactiveTimerRef.current);
-        audioProactiveTimerRef.current = window.setTimeout(() => {
-          void (async () => {
-            // The microphone capture is bound to the socket that received the
-            // floor. Replacing that socket first leaves a dead capture and a
-            // speaking UI that the stale close handler intentionally ignores.
-            // Stop admitting new turns and release the current one before the
-            // same-session connection is refreshed; caption/history cursors stay.
-            setIsSpeakGatewayReady(false);
-            await endSpeaking(true);
-            await installConnection();
-          })().catch((connectionError: unknown) => {
-            reportConnectionError(connectionError);
-            scheduleReconnect();
-          });
+        if (gatewayProactiveTimerRef.current !== null) window.clearTimeout(gatewayProactiveTimerRef.current);
+        gatewayProactiveTimerRef.current = window.setTimeout(() => {
+          gatewayProactiveTimerRef.current = null;
+          scheduleReconnect();
         }, 50 * 60 * 1_000);
       } catch (connectionError) {
-        if (audioPendingSocketRef.current === candidate) audioPendingSocketRef.current = null;
+        if (gatewayPendingSocketRef.current === candidate) gatewayPendingSocketRef.current = null;
         candidate.close();
         throw connectionError;
       }
@@ -1334,17 +1172,33 @@ export default function LiveViewer({ compact = false }: { compact?: boolean }) {
     try {
       await installConnection();
     } catch (connectionError) {
+      if (connectionError instanceof ViewerGatewayWaitingError) {
+        setRuntimePermission(false); waitForAuthoritativeStatus(); setError("");
+        setStatus("호스트 연결을 기다리고 있어요.");
+        return;
+      }
       reportConnectionError(connectionError);
       scheduleReconnect();
     }
-  }, [endSpeaking, enqueueInterpretationAudio, getLastSeq, resolveViewerDisconnect, restartInterpretationAudio, setCaptionSnapshot]);
+  }, [disconnectGateway, getLastSeq, resolveViewerGatewayStatus, setCaptionSnapshot, synchronizeSourceLedger]);
 
   const handleEvent = useCallback((event: LiveBroadcastEvent) => {
+    if (event.sessionId !== viewerSessionIdRef.current) return;
+    if (event.type === "source-draft" || event.type === "source-draft-clear") {
+      if (event.type === "source-draft" && sessionStatusRef.current !== "live") return;
+      setSourceDraftState((current) => reduceViewerSourceDraft(current, event));
+      return;
+    }
+    if (event.type === "source") {
+      try { mergeSourceEvents([event]); }
+      catch { setSourceError("원문 기록의 순서를 확인할 수 없습니다. 다시 불러와 주세요."); }
+      return;
+    }
     if (event.type === "caption") {
       // A caption can only come from a running host pipeline: if the viewer
       // missed the session-status broadcast (reconnect gap), leave the
       // waiting screen anyway instead of hiding live captions behind it.
-      setSessionStatus((current) => current === "preparing" ? "live" : current);
+      if (sessionStatusRef.current === "preparing") updateSessionStatus("live");
       // Resume bookkeeping is COMMITTED-only (contract C1). Interim captions
       // carry the seq their committed line is ABOUT to take, so running the
       // strict-greater guard over them would raise lastSeq to N and then drop
@@ -1357,40 +1211,83 @@ export default function LiveViewer({ compact = false }: { compact?: boolean }) {
         setLastSeq(event.language, event.seq);
       }
       const nextCache = mergeLanguageCaptionCache(captionsByLanguageRef.current, event.language, [event]);
-      captionsByLanguageRef.current = nextCache;
-      if (event.language === languageRef.current) setCaptions(nextCache[event.language] ?? []);
+      replaceCaptionCache(nextCache);
       return;
     }
     if (event.type === "recording-status") {
-      if (event.language === languageRef.current) setError(event.message);
+      if (event.language === languageRef.current) {
+        setError("실시간 자막 연결을 확인하고 있습니다. 원문 자막은 계속 유지됩니다.");
+      }
       return;
     }
-    if (event.type === "speaker-legend") setSpeakers(event.speakers);
+    if (event.type === "topic-upsert") {
+      setTopicState((current) => {
+        const base = current?.sessionId === event.sessionId ? current : createLiveTopicState(event.sessionId);
+        try {
+          return applyLiveTopicUpsert(base, event);
+        } catch {
+          window.queueMicrotask(() => setError("주제 정보를 확인할 수 없습니다. 실시간 자막은 계속 표시됩니다."));
+          return base;
+        }
+      });
+      return;
+    }
     if (event.type === "floor") {
       setFloorHolder(event.holder);
+      return;
     }
     if (event.type === "session-status") {
-      setSessionStatus(event.status);
+      updateSessionStatus(event.status);
       setStatus(captionConnectionLabel(event.status));
       // Going live supersedes any stale pre-live warning banner.
       if (event.status === "live") setError("");
       if (event.status === "stopped") markSessionEndedRef.current();
+      if (event.status === "failed") markSessionFailedRef.current();
     }
     // Translation failures are operator health, not participant-facing copy.
     // Keep the viewer's last Live/Preparing state while the controller handles
     // recovery; a later ready/preparing event may update this status normally.
-    if (event.type === "language-status"
-      && event.language === languageRef.current
-      && event.status !== "unavailable") setStatus(captionConnectionLabel(event.status));
-    if (event.type === "language-removed" && event.language === languageRef.current) setError("The host stopped this language. Choose another language.");
-    if (event.type === "audio-control" && event.language === languageRef.current) {
-      if (event.seq <= minimumAudioSeqRef.current) return;
-      minimumAudioSeqRef.current = Math.max(minimumAudioSeqRef.current, event.seq);
-      restartInterpretationAudio();
-      if (event.action === "restart") setStatus("Audio restored · receiving live");
+    if (event.type === "language-status") {
+      if (event.code === "SOURCE_REPLAY_INCOMPLETE") {
+        setIncompleteLanguages((current) => [...new Set([...current, event.language])]);
+      }
+      setUnavailableLanguages((current) => event.status === "unavailable"
+        ? [...new Set([...current, event.language])]
+        : current.filter((language) => language !== event.language));
+      if (event.language === languageRef.current && event.status !== "unavailable") {
+        setStatus(captionConnectionLabel(event.status));
+      }
     }
-    if (event.type === "error") setError(event.message);
-  }, [endSpeaking, getLastSeq, restartInterpretationAudio, setLastSeq]);
+    if (event.type === "language-removed") {
+      setUnavailableLanguages((current) => current.filter((language) => language !== event.language));
+      setViewer((current) => current ? {
+        ...current,
+        session: { ...current.session, languages: current.session.languages.filter((item) => item !== event.language) },
+      } : current);
+      if (event.language === languageRef.current) {
+        const remainingLanguage = languages.find((item) => item !== event.language) ?? "";
+        languageRef.current = remainingLanguage;
+        setLanguage(remainingLanguage);
+        selectedLaneIdRef.current = "source";
+        setSelectedLaneId("source");
+        anchorUtteranceKeyRef.current = anchorsByLaneRef.current.source ?? "";
+        pendingRecoveryAnchorRef.current = anchorUtteranceKeyRef.current;
+        if (remainingLanguage && viewerSessionIdRef.current) writeViewerRecoveryContext(localStorage, {
+          sessionId: viewerSessionIdRef.current,
+          language: remainingLanguage,
+          preferredTargetLanguage: remainingLanguage,
+          selectedLaneId: "source",
+          expandedTopicIds: expandedTopicIdsRef.current,
+          anchorUtteranceKey: anchorUtteranceKeyRef.current,
+          anchorsByLane: anchorsByLaneRef.current,
+        });
+        setError("호스트가 이 번역 언어를 종료했습니다. 원문으로 전환했습니다.");
+      }
+    }
+    if (event.type === "error") {
+      setError("라이브 자막 연결에 문제가 있습니다. 잠시 후 다시 확인해 주세요.");
+    }
+  }, [getLastSeq, languages, mergeSourceEvents, replaceCaptionCache, setLastSeq, updateSessionStatus]);
   handleEventRef.current = handleEvent;
 
   const subscribe = useCallback(async (
@@ -1400,26 +1297,28 @@ export default function LiveViewer({ compact = false }: { compact?: boolean }) {
   ) => {
     // 2026-07-26 fix: Attach first. The gateway buffers live events while replaying from lastSeq,
     // so the socket closes the snapshot race instead of opening one.
-    await endSpeaking(true);
     // Foreground recovery closes the half-open socket synchronously before this
     // await. Leaving, changing language, or ending the session increments the
     // generation and prevents that old recovery from resurrecting a connection.
     if (expectedConnectionGeneration !== undefined
-      && expectedConnectionGeneration !== audioConnectionGenerationRef.current) return;
+      && expectedConnectionGeneration !== gatewayConnectionGenerationRef.current) return;
     disconnectGateway();
     // 2026-07-26 fix: Sequence numbers restart per session. A viewer who leaves and joins a
     // different QR session in the same tab must not inherit either captions or
     // resume cursors from the previous call.
     if (captionCacheSessionIdRef.current !== currentViewer.session.id) {
       captionCacheSessionIdRef.current = currentViewer.session.id;
-      captionsByLanguageRef.current = {};
+      replaceCaptionCache({});
+      sourceLedgerRef.current = [];
+      setSourceLedger([]);
+      isSourceHydratedRef.current = false;
+      setSourceError("");
+      setIncompleteLanguages([]);
       lastSeqByLanguageRef.current = {};
       snapshotRegistryRef.current.reset(currentViewer.session.id);
-      setSpeakers([]);
     }
     languageRef.current = nextLanguage;
     // Show this language's known transcript at once — never a blank pane.
-    setCaptions(getCachedLanguageCaptions(captionsByLanguageRef.current, nextLanguage));
     // Per-language lastSeq memory is kept across language switches so the
     // gateway can replay only the true gap when this language is revisited.
     setStatus(getCachedLanguageCaptions(captionsByLanguageRef.current, nextLanguage).length
@@ -1439,7 +1338,7 @@ export default function LiveViewer({ compact = false }: { compact?: boolean }) {
         nextLanguage,
         () => withAbortTimeout(async (signal) => readApi<LiveSnapshot>(await fetch(
           `/api/live-sessions/${currentViewer.session.id}/snapshot?language=${encodeURIComponent(nextLanguage)}`,
-          { headers: { authorization: `Bearer ${currentViewer.viewerToken}` }, signal },
+          { signal },
         ))),
       );
     } catch {
@@ -1452,10 +1351,146 @@ export default function LiveViewer({ compact = false }: { compact?: boolean }) {
       const refreshedViewer = mergeViewerSnapshot(currentViewer, snapshot);
       if (languageRef.current === nextLanguage) setViewer(refreshedViewer);
     }
-  }, [connectGateway, disconnectGateway, endSpeaking, setCaptionSnapshot]);
+  }, [connectGateway, disconnectGateway, replaceCaptionCache, setCaptionSnapshot]);
+
+  const stopGatewayLifecycle = useCallback(() => {
+    resetViewerGatewayConnectionGate(gatewayConnectionGateRef.current);
+    disconnectGateway();
+  }, [disconnectGateway]);
+
+  const restoreViewerSession = useCallback(async () => {
+    const stored = readViewerRecoveryContext(localStorage);
+    if (!stored) {
+      clearViewerRecoveryContext(localStorage);
+      return;
+    }
+    setRecoveryError("");
+    try {
+      let result: ViewerState;
+      try {
+        const live = await readApi<unknown>(await fetch(
+          `/api/live-sessions/${stored.sessionId}/viewer-session`,
+          { method: "GET", cache: "no-store" },
+        ));
+        if (!isViewerJoinData(live)) throw new Error("세션 정보를 확인할 수 없습니다.");
+        result = live;
+      } catch (error) {
+        if (!(error instanceof ApiRequestError) || ![401, 403, 409, 410].includes(error.status)) throw error;
+        const records = parseViewerRecordsSession(await readApi<unknown>(await fetch(
+          `/api/live-sessions/${stored.sessionId}/records-session`, { cache: "no-store" },
+        )), stored.sessionId);
+        result = records.viewer;
+        setRecordsExpiresAt(records.recordsExpiresAt);
+        setIsRecordsExpired(isRecordsAccessExpired(records.recordsExpiresAt, Date.now()));
+        isSessionEndedRef.current = true;
+        setIsSessionEnded(true);
+      }
+      if (result.session.id !== stored.sessionId) throw new Error("복구된 회의가 일치하지 않습니다.");
+      const restoredSelection = resolveViewerRecoverySelection(stored, result.session.languages);
+      const restoredLanguage = restoredSelection.language;
+      const restoredLaneId = restoredSelection.selectedLaneId;
+      if (!restoredLanguage) throw new Error("No viewing language is available.");
+      setEmail(result.self.email);
+      setDisplayName(result.self.displayName);
+      setCompany(result.self.company);
+      setDepartment(result.self.department);
+      setJobTitle(result.self.jobTitle);
+      setPrivacyConsent(true);
+      setSummaryDeliveryConsent(result.self.summaryConsent);
+      viewerSessionIdRef.current = result.session.id;
+      updateSessionStatus(result.session.status ?? "live");
+      setStatus(captionConnectionLabel(result.session.status ?? "live"));
+      setViewer(result);
+      setLanguage(restoredLanguage);
+      languageRef.current = restoredLanguage;
+      selectedLaneIdRef.current = restoredLaneId;
+      setSelectedLaneId(restoredLaneId);
+      expandedTopicIdsRef.current = stored.expandedTopicIds;
+      setExpandedTopicIds(stored.expandedTopicIds);
+      anchorsByLaneRef.current = stored.anchorsByLane;
+      anchorUtteranceKeyRef.current = restoredSelection.anchorUtteranceKey;
+      pendingRecoveryAnchorRef.current = restoredSelection.anchorUtteranceKey;
+      writeViewerRecoveryContext(localStorage, {
+        sessionId: result.session.id,
+        language: restoredLanguage,
+        preferredTargetLanguage: restoredLanguage,
+        selectedLaneId: restoredLaneId,
+        expandedTopicIds: stored.expandedTopicIds,
+        anchorUtteranceKey: restoredSelection.anchorUtteranceKey,
+        anchorsByLane: stored.anchorsByLane,
+      });
+    } catch (error) {
+      stopGatewayLifecycle();
+      const code = error instanceof ApiRequestError ? error.code : "";
+      const isDenied = /EXPIRED|FORBIDDEN|NOT_FOUND|REVOKED|AUTH_REQUIRED|INVALID_TOKEN/u.test(code);
+      if (isDenied) {
+        clearViewerPrivateState(); setViewer(null); setLanguage(""); languageRef.current = "";
+      }
+      setRecoveryError(isDenied ? "기록 열람 기간이 끝났거나 접근 권한이 없습니다." : "기록을 불러오지 못했어요. 새로고침하거나 다시 시도해 주세요.");
+    }
+  }, [clearViewerPrivateState, stopGatewayLifecycle, updateSessionStatus]);
 
   useEffect(() => {
-    if (!viewer || !language || isSessionEnded || sessionStatus === "stopped") return;
+    if (!isSessionEnded || !viewer || recordsExpiresAt) return;
+    const sessionId = viewer.session.id;
+    let isCancelled = false;
+    void (async () => {
+      try {
+        const records = parseViewerRecordsSession(await readApi<unknown>(await fetch(
+          `/api/live-sessions/${sessionId}/records-session`, { cache: "no-store" },
+        )), sessionId);
+        if (isCancelled) return;
+        setViewer(records.viewer); setRecordsExpiresAt(records.recordsExpiresAt);
+      } catch { if (!isCancelled) setError("기록 열람 기한을 확인하지 못했어요. 새로고침해 주세요."); }
+    })();
+    return () => { isCancelled = true; };
+  }, [isSessionEnded, viewer?.session.id, recordsExpiresAt]);
+
+  useEffect(() => {
+    if (!recordsExpiresAt) return;
+    const expire = () => {
+      if (!isRecordsAccessExpired(recordsExpiresAt, Date.now())) return;
+      setIsRecordsExpired(true); minutesLoadGenerationRef.current += 1;
+      setTranscript([]); setRecordingGaps([]); setTranscriptTopics([]); setSummaryRecord(null); setMinutesPollingState("idle");
+    };
+    expire();
+    const timer = window.setTimeout(expire, Math.max(0, Date.parse(recordsExpiresAt) - Date.now()));
+    window.addEventListener("focus", expire);
+    return () => { window.clearTimeout(timer); window.removeEventListener("focus", expire); };
+  }, [recordsExpiresAt]);
+
+  useEffect(() => {
+    if (!viewer || isSessionEnded) return;
+    const sessionId = viewer.session.id;
+    let isCancelled = false;
+    let inFlight = false;
+    const refreshRuntime = async () => {
+      if (inFlight || document.visibilityState === "hidden") return;
+      inFlight = true;
+      try {
+        const runtime = await readApi<unknown>(await fetch(`/api/live-sessions/${sessionId}/runtime`, { cache: "no-store" }));
+        if (isCancelled || viewerSessionIdRef.current !== sessionId) return;
+        if (!isRecord(runtime) || typeof runtime.enabled !== "boolean") throw new Error("잘못된 연결 상태입니다.");
+        if (!runtime.enabled) { setRuntimePermission(null); return; }
+        if (runtime.sessionId !== sessionId || typeof runtime.canPrepareConnection !== "boolean") throw new Error("잘못된 연결 권한입니다.");
+        setRuntimePermission(runtime.canPrepareConnection);
+        if (!runtime.canPrepareConnection) setStatus("호스트 연결을 기다리고 있어요.");
+        else if (gatewayReconnectAwaitingStatusRef.current) {
+          gatewayReconnectAwaitingStatusRef.current = false;
+          setGatewayLifecycleRevision((revision) => revision + 1);
+        }
+      } catch { if (!isCancelled) setError("실시간 연결 상태를 확인하지 못했어요. 잠시 후 다시 확인합니다."); }
+      finally { inFlight = false; }
+    };
+    void refreshRuntime();
+    const timer = window.setInterval(() => void refreshRuntime(), 5_000);
+    return () => { isCancelled = true; window.clearInterval(timer); };
+  }, [viewer?.session.id, isSessionEnded]);
+
+  const { isRestoringViewer } = useViewerRecovery(restoreViewerSession);
+
+  useEffect(() => {
+    if (!viewer || !language || runtimePermission === false || !(shouldConnectViewerGateway(sessionStatus, isSessionEnded) || (runtimePermission === true && sessionStatus === "preparing" && !isSessionEnded))) return;
 
     const recover = (event: ForegroundRecoveryEvent) => {
       const operation = requestForegroundRecovery(
@@ -1465,9 +1500,21 @@ export default function LiveViewer({ compact = false }: { compact?: boolean }) {
         () => {
           // Do this before any await: a mobile browser may retain a half-open
           // WebSocket after suspension and never deliver its close event.
+          resetViewerGatewayConnectionGate(gatewayConnectionGateRef.current);
           disconnectGateway();
-          const recoveryGeneration = audioConnectionGenerationRef.current;
-          return subscribe(languageRef.current, viewer, recoveryGeneration);
+          const recoveryGeneration = gatewayConnectionGenerationRef.current;
+          return resolveViewerGatewayStatus(viewer, recoveryGeneration).then((decision) => {
+            if (decision !== "reconnect") {
+              if (decision === "wait") gatewayReconnectAwaitingStatusRef.current = true;
+              return;
+            }
+            const recoveryLanguage = languageRef.current;
+            return connectViewerGatewayOnce(
+              gatewayConnectionGateRef.current,
+              `${viewer.session.id}:${recoveryLanguage}`,
+              () => subscribe(recoveryLanguage, viewer, recoveryGeneration),
+            );
+          });
         },
       );
       void operation?.catch(() => {
@@ -1485,32 +1532,65 @@ export default function LiveViewer({ compact = false }: { compact?: boolean }) {
       window.removeEventListener("pageshow", handlePageShow);
       window.removeEventListener("online", handleOnline);
     };
-  }, [disconnectGateway, isSessionEnded, language, sessionStatus, subscribe, viewer]);
+  }, [disconnectGateway, runtimePermission, isSessionEnded, language, resolveViewerGatewayStatus, sessionStatus, subscribe, viewer]);
+
+  useEffect(() => {
+    if (!viewer || !language) return;
+    if (runtimePermission === false || !(shouldConnectViewerGateway(sessionStatus, isSessionEnded) || (runtimePermission === true && sessionStatus === "preparing" && !isSessionEnded))) {
+      stopGatewayLifecycle();
+      if (sessionStatus === "stopped") markSessionEndedRef.current();
+      if (sessionStatus === "failed") markSessionFailedRef.current();
+      return;
+    }
+    const connectionKey = `${viewer.session.id}:${language}`;
+    gatewayReconnectAwaitingStatusRef.current = false;
+    void connectViewerGatewayOnce(
+      gatewayConnectionGateRef.current,
+      connectionKey,
+      () => subscribe(language, viewer),
+    ).catch(() => {
+      setError("실시간 자막에 연결하지 못했습니다. 잠시 후 다시 시도해 주세요.");
+    });
+  }, [gatewayLifecycleRevision, runtimePermission, isSessionEnded, language, sessionStatus, stopGatewayLifecycle, subscribe, viewer]);
 
   const join = useCallback(async () => {
-    const normalizedDisplayName = normalizeDisplayName(displayName);
+    const normalizedEmail = normalizeEmail(email);
+    const normalizedDisplayName = normalizeProfileField(displayName);
+    const normalizedCompany = normalizeProfileField(company);
     const normalizedDepartment = normalizeProfileField(department);
     const normalizedJobTitle = normalizeProfileField(jobTitle);
     const normalizedAdmissionCode = admissionCode.replace(/\D/gu, "").slice(0, 6);
-    if (normalizedDisplayName.length < 1 || normalizedDisplayName.length > 40) {
-      setError("Enter a name between 1 and 40 characters.");
+    if (!/^\S+@\S+\.\S+$/u.test(normalizedEmail)) {
+      setError("올바른 이메일 주소를 입력해 주세요.");
+      return;
+    }
+    if (!normalizedDisplayName) {
+      setError("이름을 입력해 주세요.");
+      return;
+    }
+    if (normalizedDisplayName.length > 40) {
+      setError("이름은 40자 이하로 입력해 주세요.");
+      return;
+    }
+    if (normalizedCompany.length > 100) {
+      setError("회사명은 100자 이하로 입력해 주세요.");
       return;
     }
     if (normalizedDepartment.length > 80) {
-      setError("Department must be 80 characters or fewer.");
+      setError("부서는 80자 이하로 입력해 주세요.");
       return;
     }
     if (normalizedJobTitle.length > 100) {
-      setError("Job title must be 100 characters or fewer.");
+      setError("직급은 100자 이하로 입력해 주세요.");
       return;
     }
     const isInviteJoin = Boolean(pendingInviteToken);
     if (!isInviteJoin && normalizedAdmissionCode.length !== 6) {
-      setError("Enter the 6-digit access code shown by the host.");
+      setError("호스트가 공유한 6자리 인증코드를 입력해 주세요.");
       return;
     }
     if (!SUPABASE_URL || !SUPABASE_ANON_KEY) {
-      setError("The guest connection is not configured.");
+      setError("참여자 연결이 설정되지 않았습니다.");
       return;
     }
     setIsBusy(true);
@@ -1518,7 +1598,7 @@ export default function LiveViewer({ compact = false }: { compact?: boolean }) {
     let hasRedeemedGrant = false;
     try {
       const supabase = supabaseRef.current ?? createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
-        auth: { persistSession: true, storageKey: "rnw-live-viewer-auth-v1" },
+        auth: { persistSession: false },
       });
       supabaseRef.current = supabase;
       const existing = await supabase.auth.getSession();
@@ -1532,35 +1612,61 @@ export default function LiveViewer({ compact = false }: { compact?: boolean }) {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
-          ...(isInviteJoin ? { inviteToken: pendingInviteToken } : { admissionCode: normalizedAdmissionCode }),
+          ...(isInviteJoin ? { inviteToken: pendingInviteToken } : { accessCode: normalizedAdmissionCode }),
+          email: normalizedEmail,
           displayName: normalizedDisplayName,
+          company: normalizedCompany,
           department: normalizedDepartment,
           jobTitle: normalizedJobTitle,
+          privacyConsent,
+          summaryConsent: summaryDeliveryConsent,
+          marketingConsent,
+          consentNoticeVersions: {
+            privacy: PARTICIPANT_CONSENT_NOTICES.privacy.version,
+            summaryDelivery: PARTICIPANT_CONSENT_NOTICES.summaryDelivery.version,
+            marketing: PARTICIPANT_CONSENT_NOTICES.marketing.version,
+          },
           deviceId: makeDeviceId(),
           accessToken,
         }),
       }));
       if (!isViewerJoinData(result)) throw new Error("The guest join response is invalid.");
       hasRedeemedGrant = true;
-      const nextViewer = {
-        ...result,
-        accessToken,
-        displayName: normalizedDisplayName,
-        department: normalizedDepartment,
-        jobTitle: normalizedJobTitle,
-      };
+      setEmail(result.self.email);
+      setDisplayName(result.self.displayName);
+      setCompany(result.self.company);
+      setDepartment(result.self.department);
+      setJobTitle(result.self.jobTitle);
+      setPrivacyConsent(true);
+      setSummaryDeliveryConsent(result.self.summaryConsent);
+      const nextViewer = result;
+      viewerSessionIdRef.current = result.session.id;
       const requestedLanguage = requestedLanguageRef.current
         || new URLSearchParams(window.location.search).get("language");
       const firstLanguage = requestedLanguage && result.session.languages.includes(requestedLanguage)
         ? requestedLanguage
         : result.session.languages[0];
       if (!firstLanguage) throw new Error("No viewing language is available.");
-      setSessionStatus(result.session.status ?? "live");
+      updateSessionStatus(result.session.status ?? "live");
       setStatus(captionConnectionLabel(result.session.status ?? "live"));
       setViewer(nextViewer);
       setLanguage(firstLanguage);
       languageRef.current = firstLanguage;
-      await subscribe(firstLanguage, nextViewer);
+      const firstLaneId = `translation:${firstLanguage}`;
+      selectedLaneIdRef.current = firstLaneId;
+      setSelectedLaneId(firstLaneId);
+      expandedTopicIdsRef.current = [];
+      setExpandedTopicIds([]);
+      anchorUtteranceKeyRef.current = "";
+      writeViewerRecoveryContext(localStorage, {
+        sessionId: result.session.id,
+        language: firstLanguage,
+        preferredTargetLanguage: firstLanguage,
+        selectedLaneId: firstLaneId,
+        expandedTopicIds: [],
+        anchorUtteranceKey: "",
+        anchorsByLane: {},
+      });
     } catch (joinError) {
       if (joinError instanceof ApiRequestError) {
         // A closed admission almost always means the host ended the session:
@@ -1571,14 +1677,14 @@ export default function LiveViewer({ compact = false }: { compact?: boolean }) {
         }
         setError(getJoinErrorMessage(joinError));
       } else if (!hasRedeemedGrant) {
-        setError("This QR invite is invalid or has expired.");
+        setError("QR 초대가 유효하지 않거나 만료되었습니다.");
       } else {
         setError(getJoinErrorMessage(joinError));
       }
     } finally {
       setIsBusy(false);
     }
-  }, [admissionCode, department, displayName, jobTitle, pendingInviteToken, subscribe]);
+  }, [admissionCode, company, department, displayName, email, jobTitle, marketingConsent, pendingInviteToken, privacyConsent, summaryDeliveryConsent, updateSessionStatus]);
 
   useEffect(() => {
     if (getViewerSurfaceRedirect(
@@ -1588,23 +1694,43 @@ export default function LiveViewer({ compact = false }: { compact?: boolean }) {
     )) return;
     const params = new URLSearchParams(window.location.search);
     requestedLanguageRef.current = params.get("language") ?? "";
-    const inviteToken = readInviteTokenFromHash();
-    if (inviteToken === null) return;
-    if (!inviteToken) {
+    const admissionLink = parseAdmissionLinkHash(window.location.hash);
+    if (window.location.hash !== admissionLink.canonicalHash) {
+      window.history.replaceState(null, "", `${window.location.pathname}${window.location.search}${admissionLink.canonicalHash}`);
+    }
+    if (admissionLink.kind === "invalid") {
       setError("This QR invite is invalid or has expired.");
       return;
     }
-    setPendingInviteToken(inviteToken);
+    if (admissionLink.kind === "invite") setPendingInviteToken(admissionLink.inviteToken);
+    if (admissionLink.kind === "code") setAdmissionCode((current) => current || admissionLink.accessCode);
   }, []);
 
   const changeLanguage = useCallback(async (nextLanguage: string) => {
-    if (!viewer || nextLanguage === language) return;
+    if (!viewer) return;
+    const nextLaneId = `translation:${nextLanguage}`;
+    selectedLaneIdRef.current = nextLaneId;
+    setSelectedLaneId(nextLaneId);
+    anchorUtteranceKeyRef.current = anchorsByLaneRef.current[nextLaneId] ?? "";
+    pendingRecoveryAnchorRef.current = anchorUtteranceKeyRef.current;
+    writeViewerRecoveryContext(localStorage, {
+      sessionId: viewer.session.id,
+      language: nextLanguage,
+      preferredTargetLanguage: nextLanguage,
+      selectedLaneId: nextLaneId,
+      expandedTopicIds: expandedTopicIdsRef.current,
+      anchorUtteranceKey: anchorUtteranceKeyRef.current,
+      anchorsByLane: anchorsByLaneRef.current,
+    });
+    if (nextLanguage === language) return;
     languageRef.current = nextLanguage;
     setLanguage(nextLanguage);
     setError("");
     if (isSessionEnded) {
       setSummaryRecord(null);
-      setTranscript([]);
+      setTranscript([]); setRecordingGaps([]);
+      setTranscriptTopics([]);
+      setMinutesEvent(null);
       setIsTranscriptLoaded(false);
       setSummaryError("");
       setTranscriptError("");
@@ -1614,117 +1740,55 @@ export default function LiveViewer({ compact = false }: { compact?: boolean }) {
       void loadMinutes(nextLanguage);
       return;
     }
-    try {
-      await subscribe(nextLanguage, viewer);
-    } catch (switchError) {
-      setError(switchError instanceof Error ? switchError.message : "Unable to change language.");
-    }
-  }, [isSessionEnded, language, loadMinutes, subscribe, viewer]);
-
-  const openPip = useCallback(async () => {
-    const pipApi = (window as Window & { documentPictureInPicture?: { requestWindow(options: { width: number; height: number }): Promise<Window> } }).documentPictureInPicture;
-    if (!pipApi) {
-      if (!document.pictureInPictureEnabled) {
-        setError("Picture in Picture is not available in this browser.");
-        return;
-      }
-      const previous = fallbackPipRef.current;
-      if (previous) {
-        window.clearInterval(previous.timer);
-        for (const track of previous.stream.getTracks()) track.stop();
-        previous.video.remove();
-      }
-      const canvas = document.createElement("canvas");
-      canvas.width = 1280;
-      canvas.height = 720;
-      const context = canvas.getContext("2d");
-      if (!context) {
-        setError("Unable to create the Picture in Picture caption view.");
-        return;
-      }
-      drawFallbackPipFrame(context, pipFrameRef.current);
-      const stream = canvas.captureStream(12);
-      const video = document.createElement("video");
-      video.muted = true;
-      video.playsInline = true;
-      video.srcObject = stream;
-      video.style.position = "fixed";
-      video.style.width = "1px";
-      video.style.height = "1px";
-      video.style.opacity = "0";
-      video.style.pointerEvents = "none";
-      document.body.append(video);
-      const timer = window.setInterval(() => drawFallbackPipFrame(context, pipFrameRef.current), 100);
-      fallbackPipRef.current = { video, stream, timer };
-      const cleanFallback = () => {
-        const active = fallbackPipRef.current;
-        if (!active || active.video !== video) return;
-        window.clearInterval(active.timer);
-        for (const track of active.stream.getTracks()) track.stop();
-        active.video.remove();
-        fallbackPipRef.current = null;
-      };
-      video.addEventListener("leavepictureinpicture", cleanFallback, { once: true });
-      try {
-        await video.play();
-        await video.requestPictureInPicture();
-      } catch {
-        cleanFallback();
-        setError("Unable to open Picture in Picture.");
-      }
-      return;
-    }
-    const nextWindow = await pipApi.requestWindow({ width: 720, height: 360 });
-    for (const styleSheet of Array.from(document.styleSheets)) {
-      if (styleSheet.href) {
-        const link = nextWindow.document.createElement("link");
-        link.rel = "stylesheet";
-        link.href = styleSheet.href;
-        nextWindow.document.head.append(link);
-      }
-    }
-    nextWindow.document.body.className = "live-pip-body";
-    nextWindow.addEventListener("pagehide", () => {
-      pipWindowRef.current = null;
-      setPipWindow(null);
-    }, { once: true });
-    pipWindowRef.current = nextWindow;
-    setPipWindow(nextWindow);
-  }, []);
+  }, [isSessionEnded, language, loadMinutes, viewer]);
 
   const leaveMeeting = useCallback(async () => {
     const currentViewer = viewer;
-    await endSpeaking(true);
     if (currentViewer) {
       try {
         await readApi<unknown>(await fetch(`/api/live-sessions/${currentViewer.session.id}/leave`, {
           method: "POST",
-          headers: { authorization: `Bearer ${currentViewer.viewerToken}` },
         }));
       } catch {
-        setStatus("Left locally");
+        setStatus("세션에서 나감");
       }
     }
-    disconnectGateway();
-    clearInterpretationAudio();
-    pipWindowRef.current?.close();
+    endSpeaking(true);
+    stopGatewayLifecycle();
+    clearViewerPrivateState();
     setViewer(null);
     setHasLeftSession(true);
     setError("");
-  }, [clearInterpretationAudio, disconnectGateway, endSpeaking, viewer]);
+  }, [clearViewerPrivateState, endSpeaking, stopGatewayLifecycle, viewer]);
 
-  useEffect(() => () => {
-    void stopSpeakCapture();
-    disconnectGateway();
-    pipWindowRef.current?.close();
-    const fallback = fallbackPipRef.current;
-    if (fallback) {
-      window.clearInterval(fallback.timer);
-      for (const track of fallback.stream.getTracks()) track.stop();
-      fallback.video.remove();
-      fallbackPipRef.current = null;
+  useEffect(() => () => stopGatewayLifecycle(), [stopGatewayLifecycle]);
+
+  useEffect(() => () => endSpeaking(true), [endSpeaking]);
+
+  useEffect(() => {
+    if (speakState === "idle") return;
+    speakStopButtonRef.current?.focus();
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Tab") {
+        event.preventDefault();
+        speakStopButtonRef.current?.focus();
+        return;
+      }
+      if (event.key !== "Escape") return;
+      event.preventDefault();
+      endSpeaking(true);
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [endSpeaking, speakState]);
+
+  useEffect(() => {
+    if (speakStateRef.current === "idle") return;
+    if (!viewer || isSessionEnded || sessionStatus !== "live"
+      || viewer.session.participantSpeakingEnabled !== true) {
+      endSpeaking(true);
     }
-  }, [disconnectGateway, stopSpeakCapture]);
+  }, [endSpeaking, isSessionEnded, sessionStatus, viewer]);
 
   useEffect(() => {
     if (!viewer || window.parent === window) return;
@@ -1735,16 +1799,127 @@ export default function LiveViewer({ compact = false }: { compact?: boolean }) {
     }, "*");
   }, [outputMode, sessionType, viewer]);
 
-  const floorHolderLabel = floorHolderName(floorHolder);
-  const stage = useMemo(() => <ViewerStage sessionType={sessionType} outputMode={outputMode}
-    captions={captions} speakers={speakers} status={status} isAudioEnabled={isInterpretationAudioEnabled}
-    sessionStatus={sessionStatus} floorHolder={floorHolderLabel} />,
-  [captions, floorHolderLabel, isInterpretationAudioEnabled, outputMode, sessionStatus, sessionType, speakers, status]);
+  const translationLanes = useMemo(() => buildTranslationLanes(null, languages).map((lane) => ({
+    ...lane,
+    label: lane.kind === "source" ? "원문" : languageLabel(lane.language),
+  })), [languages]);
+  const selectedLane = translationLanes.find((lane) => lane.id === selectedLaneId) ?? translationLanes[0] ?? null;
+  const selectedLaneInputs = useMemo<CaptionLaneInput[]>(() => {
+    if (!selectedLane || selectedLane.kind === "source") return [];
+    const events = captionsByLanguage[selectedLane.language] ?? [];
+    return events.map((caption, index) => captionLaneInput(caption, index, events.length));
+  }, [captionsByLanguage, selectedLane]);
+  const targetLaneCaptions = useMemo(() => selectedLane?.kind === "translation"
+    ? projectCaptionLane(selectedLaneInputs, selectedLane) : [], [selectedLaneInputs, selectedLane]);
+  const sourceFinalCaptions = useMemo(() => sourceLedger.map(presentViewerSourceEvent), [sourceLedger]);
+  const sourceLaneCaptions = useMemo(() => {
+    const draft = sourceDraftState.draft;
+    if (!draft) return sourceFinalCaptions;
+    return [...sourceFinalCaptions, {
+      id: `source-draft:${draft.generation}`, text: draft.text, language: draft.sourceLanguage,
+      speakerLabel: draft.speaker.label, timestamp: formatMinuteTime(draft.emittedAt), isFinal: false,
+    }];
+  }, [sourceFinalCaptions, sourceDraftState.draft]);
+  const selectedLaneCaptions = selectedLane?.kind === "source" ? sourceLaneCaptions : targetLaneCaptions;
+
+  useEffect(() => {
+    const pendingAnchor = pendingRecoveryAnchorRef.current;
+    if (!pendingAnchor) return;
+    const target = Array.from(document.querySelectorAll<HTMLElement>("[role=tabpanel]:not([hidden]) [data-utterance-key]"))
+      .find((element) => element.dataset.utteranceKey === pendingAnchor);
+    if (!target) return;
+    target.scrollIntoView({ block: "nearest" });
+    pendingRecoveryAnchorRef.current = "";
+  }, [selectedLaneCaptions]);
+
+  const rememberReadingAnchor = useCallback((utteranceKey: string) => {
+    const sessionId = viewerSessionIdRef.current;
+    const laneId = selectedLaneIdRef.current;
+    if (!sessionId || anchorsByLaneRef.current[laneId] === utteranceKey) return;
+    anchorsByLaneRef.current = { ...anchorsByLaneRef.current, [laneId]: utteranceKey };
+    anchorUtteranceKeyRef.current = utteranceKey;
+    writeViewerRecoveryContext(localStorage, {
+      sessionId,
+      language: languageRef.current,
+      preferredTargetLanguage: languageRef.current,
+      selectedLaneId: laneId,
+      expandedTopicIds: expandedTopicIdsRef.current,
+      anchorUtteranceKey: utteranceKey,
+      anchorsByLane: anchorsByLaneRef.current,
+    });
+  }, []);
+
+  const selectTranslationLane = useCallback((lane: TranslationLanePresentation) => {
+    if (!viewer) return;
+    selectedLaneIdRef.current = lane.id;
+    setSelectedLaneId(lane.id);
+    anchorUtteranceKeyRef.current = anchorsByLaneRef.current[lane.id] ?? "";
+    pendingRecoveryAnchorRef.current = anchorUtteranceKeyRef.current;
+    if (lane.kind === "translation") {
+      void changeLanguage(lane.language);
+      return;
+    }
+    writeViewerRecoveryContext(localStorage, {
+      sessionId: viewer.session.id,
+      language,
+      preferredTargetLanguage: language,
+      selectedLaneId: lane.id,
+      expandedTopicIds: expandedTopicIdsRef.current,
+      anchorUtteranceKey: anchorUtteranceKeyRef.current,
+      anchorsByLane: anchorsByLaneRef.current,
+    });
+  }, [changeLanguage, language, viewer]);
+
+  const updateExpandedTopic = useCallback((topicId: string, isExpanded: boolean) => {
+    if (!viewer) return;
+    const next = isExpanded
+      ? [...new Set([...expandedTopicIdsRef.current, topicId])]
+      : expandedTopicIdsRef.current.filter((value) => value !== topicId);
+    expandedTopicIdsRef.current = next;
+    setExpandedTopicIds(next);
+    writeViewerRecoveryContext(localStorage, {
+      sessionId: viewer.session.id,
+      language,
+      preferredTargetLanguage: language,
+      selectedLaneId: selectedLaneIdRef.current,
+      expandedTopicIds: next,
+      anchorUtteranceKey: anchorUtteranceKeyRef.current,
+      anchorsByLane: anchorsByLaneRef.current,
+    });
+  }, [language, viewer]);
+
+  const renderTopicLane = useCallback((lane: TranslationLanePresentation) => (
+    <>
+      {lane.kind === "source" && sourceError && <div role="alert">
+        <p>{t(sourceError)}</p>
+        <button type="button" disabled={isSourceLoading} onClick={() => {
+          if (viewerSessionIdRef.current && !sourceSnapshotAbortRef.current) void synchronizeSourceLedger(viewerSessionIdRef.current, 0);
+        }}>{t("원문 다시 불러오기")}</button>
+      </div>}
+      <ViewerReadingFeed key={lane.id} captions={selectedLaneCaptions} language={lane.language} kind={lane.kind}
+        onReadingAnchorChange={rememberReadingAnchor} />
+    </>
+  ), [isSourceLoading, rememberReadingAnchor, selectedLaneCaptions, sourceError, synchronizeSourceLedger]);
+
+  if (isRestoringViewer) {
+    return (
+      <main className={`live-viewer-shell live-viewer-restoring ${compact ? "is-compact" : ""}`}>
+        <p role="status" aria-live="polite">{t("라이브 세션으로 돌아가는 중입니다.")}</p>
+      </main>
+    );
+  }
+
+  if (recoveryError && !viewer) {
+    return <main className="live-viewer-shell viewer-recovery-error"><p role="alert">{t(recoveryError)}</p>
+      <button type="button" onClick={() => void restoreViewerSession()}>{t("다시 불러오기")}</button>
+      <button type="button" onClick={() => { clearViewerPrivateState(); setRecoveryError(""); }}>{t("다른 회의 참여")}</button>
+    </main>;
+  }
 
   if (hasLeftSession) {
     return (
       <main className={`live-viewer-shell live-viewer-closed ${compact ? "is-compact" : ""}`}>
-        <p>You left the meeting.</p>
+        <p>{t("세션에서 나갔습니다.")}</p>
         {/* Leaving must not be a dead end. A participant who drops mid-call
             returns to this same URL, and re-entering the host's access code
             restores their seat and record. Clearing hasLeftSession with viewer
@@ -1755,9 +1930,9 @@ export default function LiveViewer({ compact = false }: { compact?: boolean }) {
         <button type="button" className="live-primary-action" onClick={() => {
           setHasLeftSession(false);
           setError("");
-          setStatus("Enter the access code to rejoin");
+          setStatus("다시 참여하려면 인증 코드를 입력하세요");
         }}>
-          Rejoin
+          {t("다시 참여")}
         </button>
       </main>
     );
@@ -1769,155 +1944,170 @@ export default function LiveViewer({ compact = false }: { compact?: boolean }) {
       <main className={`live-viewer-shell live-viewer-closed ${compact ? "is-compact" : ""}`}>
         <section className="live-session-ended-screen" role="status">
           <span className="live-minutes-ended-dot" aria-hidden="true" />
-          <strong>Live session ended</strong>
-          <p>The host has ended this live session. Ask the host for a new invite to join the next one.</p>
-          <button type="button" onClick={() => { setJoinEndedNotice(false); setError(""); }}>Back</button>
+          <strong>{t("라이브 세션이 종료되었습니다")}</strong>
+          <p>{t("호스트가 세션을 종료했습니다. 다음 세션의 새 초대 링크를 호스트에게 요청해 주세요.")}</p>
+          <button type="button" onClick={() => { setJoinEndedNotice(false); setError(""); }}>{t("돌아가기")}</button>
         </section>
       </main>
     );
   }
 
   if (!viewer) {
-    const hasValidProfile = normalizeDisplayName(displayName).length > 0;
+    const hasValidProfile = /^\S+@\S+\.\S+$/u.test(normalizeEmail(email)) && normalizeProfileField(displayName).length > 0;
     const isInviteJoin = Boolean(pendingInviteToken);
-    const canJoin = hasValidProfile && (isInviteJoin || admissionCode.replace(/\D/gu, "").length === 6);
+    const canJoin = hasValidProfile && privacyConsent && (isInviteJoin || admissionCode.replace(/\D/gu, "").length === 6);
     return (
       <main className={`live-viewer-shell is-join ${compact ? "is-compact" : ""}`}>
-        {/* The wordmark belongs to the SCREEN, not the card: the card is centred,
-            so a wordmark inside it reads as centred too. One mark, top-left. */}
-        <header className="live-join-brand"><span className="live-join-wordmark">NOVA</span></header>
-        <section className="live-join-card">
-            <h1 className="live-join-heading">Live Call</h1>
-            <p className="live-join-lede">
-              {isInviteJoin
-                ? "You scanned the session QR — no access code needed. Enter your profile to join."
-                : "Enter your name and the 6-digit access code from the host."}
-            </p>
-            <label htmlFor="live-display-name">Your name</label>
-            <input id="live-display-name" className="live-name-input" autoComplete="name" maxLength={40} value={displayName}
+        {/* Split lobby: identity panel + join card. Participants arriving by
+            QR/invite land here as their MAIN screen — the name field leads. */}
+        <div className="live-join-lobby">
+        <section className="live-join-context" aria-label={t("라이브 콜 안내")}>
+          <header className="live-join-brand"><span className="live-join-wordmark">NOVA</span></header>
+          <div className="live-join-context-body">
+            <h1 className="live-join-heading">{t("라이브 콜")}</h1>
+            <p className="live-join-lede">{t("실시간 번역 자막과 함께하는 라이브 세션입니다. 이름을 입력하면 바로 참여할 수 있어요.")}</p>
+          </div>
+          {/* Role switch: hosts land on the participant join screen too, so the
+              admin route must be visible here instead of a memorized URL. */}
+          <p className="live-join-admin">
+            {t("호스트이신가요?")} <a href="/login">{t("관리자로 로그인")}</a>
+          </p>
+          <footer className="live-join-credit">Realtime by Noel</footer>
+        </section>
+        <section className="live-join-card" aria-label={t("참여 정보 입력")}>
+            {isInviteJoin && (
+              <p className="live-join-invite-chip" role="status">
+                <span className="live-status-dot is-live" aria-hidden="true" />
+                {t("초대 링크가 확인되었어요 · 인증 코드 없이 입장합니다")}
+              </p>
+            )}
+            <label htmlFor="live-display-name">{t("이름")}</label>
+            <input id="live-display-name" name="displayName" className="live-name-input live-join-name-hero" autoComplete="name" maxLength={40} value={displayName}
               onChange={(event) => { setDisplayName(event.target.value); setError(""); }}
               onKeyDown={(event) => { if (event.key === "Enter") void join(); }}
-              placeholder="Enter your name" required />
-            <label htmlFor="live-department">Department (Optional)</label>
-            <input id="live-department" className="live-name-input" autoComplete="organization-title" maxLength={80} value={department}
-              onChange={(event) => { setDepartment(event.target.value); setError(""); }}
+              placeholder={t("자막에 표시될 이름")} required />
+            <label htmlFor="live-email">{t("이메일")}</label>
+            <input id="live-email" name="email" className="live-name-input" type="email" autoComplete="email" maxLength={254} value={email}
+              onChange={(event) => { setEmail(event.target.value); setError(""); }}
               onKeyDown={(event) => { if (event.key === "Enter") void join(); }}
-              placeholder="Enter your department" />
-            <label htmlFor="live-job-title">Job title (Optional)</label>
-            <input id="live-job-title" className="live-name-input" autoComplete="organization-title" maxLength={100} value={jobTitle}
-              onChange={(event) => { setJobTitle(event.target.value); setError(""); }}
-              onKeyDown={(event) => { if (event.key === "Enter") void join(); }}
-              placeholder="Enter your job title" />
+              placeholder="name@company.com" required />
+            <details className="live-join-optional-profile">
+              <summary>{t("선택 정보")}</summary>
+              <div>
+                <label htmlFor="live-company">{t("회사")}</label>
+                <input id="live-company" name="company" className="live-name-input" autoComplete="organization" maxLength={100} value={company}
+                  onChange={(event) => { setCompany(event.target.value); setError(""); }} />
+                <label htmlFor="live-department">{t("부서")}</label>
+                <input id="live-department" name="department" className="live-name-input" autoComplete="organization-title" maxLength={80} value={department}
+                  onChange={(event) => { setDepartment(event.target.value); setError(""); }} />
+                <label htmlFor="live-job-title">{t("직급")}</label>
+                <input id="live-job-title" name="jobTitle" className="live-name-input" autoComplete="organization-title" maxLength={100} value={jobTitle}
+                  onChange={(event) => { setJobTitle(event.target.value); setError(""); }} />
+              </div>
+            </details>
             {!isInviteJoin && (
               <>
-                <label htmlFor="live-admission-code">6-digit access code</label>
-                <input id="live-admission-code" className="live-code-input" autoComplete="one-time-code" inputMode="numeric"
+                <label htmlFor="live-access-code">{t("6자리 인증 코드")}</label>
+                <input id="live-access-code" name="accessCode" className="live-code-input" autoComplete="one-time-code" inputMode="numeric"
                   pattern="[0-9]{6}" maxLength={6} value={admissionCode}
                   onChange={(event) => { setAdmissionCode(event.target.value.replace(/\D/gu, "").slice(0, 6)); setError(""); }}
                   onKeyDown={(event) => { if (event.key === "Enter") void join(); }}
                   placeholder="000000" required />
               </>
             )}
+            <ParticipantConsentFields notices={PARTICIPANT_CONSENT_NOTICES}
+              privacyConsent={privacyConsent} summaryDeliveryConsent={summaryDeliveryConsent}
+              marketingConsent={marketingConsent} onPrivacyConsentChange={setPrivacyConsent}
+              onSummaryDeliveryConsentChange={setSummaryDeliveryConsent}
+              onMarketingConsentChange={setMarketingConsent} />
             <button type="button" className="live-primary-action"
               disabled={isBusy || !canJoin}
               onClick={() => void join()}>
-              {isBusy ? "Joining…" : "Join live"}
+              {isBusy ? t("참여 중…") : t("라이브 참여")}
             </button>
-            <p className="live-join-mic-note">Microphone access is requested only when you choose Speak.</p>
-            {error && <div className="live-error" role="alert">{error}</div>}
+            {error && <div className="live-error" role="alert">{t(error)}</div>}
           </section>
-        {/* Credit line, matching the desktop app's rail footer. */}
-        <footer className="live-join-credit">Realtime by Noel</footer>
+        </div>
       </main>
     );
   }
 
+  const floorHolderLabel = floorHolder?.name?.trim() || floorHolder?.displayName?.trim() || "";
+  const speakingIdentity = activeSpeakerName || floorHolderLabel || viewer.self.displayName || viewer.self.email;
+  const speakingMetadata = formatProfileMetadata(viewer.self.company, viewer.self.department, viewer.self.jobTitle);
+  const canUseSpeakingFloor = viewer.session.participantSpeakingEnabled === true
+    && !isSessionEnded && sessionStatus === "live";
+
   return (
     <main className={`live-viewer-shell ${compact ? "is-compact" : ""}`}
+      data-viewer-surface="caption-first" data-reading-state={isSessionEnded ? "ended" : "live"} data-compact={compact || undefined}
       style={{ "--live-caption-scale": captionScale } as CSSProperties}>
-      {/* The top bar keeps only identity and the way out. Reading controls moved
-          down to sit directly above the caption record — that is where they are
-          used, and it keeps the title as the first thing read. */}
-      <header className="glass-pill live-viewer-toolbar">
-        <strong>NOVA</strong>
-        {/* Translated audio is surfaced ONLY for audio-only sessions, where it is
-            the entire product. A caption session is caption-first, so the toggle
-            would be noise — but hiding it unconditionally would make an
-            `outputMode: "audio"` session unusable, since it has no captions to
-            fall back on. The AI-synthetic-interpretation disclosure rides with
-            the control, so it stays wherever the control does. */}
-        {outputMode === "audio" && (
-          <>
-            <span id="viewer-delivery-method-description" className="sr-only">{deliveryMethod.description}</span>
-            <button type="button" className={isInterpretationAudioEnabled ? "is-selected" : ""}
-              aria-pressed={isInterpretationAudioEnabled} disabled={!language} onClick={() => void enableInterpretationAudio()}
-              aria-describedby="viewer-delivery-method-description"
-              aria-label={isInterpretationAudioEnabled ? "Translated audio is on" : "Turn translated audio on"}>
-              {isInterpretationAudioEnabled ? "Audio On" : "Audio Off"}
+      <div className="live-viewer-translation-layout viewer-notebook">
+        <TranslationToolbar ariaLabel={t("실시간 자막 제어")}>
+          <strong>NOVA</strong>
+          <span className="viewer-session-status">{isSessionEnded ? t("회의 종료") : t("라이브")}</span>
+          <ControlDrawer triggerLabel={t("더보기")} title={t("세션 제어")}>
+            <ViewerSessionContext title={viewer.session.title} scheduledAt={viewer.session.scheduledAt} />
+            <label className="live-viewer-text-scale" htmlFor="live-caption-scale">
+              <span>{t("자막 글자 크기")}</span>
+              <input id="live-caption-scale" name="captionScale" type="range"
+                min={CAPTION_SCALE_MIN} max={CAPTION_SCALE_MAX} step={0.1}
+                value={captionScale}
+                onChange={(event) => setCaptionScale(Number(event.currentTarget.value))} />
+            </label>
+            {viewer.viewerCount !== undefined && <p>{t("{current}/{maximum}명 참여", { current: viewer.viewerCount, maximum: viewer.session.maxViewers })}</p>}
+            <button type="button" className="live-leave-button" onClick={() => void leaveMeeting()}>{t("세션 나가기")}</button>
+          </ControlDrawer>
+          <GatewayConnectionStatus state={gatewayConnectionState}
+            detail={<p>{formatViewerSystemStatus(status, t)} {t("· 기존 자막은 화면에 유지됩니다.")}</p>} />
+        </TranslationToolbar>
+      {speakState !== "idle" && canUseSpeakingFloor && (
+        <div className="live-speak-scrim" role="presentation">
+          <section className="live-speak-sheet" role="dialog" aria-modal="true" data-registered-identity={viewer.self.email}
+            aria-labelledby="live-speak-title" aria-describedby="live-speak-state">
+            <div className="live-speak-sheet-handle" aria-hidden="true" />
+            <header>
+              <div>
+                <strong id="live-speak-title">{speakingIdentity}</strong>
+                {speakingMetadata && <span>{speakingMetadata}</span>}
+              </div>
+              <span>{t("발언권 1명")}</span>
+            </header>
+            <VoiceLevelCanvas level={speakLevel} />
+            <p id="live-speak-state" role="status" aria-live="polite">
+              {speakState === "speaking" ? t("발언 중") : t("발언 연결 중")}
+            </p>
+            <button ref={speakStopButtonRef} type="button" className="live-speak-stop"
+              aria-label={t("발언 종료")} onClick={() => endSpeaking(true)}>
+              <span><Stop size={24} weight="fill" aria-hidden="true" /></span>
             </button>
-          </>
-        )}
-        <button type="button" className="live-pip-button" onClick={() => void openPip()} aria-label="Open Picture in Picture">PiP</button>
-        {isSessionEnded && <span className="live-end-label" role="status" aria-label="Live session ended">END</span>}
-        <button type="button" className="live-leave-button" aria-label="Leave meeting" onClick={() => void leaveMeeting()}>Leave</button>
+          </section>
+        </div>
+      )}
+      {error && <div className="live-error" role="alert">{t(error)}</div>}
+      <header className="viewer-meeting-heading">
+        <h1>{viewer.session.title}</h1>
+        {viewer.session.companyName && <p>{viewer.session.companyName}</p>}
+        {isSessionEnded && <div className="viewer-access-notice">
+          {recordsExpiresAt ? <><p>{t("열람 가능 기한")} <time dateTime={recordsExpiresAt}>{new Date(recordsExpiresAt).toLocaleString(systemLocale, { month: "long", day: "numeric", hour: "2-digit", minute: "2-digit", hour12: false })}</time></p>
+            <p>{viewer.session.endedAt ? t("{time} 종료 · 종료 후 6시간", { time: formatMinuteTime(viewer.session.endedAt) }) : t("종료 후 6시간")}</p></> : <p>{t("기록 열람 기한을 확인하고 있어요.")}</p>}
+          <p>{t("새로고침해도 열람 기한까지 기록을 이어서 볼 수 있어요.")}</p>
+        </div>}
       </header>
-      <ViewerSessionContext title={viewer.session.title} scheduledAt={viewer.session.scheduledAt} />
-      {/* Caption controls: language, then text size, with the session meta label
-          trailing. Live Call is caption-first, so translated-audio controls are
-          deliberately not surfaced here. One element = one grid cell; the compact
-          shell is a fixed-row grid, so a second sibling here would be pushed
-          past the caption stage instead of sitting above it. */}
-      <div className="live-caption-controls">
-        <div className="live-language-switch" role="group" aria-label="Caption language">
-          {languages.map((item) => (
-            <button key={item} type="button" className={item === language ? "is-selected" : ""}
-              aria-pressed={item === language} title={languageLabel(item)}
-              onClick={() => void changeLanguage(item)}>
-              {item.toUpperCase()}
-            </button>
-          ))}
-        </div>
-        <div className="live-text-size">
-          <button type="button" className="live-text-size-button"
-            aria-expanded={isTextSizeOpen} aria-controls="live-caption-scale"
-            aria-label="Caption text size" title="Caption text size"
-            onClick={() => setIsTextSizeOpen((open) => !open)}>
-            Aa
-          </button>
-          {/* Kept mounted so the slider keeps its value and stays reachable by
-              label; visibility is CSS so no layout jump on open. */}
-          <label className={`live-text-size-slider ${isTextSizeOpen ? "is-open" : ""}`}
-            hidden={!isTextSizeOpen}>
-            <span className="sr-only">Caption text size</span>
-            <input id="live-caption-scale" type="range"
-              min={CAPTION_SCALE_MIN} max={CAPTION_SCALE_MAX} step={0.1}
-              value={captionScale}
-              onChange={(event) => setCaptionScale(Number(event.target.value))} />
-          </label>
-        </div>
-        <span className="live-viewer-delivery-method" aria-label={`Current delivery: ${deliveryMethod.title}`}>
-          {deliveryMethod.title}
-        </span>
-      </div>
-      {error && <div className="live-error" role="alert">{error}</div>}
       {isSessionEnded ? (
         <div className="live-ended-view">
-          <MeetingMinutes summary={summaryRecord?.summary ?? null} summaryCreatedAt={summaryRecord?.createdAt ?? null}
-            transcript={transcript} isTranscriptLoaded={isTranscriptLoaded}
-            summaryError={summaryError} transcriptError={transcriptError}
-            isLoading={isMinutesLoading} minutesPollingState={minutesPollingState}
-            minutesPollingStartedAt={minutesPollingStartedAt} onRetry={() => {
-              setSummaryError("");
-              setTranscriptError("");
-              setMinutesPollingState("polling");
-              setMinutesPollingStartedAt(Date.now());
-              setMinutesPollingRound((round) => round + 1);
-              const missingResource = summaryRecord ? "transcript" : isTranscriptLoaded ? "summary" : "both";
-              void loadMinutes(languageRef.current, missingResource);
+          <ParticipantMeetingMinutes sessionId={viewer.session.id} email={viewer.self.email}
+            summary={summaryRecord?.summary ?? null} transcript={transcript} topics={transcriptTopics} recordingGaps={recordingGaps}
+            isTranscriptLoaded={isTranscriptLoaded} summaryError={summaryError} transcriptError={transcriptError}
+            isLoading={isMinutesLoading || minutesPollingState === "polling"} isExpired={isRecordsExpired}
+            onRetry={() => {
+              setSummaryError(""); setTranscriptError(""); setMinutesPollingState("polling");
+              setMinutesPollingStartedAt(Date.now()); setMinutesPollingRound((round) => round + 1);
+              void loadMinutes(languageRef.current, summaryRecord ? "transcript" : isTranscriptLoaded ? "summary" : "both");
             }} />
         </div>
       ) : sessionStatus === "preparing" ? (
-        <section className="live-waiting-screen" aria-label="Waiting for the host">
+        <section className="live-waiting-screen" aria-label={t("호스트 시작 대기")}>
           {/* The join redemption payload does not carry hasCoverImage, so the
               waiting room always attempts the cover (public-by-UUID route)
               and simply hides it when the session has none. */}
@@ -1931,13 +2121,13 @@ export default function LiveViewer({ compact = false }: { compact?: boolean }) {
             </>
           )}
           <h2>{viewer.session.title}</h2>
-          <p className="live-waiting-schedule">{formatSessionSchedule(viewer.session.scheduledAt)}</p>
+          <p className="live-waiting-schedule">{formatSessionSchedule(viewer.session.scheduledAt, systemLanguage)}</p>
           {(() => {
             const remainingMs = countdownMsUntil(viewer.session.scheduledAt, waitingClockMs);
             return remainingMs !== null && remainingMs > 0 ? (
               <div className="live-waiting-ring" aria-hidden="false">
                 <span className="live-loading-ring" aria-hidden="true" />
-                <p className="live-waiting-countdown" role="timer" aria-label="Time until the scheduled start">
+                <p className="live-waiting-countdown" role="timer" aria-label={t("예정 시작까지 남은 시간")}>
                   {formatCountdown(remainingMs)}
                 </p>
               </div>
@@ -1945,54 +2135,31 @@ export default function LiveViewer({ compact = false }: { compact?: boolean }) {
               <span className="live-waiting-pulse" aria-hidden="true" />
             );
           })()}
-          <strong role="status">Waiting for host</strong>
-          <p>The live session has not started yet. Captions begin automatically when the host starts.</p>
-          <button type="button" className="live-leave-button" onClick={() => void leaveMeeting()}>Leave</button>
+          <strong role="status">{t("호스트 시작을 기다리는 중")}</strong>
+          <p>{t("호스트가 시작하면 자막이 자동으로 표시됩니다.")}</p>
+          <button type="button" className="live-leave-button" onClick={() => void leaveMeeting()}>{t("나가기")}</button>
         </section>
       ) : (
         <>
-          {sessionStatus === "paused" && (
-            <div className="live-paused-banner" role="status">
-              <span className="live-status-dot" aria-hidden="true" />
-              Paused by host · the session will continue shortly
+          {sessionStatus === "failed" && (
+            <div className="live-error" role="status" aria-live="polite">
+              {t("라이브 세션에 문제가 발생해 종료되었습니다. 기존 자막은 계속 볼 수 있습니다.")}
             </div>
           )}
-          {stage}
+          <div id="live-viewer-caption-region" className="live-viewer-caption-region">
+            <ViewerLiveSurface sessionStatus={sessionStatus} selectedLane={selectedLane}
+              unavailableLanguages={unavailableLanguages} incompleteLanguages={incompleteLanguages} lanes={translationLanes}
+              selectedLaneId={selectedLaneId} onSelectLane={selectTranslationLane}
+              renderPanel={renderTopicLane} />
+          </div>
+          <div className="viewer-microphone-slot">
+            {canUseSpeakingFloor && <ParticipantSpeakButton state={speakState}
+              disabled={speakState === "idle" && gatewayConnectionState !== "connected"}
+              onClick={() => void toggleSpeak()} />}
+          </div>
         </>
       )}
-      {sessionType === "meeting" && !isSessionEnded && sessionStatus !== "preparing" && (
-        /* Copy-free floor control: the mic button fills the whole bottom bar
-           as one press target. While speaking only the button animates like a
-           recording indicator — the caption feed stays fully visible. */
-        <div className="live-speak-bar">
-          <span id="live-speak-connection-status" className="sr-only" role="status" aria-live="polite">
-            {!language
-              ? "Choose a caption language before speaking."
-              : isSpeakGatewayReady ? "Speak is ready." : "Speak is connecting to the live session."}
-          </span>
-          <button type="button"
-            ref={speakButtonRef}
-            className={`live-speak-button ${speakState === "speaking" ? "is-speaking" : ""} ${speakState === "starting" ? "is-starting" : ""}`}
-            disabled={!language || !isSpeakGatewayReady || speakState === "starting"}
-            aria-pressed={speakState === "speaking"}
-            aria-describedby="live-speak-connection-status"
-            aria-label={!language
-              ? "Speak unavailable until a language is selected"
-              : !isSpeakGatewayReady
-              ? "Speak unavailable while connecting"
-              : speakState === "speaking"
-              ? "Stop speaking"
-              : speakState === "starting" ? "Connecting microphone" : "Start speaking"}
-            data-level="0"
-            onClick={() => void (speakState === "speaking" ? endSpeaking(true) : toggleSpeak())}>
-            <SpeakControlIcon state={speakState} />
-          </button>
-        </div>
-      )}
-      {!isSessionEnded && (
-        <footer className="live-viewer-footer"><span>{formatProfileMetadata(viewer.displayName, viewer.department, viewer.jobTitle)}</span><span>{viewer.viewerCount}/{viewer.session.maxViewers} joined · Valid until the host ends this session</span></footer>
-      )}
-      {pipWindow && createPortal(stage, pipWindow.document.body)}
+      </div>
     </main>
   );
 }

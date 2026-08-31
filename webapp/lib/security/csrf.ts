@@ -5,16 +5,21 @@ import { getAllowedOrigins } from "./config";
 export class CsrfError extends Error {}
 
 const PUBLIC_UNAUTHENTICATED_PATHS = new Set([
+  "/",
   "/login",
   "/watch",
   "/m/watch",
   "/m/watch/demo",
   "/api/login",
+  // 2026-08-31 fix: 상태 조회는 라우트가 쿠키를 검증하며, 로그아웃은 만료된 쿠키도 지워야 한다. POST 출처 검사는 유지한다.
+  "/api/auth/session",
+  "/api/logout",
   "/api/pair-login",
   "/api/pair-keys",
   "/api/live-sessions/join",
 ]);
 const PUBLIC_LIVE_AUDIO_WORKLET_PATH = "/live-audio-worklet.js";
+const PUBLIC_METADATA_PATHS = new Set(["/robots.txt", "/llms.txt"]);
 const PUBLIC_STATIC_METHODS = new Set(["GET", "HEAD"]);
 
 export function isPublicUnauthenticatedPath(pathname: string): boolean {
@@ -27,12 +32,22 @@ export function isPublicLiveAudioWorkletRequest(pathname: string, search: string
     && PUBLIC_STATIC_METHODS.has(method);
 }
 
-export function isViewerSnapshotPath(pathname: string): boolean {
-  // Viewer-token-authenticated GET surfaces: each route verifies the signed
-  // viewer grant itself. status/summary/transcript stay readable after the
-  // session ends so participants can open the meeting minutes. cover is the
-  // stage/waiting-room image (contract C10), served to anonymous viewers.
-  return /^\/api\/live-sessions\/[^/]+\/(?:snapshot|status|summary|transcript|leave|cover)$/u.test(pathname);
+export function isPublicMetadataRequest(pathname: string, search: string, method: string): boolean {
+  return PUBLIC_METADATA_PATHS.has(pathname)
+    && search === ""
+    && PUBLIC_STATIC_METHODS.has(method);
+}
+
+export function isViewerSnapshotPath(pathname: string, method: string): boolean {
+  const match = /^\/api\/live-sessions\/[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\/(snapshot|source-snapshot|status|summary|transcript|leave|cover|viewer-session|records-session|recap-request|viewer-gateway-ticket|runtime|consents)$/iu.exec(pathname);
+  if (!match) return false;
+  const route = match[1];
+  if (route === "source-snapshot" || route === "viewer-session" || route === "records-session" || route === "runtime") return method === "GET";
+  if (route === "recap-request") return method === "GET" || method === "POST";
+  if (route === "viewer-gateway-ticket") return method === "POST";
+  if (route === "leave") return method === "POST";
+  if (route === "consents") return method === "PUT";
+  return PUBLIC_STATIC_METHODS.has(method);
 }
 
 export function canonicalRequestOrigin(value: string): string | null {

@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="ko" data-theme="dark">
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>NOVA Meeting Record</title>
+    <link rel="stylesheet" href="/nova-core.css" />
+    <link rel="stylesheet" href="/meeting-coach.css" />
+  </head>
+  <body>
+    <main class="coach-shell" aria-labelledby="record-title">
+      <header class="coach-topbar">
+        <div class="coach-title-group">
+          <span class="coach-wordmark" aria-label="NOVA">NOVA</span>
+          <span class="coach-title-rule" aria-hidden="true"></span>
+          <h1 id="record-title" class="coach-title">라이브 기록</h1>
+          <span id="coach-status" class="coach-status" role="status" aria-live="polite">연결 확인</span>
+        </div>
+        <div class="coach-actions">
+          <span id="record-count" class="timer">0줄</span>
+          <button id="arrange-windows" type="button" class="coach-button secondary">창 정렬</button>
+        </div>
+      </header>
+      <section class="coach-main record">
+        <div id="record-feed" class="record-feed" aria-live="off">
+          <div id="record-state-surface" class="nova-state-host record-state-host" role="status" aria-live="polite" aria-atomic="true"></div>
+        </div>
+        <button id="jump-latest" type="button" class="coach-button secondary jump-latest" hidden>최신으로</button>
+        <footer class="record-footer">
+          <p id="record-final-announcer" class="sr-only" aria-live="polite" aria-atomic="true"></p>
+          <span id="record-state" class="timer">대기</span>
+          <span id="record-updated" class="timer">--:--</span>
+        </footer>
+      </section>
+    </main>
+    <script type="module" src="/meeting-coach-record.js"></script>
+  </body>
+</html>

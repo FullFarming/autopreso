@@ -1,28 +1,8 @@
-// Single source of truth for the subtitle languages the app can translate
-// into. The core trio (en/ko/ja) keeps its exact legacy detection behavior —
-// their char patterns below are byte-identical to the old KOREAN_CHAR /
-// JAPANESE_CHAR / ENGLISH_CHAR literals. Everything else layers on top as an
-// OUTPUT language: script-based detection cannot tell two same-script languages
-// apart (es vs en, zh vs ja without kana), so new SOURCE languages rely on the
-// provider-reported languageCode (Gemini) or the single-configured-language
-// script fallback (resolveConfiguredLanguageForScript).
+// The catalog is served directly to browser surfaces and imported here by
+// Node. Detection/provider behavior stays in this module; data lives once.
+import { SUBTITLE_LANGUAGES } from "../public/subtitle-language-catalog.js";
 
-export const SUBTITLE_LANGUAGES = Object.freeze([
-  { code: "en", label: "English", nativeLabel: "English", script: "latin-basic", aliases: ["english", "eng", "en-us", "en-gb"] },
-  { code: "ko", label: "Korean", nativeLabel: "한국어", script: "hangul", aliases: ["korean", "kor", "ko-kr"] },
-  { code: "ja", label: "Japanese", nativeLabel: "日本語", script: "japanese", aliases: ["japanese", "jpn", "jp", "ja-jp"] },
-  { code: "zh-Hans", label: "Chinese (Simplified)", nativeLabel: "简体中文", script: "han", aliases: ["zh", "zh-cn", "cmn-hans-cn", "chinese", "chinese simplified", "zho", "cmn"] },
-  { code: "zh-Hant", label: "Chinese (Traditional)", nativeLabel: "繁體中文", script: "han", aliases: ["zh-tw", "zh-hk", "cmn-hant-tw", "chinese traditional"] },
-  { code: "es", label: "Spanish", nativeLabel: "Español", script: "latin", aliases: ["spanish", "spa"] },
-  { code: "pt", label: "Portuguese", nativeLabel: "Português", script: "latin", aliases: ["portuguese", "por"] },
-  { code: "fr", label: "French", nativeLabel: "Français", script: "latin", aliases: ["french", "fra"] },
-  { code: "de", label: "German", nativeLabel: "Deutsch", script: "latin", aliases: ["german", "deu"] },
-  { code: "ru", label: "Russian", nativeLabel: "Русский", script: "cyrillic", aliases: ["russian", "rus"] },
-  { code: "hi", label: "Hindi", nativeLabel: "हिन्दी", script: "devanagari", aliases: ["hindi", "hin"] },
-  { code: "id", label: "Indonesian", nativeLabel: "Bahasa Indonesia", script: "latin", aliases: ["indonesian", "ind"] },
-  { code: "vi", label: "Vietnamese", nativeLabel: "Tiếng Việt", script: "latin", aliases: ["vietnamese", "vie"] },
-  { code: "it", label: "Italian", nativeLabel: "Italiano", script: "latin", aliases: ["italian", "ita"] },
-]);
+export { SUBTITLE_LANGUAGES } from "../public/subtitle-language-catalog.js";
 
 // Each configured language opens one provider WebSocket per audio source, so
 // the selection is bounded to keep cost/latency sane.
@@ -61,6 +41,15 @@ const SCRIPT_GROUPS = {
   devanagari: "devanagari",
 };
 
+// Live Call publishes its own language set when the host configured one;
+// an empty/absent list inherits the local subtitle languages so existing
+// settings keep behaving exactly as before the split.
+export function resolveLiveCallLanguages(subtitle = {}) {
+  const explicit = subtitle?.liveCallTranslationLanguages;
+  if (Array.isArray(explicit) && explicit.length >= 1) return explicit;
+  return Array.isArray(subtitle?.translationLanguages) ? subtitle.translationLanguages : [];
+}
+
 /** @param {string} code */
 export function isSupportedSubtitleLanguage(code) {
   return Boolean(normalizeSubtitleLanguageCode(code));
@@ -68,7 +57,7 @@ export function isSupportedSubtitleLanguage(code) {
 
 /** @param {unknown} value */
 export function normalizeSubtitleLanguageCode(value) {
-  const raw = String(value ?? "").trim().toLowerCase();
+  const raw = String(value ?? "").normalize("NFC").trim().toLowerCase();
   if (!raw) return "";
   return byAlias.get(raw) ?? "";
 }
@@ -109,11 +98,10 @@ export function subtitleLanguagePrefixTokens() {
   return [...new Set(tokens)];
 }
 
-// 2026-07-23 fix: gemini-3.5-live-translate-preview validates the target
-// language lazily on the FIRST audio chunk, and regioned codes (ko-KR/en-US)
-// are rejected with close 1007 "Request contains an invalid argument". The
-// official supported list (ai.google.dev/gemini-api/docs/live-api/live-translate)
-// uses bare BCP-47 codes; only Chinese scripts and Portuguese carry a suffix.
+// 2026-08-27 fix: Transcribe Live and the downstream text translator share one
+// canonical product-language vocabulary. Bare language codes avoid provider
+// region mismatches; Chinese scripts and Portuguese retain the product's
+// explicit variants.
 const GEMINI_LANGUAGE_CODES = Object.freeze({
   en: "en", ko: "ko", ja: "ja", "zh-Hans": "zh-Hans", "zh-Hant": "zh-Hant",
   es: "es", pt: "pt-BR", fr: "fr", de: "de", ru: "ru", hi: "hi",

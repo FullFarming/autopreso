@@ -403,6 +403,295 @@ test("Live Call floor boundaries preserve the old frame only until the next capt
   );
 });
 
+test("an authoritative participant floor gives the overlay exclusively to participant gateway captions", async () => {
+  const dom = installDom({ withDesktopFloor: true });
+  await loadOverlay("participant-floor-producer-ownership");
+  const ws = dom.getWs();
+  ws.open();
+  ws.recv(SETTINGS);
+
+  dom.fireFloor({
+    type: "floor",
+    sessionId: "live-session-participant",
+    holder: { participantId: "participant-1" },
+  });
+
+  ws.recv({
+    type: "subtitle:partial",
+    targetLanguage: "en",
+    sourceLanguage: "ko",
+    translatedText: "Late local host audio must stay hidden",
+    seq: 1,
+  });
+  assert.equal(dom.zoneText("bottom-center"), "", "local output is paused while a participant owns the floor");
+
+  ws.recv({
+    type: "subtitle:partial",
+    source: "live-call",
+    streamId: "trusted-participant-stream",
+    liveSessionId: "live-session-participant",
+    targetLanguage: "en",
+    sourceLanguage: "ko",
+    translatedText: "The participant caption is visible",
+    liveCallSpeaker: { role: "participant", participantId: "participant-1", name: "Participant" },
+    seq: 2,
+  });
+  assert.equal(dom.zoneText("bottom-center"), "The participant caption is visible");
+
+  ws.recv({
+    type: "subtitle:committed",
+    source: "live-call",
+    liveSessionId: "live-session-participant",
+    targetLanguage: "en",
+    sourceLanguage: "ko",
+    translatedText: "A delayed host gateway caption must stay hidden.",
+    liveCallSpeaker: { role: "host" },
+    seq: 3,
+  });
+  assert.doesNotMatch(dom.zoneText("bottom-center"), /delayed host gateway/u);
+
+  ws.recv({
+    type: "subtitle:snapshot",
+    streamId: "mismatched-participant-stream",
+    liveSessionId: "different-live-session",
+    seq: 30,
+    events: [{
+      type: "subtitle:partial",
+      source: "live-call",
+      liveSessionId: "different-live-session",
+      targetLanguage: "en",
+      sourceLanguage: "ko",
+      translatedText: "A different session snapshot must stay hidden",
+      liveCallSpeaker: { role: "participant", participantId: "participant-other", name: "Other" },
+      seq: 30,
+    }],
+  });
+  assert.equal(dom.zoneText("bottom-center"), "The participant caption is visible");
+
+  ws.recv({
+    type: "subtitle:snapshot",
+    streamId: "late-local-stream",
+    seq: 31,
+    lanes: [{
+      type: "subtitle:partial",
+      source: "system",
+      targetLanguage: "en",
+      sourceLanguage: "ko",
+      translatedText: "A local snapshot cannot replace the participant",
+      seq: 31,
+    }],
+  });
+  assert.equal(dom.zoneText("bottom-center"), "The participant caption is visible");
+
+  ws.recv({
+    type: "subtitle:clear",
+    source: "live-call",
+    liveSessionId: "live-session-participant",
+    targetLanguage: "en",
+    seq: 4,
+  });
+  assert.equal(dom.zoneText("bottom-center"), "", "the participant gateway owns clear while its floor is active");
+});
+
+test("an authoritative host floor gives the overlay exclusively to local Caption Only output", async () => {
+  const dom = installDom({ withDesktopFloor: true });
+  await loadOverlay("host-floor-producer-ownership");
+  const ws = dom.getWs();
+  ws.open();
+  ws.recv(SETTINGS);
+
+  dom.fireFloor({ type: "floor", sessionId: "live-session-host", holder: null });
+  ws.recv({
+    type: "subtitle:partial",
+    targetLanguage: "en",
+    sourceLanguage: "ko",
+    translatedText: "The local Caption Only engine is visible",
+    seq: 1,
+  });
+  assert.equal(dom.zoneText("bottom-center"), "The local Caption Only engine is visible");
+
+  ws.recv({
+    type: "subtitle:partial",
+    source: "live-call",
+    liveSessionId: "live-session-host",
+    targetLanguage: "en",
+    sourceLanguage: "ko",
+    translatedText: "A late participant gateway tail must stay hidden",
+    liveCallSpeaker: { role: "participant", name: "Participant" },
+    seq: 2,
+  });
+  assert.equal(dom.zoneText("bottom-center"), "The local Caption Only engine is visible");
+
+  ws.recv({
+    type: "subtitle:clear",
+    source: "live-call",
+    liveSessionId: "live-session-host",
+    targetLanguage: "en",
+    seq: 3,
+  });
+  assert.equal(
+    dom.zoneText("bottom-center"),
+    "The local Caption Only engine is visible",
+    "a late participant clear cannot erase the local host caption",
+  );
+});
+
+test("a participant final already attributed to the active session may land after floor release", async () => {
+  const dom = installDom({ withDesktopFloor: true });
+  await loadOverlay("participant-late-final-after-release");
+  const ws = dom.getWs();
+  ws.open();
+  ws.recv(SETTINGS);
+
+  dom.fireFloor({
+    type: "floor",
+    sessionId: "live-session-late-final",
+    holder: { participantId: "participant-late" },
+  });
+  ws.recv({
+    type: "subtitle:partial",
+    source: "live-call",
+    liveSessionId: "live-session-late-final",
+    targetLanguage: "en",
+    sourceLanguage: "ko",
+    translatedText: "Participant draft",
+    liveCallSpeaker: { role: "participant", participantId: "participant-late", name: "Participant" },
+    seq: 11,
+  });
+
+  dom.fireFloor({ type: "floor", sessionId: "live-session-late-final", holder: null });
+  ws.recv({
+    type: "subtitle:committed",
+    source: "live-call",
+    liveSessionId: "live-session-late-final",
+    targetLanguage: "en",
+    sourceLanguage: "ko",
+    translatedText: "Participant final after release.",
+    liveCallSpeaker: { role: "participant", participantId: "participant-late", name: "Participant" },
+    seq: 12,
+  });
+  assert.match(dom.zoneText("bottom-center"), /Participant final after release\./u);
+
+  ws.recv({
+    type: "subtitle:committed",
+    source: "live-call",
+    liveSessionId: "live-session-late-final",
+    targetLanguage: "en",
+    sourceLanguage: "ko",
+    translatedText: "Gateway host echo must stay hidden.",
+    liveCallSpeaker: { role: "host", participantId: "participant-late" },
+    seq: 13,
+  });
+  assert.doesNotMatch(dom.zoneText("bottom-center"), /Gateway host echo/u);
+});
+
+test("a host-floor reconnect snapshot restores local lanes and ignores stale Live Call events", async () => {
+  const dom = installDom({ withDesktopFloor: true });
+  await loadOverlay("host-floor-mixed-reconnect-snapshot");
+  const ws = dom.getWs();
+  ws.open();
+  ws.recv(SETTINGS);
+
+  dom.fireFloor({ type: "floor", sessionId: "live-session-host-snapshot", holder: null });
+  ws.recv({
+    type: "subtitle:snapshot",
+    streamId: "reconnected-host-stream",
+    liveSessionId: "live-session-host-snapshot",
+    seq: 8,
+    events: [{
+      type: "subtitle:committed",
+      source: "live-call",
+      liveSessionId: "live-session-host-snapshot",
+      targetLanguage: "en",
+      sourceLanguage: "ko",
+      translatedText: "Stale gateway participant sentence.",
+      liveCallSpeaker: { role: "participant", name: "Participant" },
+      seq: 7,
+    }],
+    lanes: [{
+      type: "subtitle:partial",
+      source: "system",
+      targetLanguage: "en",
+      sourceLanguage: "ko",
+      translatedText: "Restored local host caption",
+      seq: 8,
+    }],
+  });
+
+  assert.equal(dom.zoneText("bottom-center"), "Restored local host caption");
+  assert.doesNotMatch(dom.zoneText("bottom-center"), /gateway participant/u);
+});
+
+test("malformed and mismatched floor events fail closed without clearing or changing session ownership", async () => {
+  const dom = installDom({ withDesktopFloor: true });
+  await loadOverlay("floor-session-fail-closed");
+  const ws = dom.getWs();
+  ws.open();
+  ws.recv(SETTINGS);
+
+  dom.fireFloor({ type: "floor", sessionId: "live-session-a", holder: null });
+  ws.recv({
+    type: "subtitle:committed",
+    streamId: "trusted-live-session-stream",
+    targetLanguage: "en",
+    sourceLanguage: "ko",
+    translatedText: "The trusted local caption remains.",
+    seq: 1,
+  });
+
+  dom.fireFloor({ type: "floor", sessionId: "live-session-b", holder: { participantId: "participant-b" } });
+  ws.recv({
+    type: "subtitle:partial",
+    source: "live-call",
+    streamId: "untrusted-other-session-stream",
+    liveSessionId: "live-session-b",
+    targetLanguage: "en",
+    sourceLanguage: "ko",
+    translatedText: "The other session must not be adopted",
+    liveCallSpeaker: { role: "participant", name: "Other" },
+    seq: 2,
+  });
+  assert.equal(dom.zoneText("bottom-center"), "The trusted local caption remains.");
+
+  dom.fireFloor({ type: "floor", sessionId: "live-session-a", holder: { participantId: "" } });
+  ws.recv({
+    type: "subtitle:clear",
+    source: "live-call",
+    liveSessionId: "live-session-a",
+    targetLanguage: "en",
+    seq: 3,
+  });
+  ws.recv({
+    type: "subtitle:committed",
+    targetLanguage: "en",
+    sourceLanguage: "ko",
+    translatedText: "Blocked local tail.",
+    seq: 4,
+  });
+  assert.equal(
+    dom.zoneText("bottom-center"),
+    "The trusted local caption remains.",
+    "an unknown same-session floor preserves the last trusted frame and accepts neither producer",
+  );
+});
+
+test("Caption Only keeps its legacy local display behavior when no Live Call floor is active", async () => {
+  const dom = installDom({ withDesktopFloor: true });
+  await loadOverlay("caption-only-with-floor-bridge");
+  const ws = dom.getWs();
+  ws.open();
+  ws.recv(SETTINGS);
+
+  ws.recv({
+    type: "subtitle:committed",
+    targetLanguage: "en",
+    sourceLanguage: "ko",
+    translatedText: "Caption Only remains unchanged.",
+    seq: 1,
+  });
+  assert.equal(dom.zoneText("bottom-center"), "Caption Only remains unchanged.");
+});
+
 test("a Live Call floor change keeps a partial visible until the next speaker caption replaces it", async () => {
   const dom = installDom({ withDesktopFloor: true });
   await loadOverlay("live-call-floor-atomic-replacement");
@@ -1218,7 +1507,7 @@ test("partial growth reuses the same live word nodes instead of recreating the r
   assert.equal(box.classList.contains("partial"), false, "only committed events become final styling");
 });
 
-test("audio-only output clears lanes and ignores partial and committed captions", async () => {
+test("legacy audio-only settings cannot suppress the captions-only overlay", async () => {
   const dom = installDom();
   globalThis.location.search = "";
   await loadOverlay("audio-only-hidden");
@@ -1230,17 +1519,13 @@ test("audio-only output clears lanes and ignores partial and committed captions"
     targetLanguage: "en",
     sourceLanguage: "ko",
     translationProvider: "gemini",
-    translatedText: "Visible before audio-only mode.",
+    translatedText: "Visible before legacy settings arrive.",
   });
   assert.match(dom.zoneText("bottom-center"), /Visible before/);
 
   ws.recv({ ...SETTINGS, settings: { subtitle: { ...SETTINGS.settings.subtitle, outputMode: "audio" } } });
-  assert.equal(dom.zoneText("bottom-center"), "", "switching to audio-only must clear existing lanes");
-  ws.recv({ type: "subtitle:partial", targetLanguage: "en", sourceLanguage: "ko", translationProvider: "gemini", translatedText: "Must remain hidden in audio mode." });
-  ws.recv({ type: "subtitle:committed", targetLanguage: "en", sourceLanguage: "ko", translationProvider: "gemini", translatedText: "Still hidden." });
-  assert.equal(dom.zoneText("bottom-center"), "");
-
-  ws.recv({ ...SETTINGS, settings: { subtitle: { ...SETTINGS.settings.subtitle, outputMode: "captions" } } });
-  ws.recv({ type: "subtitle:committed", targetLanguage: "en", sourceLanguage: "ko", translationProvider: "gemini", translatedText: "Visible after captions return." });
-  assert.match(dom.zoneText("bottom-center"), /Visible after/);
+  assert.match(dom.zoneText("bottom-center"), /Visible before/, "legacy outputMode must not clear visible captions");
+  ws.recv({ type: "subtitle:partial", targetLanguage: "en", sourceLanguage: "ko", translationProvider: "gemini", translatedText: "Captions remain active." });
+  ws.recv({ type: "subtitle:committed", targetLanguage: "en", sourceLanguage: "ko", translationProvider: "gemini", translatedText: "Captions remain active." });
+  assert.match(dom.zoneText("bottom-center"), /Captions remain active/);
 });
