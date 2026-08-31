@@ -770,7 +770,16 @@ test("host readiness activation calls the exact CAS once and strictly parses its
   const authorizer = new SupabaseHostAuthorizer({
     baseUrl: "https://dev-ref.supabase.co", serviceRoleKey: "secret",
     async fetchFn(url, init) {
-      calls.push({ url: String(url), body: JSON.parse(String(init.body)), signal: init.signal });
+      calls.push({
+        url: String(url),
+        // 2026-08-31 outage: this exact request went out WITHOUT a JSON
+        // content type, so Node fetch defaulted to text/plain and PostgREST
+        // searched for a "single unnamed text parameter" — a PGRST202 404
+        // that failed every production go-live. The header is load-bearing.
+        contentType: new Headers(init.headers).get("content-type"),
+        body: JSON.parse(String(init.body)),
+        signal: init.signal,
+      });
       return Response.json([{ session_id: "session-1", status: "live", version: 8 }]);
     },
   });
@@ -783,6 +792,7 @@ test("host readiness activation calls the exact CAS once and strictly parses its
   assert.deepEqual(result, { sessionId: "session-1", status: "live", version: 8 });
   assert.deepEqual(calls, [{
     url: "https://dev-ref.supabase.co/rest/v1/rpc/activate_live_session_after_gateway_ready_v1",
+    contentType: "application/json",
     body: {
       p_session_id: "session-1", p_host_id: "host-1", p_expected_version: 7,
       p_activation_key: "11111111-1111-4111-8111-111111111111",

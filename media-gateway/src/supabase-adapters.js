@@ -1326,7 +1326,10 @@ export class SupabaseHostAuthorizer {
       method: "POST",
       cache: "no-store",
       signal,
-      headers: createSupabaseHeaders(this.supabaseCredential),
+      // Content-Type is load-bearing: without it Node fetch sends text/plain
+      // and PostgREST resolves the RPC as "a single unnamed text parameter",
+      // 404ing every activation (2026-08-31 production go-live outage).
+      headers: createSupabaseHeaders(this.supabaseCredential, { "Content-Type": "application/json" }),
       body: JSON.stringify({
         p_session_id: settings.sessionId,
         p_host_id: claims.sub,
