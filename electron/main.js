@@ -3026,6 +3026,29 @@ function registerOverlayIpc(settingsStore, { localAppOrigin, liveWorkspaceUrl, l
       isLiveCallStarting = false;
     }
   });
+  // Discard a pre-registered session from the workspace list. The webapp DELETE
+  // route ends the session server-side, which also invalidates its invite/QR.
+  ipcMain.handle("live-call:delete-registered", async (event, sessionId) => {
+    if (isHostLogoutPending) return { ok: false, code: "HOST_LOGOUT_IN_PROGRESS" };
+    if (isHostLoginPending) return { ok: false, code: "HOST_LOGIN_IN_PROGRESS" };
+    if (liveCallEnabled !== true) return { ok: false, code: "LIVE_CALL_DISABLED" };
+    if (!isAllowedOrigin(event.sender.getURL(), new Set([localAppOrigin]))) return { ok: false, code: "FORBIDDEN" };
+    if (typeof sessionId !== "string" || !sessionId) return { ok: false, code: "INVALID_SESSION_ID" };
+    // Deleting the armed session would strand the floating controller and the
+    // stage; that path stays with the explicit 세션 폐기 control.
+    if (liveCallSession?.sessionId === sessionId) return { ok: false, code: "LIVE_CALL_ALREADY_ARMED" };
+    const login = await ensureDesktopHostSession(liveWorkspaceUrl);
+    if (!login.ok) {
+      return login;
+    }
+    const detail = await liveCallApi(liveWorkspaceUrl, `/api/live-sessions/${encodeURIComponent(sessionId)}`, { method: "GET" });
+    if (!detail.ok) return detail;
+    if (detail.data?.id !== sessionId) return { ok: false, code: "INVALID_SESSION_RESPONSE" };
+    if (detail.data.status !== "preparing") return { ok: false, code: "SESSION_NOT_PREPARING" };
+    const ended = await liveCallApi(liveWorkspaceUrl, `/api/live-sessions/${encodeURIComponent(sessionId)}`, { method: "DELETE" });
+    if (!ended.ok) return ended;
+    return { ok: true, sessionId };
+  });
   ipcMain.handle("glossary-presets:list", async (event) => {
     if (!isAllowedOrigin(event.sender.getURL(), new Set([localAppOrigin]))) {
       return { ok: false, error: "허용되지 않은 요청입니다.", code: "FORBIDDEN" };

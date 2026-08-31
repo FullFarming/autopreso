@@ -561,3 +561,37 @@ test("the controller surfaces the caption hide with a visible state and no HTML 
   // unchanged value, and an optimistic paint would then lie.
   assert.match(js, /await window\.realtimeNoelDesktop\.setOverlaysMuted\(next\)/u);
 });
+
+test("registered sessions can be deleted from the workspace list", () => {
+  const workspaceJs = fs.readFileSync(new URL("../public/subtitle-workspace.js", import.meta.url), "utf8");
+  const i18n = fs.readFileSync(new URL("../public/subtitle-i18n.js", import.meta.url), "utf8");
+  const i18nJa = fs.readFileSync(new URL("../public/subtitle-i18n-ja.js", import.meta.url), "utf8");
+
+  // Main process: a dedicated IPC that ends a registered (preparing) session
+  // through the webapp DELETE route, with the same guards as start-registered.
+  const handler = sourceBetween('ipcMain.handle("live-call:delete-registered"', 'ipcMain.handle("glossary-presets:list"');
+  assert.match(handler, /isAllowedOrigin\(event\.sender\.getURL\(\), new Set\(\[localAppOrigin\]\)\)/u);
+  assert.match(handler, /liveCallEnabled !== true/u);
+  // Deleting the session that is currently armed would strand the live
+  // controller; the workspace must route that through 세션 폐기 instead.
+  assert.match(handler, /LIVE_CALL_ALREADY_ARMED/u);
+  assert.match(handler, /SESSION_NOT_PREPARING/u);
+  assert.match(handler, /method: "DELETE"/u);
+
+  // Preload bridge.
+  assert.match(preloadSource, /deleteRegisteredLiveCall: \(sessionId\) => ipcRenderer\.invoke\("live-call:delete-registered", sessionId\)/u);
+
+  // Workspace list: every registered row renders a delete button that asks for
+  // an explicit second click before ending the registration, then refreshes.
+  assert.match(workspaceJs, /deleteRegisteredSession\(session\.id, deleteButton\)/u);
+  assert.match(workspaceJs, /bridge\.deleteRegisteredLiveCall\(sessionId\)/u);
+  assert.match(workspaceJs, /live\.registeredDeleteConfirm/u);
+  assert.match(workspaceJs, /refreshRegisteredSessions\(\{ quiet: true \}\)/u);
+  assert.doesNotMatch(workspaceJs, /\.innerHTML\s*=/u);
+
+  // Copy exists in every catalog the workspace loads.
+  for (const key of ["live.registeredDelete", "live.registeredDeleteConfirm", "live.registeredDeleted", "live.registeredDeleteFailed"]) {
+    assert.ok(i18n.split(`"${key}"`).length >= 3, `${key} needs en + ko entries in subtitle-i18n.js`);
+    assert.match(i18nJa, new RegExp(`"${key.replace(/\./gu, "\\.")}"`, "u"), `${key} missing in subtitle-i18n-ja.js`);
+  }
+});

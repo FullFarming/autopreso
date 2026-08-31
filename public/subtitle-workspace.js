@@ -436,10 +436,48 @@ function renderRegisteredSessions(sessions, statusText = "") {
     startButton.className = "accent compact";
     startButton.textContent = t("live.registeredStart");
     startButton.addEventListener("click", () => { void startRegisteredSession(session.id, startButton); });
-    row.append(meta, startButton);
+    const deleteButton = document.createElement("button");
+    deleteButton.type = "button";
+    deleteButton.className = "compact live-registered-delete";
+    deleteButton.textContent = t("live.registeredDelete");
+    // Two-click confirm: the first click only re-labels the button, so a slip
+    // never ends a registration; the confirm state resets on the next render.
+    deleteButton.addEventListener("click", () => {
+      if (deleteButton.dataset.confirming !== "true") {
+        deleteButton.dataset.confirming = "true";
+        deleteButton.textContent = t("live.registeredDeleteConfirm");
+        return;
+      }
+      void deleteRegisteredSession(session.id, deleteButton);
+    });
+    row.append(meta, startButton, deleteButton);
     rows.push(row);
   }
   registeredSessionList.replaceChildren(...rows);
+}
+
+async function deleteRegisteredSession(sessionId, button) {
+  const bridge = window.realtimeNoelDesktop;
+  if (!bridge?.deleteRegisteredLiveCall) return;
+  button.disabled = true;
+  button.setAttribute("aria-busy", "true");
+  try {
+    const result = await bridge.deleteRegisteredLiveCall(sessionId);
+    setLiveStatus(result?.ok
+      ? t("live.registeredDeleted")
+      : liveCallFailureMessage(result?.code, "live.registeredDeleteFailed"));
+    if (result?.ok) {
+      void refreshRegisteredSessions({ quiet: true });
+      return;
+    }
+  } catch {
+    setLiveStatus(t("live.registeredDeleteFailed", { code: "unknown" }));
+  } finally {
+    button.disabled = false;
+    button.removeAttribute("aria-busy");
+    delete button.dataset.confirming;
+    button.textContent = t("live.registeredDelete");
+  }
 }
 
 async function refreshRegisteredSessions({ quiet = false } = {}) {

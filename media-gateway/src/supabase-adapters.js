@@ -1348,6 +1348,12 @@ export class SupabaseHostAuthorizer {
       const safeCode = isPlainRecord(failure)
         ? allowedCodes.find((code) => failure.message === code || failure.code === code) ?? "GATEWAY_READINESS_FAILED"
         : "GATEWAY_READINESS_FAILED";
+      // Status and PostgREST code only — never the body. A stale schema cache
+      // (PGRST202 404) once failed every go-live with zero log output.
+      const rawCode = isPlainRecord(failure) && typeof failure.code === "string"
+        ? failure.code.slice(0, 40).replace(/[^A-Za-z0-9_-]/gu, "")
+        : "none";
+      console.warn(`[host-activate] rejected session=${settings.sessionId} http=${response.status} code=${rawCode} mapped=${safeCode}`);
       throw new Error(safeCode);
     }
     const rows = await response.json().catch(() => null);

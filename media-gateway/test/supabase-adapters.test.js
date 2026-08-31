@@ -818,6 +818,29 @@ test("host readiness activation fails closed on malformed, cross-session, or fai
   }
 });
 
+test("a failed readiness activation names the HTTP status and PostgREST code in the gateway log", async (t) => {
+  // 2026-08-31 incident: a stale PostgREST schema cache 404ed the activation
+  // RPC and the gateway failed go-live in total silence — no Cloud Run line
+  // pointed at the cause. Session config and status codes only; never the
+  // response body or tokens.
+  const warnings = [];
+  t.mock.method(console, "warn", (line) => { warnings.push(String(line)); });
+  const authorizer = new SupabaseHostAuthorizer({
+    baseUrl: "https://dev-ref.supabase.co", serviceRoleKey: "secret",
+    async fetchFn() {
+      return Response.json({ code: "PGRST202", message: "Could not find the function" }, { status: 404 });
+    },
+  });
+  await assert.rejects(authorizer.activate(claims, {
+    ...settings,
+    activationKey: "11111111-1111-4111-8111-111111111111",
+    gatewaySettingsFingerprint: `sha256:${"a".repeat(64)}`,
+    pinnedGlossaryFingerprint: `sha256:${"b".repeat(64)}`,
+  }), /GATEWAY_READINESS_FAILED/u);
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0], /\[host-activate\] rejected session=session-1 http=404 code=PGRST202 mapped=GATEWAY_READINESS_FAILED/u);
+});
+
 test("host lease ignores admission-only version changes but rejects configuration mismatch", async () => {
   let row = {
     id: "session-1", host_id: "host-1", status: "live", version: 8,
