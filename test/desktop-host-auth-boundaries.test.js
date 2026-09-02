@@ -149,7 +149,8 @@ test("quit after async cleanup waits for the next event loop turn instead of ree
 });
 
 test("main registers the nova scheme, parses deep links on macOS and Windows, checks state, and exchanges the code over the default session", () => {
-  assert.match(main, /app\.setAsDefaultProtocolClient\("nova"\)/u);
+  assert.match(main, /if \(app\.isPackaged \|\| process\.env\.NOVA_DEV_DEEP_LINK === "1"\) app\.setAsDefaultProtocolClient\("nova"\);/u, "dev runs must not steal nova:// from the installed app");
+  assert.equal(main.match(/setAsDefaultProtocolClient\(/gu)?.length, 1, "the scheme is registered in exactly one guarded place");
   assert.match(main, /app\.on\("open-url", \(event, url\) => \{\s*event\.preventDefault\(\);\s*void handleDesktopAuthDeepLink\(url\);/u);
   assert.match(main, /findDesktopAuthDeepLink\(argv\)/u);
   assert.match(main, /if \(!parsed \|\| !pendingDesktopLoginState \|\| parsed\.state !== pendingDesktopLoginState\)/u);

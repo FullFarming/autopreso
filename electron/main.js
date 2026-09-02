@@ -150,7 +150,10 @@ const singleInstanceLock = app.requestSingleInstanceLock();
 if (!singleInstanceLock) {
   app.quit();
 } else {
-  app.setAsDefaultProtocolClient("nova");
+  // Only a packaged build claims the nova:// scheme: an unpackaged dev run would
+  // otherwise register the Electron dev binary and steal the deep link from the
+  // installed NOVA.app. Set NOVA_DEV_DEEP_LINK=1 to opt a dev run in anyway.
+  if (app.isPackaged || process.env.NOVA_DEV_DEEP_LINK === "1") app.setAsDefaultProtocolClient("nova");
   // macOS delivers the deep link to the running instance as an event.
   app.on("open-url", (event, url) => {
     event.preventDefault();
