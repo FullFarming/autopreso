@@ -680,6 +680,25 @@ export const SUMMARY_ATTEMPT_TIMEOUT_MILLISECONDS = 20_000;
 /** Every attempt together, so one slow model cannot become an unbounded wait. */
 export const SUMMARY_TOTAL_DEADLINE_MILLISECONDS = 60_000;
 /**
+ * A limiter that just answered 429 has not recovered by the next event-loop
+ * tick, so a zero-backoff retry only re-hits it. 1.5s lets a per-minute
+ * limiter admit the next request and still fits inside the deadline; the wait
+ * is clamped to whatever deadline is left. Other availability failures retry
+ * at once because they are not a function of request spacing.
+ */
+export const SUMMARY_RATE_LIMIT_RETRY_DELAY_MILLISECONDS = 1_500;
+
+export interface MeetingSummaryGenerationOptions {
+  /** Injectable for tests; production uses a real timer. */
+  sleep?: (milliseconds: number) => Promise<void>;
+  /** Injectable clock for the deadline; production uses `Date.now`. */
+  now?: () => number;
+}
+
+function sleepForMilliseconds(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+/**
  * Only availability failures earn the second attempt. A parse, refusal or
  * configuration failure is deterministic - repeating it just spends the
  * deadline and the host's patience twice.
@@ -703,16 +722,19 @@ export async function generateMeetingSummary(
   language: string,
   generator?: GeminiSummaryContentGenerator,
   config: MeetingSummaryConfig = getMeetingSummaryConfig(),
+  options: MeetingSummaryGenerationOptions = {},
 ): Promise<{ summary: MeetingSummary; model: string }> {
   if (config.model !== GEMINI_RECAP_MODEL) {
     throw new SummaryError("요약 모델 설정이 올바르지 않습니다.", "SUMMARY_MODEL_NOT_ALLOWED", 500);
   }
   const prompt = buildSummaryPrompt(input, language);
   const attemptCeiling = Math.min(SUMMARY_ATTEMPT_TIMEOUT_MILLISECONDS, config.timeoutMilliseconds);
-  const deadlineAt = Date.now() + SUMMARY_TOTAL_DEADLINE_MILLISECONDS;
+  const now = options.now ?? Date.now;
+  const sleep = options.sleep ?? sleepForMilliseconds;
+  const deadlineAt = now() + SUMMARY_TOTAL_DEADLINE_MILLISECONDS;
   let lastError: SummaryError = new SummaryError("요약 서비스에 연결할 수 없습니다.", "SUMMARY_PROVIDER_UNAVAILABLE", 502);
   for (let attempt = 1; attempt <= SUMMARY_MAX_ATTEMPTS; attempt += 1) {
-    const remaining = deadlineAt - Date.now();
+    const remaining = deadlineAt - now();
     if (remaining <= 0) break;
     try {
       const payload = await runSummaryGenerationAttempt(
@@ -735,6 +757,10 @@ export async function generateMeetingSummary(
         : new SummaryError("요약 서비스에 연결할 수 없습니다.", "SUMMARY_PROVIDER_UNAVAILABLE", 502);
       const isLastAttempt = attempt === SUMMARY_MAX_ATTEMPTS;
       if (isLastAttempt || !SUMMARY_RETRY_ERROR_CODES.includes(lastError.code)) throw lastError;
+      if (lastError.code === "SUMMARY_PROVIDER_RATE_LIMITED") {
+        const backoff = Math.min(SUMMARY_RATE_LIMIT_RETRY_DELAY_MILLISECONDS, deadlineAt - now());
+        if (backoff > 0) await sleep(backoff);
+      }
     }
   }
   throw lastError;

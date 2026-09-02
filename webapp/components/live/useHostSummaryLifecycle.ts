@@ -14,8 +14,9 @@ interface EndedSessionReference {
 
 /**
  * Failure classes no amount of GET polling can clear: the job is either out of
- * automatic attempts or was classified permanent. The host may clear each of
- * them exactly once through the reset-and-claim POST.
+ * automatic attempts or was classified permanent. The host clears them through
+ * the reset-and-claim POST, which is repeatable and bounded only by the
+ * per-host-session summary rate limit enforced by the route.
  */
 export const SUMMARY_RESET_FAILURE_CODES = [
   "SUMMARY_GENERATION_RETRYABLE_FAILED",
@@ -146,6 +147,11 @@ export function useHostSummaryLifecycle(endedSession: EndedSessionReference | nu
     retryRef.current = true;
     setIsRetrying(true);
     setSummaryError("");
+    // The POST is the generation itself, so the skeleton belongs on screen
+    // now - not the failure branch this click is meant to clear. The GET loop
+    // is keyed on pollingRound and stays parked until the POST has answered.
+    setPollingState("polling");
+    setPollingStartedAt(Date.now());
     try {
       const response = await fetch(`/api/live-sessions/${endedSession.id}/summary`, {
         // `reset` is what makes an exhausted or permanent job claimable again;
@@ -155,14 +161,19 @@ export function useHostSummaryLifecycle(endedSession: EndedSessionReference | nu
       });
       const payload = await response.json() as ApiResponse<unknown>;
       if (!payload.ok) {
+        // Another worker already holds the lane: that is the generation the
+        // host asked for, so poll for its result instead of reporting failure.
+        if (payload.code === "SUMMARY_GENERATION_RUNNING") {
+          setSummaryFailureCode("");
+          setPollingRound((round) => round + 1);
+          return;
+        }
         setSummaryFailureCode(payload.code ?? "");
         setPollingState(payload.code === "SUMMARY_GENERATION_EXHAUSTED" ? "exhausted" : "failed");
         setSummaryError(getSafeSummaryErrorMessage(payload.code));
         return;
       }
       setSummaryFailureCode("");
-      setPollingState("polling");
-      setPollingStartedAt(Date.now());
       setPollingRound((round) => round + 1);
     } catch {
       setSummaryFailureCode(SUMMARY_REQUEST_FAILURE_CODE);

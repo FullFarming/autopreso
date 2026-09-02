@@ -6,7 +6,9 @@
 --   2. read_live_summary_generation_status reports 'empty' for NO_UTTERANCES so
 --      the API can present an empty state instead of a generic failure.
 --   3. reset_live_summary_generation_v1 lets the owning host clear an
---      exhausted or permanently failed job once so the next claim proceeds.
+--      exhausted or permanently failed job so the next claim proceeds. The RPC
+--      is repeatable: host resets are bounded by the per-host-session summary rate limit
+--      the API route enforces, not by this function.
 -- Existing job rows are never rewritten by this migration.
 
 alter table public.live_summary_generation_jobs
@@ -245,7 +247,10 @@ begin
   where job_row.session_id = p_session_id
     and job_row.language = p_language
     and (
-      (job_row.status = 'failed' and (job_row.attempt_count >= 3 or job_row.retryable is not true))
+      -- Empty is terminal; a new POST re-evaluates the utterances, a reset must not.
+      (job_row.status = 'failed'
+        and job_row.error_code <> 'NO_UTTERANCES'
+        and (job_row.attempt_count >= 3 or job_row.retryable is not true))
       -- A crashed worker leaves 'running' with an expired lease; at the attempt
       -- cap no claim can recover it either. A live lease is never stolen.
       or (job_row.status = 'running'
@@ -275,6 +280,7 @@ grant execute on function public.reset_live_summary_generation_v1(uuid, text, te
 -- Verification (development project only): fail a job with SUMMARY_FAILED and
 -- confirm read status reports retryable_failed and claim allocates attempt two;
 -- exhaust three attempts, confirm 'exhausted', then call
--- reset_live_summary_generation_v1 as the owning host and confirm exactly one
--- further claim is possible. A non-owner host id must return false and leave
--- attempt_count untouched.
+-- reset_live_summary_generation_v1 as the owning host and confirm the next
+-- claim allocates attempt one again; exhaust and reset a second time to confirm
+-- the RPC is repeatable. A non-owner host id, and a NO_UTTERANCES lane, must
+-- return false and leave attempt_count untouched.

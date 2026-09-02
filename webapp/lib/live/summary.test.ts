@@ -16,6 +16,7 @@ import {
   readMeetingSummaryGenerationStatus,
   resetMeetingSummaryGeneration,
   SUMMARY_ATTEMPT_TIMEOUT_MILLISECONDS,
+  SUMMARY_RATE_LIMIT_RETRY_DELAY_MILLISECONDS,
   SUMMARY_TOTAL_DEADLINE_MILLISECONDS,
   SummaryError,
   type MeetingSummaryInput,
@@ -772,7 +773,7 @@ test("Gemini recap errors are classified once per attempt with one bounded alter
           calls += 1;
           return entry.output();
         },
-      }, { apiKey: "gemini-key", model: "gemini-3.7-flash", maxOutputTokens: 4_000, timeoutMilliseconds: 45_000 }),
+      }, { apiKey: "gemini-key", model: "gemini-3.7-flash", maxOutputTokens: 4_000, timeoutMilliseconds: 45_000 }, { sleep: async () => {} }),
       (error: unknown) => error instanceof SummaryError && error.code === entry.code,
     );
     assert.equal(calls, entry.calls);
@@ -1246,7 +1247,7 @@ test("only transient provider failures are retried, and the recorded model is th
     };
     const generated = await generateMeetingSummary(summaryInput, "en", generator, {
       apiKey: "gemini-key", model: "gemini-3.7-flash", maxOutputTokens: 4_000, timeoutMilliseconds: 45_000,
-    });
+    }, { sleep: async () => {} });
     assert.equal(attempts, 2);
     assert.equal(generated.model, "gemini-3.7-flash");
     assert.deepEqual(generated.summary, expectedGeneratedSummary);
@@ -1324,4 +1325,50 @@ test("host summary reset targets the owned session lane and never invents a resu
       (error: unknown) => error instanceof SummaryError && error.code === "SUMMARY_STATE_FAILED",
     );
   });
+});
+
+test("a rate-limited attempt backs off 1.5s before its single retry, clamped to the deadline; other availability failures retry at once", async () => {
+  assert.equal(SUMMARY_RATE_LIMIT_RETRY_DELAY_MILLISECONDS, 1_500);
+  const config = { apiKey: "gemini-key", model: "gemini-3.7-flash", maxOutputTokens: 4_000, timeoutMilliseconds: 45_000 };
+  const cases = [
+    ["SUMMARY_PROVIDER_RATE_LIMITED", [1_500]],
+    ["SUMMARY_PROVIDER_UNAVAILABLE", []],
+    ["SUMMARY_TIMEOUT", []],
+  ] as const;
+  for (const [code, expectedWaits] of cases) {
+    const waits: number[] = [];
+    let attempts = 0;
+    const generator = {
+      async generateContent() {
+        attempts += 1;
+        if (attempts === 1) throw new SummaryError("first attempt failed", code, 502);
+        return { text: JSON.stringify(generatedSummary) };
+      },
+    };
+    await generateMeetingSummary(summaryInput, "en", generator, config, { sleep: async (milliseconds) => { waits.push(milliseconds); } });
+    assert.equal(attempts, 2, `${code} still earns exactly one retry`);
+    assert.deepEqual(waits, [...expectedWaits], `${code} backoff: a zero-backoff retry re-hits a limiter that has not recovered`);
+  }
+
+  // The backoff is clamped to what is left of the 60s deadline, and a deadline
+  // that expires during the backoff spends no second attempt.
+  let clock = 0;
+  const waits: number[] = [];
+  let attempts = 0;
+  const limited = {
+    async generateContent() {
+      attempts += 1;
+      clock += 59_000;
+      throw new SummaryError("limit", "SUMMARY_PROVIDER_RATE_LIMITED", 429);
+    },
+  };
+  await assert.rejects(
+    generateMeetingSummary(summaryInput, "en", limited, config, {
+      now: () => clock,
+      sleep: async (milliseconds) => { waits.push(milliseconds); clock += milliseconds; },
+    }),
+    (error: unknown) => error instanceof SummaryError && error.code === "SUMMARY_PROVIDER_RATE_LIMITED",
+  );
+  assert.deepEqual(waits, [1_000], "the backoff never outlives the deadline");
+  assert.equal(attempts, 1, "once the deadline has passed there is no second attempt");
 });

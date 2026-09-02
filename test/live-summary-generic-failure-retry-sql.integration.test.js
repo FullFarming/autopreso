@@ -26,6 +26,13 @@ test('generic-failure recovery extends the transient list and host reset without
   assert.match(sql, /attempt_count between 0 and 3/u, 'the reset lane needs zero while the cap of three stays');
   assert.match(sql, /error_code = 'SUMMARY_HOST_RESET'/u,
     'the failed-row state check forbids a null error code, so the reset records its own reason');
+  // Empty is terminal: a reset would turn "nothing was said" into a retryable
+  // failure, and only a fresh POST may re-evaluate the utterances.
+  assert.match(sql, /job_row\.status = 'failed'\s*\n?\s*and job_row\.error_code <> 'NO_UTTERANCES'/u,
+    'the reset predicate must exclude an empty lane');
+  // The RPC itself is repeatable; the only bound is the route's rate limit.
+  assert.match(sql, /bounded by the per-host-session summary rate limit/u);
+  assert.doesNotMatch(sql, /failed job once\b/u, 'the header must not claim a one-shot guard the SQL does not enforce');
   assert.match(sql, /'NO_UTTERANCES' then\s*\n\s*return jsonb_build_object\('ok', true, 'status', 'empty'\)/u);
   assert.match(sql, /create or replace function public\.reset_live_summary_generation_v1\(\s*p_session_id uuid,\s*p_language text,\s*p_host_id text\s*\)[\s\S]*security definer[\s\S]*set search_path = ''/u);
   assert.match(sql, /session_row\.host_id = p_host_id[\s\S]*session_row\.status in \('stopped', 'failed'\)/u);
@@ -44,8 +51,15 @@ test('a generic failure is reclaimable and only the owning host can reset an exh
     create function public.live_language_valid(text) returns boolean language sql as 'select $1 in (''ko'',''en'')';
     create table live_sessions(id uuid primary key,status text,host_id text);
     create table live_meeting_summaries(session_id uuid,language text,summary jsonb,model text,created_at timestamptz,unique(session_id,language));`);
-  await db.exec(await readMigration('20260727014000_live_summary_generation_jobs.sql'));
-  await db.exec(await readMigration('20260729235900_live_summary_generation_recovery.sql'));
+  // Every summary migration that precedes this one, in filename order, so the
+  // test runs against the same function history a real database carries
+  // (including 202609010005, whose transient list this one supersedes).
+  const priorSummaryMigrations = (await readdir(new URL('../supabase/migrations/', import.meta.url)))
+    .filter((file) => file.endsWith('.sql') && file.includes('live_summary')).sort()
+    .filter((file) => file < name);
+  assert.ok(priorSummaryMigrations.includes('202609010005_live_summary_configuration_retry.sql'));
+  assert.equal(priorSummaryMigrations.at(-1), '202609010005_live_summary_configuration_retry.sql');
+  for (const file of priorSummaryMigrations) await db.exec(await readMigration(file));
   await db.exec(await readMigration(name));
   await db.exec(await readMigration(name));
   const session = '50000000-0000-4000-8000-000000000001';
@@ -73,7 +87,7 @@ test('a generic failure is reclaimable and only the owning host can reset an exh
     assert.equal(await attempts(), 3);
   });
 
-  await t.test('only the owning host resets, and the reset restores exactly one bounded attempt budget', async () => {
+  await t.test('only the owning host resets, and each reset restores one bounded attempt budget', async () => {
     assert.equal(await reset('host-intruder'), false);
     assert.equal(await attempts(), 3);
     assert.equal(await reset('host-owner'), true);
@@ -87,6 +101,25 @@ test('a generic failure is reclaimable and only the owning host can reset an exh
     assert.equal(await reset('host-owner'), true, 'a permanent failure is host-recoverable');
   });
 
+  await t.test('the reset is repeatable: exhaust, reset, exhaust again, reset again - the RPC has no one-shot guard', async () => {
+    // The only bound on host resets is the route's per-host-session summary
+    // rate limit (10/hour); the RPC itself may be called as often as a lane is
+    // stuck. Pin that so nobody assumes a one-shot guard the SQL never had.
+    assert.equal(await attempts(), 0, 'the previous subtest left a freshly reset lane');
+    for (let round = 1; round <= 2; round += 1) {
+      for (let attempt = 1; attempt <= 3; attempt += 1) {
+        const claimed = await claim();
+        assert.equal(claimed.status, 'claimed', `round ${round} attempt ${attempt} is claimable`);
+        assert.equal(await fail(claimed.generationToken, 'SUMMARY_FAILED'), true);
+      }
+      assert.equal((await status()).status, 'exhausted');
+      assert.equal(await attempts(), 3);
+      assert.equal(await reset('host-owner'), true, `reset number ${round + 1} after exhaustion succeeds`);
+      assert.equal(await attempts(), 0);
+      assert.equal((await status()).status, 'retryable_failed');
+    }
+  });
+
   await t.test('a session with no recorded speech reads as empty, is never retried, and cannot be reset by a stranger', async () => {
     const empty = await claim('en');
     assert.equal(await fail(empty.generationToken, 'NO_UTTERANCES', 'en'), true);
@@ -94,6 +127,11 @@ test('a generic failure is reclaimable and only the owning host can reset an exh
     assert.equal((await claim('en')).status, 'permanent_failed');
     assert.equal(await attempts('en'), 1);
     assert.equal(await reset('host-intruder', 'en'), false);
+    // Empty is terminal: even the owner cannot turn it into a retryable failure.
+    // A new POST re-evaluates the utterances instead.
+    assert.equal(await reset('host-owner', 'en'), false, 'an empty lane is never reset');
+    assert.equal((await status('en')).status, 'empty');
+    assert.equal(await attempts('en'), 1);
   });
 
   await t.test('a live or already summarized lane refuses the reset and the RPC stays service-only', async () => {
