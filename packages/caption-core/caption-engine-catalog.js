@@ -7,6 +7,7 @@
 export const ENGINE_ROLES = Object.freeze(["stt", "translation", "summary"]);
 export const LANGUAGE_MODES = Object.freeze(["auto", "ko", "en"]);
 
+/** @template T @param {T} value @returns {T} */
 function deepFreeze(value) {
   if (value && typeof value === "object" && !Object.isFrozen(value)) {
     Object.freeze(value);
@@ -77,13 +78,17 @@ function normalizeRole(role, value) {
   return { provider: entry.provider, model: entry.model, languageMode };
 }
 
-/** @param {unknown} input */
+/**
+ * @param {unknown} input
+ * @returns {{stt:{provider:string,model:string,languageMode:string},translation:{provider:string,model:string},summary:{provider:string,model:string}}}
+ */
 export function normalizeEngineSelection(input) {
   if (input === undefined || input === null) return DEFAULT_ENGINE_SELECTION;
   if (!isRecord(input) || Object.keys(input).some((key) => !ENGINE_ROLES.includes(key))) throw new EngineSelectionError();
-  const stt = normalizeRole("stt", input.stt);
-  const translation = normalizeRole("translation", input.translation);
-  const summary = normalizeRole("summary", input.summary);
+  const record = /** @type {{stt?: unknown, translation?: unknown, summary?: unknown}} */ (input);
+  const stt = normalizeRole("stt", record.stt);
+  const translation = normalizeRole("translation", record.translation);
+  const summary = normalizeRole("summary", record.summary);
   const translationEntry = findEngineEntry("translation", translation.provider, translation.model);
   if (translationEntry.requiresSttProvider && translationEntry.requiresSttProvider !== stt.provider) throw new EngineSelectionError();
   return deepFreeze({ stt, translation, summary });

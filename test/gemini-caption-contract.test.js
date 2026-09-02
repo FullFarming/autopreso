@@ -100,7 +100,7 @@ test("Caption Only and Live Call canonicalize every Gemini caption setting to on
   });
   assert.equal(Object.hasOwn(defaults.models, "live"), false);
   assert.equal(defaults.models.polish, "gemini-3.7-flash");
-  assert.equal(defaults.polishPolicy.mode, "off");
+  assert.equal(defaults.polishPolicy.mode, "selective");
 });
 
 test("fixed source and summary selections share the one allowed policy", () => {

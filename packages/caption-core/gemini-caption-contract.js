@@ -102,7 +102,7 @@ export function createGeminiCaptionConfig(input = {}) {
   const requestedPolishPolicy = input.captionPolishPolicy ?? input.polishPolicy?.mode;
   const polishPolicy = VALID_POLISH_POLICIES.has(requestedPolishPolicy)
     ? requestedPolishPolicy
-    : "off";
+    : "selective";
   const config = {
     contractVersion: GEMINI_CAPTION_ENGINE_CONTRACT.version,
     provider: GEMINI_CAPTION_ENGINE_CONTRACT.provider,
