@@ -406,9 +406,11 @@ function createSourceTranscriptionClient({
   }
 
   // Binary-audio transports (Soniox) hand back Buffers that must travel as
-  // binary frames; JSON transports (Gemini) keep the single-argument call.
+  // binary frames. Strings always travel as text - JSON setup/control frames,
+  // and Soniox's EMPTY end-of-audio frame, which the provider only honours as
+  // a text frame (an empty binary frame never finishes the stream).
   function sendTransportPayload(openedSocket, payload) {
-    if (transport.binaryAudio) openedSocket.send(payload, { binary: true });
+    if (transport.binaryAudio && Buffer.isBuffer(payload)) openedSocket.send(payload, { binary: true });
     else openedSocket.send(payload);
   }
 
@@ -552,6 +554,13 @@ function createSourceTranscriptionClient({
       if (socket !== openedSocket || intentionalClose) return;
       transport.handleMessage(raw, {
         onTransportReady: () => markTransportReady(openedSocket),
+        // A transport may need a control frame on its own initiative (Soniox's
+        // finalize timer). Only the live, configured socket gets it, and the
+        // boolean tells the transport whether anything went out.
+        sendControl: (payload) => {
+          if (socket !== openedSocket || intentionalClose || !configured) return false;
+          try { openedSocket.send(payload); return true; } catch { return false; }
+        },
         // A transport that provides its own translations (Soniox combined) emits
         // SOURCE interims here. Feeding those to lane.preview() would pay Gemini
         // for a preview of a line the provider is about to translate itself and
@@ -712,6 +721,9 @@ function createSourceTranscriptionClient({
       replayOnNextOpen = false;
       for (const lane of lanes) lane.close();
       if (graceful && socket && configured) sendTransportPayload(socket, transport.closePayload());
+      // A non-graceful close never asks for closePayload(), so the transport's
+      // own timers (Soniox finalize) are released here explicitly.
+      transport.dispose?.();
       socket?.close();
       socket = null;
       configured = false;

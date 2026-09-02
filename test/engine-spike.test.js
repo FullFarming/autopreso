@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import fs from "node:fs";
 import { test } from "node:test";
 import { parseEnvValue, parseSpikeArgs, readWav16kMono, summarizeMetrics } from "../scripts/engine-spike.mjs";
 
@@ -41,4 +42,16 @@ test("env parsing strips wrapping quotes, trailing CR, and surrounding whitespac
   assert.equal(parseEnvValue("OTHER_KEY=nope\n", "SONIOX_API_KEY"), "");
   assert.equal(parseEnvValue(undefined, "SONIOX_API_KEY"), "");
   assert.equal(parseEnvValue('SONIOX_API_KEY=""\n', "SONIOX_API_KEY"), "");
+});
+
+// Spike 2026-09-02: the Soniox lane reported 0 finals because continuous speech
+// never yields <end> and the stream was ended with an empty BINARY frame, which
+// Soniox ignores (8 s drain timeout). The lane must drive the same finalize
+// scheduler as the desktop transport and finish with an empty TEXT frame.
+test("the soniox spike lane uses the finalize scheduler and ends the stream with an empty text frame", () => {
+  const source = fs.readFileSync(new URL("../scripts/engine-spike.mjs", import.meta.url), "utf8");
+  assert.match(source, /createSonioxFinalizeScheduler\(/u);
+  assert.match(source, /SONIOX_CONTROL\.finalize/u);
+  assert.match(source, /ws\.send\(""\)/u, "end of audio is an empty text frame");
+  assert.doesNotMatch(source, /Buffer\.alloc\(0\)/u, "no empty binary frame anywhere in the spike");
 });

@@ -52,7 +52,7 @@ test("first message is the config JSON, audio goes out as binary 16 kHz, replay 
   assert.equal(replay[0].length, 3_200);
   assert.equal(transport.keepalivePayload(), '{"type":"keepalive"}');
   assert.equal(transport.finalizePayload(), '{"type":"finalize"}');
-  assert.equal(transport.closePayload().length, 0, "an empty binary frame signals end of audio");
+  assert.equal(transport.closePayload(), "", "end of audio is an EMPTY TEXT frame - Soniox never finishes on an empty binary frame");
 });
 
 test("the replay ring never grows past 1.5 s of 16 kHz mono PCM", () => {
@@ -171,4 +171,106 @@ test("Soniox owns its own rollover instead of the shared 9.5-minute Gemini one",
   });
   assert.equal(transport.rolloverMilliseconds, 17_400_000, "290 minutes");
   assert.equal(transport.rolloverMilliseconds < transport.maximumSessionMilliseconds, true);
+});
+
+function createFakeTimers() {
+  let nowMs = 0;
+  let nextId = 1;
+  const timers = new Map();
+  return {
+    now: () => nowMs,
+    setTimer(callback, delay) { const id = nextId++; timers.set(id, { at: nowMs + delay, callback }); return id; },
+    clearTimer(id) { timers.delete(id); },
+    pending: () => timers.size,
+    advance(milliseconds) {
+      const target = nowMs + milliseconds;
+      for (;;) {
+        const due = [...timers.entries()].filter(([, timer]) => timer.at <= target).sort((a, b) => a[1].at - b[1].at);
+        if (!due.length) break;
+        const [id, timer] = due[0];
+        timers.delete(id);
+        nowMs = timer.at;
+        timer.callback();
+      }
+      nowMs = target;
+    },
+  };
+}
+
+const koFinal = (text, start_ms, end_ms) => ({ text, is_final: true, translation_status: "original", language: "ko", start_ms, end_ms });
+const frame = (tokens) => Buffer.from(JSON.stringify({ tokens }));
+
+// Spike 2026-09-02: 17 s of continuous speech never produced <end>, so the
+// transport asks for <fin> itself - 1.2 s without new tokens while final text is
+// pending (or a 15 s segment) sends {"type":"finalize"} as a TEXT frame through
+// the client's ctx.sendControl hook, at most once per segment.
+test("finalize goes out through ctx.sendControl after idle final text, once per segment, and stops at end of audio", () => {
+  const clock = createFakeTimers();
+  const transport = createSonioxTransport({
+    engine: sonioxEngine("auto"),
+    settings: { translationLanguages: ["en", "ko"], glossary: "" },
+    apiKey: "fixture-key",
+    now: clock.now,
+    setTimer: clock.setTimer,
+    clearTimer: clock.clearTimer,
+  });
+  const controls = [];
+  const boundaries = [];
+  const ctx = {
+    sendControl: (payload) => { controls.push(payload); return true; },
+    onBoundary: (kind) => boundaries.push(kind),
+  };
+  transport.setupPayloads();
+  transport.handleMessage(frame([koFinal("안녕하세요", 0, 900)]), ctx);
+  clock.advance(600);
+  transport.handleMessage(frame([]), ctx);
+  clock.advance(500);
+  assert.deepEqual(controls, [], "an empty result frame is not a new token and does not delay the finalize");
+  clock.advance(100);
+  assert.deepEqual(controls, ['{"type":"finalize"}']);
+  assert.equal(typeof controls[0], "string", "control messages are text frames");
+
+  clock.advance(5_000);
+  transport.handleMessage(frame([koFinal(" 여러분", 900, 1_300)]), ctx);
+  clock.advance(5_000);
+  assert.equal(controls.length, 1, "no re-send while <fin> is outstanding");
+
+  transport.handleMessage(frame([{ text: "<fin>", is_final: true }]), ctx);
+  assert.deepEqual(boundaries, ["manual-finalize"]);
+  transport.handleMessage(frame([koFinal("다음", 2_000, 2_400)]), ctx);
+  clock.advance(1_200);
+  assert.equal(controls.length, 2, "the boundary re-arms the scheduler");
+
+  transport.handleMessage(frame([{ text: "<fin>", is_final: true }, koFinal("마지막", 3_000, 3_400)]), ctx);
+  assert.equal(clock.pending(), 1, "final text after the boundary in the same frame arms a fresh finalize");
+  assert.equal(transport.closePayload(), "");
+  assert.equal(clock.pending(), 0, "end of audio cancels the pending finalize");
+  clock.advance(20_000);
+  assert.equal(controls.length, 2);
+});
+
+test("a provisional-only segment never triggers finalize, and a new socket setup discards the old scheduler", () => {
+  const clock = createFakeTimers();
+  const transport = createSonioxTransport({
+    engine: sonioxEngine("auto"),
+    settings: { translationLanguages: ["en", "ko"], glossary: "" },
+    apiKey: "fixture-key",
+    now: clock.now,
+    setTimer: clock.setTimer,
+    clearTimer: clock.clearTimer,
+  });
+  const controls = [];
+  const ctx = { sendControl: (payload) => { controls.push(payload); return true; } };
+  transport.setupPayloads();
+  transport.handleMessage(frame([{ text: "안녕하", is_final: false, translation_status: "original", language: "ko" }]), ctx);
+  clock.advance(20_000);
+  assert.deepEqual(controls, [], "nothing final is pending, so there is nothing to finalize");
+
+  transport.handleMessage(frame([koFinal("안녕하세요", 0, 900)]), ctx);
+  assert.equal(clock.pending(), 1);
+  transport.setupPayloads(); // reconnect / rollover: the next socket starts clean
+  assert.equal(clock.pending(), 0, "setup for a new socket clears the previous socket's finalize timer");
+  transport.dispose();
+  clock.advance(20_000);
+  assert.deepEqual(controls, []);
 });

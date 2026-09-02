@@ -3,7 +3,9 @@ import {
   SONIOX_CONTROL,
   SONIOX_ENDPOINTS,
   buildSonioxConfig,
+  createSonioxFinalizeScheduler,
   createSonioxTokenReducer,
+  hasSonioxContentTokens,
 } from "../../packages/caption-core/soniox-protocol.js";
 import { selectGeminiTranscriptionVocabularyFromLegacyText } from "../../packages/caption-core/index.js";
 
@@ -36,6 +38,13 @@ function translationTermsFromLegacyGlossary(glossary) {
     .map(([source, target]) => ({ source, target }));
 }
 
+// A pending finalize must never be what keeps the host process alive.
+function setUnrefTimer(callback, delay) {
+  const timer = setTimeout(callback, delay);
+  timer.unref?.();
+  return timer;
+}
+
 /**
  * Same surface as createGeminiTranscribeTransport plus:
  *  binaryAudio: true            - audioPayload returns a Buffer to send as a binary frame
@@ -43,12 +52,23 @@ function translationTermsFromLegacyGlossary(glossary) {
  *  replayPayloads()             - last 1.5 s of already-resampled PCM for reconnect/mode switch
  *  keepalivePayload()           - JSON keepalive control message
  *  finalizePayload()            - JSON manual-finalize control message
- *  rolloverMilliseconds         - provider-owned rollover, 290 min instead of the shared 9.5
+ *  closePayload()               - "" : end of audio is an EMPTY TEXT frame (spike
+ *                                 2026-09-02: an empty binary frame never finishes)
+ *  dispose()                    - cancels the finalize timer (client calls it on close)
+ *  ctx.sendControl(text)        - hook the transport uses to send a control frame on
+ *                                 its own initiative; returns whether it went out
+ *
+ * Finalize: continuous speech never yields `<end>` (spike 2026-09-02), so a
+ * createSonioxFinalizeScheduler asks for `<fin>` after 1.2 s without new tokens
+ * while final source text is pending, or at a 15 s segment cap, once per segment.
  *
  * @param {{engine: any, settings: Record<string, unknown>, apiKey?: string,
- *   endpoint?: "us"|"jp", now?: () => number}} input
+ *   endpoint?: "us"|"jp", now?: () => number,
+ *   setTimer?: (callback: () => void, delay: number) => any, clearTimer?: (timer: any) => void}} input
  */
-export function createSonioxTransport({ engine, settings, apiKey, endpoint = "us", now = Date.now }) {
+export function createSonioxTransport({
+  engine, settings, apiKey, endpoint = "us", now = Date.now, setTimer = setUnrefTimer, clearTimer = clearTimeout,
+}) {
   const resample = createCaptionPcmResampler();
   const languages = Array.isArray(settings.translationLanguages) ? settings.translationLanguages : ["en", "ko"];
   const translation = engine.translation.provider === "soniox";
@@ -63,6 +83,8 @@ export function createSonioxTransport({ engine, settings, apiKey, endpoint = "us
   let ringBytes = 0;
   let announcedReady = false;
   let reducer = null;
+  let scheduler = null;
+  let lastCtx = null;
   let configJson = "";
   let lastSourceText = "";
 
@@ -120,7 +142,21 @@ export function createSonioxTransport({ engine, settings, apiKey, endpoint = "us
       }),
       onBoundary: (kind) => {
         lastSourceText = "";
+        scheduler?.noteBoundary();
         ctx.onBoundary?.(kind);
+      },
+    });
+  }
+
+  function makeScheduler() {
+    return createSonioxFinalizeScheduler({
+      now,
+      setTimer,
+      clearTimer,
+      onFinalize: () => {
+        // The client owns the socket and answers false when there is none to
+        // send on; either way the next boundary (or the next setup) re-arms.
+        try { lastCtx?.sendControl?.(SONIOX_CONTROL.finalize); } catch { /* socket gone; nothing to finalize */ }
       },
     });
   }
@@ -151,6 +187,10 @@ export function createSonioxTransport({ engine, settings, apiKey, endpoint = "us
       announcedReady = false;
       reducer = null;
       lastSourceText = "";
+      // A new socket starts with a clean finalize clock; a timer armed for the
+      // previous socket must not fire into this one.
+      scheduler?.dispose();
+      scheduler = makeScheduler();
       // Contract: never throws. assertReady() has normally validated and cached
       // the config already; if it was skipped and the config is unusable, an
       // empty list tells the client to fail the session instead of streaming
@@ -170,8 +210,19 @@ export function createSonioxTransport({ engine, settings, apiKey, endpoint = "us
     },
     replayPayloads() { return [...ring]; },
     keepalivePayload() { return SONIOX_CONTROL.keepalive; },
-    finalizePayload() { return SONIOX_CONTROL.finalize; },
-    closePayload() { return Buffer.alloc(0); }, // empty binary frame = end of audio
+    finalizePayload() {
+      // A finalize the client sends itself counts as in flight for the scheduler.
+      scheduler?.noteFinalizeSent();
+      return SONIOX_CONTROL.finalize;
+    },
+    // End of audio is an EMPTY TEXT frame. The spike measured the alternative:
+    // an empty binary frame is ignored and the provider never sends `finished`.
+    // Nothing is left to finalize on a stream that is ending, so the timer goes.
+    closePayload() {
+      scheduler?.dispose();
+      return "";
+    },
+    dispose() { scheduler?.dispose(); },
     handleMessage(raw, ctx = {}) {
       let message;
       try {
@@ -190,8 +241,20 @@ export function createSonioxTransport({ engine, settings, apiKey, endpoint = "us
       }
       if (!announcedReady) { announcedReady = true; ctx.onTransportReady?.(); }
       if (!reducer) reducer = makeReducer(ctx);
+      if (!scheduler) scheduler = makeScheduler();
+      lastCtx = ctx;
       reducer.apply(message);
-      if (message?.finished === true) ctx.onBoundary?.("stream-finished");
+      // The segment clock starts with the first COMMITTED text: provisional
+      // tokens alone are nothing to finalize, so they neither start nor postpone
+      // it, and an empty result frame is not a new token either - neither may
+      // delay (or, for a long provisional-only stretch, force) a finalize.
+      if (hasSonioxContentTokens(message) && reducer.hasPendingFinalText()) {
+        scheduler.noteTokens({ hasPendingFinalText: true, atMs: now() });
+      }
+      if (message?.finished === true) {
+        scheduler.noteBoundary();
+        ctx.onBoundary?.("stream-finished");
+      }
     },
   };
 }

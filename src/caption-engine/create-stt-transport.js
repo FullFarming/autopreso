@@ -10,11 +10,14 @@ import { createSonioxTransport } from "./soniox-transport.js";
  *   handleMessage(raw, ctx), closePayload() }
  * Optional, for combined/long-session providers such as Soniox:
  * { binaryAudio, replayRingBytes, rolloverMilliseconds, replayPayloads(),
- *   keepalivePayload(), finalizePayload() }
+ *   keepalivePayload(), finalizePayload(), dispose() }
  * `assertReady()` owns all start-time validation - `setupPayloads()` must never
- * throw, because it runs inside the WebSocket "open" listener.
+ * throw, because it runs inside the WebSocket "open" listener. Payloads that
+ * are Buffers travel as binary frames when `binaryAudio` is set; strings
+ * (including an empty closePayload()) always travel as text frames.
  * ctx callbacks: onTransportReady, onInterim, onFinal, onTranslation?, onBoundary?,
- * onServerGoAway, onError?, broadcast
+ * onServerGoAway, onError?, broadcast, sendControl(text) -> boolean (transport-
+ * initiated control frame on the live socket; Soniox's finalize uses it)
  *
  * @param {{engine?: unknown, settings?: Record<string, unknown>, apiKeys?: Record<string, string>,
  *   createSonioxTransportImpl?: Function}} input

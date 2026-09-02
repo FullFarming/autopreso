@@ -13,8 +13,11 @@ class FakeSocket extends EventEmitter {
   deferClose = false;
   closeCalls = 0;
 
-  send(value) {
+  sendOptions = [];
+
+  send(value, options) {
     this.sent.push(value);
+    this.sendOptions.push(options);
   }
 
   open() {
@@ -721,4 +724,54 @@ test("pure or explicitly preserved Korean sources never add a same-target model 
       assert.deepEqual(requests.map((request) => request.targetLanguage), ["en"]);
     } finally { await manager.stop(); }
   }
+});
+
+// Spike 2026-09-02: Soniox finishes a stream only on an empty TEXT frame. The
+// empty BINARY frame the transport used to send left the provider waiting until
+// the drain timeout, so end-of-audio must reach the wire as a string.
+test("a graceful soniox stop ends the stream with an empty text frame while audio stays binary", async () => {
+  const { manager, sockets } = createSonioxHarness();
+  await manager.start({ sessionId: "soniox-text-close" });
+  const socket = sockets[0];
+  socket.open();
+  manager.sendAudio({ sessionId: "soniox-text-close", source: "mic", audio: audioFrame() });
+  await manager.stop();
+  assert.equal(socket.sent.at(-1), "", "end of audio is an empty string frame");
+  assert.equal(socket.sendOptions.at(-1)?.binary, undefined, "the closing frame is sent as text, not binary");
+  assert.ok(Buffer.isBuffer(socket.sent.at(-2)), "the audio frame before it is still a Buffer");
+  assert.equal(socket.sendOptions.at(-2)?.binary, true, "audio frames are still binary");
+});
+
+// The transport can ask the client to send a control frame on its own
+// initiative (Soniox's finalize timer). The hook rides on the handleMessage ctx,
+// sends a text frame on the live socket only, and reports whether it did.
+test("ctx.sendControl sends a text frame on the live socket and is a no-op after close", async () => {
+  const results = [];
+  let ctxRef = null;
+  const transport = {
+    ...createFakeCombinedTransport(),
+    handleMessage(raw, ctx) {
+      ctxRef = ctx;
+      const message = JSON.parse(String(raw));
+      if (message.ready) ctx.onTransportReady();
+      if (message.control) results.push(ctx.sendControl(message.control));
+    },
+  };
+  const { manager, sockets } = createHarness({
+    settings: { translationLanguages: ["en", "ko"] },
+    polish: async () => "unused",
+    createSttTransport: () => transport,
+  });
+  await manager.start({ sessionId: "control-frame" });
+  const socket = sockets[0];
+  socket.open();
+  socket.emit("message", JSON.stringify({ ready: true }));
+  socket.emit("message", JSON.stringify({ control: '{"type":"finalize"}' }));
+  assert.deepEqual(results, [true]);
+  assert.equal(socket.sent.at(-1), '{"type":"finalize"}');
+  assert.equal(socket.sendOptions.at(-1)?.binary, undefined, "control frames are text");
+  await manager.stop();
+  const sentBefore = socket.sent.length;
+  assert.equal(ctxRef.sendControl('{"type":"finalize"}'), false, "a closed client refuses to send");
+  assert.equal(socket.sent.length, sentBefore);
 });

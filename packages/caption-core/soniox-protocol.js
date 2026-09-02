@@ -182,6 +182,15 @@ export function createSonioxTokenReducer({
   }
   return {
     reset,
+    /**
+     * True while the open segment holds committed (`is_final`) source text
+     * that no `<end>` / `<fin>` has closed yet - the condition under which
+     * the client may ask the provider for a manual boundary. Whitespace-only
+     * finals and translation-lane text never count.
+     */
+    hasPendingFinalText() {
+      return source.committed.trim().length > 0;
+    },
     apply(result) {
       const tokens = Array.isArray(result?.tokens) ? result.tokens : [];
       let sourceChanged = false;
@@ -256,6 +265,81 @@ export function createSonioxTokenReducer({
         }
       }
     },
+  };
+}
+
+/**
+ * True when a result frame carries at least one content token (not just a
+ * `<end>` / `<fin>` marker, and not an empty `tokens` array): the frames that
+ * count as "new tokens" for the finalize scheduler's idle rule.
+ *
+ * @param {unknown} result
+ * @returns {boolean}
+ */
+export function hasSonioxContentTokens(result) {
+  const tokens = /** @type {any} */ (result)?.tokens;
+  return Array.isArray(tokens)
+    && tokens.some((token) => token && typeof token.text === "string" && token.text !== "<end>" && token.text !== "<fin>");
+}
+
+/**
+ * Decides when the client must ask Soniox for a manual `<fin>` boundary.
+ *
+ * Spike 2026-09-02: 17 s of continuous speech produced zero `<end>` tokens,
+ * and the reducer above commits only on `<end>` / `<fin>`, so a talk that never
+ * pauses never yields a final. Two rules share ONE armed timer:
+ *  - idle: at least `idleMilliseconds` since the last content token while
+ *    final source text is pending (the caller decides what counts as a token -
+ *    an empty result frame does not);
+ *  - cap: the segment, measured from its FIRST token (not from the boundary
+ *    that opened it), is older than `maxSegmentMilliseconds` while final text
+ *    is pending; pending text that itself arrives past the cap fires at once.
+ * A finalize already in flight is never re-sent before the next boundary, and
+ * `dispose()` cancels the timer for good. Timers are injectable for tests.
+ *
+ * @param {{idleMilliseconds?: number, maxSegmentMilliseconds?: number, now?: () => number,
+ *   setTimer?: (callback: () => void, delay: number) => any, clearTimer?: (timer: any) => void,
+ *   onFinalize?: () => void}} [input]
+ */
+export function createSonioxFinalizeScheduler({
+  idleMilliseconds = 1_200,
+  maxSegmentMilliseconds = 15_000,
+  now = Date.now,
+  setTimer = setTimeout,
+  clearTimer = clearTimeout,
+  onFinalize,
+} = {}) {
+  let timer = null;
+  let inFlight = false;
+  let disposed = false;
+  let segmentStartMs = null;
+
+  function cancel() {
+    if (timer !== null) clearTimer(timer);
+    timer = null;
+  }
+  function fire() {
+    cancel();
+    if (disposed || inFlight) return;
+    inFlight = true;
+    onFinalize?.();
+  }
+  return {
+    /** @param {{hasPendingFinalText?: boolean, atMs?: number}} [note] */
+    noteTokens({ hasPendingFinalText = false, atMs = now() } = {}) {
+      if (disposed) return;
+      if (segmentStartMs === null) segmentStartMs = atMs;
+      if (inFlight) return;
+      if (!hasPendingFinalText) { cancel(); return; }
+      const capDeadline = segmentStartMs + maxSegmentMilliseconds;
+      if (atMs >= capDeadline) { fire(); return; }
+      cancel();
+      timer = setTimer(fire, Math.max(0, Math.min(atMs + idleMilliseconds, capDeadline) - atMs));
+    },
+    noteBoundary() { cancel(); inFlight = false; segmentStartMs = null; },
+    noteFinalizeSent() { cancel(); inFlight = true; },
+    isFinalizeInFlight() { return inFlight; },
+    dispose() { cancel(); disposed = true; },
   };
 }
 

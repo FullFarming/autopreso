@@ -9,7 +9,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { WebSocket } from "ws";
-import { SONIOX_ENDPOINTS, buildSonioxConfig, createSonioxTokenReducer } from "../packages/caption-core/soniox-protocol.js";
+import { SONIOX_CONTROL, SONIOX_ENDPOINTS, buildSonioxConfig, createSonioxFinalizeScheduler, createSonioxTokenReducer, hasSonioxContentTokens } from "../packages/caption-core/soniox-protocol.js";
 import { buildGeminiTranscribeSetupMessage, handleGeminiTranscribeMessage } from "../src/gemini-live-transcribe.js";
 
 const GEMINI_URL = "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent";
@@ -111,26 +111,31 @@ async function runSoniox({ key, pcm, mode, endpoint, realtime }) {
   const metrics = { firstPartialMs: [], finalLagMs: [], firstTranslationMs: [], finals: 0, otherScriptFinals: 0, errors: [], transcript: [], translations: [] };
   const ws = new WebSocket(SONIOX_ENDPOINTS[endpoint]);
   const t0 = Date.now(); let audioStartedAt = 0; let segmentFirstPartialAt = null; let segmentFirstTranslationAt = null; let audioEndAt = null;
+  // Same contract as the desktop transport: continuous speech never yields <end>,
+  // so ask for <fin> after 1.2 s without new tokens (or a 15 s segment).
+  let finalizesSent = 0;
+  const scheduler = createSonioxFinalizeScheduler({ onFinalize() { if (ws.readyState !== WebSocket.OPEN) return; ws.send(SONIOX_CONTROL.finalize); finalizesSent += 1; } });
   const reducer = createSonioxTokenReducer({
     onSourcePartial() { if (segmentFirstPartialAt === null) segmentFirstPartialAt = Date.now(); },
     onSourceFinal(e) { metrics.finals += 1; if (isOtherScript(e.text)) metrics.otherScriptFinals += 1; metrics.transcript.push({ text: e.text, language: e.language, endMs: e.endMs }); if (segmentFirstPartialAt !== null && e.startMs !== null) metrics.firstPartialMs.push(segmentFirstPartialAt - (audioStartedAt + e.startMs)); if (e.endMs !== null) metrics.finalLagMs.push(Date.now() - (audioStartedAt + e.endMs)); },
     onTranslationPartial(e) { if (segmentFirstTranslationAt === null) segmentFirstTranslationAt = Date.now(); },
     onTranslationFinal(e) { metrics.translations.push({ text: e.text, language: e.language, sourceLanguage: e.sourceLanguage }); if (segmentFirstPartialAt !== null && segmentFirstTranslationAt !== null) metrics.firstTranslationMs.push(segmentFirstTranslationAt - segmentFirstPartialAt); },
-    onBoundary() { segmentFirstPartialAt = null; segmentFirstTranslationAt = null; },
+    onBoundary() { scheduler.noteBoundary(); segmentFirstPartialAt = null; segmentFirstTranslationAt = null; },
   });
   await new Promise((resolve, reject) => { ws.once("open", resolve); ws.once("error", reject); });
   ws.send(JSON.stringify(buildSonioxConfig({ apiKey: key, languageMode: mode, languages: ["en", "ko"], translation: true, clientReferenceId: `spike-${mode}` })));
   const finished = new Promise((resolve) => {
-    ws.on("message", (raw) => { const msg = JSON.parse(raw.toString("utf8")); if (msg.error_type) { metrics.errors.push({ type: msg.error_type, requestId: msg.request_id ?? null }); return; } reducer.apply(msg); if (msg.finished) resolve(); });
+    ws.on("message", (raw) => { const msg = JSON.parse(raw.toString("utf8")); if (msg.error_type) { metrics.errors.push({ type: msg.error_type, requestId: msg.request_id ?? null }); return; } reducer.apply(msg); if (hasSonioxContentTokens(msg) && reducer.hasPendingFinalText()) scheduler.noteTokens({ hasPendingFinalText: true, atMs: Date.now() }); if (msg.finished) resolve(); });
     ws.on("close", resolve);
   });
   audioStartedAt = Date.now();
   await streamPcm(ws, pcm, { realtime, binary: true });
   audioEndAt = Date.now();
-  ws.send(Buffer.alloc(0), { binary: true });
+  ws.send(""); // end of audio: an EMPTY TEXT frame - the empty binary frame never finished (8 s timeout)
   await Promise.race([finished, new Promise((r) => setTimeout(r, 8_000))]);
+  scheduler.dispose();
   ws.close();
-  return { provider: "soniox", mode, endpoint, connectMs: audioStartedAt - t0, audioMs: Math.round(pcm.length / 32), drainMs: Date.now() - audioEndAt, ...summarizeMetrics(metrics), transcript: metrics.transcript, translations: metrics.translations };
+  return { provider: "soniox", mode, endpoint, connectMs: audioStartedAt - t0, audioMs: Math.round(pcm.length / 32), drainMs: Date.now() - audioEndAt, finalizesSent, ...summarizeMetrics(metrics), transcript: metrics.transcript, translations: metrics.translations };
 }
 
 async function runGemini({ key, pcm, realtime }) {
@@ -172,7 +177,7 @@ async function main() {
   await fs.mkdir(path.dirname(out), { recursive: true });
   await fs.writeFile(out, JSON.stringify({ wav: path.basename(args.wav), results }, null, 2));
   for (const r of results) {
-    console.log(`${r.provider}/${r.mode}${r.endpoint ? `@${r.endpoint}` : ""}: connect ${r.connectMs}ms, finals ${r.finals}, other-script finals ${r.otherScriptFinals}, first partial p50 ${r.firstPartialMs.p50}ms, final lag p50 ${r.finalLagMs.p50}ms${r.firstTranslationMs ? `, first translation p50 ${r.firstTranslationMs.p50}ms` : ""}, errors ${r.errors.length}`);
+    console.log(`${r.provider}/${r.mode}${r.endpoint ? `@${r.endpoint}` : ""}: connect ${r.connectMs}ms, finals ${r.finals}, other-script finals ${r.otherScriptFinals}, first partial p50 ${r.firstPartialMs.p50}ms, final lag p50 ${r.finalLagMs.p50}ms${r.firstTranslationMs ? `, first translation p50 ${r.firstTranslationMs.p50}ms` : ""}${"finalizesSent" in r ? `, finalizes sent ${r.finalizesSent}` : ""}, errors ${r.errors.length}`);
   }
   console.log(`written ${out}`);
 }
