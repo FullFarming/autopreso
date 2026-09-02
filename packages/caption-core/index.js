@@ -72,3 +72,8 @@ export {
   preparePolishRequest,
   selectRelevantGlossary,
 } from "./polish-policy.js";
+export {
+  CAPTION_ENGINE_CATALOG, DEFAULT_ENGINE_SELECTION, ENGINE_ROLES, LANGUAGE_MODES, EngineSelectionError,
+  captionEngineCatalogForClient, engineRequiredApiKeys, engineSelectionKey, findEngineEntry,
+  isCombinedEngine, migrateLegacyEngineSelection, normalizeEngineSelection,
+} from "./caption-engine-catalog.js";
