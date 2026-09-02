@@ -22,6 +22,54 @@ async function tempPath() {
 
 const noCodexAuth = () => null;
 
+test("engine selection survives unrelated saves and a fresh disk reload", async () => {
+  const filePath = await tempPath();
+  const store = createSettingsStore({ filePath, env: {}, readCodexAuth: noCodexAuth });
+  await store.save({ subtitle: { engine: {
+    stt: { provider: "gemini", model: "gemini-3.5-transcribe-live", languageMode: "auto" },
+    translation: { provider: "gemini", model: "gemini-3.6-flash" },
+    summary: { provider: "gemini", model: "gemini-3.7-flash" },
+  } } });
+  await store.save({ subtitle: { tone: "business" } });
+  const reloaded = await createSettingsStore({ filePath, env: {}, readCodexAuth: noCodexAuth }).load();
+  assert.equal(reloaded.subtitle.engine.stt.model, "gemini-3.5-transcribe-live");
+  assert.equal(reloaded.subtitle.engine.summary.model, "gemini-3.7-flash");
+  assert.equal(reloaded.subtitle.tone, "business");
+});
+
+test("concurrent first saves preserve engine selection details and unrelated caption choices", async () => {
+  const filePath = await tempPath();
+  const store = createSettingsStore({ filePath, env: {}, readCodexAuth: noCodexAuth });
+  await Promise.all([
+    store.save({ subtitle: { engine: { stt: { provider: "gemini", model: "gemini-3.5-transcribe-live", languageMode: "auto" } }, tone: "business" } }),
+    store.save({ subtitle: { engine: { summary: { provider: "gemini", model: "gemini-3.7-flash" } }, inputMode: "mic" } }),
+  ]);
+  const reloaded = await createSettingsStore({ filePath, env: {}, readCodexAuth: noCodexAuth }).load();
+  assert.equal(reloaded.subtitle.engine.stt.model, "gemini-3.5-transcribe-live");
+  assert.equal(reloaded.subtitle.engine.summary.model, "gemini-3.7-flash");
+  assert.equal(reloaded.subtitle.tone, "business");
+  assert.equal(reloaded.subtitle.inputMode, "mic");
+});
+
+test("legacy per-role gemini model fields fall back to defaults on load and are rejected on save", async () => {
+  const filePath = await tempPath();
+  await fs.writeFile(filePath, JSON.stringify({ subtitle: { geminiTranscribeModel: "unlisted", geminiSummaryModel: "unlisted" } }));
+  const store = createSettingsStore({ filePath, env: {}, readCodexAuth: noCodexAuth });
+  const settings = await store.load();
+  // Unknown legacy values never crash the load and never fall back to a paid
+  // path the user did not choose -- they resolve to the catalog default.
+  assert.equal(settings.subtitle.engine.stt.model, "gemini-3.5-transcribe-live");
+  assert.equal(settings.subtitle.engine.summary.model, "gemini-3.6-flash");
+  assert.equal(JSON.parse(await fs.readFile(filePath, "utf8")).subtitle.engine.stt.model, "gemini-3.5-transcribe-live");
+  for (const legacyPatch of [
+    { geminiTranscribeModel: "gemini-3.5-transcribe-live" },
+    { geminiSummaryModel: "gemini-3.6-flash" },
+    { geminiPolishModel: "gemini-3.7-flash" },
+  ]) {
+    await assert.rejects(store.save({ subtitle: legacyPatch }), /subtitle\.engine/u);
+  }
+});
+
 test("createSettingsStore returns defaults when file is missing and env is empty", async () => {
   const store = createSettingsStore({ filePath: await tempPath(), env: {}, readCodexAuth: noCodexAuth });
   const settings = await store.load();
@@ -37,8 +85,15 @@ test("createSettingsStore returns defaults when file is missing and env is empty
   assert.equal(settings.subtitle.translateAllLanguages, false);
   assert.deepEqual(settings.subtitle.translationLanguages, ["en", "ko"]);
   assert.equal(settings.subtitle.outputMode, "captions");
-  assert.equal(settings.subtitle.geminiTranscribeModel, "gemini-3.5-transcribe-live");
-  for (const retiredKey of ["audioLanguage", "audioVolume", "voiceProvider", "model", "geminiModel"]) {
+  assert.deepEqual(settings.subtitle.engine, {
+    stt: { provider: "gemini", model: "gemini-3.5-transcribe-live", languageMode: "auto" },
+    translation: { provider: "gemini", model: "gemini-3.6-flash" },
+    summary: { provider: "gemini", model: "gemini-3.6-flash" },
+  });
+  for (const retiredKey of [
+    "audioLanguage", "audioVolume", "voiceProvider", "model", "geminiModel",
+    "geminiTranscribeModel", "geminiSummaryModel", "geminiPolishModel",
+  ]) {
     assert.equal(Object.hasOwn(settings.subtitle, retiredKey), false);
   }
   assert.equal(settings.subtitle.recordProvider, "ollama");
@@ -48,7 +103,6 @@ test("createSettingsStore returns defaults when file is missing and env is empty
   // The second Gemini project key is a first-class slot (parallel 3-language
   // translation), so it defaults to an empty string rather than being absent.
   assert.equal(settings.apiKeys.geminiSecondary, "");
-  assert.equal(settings.subtitle.geminiPolishModel, "gemini-3.7-flash");
 });
 
 test("createSettingsStore normalizes retired interpreted audio settings to captions", async () => {
@@ -257,7 +311,7 @@ test("createSettingsStore persists the exact plural glossary pin contract and re
   await assert.rejects(() => store.save({ subtitle: { glossaries: [{ sourceKind: "builtin", sourceId: "unknown" }] } }), /valid glossary selections/u);
 });
 
-test("createSettingsStore migrates Live Translate and voice settings to caption-only Transcribe", async () => {
+test("createSettingsStore migrates legacy voice settings while keeping direct translation caption-only", async () => {
   const filePath = await tempPath();
   await fs.writeFile(filePath, JSON.stringify({
     subtitle: { translationProvider: "openai", voiceProvider: "openai" },
@@ -265,19 +319,23 @@ test("createSettingsStore migrates Live Translate and voice settings to caption-
   const store = createSettingsStore({ filePath, env: {}, readCodexAuth: noCodexAuth });
   const settings = await store.load();
   assert.equal(settings.subtitle.translationProvider, "gemini");
-  assert.equal(settings.subtitle.geminiTranscribeModel, "gemini-3.5-transcribe-live");
+  assert.equal(settings.subtitle.engine.stt.model, "gemini-3.5-transcribe-live");
   assert.equal(Object.hasOwn(settings.subtitle, "geminiModel"), false);
   assert.equal(Object.hasOwn(settings.subtitle, "voiceProvider"), false);
   await assert.rejects(() => store.save({ subtitle: { voiceProvider: "gemini" } }), /retired/u);
-  assert.equal(settings.subtitle.geminiPolishModel, "gemini-3.7-flash");
+  assert.equal(settings.subtitle.engine.translation.model, "gemini-3.6-flash");
 
   await assert.rejects(() => store.save({ subtitle: { translationProvider: "openai" } }), /translationProvider/u);
 
   await assert.rejects(() => store.save({ subtitle: { translationProvider: "claude" } }), /translationProvider/u);
 });
 
-test("createSettingsStore migrates released polish and Live Translate defaults", async () => {
-  for (const geminiPolishModel of ["gemini-3.5-flash", "gemini-3.6-flash"]) {
+// geminiPolishModel and geminiModel are retired: the polish step is now a fixed
+// internal model, not a user-selectable field, and geminiModel never fed the
+// engine either. A stored file carrying them must load without crashing and
+// come out with those keys gone and the engine catalog default intact.
+test("legacy geminiModel and geminiPolishModel fields are dropped from disk without crashing load", async () => {
+  for (const geminiPolishModel of ["gemini-3.5-flash", "gemini-3.6-flash", "gemini-3.7-flash"]) {
     const filePath = await tempPath();
     await fs.writeFile(filePath, JSON.stringify({
       subtitle: {
@@ -288,9 +346,10 @@ test("createSettingsStore migrates released polish and Live Translate defaults",
 
     const store = createSettingsStore({ filePath, env: {}, readCodexAuth: noCodexAuth });
     const settings = await store.load();
-    assert.equal(settings.subtitle.geminiTranscribeModel, "gemini-3.5-transcribe-live");
+    assert.equal(settings.subtitle.engine.stt.model, "gemini-3.5-transcribe-live");
     assert.equal(Object.hasOwn(settings.subtitle, "geminiModel"), false);
-    assert.equal(settings.subtitle.geminiPolishModel, "gemini-3.7-flash");
+    assert.equal(Object.hasOwn(settings.subtitle, "geminiPolishModel"), false);
+    assert.equal((await store.load()).subtitle.engine.stt.model, "gemini-3.5-transcribe-live");
   }
 });
 
@@ -357,7 +416,7 @@ test("createSettingsStore.save persists subtitle settings", async () => {
   assert.equal(settings.subtitle.micDeviceId, "input-device-1");
   assert.equal(settings.subtitle.translationFontSize, 44);
   assert.equal(settings.subtitle.sourceFontSize, 42);
-  assert.equal(settings.subtitle.geminiTranscribeModel, DEFAULT_SUBTITLE_SETTINGS.geminiTranscribeModel);
+  assert.deepEqual(settings.subtitle.engine, DEFAULT_SUBTITLE_SETTINGS.engine);
   assert.equal(settings.subtitle.displayMode, "translation_only");
   assert.equal(settings.subtitle.overlayEnabled, true);
 });
@@ -730,7 +789,7 @@ test("the retired captions_audio output mode is rejected on write", () => {
   );
 });
 
-test("an existing audio settings file migrates to caption-only Transcribe instead of failing to load", async () => {
+test("an existing audio settings file migrates to the current caption contract instead of failing to load", async () => {
   const filePath = await tempPath();
   await fs.writeFile(filePath, JSON.stringify({
     subtitle: { outputMode: "captions_audio", translationLanguages: ["en", "ko"], audioLanguage: "ko" },
@@ -739,7 +798,7 @@ test("an existing audio settings file migrates to caption-only Transcribe instea
   const store = createSettingsStore({ filePath, env: {}, readCodexAuth: noCodexAuth });
   const loaded = await store.load();
   assert.equal(loaded.subtitle.outputMode, "captions", "the mixed mode degrades to captions, the safe half");
-  assert.equal(loaded.subtitle.geminiTranscribeModel, "gemini-3.5-transcribe-live");
+  assert.equal(loaded.subtitle.engine.stt.model, "gemini-3.5-transcribe-live");
   assert.equal(Object.hasOwn(loaded.subtitle, "audioLanguage"), false);
 
   // And the migration is durable: saving afterwards must not throw on the value
@@ -747,4 +806,42 @@ test("an existing audio settings file migrates to caption-only Transcribe instea
   await store.save({ subtitle: { translationLanguages: ["en", "ko"] } });
   const reloaded = await store.load();
   assert.equal(reloaded.subtitle.outputMode, "captions");
+});
+
+test("subtitle.engine defaults, migrates legacy gemini model fields, and rewrites the file", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "settings-engine-"));
+  const filePath = path.join(dir, "settings.json");
+  await fs.writeFile(filePath, JSON.stringify({ subtitle: {
+    geminiTranscribeModel: "gemini-3.5-live-translate-preview", geminiSummaryModel: "gemini-3.7-flash", geminiPolishModel: "gemini-3.7-flash",
+  } }));
+  const store = createSettingsStore({ filePath, env: {}, readCodexAuth: () => null });
+  const loaded = await store.load();
+  assert.deepEqual(loaded.subtitle.engine, {
+    stt: { provider: "gemini", model: "gemini-3.5-transcribe-live", languageMode: "auto" },
+    translation: { provider: "gemini", model: "gemini-3.7-flash" },
+    summary: { provider: "gemini", model: "gemini-3.7-flash" },
+  });
+  for (const legacy of ["geminiTranscribeModel", "geminiSummaryModel", "geminiPolishModel", "geminiModel"]) {
+    assert.equal(Object.hasOwn(loaded.subtitle, legacy), false, legacy);
+  }
+  const onDisk = JSON.parse(await fs.readFile(filePath, "utf8"));
+  assert.equal(onDisk.subtitle.engine.stt.model, "gemini-3.5-transcribe-live");
+});
+
+test("save validates engine selections and soniox key slot", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "settings-engine-"));
+  const store = createSettingsStore({ filePath: path.join(dir, "settings.json"), env: {}, readCodexAuth: () => null });
+  await store.load();
+  await assert.rejects(store.save({ subtitle: { engine: { stt: { provider: "soniox", model: "nope", languageMode: "auto" } } } }), /엔진 조합/u);
+  await assert.rejects(store.save({ subtitle: { geminiTranscribeModel: "gemini-3.5-transcribe-live" } }), /subtitle\.engine/u);
+  await store.save({ apiKeys: { soniox: "fixture-key" }, subtitle: { engine: {
+    stt: { provider: "soniox", model: "stt-rt-v5", languageMode: "en" },
+    translation: { provider: "soniox", model: "stt-rt-v5" },
+    summary: { provider: "gemini", model: "gemini-3.6-flash" },
+  } } });
+  const saved = await store.load();
+  assert.equal(saved.subtitle.engine.stt.languageMode, "en");
+  const sanitized = await store.getSanitized();
+  assert.equal(sanitized.hasSonioxKey, true);
+  assert.equal(Object.hasOwn(sanitized, "apiKeys"), false);
 });

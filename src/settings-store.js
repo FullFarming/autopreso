@@ -5,6 +5,7 @@ import path from "node:path";
 import { readCodexCliAuthSync } from "./codex-auth.js";
 import { DEFAULT_GLOSSARY_PRESET_ID, GLOSSARY_PRESETS } from "./glossary-presets.js";
 import { MAX_TRANSLATION_LANGUAGES, isSupportedSubtitleLanguage } from "./subtitle-languages.js";
+import { DEFAULT_ENGINE_SELECTION, engineSelectionKey, migrateLegacyEngineSelection, normalizeEngineSelection } from "../packages/caption-core/caption-engine-catalog.js";
 
 export const MAX_AGENT_INSTRUCTIONS_CHARS = 100_000;
 
@@ -92,8 +93,7 @@ export const DEFAULT_SUBTITLE_SETTINGS = Object.freeze({
   tone: "natural",
   tonePolishModel: "gpt-5.5",
   translationProvider: "gemini",
-  geminiTranscribeModel: "gemini-3.5-transcribe-live",
-  geminiPolishModel: "gemini-3.7-flash",
+  engine: DEFAULT_ENGINE_SELECTION,
   glossaryPresetId: DEFAULT_GLOSSARY_PRESET_ID,
   glossaryPresetName: "",
   glossaries: Object.freeze([Object.freeze({ sourceKind: "builtin", sourceId: "common_business" })]),
@@ -113,7 +113,7 @@ export const MAX_SUBTITLE_DOMAIN_CHARS = 2_000;
 export const MAX_SUBTITLE_VERTICAL_OFFSET = 600;
 export const MAX_SUBTITLE_FONT_FAMILY_CHARS = 400;
 export const MAX_API_KEY_CHARS = 500;
-export const API_KEY_NAMES = Object.freeze(["openai", "gemini", "geminiSecondary"]);
+export const API_KEY_NAMES = Object.freeze(["openai", "gemini", "geminiSecondary", "soniox"]);
 
 export const DEFAULT_SETTINGS = Object.freeze({
   agent: {
@@ -141,11 +141,31 @@ export const DEFAULT_SETTINGS = Object.freeze({
 
 export function createSettingsStore({ filePath, env = process.env, readCodexAuth = readCodexCliAuthSync }) {
   let cached = null;
+  let loadPromise = null;
 
   async function readFromDisk() {
     try {
       const raw = await fs.readFile(filePath, "utf8");
-      return migrateSettings(deepMerge(cloneDefaults(), JSON.parse(raw)));
+      const parsed = JSON.parse(raw);
+      const merged = deepMerge(cloneDefaults(), parsed);
+      // deepMerge fills in the default `engine` even when the on-disk file never
+      // had one, which would make migrateLegacyEngineSelection's "an explicit
+      // engine always wins" rule silently mask legacy per-role model fields on
+      // every disk load. Only carry `engine` into migration when the file itself
+      // set it; otherwise let the legacy fields (or the true default) decide.
+      if (isPlainObject(merged.subtitle) && !Object.hasOwn(parsed?.subtitle ?? {}, "engine")) {
+        delete merged.subtitle.engine;
+      }
+      const migrated = migrateSettings(merged);
+      const legacyPresent = ["geminiTranscribeModel", "geminiSummaryModel", "geminiPolishModel", "geminiModel"].some((key) => Object.hasOwn(parsed?.subtitle ?? {}, key));
+      let storedEngineKey;
+      try {
+        storedEngineKey = engineSelectionKey(parsed?.subtitle?.engine ?? DEFAULT_ENGINE_SELECTION);
+      } catch {
+        storedEngineKey = null;
+      }
+      if (legacyPresent || storedEngineKey !== engineSelectionKey(migrated.subtitle.engine)) await writeToDisk(migrated);
+      return migrated;
     } catch (error) {
       if (error.code === "ENOENT") return null;
       throw error;
@@ -175,15 +195,21 @@ export function createSettingsStore({ filePath, env = process.env, readCodexAuth
 
   async function load() {
     if (cached) return cached;
-    const fromDisk = await readFromDisk();
-    if (fromDisk) {
-      cached = fromDisk;
+    // 2026-09-01 fix: Concurrent first saves must merge against one initialized settings snapshot.
+    if (!loadPromise) loadPromise = (async () => {
+      const fromDisk = await readFromDisk();
+      if (fromDisk) {
+        cached = fromDisk;
+        return cached;
+      }
+      const seeded = seedFromEnv(cloneDefaults(), env, readCodexAuth);
+      await writeToDisk(seeded);
+      cached = seeded;
       return cached;
-    }
-    const seeded = seedFromEnv(cloneDefaults(), env, readCodexAuth);
-    await writeToDisk(seeded);
-    cached = seeded;
-    return cached;
+    })();
+    const pending = loadPromise;
+    try { return await pending; }
+    finally { if (loadPromise === pending) loadPromise = null; }
   }
 
   async function save(partial) {
@@ -234,6 +260,7 @@ export function createSettingsStore({ filePath, env = process.env, readCodexAuth
       hasOpenAIKey: Boolean(apiKeys?.openai),
       hasGeminiKey: Boolean(apiKeys?.gemini),
       hasGeminiSecondaryKey: Boolean(apiKeys?.geminiSecondary),
+      hasSonioxKey: Boolean(apiKeys?.soniox),
     };
   }
 
@@ -293,21 +320,24 @@ function migrateSettings(settings) {
   }
   settings.subtitle.translationProvider = "gemini";
   settings.subtitle.outputMode = "captions";
-  settings.subtitle.geminiTranscribeModel = DEFAULT_SUBTITLE_SETTINGS.geminiTranscribeModel;
-  // 2026-08-27 feat: audio output and Live Translate model aliases are read-only
-  // migration inputs. Canonical settings contain only the caption pipeline.
-  for (const retiredKey of ["audioLanguage", "audioVolume", "voiceProvider", "model", "geminiModel"]) {
+  // 2026-09-02: per-role Gemini model fields are replaced by the engine catalog selection.
+  let engine;
+  try {
+    engine = migrateLegacyEngineSelection({
+      engine: settings.subtitle.engine,
+      geminiTranscribeModel: settings.subtitle.geminiTranscribeModel,
+      geminiSummaryModel: settings.subtitle.geminiSummaryModel,
+      geminiPolishModel: settings.subtitle.geminiPolishModel,
+    });
+  } catch {
+    engine = DEFAULT_ENGINE_SELECTION;
+  }
+  settings.subtitle.engine = engine;
+  for (const retiredKey of ["geminiTranscribeModel", "geminiSummaryModel", "geminiPolishModel", "audioLanguage", "audioVolume", "voiceProvider", "model", "geminiModel"]) {
     delete settings.subtitle[retiredKey];
   }
   if (settings.subtitle?.tonePolishModel === "gpt-4o-mini") {
     settings.subtitle.tonePolishModel = DEFAULT_SUBTITLE_SETTINGS.tonePolishModel;
-  }
-  // 2026-07-29 fix: released Flash defaults are migrated forward so persisted
-  // settings do not silently bypass the current pinned polish model.
-  // Custom model ids remain untouched and the Live Translate model is separate.
-  if (settings.subtitle?.geminiPolishModel === "gemini-3.5-flash"
-    || settings.subtitle?.geminiPolishModel === "gemini-3.6-flash") {
-    settings.subtitle.geminiPolishModel = DEFAULT_SUBTITLE_SETTINGS.geminiPolishModel;
   }
   if (settings.subtitle?.displayMode === "translation_source") {
     settings.subtitle.displayMode = DEFAULT_SUBTITLE_SETTINGS.displayMode;
@@ -405,6 +435,8 @@ function seedFromEnv(settings, env, readCodexAuth) {
   if (geminiKey) next.apiKeys.gemini = geminiKey;
   const geminiSecondaryKey = trimOrEmpty(env.GEMINI_SECONDARY_API_KEY);
   if (geminiSecondaryKey) next.apiKeys.geminiSecondary = geminiSecondaryKey;
+  const sonioxKey = trimOrEmpty(env.SONIOX_API_KEY);
+  if (sonioxKey) next.apiKeys.soniox = sonioxKey;
 
   const openaiModel = trimOrEmpty(env.OPENAI_MODEL);
   if (openaiModel) next.agent.openai.model = openaiModel;
@@ -583,13 +615,10 @@ export function validateSubtitleSettings(value) {
       throw new Error(`Subtitle fontFamily must be a string of ${MAX_SUBTITLE_FONT_FAMILY_CHARS} characters or fewer.`);
     }
   }
-  if (value.geminiTranscribeModel !== undefined
-    && value.geminiTranscribeModel !== DEFAULT_SUBTITLE_SETTINGS.geminiTranscribeModel) {
-    throw new Error("Subtitle geminiTranscribeModel must remain gemini-3.5-transcribe-live.");
+  for (const legacy of ["geminiTranscribeModel", "geminiSummaryModel", "geminiPolishModel", "geminiModel"]) {
+    if (value[legacy] !== undefined) throw new Error("Subtitle model fields moved to subtitle.engine.");
   }
-  if (value.geminiPolishModel !== undefined && typeof value.geminiPolishModel !== "string") {
-    throw new Error("Subtitle geminiPolishModel must be a string.");
-  }
+  if (value.engine !== undefined) normalizeEngineSelection(value.engine);
   if (value.tonePolishModel !== undefined && typeof value.tonePolishModel !== "string") {
     throw new Error("Subtitle tonePolishModel must be a string.");
   }
