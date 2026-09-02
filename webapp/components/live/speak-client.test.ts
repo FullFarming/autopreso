@@ -523,9 +523,11 @@ test("minutes retry transcript independently after summary succeeds", () => {
   assert.ok(effectStart >= 0 && effectEnd > effectStart);
   const effect = source.slice(effectStart, effectEnd);
 
-  assert.match(effect, /summaryRecord && isTranscriptLoaded/u,
+  // A settled summary is either a record or an empty record; both leave the
+  // transcript request as the only reason to keep polling.
+  assert.match(effect, /\(summaryRecord \|\| isSummaryEmpty\) && isTranscriptLoaded/u,
     "a loaded summary must not stop retries while the transcript request is unresolved");
-  assert.match(effect, /summaryRecord \? "transcript" : isTranscriptLoaded \? "summary" : "both"/u,
+  assert.match(effect, /summaryRecord \|\| isSummaryEmpty \? "transcript" : isTranscriptLoaded \? "summary" : "both"/u,
     "the retry must request only the record resource that is still unresolved");
   assert.doesNotMatch(effect, /if \(!isSessionEnded \|\| summaryRecord\) return/u);
 });
@@ -626,30 +628,29 @@ test("host summary polling stays GET-only while the operator Retry performs one 
   assert.ok(hostRetryStart >= 0 && hostRetryEnd > hostRetryStart);
   const hostRetry = hostLifecycle.slice(hostRetryStart, hostRetryEnd);
   assert.match(hostRetry, /retryRef\.current/u);
-  assert.match(hostRetry, /summaryFailureCode !== "SUMMARY_GENERATION_RETRYABLE_FAILED"/u,
-    "only an explicitly retryable generation failure may issue a recovery POST");
+  // Every failure class that polling cannot clear may now issue exactly one
+  // reset-and-claim POST; the allowed set is named once, in the lifecycle.
+  assert.match(hostRetry, /!shouldResetSummaryGeneration\(summaryFailureCode\)/u,
+    "only a failure class that polling cannot clear may issue a recovery POST");
   assert.ok(hostRetry.indexOf("if (retryRef.current") < hostRetry.indexOf("method: \"POST\""),
     "the single-flight guard must run before the recovery request");
   assert.equal(hostRetry.match(/method: "POST"/gu)?.length, 1,
     "one operator Retry must have exactly one POST call site");
   assert.match(hostRetry, /headers: \{ "content-type": "application\/json" \}/u);
-  assert.match(hostRetry, /body: JSON\.stringify\(\{ language \}\)/u);
+  assert.match(hostRetry, /body: JSON\.stringify\(\{ language, reset: true \}\)/u);
   assert.match(hostRetry, /if \(!payload\.ok\)[\s\S]*setSummaryFailureCode\(payload\.code \?\? ""\)/u,
-    "a rejected recovery must retain the route code so exhausted or permanent jobs cannot POST again");
+    "a rejected recovery must retain the route code so the next click cannot lie about the state");
   assert.match(hostRetry, /setPollingRound\(\(round\) => round \+ 1\)/u,
     "a successful lease reclaim must restart GET polling");
   assert.ok(hostRetry.indexOf("await fetch") < hostRetry.indexOf("setPollingRound"),
     "GET polling may restart only after the recovery POST succeeds");
-  for (const blockedCode of [
-    "SUMMARY_GENERATION_EXHAUSTED",
-    "SUMMARY_GENERATION_PERMANENT_FAILED",
-    "SUMMARY_GENERATION_RUNNING",
-  ]) {
-    assert.doesNotMatch(hostRetry, new RegExp(`summaryFailureCode === ["']${blockedCode}["']`, "u"),
-      `${blockedCode} must never authorize a recovery POST`);
+  assert.match(hostLifecycle, /export const SUMMARY_RESET_FAILURE_CODES = \[\s*\n\s*"SUMMARY_GENERATION_RETRYABLE_FAILED",\s*\n\s*"SUMMARY_GENERATION_PERMANENT_FAILED",\s*\n\s*"SUMMARY_GENERATION_EXHAUSTED",\s*\n\s*\] as const;/u);
+  for (const pollableCode of ["SUMMARY_GENERATION_RUNNING", "SUMMARY_NOT_READY"]) {
+    assert.doesNotMatch(hostLifecycle, new RegExp(`SUMMARY_RESET_FAILURE_CODES = \\[[^\\]]*${pollableCode}`, "su"),
+      `${pollableCode} must keep polling instead of authorizing a recovery POST`);
   }
-  assert.match(hostLifecycle, /summaryFailureCode === "SUMMARY_GENERATION_RETRYABLE_FAILED"[\s\S]*?retrySummary/u,
-    "only the retryable failure branch may invoke the recovery POST callback");
+  assert.match(hostLifecycle, /shouldResetSummaryGeneration\(summaryFailureCode\)\) void retrySummary\(\)/u,
+    "only the reset-eligible failure classes may invoke the recovery POST callback");
   assert.doesNotMatch(host, /Create summary again|Create AI summary|generateSummaries/u);
   assert.match(hostLifecycle, /startSummaryPollLoop/u);
 

@@ -106,7 +106,12 @@ export type SummaryGenerationClaim =
   | { status: "ready" | "running" | "exhausted" | "permanent_failed" };
 
 export type SummaryGenerationStatus = {
-  status: "missing" | "running" | "retryable_failed" | "exhausted" | "permanent_failed" | "ready";
+  /**
+   * `empty` is not a failure: the session simply recorded no speech. It is
+   * stored as a non-retryable NO_UTTERANCES job (DB contract) and surfaces
+   * here so the API and UI can present an empty record instead of an error.
+   */
+  status: "missing" | "running" | "retryable_failed" | "exhausted" | "permanent_failed" | "ready" | "empty";
 };
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -666,6 +671,33 @@ function isLowSurrogate(value: number): boolean {
   return value >= 0xDC00 && value <= 0xDFFF;
 }
 
+/**
+ * One attempt is bounded far below the old 45s configuration ceiling: a host
+ * waiting on "다시 생성" must not pay a 45s wait per click, and the summary
+ * model answers well inside 20s when it answers at all.
+ */
+export const SUMMARY_ATTEMPT_TIMEOUT_MILLISECONDS = 20_000;
+/** Every attempt together, so one slow model cannot become an unbounded wait. */
+export const SUMMARY_TOTAL_DEADLINE_MILLISECONDS = 60_000;
+/**
+ * Only availability failures earn the second attempt. A parse, refusal or
+ * configuration failure is deterministic - repeating it just spends the
+ * deadline and the host's patience twice.
+ */
+const SUMMARY_RETRY_ERROR_CODES: readonly string[] = [
+  "SUMMARY_TIMEOUT",
+  "SUMMARY_PROVIDER_UNAVAILABLE",
+  "SUMMARY_PROVIDER_RATE_LIMITED",
+];
+/**
+ * Two bounded attempts inside one deadline: 20s + 20s beats a single 45s wait
+ * on an unavailable provider, and the host's "다시 생성" is not the first
+ * retry any more. The engine catalog names an alternate summary model, but the
+ * recap transport still pins the recap model, so the second attempt reuses the
+ * configured one - which is also the model the completed job records.
+ */
+const SUMMARY_MAX_ATTEMPTS = 2;
+
 export async function generateMeetingSummary(
   input: MeetingSummaryInput,
   language: string,
@@ -675,17 +707,53 @@ export async function generateMeetingSummary(
   if (config.model !== GEMINI_RECAP_MODEL) {
     throw new SummaryError("요약 모델 설정이 올바르지 않습니다.", "SUMMARY_MODEL_NOT_ALLOWED", 500);
   }
+  const prompt = buildSummaryPrompt(input, language);
+  const attemptCeiling = Math.min(SUMMARY_ATTEMPT_TIMEOUT_MILLISECONDS, config.timeoutMilliseconds);
+  const deadlineAt = Date.now() + SUMMARY_TOTAL_DEADLINE_MILLISECONDS;
+  let lastError: SummaryError = new SummaryError("요약 서비스에 연결할 수 없습니다.", "SUMMARY_PROVIDER_UNAVAILABLE", 502);
+  for (let attempt = 1; attempt <= SUMMARY_MAX_ATTEMPTS; attempt += 1) {
+    const remaining = deadlineAt - Date.now();
+    if (remaining <= 0) break;
+    try {
+      const payload = await runSummaryGenerationAttempt(
+        generator ?? getCachedGeminiSummaryGenerator(config),
+        { sessionId: input.sessionId, prompt, maxOutputTokens: config.maxOutputTokens },
+        Math.min(attemptCeiling, remaining),
+      );
+      const summary = parseGeneratedMeetingSummaryPayload(payload);
+      return {
+        summary: {
+          ...summary,
+          participationStats: deriveParticipationStats(input.utterances),
+        },
+        // The model that answered, so the completed job records it.
+        model: config.model,
+      };
+    } catch (error: unknown) {
+      lastError = error instanceof SummaryError
+        ? error
+        : new SummaryError("요약 서비스에 연결할 수 없습니다.", "SUMMARY_PROVIDER_UNAVAILABLE", 502);
+      const isLastAttempt = attempt === SUMMARY_MAX_ATTEMPTS;
+      if (isLastAttempt || !SUMMARY_RETRY_ERROR_CODES.includes(lastError.code)) throw lastError;
+    }
+  }
+  throw lastError;
+}
+
+async function runSummaryGenerationAttempt(
+  contentGenerator: GeminiSummaryContentGenerator,
+  request: { sessionId: string; prompt: string; maxOutputTokens: number },
+  timeoutMilliseconds: number,
+): Promise<unknown> {
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(new Error("SUMMARY_TIMEOUT")), config.timeoutMilliseconds);
-  let payload: unknown;
-  const contentGenerator = generator ?? getCachedGeminiSummaryGenerator(config);
+  const timeout = setTimeout(() => controller.abort(new Error("SUMMARY_TIMEOUT")), timeoutMilliseconds);
   try {
-    payload = await raceWithAbort(
+    return await raceWithAbort(
       contentGenerator.generateContent({
-        sessionId: input.sessionId,
-        prompt: buildSummaryPrompt(input, language),
+        sessionId: request.sessionId,
+        prompt: request.prompt,
         schema: MEETING_SUMMARY_JSON_SCHEMA,
-        maxOutputTokens: config.maxOutputTokens,
+        maxOutputTokens: request.maxOutputTokens,
         signal: controller.signal,
       }),
       controller.signal,
@@ -699,14 +767,6 @@ export async function generateMeetingSummary(
   } finally {
     clearTimeout(timeout);
   }
-  const summary = parseGeneratedMeetingSummaryPayload(payload);
-  return {
-    summary: {
-      ...summary,
-      participationStats: deriveParticipationStats(input.utterances),
-    },
-    model: config.model,
-  };
 }
 
 function classifyGeminiProviderError(error: unknown): SummaryError | null {
@@ -982,7 +1042,7 @@ export async function readMeetingSummaryGenerationStatus(
   }
   if (payload.status === "missing" || payload.status === "running" || payload.status === "ready"
     || payload.status === "retryable_failed" || payload.status === "exhausted"
-    || payload.status === "permanent_failed") {
+    || payload.status === "permanent_failed" || payload.status === "empty") {
     return { status: payload.status };
   }
   throw summaryRpcError();
@@ -1024,9 +1084,30 @@ export async function failMeetingSummaryGeneration(
   return payload;
 }
 
+/**
+ * Host-owned recovery: clears an exhausted or permanently failed job so the
+ * next claim can proceed. The RPC verifies session ownership itself and
+ * returns false when nothing was resettable - never a thrown surprise.
+ */
+export async function resetMeetingSummaryGeneration(
+  sessionId: string,
+  language: string,
+  hostId: string,
+  fetchFn: typeof fetch = fetch,
+): Promise<boolean> {
+  const payload = await callSummaryGenerationRpc("reset_live_summary_generation_v1", {
+    p_session_id: sessionId,
+    p_language: language,
+    p_host_id: hostId,
+  }, fetchFn);
+  if (typeof payload !== "boolean") throw summaryRpcError();
+  return payload;
+}
+
 async function callSummaryGenerationRpc(
   name: "claim_live_summary_generation" | "complete_live_summary_generation"
-    | "fail_live_summary_generation" | "read_live_summary_generation_status",
+    | "fail_live_summary_generation" | "read_live_summary_generation_status"
+    | "reset_live_summary_generation_v1",
   body: Record<string, unknown>,
   fetchFn: typeof fetch,
   options: SummaryStoredReadOptions = {},

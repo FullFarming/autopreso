@@ -12,7 +12,33 @@ interface EndedSessionReference {
   languages: string[];
 }
 
+/**
+ * Failure classes no amount of GET polling can clear: the job is either out of
+ * automatic attempts or was classified permanent. The host may clear each of
+ * them exactly once through the reset-and-claim POST.
+ */
+export const SUMMARY_RESET_FAILURE_CODES = [
+  "SUMMARY_GENERATION_RETRYABLE_FAILED",
+  "SUMMARY_GENERATION_PERMANENT_FAILED",
+  "SUMMARY_GENERATION_EXHAUSTED",
+] as const;
+/** A request that never reached the API leaves the job state unknown. */
+const SUMMARY_REQUEST_FAILURE_CODE = "SUMMARY_REQUEST_FAILED";
+/** `NO_UTTERANCES` is the legacy code; both mean "nothing was said". */
+export const SUMMARY_EMPTY_CODES = ["SUMMARY_NO_UTTERANCES", "NO_UTTERANCES"] as const;
+
+export function isSummaryEmptyCode(code: string | undefined): boolean {
+  return code !== undefined && (SUMMARY_EMPTY_CODES as readonly string[]).includes(code);
+}
+
+export function shouldResetSummaryGeneration(code: string): boolean {
+  return (SUMMARY_RESET_FAILURE_CODES as readonly string[]).includes(code)
+    || code === SUMMARY_REQUEST_FAILURE_CODE;
+}
+
 export function getSafeSummaryErrorMessage(code: string | undefined): string {
+  // An empty record is a state, not an error: it carries no failure copy.
+  if (isSummaryEmptyCode(code)) return "";
   if (code === "SUMMARY_FORBIDDEN") return "회의 요약을 볼 권한이 없습니다.";
   if (code === "SUMMARY_GENERATION_RETRYABLE_FAILED"
     || code === "SUMMARY_PROVIDER_RATE_LIMITED"
@@ -68,13 +94,20 @@ export function useHostSummaryLifecycle(endedSession: EndedSessionReference | nu
         setPollingState("polling");
         return true;
       }
+      if (isSummaryEmptyCode(payload.code)) {
+        setSummary(null);
+        setSummaryError("");
+        setSummaryFailureCode(payload.code ?? "");
+        setPollingState("idle");
+        return false;
+      }
       setSummaryError(getSafeSummaryErrorMessage(payload.code));
       setSummaryFailureCode(payload.code ?? "");
       setPollingState(payload.code === "SUMMARY_GENERATION_EXHAUSTED" ? "exhausted" : "failed");
       return false;
     } catch {
       setSummaryError(getSafeSummaryErrorMessage(undefined));
-      setSummaryFailureCode("");
+      setSummaryFailureCode(SUMMARY_REQUEST_FAILURE_CODE);
       setPollingState("failed");
       return false;
     }
@@ -109,13 +142,16 @@ export function useHostSummaryLifecycle(endedSession: EndedSessionReference | nu
 
   const retrySummary = useCallback(async () => {
     const language = endedSession?.languages[0];
-    if (retryRef.current || !endedSession || !language || summaryFailureCode !== "SUMMARY_GENERATION_RETRYABLE_FAILED") return;
+    if (retryRef.current || !endedSession || !language || !shouldResetSummaryGeneration(summaryFailureCode)) return;
     retryRef.current = true;
     setIsRetrying(true);
     setSummaryError("");
     try {
       const response = await fetch(`/api/live-sessions/${endedSession.id}/summary`, {
-        method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ language }),
+        // `reset` is what makes an exhausted or permanent job claimable again;
+        // for a merely retryable job the server reset is a no-op and the claim
+        // reclaims the expired lease exactly as before.
+        method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ language, reset: true }),
       });
       const payload = await response.json() as ApiResponse<unknown>;
       if (!payload.ok) {
@@ -129,7 +165,7 @@ export function useHostSummaryLifecycle(endedSession: EndedSessionReference | nu
       setPollingStartedAt(Date.now());
       setPollingRound((round) => round + 1);
     } catch {
-      setSummaryFailureCode("");
+      setSummaryFailureCode(SUMMARY_REQUEST_FAILURE_CODE);
       setPollingState("failed");
       setSummaryError(getSafeSummaryErrorMessage(undefined));
     } finally {
@@ -138,8 +174,10 @@ export function useHostSummaryLifecycle(endedSession: EndedSessionReference | nu
     }
   }, [endedSession, summaryFailureCode]);
 
+  const isSummaryEmpty = isSummaryEmptyCode(summaryFailureCode);
+
   useEffect(() => {
-    if (!endedSession || summary) return;
+    if (!endedSession || summary || isSummaryEmpty) return;
     let isDisposed = false;
     let stopPolling = () => {};
     setPollingState("polling");
@@ -149,16 +187,16 @@ export function useHostSummaryLifecycle(endedSession: EndedSessionReference | nu
       stopPolling = startSummaryPollLoop({
         poll: loadSummary,
         onExhausted: () => { setPollingState("exhausted"); setSummaryFailureCode("SUMMARY_GENERATION_EXHAUSTED"); setSummaryError(""); },
-        onError: () => { setPollingState("failed"); setSummaryFailureCode(""); setSummaryError(getSafeSummaryErrorMessage(undefined)); },
+        onError: () => { setPollingState("failed"); setSummaryFailureCode(SUMMARY_REQUEST_FAILURE_CODE); setSummaryError(getSafeSummaryErrorMessage(undefined)); },
       });
     });
     return () => { isDisposed = true; stopPolling(); };
-  }, [endedSession, summary, pollingRound, loadSummary]);
+  }, [endedSession, summary, isSummaryEmpty, pollingRound, loadSummary]);
 
   useEffect(() => { if (endedSession) void loadTranscript(); }, [endedSession, loadTranscript]);
 
   const retry = useCallback(() => {
-    if (summaryFailureCode === "SUMMARY_GENERATION_RETRYABLE_FAILED") void retrySummary();
+    if (shouldResetSummaryGeneration(summaryFailureCode)) void retrySummary();
     else setPollingRound((round) => round + 1);
     void loadTranscript();
   }, [loadTranscript, retrySummary, summaryFailureCode]);
@@ -168,6 +206,6 @@ export function useHostSummaryLifecycle(endedSession: EndedSessionReference | nu
     setTranscript([]); setTopics([]); setIsTranscriptLoaded(false); setTranscriptError("");
   }, []);
 
-  return { summary, summaryError, summaryFailureCode, pollingState, pollingStartedAt, transcript, topics,
+  return { summary, summaryError, summaryFailureCode, isSummaryEmpty, pollingState, pollingStartedAt, transcript, topics,
     isTranscriptLoaded, transcriptError, isRetrying, retry, reset };
 }

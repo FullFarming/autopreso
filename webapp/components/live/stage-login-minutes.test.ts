@@ -7,6 +7,7 @@ import { test } from "node:test";
 const stage = readFileSync(resolve(process.cwd(), "components/live/LiveStageView.tsx"), "utf8");
 const login = readFileSync(resolve(process.cwd(), "app/(login)/login/page.tsx"), "utf8");
 const minutes = readFileSync(resolve(process.cwd(), "components/live/MeetingMinutes.tsx"), "utf8");
+const summarySkeleton = readFileSync(resolve(process.cwd(), "components/live/SummarySkeleton.tsx"), "utf8");
 const controls = readFileSync(resolve(process.cwd(), "components/ui/FormControls.tsx"), "utf8");
 const controlStyles = readFileSync(resolve(process.cwd(), "components/ui/form-controls.module.css"), "utf8");
 const layout = readFileSync(resolve(process.cwd(), "app/layout.tsx"), "utf8");
@@ -115,7 +116,9 @@ test("minutes use the shared bounded reading surface and explicit states", () =>
   assert.match(minutes, /GroundedPostCallIndex/u);
   assert.match(minutes, /MeetingTopicChapters/u);
   assert.match(minutes, /RecapStatePanel/u);
-  assert.match(minutes, /role="status" aria-live="polite"/u);
+  // The generating state lives in SummarySkeleton; it keeps the live region.
+  assert.match(minutes, /<SummarySkeleton/u);
+  assert.match(summarySkeleton, /role="status" aria-live="polite"/u);
   assert.match(minutes, /role="alert"/u);
   assert.match(styles, /\.live-minutes-reading\s*\{[^}]*max-width:\s*920px/su);
   assert.ok(minutes.split("\n").length < 200, "MeetingMinutes must remain a focused component surface");

@@ -846,9 +846,10 @@ test("viewer lifecycle never combines waiting and live, and announces the host-e
 });
 
 test("ended minutes keep one accessible loading state across polling gaps and stop with retry", async () => {
-  const [viewer, minutes, css] = await Promise.all([
+  const [viewer, minutes, skeleton, css] = await Promise.all([
     read("webapp/components/live/LiveViewer.tsx"),
     read("webapp/components/live/MeetingMinutes.tsx"),
+    read("webapp/components/live/SummarySkeleton.tsx"),
     read("webapp/app/globals.css"),
   ]);
 
@@ -859,15 +860,19 @@ test("ended minutes keep one accessible loading state across polling gaps and st
   assert.match(viewer, /isLoading=\{isMinutesLoading \|\| minutesPollingState === "polling"\}/u);
   assert.match(viewer, /<ParticipantMeetingMinutes/u);
   assert.match(minutes, /<RecapStatePanel isBusy=\{isSummaryPolling\}>/u);
-  assert.match(minutes, /role="status" aria-live="polite"/u);
-  assert.match(minutes, /className="live-minutes-loading-dots"/u);
+  // The generating state is the summary-card skeleton; it owns the live region.
+  assert.match(minutes, /<SummarySkeleton/u);
+  assert.match(skeleton, /role="status" aria-live="polite"/u);
+  assert.match(skeleton, /className="live-summary-skeleton" aria-hidden="true"/u);
+  assert.doesNotMatch(minutes, /live-minutes-loading-dots/u);
   assert.match(minutes, /formatElapsedTime/u);
   assert.doesNotMatch(minutes, /ETA|remaining|about \d/u);
   assert.match(minutes, /회의 요약 생성이 예상보다 오래 걸리고 있습니다\./u);
-  assert.match(minutes, /"다시 시도"/u);
+  assert.match(minutes, /"다시 생성"/u);
+  assert.match(minutes, /기록된 발언이 없어 요약을 만들 수 없습니다\./u);
   assert.match(css, /\.live-minutes-elapsed \{[^}]*font-variant-numeric:\s*tabular-nums/s);
-  assert.match(css, /@keyframes live-minutes-dot/u);
-  assert.match(css, /prefers-reduced-motion: reduce[\s\S]*\.live-minutes-loading-dots i[\s\S]*animation: none/u);
+  assert.match(css, /@keyframes live-summary-shimmer/u);
+  assert.match(css, /prefers-reduced-motion: reduce[\s\S]*\.live-summary-skeleton span::after[\s\S]*animation: none/u);
 });
 
 test("host and shared viewer minutes expose the same automatic summary states without regeneration UI", async () => {
@@ -883,7 +888,9 @@ test("host and shared viewer minutes expose the same automatic summary states wi
   assert.match(dashboard, /<MeetingMinutes/u);
   assert.match(dashboard, /minutesPollingState=\{hostSummaryPollingState\}/u);
   assert.match(dashboard, /minutesPollingStartedAt=\{hostSummaryPollingStartedAt\}/u);
-  assert.match(hostSummaryLifecycle, /summaryFailureCode !== "SUMMARY_GENERATION_RETRYABLE_FAILED"/u);
+  // Every failure class polling cannot clear may issue one reset-and-claim POST.
+  assert.match(hostSummaryLifecycle, /!shouldResetSummaryGeneration\(summaryFailureCode\)/u);
+  assert.match(hostSummaryLifecycle, /export const SUMMARY_RESET_FAILURE_CODES/u);
   assert.doesNotMatch(dashboard, /Create summary again|Create AI summary|generateSummaries/u);
 
   assert.match(viewer, /startSummaryPollLoop/u);

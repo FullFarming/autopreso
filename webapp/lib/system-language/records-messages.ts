@@ -177,6 +177,8 @@ const rows = [
   ["확인 중…", "Checking…", "確認中…"],
   ["전체 자막을 불러오지 못했습니다. 다시 확인해 주세요.", "Could not load the full transcript. Try again.", "すべての字幕を読み込めませんでした。もう一度お試しください。"],
   ["다시 확인", "Check again", "再確認"],
+  ["다시 생성", "Generate again", "再生成"],
+  ["기록된 발언이 없어 요약을 만들 수 없습니다.", "There is no recorded speech, so no summary can be created.", "記録された発言がないため、要約を作成できません。"],
   ["분류되지 않은 자막", "Uncategorized captions", "未分類の字幕"],
   ["표시할 자막이 없습니다.", "No captions to display.", "表示できる字幕がありません。"],
   ["전체 자막을 불러오는 중…", "Loading the full transcript…", "すべての字幕を読み込み中…"],

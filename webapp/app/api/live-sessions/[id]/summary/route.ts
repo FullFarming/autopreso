@@ -13,6 +13,7 @@ import {
   generateMeetingSummary,
   readMeetingSummary,
   readMeetingSummaryGenerationStatus,
+  resetMeetingSummaryGeneration,
   SummaryError,
   withSummaryReadDeadline,
 } from "@/lib/live/summary";
@@ -68,12 +69,18 @@ export async function POST(request: NextRequest, context: { params: Promise<{ id
     }
     await enforceSummaryGenerationRateLimit(hostId, sessionId, store);
     const body = await readBoundedJsonBody(request);
+    const isRecordBody = Boolean(body) && typeof body === "object" && !Array.isArray(body);
     const language = parseLanguage(
-      body && typeof body === "object" && !Array.isArray(body) && typeof (body as { language?: unknown }).language === "string"
+      isRecordBody && typeof (body as { language?: unknown }).language === "string"
         ? (body as { language: string }).language
         : null,
     );
     if (!language) return summaryError("요약할 언어를 선택하세요.", "LANGUAGE_REQUIRED", 400);
+    // Host recovery: an exhausted or permanently failed job is unreachable by
+    // any claim, so the owning host may clear it once before claiming. The RPC
+    // re-verifies ownership itself and reports false when nothing was stuck.
+    const shouldReset = isRecordBody && (body as { reset?: unknown }).reset === true;
+    if (shouldReset) await resetMeetingSummaryGeneration(sessionId, language, hostId);
     const claim = await claimMeetingSummaryGeneration(sessionId, language);
     if (claim.status === "ready") {
       const record = await withSummaryReadDeadline((signal) => readMeetingSummary(sessionId, language, fetch, { signal }));
@@ -102,8 +109,10 @@ export async function POST(request: NextRequest, context: { params: Promise<{ id
         fetchMeetingSessionContext(sessionId, { signal }),
       ]));
       if (utterances.length === 0) {
+        // Nothing was said: the job records NO_UTTERANCES (DB contract) but the
+        // client is told this is an empty record, not a failure to retry.
         await failMeetingSummaryGeneration(sessionId, language, claim.generationToken, "NO_UTTERANCES");
-        return summaryError("요약할 발언 기록이 없습니다.", "NO_UTTERANCES", 404);
+        return summaryError("기록된 발언이 없어 요약을 만들 수 없습니다.", "SUMMARY_NO_UTTERANCES", 404);
       }
       const participantById = new Map(participants.map((participant) => [participant.participantId, participant]));
       const attributedUtterances = utterances.map((utterance) => {
@@ -184,6 +193,9 @@ export async function GET(request: NextRequest, context: { params: Promise<{ id:
       }
       if (generation.status === "permanent_failed") {
         return summaryError("요약을 생성할 수 없습니다.", "SUMMARY_GENERATION_PERMANENT_FAILED", 409);
+      }
+      if (generation.status === "empty") {
+        return summaryError("기록된 발언이 없어 요약을 만들 수 없습니다.", "SUMMARY_NO_UTTERANCES", 404);
       }
       return summaryError("아직 요약이 준비되지 않았습니다.", "SUMMARY_NOT_READY", 404);
     }

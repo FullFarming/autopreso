@@ -964,14 +964,18 @@ input:focus-visible {
 .live-recap-state button { min-height: 44px; border: 1px solid var(--nova-hairline-strong); border-radius: var(--nova-r-pill); background: transparent; color: var(--nova-text); padding: 0 16px; font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
 .live-recap-state button:focus-visible,
 .live-summary-actions button:focus-visible { outline: 2px solid var(--nova-system-default); outline-offset: 2px; }
-.live-minutes-loading { display: grid; grid-template-columns: auto 1fr; align-items: center; gap: 5px 12px; min-height: 52px; }
+.live-minutes-loading { display: grid; gap: 6px; justify-items: stretch; width: 100%; min-height: 52px; }
 .live-minutes-loading strong { color: var(--nova-text); font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
-.live-minutes-loading-dots { display: inline-flex; grid-row: 1 / span 2; width: 44px; height: 44px; align-items: center; justify-content: center; gap: 4px; }
-.live-minutes-loading-dots i { width: 5px; height: 5px; border-radius: var(--nova-r-pill); background: var(--nova-text); animation: live-minutes-dot 900ms ease-in-out infinite alternate; }
-.live-minutes-loading-dots i:nth-child(2) { animation-delay: 150ms; }
-.live-minutes-loading-dots i:nth-child(3) { animation-delay: 300ms; }
 .live-minutes-elapsed { color: var(--nova-text-muted); font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); font-variant-numeric: tabular-nums; }
-@keyframes live-minutes-dot { from { opacity: .3; transform: translateY(2px); } to { opacity: 1; transform: translateY(-2px); } }
+/* Skeleton of the summary card that is coming: title, overview, chapters. */
+.live-summary-skeleton { display: grid; gap: 10px; margin-top: 6px; border: 1px solid var(--nova-surface-hairline); border-radius: var(--nova-r-md); background: var(--nova-surface-layered); padding: 16px; }
+.live-summary-skeleton span { position: relative; display: block; overflow: hidden; height: 12px; border-radius: var(--nova-r-pill); background: var(--nova-surface-hairline); }
+.live-summary-skeleton .live-summary-skeleton-title { height: 18px; width: 52%; }
+.live-summary-skeleton .live-summary-skeleton-line.is-full { width: 100%; }
+.live-summary-skeleton .live-summary-skeleton-line.is-short { width: 78%; }
+.live-summary-skeleton .live-summary-skeleton-chapter { height: 10px; width: 64%; }
+.live-summary-skeleton span::after { content: ""; position: absolute; inset: 0; background: linear-gradient(90deg, transparent, var(--nova-hairline-strong), transparent); animation: live-summary-shimmer 1200ms ease-in-out infinite; }
+@keyframes live-summary-shimmer { from { transform: translateX(-100%); opacity: .35; } 50% { opacity: 1; } to { transform: translateX(100%); opacity: .35; } }
 .live-minutes-record { display: grid; gap: 16px; }
 .live-minutes-record article { border-bottom: 1px solid var(--nova-surface-hairline); padding-bottom: 14px; }
 .live-minutes-record article header { display: flex; align-items: baseline; gap: 8px; margin-bottom: 6px; color: var(--nova-fg-secondary); font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
@@ -1288,7 +1292,9 @@ input:focus-visible {
 @media (prefers-reduced-motion: reduce) {
   .live-stage-cover, .live-stage-access { transition: none; }
   .live-end-label, .live-stage-state.is-ended { animation: none; opacity: 1; }
-  .live-stage-loader i, .live-minutes-loading-dots i { animation: none; opacity: .65; transform: none; }
+  .live-stage-loader i { animation: none; opacity: .65; transform: none; }
+  /* Static bars: the skeleton still shows the shape, it just stops moving. */
+  .live-summary-skeleton span::after { animation: none; opacity: 0; }
 }
 
 /* Compact-mode touch targets: every tappable control is at least 44px tall. */

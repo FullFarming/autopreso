@@ -91,7 +91,7 @@ import {
   type ViewerState,
 } from "./viewer-controller-contract";
 import { useViewerRecovery } from "./useViewerRecovery";
-import { getSafeSummaryErrorMessage, getSafeTranscriptErrorMessage } from "./useHostSummaryLifecycle";
+import { getSafeSummaryErrorMessage, getSafeTranscriptErrorMessage, isSummaryEmptyCode } from "./useHostSummaryLifecycle";
 import {
   connectViewerGatewayOnce,
   createViewerGatewayConnectionGate,
@@ -374,6 +374,8 @@ export default function LiveViewer({ compact = false }: { compact?: boolean }) {
   const [minutesEvent, setMinutesEvent] = useState<EarningsEventPresentation | null>(null);
   const [isTranscriptLoaded, setIsTranscriptLoaded] = useState(false);
   const [summaryError, setSummaryError] = useState("");
+  // Nothing was said in this meeting: an empty record, never an error.
+  const [isSummaryEmpty, setIsSummaryEmpty] = useState(false);
   const [transcriptError, setTranscriptError] = useState("");
   const [isMinutesLoading, setIsMinutesLoading] = useState(false);
   const [minutesPollingState, setMinutesPollingState] = useState<SummaryPollingState>("idle");
@@ -584,11 +586,18 @@ export default function LiveViewer({ compact = false }: { compact?: boolean }) {
       if (summaryResult?.ok) {
         setSummaryRecord(summaryResult.value);
         setSummaryError("");
+        setIsSummaryEmpty(false);
       } else if (summaryResult && summaryResult.error instanceof ApiRequestError
         && summaryResult.error.code === "SUMMARY_NOT_READY") {
         setSummaryRecord(null);
         setSummaryError("");
+        setIsSummaryEmpty(false);
         shouldContinuePolling = true;
+      } else if (summaryResult && summaryResult.error instanceof ApiRequestError
+        && isSummaryEmptyCode(summaryResult.error.code)) {
+        setSummaryRecord(null);
+        setSummaryError("");
+        setIsSummaryEmpty(true);
       } else if (summaryResult) {
         setSummaryRecord(null);
         setSummaryError(getSafeSummaryErrorMessage(
@@ -625,7 +634,7 @@ export default function LiveViewer({ compact = false }: { compact?: boolean }) {
   // cadence (2s → 20s plus up to 25% jitter, capped at 25s).
   useEffect(() => {
     if (!isSessionEnded || isRecordsExpired) return;
-    if (summaryRecord && isTranscriptLoaded) {
+    if ((summaryRecord || isSummaryEmpty) && isTranscriptLoaded) {
       setMinutesPollingState("idle");
       return;
     }
@@ -637,7 +646,7 @@ export default function LiveViewer({ compact = false }: { compact?: boolean }) {
     setMinutesPollingStartedAt((startedAt) => startedAt ?? Date.now());
     return startSummaryPollLoop({
       poll: () => {
-        const missingResource = summaryRecord ? "transcript" : isTranscriptLoaded ? "summary" : "both";
+        const missingResource = summaryRecord || isSummaryEmpty ? "transcript" : isTranscriptLoaded ? "summary" : "both";
         return loadMinutes(languageRef.current, missingResource);
       },
       onExhausted: () => setMinutesPollingState("exhausted"),
@@ -646,7 +655,7 @@ export default function LiveViewer({ compact = false }: { compact?: boolean }) {
         setSummaryError(getSafeSummaryErrorMessage(undefined));
       },
     });
-  }, [isSessionEnded, isRecordsExpired, isTranscriptLoaded, loadMinutes, minutesPollingRound, summaryError, summaryRecord]);
+  }, [isSessionEnded, isRecordsExpired, isSummaryEmpty, isTranscriptLoaded, loadMinutes, minutesPollingRound, summaryError, summaryRecord]);
 
   // 호스트가 라이브를 종료하면 뷰어는 에러가 아니라 회의록 화면으로 전환합니다.
   markSessionEndedRef.current = () => {
@@ -2099,6 +2108,7 @@ export default function LiveViewer({ compact = false }: { compact?: boolean }) {
           <ParticipantMeetingMinutes sessionId={viewer.session.id} email={viewer.self.email}
             summary={summaryRecord?.summary ?? null} transcript={transcript} topics={transcriptTopics} recordingGaps={recordingGaps}
             isTranscriptLoaded={isTranscriptLoaded} summaryError={summaryError} transcriptError={transcriptError}
+            isSummaryEmpty={isSummaryEmpty}
             isLoading={isMinutesLoading || minutesPollingState === "polling"} isExpired={isRecordsExpired}
             onRetry={() => {
               setSummaryError(""); setTranscriptError(""); setMinutesPollingState("polling");

@@ -334,6 +334,7 @@ export default function LiveHostDashboard() {
   const {
     summary: hostSummary,
     summaryError: hostSummaryError,
+    isSummaryEmpty: isHostSummaryEmpty,
     pollingState: hostSummaryPollingState,
     pollingStartedAt: hostSummaryPollingStartedAt,
     transcript: hostTranscript,
@@ -1805,6 +1806,7 @@ export default function LiveHostDashboard() {
             summaryError={hostSummaryError}
             transcriptError={hostTranscriptError}
             isLoading={isHostSummaryRetrying}
+            isSummaryEmpty={isHostSummaryEmpty}
             minutesPollingState={hostSummaryPollingState}
             minutesPollingStartedAt={hostSummaryPollingStartedAt}
             onRetry={retryHostSummary}

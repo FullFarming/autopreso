@@ -269,3 +269,47 @@ test("session end route attaches summary lifecycle with Next after instead of a 
   assert.doesNotMatch(source, /console\.error\([^;]*,\s*summaryError/u);
   assert.match(source, /console\.error\(`live post-session summary scheduling failed \$\{safeSummarySchedulingCode\(summaryError\)\}`\)/u);
 });
+
+test("a session with no recorded speech ends as an empty record, never as a generation failure", async () => {
+  let generationCalls = 0;
+  const failures: string[] = [];
+  const outcome = await generateSummaryForLanguage(sessionId, "host-1", "ko", {
+    claim: async () => ({ status: "claimed", generationToken: "token-1" }),
+    fetchUtterances: async () => [],
+    fetchTopicTranscript: async () => topicSnapshot,
+    fetchSessionContext: async () => ({ title: "Silent", companyName: null, ticker: null, fiscalPeriod: null, eventType: null, agenda: [] }),
+    buildRoster: async () => [],
+    generate: async () => { generationCalls += 1; throw new Error("Gemini must not run"); },
+    fail: async (_session, _language, _token, code) => { failures.push(code); return true; },
+  });
+  assert.equal(outcome.status, "empty");
+  assert.equal(generationCalls, 0);
+  // The DB contract is unchanged: the job is still recorded as NO_UTTERANCES.
+  assert.deepEqual(failures, ["NO_UTTERANCES"]);
+
+  const summaries = await generateSessionSummariesAfterEnd(sessionId, "host-1", ["ko", "en"], {
+    generateForLanguage: async () => ({ status: "empty" as const }),
+  });
+  assert.deepEqual(summaries, { saved: [], ready: [], running: [], empty: ["ko", "en"], failed: [] });
+});
+
+test("the summary API presents an empty record as an empty state and keeps generic failures recoverable", async () => {
+  const source = await readFile(new URL("../../app/api/live-sessions/[id]/summary/route.ts", import.meta.url), "utf8");
+  assert.match(source, /generation\.status === "empty"[\s\S]{0,200}"SUMMARY_NO_UTTERANCES", 404/u);
+  assert.match(source, /기록된 발언이 없어 요약을 만들 수 없습니다\./u);
+  assert.match(source, /"SUMMARY_NO_UTTERANCES", 404/u);
+  // A host-authenticated reset is the only way to clear a dead job, and it
+  // stays behind the existing per-host-session rate limit.
+  const post = source.slice(source.indexOf("export async function POST"), source.indexOf("export async function GET"));
+  assert.match(post, /resetMeetingSummaryGeneration\(sessionId, language, hostId\)/u);
+  assert.ok(post.indexOf("enforceSummaryGenerationRateLimit") < post.indexOf("resetMeetingSummaryGeneration"),
+    "the reset must never run before the summary generation rate limit");
+  assert.ok(post.indexOf("resetMeetingSummaryGeneration") < post.indexOf("claimMeetingSummaryGeneration(sessionId, language)"),
+    "a reset only makes the job claimable; the claim still decides what happens");
+  assert.ok(post.indexOf("assertHostSessionOwnership") < post.indexOf("resetMeetingSummaryGeneration"),
+    "only the verified owning host may reset a job");
+  assert.match(source, /const shouldReset = [\s\S]{0,200}reset === true/u,
+    "only an explicit boolean true may reset a job");
+  const migration = await readFile(new URL("../../../supabase/migrations/202609020001_live_summary_generic_failure_retry.sql", import.meta.url), "utf8");
+  assert.match(migration, /'SUMMARY_FAILED',\s*\n\s*'SUMMARY_READY_MISSING',\s*\n\s*'SUMMARY_COMPLETE_FAILED'/u);
+});

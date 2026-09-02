@@ -14,6 +14,9 @@ import {
   parseMeetingSummary,
   readMeetingSummary,
   readMeetingSummaryGenerationStatus,
+  resetMeetingSummaryGeneration,
+  SUMMARY_ATTEMPT_TIMEOUT_MILLISECONDS,
+  SUMMARY_TOTAL_DEADLINE_MILLISECONDS,
   SummaryError,
   type MeetingSummaryInput,
   type MeetingUtterance,
@@ -751,12 +754,15 @@ test("summary config fails fast when configured numeric limits are invalid", () 
   }
 });
 
-test("Gemini recap errors are classified once without retry", async () => {
+// Availability failures earn exactly one alternate-model attempt (see the
+// model fallback chain); output failures stay single-attempt because another
+// model cannot make a deterministic parse or truncation problem go away.
+test("Gemini recap errors are classified once per attempt with one bounded alternate model", async () => {
   const cases = [
-    { output: () => { throw new SummaryError("limit", "SUMMARY_PROVIDER_RATE_LIMITED", 429); }, code: "SUMMARY_PROVIDER_RATE_LIMITED" },
-    { output: () => { throw new SummaryError("down", "SUMMARY_PROVIDER_UNAVAILABLE", 502); }, code: "SUMMARY_PROVIDER_UNAVAILABLE" },
-    { output: () => ({ text: "" }), code: "SUMMARY_INCOMPLETE" },
-    { output: () => ({ text: "not json" }), code: "SUMMARY_PARSE_FAILED" },
+    { output: () => { throw new SummaryError("limit", "SUMMARY_PROVIDER_RATE_LIMITED", 429); }, code: "SUMMARY_PROVIDER_RATE_LIMITED", calls: 2 },
+    { output: () => { throw new SummaryError("down", "SUMMARY_PROVIDER_UNAVAILABLE", 502); }, code: "SUMMARY_PROVIDER_UNAVAILABLE", calls: 2 },
+    { output: () => ({ text: "" }), code: "SUMMARY_INCOMPLETE", calls: 1 },
+    { output: () => ({ text: "not json" }), code: "SUMMARY_PARSE_FAILED", calls: 1 },
   ] as const;
   for (const entry of cases) {
     let calls = 0;
@@ -769,7 +775,7 @@ test("Gemini recap errors are classified once without retry", async () => {
       }, { apiKey: "gemini-key", model: "gemini-3.7-flash", maxOutputTokens: 4_000, timeoutMilliseconds: 45_000 }),
       (error: unknown) => error instanceof SummaryError && error.code === entry.code,
     );
-    assert.equal(calls, 1);
+    assert.equal(calls, entry.calls);
   }
 });
 
@@ -817,7 +823,7 @@ test("Gemini recap output redacts hostile string leaves before persistence", asy
   assert.match(serialized, /\[EMAIL\]|\[UUID\]|\[TOKEN\]|\[GRANT\]|\[CODE\]/u);
 });
 
-test("Gemini recap timeout aborts once and is not retried", async () => {
+test("Gemini recap timeout aborts every attempt and spends exactly one alternate model", async () => {
   let calls = 0;
   await assert.rejects(
     generateMeetingSummary(summaryInput, "en", {
@@ -830,10 +836,10 @@ test("Gemini recap timeout aborts once and is not retried", async () => {
     }, { apiKey: "gemini-key", model: "gemini-3.7-flash", maxOutputTokens: 4_000, timeoutMilliseconds: 5 }),
     (error: unknown) => error instanceof SummaryError && error.code === "SUMMARY_TIMEOUT",
   );
-  assert.equal(calls, 1);
+  assert.equal(calls, 2, "one 20s-bounded attempt per model, and never a third");
 });
 
-test("Gemini recap timeout remains active while provider resolves late", async () => {
+test("Gemini recap timeout stays authoritative for each attempt while the provider resolves late", async () => {
   let calls = 0;
   await assert.rejects(
     generateMeetingSummary(summaryInput, "en", {
@@ -846,7 +852,7 @@ test("Gemini recap timeout remains active while provider resolves late", async (
     }, { apiKey: "gemini-key", model: "gemini-3.7-flash", maxOutputTokens: 4_000, timeoutMilliseconds: 5 }),
     (error: unknown) => error instanceof SummaryError && error.code === "SUMMARY_TIMEOUT",
   );
-  assert.equal(calls, 1);
+  assert.equal(calls, 2, "one 20s-bounded attempt per model, and never a third");
 });
 
 test("summary config rejects OpenAI-only configuration", () => {
@@ -1202,5 +1208,120 @@ test("summary read fetches are cancellable and use the bounded topic context RPC
     assert.match(topicRequests[0]?.url ?? "", /\/rest\/v1\/rpc\/read_live_topic_context/u);
     assert.deepEqual(topicRequests[0]?.body, { p_session_id: "session-1", p_language: "ko" });
     assert.equal(topicRequests[0]?.signal, topicSignal.signal);
+  });
+});
+
+test("each summary attempt is bounded at 20s inside a 60s deadline and exactly one retry is spent", async () => {
+  assert.equal(SUMMARY_ATTEMPT_TIMEOUT_MILLISECONDS, 20_000);
+  assert.equal(SUMMARY_TOTAL_DEADLINE_MILLISECONDS, 60_000);
+  let attempts = 0;
+  const hangingGenerator = {
+    async generateContent(request: { signal: AbortSignal }) {
+      attempts += 1;
+      return new Promise<never>((_resolve, reject) => {
+        request.signal.addEventListener("abort", () => reject(request.signal.reason), { once: true });
+      });
+    },
+  };
+  // The configured ceiling still applies: the per-attempt bound is the smaller
+  // of the two, so a 20ms configuration exercises the same code path.
+  await assert.rejects(
+    generateMeetingSummary(summaryInput, "en", hangingGenerator, {
+      apiKey: "gemini-key", model: "gemini-3.7-flash", maxOutputTokens: 4_000, timeoutMilliseconds: 20,
+    }),
+    (error: unknown) => error instanceof SummaryError && error.code === "SUMMARY_TIMEOUT" && error.status === 504,
+  );
+  assert.equal(attempts, 2, "a timeout must spend exactly one bounded retry, never a third attempt");
+});
+
+test("only transient provider failures are retried, and the recorded model is the one that answered", async () => {
+  for (const transientCode of ["SUMMARY_TIMEOUT", "SUMMARY_PROVIDER_UNAVAILABLE", "SUMMARY_PROVIDER_RATE_LIMITED"] as const) {
+    let attempts = 0;
+    const generator = {
+      async generateContent() {
+        attempts += 1;
+        if (attempts === 1) throw new SummaryError("first attempt failed", transientCode, 502);
+        return { text: JSON.stringify(generatedSummary) };
+      },
+    };
+    const generated = await generateMeetingSummary(summaryInput, "en", generator, {
+      apiKey: "gemini-key", model: "gemini-3.7-flash", maxOutputTokens: 4_000, timeoutMilliseconds: 45_000,
+    });
+    assert.equal(attempts, 2);
+    assert.equal(generated.model, "gemini-3.7-flash");
+    assert.deepEqual(generated.summary, expectedGeneratedSummary);
+  }
+  for (const finalCode of ["SUMMARY_PARSE_FAILED", "SUMMARY_REFUSED", "SUMMARY_NOT_CONFIGURED"] as const) {
+    let attempts = 0;
+    const generator = {
+      async generateContent() {
+        attempts += 1;
+        throw new SummaryError("refused", finalCode, 502);
+      },
+    };
+    await assert.rejects(
+      generateMeetingSummary(summaryInput, "en", generator, {
+        apiKey: "gemini-key", model: "gemini-3.7-flash", maxOutputTokens: 4_000, timeoutMilliseconds: 45_000,
+      }),
+      (error: unknown) => error instanceof SummaryError && error.code === finalCode,
+    );
+    assert.equal(attempts, 1, `${finalCode} is deterministic and must never be retried`);
+  }
+});
+
+test("the bounded retry reaches the provider transport exactly twice and no further", async () => {
+  const previousFetch = globalThis.fetch;
+  const calls: string[] = [];
+  globalThis.fetch = async (input) => {
+    calls.push(String(input));
+    if (calls.length === 1) return new Response("upstream unavailable", { status: 503 });
+    return Response.json({ candidates: [{ finishReason: "STOP", content: { parts: [{ text: JSON.stringify(generatedSummary) }] } }] });
+  };
+  resetGeminiSummaryGeneratorCacheForTests();
+  try {
+    const generated = await generateMeetingSummary(summaryInput, "en", undefined, {
+      apiKey: "gemini-key", model: "gemini-3.7-flash", maxOutputTokens: 4_000, timeoutMilliseconds: 45_000,
+    });
+    // The recap transport pins the recap model, so the retry repeats it; the
+    // recorded model therefore always matches what was really requested.
+    assert.equal(generated.model, "gemini-3.7-flash");
+    assert.equal(calls.length, 2);
+    for (const call of calls) assert.match(call, /models\/gemini-3\.7-flash:generateContent/u);
+  } finally {
+    globalThis.fetch = previousFetch;
+    resetGeminiSummaryGeneratorCacheForTests();
+  }
+});
+
+test("an empty record is a first-class generation status, not a permanent failure", async () => {
+  await withSupabaseTestEnvironment(async () => {
+    const bodies: unknown[] = [];
+    const fetchFn: typeof fetch = async (_input, init) => {
+      bodies.push(JSON.parse(String(init?.body ?? "{}")));
+      return Response.json({ ok: true, status: "empty" });
+    };
+    const status = await readMeetingSummaryGenerationStatus("11111111-1111-4111-8111-111111111111", "ko", fetchFn);
+    assert.deepEqual(status, { status: "empty" });
+    assert.deepEqual(bodies, [{ p_session_id: "11111111-1111-4111-8111-111111111111", p_language: "ko" }]);
+  });
+});
+
+test("host summary reset targets the owned session lane and never invents a result", async () => {
+  await withSupabaseTestEnvironment(async () => {
+    const requests: Array<{ url: string; body: unknown }> = [];
+    const respond = (payload: unknown): typeof fetch => async (input, init) => {
+      requests.push({ url: String(input), body: JSON.parse(String(init?.body ?? "{}")) });
+      return Response.json(payload);
+    };
+    assert.equal(await resetMeetingSummaryGeneration("11111111-1111-4111-8111-111111111111", "ko", "host-owner", respond(true)), true);
+    assert.equal(await resetMeetingSummaryGeneration("11111111-1111-4111-8111-111111111111", "ko", "host-owner", respond(false)), false);
+    assert.match(requests[0]?.url ?? "", /\/rest\/v1\/rpc\/reset_live_summary_generation_v1$/u);
+    assert.deepEqual(requests[0]?.body, {
+      p_session_id: "11111111-1111-4111-8111-111111111111", p_language: "ko", p_host_id: "host-owner",
+    });
+    await assert.rejects(
+      resetMeetingSummaryGeneration("11111111-1111-4111-8111-111111111111", "ko", "host-owner", respond({ ok: true })),
+      (error: unknown) => error instanceof SummaryError && error.code === "SUMMARY_STATE_FAILED",
+    );
   });
 });

@@ -13,6 +13,7 @@ import type { MeetingSummary } from "@/lib/live/summary";
 import type { LiveTopicPublicMetadata } from "@/lib/live-contract";
 import { ReadingSurface } from "@/components/ui/FormControls";
 import MeetingSummaryCard from "./MeetingSummaryCard";
+import SummarySkeleton from "./SummarySkeleton";
 import { indexTopicCaptions, type TopicPresentation } from "./translation";
 import { MeetingTopicChapters, RecapStatePanel } from "./quality/MeetingTopicPresentation";
 import { EarningsCallHeader, GroundedPostCallIndex, hasEarningsContext, type EarningsEventPresentation } from "./earnings";
@@ -30,6 +31,7 @@ export default function MeetingMinutes({
   summaryError,
   transcriptError,
   isLoading,
+  isSummaryEmpty = false,
   minutesPollingState,
   minutesPollingStartedAt,
   onRetry,
@@ -45,6 +47,8 @@ export default function MeetingMinutes({
   summaryError: string;
   transcriptError: string;
   isLoading: boolean;
+  /** No speech was recorded: an empty record, not a generation failure. */
+  isSummaryEmpty?: boolean;
   minutesPollingState: SummaryPollingState;
   minutesPollingStartedAt: number | null;
   onRetry: () => void;
@@ -116,15 +120,14 @@ export default function MeetingMinutes({
           : (
             <RecapStatePanel isBusy={isSummaryPolling}>
               {isSummaryPolling ? (
-                <div className="live-minutes-loading" role="status" aria-live="polite">
-                  <span className="live-minutes-loading-dots" aria-hidden="true"><i /><i /><i /></span>
-                  <strong>{t("회의 요약을 만들고 있습니다")}</strong>
-                  <span className="live-minutes-elapsed">{t("경과 시간 {elapsed}", { elapsed: elapsedTime })}</span>
-                </div>
+                <SummarySkeleton label={t("회의 요약을 만들고 있습니다")}
+                  elapsedLabel={t("경과 시간 {elapsed}", { elapsed: elapsedTime })} />
+              ) : isSummaryEmpty ? (
+                <p className="live-minutes-empty">{t("기록된 발언이 없어 요약을 만들 수 없습니다.")}</p>
               ) : (
                 <>
                   <p role={summaryError ? "alert" : undefined}>{t(summaryError || "회의 요약 생성이 예상보다 오래 걸리고 있습니다.")}</p>
-                  <button type="button" disabled={isLoading} onClick={onRetry}>{t(isLoading ? "확인 중…" : "다시 시도")}</button>
+                  <button type="button" disabled={isLoading} onClick={onRetry}>{t(isLoading ? "확인 중…" : "다시 생성")}</button>
                 </>
               )}
             </RecapStatePanel>
