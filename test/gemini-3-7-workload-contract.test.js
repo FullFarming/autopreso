@@ -81,7 +81,7 @@ test("SDK runtime owns the exact workload thinking matrix, one-attempt policy, a
   });
   const signal = new AbortController().signal;
 
-  for (const workload of ["topic", "polish", "recap"]) {
+  for (const workload of ["topic", "translation", "polish", "recap"]) {
     await runtime.generateContent({
       sessionId: `contract-${workload}`,
       workload,
@@ -95,22 +95,22 @@ test("SDK runtime owns the exact workload thinking matrix, one-attempt policy, a
     apiKey: "server-only-key",
     httpOptions: { retryOptions: { attempts: 1 } },
   }]);
-  assert.equal(calls.length, 3);
-  for (const [index, workload] of ["topic", "polish", "recap"].entries()) {
-    assert.equal(calls[index].model, ["gemini-3.6-flash", TEXT_MODEL, "gemini-3.6-flash"][index]);
+  assert.equal(calls.length, 4);
+  for (const [index, workload] of ["topic", "translation", "polish", "recap"].entries()) {
+    assert.equal(calls[index].model, ["gemini-3.6-flash", TRANSLATION_MODEL, TEXT_MODEL, "gemini-3.6-flash"][index]);
     assert.equal(calls[index].config.abortSignal, signal);
     assert.deepEqual(calls[index].config.thinkingConfig, { thinkingLevel: THINKING_LEVELS[workload] });
     for (const deprecated of ["temperature", "topP", "topK", "candidateCount"]) {
       assert.equal(Object.hasOwn(calls[index].config, deprecated), false);
     }
   }
-  assert.equal(observations.length, 3);
+  assert.equal(observations.length, 4);
   for (const [index, observation] of observations.entries()) {
     assert.deepEqual(Object.keys(observation).sort(), [
       "code", "inputTokens", "latencyMilliseconds", "model", "outputTokens", "totalTokens", "usageKnown", "workload",
     ]);
-    assert.equal(observation.workload, ["topic", "polish", "recap"][index]);
-    assert.equal(observation.model, ["gemini-3.6-flash", TEXT_MODEL, "gemini-3.6-flash"][index]);
+    assert.equal(observation.workload, ["topic", "translation", "polish", "recap"][index]);
+    assert.equal(observation.model, ["gemini-3.6-flash", TRANSLATION_MODEL, TEXT_MODEL, "gemini-3.6-flash"][index]);
     assert.equal(observation.code, "OK");
     assert.equal(Number.isSafeInteger(observation.inputTokens), true);
     assert.equal(Number.isSafeInteger(observation.outputTokens), true);
@@ -121,13 +121,13 @@ test("SDK runtime owns the exact workload thinking matrix, one-attempt policy, a
   await assert.rejects(
     () => runtime.generateContent({
       sessionId: "caller-thinking",
-      workload: "polish",
+      workload: "translation",
       contents: [{ role: "user", parts: [{ text: "prompt" }] }],
       config: { thinkingConfig: { thinkingLevel: "low" } },
     }),
     /INVALID_GEMINI_GENERATION_CONFIG/u,
   );
-  assert.equal(calls.length, 3, "caller thinking overrides must fail before provider dispatch");
+  assert.equal(calls.length, 4, "caller thinking overrides must fail before provider dispatch");
 
   const unsafeUsageObservations = [];
   const unsafeUsageCalls = [];
@@ -149,7 +149,7 @@ test("SDK runtime owns the exact workload thinking matrix, one-attempt policy, a
   await assert.rejects(
     () => unsafeUsageRuntime.generateContent({
       sessionId: "unsafe-usage",
-      workload: "polish",
+      workload: "translation",
       contents: [{ role: "user", parts: [{ text: "prompt" }] }],
     }),
     /GEMINI_USAGE_INVALID/u,
@@ -157,8 +157,8 @@ test("SDK runtime owns the exact workload thinking matrix, one-attempt policy, a
   assert.equal(unsafeUsageCalls.length, 1);
   assert.equal(unsafeUsageObservations.length, 1);
   assert.deepEqual(unsafeUsageObservations[0], {
-    workload: "polish",
-    model: TEXT_MODEL,
+    workload: "translation",
+    model: TRANSLATION_MODEL,
     latencyMilliseconds: unsafeUsageObservations[0].latencyMilliseconds,
     inputTokens: 0,
     outputTokens: 0,
@@ -229,15 +229,15 @@ test("translation and polish keep exact deadlines, abort physical work, and neve
       },
     },
   };
-  const defaults = new GeminiTextTranslateAdapter({ client: hangingClient, model: TEXT_MODEL });
-  assert.equal(defaults.timeoutMilliseconds, 6_000);
-  assert.equal(defaults.timeoutMilliseconds, captionPolishContract.timeoutMilliseconds);
+  const defaults = new GeminiTextTranslateAdapter({ client: hangingClient, model: TRANSLATION_MODEL });
+  // Plan 2 aligns this to captionPolishContract.timeoutMilliseconds when the gateway adapter change lands.
+  assert.equal(defaults.timeoutMilliseconds, 3_500);
   assert.equal(defaults.partialTimeoutMilliseconds, 1_200);
   assert.equal(captionPolishContract.timeoutMilliseconds, 6_000);
 
   const translator = new GeminiTextTranslateAdapter({
     client: hangingClient,
-    model: TEXT_MODEL,
+    model: TRANSLATION_MODEL,
     timeoutMilliseconds: 15,
     partialTimeoutMilliseconds: 10,
   });
@@ -298,6 +298,6 @@ test("legacy REST translation never accepts a Live Translate model", () => {
   let calls = 0;
   const client = { models: { generateContent() { calls += 1; throw new Error("must not dispatch"); } } };
   assert.throws(() => new GeminiTextTranslateAdapter({ client, model: RETIRED_LIVE_TRANSLATE_MODEL }), /GEMINI_MODEL_OVERRIDE_FORBIDDEN/u);
-  assert.equal(new GeminiTextTranslateAdapter({ client }).model, TEXT_MODEL);
+  assert.equal(new GeminiTextTranslateAdapter({ client, model: TRANSLATION_MODEL }).model, TRANSLATION_MODEL);
   assert.equal(calls, 0);
 });

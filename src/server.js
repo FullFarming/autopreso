@@ -20,7 +20,7 @@ import { createMoonshineTranscription as createDefaultMoonshineTranscription } f
 import { createOpenAITranscription as createDefaultOpenAITranscription } from "./openai-transcription.js";
 import { audioSecondsFromBase64Pcm16 } from "./session-cost.js";
 import { DEFAULT_SUBTITLE_SETTINGS, validateAgentInstructions, validateSubtitleSettings } from "./settings-store.js";
-import { generateGeminiText, generateGeminiTextWithModelFallback } from "./gemini-text-generation.js";
+import { generateGeminiTextWithModelFallback } from "./gemini-text-generation.js";
 
 import { GLOSSARY_PRESETS } from "./glossary-presets.js";
 import { createSessionTranscripts } from "./session-transcripts.js";
