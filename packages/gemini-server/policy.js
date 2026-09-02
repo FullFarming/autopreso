@@ -23,13 +23,12 @@ export function resolveGeminiWorkloadModel(workload, value = undefined) {
 }
 export const GEMINI_WORKLOAD_THINKING_LEVELS = Object.freeze({
   glossaryExtraction: "medium",
-  source: "low",
   topic: "low",
   translation: "low",
   polish: "low",
   recap: "medium",
 });
-export const WORKLOAD_OUTPUT_CODEPOINTS = Object.freeze({ source: 8_000, topic: 2_000, translation: 4_000, polish: 4_000, recap: 16_000 });
+export const WORKLOAD_OUTPUT_CODEPOINTS = Object.freeze({ topic: 2_000, translation: 4_000, polish: 4_000, recap: 16_000 });
 const MAX_PROMPT_CODEPOINTS = 50_000;
 const MAX_SYSTEM_INSTRUCTION_CODEPOINTS = 10_000;
 const MAX_SCHEMA_CODEPOINTS = 20_000;
@@ -37,7 +36,7 @@ const MAX_SCHEMA_DEPTH = 8;
 const SAFE_GENERATION_ERROR_CODES = new Set([
   "GEMINI_GLOSSARY_OUTPUT_INVALID",
   "GEMINI_OUTPUT_INVALID", "GEMINI_OUTPUT_SCHEMA_INVALID", "GEMINI_OUTPUT_TOO_LARGE", "GEMINI_OUTPUT_UNSAFE",
-  "GEMINI_PROVIDER_REFUSAL", "GEMINI_PROVIDER_RATE_LIMITED", "GEMINI_RECAP_VALIDATION_FAILED", "GEMINI_USAGE_INVALID",
+  "GEMINI_PROVIDER_REFUSAL", "GEMINI_PROVIDER_RATE_LIMITED", "GEMINI_PROVIDER_UNAVAILABLE", "GEMINI_RECAP_VALIDATION_FAILED", "GEMINI_USAGE_INVALID",
 ]);
 
 export function validateSessionId(value) {
@@ -167,9 +166,14 @@ export function assertSafeOutputValue(value) {
   if (value !== null && typeof value !== "boolean" && !(typeof value === "number" && Number.isFinite(value))) throw new Error("GEMINI_OUTPUT_UNSAFE");
 }
 
+/** Provider HTTP status is the only detail that survives sanitization, and only
+ *  as one of two transient codes: callers may move to a fallback model on
+ *  RATE_LIMITED (429) or UNAVAILABLE (5xx); FAILED (4xx, network, unknown) is final. */
 export function safeErrorCode(error) {
   const message = error instanceof Error ? error.message : "";
-  if (error !== null && typeof error === "object" && error.status === 429) return "GEMINI_PROVIDER_RATE_LIMITED";
+  const status = error !== null && typeof error === "object" ? error.status : undefined;
+  if (status === 429) return "GEMINI_PROVIDER_RATE_LIMITED";
+  if (Number.isSafeInteger(status) && status >= 500 && status <= 599) return "GEMINI_PROVIDER_UNAVAILABLE";
   return SAFE_GENERATION_ERROR_CODES.has(message) ? message : "GEMINI_PROVIDER_FAILED";
 }
 

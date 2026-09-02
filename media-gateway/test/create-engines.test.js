@@ -54,3 +54,26 @@ test("an unknown engine selection fails closed before any adapter is built", () 
   assert.throws(() => createTextTranslate({ engine: forged, geminiRuntime: fakeRuntime, sessionId: "s1" }), /ENGINE_SELECTION_INVALID/u);
   assert.throws(() => assertEngineKeys(forged, { GEMINI_API_KEY: "fixture-key" }), /ENGINE_SELECTION_INVALID/u);
 });
+
+test("the soniox adapter never exposes the api key on a public property", () => {
+  const stt = createSpeechToText({ engine: soniox, liveClient: fakeLiveClient, sonioxApiKey: "fixture-key", languageCodes: [], compiledGlossary: null, translationLanguages: ["en", "ko"] });
+  assert.equal(JSON.stringify(stt).includes("fixture-key"), false);
+  assert.equal(Object.values(stt).includes("fixture-key"), false);
+});
+
+test("factory errors carry a machine code the gateway can map", () => {
+  const forged = { ...DEFAULT_ENGINE_SELECTION, stt: { provider: "gemini", model: "attacker-model", languageMode: "auto" } };
+  for (const run of [
+    () => createSpeechToText({ engine: forged, liveClient: fakeLiveClient, languageCodes: [] }),
+    () => createTextTranslate({ engine: forged, geminiRuntime: fakeRuntime, sessionId: "s1" }),
+    () => assertEngineKeys(forged, { GEMINI_API_KEY: "fixture-key" }),
+  ]) {
+    assert.throws(run, (error) => error instanceof Error && error.code === "ENGINE_SELECTION_INVALID" && error.message === "ENGINE_SELECTION_INVALID");
+  }
+  for (const run of [
+    () => assertEngineKeys(soniox, { GEMINI_API_KEY: "fixture-key" }),
+    () => createSpeechToText({ engine: soniox, liveClient: fakeLiveClient, sonioxApiKey: "", languageCodes: [], translationLanguages: ["en", "ko"] }),
+  ]) {
+    assert.throws(run, (error) => error instanceof Error && error.code === "ENGINE_KEY_MISSING" && error.message === "ENGINE_KEY_MISSING");
+  }
+});

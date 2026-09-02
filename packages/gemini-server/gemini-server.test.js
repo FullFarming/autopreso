@@ -433,3 +433,26 @@ test("REST translation is the two-stage text workload, bound to one catalog tran
   runtime.releaseSession("translation-fixture");
   runtime.releaseSession("translation-default");
 });
+
+test("provider HTTP failures map to safe transient codes: 429 rate limited, 5xx unavailable, everything else failed", async () => {
+  const statuses = [503, 500, 599, 429, 400, 404, undefined];
+  const expected = [
+    "GEMINI_PROVIDER_UNAVAILABLE", "GEMINI_PROVIDER_UNAVAILABLE", "GEMINI_PROVIDER_UNAVAILABLE",
+    "GEMINI_PROVIDER_RATE_LIMITED", "GEMINI_PROVIDER_FAILED", "GEMINI_PROVIDER_FAILED", "GEMINI_PROVIDER_FAILED",
+  ];
+  let index = 0;
+  const { FakeGoogleGenAI } = createFakeGoogleGenAI(async () => {
+    const status = statuses[index++];
+    throw status === undefined ? new Error("private network detail") : Object.assign(new Error("private provider body"), { status });
+  });
+  const observations = [];
+  const runtime = createGeminiServerRuntime({ GoogleGenAI: FakeGoogleGenAI, apiKey: "fixture", observe: (event) => observations.push(event) });
+  for (const [position, code] of expected.entries()) {
+    await assert.rejects(runtime.generateContent({
+      sessionId: `status-fixture-${position}`, workload: "translation",
+      contents: [{ role: "user", parts: [{ text: "Translate." }] }],
+    }), new RegExp(`^Error: ${code}$`, "u"));
+  }
+  assert.deepEqual(observations.map((event) => event.code), expected);
+  assert.equal(JSON.stringify(observations).includes("private"), false);
+});

@@ -8,7 +8,7 @@ import {
 } from "../packages/caption-core/index.js";
 import { evaluateGlossaryQuality } from "../packages/caption-core/glossary-quality-eval.js";
 import { CAPTION_ENGINE_CATALOG, DEFAULT_ENGINE_SELECTION, findEngineEntry } from "../packages/caption-core/caption-engine-catalog.js";
-import { GENERATE_WORKLOADS, resolveGeminiWorkloadModel } from "../packages/gemini-server/policy.js";
+import { GEMINI_WORKLOAD_THINKING_LEVELS, GENERATE_WORKLOADS, resolveGeminiWorkloadModel, WORKLOAD_OUTPUT_CODEPOINTS } from "../packages/gemini-server/policy.js";
 import {
   createGeminiPdfGlossaryExtractor,
   createGeminiServerRuntime,
@@ -84,6 +84,8 @@ test("workload matrix pins transcription to Transcribe Live and text roles to th
 test("the translation workload is restored and accepts exactly the catalog translation models", () => {
   assert.deepEqual([...GENERATE_WORKLOADS].sort(), [...REST_WORKLOADS].sort());
   assert.equal(GENERATE_WORKLOADS.has("source"), false, "the retired direct Live Translate path stays out of REST");
+  assert.deepEqual(Object.keys(GEMINI_WORKLOAD_THINKING_LEVELS).sort(), ["glossaryExtraction", "polish", "recap", "topic", "translation"]);
+  assert.deepEqual(Object.keys(WORKLOAD_OUTPUT_CODEPOINTS).sort(), ["polish", "recap", "topic", "translation"]);
   assert.equal(resolveGeminiWorkloadModel("translation"), TRANSLATION_MODEL);
   for (const entry of CAPTION_ENGINE_CATALOG.translation.filter((candidate) => candidate.provider === "gemini")) {
     assert.equal(resolveGeminiWorkloadModel("translation", entry.model), entry.model);
@@ -260,6 +262,7 @@ test("translation and polish keep exact deadlines, abort physical work, and neve
   assert.deepEqual(defaults.fallbackModels, [], "the adapter never invents a chain; the factory supplies it from the catalog");
   assert.equal(defaults.timeoutMilliseconds, 6_000);
   assert.equal(defaults.timeoutMilliseconds, captionPolishContract.timeoutMilliseconds);
+  assert.equal(defaults.attemptTimeoutMilliseconds, 2_800, "spec per-attempt cap inside the 6 s total");
   assert.equal(defaults.partialTimeoutMilliseconds, 1_200);
   assert.equal(captionPolishContract.timeoutMilliseconds, 6_000);
 

@@ -15,6 +15,10 @@ const DEFAULT_FINAL_TRANSLATION_TIMEOUT_MILLISECONDS = captionPolishContract.tim
  *  deadline is left; a shorter window would just bill an attempt that is
  *  guaranteed to time out. */
 const MINIMUM_FALLBACK_BUDGET_MILLISECONDS = 250;
+/** Spec per-attempt cap (2026-09-03 controller ruling): every model in the
+ *  chain gets at most this long inside the 6 s final budget, so a hung primary
+ *  still leaves the fallback time to answer instead of eating the whole deadline. */
+const DEFAULT_ATTEMPT_TIMEOUT_MILLISECONDS = 2_800;
 export class GeminiLiveTranscriptionAdapter {
   constructor({
     client,
@@ -408,10 +412,20 @@ function findMissingPortableNumericTokens(sourceText, translatedText) {
  *  to the next model in the catalog chain. Output-quality rejections and caller
  *  aborts are final for this utterance: a second model would not be "the same
  *  translation, later", it would be a different engine deciding the wording. */
+const TRANSIENT_TRANSLATE_CODES = new Set([
+  "GEMINI_TRANSLATE_TIMEOUT",
+  // Codes the session runtime (packages/gemini-server) substitutes for raw
+  // provider errors; GEMINI_PROVIDER_FAILED (4xx/network/unknown) is deliberately absent.
+  "GEMINI_PROVIDER_RATE_LIMITED",
+  "GEMINI_PROVIDER_UNAVAILABLE",
+]);
+
+const SAFE_TRANSLATE_CODE_PATTERN = /^(?:GEMINI|TRANSLATION)_[A-Z0-9_]{1,60}$/u;
+
 function isTransientTranslateFailure(error) {
   if (!(error instanceof Error)) return false;
-  if (error.message === "GEMINI_TRANSLATE_TIMEOUT") return true;
-  // @google/genai ApiError carries `status`; other transports use `code`.
+  if (TRANSIENT_TRANSLATE_CODES.has(error.message)) return true;
+  // A raw @google/genai ApiError carries `status`; other transports use `code`.
   const provider = /** @type {{status?: unknown, code?: unknown}} */ (/** @type {unknown} */ (error));
   for (const status of [provider.status, provider.code]) {
     if (typeof status === "number" && Number.isSafeInteger(status) && (status === 429 || (status >= 500 && status <= 599))) return true;
@@ -421,8 +435,9 @@ function isTransientTranslateFailure(error) {
 
 /** Meeting text translation is Gemini-only. The catalog gives each translation
  *  model a fallback chain; every model in the chain is tried at most once, only
- *  after a transient provider failure, and only inside the caller's remaining
- *  deadline. A different provider is never substituted. */
+ *  after a transient provider failure, each attempt capped at
+ *  `attemptTimeoutMilliseconds` (2.8 s) inside the final `timeoutMilliseconds`
+ *  (6 s) total. A different provider is never substituted. */
 export class GeminiTextTranslateAdapter {
   // Interims get a much tighter budget than finals (1.2s vs 6s). Partial
   // lanes translate one at a time and drop the intermediate transcripts
@@ -437,6 +452,7 @@ export class GeminiTextTranslateAdapter {
     fallbackClients = [],
     timeoutMilliseconds = DEFAULT_FINAL_TRANSLATION_TIMEOUT_MILLISECONDS,
     partialTimeoutMilliseconds = 1_200,
+    attemptTimeoutMilliseconds = DEFAULT_ATTEMPT_TIMEOUT_MILLISECONDS,
     now = Date.now,
   }) {
     if (!client?.models?.generateContent) throw new Error("GEMINI_TEXT_CLIENT_UNAVAILABLE");
@@ -449,7 +465,7 @@ export class GeminiTextTranslateAdapter {
       throw new Error("GEMINI_MODEL_OVERRIDE_FORBIDDEN");
     }
     if (fallbackClients.some((candidate) => !candidate?.models?.generateContent)) throw new Error("GEMINI_TEXT_CLIENT_UNAVAILABLE");
-    if (![timeoutMilliseconds, partialTimeoutMilliseconds].every((value) => Number.isFinite(value) && value > 0 && value <= 60_000)) {
+    if (![timeoutMilliseconds, partialTimeoutMilliseconds, attemptTimeoutMilliseconds].every((value) => Number.isFinite(value) && value > 0 && value <= 60_000)) {
       throw new Error("GEMINI_TRANSLATE_TIMEOUT_INVALID");
     }
     this.provider = "gemini";
@@ -459,13 +475,22 @@ export class GeminiTextTranslateAdapter {
     this.fallbackClients = Object.freeze([...fallbackClients]);
     this.timeoutMilliseconds = timeoutMilliseconds;
     this.partialTimeoutMilliseconds = partialTimeoutMilliseconds;
+    this.attemptTimeoutMilliseconds = attemptTimeoutMilliseconds;
     this.now = now;
   }
 
+  /** Pipeline contract: the translated string. */
   async translate(input) {
+    return (await this.translateWithProvenance(input)).text;
+  }
+
+  /** Same call, plus which catalog model actually produced the text, so
+   *  captions can record the producing model rather than the requested one. */
+  async translateWithProvenance(input) {
     const { intent, signal } = input;
     const budget = intent === "partial" ? this.partialTimeoutMilliseconds : this.timeoutMilliseconds;
-    const deadline = this.now() + budget;
+    const startedAt = this.now();
+    const deadline = startedAt + budget;
     const attempts = [
       { model: this.model, client: this.client },
       ...this.fallbackModels.map((model, index) => ({ model, client: this.fallbackClients[index] })),
@@ -475,10 +500,17 @@ export class GeminiTextTranslateAdapter {
       const remaining = index === 0 ? budget : deadline - this.now();
       if (index > 0 && remaining < MINIMUM_FALLBACK_BUDGET_MILLISECONDS) break;
       try {
-        return await this.#translateOnce(input, { ...attempt, timeoutMilliseconds: remaining });
+        const text = await this.#translateOnce(input, {
+          ...attempt, timeoutMilliseconds: Math.min(remaining, this.attemptTimeoutMilliseconds),
+        });
+        return { text, provider: "gemini", model: attempt.model, latencyMs: Math.max(0, this.now() - startedAt) };
       } catch (error) {
         lastError = error;
-        const code = safeProviderErrorIdentifier(error, "GEMINI_TRANSLATE_FAILED");
+        // The session runtime has already reduced provider errors to a safe
+        // token (GEMINI_PROVIDER_UNAVAILABLE, ...); log that token, never prose.
+        const code = SAFE_TRANSLATE_CODE_PATTERN.test(error?.message ?? "")
+          ? error.message
+          : safeProviderErrorIdentifier(error, "GEMINI_TRANSLATE_FAILED");
         const canFallBack = !signal?.aborted && isTransientTranslateFailure(error) && index < attempts.length - 1;
         console.warn(`[translate] gemini ${attempt.model} failed (${code}); ${canFallBack ? "trying the next catalog model once" : "no alternate provider is configured"}`);
         if (!canFallBack) break;

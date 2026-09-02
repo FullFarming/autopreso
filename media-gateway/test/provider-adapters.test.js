@@ -792,3 +792,69 @@ test("a fallback runs only inside the caller's remaining deadline, so a primary 
   assert.equal(value, "Revenue rose.");
   assert.ok(fallbackRequest.config.abortSignal instanceof AbortSignal);
 });
+
+test("translateWithProvenance names the model that actually produced the caption", async () => {
+  const primary = translateClient(() => { throw Object.assign(new Error("overloaded"), { status: 503 }); });
+  const fallback = translateClient(() => ({ text: "Revenue rose." }));
+  let clock = 0;
+  const adapter = new GeminiTextTranslateAdapter({
+    client: primary, model: "gemini-3.6-flash", fallbackModels: ["gemini-3.5-flash-lite"], fallbackClients: [fallback], now: () => (clock += 7),
+  });
+  const { value } = await withQuietWarnings(() => adapter.translateWithProvenance({ text: "매출이 올랐습니다", language: "en", sourceLanguage: "ko-KR", intent: "final" }));
+  assert.deepEqual(Object.keys(value).sort(), ["latencyMs", "model", "provider", "text"]);
+  assert.equal(value.text, "Revenue rose.");
+  assert.equal(value.provider, "gemini");
+  assert.equal(value.model, "gemini-3.5-flash-lite");
+  assert.equal(Number.isSafeInteger(value.latencyMs) && value.latencyMs > 0, true);
+  const direct = new GeminiTextTranslateAdapter({ client: fallback, model: "gemini-3.7-flash" });
+  assert.equal((await direct.translateWithProvenance({ text: "매출", language: "en", intent: "final" })).model, "gemini-3.7-flash");
+});
+
+test("runtime-sanitized transient codes trigger a fallback; the generic failure code does not", async () => {
+  for (const [message, expectFallback] of [["GEMINI_PROVIDER_UNAVAILABLE", true], ["GEMINI_PROVIDER_RATE_LIMITED", true], ["GEMINI_PROVIDER_FAILED", false], ["GEMINI_OUTPUT_UNSAFE", false]]) {
+    const fallbackCalls = [];
+    const adapter = new GeminiTextTranslateAdapter({
+      client: translateClient(() => { throw new Error(message); }), model: "gemini-3.6-flash",
+      fallbackModels: ["gemini-3.5-flash-lite"], fallbackClients: [translateClient(() => { fallbackCalls.push(1); return { text: "Revenue rose." }; })],
+    });
+    const { value } = await withQuietWarnings(() => adapter.translate({ text: "매출이 올랐습니다", language: "en", sourceLanguage: "ko-KR", intent: "final" }).then((text) => text, (error) => error));
+    if (expectFallback) assert.equal(value, "Revenue rose.", message);
+    else assert.equal(value.message, message);
+    assert.equal(fallbackCalls.length, expectFallback ? 1 : 0, message);
+  }
+});
+
+test("each attempt is capped at 2.8 s inside the 6 s total, so a hung primary still leaves the chain time to answer", async (context) => {
+  context.mock.timers.enable({ apis: ["setTimeout"] });
+  let clock = 0;
+  const now = () => clock;
+  let primaryRequest;
+  let fallbackStartedAt = null;
+  let fallbackRequest;
+  const adapter = new GeminiTextTranslateAdapter({
+    client: translateClient((request) => { primaryRequest = request; return new Promise(() => {}); }),
+    model: "gemini-3.6-flash",
+    fallbackModels: ["gemini-3.5-flash-lite"],
+    fallbackClients: [translateClient((request) => { fallbackStartedAt = clock; fallbackRequest = request; return { text: "Revenue rose." }; })],
+    now,
+  });
+  assert.equal(adapter.timeoutMilliseconds, 6_000);
+  assert.equal(adapter.attemptTimeoutMilliseconds, 2_800);
+  const { value } = await withQuietWarnings(async () => {
+    const translating = adapter.translateWithProvenance({ text: "매출이 올랐습니다", language: "en", sourceLanguage: "ko-KR", intent: "final" });
+    for (let tick = 0; tick < 3; tick += 1) await Promise.resolve();
+    clock = 2_799;
+    context.mock.timers.tick(2_799);
+    for (let tick = 0; tick < 3; tick += 1) await Promise.resolve();
+    assert.equal(fallbackStartedAt, null, "the primary keeps its full per-attempt budget");
+    clock = 2_800;
+    context.mock.timers.tick(1);
+    return await translating;
+  });
+  assert.equal(primaryRequest.config.abortSignal.aborted, true, "the hung primary is abandoned at the per-attempt cap");
+  assert.equal(fallbackStartedAt, 2_800);
+  assert.equal(value.model, "gemini-3.5-flash-lite");
+  assert.equal(value.text, "Revenue rose.");
+  assert.ok(fallbackRequest.config.abortSignal instanceof AbortSignal);
+  assert.throws(() => new GeminiTextTranslateAdapter({ client: translateClient(() => ({})), attemptTimeoutMilliseconds: 0 }), /GEMINI_TRANSLATE_TIMEOUT_INVALID/u);
+});

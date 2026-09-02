@@ -16,14 +16,20 @@ const ENV_KEY_BY_PROVIDER_KEY = Object.freeze({ gemini: "GEMINI_API_KEY", soniox
 
 export { isCombinedEngine };
 
-/** Catalog errors already carry code ENGINE_SELECTION_INVALID; surface that
- *  code as the message so `assert.throws(/ENGINE_SELECTION_INVALID/)` and the
- *  gateway's safe error identifiers both see one stable token. */
+/** Every factory error is a stable token in BOTH `message` and `code`: the
+ *  message keeps `assert.throws(/CODE/)` and safe log identifiers working, and
+ *  gateway-server maps `.code` to a client-facing rejection. */
+function codedError(code) {
+  return Object.assign(new Error(code), { code });
+}
+
+/** The catalog's EngineSelectionError carries a Korean UI message; re-key it to
+ *  the machine token here so the gateway never has to parse prose. */
 function normalizeOrThrow(engine) {
   try {
     return normalizeEngineSelection(engine);
   } catch (error) {
-    if (error?.code === "ENGINE_SELECTION_INVALID") throw new Error("ENGINE_SELECTION_INVALID");
+    if (error?.code === "ENGINE_SELECTION_INVALID") throw codedError("ENGINE_SELECTION_INVALID");
     throw error;
   }
 }
@@ -37,7 +43,7 @@ export function assertEngineKeys(engine, environment = process.env) {
   const selection = normalizeOrThrow(engine);
   for (const key of engineRequiredApiKeys(selection)) {
     const envName = ENV_KEY_BY_PROVIDER_KEY[key];
-    if (!envName || !String(environment?.[envName] ?? "").trim()) throw new Error("ENGINE_KEY_MISSING");
+    if (!envName || !String(environment?.[envName] ?? "").trim()) throw codedError("ENGINE_KEY_MISSING");
   }
   return selection;
 }
@@ -57,7 +63,7 @@ export function createSpeechToText({
     return new GeminiLiveTranscriptionAdapter({ client: liveClient, model: selection.stt.model, languageCodes, compiledGlossary });
   }
   if (selection.stt.provider === "soniox") {
-    if (!String(sonioxApiKey ?? "").trim()) throw new Error("ENGINE_KEY_MISSING");
+    if (!String(sonioxApiKey ?? "").trim()) throw codedError("ENGINE_KEY_MISSING");
     return new SonioxRealtimeAdapter({
       apiKey: sonioxApiKey,
       languageMode: selection.stt.languageMode,
@@ -67,7 +73,7 @@ export function createSpeechToText({
       domainText,
     });
   }
-  throw new Error("ENGINE_SELECTION_INVALID");
+  throw codedError("ENGINE_SELECTION_INVALID");
 }
 
 /**
@@ -77,7 +83,7 @@ export function createSpeechToText({
 export function createTextTranslate({ engine, geminiRuntime, sessionId }) {
   const selection = normalizeOrThrow(engine);
   if (isCombinedEngine(selection)) return null;
-  if (selection.translation.provider !== "gemini") throw new Error("ENGINE_SELECTION_INVALID");
+  if (selection.translation.provider !== "gemini") throw codedError("ENGINE_SELECTION_INVALID");
   const entry = findEngineEntry("translation", "gemini", selection.translation.model);
   const fallbackModels = [...(entry?.fallbackModels ?? [])];
   // The session runtime rejects a `model` field on generateContent requests, so
