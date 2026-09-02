@@ -138,3 +138,66 @@ interface TextTranslator {
 ## 8. 범위 밖
 
 2단계 공급자(Deepgram·OpenAI·DeepL) 어댑터, 브라우저 직접 Soniox 연결(temporary key), Soniox TTS, 한국 리전(미제공), Cloud Run 1시간 소켓 교체 문제(별도 과제), 화이트보드 제품.
+
+## Plan 1 hand-off (desktop complete) — 2026-09-02
+
+Tasks 1-8 (steps 1-5) landed on HEAD `bc8d4f1`. Root suite (`npm test`) is green.
+Ran, from repo root: `npm --prefix media-gateway test`, `npm --prefix webapp run test:live`,
+`npm --prefix webapp run typecheck`, `npm --prefix webapp test`. No fixes applied.
+
+- Catalog: `packages/caption-core/caption-engine-catalog.js`; protocol: `soniox-protocol.js`.
+  Gateway/webapp still consume the shim `packages/caption-core/gemini-model-catalog.js`
+  (default now `gemini-3.5-transcribe-live`, translation `gemini-3.6-flash`), which is
+  the entire cause of every failure below — all are contract-pin mismatches, not code bugs.
+
+**media-gateway** (`npm --prefix media-gateway test`): 593 tests, 574 pass, 19 fail.
+Failing files:
+- `test/config.test.js` — 11/16 fail. `GEMINI_WORKLOAD_MODEL_MATRIX.translation` is now
+  `gemini-3.6-flash` (catalog default); gateway env fixtures/adapters still pin the old
+  `gemini-3.7-flash`/legacy values. **Item 1 from the controller's ledger — confirmed.**
+- `test/host-model-authorization.test.js` — 2/4 fail (old model-pin assertions).
+- `test/live-input-source-persistence.test.js` — 1/4 fail (same cause).
+- `test/gemini-only-shared-engine.test.js` — 1/9 fail (v4 config pins old translation role).
+- `test/gateway-readiness-composition.test.js` — 2/2 fail (captions-settings activation pins old model id).
+- `test/quality-runner.test.js` — 1/1 fail (`gemini-3.5-transcribe-live` vs expected `gemini-3.5-live-translate-preview`).
+- `test/gemini-runtime-composition.test.js`, `test/direct-live-input-source.test.js`,
+  `test/direct-live-pipeline.test.js`, `test/direct-live-translation-session.test.js` —
+  **all pass (0 fail)**, contrary to the brief's prediction; no action needed there.
+- **Concern (not a Plan-1 regression):** `test/gemini-source-transcriber.test.js` crashes the
+  whole file with `ERR_MODULE_NOT_FOUND` for `packages/caption-core/gemini-source-audio.js`
+  (a module that has never existed in git history). Both the test file and its companion
+  `media-gateway/src/gemini-source-transcriber.js` are **untracked**, part of unrelated
+  in-flight uncommitted work (pre-dates this catalog change) — not caused by Tasks 1-8, but
+  it will keep failing until Plan 2 either creates that module or removes the orphaned test.
+
+**webapp**: `test:live` = 821 tests, 811 pass, 10 fail — all contract-pin mismatches, no
+import/syntax errors. `npm run typecheck` passes clean (exit 0). `npm test` (`test:live &&
+test:core`) short-circuits on the same 10 failures, so `test:core` (7 files: host-surface,
+invite-share, speak-client, audio, channelCore, languageDetect, live-contract) did not run
+this pass — unrelated to caption engine, low risk.
+Failing files: `components/live/live-audio-client.test.ts` (2), `lib/live/live-service.test.ts` (2),
+`lib/live/model-preferences.test.ts` (3, incl. the predicted one), `lib/live/post-session-summary.test.ts` (1),
+`lib/live/summary.test.ts` (1), `lib/security/live-security.test.ts` (1, pins
+`DEFAULT_GEMINI_MODEL_SELECTION.source` — renamed to `DEFAULT_ENGINE_SELECTION.stt.model`).
+
+**Root suite:** `test/gemini-3-7-workload-contract.test.js` passes (6/6) against the current
+working tree (adapter timeout 6_000, `LEGACY_TEXT_TRANSLATION_MODEL = gemini-3.7-flash`,
+`GENERATE_WORKLOADS` without `translation`) — but this pins the **working-tree** gateway
+contract, not any committed state, so it goes red on a clean single-commit checkout until
+Plan 2 commits the gateway/gemini-server changes and re-adds the two-stage `translation`
+workload. Plan 2 must reconcile this test as part of that commit.
+
+**Stale doc:** AGENTS.md's "root-vs-`public/` frontend duplication trap" section is now
+stale — the eight root-level `subtitle-*` duplicates were deleted on this branch, and
+`test/subtitle-frontend.test.js` asserts `public/<file>` is the sole runtime copy. Plan 2
+(or the final sweep) should correct that section.
+
+**Deferred minors** (full text in `.superpowers/sdd/2026-09-02-caption-engine-plan-1-core-desktop/progress.md`,
+lines `Task N: minor (deferred)`): Task 1: 3, Task 2: 3, Task 3: 1, Task 4: 6, Task 5: 3,
+Task 6: 3, Task 7: 6, Task 8: 2 — 27 total, none blocking.
+
+**Not yet done:** Task 8 steps 6-7 (real-API spike run + choosing the default provider)
+are pending a Soniox key; the catalog default remains Gemini until then. The installed
+`/Applications/NOVA.app` and the deployed gateway are unchanged, so Live Call started from
+`npm run desktop` is rejected by the deployed gateway (`SESSION_REVOKED`, model mismatch)
+until Plan 2 commits, builds, and deploys both sides.
