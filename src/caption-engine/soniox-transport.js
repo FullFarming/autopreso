@@ -8,6 +8,7 @@ import {
 import { selectGeminiTranscriptionVocabularyFromLegacyText } from "../../packages/caption-core/index.js";
 
 const REPLAY_RING_BYTES = 48_000; // 1.5 s of 16 kHz mono PCM16
+const ROLLOVER_MS = 17_400_000; // 290 min, under Soniox's 300-min stream cap
 const MAX_MESSAGE_BYTES = 1_048_576;
 const ERROR_CODES = Object.freeze({
   invalid_request: "SONIOX_INVALID_REQUEST",
@@ -41,6 +42,8 @@ function translationTermsFromLegacyGlossary(glossary) {
  *  requiresSetupAck: false      - Soniox has no setupComplete; first result = ready
  *  replayPayloads()             - last 1.5 s of already-resampled PCM for reconnect/mode switch
  *  keepalivePayload()           - JSON keepalive control message
+ *  finalizePayload()            - JSON manual-finalize control message
+ *  rolloverMilliseconds         - provider-owned rollover, 290 min instead of the shared 9.5
  *
  * @param {{engine: any, settings: Record<string, unknown>, apiKey?: string,
  *   endpoint?: "us"|"jp", now?: () => number}} input
@@ -63,7 +66,10 @@ export function createSonioxTransport({ engine, settings, apiKey, endpoint = "us
   let configJson = "";
   let lastSourceText = "";
 
-  function setupMessage() {
+  // Built once, at start time, from assertReady() - never from inside the
+  // WebSocket "open" listener, where a throw would escape every try/catch the
+  // client has and take the host process down with it.
+  function buildConfigJson() {
     if (!configJson) {
       configJson = JSON.stringify(buildSonioxConfig({
         apiKey,
@@ -124,9 +130,16 @@ export function createSonioxTransport({ engine, settings, apiKey, endpoint = "us
     binaryAudio: true,
     providerLabel: "Soniox",
     maximumSessionMilliseconds: 18_000_000,
+    // Soniox streams for 300 minutes; rolling at 290 keeps the desktop well
+    // inside that cap without paying a reconnect plus audio replay every 9.5
+    // minutes the way the shared Gemini rollover would.
+    rolloverMilliseconds: ROLLOVER_MS,
     replayRingBytes: REPLAY_RING_BYTES,
     assertReady() {
       if (!String(apiKey ?? "").trim()) throw new Error("Soniox API key is required for realtime subtitles.");
+      // Validate the whole config here so an unusable language/translation
+      // combination surfaces as a start failure, not as a crash on open.
+      buildConfigJson();
     },
     connect({ createWebSocket }) {
       return createWebSocket(SONIOX_ENDPOINTS[endpoint] ?? SONIOX_ENDPOINTS.us, undefined, {});
@@ -135,7 +148,15 @@ export function createSonioxTransport({ engine, settings, apiKey, endpoint = "us
       announcedReady = false;
       reducer = null;
       lastSourceText = "";
-      return [setupMessage()];
+      // Contract: never throws. assertReady() has normally validated and cached
+      // the config already; if it was skipped and the config is unusable, an
+      // empty list tells the client to fail the session instead of streaming
+      // audio into a socket that was never configured.
+      try {
+        return [buildConfigJson()];
+      } catch {
+        return [];
+      }
     },
     audioPayload(base64Pcm24k) {
       const pcm16k = resample(Buffer.from(base64Pcm24k, "base64"));

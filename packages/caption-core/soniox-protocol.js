@@ -166,8 +166,17 @@ export function createSonioxTokenReducer({
       const translationPreview = new Map();
       for (const token of tokens) {
         if (!token || typeof token.text !== "string") continue;
-        if (token.text === "<end>") { emitSegment("endpoint"); continue; }
-        if (token.text === "<fin>") { emitSegment("manual-finalize"); continue; }
+        if (token.text === "<end>" || token.text === "<fin>") {
+          emitSegment(token.text === "<end>" ? "endpoint" : "manual-finalize");
+          // Provisional tokens that preceded the boundary in this same frame
+          // belong to the segment just closed; they must not be flushed as a
+          // partial of the fresh segment below.
+          sourceChanged = false;
+          sourcePreview = "";
+          changedTranslations.clear();
+          translationPreview.clear();
+          continue;
+        }
         if (token.translation_status === "translation") {
           const language = token.language ?? "unknown";
           const lane = laneFor(token.language);

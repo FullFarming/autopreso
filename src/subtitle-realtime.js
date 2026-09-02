@@ -353,6 +353,8 @@ function createSourceTranscriptionClient({
   // Providers with no setup ack (Soniox) never fail the setup handshake, so an
   // unrecoverable rejection has to stop the reconnect ladder explicitly.
   let noReconnect = false;
+  // One start-failure report per client: audio frames arrive every 40 ms.
+  let reportedStartFailure = false;
   let keepaliveTimer = null;
   let lastAudioSentAt = 0;
   let replayOnNextOpen = false;
@@ -387,6 +389,9 @@ function createSourceTranscriptionClient({
 
   function markTransportReady(openedSocket) {
     if (socket !== openedSocket || intentionalClose) return;
+    // A no-ack transport is marked ready on open, so its first result message
+    // reports readiness again; re-flushing and re-arming would be wrong.
+    if (configured) return;
     setupAckTimer = clearTimer(setupAckTimer);
     configured = true;
     reconnectAttempts = 0;
@@ -409,7 +414,7 @@ function createSourceTranscriptionClient({
     rolloverTimer = setTimeout(() => {
       if (socket !== openedSocket || intentionalClose) return;
       requestGracefulRollover(openedSocket, "session_rollover");
-    }, Math.min(transcribeRolloverMs, maximumSessionMs - 1));
+    }, Math.min(transport.rolloverMilliseconds ?? transcribeRolloverMs, maximumSessionMs - 1));
     rolloverTimer.unref?.();
   }
 
@@ -480,7 +485,22 @@ function createSourceTranscriptionClient({
     configured = false;
     openedSocket.on("open", () => {
       if (socket !== openedSocket || intentionalClose) return;
-      for (const payload of transport.setupPayloads()) openedSocket.send(payload);
+      // This listener sits outside open()'s try/catch, so anything thrown here
+      // would reach the process. Fail the session loudly instead.
+      try {
+        const payloads = transport.setupPayloads();
+        if (!payloads?.length) throw new Error("transport produced no setup payload");
+        for (const payload of payloads) openedSocket.send(payload);
+      } catch (error) {
+        broadcast({
+          type: "subtitle:error",
+          message: `${providerLabel} 시작 실패 (${source}): ${redactTransportDiagnostic(error?.message ?? error)}`,
+          code: "TRANSCRIBE_START_FAILED",
+        });
+        intentionalClose = true;
+        openedSocket.terminate?.();
+        return;
+      }
       // Soniox acknowledges nothing: the config frame is accepted or the socket
       // is rejected, so the session is ready the moment setup is on the wire.
       if (transport.requiresSetupAck === false) markTransportReady(openedSocket);
@@ -579,7 +599,22 @@ function createSourceTranscriptionClient({
       }
     },
     sendAudio(audio) {
-      const connection = ensureSocket();
+      // Audio arrives from an async WebSocket listener with no outer catch, so a
+      // transport that refuses to start must not throw out of here either.
+      let connection;
+      try {
+        connection = ensureSocket();
+      } catch (error) {
+        if (!reportedStartFailure) {
+          reportedStartFailure = true;
+          broadcast({
+            type: "subtitle:error",
+            message: `${providerLabel}를 시작할 수 없습니다: ${redactTransportDiagnostic(error?.message ?? error)}`,
+            code: "TRANSCRIBE_START_FAILED",
+          });
+        }
+        return;
+      }
       if (!configured) {
         const enqueuedAt = Date.now();
         pendingAudio.push({ audio, enqueuedAt, preserveThroughRollover: preservePendingAudio });
@@ -794,27 +829,33 @@ function createTextTranslationLane({
 
   // Combined providers (Soniox) deliver the translation themselves; the Gemini
   // text lane never receives this. A provider translation is still model output,
-  // so it clears exactly the same gates a Gemini final does: same-language
-  // clear, placeholder drop, target-language check, and source-echo rejection.
+  // so it clears exactly the same gates a Gemini final does: no-role handling
+  // (with the finals-only same-language clear), placeholder drop,
+  // target-language check, and source-echo rejection.
   function acceptProviderTranslationNow(event) {
     if (closed) return;
     const sourceText = boundTranscript(event.sourceText ?? "").trim();
     const sourceLanguage = normalizeProviderLanguageCode(event.sourceLanguage)
       || resolveSourceLanguage({ text: sourceText, languageCode: event.sourceLanguage });
-    if (sourceLanguage === targetLanguage) {
-      // The speaker is already speaking this lane's language: drop the lane so
-      // the overlay stops showing a stale rendition, exactly as commitNow does.
-      broadcast({
-        type: "subtitle:clear",
-        source,
-        targetLanguage,
-        reason: "same_language_source",
-        translationProvider: event.provider ?? "gemini",
-      });
+    // resolveTranslationRole comes first so the mixed-Korean exception (Korean
+    // speech that still needs its Korean rendition) keeps its role instead of
+    // being cleared away as same-language.
+    const translationRole = resolveTranslationRole(sourceText || event.text, sourceLanguage);
+    if (!translationRole) {
+      // Finals only, exactly like commitNow: the speaker has moved to this
+      // lane's own language, so drop the stale rendition. A partial in that
+      // situation is ignored in silence, the way translatePreview does.
+      if (event.isFinal && sourceLanguage === targetLanguage) {
+        broadcast({
+          type: "subtitle:clear",
+          source,
+          targetLanguage,
+          reason: "same_language_source",
+          translationProvider: event.provider ?? "gemini",
+        });
+      }
       return;
     }
-    const translationRole = resolveTranslationRole(sourceText || event.text, sourceLanguage);
-    if (!translationRole) return;
     const corrected = stripSubtitlePrefix(termRetriever.repair(boundTranscript(event.text).normalize("NFC"), {
       language: targetLanguage,
       isFinal: event.isFinal,

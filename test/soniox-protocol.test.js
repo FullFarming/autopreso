@@ -77,3 +77,27 @@ test("reducer: keeps Korean spacing (no trim/join), ignores <fin> text, same seg
   assert.deepEqual(seen[2], ["b", "manual-finalize"]);
   assert.equal(SONIOX_CONTROL.keepalive, '{"type":"keepalive"}');
 });
+
+test("reducer: a provisional token that precedes <end> in the same frame never leaks into the next segment", () => {
+  const events = [];
+  const reducer = createSonioxTokenReducer({
+    onSourcePartial: (e) => events.push(["sp", e.text, e.segmentId]),
+    onSourceFinal: (e) => events.push(["sf", e.text]),
+    onTranslationPartial: (e) => events.push(["tp", e.text]),
+    onTranslationFinal: (e) => events.push(["tf", e.text]),
+    onBoundary: (kind) => events.push(["b", kind]),
+  });
+  reducer.apply({ tokens: [
+    { text: "이번", is_final: true, translation_status: "original", language: "ko", start_ms: 0, end_ms: 200 },
+    { text: " 분기에", is_final: false, translation_status: "original", language: "ko" },
+    { text: "Quarter", is_final: false, translation_status: "translation", language: "en", source_language: "ko" },
+    { text: "<end>", is_final: true },
+  ] });
+  assert.deepEqual(events, [["sf", "이번"], ["b", "endpoint"]]);
+
+  reducer.apply({ tokens: [
+    { text: "매출", is_final: false, translation_status: "original", language: "ko" },
+  ] });
+  assert.deepEqual(events.at(-1), ["sp", "매출", events.at(-1)[2]]);
+  assert.equal(events.filter(([kind]) => kind === "sp").length, 1, "no partial was flushed for the closed segment");
+});

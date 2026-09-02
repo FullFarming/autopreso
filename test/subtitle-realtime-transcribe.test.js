@@ -222,6 +222,124 @@ test("a provider final that never reached the target language reports TEXT_TRANS
   assert.equal(events.some((event) => event.type === "subtitle:committed"), false);
 });
 
+test("a same-language provider PARTIAL is ignored while the FINAL clears the lane", async () => {
+  const base = {
+    text: "안녕하세요 여러분",
+    targetLanguage: "ko",
+    sourceText: "안녕하세요 여러분",
+    sourceLanguage: "ko",
+    provider: "soniox",
+    segmentId: "same-lang-partial",
+  };
+  const partial = await runProviderTranslation({ ...base, isFinal: false });
+  assert.equal(partial.events.some((event) => event.type === "subtitle:clear"), false,
+    `a partial must not clear the lane: ${JSON.stringify(partial.events)}`);
+  assert.equal(partial.events.some((event) => event.type === "subtitle:partial"), false);
+
+  const final = await runProviderTranslation({ ...base, isFinal: true });
+  const cleared = final.events.filter((event) => event.type === "subtitle:clear");
+  assert.equal(cleared.length, 1, JSON.stringify(final.events));
+  assert.equal(cleared[0].reason, "same_language_source");
+});
+
+const SONIOX_ENGINE = Object.freeze({
+  stt: { provider: "soniox", model: "stt-rt-v5", languageMode: "auto" },
+  translation: { provider: "soniox", model: "stt-rt-v5" },
+  summary: { provider: "gemini", model: "gemini-3.6-flash" },
+});
+
+// Drives the REAL Soniox transport (binary audio, no setup ack, replay ring,
+// provider error codes) over the harness's fake socket.
+function createSonioxHarness({ settings = {}, ...options } = {}) {
+  return createHarness({
+    settings: { translationLanguages: ["en", "ko"], glossary: "", engine: SONIOX_ENGINE, ...settings },
+    apiKeys: { soniox: "fixture-key" },
+    polish: async () => "text-lane output that must never appear",
+    ...options,
+  });
+}
+
+const audioFrame = (value = 1) => Buffer.alloc(4_800, value).toString("base64");
+const settle = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
+
+test("a soniox engine that cannot build a config fails the session instead of throwing on open", async () => {
+  const { manager, sockets, events } = createSonioxHarness({
+    settings: { translationLanguages: ["en", "ko", "ja"] },
+  });
+  await manager.start({ sessionId: "soniox-bad-pair" });
+  try {
+    await settle(10);
+    assert.equal(sockets.length, 0, "no socket is opened for an unusable config");
+    const failures = events.filter((event) => event.code === "TRANSCRIBE_START_FAILED");
+    assert.equal(failures.length >= 1, true, JSON.stringify(events));
+    assert.match(failures[0].message, /SONIOX_TRANSLATION_PAIR_REQUIRED/u);
+    // Audio keeps arriving from the renderer after a failed start; it must not
+    // throw out of the async WebSocket listener that delivers it.
+    assert.doesNotThrow(() => manager.sendAudio({
+      sessionId: "soniox-bad-pair", source: "mic", audio: audioFrame(),
+    }));
+    assert.equal(sockets.length, 0);
+  } finally { await manager.stop(); }
+});
+
+test("a soniox session does not take the shared Gemini rollover", async () => {
+  const { manager, sockets } = createSonioxHarness({
+    transcribeRolloverMs: 15,
+    transcribeFinalDrainMs: 5,
+    reconnectBaseMs: 1,
+  });
+  await manager.start({ sessionId: "soniox-no-rollover" });
+  try {
+    sockets[0].open();
+    await settle(45);
+    assert.equal(sockets.length, 1, "the transport's own 290-minute rollover must win");
+    assert.equal(sockets[0].readyState, WebSocket.OPEN);
+  } finally { await manager.stop(); }
+});
+
+test("replay payloads are withheld on first open and resent after a reconnect", async () => {
+  const { manager, sockets } = createSonioxHarness({ reconnectBaseMs: 1 });
+  await manager.start({ sessionId: "soniox-replay" });
+  try {
+    const first = sockets[0];
+    first.open();
+    assert.equal(first.sent.length, 1, "first open sends the config and nothing else");
+    manager.sendAudio({ sessionId: "soniox-replay", source: "mic", audio: audioFrame() });
+    const sentLive = first.sent.filter((value) => Buffer.isBuffer(value) && value.length > 0);
+    assert.equal(sentLive.length, 1);
+
+    first.finishClose(1006);
+    await settle(25);
+    assert.equal(sockets.length, 2, "a non-graceful close reconnects");
+    const second = sockets[1];
+    second.open();
+    const replayed = second.sent.filter((value) => Buffer.isBuffer(value) && value.length > 0);
+    assert.equal(replayed.length, 1, "the reconnect replays the buffered audio tail");
+    assert.equal(replayed[0].length, 3_200);
+    assert.equal(replayed[0].equals(sentLive[0]), true);
+  } finally { await manager.stop(); }
+});
+
+test("an unauthenticated soniox rejection reports the code and never starts a reconnect ladder", async () => {
+  const { manager, sockets, events } = createSonioxHarness({ reconnectBaseMs: 1 });
+  await manager.start({ sessionId: "soniox-unauthenticated" });
+  try {
+    sockets[0].open();
+    sockets[0].emit("message", Buffer.from(JSON.stringify({
+      error_type: "unauthenticated", error_code: 401, request_id: "r1",
+    })));
+    await settle(5);
+    const failures = events.filter((event) => event.code === "SONIOX_UNAUTHENTICATED");
+    assert.equal(failures.length, 1, JSON.stringify(events));
+    assert.equal(failures[0].type, "subtitle:error");
+    assert.equal(failures[0].requestId, "r1");
+
+    sockets[0].finishClose(1006);
+    await settle(25);
+    assert.equal(sockets.length, 1, "a key rejection must not be retried");
+  } finally { await manager.stop(); }
+});
+
 test("soniox engine sends config first, binary audio frames, and commits provider translations without Gemini calls", async () => {
   let textCalls = 0;
   const { manager, sockets, events } = createHarness({

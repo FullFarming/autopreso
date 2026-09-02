@@ -129,18 +129,46 @@ test("a malformed or oversized frame reports SONIOX_MESSAGE_INVALID instead of t
   assert.deepEqual(codes, ["SONIOX_MESSAGE_INVALID"]);
 });
 
-test("assertReady refuses to open a session without a Soniox key", () => {
-  const transport = createSonioxTransport({
+// setupPayloads() runs inside the WebSocket "open" listener, which is outside
+// every try/catch the client owns, so a throw there would take the host process
+// down. All validation therefore belongs to assertReady().
+test("assertReady owns every start-time rejection and setupPayloads never throws", () => {
+  const ready = createSonioxTransport({
     engine: sonioxEngine("auto"),
     settings: { translationLanguages: ["en", "ko"], glossary: "" },
     apiKey: "fixture-key",
   });
-  transport.assertReady();
+  ready.assertReady();
+
   const keyless = createSonioxTransport({
     engine: sonioxEngine("auto"),
     settings: { translationLanguages: ["en", "ko"], glossary: "" },
     apiKey: "",
   });
   assert.throws(() => keyless.assertReady(), /Soniox API key/u);
-  assert.throws(() => keyless.setupPayloads(), /SONIOX_API_KEY_REQUIRED/u);
+
+  for (const translationLanguages of [["en", "ko", "ja"], ["ja"]]) {
+    const transport = createSonioxTransport({
+      engine: sonioxEngine("auto"),
+      settings: { translationLanguages, glossary: "" },
+      apiKey: "fixture-key",
+    });
+    assert.throws(() => transport.assertReady(), /SONIOX_TRANSLATION_PAIR_REQUIRED/u,
+      `${translationLanguages.join("+")} is not a two_way pair`);
+    assert.doesNotThrow(() => transport.setupPayloads());
+    assert.deepEqual(transport.setupPayloads(), [], "an unusable config yields no setup payload");
+  }
+
+  assert.doesNotThrow(() => keyless.setupPayloads());
+  assert.deepEqual(keyless.setupPayloads(), []);
+});
+
+test("Soniox owns its own rollover instead of the shared 9.5-minute Gemini one", () => {
+  const transport = createSonioxTransport({
+    engine: sonioxEngine("auto"),
+    settings: { translationLanguages: ["en", "ko"], glossary: "" },
+    apiKey: "fixture-key",
+  });
+  assert.equal(transport.rolloverMilliseconds, 17_400_000, "290 minutes");
+  assert.equal(transport.rolloverMilliseconds < transport.maximumSessionMilliseconds, true);
 });

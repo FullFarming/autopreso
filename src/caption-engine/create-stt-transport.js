@@ -8,8 +8,13 @@ import { createSonioxTransport } from "./soniox-transport.js";
  * { requiresSetupAck, providerLabel, maximumSessionMilliseconds, assertReady(),
  *   connect({createWebSocket}), setupPayloads(), audioPayload(base64Pcm24k),
  *   handleMessage(raw, ctx), closePayload() }
+ * Optional, for combined/long-session providers such as Soniox:
+ * { binaryAudio, replayRingBytes, rolloverMilliseconds, replayPayloads(),
+ *   keepalivePayload(), finalizePayload() }
+ * `assertReady()` owns all start-time validation - `setupPayloads()` must never
+ * throw, because it runs inside the WebSocket "open" listener.
  * ctx callbacks: onTransportReady, onInterim, onFinal, onTranslation?, onBoundary?,
- * onServerGoAway, broadcast
+ * onServerGoAway, onError?, broadcast
  *
  * @param {{engine?: unknown, settings?: Record<string, unknown>, apiKeys?: Record<string, string>,
  *   createSonioxTransportImpl?: Function}} input
