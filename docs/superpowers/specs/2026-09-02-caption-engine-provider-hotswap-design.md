@@ -193,11 +193,16 @@ stale — the eight root-level `subtitle-*` duplicates were deleted on this bran
 (or the final sweep) should correct that section.
 
 **Deferred minors** (full text in `.superpowers/sdd/2026-09-02-caption-engine-plan-1-core-desktop/progress.md`,
-lines `Task N: minor (deferred)`): Task 1: 3, Task 2: 3, Task 3: 1, Task 4: 6, Task 5: 3,
-Task 6: 3, Task 7: 6, Task 8: 2 — 27 total, none blocking.
+lines matching `^Task N: minor (deferred`, **including the variant phrasings**
+`(deferred, Plan 2)`, `(deferred, for final review)`, and `(deferred, Plan 2/store)`):
+Task 1: 3, Task 2: 3, Task 3: 1, Task 4: 7, Task 5: 4, Task 6: 3, Task 7: 7, Task 8: 1 —
+29 total, none blocking.
 
 **Not yet done:** Task 8 steps 6-7 (real-API spike run + choosing the default provider)
 are pending a Soniox key; the catalog default remains Gemini until then. The installed
-`/Applications/NOVA.app` and the deployed gateway are unchanged, so Live Call started from
-`npm run desktop` is rejected by the deployed gateway (`SESSION_REVOKED`, model mismatch)
-until Plan 2 commits, builds, and deploys both sides.
+`/Applications/NOVA.app` and the deployed gateway are unchanged. Live Call started from
+`npm run desktop` is rejected during host authorization because the deployed gateway's
+Supabase host authorizer compares the DB model pin against the desktop's captionConfig
+and the desktop now sends the Transcribe-Live default; the exact error code surfaced to
+the desktop was not exercised in Plan 1. This will not resolve until Plan 2 commits,
+builds, and deploys both sides.
