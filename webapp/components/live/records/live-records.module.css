@@ -416,6 +416,7 @@
 .transcriptMeta { display: flex; flex-wrap: wrap; gap: 12px; color: var(--nova-fg-secondary); }
 .transcriptList p { margin: 0; white-space: pre-wrap; word-break: keep-all; overflow-wrap: anywhere; }
 .transcriptParagraphs { display: grid; gap: 16px; margin-top: 8px; }
+.fragmentTime { font-variant-numeric: tabular-nums; color: var(--nova-fg-secondary); font-size: 0.8125rem; margin-right: 0.35em; user-select: none; }
 .correctionMarker { margin-left: 8px; color: var(--nova-fg-secondary); }
 .rawOriginal { margin-top: 12px; color: var(--nova-fg-secondary); }
 .rawOriginal summary { display: flex; align-items: center; min-height: 44px; cursor: pointer; }

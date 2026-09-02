@@ -39,40 +39,23 @@ function hasRecordingBreak(previous: ReadingFragment, entry: ReadingFragment, ga
   });
 }
 
-function endsSentence(text: string): boolean {
-  return /[.!?。！？]["'”’」』)\]]*\s*$/u.test(text);
-}
-
 export function groupTranscriptReading(entries: readonly ReadingFragment[], gaps: readonly RecordingInterval[] = []): ReadingTurn[] {
   const turns: ReadingTurn[] = [];
   let previous: ReadingFragment | undefined;
-  let paragraphCharacters = 0;
-  let completedFragments = 0;
   for (const entry of entries) {
     let turn = turns.at(-1);
     if (!previous || !turn || previous.speakerKey !== entry.speakerKey
       || entry.seq !== previous.seq + 1 || hasRecordingBreak(previous, entry, gaps)) {
+      // 2026-09-03 fix: a turn is exactly one paragraph. Language, topic, pauses and length never split a speaker's
+      // text; every fragment carries its own time marker at render time instead. Only a speaker change, a seq gap
+      // or a recording break starts a new turn. The paragraphs array is kept so existing consumers compile.
       turn = { key: entry.id, speakerKey: entry.speakerKey, speaker: entry.speaker,
-        startedAt: entry.startedAt, endedAt: entry.endedAt, paragraphs: [] };
+        startedAt: entry.startedAt, endedAt: entry.endedAt, paragraphs: [{ key: entry.id, fragments: [] }] };
       turns.push(turn);
-      paragraphCharacters = 0;
-      completedFragments = 0;
-    }
-    const shouldStartParagraph = previous && turn.paragraphs.length > 0 && (
-      entry.language !== previous.language || entry.topicId !== previous.topicId
-      || Date.parse(entry.startedAt) - Date.parse(previous.endedAt) >= 30_000
-      || (endsSentence(previous.text) && (completedFragments >= 3 || paragraphCharacters >= 400))
-    );
-    if (turn.paragraphs.length === 0 || shouldStartParagraph) {
-      turn.paragraphs.push({ key: entry.id, fragments: [] });
-      paragraphCharacters = 0;
-      completedFragments = 0;
     }
     // 2026-08-31 feat: Group presentation only; keep exact text and correction evidence attached to each source row.
-    turn.paragraphs[turn.paragraphs.length - 1].fragments.push(entry);
+    turn.paragraphs[0].fragments.push(entry);
     turn.endedAt = entry.endedAt;
-    paragraphCharacters += entry.text.length;
-    if (endsSentence(entry.text)) completedFragments += 1;
     previous = entry;
   }
   return turns;

@@ -9,6 +9,7 @@ import {
   getVisibleRecordTopics,
   normalizeRecordSearch,
 } from "./live-records-presentation";
+import { formatSystemRecordTime } from "../../../lib/system-language/records-messages";
 
 test("record search is normalized and topic disclosure remains bounded", () => {
   assert.equal(normalizeRecordSearch("  2026년  실적  "), "2026년 실적");
@@ -116,6 +117,28 @@ test("host originals render one speaker header per turn and preserve correction 
   assert.match(styles, /\.transcriptParagraphs[^}]*gap: 16px/u);
   assert.match(styles, /\.transcriptList[^}]*gap: 32px/u);
   assert.doesNotMatch(panel, /effectiveText.replace|rawText.replace/u);
+});
+
+test("host originals keep one paragraph per speaker turn and stamp every utterance with its own time marker", () => {
+  const panel = readFileSync(new URL("./RecordContentPanels.tsx", import.meta.url), "utf8");
+  const styles = readFileSync(new URL("./live-records.module.css", import.meta.url), "utf8");
+  // One <p> per turn: the model guarantees paragraphs.length === 1, the renderer must not add a second <p> path.
+  assert.equal((panel.match(/<p>\{paragraph.fragments.map/gu) ?? []).length, 1);
+  assert.match(panel, /<time dateTime=\{fragment.startedAt\} className=\{styles.fragmentTime\}>/u);
+  assert.match(panel, /formatSystemRecordTime\(fragment.startedAt, language, \{ seconds: true \}\)/u);
+  assert.match(panel, /import \{ recordsMessages, formatSystemRecordDate, formatSystemRecordTime \} from "@\/lib\/system-language\/records-messages"/u);
+  assert.match(styles, /\.fragmentTime \{[^}]*font-variant-numeric: tabular-nums;[^}]*color: var\(--nova-fg-secondary\);[^}]*user-select: none;[^}]*\}/u);
+  assert.doesNotMatch(styles, /\.fragmentTime[^}]*(content:|url\(|emoji)/u);
+  const instant = "2026-08-31T01:04:12.000Z";
+  for (const [language, locale] of [["ko", "ko-KR"], ["en", "en-US"], ["ja", "ja-JP"]] as const) {
+    assert.equal(formatSystemRecordTime(instant, language, { seconds: true }), new Intl.DateTimeFormat(locale, {
+      timeZone: "Asia/Seoul", hour: "2-digit", minute: "2-digit", second: "2-digit",
+    }).format(new Date(instant)));
+    assert.equal(formatSystemRecordTime(instant, language), new Intl.DateTimeFormat(locale, {
+      timeZone: "Asia/Seoul", hour: "2-digit", minute: "2-digit",
+    }).format(new Date(instant)));
+    assert.equal(formatSystemRecordTime("not-a-date", language, { seconds: true }), null);
+  }
 });
 
 test("host reading identity does not merge unknown speakers or participants without ids", () => {

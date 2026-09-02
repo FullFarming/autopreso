@@ -233,10 +233,11 @@ export function formatSystemRecordDate(value: string | null, language: keyof typ
   }).format(date);
 }
 
-export function formatSystemRecordTime(value: string | null | undefined, language: keyof typeof recordsMessages): string | null {
+export function formatSystemRecordTime(value: string | null | undefined, language: keyof typeof recordsMessages,
+  options: { seconds?: boolean } = {}): string | null {
   const date = value ? new Date(value) : null;
   if (!date || Number.isNaN(date.getTime())) return null;
   return new Intl.DateTimeFormat({ ko: "ko-KR", en: "en-US", ja: "ja-JP" }[language], {
-    timeZone: "Asia/Seoul", hour: "2-digit", minute: "2-digit",
+    timeZone: "Asia/Seoul", hour: "2-digit", minute: "2-digit", ...(options.seconds ? { second: "2-digit" as const } : {}),
   }).format(date);
 }

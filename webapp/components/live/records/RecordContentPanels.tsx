@@ -1,7 +1,7 @@
 "use client";
 
 import { useSystemLanguage, useSystemText } from "@/components/system-language/SystemLanguageProvider";
-import { recordsMessages, formatSystemRecordDate } from "@/lib/system-language/records-messages";
+import { recordsMessages, formatSystemRecordDate, formatSystemRecordTime } from "@/lib/system-language/records-messages";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { AuthoritativeTranscriptItem, LiveRecordSelectedSummary, SafeSummaryStatus } from "@/lib/live-records/service";
@@ -86,7 +86,8 @@ export function RecordOriginalPanel({ sessionId, loadOriginals = fetchLiveRecord
       </div>
       <div className={styles.transcriptParagraphs}>{turn.paragraphs.map((paragraph) => <div key={paragraph.key}>
         <p>{paragraph.fragments.map((fragment, index) => <span key={fragment.id} lang={fragment.language} data-source-utterance-id={fragment.id}>
-          {index > 0 ? " " : ""}{fragment.text}{fragment.isCorrected && <span className={styles.correctionMarker}>{t("교정본")}</span>}
+          {index > 0 ? " " : ""}<time dateTime={fragment.startedAt} className={styles.fragmentTime}>{formatSystemRecordTime(fragment.startedAt, language, { seconds: true })}</time>
+          {fragment.text}{fragment.isCorrected && <span className={styles.correctionMarker}>{t("교정본")}</span>}
         </span>)}</p>
         {paragraph.fragments.filter((fragment) => fragment.isCorrected && fragment.rawText !== fragment.text).map((fragment) => <details key={fragment.id} className={styles.rawOriginal} data-original-for={fragment.id}>
           <summary>{t("최초 전사 보기 · 발언 {seq}", { seq: fragment.seq })}</summary><p>{fragment.rawText}</p>

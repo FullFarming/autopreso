@@ -9,11 +9,11 @@ function fragment(seq: number, changes: Partial<ReadingFragment> = {}): ReadingF
     text: `실제 발언 ${seq}입니다.`, language: "ko", ...changes };
 }
 
-test("continuous speech keeps one speaker header and readable paragraphs without modifying source fragments", () => {
+test("continuous speech keeps one speaker header and one paragraph without modifying source fragments", () => {
   const entries = Array.from({ length: 7 }, (_, i) => Object.freeze(fragment(i + 1)));
   const turns = groupTranscriptReading(Object.freeze(entries));
   assert.equal(turns.length, 1);
-  assert.deepEqual(turns[0].paragraphs.map((p) => p.fragments.length), [3, 3, 1]);
+  assert.deepEqual(turns[0].paragraphs.map((p) => p.fragments.length), [7]);
   assert.deepEqual(turns[0].paragraphs.flatMap((p) => p.fragments), entries);
   assert.equal(turns[0].startedAt, entries[0].startedAt);
   assert.equal(turns[0].endedAt, entries[6].endedAt);
@@ -33,17 +33,28 @@ test("page boundaries do not repeat the header, but missing sequence or recordin
   assert.equal(groupTranscriptReading(entries, [{ ...gap, endedAt: null }]).length, 2);
 });
 
-test("language, topic and a long pause start paragraphs without repeating the same speaker", () => {
+test("language, topic and a long pause do NOT split a speaker's paragraph", () => {
   const entries = [fragment(1), fragment(2, { language: "en" }), fragment(3, { language: "en", topicId: "qa" }),
     fragment(4, { language: "en", topicId: "qa", startedAt: "2026-08-31T04:01:20Z", endedAt: "2026-08-31T04:01:25Z" })];
   const turns = groupTranscriptReading(entries);
   assert.equal(turns.length, 1);
-  assert.deepEqual(turns[0].paragraphs.map((p) => p.fragments.length), [1, 1, 1, 1]);
+  assert.deepEqual(turns[0].paragraphs.map((p) => p.fragments.length), [4]);
+});
+
+test("every turn has exactly one paragraph no matter how many sentences or characters a speaker produces", () => {
+  const entries = Array.from({ length: 40 }, (_, i) => fragment(i + 1, { text: `${"긴 문장 ".repeat(30)}${i + 1}번째 발언입니다.` }));
+  const turns = groupTranscriptReading(entries);
+  assert.equal(turns.length, 1);
+  assert.equal(turns[0].paragraphs.length, 1);
+  assert.deepEqual(turns[0].paragraphs[0].fragments, entries);
+  const alternating = [fragment(1), fragment(2, { speakerKey: "participant:two", speaker: "이서연" }), fragment(3), fragment(4)];
+  assert.deepEqual(groupTranscriptReading(alternating).map((turn) => turn.paragraphs.length), [1, 1, 1]);
+  assert.deepEqual(groupTranscriptReading(alternating).map((turn) => turn.paragraphs[0].fragments.map((f) => f.seq)), [[1], [2], [3, 4]]);
 });
 
 test("sentence fragments are never broken only because they are long", () => {
   const entries = [fragment(1, { text: "가".repeat(450) }), fragment(2, { text: "이어지는 문장입니다." }), fragment(3)];
-  assert.deepEqual(groupTranscriptReading(entries)[0].paragraphs.map((p) => p.fragments.length), [2, 1]);
+  assert.deepEqual(groupTranscriptReading(entries)[0].paragraphs.map((p) => p.fragments.length), [3]);
 });
 
 test("real numbering, line breaks, HTML-like text and corrected originals remain untouched", () => {
