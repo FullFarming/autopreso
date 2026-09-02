@@ -17,6 +17,11 @@ const PUBLIC_UNAUTHENTICATED_PATHS = new Set([
   "/api/pair-login",
   "/api/pair-keys",
   "/api/live-sessions/join",
+  // 2026-09-02 auth: Supabase login finishes on these pages/routes before any app cookie exists.
+  "/auth/callback",
+  "/pending",
+  "/api/auth/exchange",
+  "/api/auth/desktop-exchange",
 ]);
 const PUBLIC_LIVE_AUDIO_WORKLET_PATH = "/live-audio-worklet.js";
 const PUBLIC_METADATA_PATHS = new Set(["/robots.txt", "/llms.txt"]);
