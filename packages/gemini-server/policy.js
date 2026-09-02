@@ -1,15 +1,35 @@
 import { GEMINI_WORKLOAD_MODEL_MATRIX, redactGeminiSensitiveText } from "../caption-core/index.js";
+import { findEngineEntry } from "../caption-core/caption-engine-catalog.js";
 
+// `translation` is the two-stage text translation of committed source
+// utterances (Transcribe -> Flash). `source` (the retired direct Live
+// Translate / WAV path) is deliberately absent.
 export const GENERATE_WORKLOADS = new Set(["topic", "translation", "polish", "recap"]);
 export const GEMINI_SERVER_WORKLOAD_MODELS = GEMINI_WORKLOAD_MODEL_MATRIX;
+/** Which catalog role a caller-selected model must belong to, per workload.
+ *  `polish` is pinned to the matrix and has no caller choice. */
+const WORKLOAD_CATALOG_ROLE = Object.freeze({ topic: "summary", recap: "summary", translation: "translation" });
+
+export function resolveGeminiWorkloadModel(workload, value = undefined) {
+  if (!GENERATE_WORKLOADS.has(workload)) throw new Error("INVALID_GEMINI_WORKLOAD");
+  if (value === undefined) return GEMINI_SERVER_WORKLOAD_MODELS[workload];
+  if (typeof value !== "string") throw new Error("INVALID_GEMINI_MODEL_SELECTION");
+  if (workload === "polish") {
+    if (value !== GEMINI_SERVER_WORKLOAD_MODELS.polish) throw new Error("INVALID_GEMINI_MODEL_SELECTION");
+    return value;
+  }
+  if (findEngineEntry(WORKLOAD_CATALOG_ROLE[workload], "gemini", value) === null) throw new Error("INVALID_GEMINI_MODEL_SELECTION");
+  return value;
+}
 export const GEMINI_WORKLOAD_THINKING_LEVELS = Object.freeze({
   glossaryExtraction: "medium",
+  source: "low",
   topic: "low",
   translation: "low",
   polish: "low",
   recap: "medium",
 });
-export const WORKLOAD_OUTPUT_CODEPOINTS = Object.freeze({ topic: 2_000, translation: 4_000, polish: 4_000, recap: 16_000 });
+export const WORKLOAD_OUTPUT_CODEPOINTS = Object.freeze({ source: 8_000, topic: 2_000, translation: 4_000, polish: 4_000, recap: 16_000 });
 const MAX_PROMPT_CODEPOINTS = 50_000;
 const MAX_SYSTEM_INSTRUCTION_CODEPOINTS = 10_000;
 const MAX_SCHEMA_CODEPOINTS = 20_000;
@@ -89,10 +109,15 @@ function isBoundedJsonSchema(value) {
 
 export function readStrictOutputText(response, maximumCodepoints) {
   if (hasRefusal(response)) throw new Error("GEMINI_PROVIDER_REFUSAL");
-  const raw = response?.text ?? response?.candidates?.[0]?.content?.parts?.map((part) => part?.text ?? "").join("");
-  if (typeof raw !== "string") throw new Error("GEMINI_OUTPUT_INVALID");
+  const candidate = Array.isArray(response?.candidates) ? response.candidates[0] : undefined;
+  // 2026-08-31 fix: A nonempty partial response is not a finished translation or summary.
+  if (candidate?.finishReason !== "STOP" || !Array.isArray(candidate?.content?.parts)) throw new Error("GEMINI_OUTPUT_INVALID");
+  const raw = candidate.content.parts.map((part) => {
+    if (!part || typeof part !== "object" || (part.thought !== undefined && part.thought !== false)) return "";
+    return typeof part.text === "string" ? part.text : "";
+  }).join("");
   const outputText = raw.trim();
-  if (!outputText || outputText !== outputText.normalize("NFC") || /[<>\p{Cc}\p{Cf}]/u.test(outputText)
+  if (!outputText || outputText !== outputText.normalize("NFC") || /[<>\p{Cc}\p{Cf}]/u.test(raw.replace(/[\r\n\t]/gu, ""))
     || Array.from(outputText).length > maximumCodepoints) throw new Error("GEMINI_OUTPUT_UNSAFE");
   return outputText;
 }

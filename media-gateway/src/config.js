@@ -1,4 +1,4 @@
-import { CAPTION_LANGUAGE_CODES, createGeminiCaptionConfig, geminiCaptionConfigFingerprint, GEMINI_WORKLOAD_MODEL_MATRIX } from "../../packages/caption-core/index.js";
+import { CAPTION_LANGUAGE_CODES, createGeminiCaptionConfig, geminiCaptionConfigFingerprint } from "../../packages/caption-core/index.js";
 
 export const AUDIO_CONFIG = Object.freeze({
   inputSampleRate: 16_000,
@@ -145,12 +145,11 @@ export function readGatewayEnvironment(environment = process.env) {
       throw new Error(`${name} 환경변수가 필요합니다.`);
     }
   }
-  const configuredTranscribeModel = String(environment.GEMINI_TRANSCRIBE_MODEL ?? "").trim();
-  const configuredTextModel = String(environment.GEMINI_TEXT_MODEL ?? "").trim();
-  if ((configuredTranscribeModel && configuredTranscribeModel !== GEMINI_WORKLOAD_MODEL_MATRIX.transcription)
-    || (configuredTextModel && configuredTextModel !== GEMINI_WORKLOAD_MODEL_MATRIX.translation)) {
-    throw new Error("Gemini 모델은 서버의 고정 workload matrix와 일치해야 합니다.");
-  }
+  // Provider/model selection is governed by the shared engine catalog carried in
+  // each session's captionConfig.engine, never by env. SONIOX_API_KEY is
+  // optional: a Soniox engine selection without it is rejected per session
+  // (ENGINE_KEY_MISSING) instead of failing gateway startup.
+  const sonioxApiKey = String(environment.SONIOX_API_KEY ?? "").trim();
   const supabaseSecretKey = typeof environment.SUPABASE_SECRET_KEY === "string"
     ? environment.SUPABASE_SECRET_KEY.trim()
     : "";
@@ -227,8 +226,7 @@ export function readGatewayEnvironment(environment = process.env) {
     port: Number(environment.PORT ?? 8080),
     host: isExactLocalSupabase && canUseLocalSupabase ? "127.0.0.1" : "0.0.0.0",
     geminiApiKey: environment.GEMINI_API_KEY,
-    geminiTranscribeModel: GEMINI_WORKLOAD_MODEL_MATRIX.transcription,
-    geminiTextModel: GEMINI_WORKLOAD_MODEL_MATRIX.translation,
+    sonioxApiKey,
     projectId: environment.GOOGLE_CLOUD_PROJECT,
     baseUrl: supabaseUrl.origin,
     supabaseApiKey: supabaseSecretKey || legacyServiceRoleKey,

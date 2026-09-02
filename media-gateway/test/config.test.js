@@ -4,11 +4,11 @@ import test from "node:test";
 import { AUDIO_CONFIG, readGatewayEnvironment, validateLiveSettings } from "../src/config.js";
 import * as gatewayConfig from "../src/config.js";
 import { geminiCaptionConfigFingerprint } from "../../packages/caption-core/index.js";
+import { DEFAULT_ENGINE_SELECTION } from "../../packages/caption-core/caption-engine-catalog.js";
 
 function gatewayEnvironment() {
   return {
     GEMINI_API_KEY: "test-key",
-    GEMINI_TRANSCRIBE_MODEL: "gemini-3.5-transcribe-live",
     GOOGLE_CLOUD_PROJECT: "dev-project",
     SUPABASE_URL: "https://dev-ref.supabase.co",
     SUPABASE_SECRET_KEY: "sb_secret_primary",
@@ -36,11 +36,29 @@ test("gateway config exposes no retired OpenAI translation language registry", (
   assert.equal("OPENAI_REALTIME_TRANSLATION_LANGUAGES" in gatewayConfig, false);
 });
 
-test("gateway environment cannot select arbitrary Gemini workload models", () => {
-  assert.equal(readGatewayEnvironment({ ...gatewayEnvironment(), GEMINI_TRANSCRIBE_MODEL: undefined }).geminiTranscribeModel, "gemini-3.5-transcribe-live");
-  assert.equal(readGatewayEnvironment({ ...gatewayEnvironment(), GEMINI_TEXT_MODEL: undefined }).geminiTextModel, "gemini-3.7-flash");
-  assert.throws(() => readGatewayEnvironment({ ...gatewayEnvironment(), GEMINI_TRANSCRIBE_MODEL: "attacker-model" }), /고정 workload matrix/u);
-  assert.throws(() => readGatewayEnvironment({ ...gatewayEnvironment(), GEMINI_TEXT_MODEL: "attacker-model" }), /고정 workload matrix/u);
+test("gateway environment carries no Gemini model selection: the engine catalog governs per session", () => {
+  const config = readGatewayEnvironment(gatewayEnvironment());
+  assert.equal("geminiTranscribeModel" in config, false);
+  assert.equal("geminiTextModel" in config, false);
+  // Retired env model pins are ignored rather than validated: no env value can
+  // select, forbid, or forge a provider model.
+  for (const override of [
+    { GEMINI_TRANSCRIBE_MODEL: "gemini-3.5-live-translate-preview" },
+    { GEMINI_TRANSCRIBE_MODEL: "attacker-model" },
+    { GEMINI_TEXT_MODEL: "attacker-model" },
+    { GEMINI_LIVE_MODEL: "attacker-model" },
+  ]) {
+    const ignored = readGatewayEnvironment({ ...gatewayEnvironment(), ...override });
+    assert.equal(JSON.stringify(ignored).includes("attacker-model"), false);
+    assert.equal(JSON.stringify(ignored).includes("live-translate"), false);
+  }
+});
+
+test("gateway reads an optional trimmed Soniox key and never requires it at startup", () => {
+  assert.equal(readGatewayEnvironment(gatewayEnvironment()).sonioxApiKey, "");
+  assert.equal(readGatewayEnvironment({ ...gatewayEnvironment(), SONIOX_API_KEY: "   " }).sonioxApiKey, "");
+  assert.equal(readGatewayEnvironment({ ...gatewayEnvironment(), SONIOX_API_KEY: "  fixture-soniox-key  " }).sonioxApiKey, "fixture-soniox-key");
+  assert.throws(() => readGatewayEnvironment({ ...gatewayEnvironment(), GEMINI_API_KEY: "" }), /GEMINI_API_KEY/u);
 });
 
 test("live settings normalize every legacy audio output mode to captions-only", () => {
@@ -74,7 +92,11 @@ test("live settings accept one to three unique languages", () => {
   });
   assert.equal(captionConfig.provider, "gemini");
   assert.equal(captionConfig.voiceProvider, null);
-  assert.match(captionConfigFingerprint, /^gemini-caption-v2-[a-f0-9]{16}$/u);
+  assert.match(captionConfigFingerprint, /^gemini-caption-v5-[a-f0-9]{16}$/u);
+  assert.deepEqual(captionConfig.engine, DEFAULT_ENGINE_SELECTION);
+  assert.deepEqual(captionConfig.models, { transcription: "gemini-3.5-transcribe-live", polish: "gemini-3.7-flash", summary: "gemini-3.6-flash" });
+  assert.equal("live" in captionConfig.models, false, "the direct Live Translate role is retired");
+  assert.equal(captionConfig.polishPolicy.mode, "selective");
   const legacyTownhall = validateLiveSettings({ mode: "townhall", languages: ["ko"], voiceOutputMode: "auto_voice" });
   assert.equal(legacyTownhall.sessionType, "meeting");
   assert.equal(legacyTownhall.outputMode, "captions");

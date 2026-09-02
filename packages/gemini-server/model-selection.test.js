@@ -47,7 +47,12 @@ test("binding rejects unrelated models or surplus options and requests cannot ov
     }
     assert.throws(() => h.runtime.createSessionClient("selection", workload, { model: MODELS[0], fallback: MODELS[1] }), /INVALID_GEMINI_MODEL_SELECTION/u);
   }
-  assert.throws(() => h.runtime.createSessionClient("selection", "translation", { model: MODELS[0] }), /INVALID_GEMINI_WORKLOAD/u);
+  // The retired direct Live source workload is not a REST workload; translation is, and it accepts only catalog translation models.
+  assert.throws(() => h.runtime.createSessionClient("selection", "source", { model: MODELS[0] }), /INVALID_GEMINI_WORKLOAD/u);
+  for (const model of ["gemini-3.5-transcribe-live", "gemini-3.5-live-translate-preview", "gemini-9-flash", "", null]) {
+    assert.throws(() => h.runtime.createSessionClient("selection", "translation", { model }), /INVALID_GEMINI_MODEL_SELECTION/u);
+  }
+  assert.throws(() => h.runtime.createSessionClient("selection", "translation", { model: "gemini-3.6-flash", fallback: "gemini-3.5-flash-lite" }), /INVALID_GEMINI_MODEL_SELECTION/u);
   assert.throws(() => h.runtime.createSessionClient("selection", "polish", { model: MODELS[1] }), /INVALID_GEMINI_MODEL_SELECTION/u);
   const client = h.runtime.createSessionClient("selection", "topic", { model: MODELS[1] });
   await assert.rejects(client.models.generateContent({ contents, model: MODELS[2] }), /INVALID_GEMINI_DISPATCH/u);

@@ -7,6 +7,8 @@ import {
   GEMINI_WORKLOAD_MODEL_MATRIX,
 } from "../packages/caption-core/index.js";
 import { evaluateGlossaryQuality } from "../packages/caption-core/glossary-quality-eval.js";
+import { CAPTION_ENGINE_CATALOG, DEFAULT_ENGINE_SELECTION, findEngineEntry } from "../packages/caption-core/caption-engine-catalog.js";
+import { GENERATE_WORKLOADS, resolveGeminiWorkloadModel } from "../packages/gemini-server/policy.js";
 import {
   createGeminiPdfGlossaryExtractor,
   createGeminiServerRuntime,
@@ -18,8 +20,12 @@ import {
 } from "../media-gateway/src/google-provider-adapters.js";
 
 const TEXT_MODEL = "gemini-3.7-flash";
-const TRANSCRIPTION_MODEL = "gemini-3.5-transcribe-live";
-const TRANSLATION_MODEL = "gemini-3.6-flash";
+const TRANSCRIPTION_MODEL = DEFAULT_ENGINE_SELECTION.stt.model;
+const TRANSLATION_MODEL = DEFAULT_ENGINE_SELECTION.translation.model;
+// Two-stage captions: Transcribe (STT) -> Flash text translation. The REST
+// workloads the session runtime may dispatch, in dispatch order for the loop below.
+const REST_WORKLOADS = Object.freeze(["topic", "translation", "polish", "recap"]);
+const REST_WORKLOAD_MODELS = Object.freeze(["gemini-3.6-flash", TRANSLATION_MODEL, TEXT_MODEL, "gemini-3.6-flash"]);
 const THINKING_LEVELS = Object.freeze({
   glossaryExtraction: "medium",
   topic: "low",
@@ -48,6 +54,8 @@ function fakeGoogleGenAI(calls, constructions) {
 }
 
 test("workload matrix pins transcription to Transcribe Live and text roles to the engine defaults", () => {
+  assert.equal(TRANSCRIPTION_MODEL, "gemini-3.5-transcribe-live");
+  assert.equal(TRANSLATION_MODEL, "gemini-3.6-flash");
   assert.deepEqual(GEMINI_WORKLOAD_MODEL_MATRIX, {
     transcription: TRANSCRIPTION_MODEL,
     source: TRANSCRIPTION_MODEL,
@@ -58,14 +66,33 @@ test("workload matrix pins transcription to Transcribe Live and text roles to th
     recap: "gemini-3.6-flash",
   });
   assert.equal(Object.isFrozen(GEMINI_WORKLOAD_MODEL_MATRIX), true);
-  assert.throws(
-    () => new GeminiLiveTranscriptionAdapter({ client: { live: { connect() {} } }, model: TEXT_MODEL }),
-    /GEMINI_MODEL_OVERRIDE_FORBIDDEN/u,
-  );
+  // Adapter model checks go through the catalog, not a hard-coded id.
+  for (const forbidden of [TEXT_MODEL, "gemini-3.5-live-translate-preview", "attacker-model"]) {
+    assert.equal(findEngineEntry("stt", "gemini", forbidden), null);
+    assert.throws(
+      () => new GeminiLiveTranscriptionAdapter({ client: { live: { connect() {} } }, model: forbidden }),
+      /GEMINI_MODEL_OVERRIDE_FORBIDDEN/u,
+    );
+  }
   assert.doesNotThrow(() => new GeminiLiveTranscriptionAdapter({
     client: { live: { connect() {} } },
     model: TRANSCRIPTION_MODEL,
   }));
+  assert.equal(new GeminiLiveTranscriptionAdapter({ client: { live: { connect() {} } } }).model, TRANSCRIPTION_MODEL);
+});
+
+test("the translation workload is restored and accepts exactly the catalog translation models", () => {
+  assert.deepEqual([...GENERATE_WORKLOADS].sort(), [...REST_WORKLOADS].sort());
+  assert.equal(GENERATE_WORKLOADS.has("source"), false, "the retired direct Live Translate path stays out of REST");
+  assert.equal(resolveGeminiWorkloadModel("translation"), TRANSLATION_MODEL);
+  for (const entry of CAPTION_ENGINE_CATALOG.translation.filter((candidate) => candidate.provider === "gemini")) {
+    assert.equal(resolveGeminiWorkloadModel("translation", entry.model), entry.model);
+  }
+  for (const forbidden of [TRANSCRIPTION_MODEL, "gemini-3.5-live-translate-preview", "stt-rt-v5", "attacker-model"]) {
+    assert.throws(() => resolveGeminiWorkloadModel("translation", forbidden), /INVALID_GEMINI_MODEL_SELECTION/u);
+  }
+  assert.throws(() => resolveGeminiWorkloadModel("polish", TRANSLATION_MODEL), /INVALID_GEMINI_MODEL_SELECTION/u);
+  assert.throws(() => resolveGeminiWorkloadModel("source"), /INVALID_GEMINI_WORKLOAD/u);
 });
 
 test("SDK runtime owns the exact workload thinking matrix, one-attempt policy, and safe token metrics", async () => {
@@ -81,7 +108,7 @@ test("SDK runtime owns the exact workload thinking matrix, one-attempt policy, a
   });
   const signal = new AbortController().signal;
 
-  for (const workload of ["topic", "polish", "recap"]) {
+  for (const workload of REST_WORKLOADS) {
     await runtime.generateContent({
       sessionId: `contract-${workload}`,
       workload,
@@ -95,22 +122,22 @@ test("SDK runtime owns the exact workload thinking matrix, one-attempt policy, a
     apiKey: "server-only-key",
     httpOptions: { retryOptions: { attempts: 1 } },
   }]);
-  assert.equal(calls.length, 3);
-  for (const [index, workload] of ["topic", "polish", "recap"].entries()) {
-    assert.equal(calls[index].model, ["gemini-3.6-flash", TEXT_MODEL, "gemini-3.6-flash"][index]);
+  assert.equal(calls.length, REST_WORKLOADS.length);
+  for (const [index, workload] of REST_WORKLOADS.entries()) {
+    assert.equal(calls[index].model, REST_WORKLOAD_MODELS[index]);
     assert.equal(calls[index].config.abortSignal, signal);
     assert.deepEqual(calls[index].config.thinkingConfig, { thinkingLevel: THINKING_LEVELS[workload] });
     for (const deprecated of ["temperature", "topP", "topK", "candidateCount"]) {
       assert.equal(Object.hasOwn(calls[index].config, deprecated), false);
     }
   }
-  assert.equal(observations.length, 3);
+  assert.equal(observations.length, REST_WORKLOADS.length);
   for (const [index, observation] of observations.entries()) {
     assert.deepEqual(Object.keys(observation).sort(), [
       "code", "inputTokens", "latencyMilliseconds", "model", "outputTokens", "totalTokens", "usageKnown", "workload",
     ]);
-    assert.equal(observation.workload, ["topic", "polish", "recap"][index]);
-    assert.equal(observation.model, ["gemini-3.6-flash", TEXT_MODEL, "gemini-3.6-flash"][index]);
+    assert.equal(observation.workload, REST_WORKLOADS[index]);
+    assert.equal(observation.model, REST_WORKLOAD_MODELS[index]);
     assert.equal(observation.code, "OK");
     assert.equal(Number.isSafeInteger(observation.inputTokens), true);
     assert.equal(Number.isSafeInteger(observation.outputTokens), true);
@@ -127,7 +154,7 @@ test("SDK runtime owns the exact workload thinking matrix, one-attempt policy, a
     }),
     /INVALID_GEMINI_GENERATION_CONFIG/u,
   );
-  assert.equal(calls.length, 3, "caller thinking overrides must fail before provider dispatch");
+  assert.equal(calls.length, REST_WORKLOADS.length, "caller thinking overrides must fail before provider dispatch");
 
   const unsafeUsageObservations = [];
   const unsafeUsageCalls = [];
@@ -230,6 +257,7 @@ test("translation and polish keep exact deadlines, abort physical work, and neve
     },
   };
   const defaults = new GeminiTextTranslateAdapter({ client: hangingClient, model: TEXT_MODEL });
+  assert.deepEqual(defaults.fallbackModels, [], "the adapter never invents a chain; the factory supplies it from the catalog");
   assert.equal(defaults.timeoutMilliseconds, 6_000);
   assert.equal(defaults.timeoutMilliseconds, captionPolishContract.timeoutMilliseconds);
   assert.equal(defaults.partialTimeoutMilliseconds, 1_200);
@@ -292,12 +320,19 @@ test("the existing offline glossary golden fixture keeps deterministic invariant
 });
 
 
-test("legacy REST translation never accepts a Live Translate model", () => {
-  // The retired direct Live Translate model must still be refused outright.
-  const RETIRED_LIVE_TRANSLATE_MODEL = "gemini-3.5-live-translate-preview";
+test("REST translation accepts only catalog translation models and defaults to the catalog default", () => {
+  // The retired direct Live Translate model and the STT model must be refused outright.
   let calls = 0;
   const client = { models: { generateContent() { calls += 1; throw new Error("must not dispatch"); } } };
-  assert.throws(() => new GeminiTextTranslateAdapter({ client, model: RETIRED_LIVE_TRANSLATE_MODEL }), /GEMINI_MODEL_OVERRIDE_FORBIDDEN/u);
-  assert.equal(new GeminiTextTranslateAdapter({ client }).model, TEXT_MODEL);
+  for (const forbidden of ["gemini-3.5-live-translate-preview", TRANSCRIPTION_MODEL, "attacker-model"]) {
+    assert.equal(findEngineEntry("translation", "gemini", forbidden), null);
+    assert.throws(() => new GeminiTextTranslateAdapter({ client, model: forbidden }), /GEMINI_MODEL_OVERRIDE_FORBIDDEN/u);
+  }
+  assert.equal(new GeminiTextTranslateAdapter({ client }).model, TRANSLATION_MODEL);
+  const entry = findEngineEntry("translation", "gemini", TRANSLATION_MODEL);
+  const chained = new GeminiTextTranslateAdapter({
+    client, model: TRANSLATION_MODEL, fallbackModels: entry.fallbackModels, fallbackClients: entry.fallbackModels.map(() => client),
+  });
+  assert.deepEqual(chained.fallbackModels, ["gemini-3.5-flash-lite"]);
   assert.equal(calls, 0);
 });

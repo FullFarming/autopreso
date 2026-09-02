@@ -267,7 +267,7 @@ test("Gemini text translation serves BOTH partials and finals without an alterna
   const finalText = await adapter.translate({ text: "안녕하세요 여러분 시작하겠습니다", language: "en", sourceLanguage: "ko-KR", intent: "final" });
   assert.equal(finalText, "Hello everyone, let us begin.");
   assert.equal(calls.length, 1);
-  assert.equal(calls[0].model, "gemini-3.7-flash");
+  assert.equal(Object.hasOwn(calls[0], "model"), false, "the session-bound runtime owns model selection");
   assert.equal("thinkingConfig" in calls[0].config, false, "the server runtime owns fixed thinking policy");
   assert.equal("temperature" in calls[0].config, false);
   assert.equal("topP" in calls[0].config, false);
@@ -300,7 +300,7 @@ test("Korean translation prompt preserves only explicit glossary spellings with 
   assert.match(prompt, /only when the glossary explicitly registers/u);
   assert.match(prompt, /Capitalization alone never authorizes untranslated English/u);
   assert.doesNotMatch(prompt, /Keep company names, personal names, and acronyms verbatim/u);
-  assert.equal(calls[0].model, "gemini-3.7-flash");
+  assert.equal(Object.hasOwn(calls[0], "model"), false, "the session-bound runtime owns model selection");
 });
 
 test("Gemini text failure logs only a safe failure code and propagates", async () => {
@@ -662,4 +662,133 @@ test("text translation timeout aborts the SDK request and ignores a late result 
   release({ text: "Revenue increased." });
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(calls, 1);
+});
+
+// --- Catalog model checks and the one-attempt-per-model fallback chain ---
+
+function translateClient(handler) {
+  return { models: { async generateContent(request) { return await handler(request); } } };
+}
+
+function withQuietWarnings(run) {
+  const warnings = [];
+  const originalWarn = console.warn;
+  console.warn = (...values) => warnings.push(values.join(" "));
+  return Promise.resolve().then(run).finally(() => { console.warn = originalWarn; }).then((value) => ({ value, warnings }));
+}
+
+test("adapters accept only catalog Gemini models and default to the catalog selection", () => {
+  const live = { live: { connect() {} } };
+  assert.equal(new GeminiLiveTranscriptionAdapter({ client: live }).model, "gemini-3.5-transcribe-live");
+  assert.equal(new GeminiLiveTranscriptionAdapter({ client: live }).provider, "gemini");
+  for (const forbidden of ["gemini-3.5-live-translate-preview", "gemini-3.7-flash", "attacker-model"]) {
+    assert.throws(() => new GeminiLiveTranscriptionAdapter({ client: live, model: forbidden }), /GEMINI_MODEL_OVERRIDE_FORBIDDEN/u);
+  }
+  const text = translateClient(() => ({ text: "unused" }));
+  const defaults = new GeminiTextTranslateAdapter({ client: text });
+  assert.equal(defaults.model, "gemini-3.6-flash");
+  assert.equal(defaults.provider, "gemini");
+  assert.deepEqual(defaults.fallbackModels, []);
+  for (const model of ["gemini-3.5-flash-lite", "gemini-3.6-flash", "gemini-3.7-flash"]) {
+    assert.equal(new GeminiTextTranslateAdapter({ client: text, model }).model, model);
+  }
+  for (const forbidden of ["gemini-3.5-transcribe-live", "gemini-3.5-live-translate-preview", "stt-rt-v5", "attacker-model"]) {
+    assert.throws(() => new GeminiTextTranslateAdapter({ client: text, model: forbidden }), /GEMINI_MODEL_OVERRIDE_FORBIDDEN/u);
+  }
+  // The chain must be catalog models, distinct from the primary, one client each.
+  assert.throws(() => new GeminiTextTranslateAdapter({ client: text, fallbackModels: ["gemini-3.5-flash-lite"], fallbackClients: [] }), /GEMINI_MODEL_OVERRIDE_FORBIDDEN/u);
+  assert.throws(() => new GeminiTextTranslateAdapter({ client: text, fallbackModels: ["gemini-3.6-flash"], fallbackClients: [text] }), /GEMINI_MODEL_OVERRIDE_FORBIDDEN/u);
+  assert.throws(() => new GeminiTextTranslateAdapter({ client: text, fallbackModels: ["attacker-model"], fallbackClients: [text] }), /GEMINI_MODEL_OVERRIDE_FORBIDDEN/u);
+  assert.throws(() => new GeminiTextTranslateAdapter({ client: text, fallbackModels: ["gemini-3.5-flash-lite"], fallbackClients: [{}] }), /GEMINI_TEXT_CLIENT_UNAVAILABLE/u);
+  const chained = new GeminiTextTranslateAdapter({ client: text, model: "gemini-3.7-flash", fallbackModels: ["gemini-3.6-flash", "gemini-3.5-flash-lite"], fallbackClients: [text, text] });
+  assert.deepEqual(chained.fallbackModels, ["gemini-3.6-flash", "gemini-3.5-flash-lite"]);
+  assert.equal(Object.isFrozen(chained.fallbackModels), true);
+});
+
+test("a transient provider failure moves to the next catalog model exactly once and never returns to the primary", async () => {
+  const calls = [];
+  const unavailable = Object.assign(new Error("Service Unavailable"), { status: 503 });
+  const primary = translateClient(() => { calls.push("primary"); throw unavailable; });
+  const first = translateClient(() => { calls.push("first"); return { text: "Revenue rose." }; });
+  const second = translateClient(() => { calls.push("second"); return { text: "must not be reached" }; });
+  const adapter = new GeminiTextTranslateAdapter({
+    client: primary, model: "gemini-3.6-flash", fallbackModels: ["gemini-3.5-flash-lite", "gemini-3.7-flash"], fallbackClients: [first, second],
+  });
+  const { value, warnings } = await withQuietWarnings(() => adapter.translate({ text: "매출이 올랐습니다", language: "en", sourceLanguage: "ko-KR", intent: "final" }));
+  assert.equal(value, "Revenue rose.");
+  assert.deepEqual(calls, ["primary", "first"]);
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0], /GEMINI_TRANSLATE_FAILED/u);
+  assert.match(warnings[0], /gemini-3\.6-flash/u);
+
+  // 429 and 5xx from either `status` or `code` are transient; every chain model is tried once, then the last error propagates.
+  const attempts = [];
+  const exhausted = new GeminiTextTranslateAdapter({
+    client: translateClient(() => { attempts.push("primary"); throw Object.assign(new Error("rate limited"), { code: 429 }); }),
+    model: "gemini-3.6-flash",
+    fallbackModels: ["gemini-3.5-flash-lite", "gemini-3.7-flash"],
+    fallbackClients: [
+      translateClient(() => { attempts.push("first"); throw Object.assign(new Error("bad gateway"), { status: 502 }); }),
+      translateClient(() => { attempts.push("second"); throw Object.assign(new Error("overloaded"), { status: 503 }); }),
+    ],
+  });
+  const { value: rejected } = await withQuietWarnings(() => exhausted.translate({ text: "매출", language: "en", intent: "final" }).then(() => null, (error) => error));
+  assert.equal(rejected.status, 503);
+  assert.deepEqual(attempts, ["primary", "first", "second"]);
+});
+
+test("quality rejections, caller aborts, and 4xx client errors never trigger a fallback model", async () => {
+  const fallbackCalls = [];
+  const fallback = translateClient(() => { fallbackCalls.push(1); return { text: "never" }; });
+  const build = (handler) => new GeminiTextTranslateAdapter({ client: translateClient(handler), model: "gemini-3.6-flash", fallbackModels: ["gemini-3.5-flash-lite"], fallbackClients: [fallback] });
+  const input = { text: "안녕하세요 여러분", language: "en", sourceLanguage: "ko-KR", intent: "final" };
+  await withQuietWarnings(async () => {
+    await assert.rejects(build(() => ({ text: "안녕하세요 여러분" })).translate(input), /TRANSLATION_WRONG_SCRIPT/u);
+    await assert.rejects(build(() => ({ text: "<b>Hi</b>" })).translate(input), /TRANSLATION_INVALID/u);
+    await assert.rejects(build(() => { throw Object.assign(new Error("bad request"), { status: 400 }); }).translate(input), /bad request/u);
+    await assert.rejects(build(() => { throw new Error("GEMINI_DOWN"); }).translate(input), /GEMINI_DOWN/u);
+    const controller = new AbortController();
+    const aborting = build(() => new Promise(() => {}));
+    const pending = assert.rejects(aborting.translate({ ...input, signal: controller.signal }), /GEMINI_TRANSLATE_ABORTED/u);
+    await Promise.resolve();
+    controller.abort();
+    await pending;
+  });
+  assert.equal(fallbackCalls.length, 0);
+});
+
+test("a fallback runs only inside the caller's remaining deadline, so a primary timeout leaves no second paid attempt", async (context) => {
+  context.mock.timers.enable({ apis: ["setTimeout"] });
+  let clock = 0;
+  const now = () => clock;
+  const fallbackCalls = [];
+  const fallback = translateClient(() => { fallbackCalls.push(1); return { text: "never" }; });
+  const adapter = new GeminiTextTranslateAdapter({
+    client: translateClient(() => new Promise(() => {})), model: "gemini-3.6-flash",
+    fallbackModels: ["gemini-3.5-flash-lite"], fallbackClients: [fallback], timeoutMilliseconds: 100, now,
+  });
+  const { value: error } = await withQuietWarnings(async () => {
+    const translating = adapter.translate({ text: "매출 증가", language: "en", intent: "final" }).then(() => null, (reason) => reason);
+    await Promise.resolve();
+    clock = 100;
+    context.mock.timers.tick(100);
+    return await translating;
+  });
+  assert.equal(error.message, "GEMINI_TRANSLATE_TIMEOUT");
+  assert.equal(fallbackCalls.length, 0);
+
+  // A fast 503 leaves budget: the fallback gets the remainder, not a fresh full timeout.
+  let fallbackRequest;
+  const budgeted = new GeminiTextTranslateAdapter({
+    client: translateClient(() => { clock += 40; throw Object.assign(new Error("overloaded"), { status: 503 }); }),
+    model: "gemini-3.6-flash",
+    fallbackModels: ["gemini-3.5-flash-lite"],
+    fallbackClients: [translateClient((request) => { fallbackRequest = request; return { text: "Revenue rose."}; })],
+    timeoutMilliseconds: 1_000,
+    now,
+  });
+  clock = 0;
+  const { value } = await withQuietWarnings(() => budgeted.translate({ text: "매출이 올랐습니다", language: "en", sourceLanguage: "ko-KR", intent: "final" }));
+  assert.equal(value, "Revenue rose.");
+  assert.ok(fallbackRequest.config.abortSignal instanceof AbortSignal);
 });

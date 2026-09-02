@@ -5,7 +5,7 @@ import {
   createGeminiServerRuntime,
   GEMINI_SERVER_WORKLOAD_MODELS,
 } from "./index.js";
-import { parseUsage } from "./policy.js";
+import { parseUsage, readStrictOutputText } from "./policy.js";
 
 function createFakeGoogleGenAI(handler) {
   const constructions = [];
@@ -19,6 +19,76 @@ function createFakeGoogleGenAI(handler) {
   return { FakeGoogleGenAI, constructions };
 }
 
+function completedResponse(text) {
+  return { candidates: [{ finishReason: "STOP", content: { parts: [{ text }] } }] };
+}
+
+test("nonstream output requires the first candidate to have completed normally", () => {
+  for (const finishReason of [undefined, null, "", "MAX_TOKENS", "FINISH_REASON_UNSPECIFIED", "STOP_OTHER"]) {
+    assert.throws(() => readStrictOutputText({
+      text: "private-convenience-text",
+      candidates: [{ finishReason, content: { parts: [{ text: "unfinished output" }] } }],
+    }, 100), /GEMINI_OUTPUT_INVALID/u);
+  }
+  assert.throws(() => readStrictOutputText({ text: "convenience-only" }, 100), /GEMINI_OUTPUT_INVALID/u);
+  assert.throws(() => readStrictOutputText({ candidates: [
+    { finishReason: "MAX_TOKENS", content: { parts: [{ text: "unfinished" }] } },
+    { finishReason: "STOP", content: { parts: [{ text: "other candidate" }] } },
+  ] }, 100), /GEMINI_OUTPUT_INVALID/u);
+});
+
+test("normally completed output excludes thought parts and does not trust the convenience text getter", () => {
+  assert.equal(readStrictOutputText({
+    get text() { throw new Error("private-getter-must-not-run"); },
+    candidates: [{ finishReason: "STOP", content: { parts: [
+      { thought: true, text: "private-thought" }, { text: "정상 " }, { thought: false, text: "자막" },
+    ] } }],
+  }, 100), "정상 자막");
+  assert.throws(() => readStrictOutputText({
+    text: "private-thought",
+    candidates: [{ finishReason: "STOP", content: { parts: [{ thought: true, text: "private-thought" }] } }],
+  }, 100), /GEMINI_OUTPUT_UNSAFE/u);
+});
+
+test("raw completed output preserves legitimate multiline text but rejects other control characters and markup", () => {
+  const source = "첫 번째 문장입니다.\n두 번째 문장입니다.\r\n\t세 번째 문장입니다.";
+  assert.equal(readStrictOutputText(completedResponse(source), 100), source);
+  for (const unsafe of ["first\u0000second", "first\u0007second", "first\u000bsecond", "first\u001fsecond", "first\u007fsecond", "first\u0085second", "first\u202esecond", "<script>alert(1)</script>"]) {
+    assert.throws(() => readStrictOutputText(completedResponse(unsafe), 100), /GEMINI_OUTPUT_UNSAFE/u);
+  }
+});
+
+test("formatted summary JSON is accepted but parsed summary values still reject embedded control characters", async () => {
+  const outputs = ['{\n\t"summary": "정상 요약"\n}', '{\n  "summary": "첫 줄\\n다음 줄"\n}'];
+  const { FakeGoogleGenAI } = createFakeGoogleGenAI(async () => completedResponse(outputs.shift()));
+  const runtime = createGeminiServerRuntime({ GoogleGenAI: FakeGoogleGenAI, apiKey: "fixture" });
+  const request = { sessionId: "formatted-summary", prompt: "Summarize.", validate: (value) => value,
+    responseJsonSchema: { type: "object", additionalProperties: false, required: ["summary"], properties: { summary: { type: "string" } } } };
+  assert.deepEqual(await runtime.generateRecap(request), { summary: "정상 요약" });
+  await assert.rejects(runtime.generateRecap(request), /GEMINI_OUTPUT_UNSAFE/u);
+});
+
+test("a truncated text response fails once through the bound runtime while retaining reported usage", async () => {
+  const observations = [];
+  let calls = 0;
+  const { FakeGoogleGenAI } = createFakeGoogleGenAI(async () => {
+    calls += 1;
+    return {
+      candidates: [{ finishReason: "MAX_TOKENS", content: { parts: [{ text: "private-truncated-output" }] } }],
+      usageMetadata: { promptTokenCount: 11, candidatesTokenCount: 4, totalTokenCount: 15 },
+    };
+  });
+  const runtime = createGeminiServerRuntime({ GoogleGenAI: FakeGoogleGenAI, apiKey: "fixture", observe: (event) => observations.push(event) });
+  const client = runtime.createSessionClient("truncation-fixture", "polish");
+  await assert.rejects(client.models.generateContent({ contents: [{ role: "user", parts: [{ text: "Translate." }] }] }), /GEMINI_OUTPUT_INVALID/u);
+  assert.equal(calls, 1);
+  assert.equal(observations.length, 1);
+  assert.equal(observations[0].code, "GEMINI_OUTPUT_INVALID");
+  assert.equal(observations[0].usageKnown, true);
+  assert.equal(observations[0].totalTokens, 15);
+  assert.doesNotMatch(JSON.stringify(observations), /private-|truncation-fixture/u);
+});
+
 test("token observations distinguish unknown usage from an explicitly reported zero", () => {
   const zero = { inputTokens: 0, outputTokens: 0, totalTokens: 0 };
   assert.deepEqual(parseUsage(undefined), { ...zero, usageKnown: false });
@@ -31,11 +101,11 @@ test("token observations distinguish unknown usage from an explicitly reported z
 test("rejected paid responses retain their actual usage and network failures remain unknown without retry", async () => {
   const usageMetadata = { promptTokenCount: 11, candidatesTokenCount: 4, totalTokenCount: 15 };
   const responses = [
-    { text: "<b>unsafe</b>", usageMetadata },
+    { ...completedResponse("<b>unsafe</b>"), usageMetadata },
     { promptFeedback: { blockReason: "SAFETY" }, usageMetadata },
     { usageMetadata },
     new Error("NETWORK_FAILED"),
-    { text: "safe" },
+    completedResponse("safe"),
   ];
   const observations = [];
   let calls = 0;
@@ -46,7 +116,7 @@ test("rejected paid responses retain their actual usage and network failures rem
     return response;
   });
   const runtime = createGeminiServerRuntime({ GoogleGenAI: FakeGoogleGenAI, apiKey: "fixture", observe: (event) => observations.push(event) });
-  const request = { sessionId: "usage-fixture", workload: "translation", contents: [{ role: "user", parts: [{ text: "Translate." }] }] };
+  const request = { sessionId: "usage-fixture", workload: "polish", contents: [{ role: "user", parts: [{ text: "Translate." }] }] };
   for (const code of ["GEMINI_OUTPUT_UNSAFE", "GEMINI_PROVIDER_REFUSAL", "GEMINI_OUTPUT_INVALID", "GEMINI_PROVIDER_FAILED"]) {
     await assert.rejects(runtime.generateContent(request), new RegExp(code, "u"));
   }
@@ -66,7 +136,7 @@ test("server runtime constructs one no-retry client and dispatches only fixed wo
   const { FakeGoogleGenAI, constructions } = createFakeGoogleGenAI(async (request) => {
     calls.push(request);
     return {
-      text: "정상 응답",
+      ...completedResponse("정상 응답"),
       usageMetadata: { promptTokenCount: 11, candidatesTokenCount: 4, totalTokenCount: 15 },
     };
   });
@@ -79,7 +149,7 @@ test("server runtime constructs one no-retry client and dispatches only fixed wo
   const signal = new AbortController().signal;
   const result = await runtime.generateContent({
     sessionId: "session-1",
-    workload: "translation",
+    workload: "polish",
     contents: [{ role: "user", parts: [{ text: `담당자@회사.한국 ${"A".repeat(43)} 매출 123456` }] }],
     config: { systemInstruction: "Translate safely.", maxOutputTokens: 128 },
     signal,
@@ -89,7 +159,7 @@ test("server runtime constructs one no-retry client and dispatches only fixed wo
     apiKey: "server-only-key",
     httpOptions: { retryOptions: { attempts: 1 } },
   }]);
-  assert.equal(calls[0].model, GEMINI_SERVER_WORKLOAD_MODELS.translation);
+  assert.equal(calls[0].model, GEMINI_SERVER_WORKLOAD_MODELS.polish);
   assert.equal(calls[0].config.abortSignal, signal);
   assert.equal("temperature" in calls[0].config, false);
   assert.equal("topP" in calls[0].config, false);
@@ -105,7 +175,7 @@ test("server runtime constructs one no-retry client and dispatches only fixed wo
   }), { text: "정상 응답" });
   assert.equal(calls[1].model, GEMINI_SERVER_WORKLOAD_MODELS.polish);
   assert.deepEqual(observations[0], {
-    workload: "translation",
+    workload: "polish",
     model: "gemini-3.7-flash",
     latencyMilliseconds: 5,
     inputTokens: 11,
@@ -125,10 +195,10 @@ test("every SDK prompt boundary redacts a raw six-digit field but preserves cont
   const calls = [];
   const { FakeGoogleGenAI } = createFakeGoogleGenAI(async (request) => {
     calls.push(request);
-    return { text: "safe" };
+    return completedResponse("safe");
   });
   const runtime = createGeminiServerRuntime({ GoogleGenAI: FakeGoogleGenAI, apiKey: "server-only-key" });
-  for (const workload of ["topic", "translation", "polish", "recap"]) {
+  for (const workload of ["topic", "polish", "recap"]) {
     await runtime.generateContent({
       sessionId: `session-${workload}`,
       workload,
@@ -141,7 +211,7 @@ test("every SDK prompt boundary redacts a raw six-digit field but preserves cont
     assert.equal(call.contents[0].parts[1].text, "매출 123456");
     assert.equal(call.config.systemInstruction, "[CODE]");
   }
-  assert.deepEqual(calls.map((call) => call.config.thinkingConfig?.thinkingLevel), ["low", "low", "low", "medium"]);
+  assert.deepEqual(calls.map((call) => call.config.thinkingConfig?.thinkingLevel), ["low", "low", "medium"]);
 });
 
 test("outstanding provider work retains global and session slots after caller timeout", async () => {
@@ -151,7 +221,7 @@ test("outstanding provider work retains global and session slots after caller ti
   const { FakeGoogleGenAI } = createFakeGoogleGenAI(async () => {
     calls += 1;
     if (calls === 1) return firstResponse;
-    return { text: "후속 응답" };
+    return completedResponse("후속 응답");
   });
   const runtime = createGeminiServerRuntime({
     GoogleGenAI: FakeGoogleGenAI,
@@ -173,7 +243,7 @@ test("outstanding provider work retains global and session slots after caller ti
     }),
     /GEMINI_GLOBAL_BUDGET_EXHAUSTED/u,
   );
-  releaseFirst({ text: "첫 응답" });
+  releaseFirst(completedResponse("첫 응답"));
   await underlying;
   assert.deepEqual(await runtime.generateContent({
     sessionId: "session-1", workload: "polish",
@@ -183,8 +253,8 @@ test("outstanding provider work retains global and session slots after caller ti
 
 test("recap has no model input and returns only schema-valid caller-validated values", async () => {
   const responses = [
-    { text: '{"summary":"임대 현황","actions":["검토"]}' },
-    { text: '{"summary":"임대 현황","actions":[],"unknown":true}' },
+    completedResponse('{"summary":"임대 현황","actions":["검토"]}'),
+    completedResponse('{"summary":"임대 현황","actions":[],"unknown":true}'),
     { promptFeedback: { blockReason: "SAFETY" } },
   ];
   const calls = [];
@@ -219,9 +289,9 @@ test("recap has no model input and returns only schema-valid caller-validated va
 
 test("runtime rejects unknown workloads, deprecated sampling, unsafe output, and non-numeric usage", async () => {
   const responses = [
-    { text: "<b>markup</b>" },
-    { text: "NFC 가" },
-    { text: "safe", usageMetadata: { promptTokenCount: "secret" } },
+    completedResponse("<b>markup</b>"),
+    completedResponse("NFC 가"),
+    { ...completedResponse("safe"), usageMetadata: { promptTokenCount: "secret" } },
   ];
   const { FakeGoogleGenAI } = createFakeGoogleGenAI(async () => responses.shift());
   const runtime = createGeminiServerRuntime({ GoogleGenAI: FakeGoogleGenAI, apiKey: "server-only-key" });
@@ -255,7 +325,7 @@ test("request-rate and schema bounds reject before provider dispatch without lea
   });
   const base = {
     sessionId: "session-1",
-    workload: "translation",
+    workload: "polish",
     contents: [{ role: "user", parts: [{ text: "safe prompt" }] }],
   };
   await assert.rejects(() => runtime.generateContent(base), /^Error: GEMINI_PROVIDER_FAILED$/u);
@@ -297,7 +367,7 @@ test("rejected semaphore admission spends no rate quota and expired session wind
   const { FakeGoogleGenAI } = createFakeGoogleGenAI(async () => {
     calls += 1;
     if (calls === 1) return first;
-    return { text: "safe" };
+    return completedResponse("safe");
   });
   const runtime = createGeminiServerRuntime({
     GoogleGenAI: FakeGoogleGenAI,
@@ -318,7 +388,7 @@ test("rejected semaphore admission spends no rate quota and expired session wind
   });
   const pending = runtime.generateContent(request("session-1"));
   await assert.rejects(() => runtime.generateContent(request("session-2")), /GEMINI_GLOBAL_BUDGET_EXHAUSTED/u);
-  releaseFirst({ text: "safe" });
+  releaseFirst(completedResponse("safe"));
   await pending;
   await assert.rejects(() => runtime.generateContent(request("session-2")), /GEMINI_SESSION_RATE_STATE_EXHAUSTED/u);
   assert.equal(calls, 1);
@@ -326,4 +396,40 @@ test("rejected semaphore admission spends no rate quota and expired session wind
   assert.deepEqual(await runtime.generateContent(request("session-2")), { outputText: "safe" });
   assert.equal(calls, 2);
   runtime.releaseSession("session-2");
+});
+
+
+test("REST generation rejects the retired Live source workloads before any provider dispatch", async () => {
+  let calls = 0;
+  const { FakeGoogleGenAI } = createFakeGoogleGenAI(async () => { calls += 1; return completedResponse("unused"); });
+  const runtime = createGeminiServerRuntime({ GoogleGenAI: FakeGoogleGenAI, apiKey: "fixture" });
+  for (const workload of ["source", "live", "glossaryExtraction", "transcription"]) {
+    assert.throws(() => runtime.createSessionClient("live-workload-fixture", workload), /INVALID_GEMINI_WORKLOAD/u);
+    await assert.rejects(runtime.generateContent({
+      sessionId: "live-workload-fixture", workload,
+      contents: [{ role: "user", parts: [{ text: "Do not send this through REST." }] }],
+    }), /INVALID_GEMINI_WORKLOAD/u);
+  }
+  assert.equal(calls, 0);
+});
+
+test("REST translation is the two-stage text workload, bound to one catalog translation model per session client", async () => {
+  const requests = [];
+  const { FakeGoogleGenAI } = createFakeGoogleGenAI(async (request) => { requests.push(request); return completedResponse("Revenue rose."); });
+  const runtime = createGeminiServerRuntime({ GoogleGenAI: FakeGoogleGenAI, apiKey: "fixture" });
+  for (const forbidden of ["gemini-3.5-transcribe-live", "gemini-3.5-live-translate-preview", "stt-rt-v5", "attacker-model"]) {
+    assert.throws(() => runtime.createSessionClient("translation-fixture", "translation", { model: forbidden }), /INVALID_GEMINI_MODEL_SELECTION/u);
+  }
+  assert.equal(requests.length, 0);
+  const contents = [{ role: "user", parts: [{ text: "매출이 올랐습니다" }] }];
+  const lite = runtime.createSessionClient("translation-fixture", "translation", { model: "gemini-3.5-flash-lite" });
+  await lite.models.generateContent({ contents, config: { maxOutputTokens: 64 } });
+  const defaulted = runtime.createSessionClient("translation-default", "translation");
+  await defaulted.models.generateContent({ contents, config: { maxOutputTokens: 64 } });
+  assert.equal(requests.length, 2);
+  assert.equal(requests[0].model, "gemini-3.5-flash-lite");
+  assert.equal(requests[1].model, "gemini-3.6-flash");
+  for (const request of requests) assert.deepEqual(request.config.thinkingConfig, { thinkingLevel: "low" });
+  runtime.releaseSession("translation-fixture");
+  runtime.releaseSession("translation-default");
 });
