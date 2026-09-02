@@ -11,6 +11,7 @@ import { test } from "node:test";
 import { WebSocket } from "ws";
 
 import { createSubtitleRealtimeManager } from "../src/subtitle-realtime.js";
+import { createSttTransport as createRealSttTransport } from "../src/caption-engine/create-stt-transport.js";
 
 class FakeSocket extends EventEmitter {
   constructor(url, init) {
@@ -82,17 +83,22 @@ test("restartChannels rebuilds translation channels while keeping the session al
   const initialCount = sockets.length;
   assert.ok(initialCount > 0);
 
-  const restarted = await manager.restartChannels({ reason: "test" });
-  assert.equal(restarted, true);
+  // Open-new-before-close-old means restartChannels only settles once the
+  // replacement is ready (or its waitUntilReady timeout expires), so it must
+  // be driven to readiness rather than merely awaited - otherwise the test
+  // burns the full 2.5s fallback for no reason.
+  const restarting = manager.restartChannels({ reason: "test" });
+  await new Promise((resolve) => setImmediate(resolve));
   assert.ok(sockets.length > initialCount, "new sockets are opened for the rebuilt channels");
+  for (const socket of sockets.slice(initialCount)) {
+    socket.emit("message", JSON.stringify({ setupComplete: {} }));
+  }
+  const restarted = await restarting;
+  assert.equal(restarted, true);
   assert.equal(manager._state.sessionId, "active", "the session survives the rebuild");
   assert.equal(manager._state.active, true);
 
   // Audio continues to flow into the NEW channels under the same session id.
-  await new Promise((resolve) => setTimeout(resolve, 5));
-  for (const socket of sockets.slice(initialCount)) {
-    socket.emit("message", JSON.stringify({ setupComplete: {} }));
-  }
   const before = sockets.reduce((sum, socket) => sum + socket.sent.length, 0);
   manager.sendAudio({ sessionId: "active", source: "mic", audio: "AAAA" });
   const after = sockets.reduce((sum, socket) => sum + socket.sent.length, 0);
@@ -245,7 +251,13 @@ test("retired channel handlers cannot affect the rebuilt session", async () => {
 
   await manager.start({ sessionId: "generation-fence" });
   const retiredSocket = sockets[0];
-  await manager.restartChannels({ reason: "generation_fence_test" });
+  const initialCount = sockets.length;
+  const restarting = manager.restartChannels({ reason: "generation_fence_test" });
+  await new Promise((resolve) => setImmediate(resolve));
+  for (const socket of sockets.slice(initialCount)) {
+    socket.emit("message", JSON.stringify({ setupComplete: {} }));
+  }
+  await restarting;
   broadcasts.length = 0;
 
   retiredSocket.emit("error", new Error("late retired provider failure"));
@@ -367,6 +379,58 @@ test("restartChannels opens the replacement socket before closing the old one", 
     .map((message) => `${message.status}:${message.reason ?? ""}`);
   assert.ok(statuses.includes("recovering:engine_change"));
   assert.equal(statuses.at(-1), "listening:");
+
+  await manager.stop();
+});
+
+// Fix round 1: if the replacement engine cannot even be constructed (e.g. an
+// invalid engine selection reaching the transport factory), restartChannels
+// must resolve false - never reject - after closing the still-live previous
+// channels and reporting the failure, leaving exactly one generation of
+// clients (zero, since the replacement never got one either) behind.
+test("restartChannels resolves false and cleans up when the replacement engine cannot be constructed", async () => {
+  const sockets = [];
+  const broadcasts = [];
+  let transportCalls = 0;
+  const manager = createSubtitleRealtimeManager({
+    broadcast: (message) => broadcasts.push(message),
+    settingsStore: {
+      load: async () => ({
+        apiKeys: { gemini: "AIza-test" },
+        subtitle: { translationProvider: "gemini", inputMode: "mic", languagePair: { a: "en", b: "ko" } },
+      }),
+    },
+    createWebSocket: (url, protocols, init) => {
+      const socket = new FakeSocket(url, init);
+      sockets.push(socket);
+      setImmediate(() => socket.emit("open"));
+      return socket;
+    },
+    log: { warn() {} },
+    polish: async () => "This is a translated caption.",
+    partialTranslationDebounceMs: 0,
+    // First call (start()) builds the real transport so the first socket
+    // behaves normally; the second call (restartChannels's replacement)
+    // simulates an engine selection that fails to construct at all.
+    createSttTransport: (args) => {
+      transportCalls += 1;
+      if (transportCalls === 2) throw new Error("ENGINE_SELECTION_INVALID");
+      return createRealSttTransport(args);
+    },
+  });
+
+  await manager.start({ sessionId: "engine-restart-failure" });
+  await new Promise((resolve) => setImmediate(resolve));
+  const first = sockets.at(-1);
+  first.emit("message", JSON.stringify({ setupComplete: {} }));
+
+  const restarted = await manager.restartChannels({ reason: "engine_change" });
+  assert.equal(restarted, false, "a construction failure must resolve false, not reject");
+  assert.equal(first.closed, true, "the old socket was closed");
+  const failure = broadcasts.find((message) => message.type === "subtitle:error"
+    && message.code === "ENGINE_RESTART_FAILED");
+  assert.ok(failure, "subtitle:error with ENGINE_RESTART_FAILED was broadcast");
+  assert.equal(manager._state.clients.size, 0, "no client generation is left dangling");
 
   await manager.stop();
 });

@@ -295,8 +295,22 @@ export function createSubtitleRealtimeManager(options = {}) {
         replacements = sourcesForInputMode(normalizedSettings.inputMode).map((source) => ensureClient(source));
         for (const client of replacements) client.open();
       } catch (error) {
+        // The replacement engine could not even be constructed (e.g. an
+        // invalid engine selection slipping past validation). The OLD
+        // channels are still the ones state.clients pointed at before this
+        // block ran, so closing them here - rather than rethrowing and
+        // leaving both generations half-alive - is what actually restores a
+        // clean, single-generation state.
         await Promise.all(previousClients.map((client) => client.close({ graceful: true })));
-        throw error;
+        log.warn?.(`[subtitle] restartChannels failed to open replacement channels: ${redactTransportDiagnostic(error?.message ?? error)}`);
+        broadcast?.({
+          type: "subtitle:error",
+          code: "ENGINE_RESTART_FAILED",
+          reason,
+          message: "엔진 교체에 실패했습니다. 설정을 확인하고 자막을 다시 시작해 주세요.",
+          recoveryAllowed: false,
+        });
+        return false;
       }
       await Promise.all(replacements.map((client) => client.waitUntilReady(2_500).catch(() => undefined)));
       if (!state.active || state.sessionId !== ownerSessionId || producerGeneration !== replacementGeneration) {
