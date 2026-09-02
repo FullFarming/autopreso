@@ -1227,7 +1227,8 @@ test("desktop terminal paths clear caption text and speaker state without treati
 
   assert.match(dashboard, /function clearActiveSubtitleSurface\(\)/u);
   assert.match(dashboard, /message\.status === "idle"[\s\S]{0,220}clearActiveSubtitleSurface\(\)/u);
-  assert.match(dashboard, /async function stopSubtitles\(\)[\s\S]{0,260}clearActiveSubtitleSurface\(\)/u);
+  // stopSubtitles takes an options bag now; the clear-on-stop guarantee is unchanged.
+  assert.match(dashboard, /async function stopSubtitles\([\s\S]{0,260}clearActiveSubtitleSurface\(\)/u);
   assert.match(dashboard, /floor\?\.type === "live-call-ended"[\s\S]{0,260}clearActiveSubtitleSurface\(\)/u);
 
   const reconnectStart = dashboard.indexOf("async function reconnectLiveCallTranslation()");

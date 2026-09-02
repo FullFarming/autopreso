@@ -2,8 +2,12 @@
 import { HttpsProxyAgent } from "https-proxy-agent";
 import { WebSocket } from "ws";
 
-import { createGeminiTranscribeTransport, geminiTranscribeContract } from "./gemini-live-transcribe.js";
+import { createSttTransport } from "./caption-engine/create-stt-transport.js";
 import { DEFAULT_SUBTITLE_SETTINGS } from "./settings-store.js";
+import {
+  engineRequiredApiKeys,
+  normalizeEngineSelection,
+} from "../packages/caption-core/caption-engine-catalog.js";
 import {
   applyGlossaryCorrections,
   countLanguageSignalChars,
@@ -15,7 +19,6 @@ import {
   isEllipsisPlaceholder,
   isOutputInTargetLanguage,
   isFixedTargetOutputSupported,
-  selectGeminiTranscriptionVocabularyFromLegacyText,
 } from "../packages/caption-core/index.js";
 import {
   MAX_TRANSLATION_LANGUAGES,
@@ -67,6 +70,8 @@ export function createSubtitleRealtimeManager(options = {}) {
     transcribeFinalDrainMs = TRANSCRIBE_FINAL_DRAIN_MS,
     reconnectBaseMs = RECONNECT_BASE_MS,
     polish = async ({ translatedText }) => translatedText,
+    // Injection point for tests and for Task 5's Soniox transport.
+    createSttTransport: createTransport = createSttTransport,
   } = options;
   const proxyUrl = env.HTTPS_PROXY || env.https_proxy || "";
   const proxyAgent = proxyUrl ? new HttpsProxyAgent(proxyUrl) : undefined;
@@ -89,7 +94,7 @@ export function createSubtitleRealtimeManager(options = {}) {
     captionConfig: null,
     clients: new Map(),
     active: false,
-    apiKeys: { gemini: "", geminiSecondary: "" },
+    apiKeys: { gemini: "", geminiSecondary: "", soniox: "" },
   };
   let producerGeneration = 0;
   let restartInFlight = false;
@@ -152,17 +157,29 @@ export function createSubtitleRealtimeManager(options = {}) {
     });
   }
 
+  // Every provider the selected engine touches needs its own key slot; the
+  // engine catalog decides which of them are actually required.
+  function readApiKeys(saved = {}) {
+    return {
+      gemini: String(saved.apiKeys?.gemini || env.GEMINI_API_KEY || "").trim(),
+      geminiSecondary: String(saved.apiKeys?.geminiSecondary || env.GEMINI_SECONDARY_API_KEY || "").trim(),
+      soniox: String(saved.apiKeys?.soniox || env.SONIOX_API_KEY || "").trim(),
+    };
+  }
+
+  function assertEngineApiKeys(engine, apiKeys) {
+    const missingKey = engineRequiredApiKeys(engine).find((name) => !apiKeys[name]);
+    if (missingKey) throw new Error(`${missingKey} API key is required for the selected caption engine.`);
+  }
+
   /** @param {{sessionId?: string, settings?: Record<string, unknown>}} [input] */
   async function start({ sessionId, settings = {} } = {}) {
     if (typeof sessionId !== "string" || !sessionId) throw new Error("subtitle:start requires a sessionId.");
     await stop();
     const saved = settingsStore ? await settingsStore.load() : {};
     const normalizedSettings = normalizeSubtitleSettings({ ...(saved.subtitle ?? {}), ...(settings ?? {}) });
-    const apiKeys = {
-      gemini: String(saved.apiKeys?.gemini || env.GEMINI_API_KEY || "").trim(),
-      geminiSecondary: String(saved.apiKeys?.geminiSecondary || env.GEMINI_SECONDARY_API_KEY || "").trim(),
-    };
-    if (!apiKeys.gemini) throw new Error("Gemini API key is required for realtime subtitles.");
+    const apiKeys = readApiKeys(saved);
+    assertEngineApiKeys(normalizedSettings.engine, apiKeys);
     state.sessionId = sessionId;
     state.settings = normalizedSettings;
     state.captionConfig = createGeminiCaptionConfig(normalizedSettings);
@@ -186,7 +203,11 @@ export function createSubtitleRealtimeManager(options = {}) {
       source,
       settings: state.settings,
       captionConfig: state.captionConfig,
-      apiKey: state.apiKeys.gemini,
+      transport: createTransport({
+        engine: state.settings.engine,
+        settings: state.settings,
+        apiKeys: state.apiKeys,
+      }),
       createWebSocket,
       broadcast: (message) => broadcastCurrent(message, ownerSessionId, ownerGeneration),
       log,
@@ -244,14 +265,14 @@ export function createSubtitleRealtimeManager(options = {}) {
       const saved = settingsStore ? await settingsStore.load() : {};
       if (!state.active || state.sessionId !== ownerSessionId) return false;
       const normalizedSettings = normalizeSubtitleSettings({ ...(state.settings ?? {}), ...(saved.subtitle ?? {}) });
-      const apiKey = String(saved.apiKeys?.gemini || env.GEMINI_API_KEY || "").trim();
-      if (!apiKey) throw new Error("Gemini API key is required for realtime subtitles.");
+      const apiKeys = readApiKeys(saved);
+      assertEngineApiKeys(normalizedSettings.engine, apiKeys);
       const clients = [...state.clients.values()];
       state.clients.clear();
       producerGeneration += 1;
       state.settings = normalizedSettings;
       state.captionConfig = createGeminiCaptionConfig(normalizedSettings);
-      state.apiKeys = { gemini: apiKey, geminiSecondary: "" };
+      state.apiKeys = apiKeys;
       broadcast?.({ type: "subtitle:status", status: "recovering", reason });
       await Promise.all(clients.map((client) => client.close()));
       if (!state.active || state.sessionId !== ownerSessionId) return false;
@@ -288,7 +309,7 @@ function createSourceTranscriptionClient({
   source,
   settings,
   captionConfig,
-  apiKey,
+  transport,
   createWebSocket,
   broadcast,
   log,
@@ -300,8 +321,8 @@ function createSourceTranscriptionClient({
   transcribeFinalDrainMs,
   reconnectBaseMs,
 }) {
-  const vocabulary = selectGeminiTranscriptionVocabularyFromLegacyText(settings.glossary);
-  const transport = createGeminiTranscribeTransport({ apiKey, customVocabulary: vocabulary });
+  const providerLabel = transport.providerLabel ?? "Gemini Transcribe";
+  const maximumSessionMs = transport.maximumSessionMilliseconds ?? Number.POSITIVE_INFINITY;
   const lanes = languageTargets(settings).map((targetLanguage) => createTextTranslationLane({
     source,
     targetLanguage,
@@ -347,7 +368,7 @@ function createSourceTranscriptionClient({
     rolloverTimer = setTimeout(() => {
       if (socket !== openedSocket || intentionalClose) return;
       requestGracefulRollover(openedSocket, "session_rollover");
-    }, Math.min(transcribeRolloverMs, geminiTranscribeContract.maximumSessionMilliseconds - 1));
+    }, Math.min(transcribeRolloverMs, maximumSessionMs - 1));
     rolloverTimer.unref?.();
   }
 
@@ -376,7 +397,7 @@ function createSourceTranscriptionClient({
       if (socket !== openedSocket || configured || intentionalClose) return;
       broadcast({
         type: "subtitle:error",
-        message: `Gemini Transcribe 세션 준비 응답이 지연되었습니다 (${source}).`,
+        message: `${providerLabel} 세션 준비 응답이 지연되었습니다 (${source}).`,
         code: "TRANSCRIBE_SETUP_TIMEOUT",
       });
       openedSocket.terminate?.();
@@ -389,7 +410,7 @@ function createSourceTranscriptionClient({
     if (reconnectAttempts >= MAX_AUTO_RECONNECTS) {
       broadcast({
         type: "subtitle:error",
-        message: `Gemini Transcribe 재연결을 중단했습니다 (${source}). 네트워크와 API 키를 확인한 뒤 자막을 다시 시작하세요.`,
+        message: `${providerLabel} 재연결을 중단했습니다 (${source}). 네트워크와 API 키를 확인한 뒤 자막을 다시 시작하세요.`,
         code: "TRANSCRIBE_RECONNECT_EXHAUSTED",
       });
       return;
@@ -409,7 +430,7 @@ function createSourceTranscriptionClient({
 
   function ensureSocket() {
     if (socket) return socket;
-    if (!String(apiKey ?? "").trim()) throw new Error("Gemini API key is required for realtime subtitles.");
+    if (typeof transport.assertReady === "function") transport.assertReady();
     const openedSocket = transport.connect({ createWebSocket });
     socket = openedSocket;
     configured = false;
@@ -424,6 +445,12 @@ function createSourceTranscriptionClient({
         onTransportReady: () => markTransportReady(openedSocket),
         onInterim: (event) => { for (const lane of lanes) lane.preview(event); },
         onFinal: (event) => { for (const lane of lanes) lane.commit(event); },
+        // Combined STT+translation providers surface the translation themselves;
+        // Gemini Transcribe never fires these two.
+        onTranslation: (event) => {
+          for (const lane of lanes) if (lane.targetLanguage === event.targetLanguage) lane.acceptProviderTranslation(event);
+        },
+        onBoundary: (kind) => { for (const lane of lanes) lane.onProviderBoundary?.(kind); },
         onServerGoAway: () => {
           requestGracefulRollover(openedSocket, "provider_go_away");
         },
@@ -436,7 +463,7 @@ function createSourceTranscriptionClient({
       const guidance = describeSocketError(detail);
       broadcast({
         type: "subtitle:error",
-        message: `Gemini Transcribe 연결 오류 (${source}): ${detail}${guidance ? ` — ${guidance}` : ""}`,
+        message: `${providerLabel} 연결 오류 (${source}): ${detail}${guidance ? ` — ${guidance}` : ""}`,
         code: "TRANSCRIBE_SOCKET_ERROR",
       });
       if (openedSocket.readyState === WebSocket.CONNECTING) openedSocket.terminate?.();
@@ -446,7 +473,7 @@ function createSourceTranscriptionClient({
       if (socket !== openedSocket || intentionalClose) return;
       broadcast({
         type: "subtitle:error",
-        message: `Gemini Transcribe 연결이 차단되었습니다 (${response?.statusCode ?? "?"}).`,
+        message: `${providerLabel} 연결이 차단되었습니다 (${response?.statusCode ?? "?"}).`,
         code: "TRANSCRIBE_SOCKET_BLOCKED",
       });
       openedSocket.terminate?.();
@@ -488,7 +515,7 @@ function createSourceTranscriptionClient({
       try { ensureSocket(); } catch (error) {
         broadcast({
           type: "subtitle:error",
-          message: `Gemini Transcribe를 시작할 수 없습니다: ${redactTransportDiagnostic(error?.message ?? error)}`,
+          message: `${providerLabel}를 시작할 수 없습니다: ${redactTransportDiagnostic(error?.message ?? error)}`,
           code: "TRANSCRIBE_START_FAILED",
         });
       }
@@ -641,6 +668,9 @@ function createTextTranslationLane({
   }
 
   async function commitNow(event) {
+    // Soniox already committed this segment's translation through
+    // acceptProviderTranslation; re-translating it would double-bill and race.
+    if (event.providerTranslated) return;
     const sourceText = boundTranscript(event.text).trim();
     const sourceLanguage = resolveSourceLanguage(event);
     const translationRole = resolveTranslationRole(sourceText, sourceLanguage);
@@ -701,7 +731,62 @@ function createTextTranslationLane({
     finalizer.release?.();
   }
 
-  return { preview, commit, invalidatePreview, close };
+  return {
+    preview,
+    commit,
+    invalidatePreview,
+    close,
+    targetLanguage,
+    acceptProviderTranslation(event) {
+      // Combined providers (Soniox) deliver the translation themselves; the
+      // Gemini text lane never receives this. Partial -> preview text, final ->
+      // committed through the same glossary repair the text lane applies.
+      if (closed) return;
+      const sourceText = boundTranscript(event.sourceText ?? "").trim();
+      const sourceLanguage = normalizeProviderLanguageCode(event.sourceLanguage)
+        || resolveSourceLanguage({ text: sourceText, languageCode: event.sourceLanguage });
+      const translationRole = resolveTranslationRole(sourceText || event.text, sourceLanguage);
+      if (!translationRole) return;
+      const corrected = stripSubtitlePrefix(termRetriever.repair(boundTranscript(event.text).normalize("NFC"), {
+        language: targetLanguage,
+        isFinal: event.isFinal,
+      }));
+      if (!corrected || !isTargetOutputSupported(corrected)) return;
+      if (!event.isFinal) {
+        broadcast({
+          type: "subtitle:partial",
+          source,
+          targetLanguage,
+          sourceLanguage,
+          translationRole,
+          translationProvider: event.provider,
+          sourceText,
+          translatedText: corrected,
+          isAuthoritative: false,
+          segmentId: event.segmentId,
+        });
+        return;
+      }
+      invalidatePreview();
+      broadcast({
+        type: "subtitle:committed",
+        source,
+        targetLanguage,
+        sourceLanguage,
+        translationRole,
+        translationProvider: event.provider,
+        sourceText,
+        translatedText: applyGlossaryCorrections(corrected, {
+          glossary: captionConfig.glossary,
+          sourceText,
+          targetLanguage,
+        }).trim(),
+        isAuthoritative: true,
+        segmentId: event.segmentId,
+      });
+    },
+    onProviderBoundary(kind) { if (kind === "interrupted") invalidatePreview(); },
+  };
 }
 
 async function withTimeout(run, timeoutMilliseconds, fallback) {
@@ -785,7 +870,7 @@ export function normalizeSubtitleSettings(settings = {}) {
     translationLanguages,
     outputMode: "captions",
     translationProvider: "gemini",
-    geminiTranscribeModel: "gemini-3.5-transcribe-live",
+    engine: normalizeEngineSelection(merged.engine),
     displayMode: ["translation_only", "translation_source"].includes(merged.displayMode)
       ? merged.displayMode
       : DEFAULT_SUBTITLE_SETTINGS.displayMode,
@@ -829,7 +914,7 @@ function normalizeTranslationLanguages(settings = {}) {
 
 export function normalizeRealtimeModel(model) {
   void model;
-  return "gemini-3.5-transcribe-live";
+  return normalizeEngineSelection(undefined).stt.model;
 }
 
 function normalizeEchoText(text) {

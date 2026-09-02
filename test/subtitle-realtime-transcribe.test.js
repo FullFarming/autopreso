@@ -67,6 +67,94 @@ function createHarness({ polish, settings = {}, ...options } = {}) {
   return { manager, sockets, events };
 }
 
+// A combined STT+translation provider (Soniox) hands the pipeline a finished
+// translation. The transport contract lets it surface that through onTranslation
+// and flag the matching final as providerTranslated.
+function createFakeCombinedTransport() {
+  return {
+    providerLabel: "Fake Combined",
+    maximumSessionMilliseconds: 600_000,
+    assertReady() {},
+    connect({ createWebSocket }) { return createWebSocket("wss://combined.invalid", undefined, {}); },
+    setupPayloads() { return ["setup"]; },
+    audioPayload(audio) { return `audio:${audio}`; },
+    closePayload() { return "close"; },
+    handleMessage(raw, ctx) {
+      const message = JSON.parse(String(raw));
+      if (message.ready) {
+        ctx.onTransportReady();
+        return;
+      }
+      if (message.boundary) {
+        ctx.onBoundary?.(message.boundary);
+        return;
+      }
+      if (!message.translation) return;
+      ctx.onTranslation?.(message.translation);
+      if (message.translation.isFinal) {
+        ctx.onFinal({
+          text: message.translation.sourceText,
+          languageCode: message.translation.sourceLanguage,
+          providerTranslated: true,
+        });
+      }
+    },
+  };
+}
+
+test("a provider-delivered translation is committed without a text-translation call", async () => {
+  const polishCalls = [];
+  const { manager, sockets, events } = createHarness({
+    settings: { translationLanguages: ["en", "ko"] },
+    polish: async (request) => {
+      polishCalls.push(request);
+      return "text-lane translation that must never appear";
+    },
+    createSttTransport: () => createFakeCombinedTransport(),
+  });
+
+  await manager.start({ sessionId: "combined-provider" });
+  assert.equal(sockets.length, 1);
+  sockets[0].open();
+  sockets[0].emit("message", JSON.stringify({ ready: true }));
+  sockets[0].emit("message", JSON.stringify({
+    translation: {
+      text: "Hello everyone",
+      targetLanguage: "en",
+      sourceText: "안녕하세요 여러분",
+      sourceLanguage: "ko",
+      isFinal: false,
+      provider: "soniox",
+      segmentId: "seg-1",
+    },
+  }));
+  sockets[0].emit("message", JSON.stringify({
+    translation: {
+      text: "Hello everyone, welcome.",
+      targetLanguage: "en",
+      sourceText: "안녕하세요 여러분, 환영합니다",
+      sourceLanguage: "ko",
+      isFinal: true,
+      provider: "soniox",
+      segmentId: "seg-1",
+    },
+  }));
+  await new Promise((resolve) => setTimeout(resolve, 30));
+
+  assert.deepEqual(polishCalls, []);
+  const partials = events.filter((event) => event.type === "subtitle:partial");
+  assert.equal(partials.length, 1);
+  assert.equal(partials[0].targetLanguage, "en");
+  assert.equal(partials[0].translatedText, "Hello everyone");
+  const committed = events.filter((event) => event.type === "subtitle:committed");
+  assert.equal(committed.length, 1);
+  assert.equal(committed[0].targetLanguage, "en");
+  assert.equal(committed[0].translatedText, "Hello everyone, welcome.");
+  assert.equal(committed[0].translationProvider, "soniox");
+  assert.equal(committed[0].segmentId, "seg-1");
+  assert.equal(committed[0].isAuthoritative, true);
+});
+
 test("one source opens one Transcribe session and final source fans out through text translation", async () => {
   const requests = [];
   const translations = { ko: "쿠시먼앤드웨이크필드의 순영업소득입니다.", ja: "クッシュマン・アンド・ウェイクフィールドのNOIです。" };

@@ -3,9 +3,16 @@ import test from "node:test";
 import { readFileSync } from "node:fs";
 import vm from "node:vm";
 import { EventEmitter } from "node:events";
+import { createGeminiCaptionConfig, geminiCaptionConfigFingerprint } from "../packages/caption-core/index.js";
+import { GeminiModelSelectionError, migrateLegacyGeminiModelSelection } from "../packages/caption-core/gemini-model-catalog.js";
 
 const modulePath = "../electron/live-demand-controller.js";
 const { createDesktopLiveDemandController } = await import(modulePath);
+const authorizerModulePath = "../media-gateway/src/supabase-adapters.js";
+/** @type {{ SupabaseHostAuthorizer: new (config: {baseUrl: string, serviceRoleKey: string, fetchFn: () => Promise<Response>}) => {
+ * authorize: (claims: object, settings: object, options: object) => Promise<unknown>
+ * } }} */
+const { SupabaseHostAuthorizer } = await import(authorizerModulePath);
 
 function harness(overrides = {}) {
   let now = 1_000;
@@ -165,7 +172,9 @@ test("desktop start intent retains activation identity and rejects a demand-to-l
   const session = { sessionId: "call-a", baseUrl: "https://example.test", demandEnabled: true };
   let enabled = true;
   const calls = [];
-  const intent = vm.runInNewContext(`${mainSection("async function requestDesktopLiveStartIntent", "async function startDesktopLiveDemand")}; requestDesktopLiveStartIntent`, {
+  const intent = vm.runInNewContext(`${mainSection("function readLiveCallModelPreferences", "function sanitizeLiveCallDraft")}
+${mainSection("async function requestDesktopLiveStartIntent", "async function startDesktopLiveDemand")}; requestDesktopLiveStartIntent`, {
+    createGeminiCaptionConfig, geminiCaptionConfigFingerprint, GeminiModelSelectionError, migrateLegacyGeminiModelSelection,
     liveCallSession: session,
     liveCallApi: async (_base, path, input) => {
       calls.push({ path, input });
@@ -293,6 +302,38 @@ test("desktop preparing manual retry preserves the server activation key for rea
   assert.equal(request?.activationKey, h.session.activationKey);
   assert.equal(request?.version, 9);
   assert.equal(h.session.manualGatewayRestartPending, false);
+});
+
+test("initial desktop activation uses the latest preparing version and the engine STT model without replacing its activation key", async () => {
+  const h = mainGatewayHarness();
+  h.session.status = "preparing";
+  const activationKey = h.session.activationKey;
+  h.session.gatewaySettings.captionConfig = createGeminiCaptionConfig({ languages: h.session.gatewaySettings.languages, geminiTranscribeModel: "gemini-3.6-flash" });
+  h.context.liveCallApi = async () => ({ ok: true, data: { id: "call-a", status: "preparing", version: 9 } });
+  await h.ensure({ allowPreparing: true });
+  const request = h.sockets[0].messages.find((message) => message.type === "start");
+  const authorizer = new SupabaseHostAuthorizer({ baseUrl: "https://fixture.invalid", serviceRoleKey: "fixture",
+    fetchFn: async () => Response.json([{ id: "call-a", host_id: "fixture-host", status: "preparing", version: 9,
+      session_type: "meeting", output_mode: "captions", languages: ["en"], pinned_glossary_fingerprint: null,
+      event_metadata: { modelPreferences: { source: "gemini-3.6-flash", summary: "gemini-3.6-flash" } } }]),
+  });
+  const authorized = await authorizer.authorize({ role: "HOST", sub: "fixture-host", sessionId: "call-a" }, request, { readinessStart: true });
+  assert.notEqual(authorized, false, "a refreshed version must reach the real gateway authorization boundary");
+  assert.equal(request.version, 9);
+  assert.equal(request.activationKey, activationKey);
+  assert.equal(request.captionConfig.models.transcription, "gemini-3.5-transcribe-live");
+  h.sockets[0].close();
+});
+
+test("already-live activation retains the original version and key for lost-ACK replay", async () => {
+  const h = mainGatewayHarness();
+  h.context.liveCallApi = async () => ({ ok: true, data: { id: "call-a", status: "live", version: 2 } });
+  const activationKey = h.session.activationKey;
+  await h.ensure();
+  const request = h.sockets[0].messages.find((message) => message.type === "start");
+  assert.equal(request.version, 1);
+  assert.equal(request.activationKey, activationKey);
+  h.sockets[0].close();
 });
 
 test("desktop fatal provider signal marks a manual fence before its close can schedule automatic recovery", async () => {

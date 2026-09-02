@@ -3,6 +3,7 @@ import { EventEmitter } from "node:events";
 import { readFileSync } from "node:fs";
 import test from "node:test";
 import vm from "node:vm";
+import { GeminiModelSelectionError, readGeminiSelectedModel, migrateLegacyGeminiModelSelection } from "../packages/caption-core/gemini-model-catalog.js";
 
 import {
   sanitizeLiveCaptionDisplayLanguage,
@@ -29,7 +30,15 @@ test("local provider close and replacement start share one serialized transition
   assert.match(serverSource, /let subtitleProducerTransitionTail = Promise\.resolve\(\)/u);
   assert.match(serverSource, /const stopSubtitleProviderSafely = async[\s\S]{0,500}queueSubtitleProducerTransition\(\(\) => subtitles\.stop\(sessionId\)\)/u);
   assert.match(serverSource, /stopSubtitleProviderSafely\(orphanedSessionId, "owner_closed"\)/u);
-  assert.match(serverSource, /queueSubtitleProducerTransition\(\(\) => subtitles\.start\(/u);
+  const pending = serverSource.indexOf("pendingSubtitleProviderStarts += 1;");
+  const queuedStart = serverSource.indexOf("await queueSubtitleProducerTransition(async () => {", pending);
+  const cleanup = serverSource.indexOf("pendingSubtitleProviderStarts -= 1;", queuedStart);
+  assert.ok(pending >= 0 && queuedStart > pending && cleanup > queuedStart);
+  const startTransition = serverSource.slice(queuedStart, cleanup);
+  assert.match(startTransition, /const saved = await options\.settingsStore\?\.load\(\)/u);
+  assert.match(startTransition, /subtitleSessionId !== requestedSessionId \|\| isSubtitleSessionStopping\) return/u);
+  assert.match(startTransition, /await subtitles\.start\(\{ sessionId: requestedSessionId, settings: startSettings \}\)/u);
+  assert.match(serverSource, /finally \{\s*pendingSubtitleProviderStarts -= 1;/u);
   assert.match(serverSource, /didAttemptLocalProviderStart[\s\S]{0,2500}stopSubtitleProviderSafely\(requestedSessionId, "start_failed"\)/u);
 });
 
@@ -45,7 +54,7 @@ test("Live Call desktop renders exactly one opposite-language lane for participa
         // source identity must never become a second screen line.
         { language: sourceLanguage, sourceLanguage, speaker, speakerRole: "participant" },
       ];
-      const displayed = captions.filter((caption) => shouldDisplayLiveCaption(caption, displayLanguage));
+      const displayed = captions.filter((caption) => shouldDisplayLiveCaption(caption, displayLanguage, "gateway"));
       assert.equal(displayed.length, 1, `${displayLanguage}/${sourceLanguage}`);
       assert.equal(displayed[0].language, translationLanguage);
       assert.equal(displayed[0].sourceLanguage, sourceLanguage);
@@ -54,16 +63,16 @@ test("Live Call desktop renders exactly one opposite-language lane for participa
   }
 });
 
-test("Live Call desktop drops duplicate host gateway captions and keeps participant captions", () => {
+test("hybrid Live Call desktop drops duplicate host captions and keeps participant captions", () => {
   for (const sourceLanguage of ["ko", "en"]) {
     const language = sourceLanguage === "ko" ? "en" : "ko";
-    assert.equal(shouldDisplayLiveCaption({ language, sourceLanguage, speakerRole: "host" }, language), false);
-    assert.equal(shouldDisplayLiveCaption({ language, sourceLanguage, speakerRole: "participant" }, language), true);
+    assert.equal(shouldDisplayLiveCaption({ language, sourceLanguage, speakerRole: "host" }, language, "hybrid"), false);
+    assert.equal(shouldDisplayLiveCaption({ language, sourceLanguage, speakerRole: "participant" }, language, "hybrid"), true);
     assert.equal(shouldDisplayLiveCaption({
       language,
       sourceLanguage,
       speaker: { isParticipant: true, participantId: "viewer-1" },
-    }, language), true);
+    }, language, "hybrid"), true);
   }
 });
 
@@ -73,15 +82,15 @@ test("Live Call display rejects source, failed, and same-language events while a
   for (const invalid of [undefined, null, "EN", "ja", "", {}, []]) {
     assert.equal(sanitizeLiveCaptionDisplayLanguage(invalid), "ko");
   }
-  assert.equal(shouldDisplayLiveCaption({ language: "en", sourceLanguage: "ko", origin: "source" }, "ko"), false);
-  assert.equal(shouldDisplayLiveCaption({ language: "en", sourceLanguage: "ko", translationStatus: "failed" }, "ko"), false);
-  assert.equal(shouldDisplayLiveCaption({ language: "ko", sourceLanguage: "ko" }, "ko"), false);
-  assert.equal(shouldDisplayLiveCaption({ language: "en", sourceLanguage: "ko" }, "ko"), true);
-  assert.equal(shouldDisplayLiveCaption({ language: "en", sourceLanguage: "ko" }, "en"), true,
+  assert.equal(shouldDisplayLiveCaption({ language: "en", sourceLanguage: "ko", origin: "source" }, "ko", "gateway"), false);
+  assert.equal(shouldDisplayLiveCaption({ language: "en", sourceLanguage: "ko", translationStatus: "failed" }, "ko", "gateway"), false);
+  assert.equal(shouldDisplayLiveCaption({ language: "ko", sourceLanguage: "ko" }, "ko", "gateway"), false);
+  assert.equal(shouldDisplayLiveCaption({ language: "en", sourceLanguage: "ko" }, "ko", "gateway"), true);
+  assert.equal(shouldDisplayLiveCaption({ language: "en", sourceLanguage: "ko" }, "en", "gateway"), true,
     "the old fixed display-language setting must not override utterance direction");
-  assert.equal(shouldDisplayLiveCaption({ language: "ko", sourceLanguage: "en" }, "ko"), true);
-  assert.equal(shouldDisplayLiveCaption({ language: "ja", sourceLanguage: "ko" }, "ko"), false);
-  assert.equal(shouldDisplayLiveCaption({ language: "ko", sourceLanguage: "ja" }, "ko"), false);
+  assert.equal(shouldDisplayLiveCaption({ language: "ko", sourceLanguage: "en" }, "ko", "gateway"), true);
+  assert.equal(shouldDisplayLiveCaption({ language: "ja", sourceLanguage: "ko" }, "ko", "gateway"), false);
+  assert.equal(shouldDisplayLiveCaption({ language: "ko", sourceLanguage: "ja" }, "ko", "gateway"), false);
 });
 
 function sourceBetween(start, end) {
@@ -291,13 +300,15 @@ test("Live Call failure responses and logs do not expose stored credentials", ()
 
 test("Live Call preflight preserves the complete 40k glossary for the gateway", async () => {
   const preflight = vm.runInNewContext(
-    `${sourceBetween("async function preflightLiveCallCaptionSession", "function requestRendererLiveCaptionPreflight")}; preflightLiveCallCaptionSession`,
+    `${sourceBetween("function readLiveCallModelPreferences", "function sanitizeLiveCallDraft")}
+${sourceBetween("async function preflightLiveCallCaptionSession", "function requestRendererLiveCaptionPreflight")}; preflightLiveCallCaptionSession`,
     {
       dashboardWindow: {
         isDestroyed: () => false,
         webContents: { isDestroyed: () => false },
       },
       validateSubtitleSettings: () => {},
+      GeminiModelSelectionError, readGeminiSelectedModel, migrateLegacyGeminiModelSelection,
       createGeminiCaptionConfig,
       geminiCaptionConfigFingerprint,
       resolveLiveCallLanguages,
@@ -322,7 +333,7 @@ test("Live Call preflight preserves the complete 40k glossary for the gateway", 
   assert.equal(armedSession.gatewaySettings.translationTone, "business");
   assert.equal(armedSession.gatewaySettings.domainText, "Commercial real estate");
   assert.equal(armedSession.gatewaySettings.captionConfig.glossary, glossary);
-  assert.match(armedSession.gatewaySettings.captionConfigFingerprint, /^gemini-caption-v2-[a-f0-9]{16}$/u);
+  assert.match(armedSession.gatewaySettings.captionConfigFingerprint, /^gemini-caption-v5-[a-f0-9]{16}$/u);
   assert.equal(armedSession.gatewaySettings.existing, true);
 });
 
@@ -700,7 +711,7 @@ test("active bridge host-speak is single-flight and does not leak listeners acro
     clearTimeout,
   };
   const api = vm.runInNewContext(
-    `${sourceBetween("function hostSpeakViaActiveBridge", "// After the host ends")}; hostSpeakViaActiveBridge`,
+    `${sourceBetween("function hostSpeakViaActiveBridge", "let liveCallArchive")}; hostSpeakViaActiveBridge`,
     context,
   );
   for (let turn = 0; turn < 12; turn += 1) {

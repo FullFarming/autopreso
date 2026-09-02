@@ -273,7 +273,59 @@ test("settings export downloads subtitle settings as a portable JSON file", asyn
   }
 });
 
+test("text adapter accepts one-character speech without optional polish settings", () => {
+  const saved = { apiKeys: { gemini: "test-caption-key" } };
+  assert.deepEqual(selectSubtitlePolishOptions({
+    args: { translatedText: "…", sourceText: "네", tone: "natural" }, saved, env: {},
+  }), { provider: "gemini", apiKey: saved.apiKeys.gemini, modelId: "gemini-3.6-flash", fallbackModels: ["gemini-3.5-flash-lite"] });
+  assert.equal(selectSubtitlePolishOptions({
+    args: { translatedText: "…", sourceText: "  ", tone: "natural" }, saved, env: {},
+  }), null);
+});
+
+// Availability routing only: one attempt per model in the selected engine's
+// catalog chain, in order, and no model is retried.
+test("text adapter outages walk the engine fallback chain once per model", async () => {
+  let polish;
+  const calls = [];
+  const { httpServer } = await startServer({
+    host: "127.0.0.1", port: 0, env: { GEMINI_API_KEY: "test-caption-key" },
+    createTranscription: () => ({ ready: async () => {}, sendAudio() {}, stop() {}, close() {} }),
+    createSubtitleRealtimeManager: (options) => { polish = options.polish; return { close() {} }; },
+    fetchImpl: async (url) => { calls.push(url); return new Response("", { status: 503 }); },
+  });
+  try {
+    await polish({ translatedText: "…", sourceText: "오늘 회의를 시작합니다.", targetLanguage: "en", tone: "natural" });
+    assert.deepEqual(
+      calls.map((url) => String(url).split("/").at(-1)),
+      ["gemini-3.6-flash:generateContent", "gemini-3.5-flash-lite:generateContent"],
+    );
+  } finally {
+    await new Promise((resolve) => httpServer.close(resolve));
+  }
+});
+
+// The "polish" call is the caption text-translation call, so its model is the
+// engine selection's translation model — not a separate hard-coded pin.
+test("caption text translation follows the saved engine translation model", () => {
+  const saved = {
+    apiKeys: { gemini: "AIza-live" },
+    subtitle: {
+      engine: {
+        stt: { provider: "gemini", model: "gemini-3.5-transcribe-live", languageMode: "auto" },
+        translation: { provider: "gemini", model: "gemini-3.7-flash" },
+        summary: { provider: "gemini", model: "gemini-3.6-flash" },
+      },
+    },
+  };
+  assert.deepEqual(
+    selectSubtitlePolishOptions({ args: { tone: "business", glossary: "" }, saved, env: {} }),
+    { provider: "gemini", apiKey: "AIza-live", modelId: "gemini-3.7-flash", fallbackModels: ["gemini-3.6-flash", "gemini-3.5-flash-lite"] },
+  );
+});
+
 test("subtitle second-pass polish uses separated provider keys", () => {
+  const secondaryFixture = "AIza-finalizer";
   assert.equal(
     selectSubtitlePolishOptions({
       args: { tone: "natural", glossary: "operator = 운영사" },
@@ -292,7 +344,7 @@ test("subtitle second-pass polish uses separated provider keys", () => {
       },
       env: {},
     }),
-    { provider: "gemini", apiKey: "AIza-finalizer", modelId: "gemini-3.7-flash" },
+    { provider: "gemini", apiKey: secondaryFixture, modelId: "gemini-3.6-flash", fallbackModels: ["gemini-3.5-flash-lite"] },
   );
 
   assert.deepEqual(
@@ -310,7 +362,7 @@ test("subtitle second-pass polish uses separated provider keys", () => {
       },
       env: {},
     }),
-    { provider: "gemini", apiKey: "AIza-finalizer", modelId: "gemini-3.7-flash" },
+    { provider: "gemini", apiKey: secondaryFixture, modelId: "gemini-3.6-flash", fallbackModels: ["gemini-3.5-flash-lite"] },
   );
 
   assert.deepEqual(
@@ -322,7 +374,7 @@ test("subtitle second-pass polish uses separated provider keys", () => {
       },
       env: {},
     }),
-    { provider: "gemini", apiKey: "AIza-live", modelId: "gemini-3.7-flash" },
+    { provider: "gemini", apiKey: "AIza-live", modelId: "gemini-3.6-flash", fallbackModels: ["gemini-3.5-flash-lite"] },
   );
 
   assert.equal(
@@ -340,7 +392,7 @@ test("subtitle second-pass polish uses separated provider keys", () => {
       saved: { apiKeys: { gemini: "AIza-live" }, subtitle: {} },
       env: {},
     }),
-    { provider: "gemini", apiKey: "AIza-live", modelId: "gemini-3.7-flash" },
+    { provider: "gemini", apiKey: "AIza-live", modelId: "gemini-3.6-flash", fallbackModels: ["gemini-3.5-flash-lite"] },
   );
 });
 
@@ -431,7 +483,7 @@ test("subtitle:stop without a sessionId cannot stop the active subtitle session"
       type: "subtitle:audio",
       sessionId: "active",
       source: "mic",
-      audio: "AAAA",
+      audio: Buffer.alloc(4_800, 1).toString("base64"),
     }));
     await new Promise((resolve) => setTimeout(resolve, 25));
 
@@ -685,7 +737,7 @@ test("server returns a sanitized OpenAI validation error", async () => {
   }
 });
 
-test("server validates Gemini keys through text generation before saving", async () => {
+test("server validates Gemini model access without paid inference and rate limits repeated checks", async () => {
   const fetchCalls = [];
   const { httpServer, url } = await startServer({
     host: "127.0.0.1",
@@ -702,7 +754,7 @@ test("server validates Gemini keys through text generation before saving", async
       fetchCalls.push({ url: requestUrl, init });
       return {
         ok: true,
-        json: async () => ({ candidates: [{ content: { parts: [{ text: "ok" }] } }] }),
+        json: async () => ({ candidates: [{ finishReason: "STOP", content: { parts: [{ text: "ok" }] } }] }),
       };
     },
   });
@@ -716,9 +768,17 @@ test("server validates Gemini keys through text generation before saving", async
     assert.equal(response.status, 200);
     assert.deepEqual(await response.json(), { ok: true, data: { status: "valid" } });
     assert.match(fetchCalls[0].url, /generativelanguage\.googleapis\.com/);
-    assert.match(fetchCalls[0].url, /gemini-3\.7-flash/u);
+    assert.match(fetchCalls[0].url, /gemini-3\.6-flash/u);
     assert.equal(fetchCalls[0].init.headers["x-goog-api-key"], "AIza-test");
-    assert.match(JSON.parse(fetchCalls[0].init.body).contents[0].parts[0].text, /ok/);
+    assert.equal(fetchCalls[0].init.method, "GET");
+    assert.equal(fetchCalls[0].init.body, undefined);
+    assert.equal(fetchCalls[0].init.redirect, "error");
+    const repeated = await fetch(`${url}/api/subtitles/gemini/validate`, {
+      method: "POST", headers: sameOriginHeaders(url, { "content-type": "application/json" }),
+      body: JSON.stringify({ apiKey: "AIza-test" }),
+    });
+    assert.equal(repeated.status, 429);
+    assert.equal(fetchCalls.length, 1);
   } finally {
     await new Promise((resolve) => httpServer.close(resolve));
   }
@@ -1265,3 +1325,58 @@ function waitForWebSocketMessage(ws, predicate) {
     ws.on("message", onMessage);
   });
 }
+
+test("caption engine settings come from the server catalog and reject unknown selections", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "nova-model-settings-"));
+  const store = createSettingsStore({ filePath: path.join(dir, "settings.json"), env: {}, readCodexAuth: () => null });
+  await store.load();
+  const activeState = { active: true };
+  let providerStarts = 0;
+  const { httpServer, url } = await startServer({
+    host: "127.0.0.1", port: 0, moonshineModel: "medium", settingsStore: store,
+    createTranscription: () => ({ ready: async () => {}, sendAudio() {}, stop() {}, close() {} }),
+    createSubtitleRealtimeManager: () => ({ _state: activeState, start() { providerStarts += 1; }, stop() {}, close() {}, sendAudio() {} }),
+  });
+  try {
+    const config = await fetch(`${url}/api/config`).then((response) => response.json());
+    assert.equal(config.captionModels, undefined, "the retired per-role model catalog is gone");
+    assert.deepEqual(
+      config.captionEngines.stt.map((entry) => `${entry.provider}:${entry.model}`),
+      ["gemini:gemini-3.5-transcribe-live", "soniox:stt-rt-v5"],
+    );
+    assert.deepEqual(config.captionEngines.defaults, {
+      stt: { provider: "gemini", model: "gemini-3.5-transcribe-live", languageMode: "auto" },
+      translation: { provider: "gemini", model: "gemini-3.6-flash" },
+      summary: { provider: "gemini", model: "gemini-3.6-flash" },
+    });
+    // Availability is reported, never the key itself.
+    assert.equal(JSON.stringify(config.captionEngines).includes("apiKey"), false);
+    assert.equal(config.captionEngines.stt.every((entry) => entry.available === false), true);
+
+    const put = (subtitle) => fetch(`${url}/api/settings`, {
+      method: "PUT",
+      headers: sameOriginHeaders(url, { "content-type": "application/json" }),
+      body: JSON.stringify({ subtitle }),
+    });
+
+    // Retired per-role model fields and unknown provider/model pairs are refused.
+    assert.equal((await put({ geminiTranscribeModel: "gemini-3.7-flash" })).status, 400);
+    assert.equal((await put({ engine: { stt: { provider: "gemini", model: "gemini-9.9-imaginary", languageMode: "auto" } } })).status, 400);
+    assert.equal((await put({ engine: { translation: { provider: "soniox", model: "stt-rt-v5" } } })).status, 400,
+      "a combined translation engine cannot be paired with a Gemini STT engine");
+    assert.deepEqual((await store.load()).subtitle.engine.stt, {
+      provider: "gemini", model: "gemini-3.5-transcribe-live", languageMode: "auto",
+    });
+
+    // A valid engine change is accepted even while a session is running: the
+    // selection is picked up by the next channel restart.
+    assert.equal((await put({ engine: { translation: { provider: "gemini", model: "gemini-3.7-flash" } } })).status, 200);
+    const saved = await store.load();
+    assert.equal(saved.subtitle.engine.translation.model, "gemini-3.7-flash");
+    assert.equal(saved.subtitle.engine.stt.model, "gemini-3.5-transcribe-live");
+    assert.equal(providerStarts, 0, "reading or saving settings never starts a paid session");
+  } finally {
+    await new Promise((resolve) => httpServer.close(resolve));
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});

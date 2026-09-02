@@ -24,11 +24,31 @@ test("desktop caption settings are caption-only and pin Gemini Transcribe Live",
   });
 
   assert.equal(settings.outputMode, "captions");
-  assert.equal(settings.geminiTranscribeModel, "gemini-3.5-transcribe-live");
+  // The per-role model pins now live on the canonical engine selection.
+  assert.deepEqual(settings.engine.stt, {
+    provider: "gemini",
+    model: "gemini-3.5-transcribe-live",
+    languageMode: "auto",
+  });
+  assert.equal(settings.engine.translation.provider, "gemini");
+  assert.equal(settings.engine.summary.provider, "gemini");
   for (const retiredKey of ["audioLanguage", "audioVolume", "voiceProvider", "model", "geminiModel"]) {
     assert.equal(Object.hasOwn(settings, retiredKey), false);
   }
   assert.equal(normalizeRealtimeModel("gemini-3.5-live-translate-preview"), "gemini-3.5-transcribe-live");
+});
+
+test("an explicitly selected engine survives normalization instead of being pinned back", () => {
+  const settings = normalizeSubtitleSettings({
+    engine: {
+      stt: { provider: "gemini", model: "gemini-3.5-transcribe-live", languageMode: "auto" },
+      translation: { provider: "gemini", model: "gemini-3.7-flash" },
+      summary: { provider: "gemini", model: "gemini-3.7-flash" },
+    },
+  });
+
+  assert.equal(settings.engine.translation.model, "gemini-3.7-flash");
+  assert.equal(settings.engine.summary.model, "gemini-3.7-flash");
 });
 
 test("language detection remains stable for code-switching and proper nouns", () => {

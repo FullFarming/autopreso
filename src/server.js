@@ -22,16 +22,17 @@ import { audioSecondsFromBase64Pcm16 } from "./session-cost.js";
 import { DEFAULT_SUBTITLE_SETTINGS, validateAgentInstructions, validateSubtitleSettings } from "./settings-store.js";
 import { generateGeminiText, generateGeminiTextWithModelFallback } from "./gemini-text-generation.js";
 
-// gemini-3.7-flash is the primary text workload model (caption polish,
-// transcript summaries). These are availability fallbacks only — one attempt
-// each when the primary is transiently unavailable, never a quality override.
-const SUBTITLE_POLISH_FALLBACK_MODELS = Object.freeze(["gemini-3.6-flash", "gemini-flash-lite-latest"]);
 import { GLOSSARY_PRESETS } from "./glossary-presets.js";
 import { createSessionTranscripts } from "./session-transcripts.js";
 import { createSubtitleChannelHub, isRetiredTranslatedAudioMessage } from "./subtitle-channels.js";
 import { createSubtitleHistory, historyToCsv } from "./subtitle-history.js";
 import { SUBTITLE_LANGUAGES, isSupportedSubtitleLanguage } from "./subtitle-languages.js";
 import { getBuiltInGlossary } from "../packages/caption-core/index.js";
+import {
+  captionEngineCatalogForClient,
+  DEFAULT_ENGINE_SELECTION,
+  findEngineEntry,
+} from "../packages/caption-core/caption-engine-catalog.js";
 import { createSubtitlePolisher } from "./subtitle-polish.js";
 import { createSubtitleRealtimeManager } from "./subtitle-realtime.js";
 import { broadcast, createWhiteboardSession } from "./whiteboard-session.js";
@@ -55,6 +56,7 @@ const SUBTITLE_NO_STORE_ASSETS = new Set([
   "subtitle.html",
   "subtitle-dashboard.js",
   "subtitle-workspace.js",
+  "subtitle-model-settings.js",
   "subtitle.css",
   "subtitle-overlay.html",
   "subtitle-overlay.js",
@@ -344,6 +346,8 @@ export async function startServer(options) {
   let subtitleSessionProducer = null;
   let subtitleSessionId = "";
   let isSubtitleLocalProviderActive = false;
+  let pendingSubtitleProviderStarts = 0;
+  let isSubtitleSessionStopping = false;
   let subtitleProducerTransitionTail = Promise.resolve();
   const queueSubtitleProducerTransition = (operation) => {
     const result = subtitleProducerTransitionTail.then(operation, operation);
@@ -407,27 +411,26 @@ export async function startServer(options) {
         recorderStatus: { ...subtitleHistory.getSnapshot().recorderStatus, lastError: error.message },
       }));
   };
-  // Caption contract v2 transcribes with Gemini 3.5 Transcribe Live and uses
-  // Gemini 3.7 Flash for text translation/final terminology repair. The second
-  // key remains optional so committed-line repair cannot stall transcription.
+  // The "polish" call IS the text-translation half of the two-stage caption
+  // engine, so its model comes from the saved engine selection. The catalog's
+  // per-model fallback chain is availability routing only — one attempt per
+  // model inside the polisher's own deadline, never a quality override
+  // (2026-08-31 incident: a 503 on the primary blanked every committed line).
   const subtitlePolish = async (args) => {
     const saved = options.settingsStore ? await options.settingsStore.load() : {};
     const env = options.env ?? process.env;
     const polishOptions = selectSubtitlePolishOptions({ args, saved, env });
-    if (!polishOptions) return args?.translatedText;
+    if (!polishOptions) {
+      if (args?.required) throw Object.assign(new Error("TRANSLATION_CONFIG_ERROR"), { code: "TRANSLATION_CONFIG_ERROR" });
+      return args?.translatedText;
+    }
     const polisher = createSubtitlePolisher({
-      // Availability routing (2026-08-31 outage): gemini-3.7-flash stays the
-      // primary text model, but a transient 5xx/hang on it must not turn every
-      // committed caption into TEXT_TRANSLATION_FAILED — one attempt per
-      // fallback model inside the polisher's own 6s deadline.
       generateText: options.subtitleGeminiPolishGenerateText ?? ((request) => generateGeminiTextWithModelFallback({
         ...request,
-        models: [
-          polishOptions.modelId,
-          ...SUBTITLE_POLISH_FALLBACK_MODELS.filter((fallbackModel) => fallbackModel !== polishOptions.modelId),
-        ],
+        models: [polishOptions.modelId, ...polishOptions.fallbackModels],
         apiKey: polishOptions.apiKey,
         fetchImpl: options.fetchImpl ?? globalThis.fetch,
+        perAttemptTimeoutMs: 2_800,
       })),
       model: polishOptions.modelId,
     });
@@ -446,6 +449,9 @@ export async function startServer(options) {
     res.json({
       transcriptionEngine: transcription.getLabel(),
       settings: sanitized,
+      captionEngines: captionEngineCatalogForClient({
+        hasApiKeys: { gemini: Boolean(sanitized?.hasGeminiKey), soniox: Boolean(sanitized?.hasSonioxKey) },
+      }),
     });
   });
 
@@ -524,10 +530,10 @@ export async function startServer(options) {
     const env = options.env ?? process.env;
     const geminiKey = saved.apiKeys?.gemini || env.GEMINI_API_KEY || "";
     if (geminiKey) {
-      const model = DEFAULT_SUBTITLE_SETTINGS.geminiPolishModel;
+      const summary = selectSubtitleEngineModel(saved, "summary");
       return (request) => generateGeminiTextWithModelFallback({
         ...request,
-        models: [model, ...SUBTITLE_POLISH_FALLBACK_MODELS.filter((fallbackModel) => fallbackModel !== model)],
+        models: [summary.modelId, ...summary.fallbackModels],
         apiKey: geminiKey,
         // Summaries produce long output; give each model attempt a real window.
         perAttemptTimeoutMs: 20_000,
@@ -585,8 +591,8 @@ export async function startServer(options) {
     const meta = await sessionTranscripts.importSession(req.body ?? {});
     if (!meta) return res.status(400).json({ ok: false, error: "세션 기록 형식이 올바르지 않습니다." });
     broadcast(wss, { type: "subtitle:sessions", sessions: await sessionTranscripts.list() });
-    // No stored summary yet → generate one locally from the imported lines.
-    if (!meta.hasSummary && meta.lineCount > 0) {
+    // Live Call recap belongs to the workspace job; import must never duplicate paid generation.
+    if (meta.kind !== "live-call" && !meta.hasSummary && meta.lineCount > 0) {
       summarizeSessionTranscript(meta.id).catch((error) => {
         (options.log ?? console).warn?.(`[session-transcripts] import summary skipped: ${error?.message ?? error}`);
       });
@@ -629,22 +635,29 @@ export async function startServer(options) {
     }
   });
 
+  let isGeminiValidationPending = false;
+  let lastGeminiValidationAt = 0;
   app.post("/api/subtitles/gemini/validate", async (req, res) => {
     const providedApiKey = typeof req.body?.apiKey === "string" ? req.body.apiKey.trim() : "";
     const saved = options.settingsStore ? await options.settingsStore.load() : {};
     const env = options.env ?? process.env;
     const apiKey = providedApiKey || saved.apiKeys?.gemini || env.GEMINI_API_KEY || "";
-    if (!apiKey.trim()) {
+    if (!apiKey.trim() || apiKey.length > 512 || /[\p{Cc}\p{Cf}]/u.test(apiKey)) {
       return res.status(400).json({
         ok: false,
         error: "Gemini API key를 입력하세요.",
         code: "GEMINI_KEY_REQUIRED",
       });
     }
+    if (isGeminiValidationPending || Date.now() - lastGeminiValidationAt < 10_000) {
+      return res.status(429).json({ ok: false, error: "연결 확인 중입니다. 잠시 후 다시 시도해 주세요.", code: "GEMINI_VALIDATE_RATE_LIMITED" });
+    }
+    isGeminiValidationPending = true;
+    lastGeminiValidationAt = Date.now();
     try {
-      await validateGeminiTextGenerationKey({
+      await validateGeminiModelAccess({
         apiKey,
-        model: DEFAULT_SUBTITLE_SETTINGS.geminiPolishModel,
+        model: selectSubtitleEngineModel(saved, "summary").modelId,
         fetchImpl: options.fetchImpl ?? globalThis.fetch,
       });
       res.json({ ok: true, data: { status: "valid" } });
@@ -654,6 +667,8 @@ export async function startServer(options) {
         error: "Gemini 연결 확인에 실패했습니다. API key, 프로젝트 권한, 사용량 한도를 확인하세요.",
         code: "GEMINI_VALIDATE_FAILED",
       });
+    } finally {
+      isGeminiValidationPending = false;
     }
   });
 
@@ -726,10 +741,17 @@ export async function startServer(options) {
     res.json({ ok: true });
   });
 
+  // The engine selection is validated by the settings store and picked up on
+  // the next channel restart, so a model change no longer has to fence an
+  // active session.
+  async function saveSettingsPatch(patch) {
+    return options.settingsStore.save(patch);
+  }
+
   app.put("/api/settings", async (req, res) => {
     if (!options.settingsStore) return res.status(404).json({ error: "Settings store not available." });
     try {
-      await options.settingsStore.save(req.body ?? {});
+      await saveSettingsPatch(req.body ?? {});
       await transcription.applyCurrent();
       const sanitized = await options.settingsStore.getSanitized();
       res.json({ settings: sanitized, transcriptionEngine: transcription.getLabel() });
@@ -766,14 +788,20 @@ export async function startServer(options) {
       subtitleHub.removeClient(client);
       if (client === subtitleSessionProducer) {
         const orphanedSessionId = subtitleSessionId;
-        const shouldCloseLocalProvider = isSubtitleLocalProviderActive;
-        subtitleSessionProducer = null;
-        subtitleSessionId = "";
-        isSubtitleLocalProviderActive = false;
+        const shouldCloseLocalProvider = isSubtitleLocalProviderActive || pendingSubtitleProviderStarts > 0;
         // Keep the transcript active for renderer recovery, but never leave a
         // paid local provider orphaned after its only audio producer vanished.
-        if (shouldCloseLocalProvider && orphanedSessionId) {
-          void stopSubtitleProviderSafely(orphanedSessionId, "owner_closed");
+        if (!isSubtitleSessionStopping) {
+          isSubtitleSessionStopping = true;
+          const closed = shouldCloseLocalProvider && orphanedSessionId
+            ? stopSubtitleProviderSafely(orphanedSessionId, "owner_closed") : Promise.resolve();
+          void closed.then(() => {
+            if (client !== subtitleSessionProducer || orphanedSessionId !== subtitleSessionId) return;
+            subtitleSessionProducer = null;
+            subtitleSessionId = "";
+            isSubtitleLocalProviderActive = false;
+            isSubtitleSessionStopping = false;
+          });
         }
       }
       if (client === liveCallCaptionProducer) {
@@ -836,7 +864,7 @@ export async function startServer(options) {
       if (message.type === "settings:update" && options.settingsStore) {
         if (!hasTrustedBrowserOrigin) return;
         try {
-          await options.settingsStore.save(message.patch ?? {});
+          await saveSettingsPatch(message.patch ?? {});
           await transcription.applyCurrent();
           const sanitized = await options.settingsStore.getSanitized();
           broadcast(wss, { type: "settings", settings: sanitized });
@@ -1049,6 +1077,7 @@ export async function startServer(options) {
           return;
         }
         let didAttemptLocalProviderStart = false;
+        let didClaimSubtitleSession = false;
         let requestedSessionId = "";
         try {
           if (!hasTrustedBrowserOrigin) throw new Error("SUBTITLE_PRODUCER_UNTRUSTED");
@@ -1069,14 +1098,15 @@ export async function startServer(options) {
           if (subtitleSessionProducer === client && subtitleSessionId && subtitleSessionId !== requestedSessionId) {
             throw new Error("SUBTITLE_SESSION_ACTIVE");
           }
-          subtitleSessionProducer = client;
-          subtitleSessionId = requestedSessionId;
+          if (isSubtitleSessionStopping || pendingSubtitleProviderStarts > 0) {
+            throw new Error("SUBTITLE_SESSION_TRANSITION_PENDING");
+          }
           const meeting = message.meeting && typeof message.meeting === "object" ? message.meeting : {};
+          const requestedLiveSessionId = String(meeting.liveSessionId ?? "").trim().slice(0, 240);
           if (requestedProducerKind === "gateway" || requestedProducerKind === "hybrid") {
             if (!hasTrustedBrowserOrigin || meeting.kind !== "live-call") {
               throw new Error("LIVE_CALL_CAPTION_PRODUCER_UNTRUSTED");
             }
-            const requestedLiveSessionId = String(meeting.liveSessionId ?? "").trim().slice(0, 240);
             if (!requestedLiveSessionId) throw new Error("LIVE_CALL_SESSION_REQUIRED");
             if (liveCallCaptionProducer && liveCallCaptionProducer !== client) {
               throw new Error("LIVE_CALL_CAPTION_PRODUCER_ACTIVE");
@@ -1086,38 +1116,42 @@ export async function startServer(options) {
               && liveCallCaptionSessionId !== requestedLiveSessionId) {
               throw new Error("LIVE_CALL_CAPTION_SESSION_ACTIVE");
             }
+          } else if (client === liveCallCaptionProducer
+            && (meeting.kind !== "live-call" || requestedLiveSessionId !== liveCallCaptionSessionId)) {
+            throw new Error("LIVE_CALL_LOCAL_SESSION_MISMATCH");
+          }
+          subtitleSessionProducer = client;
+          subtitleSessionId = requestedSessionId;
+          didClaimSubtitleSession = true;
+          if (requestedProducerKind === "gateway" || requestedProducerKind === "hybrid") {
             liveCallCaptionProducer = client;
             liveCallCaptionSessionId = requestedLiveSessionId;
             liveCallCaptionProducerKind = requestedProducerKind;
             cancelLiveCallSilenceClears();
             subtitleHub.setLiveCallSession(liveCallCaptionSessionId);
-            if (requestedProducerKind === "hybrid") {
-              didAttemptLocalProviderStart = true;
-              await queueSubtitleProducerTransition(() => subtitles.start({
-                sessionId: requestedSessionId,
-                settings: message.settings,
-              }));
-              isSubtitleLocalProviderActive = true;
-            }
-          } else if (client === liveCallCaptionProducer) {
-            const requestedLiveSessionId = String(meeting.liveSessionId ?? "").trim().slice(0, 240);
-            if (meeting.kind !== "live-call" || requestedLiveSessionId !== liveCallCaptionSessionId) {
-              throw new Error("LIVE_CALL_LOCAL_SESSION_MISMATCH");
-            }
-            didAttemptLocalProviderStart = true;
-            await queueSubtitleProducerTransition(() => subtitles.start({
-              sessionId: requestedSessionId,
-              settings: message.settings,
-            }));
-            isSubtitleLocalProviderActive = true;
-          } else {
-            didAttemptLocalProviderStart = true;
-            await queueSubtitleProducerTransition(() => subtitles.start({
-              sessionId: requestedSessionId,
-              settings: message.settings,
-            }));
-            isSubtitleLocalProviderActive = true;
           }
+          if (requestedProducerKind !== "gateway") {
+            didAttemptLocalProviderStart = true;
+            pendingSubtitleProviderStarts += 1;
+            try {
+              await queueSubtitleProducerTransition(async () => {
+                let startSettings = message.settings;
+                if (requestedProducerKind === "local") {
+                  const saved = await options.settingsStore?.load();
+                  if (client !== subtitleSessionProducer || subtitleSessionId !== requestedSessionId || isSubtitleSessionStopping) return;
+                  // Local WS requests cannot override the saved engine selection.
+                  // Hybrid settings remain the capability-authenticated meeting pin supplied by Electron main.
+                  startSettings = { ...(message.settings ?? {}), engine: saved?.subtitle?.engine };
+                }
+                await subtitles.start({ sessionId: requestedSessionId, settings: startSettings });
+                isSubtitleLocalProviderActive = true;
+              });
+            } finally {
+              pendingSubtitleProviderStarts -= 1;
+            }
+          }
+          // 2026-08-31 fix: STOP/owner-close must drain an in-flight paid start before a replacement can claim it.
+          if (client !== subtitleSessionProducer || subtitleSessionId !== requestedSessionId || isSubtitleSessionStopping) return;
           // Optional meeting identity. When captions are running for a Live Call
           // the record must be anchored to the CALL's start and carry its title,
           // because that is what the records calendar places on the grid. Every
@@ -1130,23 +1164,30 @@ export async function startServer(options) {
             title: typeof meeting.title === "string" ? meeting.title : "",
             startedAt: typeof meeting.startedAt === "string" ? meeting.startedAt : "",
           });
+          if (client !== subtitleSessionProducer || subtitleSessionId !== requestedSessionId || isSubtitleSessionStopping) return;
           client.send(JSON.stringify({
             type: "subtitle:started",
             sessionId: requestedSessionId,
             captionProducer: requestedProducerKind,
           }));
         } catch (error) {
-          const shouldCompensateLocalProvider = requestedSessionId
+          // 2026-08-31 fix: A rejected replacement never acquired the existing session's cleanup authority.
+          const shouldCompensateLocalProvider = didClaimSubtitleSession
+            && client === subtitleSessionProducer && subtitleSessionId === requestedSessionId
+            && !isSubtitleSessionStopping
             && (didAttemptLocalProviderStart || isSubtitleLocalProviderActive);
           if (shouldCompensateLocalProvider) {
             await stopSubtitleProviderSafely(requestedSessionId, "start_failed");
           }
-          if (client === subtitleSessionProducer) {
+          const stillOwnsRequestedSession = didClaimSubtitleSession
+            && client === subtitleSessionProducer && subtitleSessionId === requestedSessionId
+            && !isSubtitleSessionStopping;
+          if (stillOwnsRequestedSession) {
             subtitleSessionProducer = null;
             subtitleSessionId = "";
             isSubtitleLocalProviderActive = false;
           }
-          if (client === liveCallCaptionProducer) {
+          if (stillOwnsRequestedSession && client === liveCallCaptionProducer) {
             cancelLiveCallSilenceClears();
             subtitleHub.clearLiveCallSession(liveCallCaptionSessionId);
             liveCallCaptionProducer = null;
@@ -1345,18 +1386,21 @@ export async function startServer(options) {
 
       if (message.type === "subtitle:stop") {
         if (typeof message.sessionId !== "string" || message.sessionId.length === 0) return;
-        if (client !== subtitleSessionProducer || message.sessionId !== subtitleSessionId) {
+        if (client !== subtitleSessionProducer || message.sessionId !== subtitleSessionId || isSubtitleSessionStopping) {
           client.send(JSON.stringify({
             type: "subtitle:error",
             code: "SUBTITLE_SESSION_MISMATCH",
+            sessionId: message.sessionId,
+            requestId: typeof message.requestId === "string" ? message.requestId.slice(0, 128) : "",
             message: "활성 자막 세션이 아닙니다.",
           }));
           return;
         }
+        isSubtitleSessionStopping = true;
         const shouldBroadcastTerminalIdle = client === liveCallCaptionProducer
           || !isSubtitleLocalProviderActive;
         let providerStopError = null;
-        if (isSubtitleLocalProviderActive) {
+        if (isSubtitleLocalProviderActive || pendingSubtitleProviderStarts > 0) {
           providerStopError = await stopSubtitleProviderSafely(message.sessionId, "session_stop");
           isSubtitleLocalProviderActive = false;
         }
@@ -1382,19 +1426,29 @@ export async function startServer(options) {
           liveCallCaptionSessionId = "";
           liveCallCaptionProducerKind = null;
         }
-        subtitleSessionProducer = null;
-        subtitleSessionId = "";
-        await transcriptRecordTail;
-        // Close the transcript session and, when a provider key exists,
-        // generate the AI summary automatically. Best-effort: a summary
-        // failure never blocks or breaks the stop.
-        const ended = await sessionTranscripts?.end();
-        broadcast(wss, { type: "subtitle:sessions", sessions: await (sessionTranscripts?.list() ?? []) });
-        if (providerStopError) {
+        let ended = null;
+        let didFinalizeFail = false;
+        try {
+          await transcriptRecordTail;
+          ended = await sessionTranscripts?.end();
+          broadcast(wss, { type: "subtitle:sessions", sessions: await (sessionTranscripts?.list() ?? []) });
+        } catch {
+          didFinalizeFail = true;
+        } finally {
+          // 2026-09-01 fix: Failed record I/O must not retain ownership of an already stopped provider.
+          if (client === subtitleSessionProducer && message.sessionId === subtitleSessionId) {
+            subtitleSessionProducer = null;
+            subtitleSessionId = "";
+            isSubtitleSessionStopping = false;
+          }
+        }
+        if (providerStopError || didFinalizeFail) {
           client.send(JSON.stringify({
             type: "subtitle:error",
-            code: "SUBTITLE_PROVIDER_STOP_FAILED",
-            message: "로컬 자막 엔진 종료를 확인하지 못했습니다.",
+            code: providerStopError ? "SUBTITLE_PROVIDER_STOP_FAILED" : "SUBTITLE_SESSION_FINALIZE_FAILED",
+            sessionId: message.sessionId,
+            requestId: typeof message.requestId === "string" ? message.requestId.slice(0, 128) : "",
+            message: providerStopError ? "로컬 자막 엔진 종료를 확인하지 못했습니다." : "자막은 종료했지만 기록 저장을 완료하지 못했습니다.",
           }));
         } else {
           client.send(JSON.stringify({
@@ -1403,7 +1457,7 @@ export async function startServer(options) {
             requestId: typeof message.requestId === "string" ? message.requestId.slice(0, 128) : "",
           }));
         }
-        if (ended && ended.lineCount > 0) {
+        if (ended && ended.kind !== "live-call" && ended.lineCount > 0) {
           summarizeSessionTranscript(ended.id).catch((error) => {
             (options.log ?? console).warn?.(`[session-transcripts] auto summary skipped: ${error?.message ?? error}`);
           });
@@ -1565,17 +1619,17 @@ function validateOpenAIRealtimeTranscriptionKey({ apiKey, model, createWebSocket
   });
 }
 
-async function validateGeminiTextGenerationKey({ apiKey, model, fetchImpl }) {
+async function validateGeminiModelAccess({ apiKey, model, fetchImpl }) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 8000);
   try {
-    await generateGeminiText({
-      apiKey,
-      model,
-      prompt: "Return the word ok.",
-      abortSignal: controller.signal,
-      fetchImpl,
+    // 2026-09-01 fix: Settings validation must not create paid inference or
+    // misclassify model overload as an invalid API key.
+    const response = await fetchImpl(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}`, {
+      method: "GET", redirect: "error", headers: { "x-goog-api-key": apiKey }, signal: controller.signal,
     });
+    await response.body?.cancel();
+    if (!response.ok) throw new Error("GEMINI_MODEL_ACCESS_FAILED");
   } finally {
     clearTimeout(timer);
   }
@@ -1585,7 +1639,7 @@ async function validateGeminiTextGenerationKey({ apiKey, model, fetchImpl }) {
 export function selectSubtitlePolishOptions({ args = {}, saved = {}, env = process.env } = {}) {
   const hasGlossaryOrDomain = Boolean(String(args.glossary ?? "").trim() || String(args.domain ?? "").trim());
   const shouldRecoverPlaceholder = isEllipsisPlaceholder(args.translatedText)
-    && String(args.sourceText ?? "").trim().length >= 2;
+    && String(args.sourceText ?? "").trim().length > 0;
   if (args.tone !== "business" && !hasGlossaryOrDomain && !shouldRecoverPlaceholder) return null;
   const provider = "gemini";
   const secondaryKey = (saved.apiKeys?.geminiSecondary
@@ -1595,11 +1649,24 @@ export function selectSubtitlePolishOptions({ args = {}, saved = {}, env = proce
     || "").trim();
   if (!secondaryKey) return null;
 
-  return {
-    provider,
-    apiKey: secondaryKey,
-    modelId: DEFAULT_SUBTITLE_SETTINGS.geminiPolishModel,
-  };
+  const { modelId, fallbackModels } = selectSubtitleEngineModel(saved, "translation");
+  return { provider, apiKey: secondaryKey, modelId, fallbackModels };
+}
+
+/**
+ * Resolves one Gemini text role from the saved engine selection. A non-Gemini
+ * (combined-provider) selection has no separate text model, so the catalog
+ * default stands in for the roles the desktop still runs through Gemini.
+ *
+ * @param {any} saved
+ * @param {"translation"|"summary"} role
+ */
+function selectSubtitleEngineModel(saved, role) {
+  const selected = saved?.subtitle?.engine?.[role];
+  const modelId = selected?.provider === "gemini" && typeof selected.model === "string"
+    ? selected.model
+    : DEFAULT_ENGINE_SELECTION[role].model;
+  return { modelId, fallbackModels: findEngineEntry(role, "gemini", modelId)?.fallbackModels ?? [] };
 }
 
 function isEllipsisPlaceholder(value) {
