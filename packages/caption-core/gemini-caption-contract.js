@@ -1,14 +1,15 @@
 import { localTermRetrievalContract } from "./local-term-retrieval.js";
 import { CAPTION_LANGUAGE_CODES, normalizeCaptionLanguage } from "./languages.js";
 import { captionPolishContract } from "./polish-policy.js";
-import { geminiTranscriptionVocabularyContract } from "./gemini-transcription-vocabulary.js";
+import { DEFAULT_ENGINE_SELECTION, migrateLegacyEngineSelection, normalizeEngineSelection } from "./caption-engine-catalog.js";
 
 const MAX_GLOSSARY_CHARACTERS = localTermRetrievalContract.maximumGlossaryCharacters;
 const MAX_DOMAIN_CHARACTERS = 2_000;
 const MAX_PRESET_ID_CHARACTERS = 128;
 const MAX_PRESET_NAME_CHARACTERS = 80;
-const DEFAULT_TRANSCRIPTION_MODEL = "gemini-3.5-transcribe-live";
+const DEFAULT_TRANSCRIPTION_MODEL = DEFAULT_ENGINE_SELECTION.stt.model;
 const DEFAULT_POLISH_MODEL = "gemini-3.7-flash";
+const DEFAULT_ANALYSIS_MODEL = DEFAULT_ENGINE_SELECTION.summary.model;
 const DEFAULT_PARTIAL_STABILITY_MILLISECONDS = 140;
 const DEFAULT_PARTIAL_MAX_HOLD_MILLISECONDS = 500;
 const DEFAULT_COMMIT_SILENCE_MILLISECONDS = 1_200;
@@ -17,15 +18,16 @@ const VALID_POLISH_POLICIES = new Set(["off", "selective", "full"]);
 
 export const GEMINI_WORKLOAD_MODEL_MATRIX = deepFreeze({
   transcription: DEFAULT_TRANSCRIPTION_MODEL,
+  source: DEFAULT_TRANSCRIPTION_MODEL,
   glossaryExtraction: DEFAULT_POLISH_MODEL,
-  topic: DEFAULT_POLISH_MODEL,
-  translation: DEFAULT_POLISH_MODEL,
+  topic: DEFAULT_ANALYSIS_MODEL,
+  translation: DEFAULT_ENGINE_SELECTION.translation.model,
   polish: DEFAULT_POLISH_MODEL,
-  recap: DEFAULT_POLISH_MODEL,
+  recap: DEFAULT_ANALYSIS_MODEL,
 });
 
 export const GEMINI_CAPTION_ENGINE_CONTRACT = deepFreeze({
-  version: 2,
+  version: 5,
   provider: "gemini",
   voiceProvider: null,
   workloadModels: GEMINI_WORKLOAD_MODEL_MATRIX,
@@ -36,8 +38,7 @@ export const GEMINI_CAPTION_ENGINE_CONTRACT = deepFreeze({
     responseModalities: ["TEXT"],
     interimField: "interimInputTranscription",
     authoritativeField: "inputTranscription",
-    maximumCustomVocabularyEntries: geminiTranscriptionVocabularyContract.defaultMaximumEntries,
-    apiMaximumCustomVocabularyEntries: geminiTranscriptionVocabularyContract.apiMaximumEntries,
+    inputMimeType: "audio/pcm;rate=16000",
   },
   retrieval: {
     engine: "local-session-index",
@@ -77,6 +78,13 @@ export const GEMINI_CAPTION_ENGINE_CONTRACT = deepFreeze({
  */
 export function createGeminiCaptionConfig(input = {}) {
   assertAllowedModelInput(input);
+  const engine = input.engine !== undefined
+    ? normalizeEngineSelection(input.engine)
+    : migrateLegacyEngineSelection({
+      geminiTranscribeModel: input.geminiTranscribeModel ?? input.transcriptionModel ?? input.transcribeModel ?? input.models?.transcription,
+      geminiSummaryModel: input.geminiSummaryModel ?? input.summaryModel ?? input.models?.summary,
+      geminiPolishModel: input.geminiPolishModel ?? input.polishModel ?? input.models?.polish,
+    });
   const glossary = normalizedBoundedString(
     input.glossary ?? input.glossaryText,
     MAX_GLOSSARY_CHARACTERS,
@@ -94,22 +102,16 @@ export function createGeminiCaptionConfig(input = {}) {
   const requestedPolishPolicy = input.captionPolishPolicy ?? input.polishPolicy?.mode;
   const polishPolicy = VALID_POLISH_POLICIES.has(requestedPolishPolicy)
     ? requestedPolishPolicy
-    : "selective";
+    : "off";
   const config = {
     contractVersion: GEMINI_CAPTION_ENGINE_CONTRACT.version,
     provider: GEMINI_CAPTION_ENGINE_CONTRACT.provider,
     voiceProvider: GEMINI_CAPTION_ENGINE_CONTRACT.voiceProvider,
     outputMode: normalizeOutputMode(input.outputMode),
+    engine,
     models: {
-      transcription: fixedModel(
-        input.geminiTranscribeModel
-          ?? input.transcriptionModel
-          ?? input.transcribeModel
-          ?? input.geminiModel
-          ?? input.liveModel
-          ?? input.models?.transcription,
-        DEFAULT_TRANSCRIPTION_MODEL,
-      ),
+      transcription: engine.stt.model,
+      summary: engine.summary.model,
       polish: fixedModel(input.geminiPolishModel ?? input.polishModel ?? input.models?.polish, DEFAULT_POLISH_MODEL),
     },
     preset: {
@@ -140,26 +142,19 @@ export function createGeminiCaptionConfig(input = {}) {
 
 function assertAllowedModelInput(input) {
   if (!input || typeof input !== "object" || Array.isArray(input)) throw new Error("INVALID_GEMINI_CAPTION_CONFIG");
-  if (Object.hasOwn(input, "model")) {
-    if (typeof input.model !== "string") throw new Error("GEMINI_MODEL_OVERRIDE_FORBIDDEN");
-    const legacyModel = input.model.trim();
-    if (legacyModel && legacyModel !== DEFAULT_TRANSCRIPTION_MODEL) throw new Error("GEMINI_MODEL_OVERRIDE_FORBIDDEN");
+  if (Object.hasOwn(input, "model") && typeof input.model !== "string") throw new Error("GEMINI_MODEL_OVERRIDE_FORBIDDEN");
+  if (input.models !== undefined && (!input.models || typeof input.models !== "object" || Array.isArray(input.models)
+    || Object.keys(input.models).some((key) => !["transcription", "polish", "summary"].includes(key)))) {
+    throw new Error("GEMINI_MODEL_OVERRIDE_FORBIDDEN");
   }
-  if (input.models !== undefined) {
-    if (!input.models || typeof input.models !== "object" || Array.isArray(input.models)
-      || Object.keys(input.models).some((key) => !["transcription", "polish"].includes(key))) {
-      throw new Error("GEMINI_MODEL_OVERRIDE_FORBIDDEN");
-    }
-  }
+  if (input.engine !== undefined && (!input.engine || typeof input.engine !== "object")) throw new Error("GEMINI_MODEL_OVERRIDE_FORBIDDEN");
   for (const key of ["topicModel", "translationModel", "recapModel", "geminiTextModel"]) {
     if (Object.hasOwn(input, key)) throw new Error("GEMINI_MODEL_OVERRIDE_FORBIDDEN");
   }
 }
 
 export function geminiCaptionConfigFingerprint(configOrInput = {}) {
-  const config = isCanonicalConfig(configOrInput)
-    ? configOrInput
-    : createGeminiCaptionConfig(configOrInput);
+  const config = isCanonicalConfig(configOrInput) ? configOrInput : createGeminiCaptionConfig(configOrInput);
   const serialized = stableSerialize(config);
   // FNV-1a 64-bit is deterministic in both Electron and the gateway without a
   // runtime-specific crypto dependency. This is an identity check, not a secret.

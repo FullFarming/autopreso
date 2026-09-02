@@ -14,6 +14,7 @@ import {
 } from "../packages/caption-core/index.js";
 import { createCaptionPolisher } from "../media-gateway/src/caption-polish.js";
 import { createSubtitlePolisher } from "../src/subtitle-polish.js";
+import { GEMINI_MODEL_CATALOG, DEFAULT_GEMINI_MODEL_SELECTION, readGeminiSelectedModel } from "../packages/caption-core/gemini-model-catalog.js";
 
 const STRUCTURED_GLOSSARY = [
   "[규칙]",
@@ -39,7 +40,7 @@ function createModeInputs(overrides = {}) {
     glossaryPresetName: "CRE Professional",
     tone: "business",
     languages: ["ko", "en"],
-    geminiModel: "gemini-3.5-transcribe-live",
+    geminiModel: "gemini-3.5-live-translate-preview",
     geminiPolishModel: "gemini-3.7-flash",
     ...overrides,
   };
@@ -95,21 +96,67 @@ test("Caption Only and Live Call canonicalize every Gemini caption setting to on
   assert.deepEqual(defaults.models, {
     transcription: "gemini-3.5-transcribe-live",
     polish: "gemini-3.7-flash",
+    summary: "gemini-3.6-flash",
   });
+  assert.equal(Object.hasOwn(defaults.models, "live"), false);
   assert.equal(defaults.models.polish, "gemini-3.7-flash");
-  assert.equal(defaults.polishPolicy.mode, "selective");
+  assert.equal(defaults.polishPolicy.mode, "off");
+});
+
+test("fixed source and summary selections share the one allowed policy", () => {
+  const config = createGeminiCaptionConfig({
+    geminiTranscribeModel: DEFAULT_GEMINI_MODEL_SELECTION.source,
+    geminiSummaryModel: DEFAULT_GEMINI_MODEL_SELECTION.summary,
+  });
+  assert.equal(config.models.transcription, DEFAULT_GEMINI_MODEL_SELECTION.source);
+  assert.equal(config.models.summary, DEFAULT_GEMINI_MODEL_SELECTION.summary);
+  assert.equal(geminiCaptionConfigFingerprint(config), geminiCaptionConfigFingerprint(createGeminiCaptionConfig()));
+  assert.equal(Object.isFrozen(GEMINI_MODEL_CATALOG.source[0]), true);
+  assert.deepEqual(GEMINI_MODEL_CATALOG.source.map(({ id }) => id), ["gemini-3.5-transcribe-live"]);
+  assert.equal(readGeminiSelectedModel("summary", undefined), "gemini-3.6-flash");
+});
+
+test("unrecognized legacy model settings silently fall back to the default (migration, not override); the models field shape and the standalone selector remain strict", () => {
+  for (const value of [null, "", "gemini-3.7-pro", " gemini-3.6-flash", {}, 3]) {
+    assert.equal(createGeminiCaptionConfig({ geminiTranscribeModel: value }).models.transcription, DEFAULT_GEMINI_MODEL_SELECTION.source);
+    assert.equal(createGeminiCaptionConfig({ geminiSummaryModel: value }).models.summary, DEFAULT_GEMINI_MODEL_SELECTION.summary);
+  }
+  assert.equal(createGeminiCaptionConfig({ geminiTranscribeModel: "gemini-3.5-transcribe-live" }).models.transcription, "gemini-3.5-transcribe-live");
+  // The first-defined alias wins; a stale `models` value behind it is migrated, not compared for conflict.
+  assert.equal(createGeminiCaptionConfig({ geminiSummaryModel: "gemini-3.6-flash", models: { summary: "gemini-3.7-flash" } }).models.summary, "gemini-3.6-flash");
+  assert.equal(createGeminiCaptionConfig({ geminiTranscribeModel: "gemini-3.6-flash", models: { transcription: "unlisted" } }).models.transcription, DEFAULT_GEMINI_MODEL_SELECTION.source);
+  assert.throws(() => createGeminiCaptionConfig({ models: "not-an-object" }), /GEMINI_MODEL_OVERRIDE_FORBIDDEN/u);
+  assert.throws(() => createGeminiCaptionConfig({ models: { unknownField: "x" } }), /GEMINI_MODEL_OVERRIDE_FORBIDDEN/u);
+  assert.equal(readGeminiSelectedModel("translation", "gemini-3.5-transcribe-live"), "gemini-3.5-transcribe-live");
+  assert.throws(() => readGeminiSelectedModel("translation", "gemini-3.5-flash"), /지원하지 않는/u);
+  assert.throws(() => readGeminiSelectedModel("unknown-role", undefined), /지원하지 않는/u);
+});
+
+test("known historical model choices migrate to one current runtime identity", () => {
+  const baseline = createGeminiCaptionConfig();
+  const sourceOnly = createGeminiCaptionConfig({ geminiTranscribeModel: "gemini-3.6-flash" });
+  const summaryOnly = createGeminiCaptionConfig({ geminiSummaryModel: "gemini-3.5-flash" });
+  assert.equal(sourceOnly.models.summary, "gemini-3.6-flash");
+  assert.equal(summaryOnly.models.transcription, "gemini-3.5-transcribe-live");
+  assert.equal(geminiCaptionConfigFingerprint(sourceOnly), geminiCaptionConfigFingerprint(baseline));
+  assert.equal(geminiCaptionConfigFingerprint(summaryOnly), geminiCaptionConfigFingerprint(baseline));
+  // A prior live-translate source setting migrates to the same canonical engine as a fresh default.
+  const legacySource = createGeminiCaptionConfig({ geminiTranscribeModel: "gemini-3.5-live-translate-preview" });
+  assert.equal(geminiCaptionConfigFingerprint(legacySource), geminiCaptionConfigFingerprint(baseline));
 });
 
 test("Gemini workload models are fixed and shared redaction preserves ordinary business figures", () => {
   assert.deepEqual(GEMINI_WORKLOAD_MODEL_MATRIX, {
     transcription: "gemini-3.5-transcribe-live",
+    source: "gemini-3.5-transcribe-live",
     glossaryExtraction: "gemini-3.7-flash",
-    topic: "gemini-3.7-flash",
-    translation: "gemini-3.7-flash",
+    topic: "gemini-3.6-flash",
+    translation: "gemini-3.6-flash",
     polish: "gemini-3.7-flash",
-    recap: "gemini-3.7-flash",
+    recap: "gemini-3.6-flash",
   });
-  assert.throws(() => createGeminiCaptionConfig({ geminiModel: "browser-choice" }), /GEMINI_MODEL_OVERRIDE_FORBIDDEN/u);
+  // The retired live-translate `geminiModel` field is now inert, not forbidden.
+  assert.equal(Object.hasOwn(createGeminiCaptionConfig({ geminiModel: "browser-choice" }).models, "live"), false);
   assert.throws(() => createGeminiCaptionConfig({ geminiPolishModel: "session-choice" }), /GEMINI_MODEL_OVERRIDE_FORBIDDEN/u);
   assert.throws(() => createGeminiCaptionConfig({ models: { topic: "gemini-3.7-flash" } }), /GEMINI_MODEL_OVERRIDE_FORBIDDEN/u);
   assert.throws(() => createGeminiCaptionConfig({ geminiTextModel: "gemini-3.7-flash" }), /GEMINI_MODEL_OVERRIDE_FORBIDDEN/u);
@@ -131,35 +178,30 @@ test("Gemini workload models are fixed and shared redaction preserves ordinary b
   ]) assert.equal(redactGeminiSensitiveText(ordinary), ordinary);
 });
 
-test("legacy model input accepts only empty or the exact fixed transcription model", () => {
-  assert.equal(createGeminiCaptionConfig({ model: "" }).models.transcription, "gemini-3.5-transcribe-live");
-  assert.equal(
-    createGeminiCaptionConfig({ model: "gemini-3.5-transcribe-live" }).models.transcription,
-    "gemini-3.5-transcribe-live",
-  );
-  for (const model of ["gemini-3.5-live-translate-preview", "gemini-live", "caller-model"]) {
-    assert.throws(() => createGeminiCaptionConfig({ model }), /GEMINI_MODEL_OVERRIDE_FORBIDDEN/u);
-  }
+test("caption model changes alter fingerprints and an unlisted `models` key still cannot become a runtime override", () => {
+  const config = createGeminiCaptionConfig();
+  const previous = { ...config, models: { ...config.models, live: "gemini-3.5-transcribe-live" } };
+  assert.notEqual(geminiCaptionConfigFingerprint(config), geminiCaptionConfigFingerprint(previous));
+  assert.throws(() => createGeminiCaptionConfig({ models: { live: "gemini-3.5-transcribe-live" } }), /GEMINI_MODEL_OVERRIDE_FORBIDDEN/u);
+  assert.equal(config.engine.translation.model, GEMINI_WORKLOAD_MODEL_MATRIX.translation);
 });
-
-test("caption config deletes audio semantics and exposes the Transcribe Live event contract", () => {
-  const config = createGeminiCaptionConfig({
-    outputMode: "audio",
-    audioLanguage: "ja",
-    outputSampleRate: 24_000,
-    languages: ["en", "ja"],
-  });
-
-  assert.equal(config.outputMode, "captions");
-  assert.equal(config.voiceProvider, null);
-  assert.equal(Object.hasOwn(config, "audioLanguage"), false);
-  assert.equal(Object.hasOwn(config.streamingPolicy, "outputSampleRate"), false);
-  assert.equal(GEMINI_CAPTION_ENGINE_CONTRACT.transcription.model, "gemini-3.5-transcribe-live");
-  assert.deepEqual(GEMINI_CAPTION_ENGINE_CONTRACT.transcription.responseModalities, ["TEXT"]);
-  assert.equal(GEMINI_CAPTION_ENGINE_CONTRACT.transcription.interimField, "interimInputTranscription");
-  assert.equal(GEMINI_CAPTION_ENGINE_CONTRACT.transcription.authoritativeField, "inputTranscription");
-  assert.equal(GEMINI_CAPTION_ENGINE_CONTRACT.transcription.maximumCustomVocabularyEntries, 100);
-  assert.equal(GEMINI_CAPTION_ENGINE_CONTRACT.transcription.apiMaximumCustomVocabularyEntries, 1_000);
+test("the retired direct `model` field is ignored (only type-checked); `models.live` is no longer an accepted key", () => {
+  for (const model of ["", "gemini-3.5-live-translate-preview", "gemini-3.5-transcribe-live", "gemini-live", "caller-model"]) {
+    assert.equal(Object.hasOwn(createGeminiCaptionConfig({ model }).models, "live"), false);
+  }
+  assert.throws(() => createGeminiCaptionConfig({ model: 3 }), /GEMINI_MODEL_OVERRIDE_FORBIDDEN/u);
+  assert.throws(() => createGeminiCaptionConfig({ models: { live: "gemini-3.5-live-translate-preview" } }), /GEMINI_MODEL_OVERRIDE_FORBIDDEN/u);
+});
+test("caption config hides generated audio and the transcription contract reflects Transcribe Live's TEXT-only stream", () => {
+  const config=createGeminiCaptionConfig({outputMode:"audio",audioLanguage:"ja",languages:["en","ja"]});
+  assert.equal(config.outputMode,"captions");
+  assert.equal(config.voiceProvider,null);
+  assert.equal(Object.hasOwn(config,"audioLanguage"),false);
+  assert.equal(GEMINI_CAPTION_ENGINE_CONTRACT.voiceProvider,null);
+  assert.equal(GEMINI_CAPTION_ENGINE_CONTRACT.transcription.model,"gemini-3.5-transcribe-live");
+  assert.deepEqual(GEMINI_CAPTION_ENGINE_CONTRACT.transcription.responseModalities,["TEXT"]);
+  assert.equal(GEMINI_CAPTION_ENGINE_CONTRACT.transcription.interimField,"interimInputTranscription");
+  assert.equal(GEMINI_CAPTION_ENGINE_CONTRACT.transcription.authoritativeField,"inputTranscription");
 });
 
 test("the canonical config keeps a 40k structured glossary byte-for-byte, including a relevant late entry", () => {
