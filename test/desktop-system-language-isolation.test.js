@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import vm from "node:vm";
 import test from "node:test";
+import { mountCaptionEngineSettings } from "../public/subtitle-model-settings.js";
+import { captionEngineCatalogForClient } from "../packages/caption-core/caption-engine-catalog.js";
 
 test("system language repaint preserves unsaved translation targets and glossary without new requests", () => {
   const source = readFileSync(new URL("../public/subtitle-dashboard.js", import.meta.url), "utf8");
@@ -20,8 +22,20 @@ test("system language repaint preserves unsaved translation targets and glossary
   let filters = 0;
   let visiblePlacementLanguages;
   const noCall = () => { throw new Error("system language must not call the engine, overwrite settings, or fetch records"); };
+  const ownerDocument = { createElement: () => ({ value: "", textContent: "", disabled: false }) };
+  const engineFields = Object.fromEntries(["engineStt", "engineLanguageMode", "engineTranslation", "engineSummary"].map(name => [name, {
+    value: "", disabled: false, ownerDocument, replaceChildren() {}, addEventListener() {},
+  }]));
+  // No Gemini key: every option is unavailable, which is exactly the state a
+  // language repaint must not silently "fix" by writing a settings patch.
+  const engineCatalog = captionEngineCatalogForClient({ hasApiKeys: {} });
+  const engineSettings = { engine: engineCatalog.defaults };
+  const form = { querySelectorAll: () => inputs, querySelector: () => null, elements: engineFields, ownerDocument };
+  const captionEngineSettings = mountCaptionEngineSettings({ form, getSettings: () => engineSettings,
+    save: noCall, onSaved: noCall, onError: noCall, translate: key => key });
+  captionEngineSettings.setCatalog(engineCatalog);
   const context = vm.createContext({
-    form: { querySelectorAll: () => inputs },
+    form, captionEngineSettings,
     selectedGlossaryPresetId: () => "unsaved-preset",
     selectedGlossaryPresetName: () => "User draft glossary",
     renderLanguagePills: () => { inputs[1].checked = true; },
@@ -44,4 +58,8 @@ test("system language repaint preserves unsaved translation targets and glossary
   assert.equal(restoredPreset[2].persistConfirmedMissing, false);
   assert.equal(filters, 1);
   assert.deepEqual(visiblePlacementLanguages, ["ko", "ja"]);
+  assert.equal(engineFields.engineStt.value, `${engineCatalog.defaults.stt.provider}:${engineCatalog.defaults.stt.model}`);
+  assert.equal(engineFields.engineSummary.value, `${engineCatalog.defaults.summary.provider}:${engineCatalog.defaults.summary.model}`);
+  assert.deepEqual(engineSettings, { engine: engineCatalog.defaults }, "language repaint must not migrate or save settings");
+  assert.equal(engineFields.engineLanguageMode.disabled, true, "the Gemini STT has a single input-language mode");
 });

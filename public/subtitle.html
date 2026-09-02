@@ -556,6 +556,15 @@
                 <div class="cfg-heading">
                   <h2 id="cfg-advanced-title"><span data-i18n="cfg.engineGlossary">엔진 · 용어집</span></h2>
                 </div>
+                <div class="settings-panel" role="group" aria-labelledby="caption-models-heading">
+                  <h3 id="caption-models-heading" data-i18n="models.heading">API · 모델</h3>
+                  <label><span data-i18n="engine.stt">음성 인식</span><select name="engineStt" aria-describedby="caption-engine-status"></select></label>
+                  <label><span data-i18n="engine.languageMode">입력 언어</span><select name="engineLanguageMode" aria-describedby="caption-engine-status"></select></label>
+                  <label><span data-i18n="engine.translation">번역</span><select name="engineTranslation" aria-describedby="caption-engine-status"></select></label>
+                  <label><span data-i18n="engine.summary">요약</span><select name="engineSummary" aria-describedby="caption-engine-status"></select></label>
+                  <p id="caption-engine-status" class="field-status" data-caption-engine-status role="status" aria-live="polite" data-i18n="engine.loading">모델 목록을 불러오고 있어요.</p>
+                  <p id="caption-model-cost" class="field-status" data-i18n="models.cost">API 사용 요금이 발생합니다. 번역 음성을 재생하지 않아도 Live API 음성 생성 비용이 발생할 수 있습니다.</p>
+                </div>
                 <details class="settings-drawer">
                   <summary data-i18n="settings.drawerAdvanced">고급</summary>
                   <div class="settings-panel">
@@ -584,6 +593,14 @@
                         <button id="save-gemini-secondary-key" type="button" class="secondary compact" data-i18n="settings.saveKey2">키 2 저장</button>
                       </div>
                       <span id="gemini-secondary-key-status" class="field-status" data-i18n="key.geminiSecondaryHint">미등록</span>
+                    </label>
+
+                    <label>
+                      <span data-i18n="keys.soniox">Soniox API 키</span>
+                      <div class="key-row">
+                        <input name="sonioxKey" type="password" autocomplete="off" placeholder="soniox..." />
+                      </div>
+                      <span id="soniox-key-status" class="field-status" data-i18n="key.unregistered">미등록</span>
                     </label>
 
                     <input name="translationProvider" type="hidden" value="gemini" />

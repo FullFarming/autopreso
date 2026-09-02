@@ -6,6 +6,7 @@ import {
   pcm16ArrayBufferToBase64,
 } from "./subtitle-audio-capture.js";
 import { buildMonthGrid, buildTimeGrid } from "./records-calendar.js";
+import { mountCaptionEngineSettings } from "./subtitle-model-settings.js";
 // Every user-visible string in this file resolves through t(); subtitle-workspace.js
 // owns restoring/persisting the choice and the declarative data-i18n pass.
 import { getLanguage, hasKey, subscribe as subscribeToLanguage, t } from "./subtitle-i18n.js";
@@ -20,6 +21,7 @@ const LIVE_TRANSLATION_SIGNAL_GAP_MILLISECONDS = 250;
 const CAPTURE_TIMEOUT_MS = 8000;
 const WEBSOCKET_OPEN_TIMEOUT_MS = 5_000;
 const SUBTITLE_START_ACK_TIMEOUT_MS = 10_000;
+const SUBTITLE_STOP_ACK_TIMEOUT_MS = 10_000;
 const SUBTITLE_PREFLIGHT_ACK_TIMEOUT_MS = 2_000;
 const DEFAULT_GLOSSARY_PRESET_ID = "default-cre-ai-en-ko";
 const CUSTOM_GLOSSARY_PRESET_VALUE = "custom";
@@ -42,7 +44,6 @@ const DEFAULT_SUBTITLE = {
   displayMode: "translation_only",
   showSourceText: false,
   translateAllLanguages: false,
-  geminiTranscribeModel: "gemini-3.5-transcribe-live",
   fontFamily: "Arial, Helvetica, sans-serif",
   translationFontSize: 38,
   sourceFontSize: 36,
@@ -82,7 +83,6 @@ function normalizeCaptionSettings(settings = {}) {
     ...DEFAULT_SUBTITLE,
     ...currentSettings,
     outputMode: "captions",
-    geminiTranscribeModel: DEFAULT_SUBTITLE.geminiTranscribeModel,
     translationProvider: "gemini",
     glossaries,
   };
@@ -117,6 +117,7 @@ const state = {
   hasOpenAIKey: false,
   hasGeminiKey: false,
   hasGeminiSecondaryKey: false,
+  hasSonioxKey: false,
   previewStatusTimer: null,
   history: { records: [], topics: [], historyDays: [], recorderStatus: {} },
   audioMeters: new Map(),
@@ -131,6 +132,8 @@ const CAPTION_RUNTIME_TRANSITIONS = Object.freeze({
   failed: new Set(["idle", "starting", "reconnecting", "stopping"]),
 });
 let captionRuntimeState = "idle";
+let captionEngineSettings = null;
+let subtitleStopAcknowledgementPromise = null;
 let liveTranslationReconnectPromise = null;
 let isLiveParticipantDemandEnabled = false;
 let captionWebSocketReconnectTimer = null;
@@ -193,6 +196,7 @@ function transitionCaptionRuntime(nextState) {
     return false;
   }
   captionRuntimeState = nextState;
+  if (typeof captionEngineSettings !== "undefined") captionEngineSettings?.refresh();
   return true;
 }
 
@@ -225,6 +229,11 @@ const geminiKeyStatus = document.getElementById("gemini-key-status");
 const geminiSecondaryKeyInput = form.elements.geminiSecondaryKey;
 const saveGeminiSecondaryKeyButton = document.getElementById("save-gemini-secondary-key");
 const geminiSecondaryKeyStatus = document.getElementById("gemini-secondary-key-status");
+const sonioxKeyInput = form.elements.sonioxKey;
+const sonioxKeyStatus = document.getElementById("soniox-key-status");
+// The engine picker owns these fields end to end: the shared settings form
+// must not autosave them, and the API key inputs never enter `subtitle`.
+const CAPTION_ENGINE_FIELD_NAMES = ["engineStt", "engineLanguageMode", "engineTranslation", "engineSummary", "sonioxKey"];
 const fileProtocolWarning = document.getElementById("file-protocol-warning");
 const overlayEnabledInput = document.getElementById("overlay-enabled");
 const sessionSummary = document.getElementById("session-summary");
@@ -275,7 +284,10 @@ function showFileProtocolWarning() {
 }
 
 form.addEventListener("input", (event) => {
-  if (event.target === openaiKeyInput || event.target === geminiKeyInput || event.target === geminiSecondaryKeyInput || event.target === glossaryPresetNameInput) return;
+  if (CAPTION_ENGINE_FIELD_NAMES.includes(event.target?.name)
+    || captionEngineSettings?.isSaving()) return;
+  if (event.target === openaiKeyInput || event.target === geminiKeyInput || event.target === geminiSecondaryKeyInput
+    || event.target === sonioxKeyInput || event.target === glossaryPresetNameInput) return;
   if (event.target === form.elements.glossary
     || event.target === form.elements.translationDomain
     || event.target?.name === "translationLanguages") {
@@ -299,7 +311,8 @@ form.addEventListener("input", (event) => {
 const CHANNEL_REBUILD_CONTROLS = new Set(["translationLanguages"]);
 
 form.addEventListener("change", (event) => {
-  if (event.target === glossaryPresetNameInput) return;
+  if (captionEngineSettings?.isSaving()) { writeSettingsToForm(state.settings); return; }
+  if (event.target === glossaryPresetNameInput || CAPTION_ENGINE_FIELD_NAMES.includes(event.target?.name)) return;
   syncLanguageControls(event.target);
   syncLiveCallLanguageControls(event.target);
   state.settings = readSettingsFromForm();
@@ -324,6 +337,14 @@ form.addEventListener("change", (event) => {
       showNotice(t("notice.settingsSaved"));
     })
     .catch(showError);
+});
+
+captionEngineSettings = mountCaptionEngineSettings({
+  form,
+  getSettings: () => state.settings,
+  save: patch => saveSettings({ subtitle: patch }),
+  onSaved: patch => { state.settings = { ...state.settings, ...patch }; showNotice(t("notice.settingsSaved")); },
+  onError: showError,
 });
 
 startButton.addEventListener("click", startSubtitles);
@@ -1628,7 +1649,6 @@ async function loadConfig() {
     const config = await fetch("/api/config").then((res) => res.json());
     const shouldNormalizeCaptionSettings = config.settings?.subtitle
       && (config.settings.subtitle.translationProvider !== "gemini"
-        || config.settings.subtitle.geminiTranscribeModel !== DEFAULT_SUBTITLE.geminiTranscribeModel
         || [...RETIRED_SUBTITLE_SETTING_KEYS].some((key) => Object.hasOwn(config.settings.subtitle, key)));
     if (config.settings?.subtitle) {
       state.settings = normalizeCaptionSettings(config.settings.subtitle);
@@ -1636,12 +1656,15 @@ async function loadConfig() {
     state.hasOpenAIKey = Boolean(config.settings?.hasOpenAIKey);
     state.hasGeminiKey = Boolean(config.settings?.hasGeminiKey);
     state.hasGeminiSecondaryKey = Boolean(config.settings?.hasGeminiSecondaryKey);
+    state.hasSonioxKey = Boolean(config.settings?.hasSonioxKey);
     writeSettingsToForm(state.settings);
+    if (typeof captionEngineSettings !== "undefined") captionEngineSettings?.setCatalog(config.captionEngines);
     await hydrateOverlayEnabled();
     applyPreviewSettings(state.settings);
     updateOpenAIKeyPlaceholder();
     updateGeminiKeyStatus();
     updateGeminiSecondaryKeyStatus();
+    updateSonioxKeyStatus();
     updateOpenAIKeyStatus();
     updateSessionSummary();
     updateServiceStrip();
@@ -2242,6 +2265,16 @@ async function openSessionRecordDetail(session) {
   }
   let didOpen = false;
   try {
+    if (typeof session.id === "string" && /^live-[0-9a-f-]{36}$/iu.test(session.id)
+      && window.realtimeNoelDesktop?.refreshLiveCallArchive) {
+      const refreshed = await window.realtimeNoelDesktop.refreshLiveCallArchive(session.id);
+      if (!refreshed?.ok) {
+        if (refreshed?.canUseCached !== true || ["FORBIDDEN", "HOST_LOGIN_REQUIRED"].includes(refreshed?.code)) {
+          throw new Error(t("records.loadFailed"));
+        }
+        showError(t("records.loadFailed"));
+      }
+    }
     const body = await fetch(`/api/subtitles/sessions/${encodeURIComponent(session.id)}`).then((res) => res.json());
     if (!body.ok) throw new Error(body.error || t("records.loadFailed"));
     const detail = body.data;
@@ -2529,12 +2562,17 @@ function connectWebSocket() {
       state.hasOpenAIKey = Boolean(message.settings.hasOpenAIKey);
       state.hasGeminiKey = Boolean(message.settings.hasGeminiKey);
       state.hasGeminiSecondaryKey = Boolean(message.settings.hasGeminiSecondaryKey);
+      state.hasSonioxKey = Boolean(message.settings.hasSonioxKey);
       writeSettingsToForm(state.settings);
       applyPreviewSettings(state.settings);
       updateOpenAIKeyPlaceholder();
       updateOpenAIKeyStatus();
       updateGeminiKeyStatus();
       updateGeminiSecondaryKeyStatus();
+      updateSonioxKeyStatus();
+      // A settings broadcast carries no catalog, so repaint the engine picker
+      // from the new selection instead of re-normalizing a catalog we still hold.
+      captionEngineSettings?.refresh();
       updateSessionSummary();
       updateServiceStrip();
       updateAudioInspectorLabels();
@@ -2656,7 +2694,48 @@ async function recoverLiveCaptionSocket() {
   return liveCaptionSocketRecoveryPromise;
 }
 
+function requestSubtitleStop(socket, sessionId) {
+  const failure = (code) => Object.assign(new Error(code), { code });
+  if (!socket || socket.readyState !== WebSocket.OPEN) {
+    return Promise.reject(failure("SUBTITLE_STOP_CONNECTION_CLOSED"));
+  }
+  const requestId = crypto.randomUUID();
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const finish = (error) => {
+      if (settled) return;
+      settled = true;
+      window.clearTimeout(timer);
+      socket.removeEventListener("message", onMessage);
+      socket.removeEventListener("close", onClose);
+      if (error) reject(error);
+      else resolve();
+    };
+    const onMessage = (event) => {
+      let message;
+      try { message = JSON.parse(event.data); } catch { return; }
+      if (message.sessionId !== sessionId || message.requestId !== requestId) return;
+      if (message.type === "subtitle:stopped") finish();
+      else if (message.type === "subtitle:error"
+        && ["SUBTITLE_PROVIDER_STOP_FAILED", "SUBTITLE_SESSION_FINALIZE_FAILED", "SUBTITLE_SESSION_MISMATCH"].includes(message.code)) {
+        finish(failure("SUBTITLE_STOP_FAILED"));
+      }
+    };
+    const onClose = () => finish(failure("SUBTITLE_STOP_CONNECTION_CLOSED"));
+    const timer = window.setTimeout(() => finish(failure("SUBTITLE_STOP_TIMEOUT")), SUBTITLE_STOP_ACK_TIMEOUT_MS);
+    socket.addEventListener("message", onMessage);
+    socket.addEventListener("close", onClose, { once: true });
+    try { socket.send(JSON.stringify({ type: "subtitle:stop", sessionId, requestId })); }
+    catch { finish(failure("SUBTITLE_STOP_CONNECTION_CLOSED")); }
+  });
+}
+
 function requestSubtitleStart(payload) {
+  // 2026-09-01 fix: Only the opt-in Live Call local engine consumes mixed PCM.
+  // Keep saved device selection intact while start/recovery/reconfigure share its mic wire lane.
+  const startPayload = payload.meeting?.kind === "live-call" && payload.captionProducer !== "gateway"
+    ? { ...payload, settings: { ...payload.settings, inputMode: "mic" } }
+    : payload;
   const socket = state.ws;
   if (!socket || socket.readyState !== WebSocket.OPEN) {
     return Promise.reject(new Error(t("error.websocketClosed")));
@@ -2699,11 +2778,20 @@ function requestSubtitleStart(payload) {
     );
     socket.addEventListener("message", onMessage);
     socket.addEventListener("close", onClose, { once: true });
-    socket.send(JSON.stringify(payload));
+    socket.send(JSON.stringify(startPayload));
   });
 }
 
 async function handleSubtitleRuntimeError(message) {
+  // 2026-08-31 fix: 한 문장의 번역 실패로 정상 자막이나 다른 언어 채널을 종료하지 않는다.
+  if (message.code === "TEXT_TRANSLATION_FAILED") {
+    // 원문은 도착했으므로 번역 실패를 입력 정체로 오인해 재연결하지 않는다.
+    if (activeCaptionSessionOwner === "live-call" && state.running) {
+      liveTranslationStallMonitor.noteOutput(performance.now());
+    }
+    showError(new Error(message.message));
+    return;
+  }
   // Initial-start errors are owned by requestSubtitleStart, which rejects the
   // matching promise and lets that start path release its own capture exactly once.
   if (captionRuntimeState === "starting") return;
@@ -2720,6 +2808,7 @@ async function handleSubtitleRuntimeError(message) {
 }
 
 async function startSubtitles() {
+  if (typeof captionEngineSettings !== "undefined" && captionEngineSettings?.isSaving()) { showNotice(t("engine.saving")); return; }
   if (state.running || captionRuntimeState === "starting" || captionRuntimeState === "stopping") return;
   if (captionRuntimeState === "failed") transitionCaptionRuntime("idle");
   transitionCaptionRuntime("starting");
@@ -2734,6 +2823,7 @@ async function startSubtitles() {
     if (openaiKeyInput.value.trim()) apiKeysPatch.openai = openaiKeyInput.value.trim();
     if (geminiKeyInput?.value.trim()) apiKeysPatch.gemini = geminiKeyInput.value.trim();
     if (geminiSecondaryKeyInput?.value.trim()) apiKeysPatch.geminiSecondary = geminiSecondaryKeyInput.value.trim();
+    if (sonioxKeyInput?.value.trim()) apiKeysPatch.soniox = sonioxKeyInput.value.trim();
     if (Object.keys(apiKeysPatch).length > 0) patch.apiKeys = apiKeysPatch;
     if (!state.hasGeminiKey && !geminiKeyInput?.value.trim()) {
       throw new Error(t("key.geminiRequired"));
@@ -2748,6 +2838,11 @@ async function startSubtitles() {
       state.hasGeminiSecondaryKey = true;
       geminiSecondaryKeyInput.value = "";
       updateGeminiSecondaryKeyStatus();
+    }
+    if (sonioxKeyInput?.value.trim()) {
+      state.hasSonioxKey = true;
+      sonioxKeyInput.value = "";
+      updateSonioxKeyStatus();
     }
     if (openaiKeyInput.value.trim()) {
       state.hasOpenAIKey = true;
@@ -2808,13 +2903,15 @@ async function startSubtitles() {
   }
 }
 
-async function stopSubtitles() {
+async function stopSubtitles({ waitForAcknowledgement = false } = {}) {
+  if (subtitleStopAcknowledgementPromise) return subtitleStopAcknowledgementPromise;
   if (captionRuntimeState !== "stopping") transitionCaptionRuntime("stopping");
   clearActiveSubtitleSurface();
   const sessionId = state.sessionId;
   state.sessionId = null;
   stopLocalStreams();
-  if (state.ws?.readyState === WebSocket.OPEN && sessionId) {
+  const stopped = waitForAcknowledgement && sessionId ? requestSubtitleStop(state.ws, sessionId) : null;
+  if (!waitForAcknowledgement && state.ws?.readyState === WebSocket.OPEN && sessionId) {
     state.ws.send(JSON.stringify({ type: "subtitle:stop", sessionId }));
   }
   state.running = false;
@@ -2824,10 +2921,21 @@ async function stopSubtitles() {
   resetLiveCallCaptionRelay();
   window.clearTimeout(liveCaptionSocketRecoveryTimer);
   liveCaptionSocketRecoveryTimer = null;
-  transitionCaptionRuntime("idle");
-  startButton.disabled = false;
-  stopButton.disabled = true;
-  syncRuntimeOutputVisibility();
+  try {
+    if (stopped) {
+      subtitleStopAcknowledgementPromise = stopped;
+      startButton.disabled = true;
+      stopButton.disabled = true;
+      syncRuntimeOutputVisibility();
+      await stopped;
+    }
+  } finally {
+    subtitleStopAcknowledgementPromise = null;
+    transitionCaptionRuntime("idle");
+    startButton.disabled = false;
+    stopButton.disabled = true;
+    syncRuntimeOutputVisibility();
+  }
 }
 
 // Rebuild the running session's translation channels without tearing down the
@@ -3073,7 +3181,8 @@ function stopMediaStream(stream) {
 }
 
 
-async function createAudioStreamer(media, sourceName, label, onChunk) {
+async function createAudioStreamer(media, sourceName, label, onChunk, { signal } = {}) {
+  if (Array.isArray(media)) return createLiveCallMixedAudioStreamer(media, onChunk, signal);
   const context = new AudioContext({ sampleRate: CAPTION_AUDIO_SAMPLE_RATE, latencyHint: "interactive" });
   await ensureAudioContextRunning(context, sourceName);
   const source = context.createMediaStreamSource(media);
@@ -3113,6 +3222,84 @@ async function createAudioStreamer(media, sourceName, label, onChunk) {
       await context.close();
     },
   };
+}
+
+async function createLiveCallMixedAudioStreamer(captures, onChunk, signal) {
+  if (signal?.aborted) throw new DOMException("Audio capture cancelled", "AbortError");
+  if (captures.length < 1 || captures.length > 2
+    || new Set(captures.map(capture => capture.source)).size !== captures.length
+    || captures.some(capture => !["system", "mic"].includes(capture.source)
+      || !capture.stream?.getAudioTracks?.().length)) throw new Error("INVALID_LIVE_AUDIO_INPUTS");
+  const context = new AudioContext({ sampleRate: CAPTION_AUDIO_SAMPLE_RATE, latencyHint: "interactive" });
+  const nodes = [];
+  const meters = [];
+  const trackCleanups = [];
+  let processor;
+  let chunker;
+  let isClosed = false;
+  let closePromise;
+  const onStateChange = () => {
+    if (isClosed) return;
+    for (const capture of captures) {
+      if (context.state === "running") setAudioSourceStatus(capture.source, t("audio.ready"), 0);
+      if (context.state === "suspended") setAudioSourceStatus(capture.source, t("audio.paused"), 0);
+    }
+  };
+  const close = () => {
+    if (closePromise) return closePromise;
+    isClosed = true;
+    signal?.removeEventListener("abort", onAbort);
+    context.removeEventListener?.("statechange", onStateChange);
+    if (processor) processor.onaudioprocess = null;
+    chunker?.reset();
+    for (const cleanup of trackCleanups) cleanup();
+    for (const meter of meters) meter.close();
+    for (const node of nodes) node.disconnect();
+    closePromise = context.close().catch(() => console.warn("LIVE_AUDIO_CONTEXT_CLOSE_FAILED"));
+    return closePromise;
+  };
+  const onAbort = () => { void close(); };
+  signal?.addEventListener("abort", onAbort, { once: true });
+  try {
+    await ensureAudioContextRunning(context, "mic");
+    if (isClosed || signal?.aborted) throw new DOMException("Audio capture cancelled", "AbortError");
+    // 2026-09-01 fix: Live Call has one host audio clock. Sum simultaneous
+    // device samples before chunking; relabelling interleaved packets doubles time.
+    const mix = context.createGain();
+    nodes.push(mix);
+    mix.channelCount = 1;
+    mix.channelCountMode = "explicit";
+    mix.channelInterpretation = "speakers";
+    mix.gain.value = 1;
+    processor = context.createScriptProcessor(CAPTION_AUDIO_PROCESSOR_BUFFER_SIZE, 1, 1);
+    nodes.push(processor);
+    chunker = createCaptionAudioChunker({ inputSampleRate: context.sampleRate, source: "mic", onChunk });
+    for (const capture of captures) {
+      const source = context.createMediaStreamSource(capture.stream);
+      nodes.push(source);
+      const analyser = context.createAnalyser();
+      nodes.push(analyser);
+      analyser.fftSize = 256;
+      source.connect(mix);
+      source.connect(analyser);
+      meters.push(startAudioLevelMeter(capture.source, capture.label, analyser));
+      trackCleanups.push(watchAudioTrackState(capture.stream, capture.source));
+    }
+    processor.onaudioprocess = event => {
+      if (!isClosed && !signal?.aborted) chunker.push(event.inputBuffer.getChannelData(0));
+    };
+    const mute = context.createGain();
+    nodes.push(mute);
+    mute.gain.value = 0;
+    mix.connect(processor);
+    processor.connect(mute);
+    mute.connect(context.destination);
+    context.addEventListener?.("statechange", onStateChange);
+    return { close };
+  } catch (error) {
+    await close();
+    throw error;
+  }
 }
 
 async function ensureAudioContextRunning(context, sourceName) {
@@ -3294,10 +3481,12 @@ async function saveSettings(patch) {
     state.hasOpenAIKey = Boolean(body.settings.hasOpenAIKey);
     state.hasGeminiKey = Boolean(body.settings.hasGeminiKey);
     state.hasGeminiSecondaryKey = Boolean(body.settings.hasGeminiSecondaryKey);
+    state.hasSonioxKey = Boolean(body.settings.hasSonioxKey);
     updateOpenAIKeyPlaceholder();
     updateOpenAIKeyStatus();
     updateGeminiKeyStatus();
     updateGeminiSecondaryKeyStatus();
+    updateSonioxKeyStatus();
   }
   return body;
 }
@@ -3324,7 +3513,6 @@ function readSettingsFromForm() {
     // Source ("원문") display removed — subtitles are always translation-only.
     showSourceText: false,
     translateAllLanguages: translationLanguages.length >= 3,
-    geminiTranscribeModel: DEFAULT_SUBTITLE.geminiTranscribeModel,
     fontFamily: form.elements.fontFamily.value || DEFAULT_SUBTITLE.fontFamily,
     translationFontSize,
     sourceFontSize,
@@ -3512,6 +3700,12 @@ function updateOpenAIKeyStatus() {
 function updateGeminiKeyStatus() {
   renderKeyStatus(geminiKeyStatus, state.hasGeminiKey);
   if (geminiKeyInput) geminiKeyInput.placeholder = state.hasGeminiKey ? t("key.configuredPlaceholder") : "AIza...";
+}
+
+// Presence only: the Soniox key never round-trips to the client.
+function updateSonioxKeyStatus() {
+  renderKeyStatus(sonioxKeyStatus, state.hasSonioxKey);
+  if (sonioxKeyInput) sonioxKeyInput.placeholder = state.hasSonioxKey ? t("key.configuredPlaceholder") : "soniox...";
 }
 
 // Explicit registration badge: the key never round-trips to the client, so
@@ -3927,6 +4121,7 @@ function syncLinkedControl(target) {
 }
 
 function syncCaptionPlayerController() {
+  if (typeof captionEngineSettings !== "undefined") captionEngineSettings?.refresh();
   if (!captionPlayerController) return;
   const isVisible = state.running;
   captionPlayerController.hidden = !isVisible;
@@ -4169,6 +4364,7 @@ function formatCaptureFailure(source, error) {
 let liveBridgeCapture = null;
 let isLiveBridgeStarting = false;
 let liveBridgePreflightRequestId = null;
+let liveCaptionStartAttempt = null;
 let liveBridgeCaptureStartPromise = null;
 let isLiveParticipantFloorActive = false;
 let activeLiveFloorSessionId = "";
@@ -4283,6 +4479,7 @@ function stopLiveCallAudioBridge(reason) {
   if (!liveBridgeCapture) return;
   const capture = liveBridgeCapture;
   liveBridgeCapture = null;
+  capture.abortController?.abort();
   for (const streamer of capture.streamers ?? []) void streamer.close?.();
   for (const stream of capture.streams ?? []) stopMediaStream(stream);
   console.info(`[live-bridge] audio capture stopped${reason ? ` (${reason})` : ""}`);
@@ -4292,7 +4489,7 @@ async function startLiveCallMicCapture({ requestId = "" } = {}) {
   if (liveBridgeCapture?.ready) return { ok: true, reused: true };
   if (liveBridgeCaptureStartPromise) return liveBridgeCaptureStartPromise;
   if (liveBridgeCapture?.failed) stopLiveCallAudioBridge("retrying capture");
-  const capture = { streams: [], streamers: [], requestId };
+  const capture = { streams: [], streamers: [], requestId, abortController: new AbortController() };
   liveBridgeCapture = capture;
   liveBridgeCaptureStartPromise = (async () => {
     try {
@@ -4303,23 +4500,22 @@ async function startLiveCallMicCapture({ requestId = "" } = {}) {
         return { ok: false, cancelled: true };
       }
       capture.streams = sources.map((source) => source.stream);
-      for (const source of sources) {
-        if (liveBridgeCapture !== capture) return { ok: false, cancelled: true };
-        const streamer = await createAudioStreamer(source.stream, source.source, source.label, (packet) => {
-          forwardLiveCallHostAudioPacket(packet, capture, source.source);
-        });
-        if (liveBridgeCapture !== capture) {
-          void streamer.close?.();
-          return { ok: false, cancelled: true };
-        }
-        capture.streamers.push(streamer);
+      const streamer = await createAudioStreamer(sources, "mic", "", (packet) => {
+        forwardLiveCallHostAudioPacket(packet, capture, "mic");
+      }, { signal: capture.abortController.signal });
+      if (liveBridgeCapture !== capture) {
+        await streamer.close?.();
+        return { ok: false, cancelled: true };
       }
+      capture.streamers.push(streamer);
       if (liveBridgeCapture !== capture) return { ok: false, cancelled: true };
       capture.ready = true;
       console.info(`[live-bridge] ${sources.map((source) => source.source).join("+")} audio is streaming to the gateway`);
       return { ok: true };
     } catch (error) {
+      if (liveBridgeCapture !== capture) return { ok: false, cancelled: true };
       console.warn(`[live-bridge] audio capture unavailable: ${error?.message ?? error}`);
+      capture.abortController.abort();
       for (const streamer of capture.streamers) void streamer.close?.();
       for (const stream of capture.streams) stopMediaStream(stream);
       capture.streamers = [];
@@ -4423,6 +4619,13 @@ async function handleLiveCallPreflight(request) {
   const requestId = typeof request?.requestId === "string" ? request.requestId : "";
   const bridge = window.realtimeNoelDesktop;
   if (!requestId || !bridge?.completeLiveCallPreflight) return;
+  // 2026-09-01 fix: 진행 중인 모델 저장을 이전 전체 설정으로 덮어쓰지 않는다.
+  if (captionEngineSettings?.isSaving()) {
+    await bridge.completeLiveCallPreflight(requestId, {
+      ok: false, code: "SUBTITLE_SESSION_TRANSITION_PENDING", message: t("engine.saving"),
+    });
+    return;
+  }
   liveBridgePreflightRequestId = requestId;
   isLiveParticipantDemandEnabled = request?.demandEnabled === true;
   let failureCode = "LIVE_CALL_AUDIO_CAPTURE_FAILED";
@@ -4443,6 +4646,7 @@ async function handleLiveCallPreflight(request) {
     if (liveBridgePreflightRequestId !== requestId) return;
     activeLiveFloorSessionId = String(request?.liveSessionId ?? "");
     await startHybridCaptionSession({
+      preflightRequestId: requestId,
       sessionId: activeLiveFloorSessionId,
       title: String(request?.title ?? ""),
       liveStartedAt: String(request?.startedAt ?? ""),
@@ -4458,7 +4662,8 @@ async function handleLiveCallPreflight(request) {
     stopLiveCallAudioBridge("preflight failed");
     await bridge.completeLiveCallPreflight(requestId, {
       ok: false,
-      code: failureCode,
+      code: ["SUBTITLE_STOP_TIMEOUT", "SUBTITLE_STOP_CONNECTION_CLOSED", "SUBTITLE_STOP_FAILED"].includes(error?.code)
+        ? error.code : failureCode,
       message: String(error?.message ?? error),
     });
   }
@@ -4568,9 +4773,22 @@ async function syncLiveCallAudioBridge() {
 }
 
 async function startHybridCaptionSession(liveState) {
+  const attempt = {};
+  liveCaptionStartAttempt = attempt;
+  const preflightRequestId = String(liveState.preflightRequestId ?? "");
+  const assertCurrentAttempt = () => {
+    if (liveCaptionStartAttempt !== attempt
+      || (preflightRequestId && liveBridgePreflightRequestId !== preflightRequestId)) {
+      throw Object.assign(new Error("LIVE_CALL_PREFLIGHT_CANCELLED"), { code: "LIVE_CALL_PREFLIGHT_CANCELLED" });
+    }
+  };
   await ensureLiveCallProducerCapability();
-  if (state.running) await stopSubtitles();
+  assertCurrentAttempt();
+  // 2026-08-31 fix: The old provider retains its server owner until its stop acknowledgement.
+  if (state.running) await stopSubtitles({ waitForAcknowledgement: true });
+  assertCurrentAttempt();
   await ensureWebSocketOpen();
+  assertCurrentAttempt();
   transitionCaptionRuntime("starting");
   state.settings = readSettingsFromForm();
   state.sessionId = `live-${String(liveState.sessionId ?? crypto.randomUUID())}`;
@@ -4586,11 +4804,20 @@ async function startHybridCaptionSession(liveState) {
     },
   };
   const startedProducerKind = liveState.demandEnabled === true ? "gateway" : resolveLiveCallProducerKind();
-  await requestSubtitleStart({
-    ...startPayload,
-    captionProducer: startedProducerKind,
-    producerCapability: liveCallProducerCapability,
-  });
+  try {
+    await requestSubtitleStart({
+      ...startPayload,
+      captionProducer: startedProducerKind,
+      producerCapability: liveCallProducerCapability,
+    });
+    assertCurrentAttempt();
+  }
+  catch (error) {
+    if (liveCaptionStartAttempt === attempt && state.sessionId === startPayload.sessionId) {
+      await stopSubtitles({ waitForAcknowledgement: true });
+    }
+    throw error;
+  }
   for (const caption of liveState.captionSnapshot ?? []) {
     enqueueLiveCallCaptionRelay(caption);
   }
@@ -4699,13 +4926,14 @@ function normalizeLiveCallCaptionRelay(caption) {
 }
 
 function isLiveCallCaptionRelayReady() {
-  return activeCaptionProducer === "hybrid"
+  return (activeCaptionProducer === "gateway"
+      || (activeCaptionProducer === "hybrid"
+        && typeof activeLiveParticipantId === "string"
+        && activeLiveParticipantId.length > 0
+        && appliedLiveFloorGateRevision === liveFloorGateRevision))
     && (typeof activeCaptionSessionOwner === "undefined"
       || (activeCaptionSessionOwner === "live-call" && state.running))
     && (typeof captionRuntimeState === "undefined" || captionRuntimeState === "running")
-    && typeof activeLiveParticipantId === "string"
-    && activeLiveParticipantId.length > 0
-    && appliedLiveFloorGateRevision === liveFloorGateRevision
     && state.ws?.readyState === WebSocket.OPEN;
 }
 
@@ -4832,6 +5060,7 @@ function resetLiveCallCaptionRelay() {
 // subtitle-workspace.js repaints every static data-i18n node; the dynamic
 // panels this file renders have to be rebuilt from their current state.
 function refreshSystemLanguagePresentation() {
+  captionEngineSettings?.refresh();
   const targetSelector = 'input[name="translationLanguages"], input[name="liveCallTranslationLanguages"]';
   const selectedTargets = new Set([...form.querySelectorAll(targetSelector)]
     .filter((input) => input.checked).map((input) => `${input.name}:${input.value}`));
@@ -4858,15 +5087,18 @@ subscribeToLanguage(refreshGlossarySystemLanguagePresentation);
 
 if (window.realtimeNoelDesktop?.onLiveCallCaption) {
   window.realtimeNoelDesktop.onLiveCallCaption((caption) => {
-    if (!caption || activeCaptionProducer !== "hybrid") return;
+    if (!caption || !["gateway", "hybrid"].includes(activeCaptionProducer)) return;
     if (activeCaptionSessionOwner !== "live-call" || !state.running) return;
     if (typeof activeLiveFloorSessionId !== "undefined"
       && caption.sessionId !== activeLiveFloorSessionId) return;
-    const participantId = String(caption.speaker?.participantId ?? "");
-    const isParticipant = caption.speakerRole === "participant" || caption.speaker?.isParticipant === true;
-    if (!isParticipant || !participantId || participantId !== lastAuthorizedLiveParticipantId) return;
-    if (isLiveParticipantFloorActive && participantId !== activeLiveParticipantId) return;
-    if (!isLiveParticipantFloorActive && caption.isFinal !== true) return;
+    // 2026-09-01 fix: gateway 단일 생산자의 호스트 자막은 로컬 중복이 없어 그대로 전달한다.
+    if (activeCaptionProducer === "hybrid") {
+      const participantId = String(caption.speaker?.participantId ?? "");
+      const isParticipant = caption.speakerRole === "participant" || caption.speaker?.isParticipant === true;
+      if (!isParticipant || !participantId || participantId !== lastAuthorizedLiveParticipantId) return;
+      if (isLiveParticipantFloorActive && participantId !== activeLiveParticipantId) return;
+      if (!isLiveParticipantFloorActive && caption.isFinal !== true) return;
+    }
     if (String(caption.text ?? "").trim() && typeof liveTranslationStallMonitor !== "undefined") {
       liveTranslationStallMonitor.noteOutput(performance.now());
     }

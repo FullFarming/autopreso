@@ -28,6 +28,21 @@ export const MENU_KEYS = [
 ];
 
 const EN = {
+  "models.heading": "API · Models",
+  "engine.stt": "Speech recognition",
+  "engine.languageMode": "Input language",
+  "engine.translation": "Translation",
+  "engine.summary": "Summary",
+  "engine.mode.auto": "Auto (KO+EN)",
+  "engine.mode.ko": "Korean only",
+  "engine.mode.en": "English only",
+  "engine.loading": "Loading engines.",
+  "engine.unavailable": "Engines unavailable. Reopen Settings after checking the connection.",
+  "engine.saving": "Applying…",
+  "engine.saveFailed": "Could not save. Select again to retry.",
+  "engine.appliesNow": "Changes apply immediately, including running captions.",
+  "keys.soniox": "Soniox API key",
+  "models.cost": "API usage is billed. Live API audio generation may incur charges even when translated audio is not played.",
   // ── Brand ───────────────────────────────────────────────────────────────
   "app.name": "NOVA",
   "app.credit": "Realtime by Noel",
@@ -606,6 +621,21 @@ const EN = {
 };
 
 const KO = {
+  "models.heading": "API · 모델",
+  "engine.stt": "음성 인식",
+  "engine.languageMode": "입력 언어",
+  "engine.translation": "번역",
+  "engine.summary": "요약",
+  "engine.mode.auto": "자동 (한국어+영어)",
+  "engine.mode.ko": "한국어만",
+  "engine.mode.en": "영어만",
+  "engine.loading": "모델 목록을 불러오고 있어요.",
+  "engine.unavailable": "모델 목록을 불러오지 못했어요. 연결을 확인하고 설정을 다시 열어 주세요.",
+  "engine.saving": "적용하고 있어요…",
+  "engine.saveFailed": "저장하지 못했어요. 다시 선택해 주세요.",
+  "engine.appliesNow": "변경은 진행 중인 자막에도 바로 적용됩니다.",
+  "keys.soniox": "Soniox API 키",
+  "models.cost": "API 사용 요금이 발생합니다. 번역 음성을 재생하지 않아도 Live API 음성 생성 비용이 발생할 수 있습니다.",
   // ── Brand ───────────────────────────────────────────────────────────────
   "app.name": "NOVA",
   "app.credit": "Realtime by Noel",

@@ -5,6 +5,7 @@ import { test } from "node:test";
 import vm from "node:vm";
 
 import { MESSAGES } from "../public/subtitle-i18n.js";
+import { DEFAULT_SUBTITLE_SETTINGS, validateSubtitleSettings } from "../src/settings-store.js";
 
 // UI copy lives in the i18n dictionary now: surfaces carry the KEY and the copy
 // must resolve in both languages (test/ui-i18n.test.js proves key parity).
@@ -21,7 +22,7 @@ const rootDir = path.join(import.meta.dirname, "..");
 function extractFunctionBody(source, signature) {
   const signatureIndex = source.indexOf(signature);
   assert.ok(signatureIndex >= 0, `${signature} must exist`);
-  const openingBraceIndex = source.indexOf("{", signatureIndex);
+  const openingBraceIndex = source.indexOf("{", signatureIndex + signature.length);
   let depth = 0;
   for (let index = openingBraceIndex; index < source.length; index += 1) {
     if (source[index] === "{") depth += 1;
@@ -35,7 +36,7 @@ function extractFunctionBody(source, signature) {
 function extractBalancedStatement(source, signature) {
   const signatureIndex = source.indexOf(signature);
   assert.ok(signatureIndex >= 0, `${signature} must exist`);
-  const openingBraceIndex = source.indexOf("{", signatureIndex);
+  const openingBraceIndex = source.indexOf("{", signatureIndex + signature.length);
   let depth = 0;
   for (let index = openingBraceIndex; index < source.length; index += 1) {
     if (source[index] === "{") depth += 1;
@@ -416,7 +417,7 @@ test("subtitle dashboard exposes main controls, Gemma recording, and settings dr
   assert.match(js, /syncControllerOpacity/);
   assert.match(js, /handleSubtitleControllerCommand/);
   assert.match(js, /setControllerWindowVisible\(state\.running\)/);
-  const stopSubtitlesBody = extractFunctionBody(js, "async function stopSubtitles()");
+  const stopSubtitlesBody = extractFunctionBody(js, "async function stopSubtitles({ waitForAcknowledgement = false } = {})");
   assert.match(stopSubtitlesBody, /state\.running = false[\s\S]*syncRuntimeOutputVisibility\(\)/,
     "the stop path must hide the controller through the single runtime visibility rule");
   assert.match(controllerJs, /type: "subtitle:control"/);
@@ -629,7 +630,7 @@ test("desktop subtitle UI is captions-only and contains no translated-audio lane
   assert.doesNotMatch(js, /subtitleAudioPlayer|translatedAudioGuard|clearTranslatedAudioQueue|shouldGateTranslatedAudioInput/);
   assert.doesNotMatch(js, /form\.elements\.(?:audioLanguage|audioVolume|voiceProvider)|\b(?:audioLanguage|audioVolume|voiceProvider)\s*:/);
   assert.match(js, /RETIRED_SUBTITLE_SETTING_KEYS/);
-  assert.match(js, /geminiTranscribeModel: "gemini-3\.5-transcribe-live"/);
+  assert.doesNotMatch(js, /geminiTranscribeModel:\s*"gemini-/);
   assert.doesNotMatch(js, /gemini-3\.5-live-translate-preview/);
   assert.doesNotMatch(overlay, /outputMode|isAudioOnlyOutput/);
   assert.doesNotMatch(i18n, /통역 음성|interpretation audio/iu);
@@ -674,9 +675,9 @@ test("desktop subtitle UI is captions-only and contains no translated-audio lane
   );
   const settings = readSettingsFromForm(
     form,
-    { settings: { model: "gemini-3.5-live-translate-preview", audioVolume: 0.8 } },
+    { settings: { model: "gemini-3.5-live-translate-preview", audioVolume: 0.8, engine: DEFAULT_SUBTITLE_SETTINGS.engine } },
     {
-      geminiTranscribeModel: "gemini-3.5-transcribe-live",
+      engine: DEFAULT_SUBTITLE_SETTINGS.engine,
       translationFontSize: 38,
       fontFamily: "Arial",
       maxWidth: 1500,
@@ -698,7 +699,7 @@ test("desktop subtitle UI is captions-only and contains no translated-audio lane
     () => [{ sourceKind: "builtin", sourceId: "common_business" }],
   );
   assert.equal(settings.outputMode, "captions");
-  assert.equal(settings.geminiTranscribeModel, "gemini-3.5-transcribe-live");
+  assert.deepEqual(settings.engine, DEFAULT_SUBTITLE_SETTINGS.engine);
   assert.equal(Object.hasOwn(settings, "model"), false);
   assert.equal(Object.hasOwn(settings, "audioVolume"), false);
   assert.deepEqual(settings.glossaries, [{ sourceKind: "builtin", sourceId: "common_business" }]);
@@ -1476,7 +1477,7 @@ test("Live Call shutdown finalizes its hybrid ownership", () => {
   const dashboard = readFileSync(path.join(rootDir, "public", "subtitle-dashboard.js"), "utf8");
   const sync = extractFunctionBody(dashboard, "async function syncLiveCallAudioBridge()");
   const hybrid = extractFunctionBody(dashboard, "async function startHybridCaptionSession(liveState)");
-  const stop = extractFunctionBody(dashboard, "async function stopSubtitles()");
+  const stop = extractFunctionBody(dashboard, "async function stopSubtitles({ waitForAcknowledgement = false } = {})");
   const endedCallBranch = sync.slice(
     sync.indexOf("if (!liveState?.armed || !liveState.live)"),
     sync.indexOf("if (isLiveBridgeStarting)"),
@@ -1515,11 +1516,283 @@ test("caption runtime waits for the matching start acknowledgement before exposi
     "the controller must become visible only after the acknowledged running state");
 });
 
-test("Live Call recovery keeps its controller and record while caption-only errors still stop", () => {
+function createSubtitleStopHandshakeHarness() {
+  const source = readFileSync(path.join(rootDir, "public", "subtitle-dashboard.js"), "utf8");
+  const implementation = extractBalancedStatement(source, "function requestSubtitleStop(socket, sessionId)");
+  const listeners = new Map();
+  const timers = new Map();
+  const sent = [];
+  const socket = {
+    readyState: 1,
+    addEventListener(type, handler) {
+      if (!listeners.has(type)) listeners.set(type, new Set());
+      listeners.get(type).add(handler);
+    },
+    removeEventListener(type, handler) { listeners.get(type)?.delete(handler); },
+    send(data) { sent.push(JSON.parse(data)); },
+  };
+  const context = {
+    WebSocket: { OPEN: 1 }, crypto: { randomUUID: () => "stop-request-fixture" },
+    SUBTITLE_STOP_ACK_TIMEOUT_MS: 10_000,
+    window: { setTimeout(callback, milliseconds) { timers.set(1, { callback, milliseconds }); return 1; }, clearTimeout(id) { timers.delete(id); } },
+  };
+  const request = vm.runInNewContext(`${implementation}; requestSubtitleStop;`, context);
+  return { request: (sessionId = "old-session") => request(socket, sessionId), sent, timers,
+    listeners, socket, emit(message) {
+      for (const handler of [...(listeners.get("message") ?? [])]) handler({ data: JSON.stringify(message) });
+    }, close() { for (const handler of [...(listeners.get("close") ?? [])]) handler(); } };
+}
+
+test("Live Call transition waits for exactly its stop request and session acknowledgement", async () => {
+  const harness = createSubtitleStopHandshakeHarness();
+  let completed = false;
+  const pending = harness.request().then(() => { completed = true; });
+  assert.deepEqual(harness.sent, [{ type: "subtitle:stop", sessionId: "old-session", requestId: "stop-request-fixture" }]);
+  harness.emit({ type: "subtitle:stopped", sessionId: "other-session", requestId: "stop-request-fixture" });
+  harness.emit({ type: "subtitle:stopped", sessionId: "old-session", requestId: "old-request" });
+  harness.emit({ type: "subtitle:started", sessionId: "old-session", requestId: "stop-request-fixture" });
+  await Promise.resolve();
+  assert.equal(completed, false);
+  assert.equal(harness.timers.get(1).milliseconds, 10_000);
+  harness.emit({ type: "subtitle:stopped", sessionId: "old-session", requestId: "stop-request-fixture" });
+  await pending;
+  assert.equal(completed, true);
+  assert.equal(harness.timers.size, 0);
+  assert.equal(harness.listeners.get("message").size, 0);
+});
+
+test("a stop timeout, closed socket, or matching stop failure never retries and retains a safe reason", async () => {
+  for (const [mode, code] of [["timeout", "SUBTITLE_STOP_TIMEOUT"], ["close", "SUBTITLE_STOP_CONNECTION_CLOSED"], ["provider", "SUBTITLE_STOP_FAILED"], ["records", "SUBTITLE_STOP_FAILED"]]) {
+    const harness = createSubtitleStopHandshakeHarness();
+    const pending = assert.rejects(harness.request(), (error) => error !== null && typeof error === "object" && "code" in error && error.code === code);
+    if (mode === "timeout") harness.timers.get(1).callback();
+    else if (mode === "close") harness.close();
+    else harness.emit({ type: "subtitle:error", code: mode === "records" ? "SUBTITLE_SESSION_FINALIZE_FAILED" : "SUBTITLE_PROVIDER_STOP_FAILED", requestId: "stop-request-fixture", sessionId: "old-session", message: "must not forward raw provider detail" });
+    await pending;
+    harness.emit({ type: "subtitle:stopped", requestId: "stop-request-fixture", sessionId: "old-session" });
+    assert.equal(harness.sent.length, 1);
+    assert.equal(harness.timers.size, 0);
+    assert.equal(harness.listeners.get("message").size, 0);
+  }
+});
+
+test("a cancelled preflight cannot start a new relay after its old stop acknowledgement arrives", async () => {
+  const source = readFileSync(path.join(rootDir, "public", "subtitle-dashboard.js"), "utf8");
+  const implementation = extractBalancedStatement(source, "async function startHybridCaptionSession(liveState)");
+  let releaseStop = () => {};
+  let reportStopEntered = () => {};
+  const stopEntered = new Promise((resolve) => { reportStopEntered = () => resolve(); });
+  const stopPending = new Promise((resolve) => { releaseStop = () => resolve(); });
+  const stops = [];
+  let starts = 0;
+  const context = {
+    liveBridgePreflightRequestId: "preflight-fixture", liveCaptionStartAttempt: null, state: { running: true, sessionId: "old-session" },
+    ensureLiveCallProducerCapability: async () => {},
+    stopSubtitles: async (options) => { stops.push(options); reportStopEntered(); await stopPending; },
+    ensureWebSocketOpen: async () => {}, transitionCaptionRuntime() {},
+    readSettingsFromForm: () => ({}), crypto: { randomUUID: () => "unused" },
+    resolveLiveCallProducerKind: () => "gateway", liveCallProducerCapability: "fixture",
+    requestSubtitleStart: async () => { starts += 1; }, liveTranslationStallMonitor: { reset() {} },
+    startButton: {}, stopButton: {}, syncRuntimeOutputVisibility() {}, setConnectionStatus() {}, t: (key) => key,
+    sendCurrentLiveCallFloorGate() {}, flushLiveCallCaptionRelayQueue() {},
+  };
+  const start = vm.runInNewContext(`${implementation}; startHybridCaptionSession;`, context);
+  const pending = start({ sessionId: "call-next", preflightRequestId: "preflight-fixture" });
+  await stopEntered;
+  assert.equal(stops.length, 1);
+  assert.equal(stops[0]?.waitForAcknowledgement, true);
+  assert.equal(starts, 0);
+  context.liveBridgePreflightRequestId = null;
+  releaseStop();
+  await assert.rejects(pending, (error) => error !== null && typeof error === "object" && "code" in error && error.code === "LIVE_CALL_PREFLIGHT_CANCELLED");
+  assert.equal(starts, 0);
+});
+
+test("waiting for a stop acknowledgement keeps caption start locked through duplicate stop and releases on success or failure", async () => {
+  const source = readFileSync(path.join(rootDir, "public", "subtitle-dashboard.js"), "utf8");
+  const stopImplementation = extractBalancedStatement(source, "async function stopSubtitles({ waitForAcknowledgement = false } = {})");
+  const startImplementation = extractBalancedStatement(source, "async function startSubtitles()");
+  for (const outcome of ["acknowledged", "failed"]) {
+    let releaseStop = () => {};
+    let stopRequests = 0;
+    let startWork = 0;
+    const acknowledgement = new Promise((resolve, reject) => {
+      releaseStop = () => outcome === "acknowledged" ? resolve() : reject(new Error("SUBTITLE_STOP_TIMEOUT"));
+    });
+    const context = {
+      captionRuntimeState: "running", subtitleStopAcknowledgementPromise: null,
+      state: { running: true, sessionId: "previous-caption", ws: { readyState: 1 } },
+      startButton: { disabled: true }, stopButton: { disabled: false },
+      transitionCaptionRuntime(next) { context.captionRuntimeState = next; },
+      clearActiveSubtitleSurface() {}, stopLocalStreams() {},
+      requestSubtitleStop() { stopRequests += 1; return acknowledgement; },
+      WebSocket: { OPEN: 1 }, activeCaptionProducer: "local", activeCaptionSessionOwner: "caption-only",
+      liveTranslationStallMonitor: { reset() {} }, resetLiveCallCaptionRelay() {},
+      window: { clearTimeout() {} }, liveCaptionSocketRecoveryTimer: null, syncRuntimeOutputVisibility() {},
+      clearError() { startWork += 1; },
+    };
+    const ui = vm.runInNewContext(`${stopImplementation}\n${startImplementation}\n({ stopSubtitles, startSubtitles });`, context);
+    const stop = ui.stopSubtitles({ waitForAcknowledgement: true });
+    assert.equal(context.captionRuntimeState, "stopping");
+    assert.equal(context.startButton.disabled, true);
+    assert.equal(context.stopButton.disabled, true);
+    const repeatedStop = ui.stopSubtitles();
+    await ui.startSubtitles();
+    assert.equal(startWork, 0, "even a programmatic start cannot run capture during the handoff");
+    assert.equal(stopRequests, 1);
+    assert.equal(context.captionRuntimeState, "stopping");
+    const completion = outcome === "failed"
+      ? Promise.all([assert.rejects(stop, /SUBTITLE_STOP_TIMEOUT/), assert.rejects(repeatedStop, /SUBTITLE_STOP_TIMEOUT/)])
+      : Promise.all([stop, repeatedStop]);
+    releaseStop();
+    await completion;
+    assert.equal(context.captionRuntimeState, "idle");
+    assert.equal(context.startButton.disabled, false);
+    assert.equal(context.stopButton.disabled, true);
+    assert.equal(context.subtitleStopAcknowledgementPromise, null);
+  }
+});
+
+test("a timed-out or cancelled Live Call start cleans only its own pending session and never retries", async () => {
+  const source = readFileSync(path.join(rootDir, "public", "subtitle-dashboard.js"), "utf8");
+  const implementation = extractBalancedStatement(source, "async function startHybridCaptionSession(liveState)");
+  for (const outcome of ["timeout", "cancelled", "superseded", "success"]) {
+    let finishStart = () => {};
+    let reportStartEntered = () => {};
+    const entered = new Promise((resolve) => { reportStartEntered = () => resolve(); });
+    const pendingStart = new Promise((resolve, reject) => {
+      finishStart = () => outcome === "timeout"
+        ? reject(Object.assign(new Error("SUBTITLE_START_TIMEOUT"), { code: "SUBTITLE_START_TIMEOUT" })) : resolve();
+    });
+    const calls = { starts: 0, stops: [], rendered: 0 };
+    const context = {
+      liveBridgePreflightRequestId: "preflight-fixture", liveCaptionStartAttempt: null,
+      state: { running: false, sessionId: null }, activeCaptionProducer: "none", activeCaptionSessionOwner: "none",
+      ensureLiveCallProducerCapability: async () => {}, ensureWebSocketOpen: async () => {},
+      stopSubtitles: async (options) => { calls.stops.push({ ...options, sessionId: context.state.sessionId }); context.state.sessionId = null; },
+      transitionCaptionRuntime() {}, readSettingsFromForm: () => ({}), crypto: { randomUUID: () => "unused" },
+      resolveLiveCallProducerKind: () => "gateway", liveCallProducerCapability: "fixture",
+      requestSubtitleStart: async () => { calls.starts += 1; reportStartEntered(); await pendingStart; },
+      liveTranslationStallMonitor: { reset() {} }, startButton: {}, stopButton: {},
+      syncRuntimeOutputVisibility() {}, setConnectionStatus() { calls.rendered += 1; }, t: (key) => key,
+      sendCurrentLiveCallFloorGate() {}, flushLiveCallCaptionRelayQueue() {},
+    };
+    const start = vm.runInNewContext(`${implementation}; startHybridCaptionSession;`, context);
+    const pending = start({ sessionId: "call-next", preflightRequestId: "preflight-fixture" });
+    await entered;
+    if (outcome === "cancelled") context.liveBridgePreflightRequestId = null;
+    if (outcome === "superseded") {
+      context.liveCaptionStartAttempt = {};
+      context.state.sessionId = "newer-owner";
+    }
+    finishStart();
+    if (outcome === "success") await pending;
+    else await assert.rejects(pending, (error) => error !== null && typeof error === "object" && "code" in error
+      && error.code === (outcome === "timeout" ? "SUBTITLE_START_TIMEOUT" : "LIVE_CALL_PREFLIGHT_CANCELLED"));
+    assert.equal(calls.starts, 1, `${outcome}: no automatic second paid start`);
+    assert.equal(calls.rendered, outcome === "success" ? 1 : 0);
+    assert.equal(context.state.running, outcome === "success");
+    if (outcome === "timeout" || outcome === "cancelled") {
+      assert.deepEqual(calls.stops, [{ waitForAcknowledgement: true, sessionId: "live-call-next" }]);
+    } else {
+      assert.deepEqual(calls.stops, [], `${outcome}: no cleanup of an unrelated session`);
+    }
+  }
+});
+
+test("text translation failures show their safe reason without clearing captions or restarting either producer", async () => {
+  const dashboard = readFileSync(path.join(rootDir, "public", "subtitle-dashboard.js"), "utf8");
+  const signatures = [
+    "async function handleSubtitleRuntimeError(message)",
+    "async function stopSubtitles({ waitForAcknowledgement = false } = {})",
+    "function clearActiveSubtitleSurface()",
+    "function showError(error)",
+    "function setPreviewText(translatedText, sourceText, partial)",
+  ];
+  const implementation = signatures.map((signature) => extractBalancedStatement(dashboard, signature)).join("\n");
+  for (const owner of ["caption-only", "live-call"]) {
+    for (const runtime of ["running", "starting"]) {
+      const translation = { textContent: "이미 확정된 번역" };
+      const source = { textContent: "" };
+      const history = { records: [{ translatedText: "이미 확정된 번역" }] };
+      const calls = { stopCapture: 0, reconnect: 0, socketSend: 0, clearTimer: 0 };
+      const errorBox = { hidden: true, textContent: "", classList: { remove() {} } };
+      const context = {
+        captionRuntimeState: runtime,
+        activeCaptionSessionOwner: owner,
+        liveBridgePreflightRequestId: null,
+        state: { running: true, sessionId: "session-a", history, previewStatusTimer: null,
+          ws: { readyState: 1, send() { calls.socketSend += 1; } } },
+        preview: { querySelector(selector) { return selector === ".translation-line" ? translation : source; },
+          classList: { remove() {}, toggle() {} } },
+        errorBox,
+        t: (key) => key,
+        transitionCaptionRuntime() {}, setConnectionStatus() {}, setRealtimeApiStatus() {},
+        reconnectLiveCallTranslation: async () => { calls.reconnect += 1; },
+        stopLocalStreams() { calls.stopCapture += 1; },
+        clearTimeout() { calls.clearTimer += 1; },
+        window: { clearTimeout() {} }, WebSocket: { OPEN: 1 },
+        performance: { now: () => 1000 },
+        liveTranslationStallMonitor: { reset() {}, noteOutput() {} }, resetLiveCallCaptionRelay() {},
+        liveCaptionSocketRecoveryTimer: null, activeCaptionProducer: "local",
+        startButton: { disabled: false }, stopButton: { disabled: false },
+        syncRuntimeOutputVisibility() {}, appendScreenPermissionAction() {},
+      };
+      const ui = vm.runInNewContext(`${implementation}; ({ handleSubtitleRuntimeError, setPreviewText });`, context);
+      for (const reason of ["HTTP_AUTH", "QUOTA", "TIMEOUT", "EMPTY", "LANGUAGE", "ECHO"]) {
+        const message = `번역을 확정하지 못했습니다: ${reason}`;
+        await ui.handleSubtitleRuntimeError({ type: "subtitle:error", code: "TEXT_TRANSLATION_FAILED", reason, message, targetLanguage: "en" });
+        assert.equal(errorBox.hidden, false, `${owner}/${runtime}/${reason}: visible explanation`);
+        assert.equal(errorBox.textContent, message);
+        assert.equal(translation.textContent, "이미 확정된 번역");
+        assert.equal(context.state.running, true);
+        assert.equal(context.state.sessionId, "session-a");
+        assert.equal(context.state.history, history);
+        assert.deepEqual(history.records, [{ translatedText: "이미 확정된 번역" }]);
+      }
+      assert.deepEqual(calls, { stopCapture: 0, reconnect: 0, socketSend: 0, clearTimer: 0 });
+      ui.setPreviewText("이후 정상 확정 번역", "source", false);
+      assert.equal(translation.textContent, "이후 정상 확정 번역", "new captions remain renderable after a failed line");
+    }
+  }
+});
+
+test("repeated text translation failures count source progress without disabling genuine stall recovery", async () => {
+  const dashboard = readFileSync(path.join(rootDir, "public", "subtitle-dashboard.js"), "utf8");
+  const monitorImplementation = extractBalancedStatement(dashboard, "function createLiveTranslationStallMonitor");
+  const handlerImplementation = extractBalancedStatement(dashboard, "async function handleSubtitleRuntimeError(message)");
+  let now = 0;
+  let recoveries = 0;
+  let shownErrors = 0;
+  const context = {
+    activeCaptionSessionOwner: "live-call", captionRuntimeState: "running", state: { running: true },
+    liveBridgePreflightRequestId: null,
+    performance: { now: () => now },
+    requestRecovery: () => { recoveries += 1; },
+    reconnectLiveCallTranslation: async () => { recoveries += 1; },
+    showError() { shownErrors += 1; },
+  };
+  const ui = vm.runInNewContext(`${monitorImplementation};
+    const liveTranslationStallMonitor = createLiveTranslationStallMonitor(requestRecovery, 2000, 1000);
+    ${handlerImplementation}; ({ handleSubtitleRuntimeError, monitor: liveTranslationStallMonitor });`, context);
+  ui.monitor.noteInput("mic", true, now, true);
+  for (now = 500; now <= 10000; now += 500) {
+    if (now % 1000 === 0) {
+      await ui.handleSubtitleRuntimeError({ code: "TEXT_TRANSLATION_FAILED", reason: "QUOTA", message: "번역 요청 한도를 확인해 주세요." });
+    }
+    ui.monitor.noteInput("mic", true, now, true);
+  }
+  assert.equal(shownErrors, 10);
+  assert.equal(recoveries, 0, "arriving source utterances must not be mistaken for a stalled input pipeline");
+  for (now = 10500; now <= 15000; now += 500) ui.monitor.noteInput("mic", true, now, true);
+  assert.equal(recoveries, 1, "continued input without source progress still requests one existing recovery");
+});
+
+test("Live Call recovery keeps its controller and record while fatal caption-only errors still stop", () => {
   const dashboard = readFileSync(path.join(rootDir, "public", "subtitle-dashboard.js"), "utf8");
   const errorHandler = extractFunctionBody(dashboard, "async function handleSubtitleRuntimeError(message)");
   const reconnect = extractFunctionBody(dashboard, "async function reconnectLiveCallTranslation()");
-  const stop = extractFunctionBody(dashboard, "async function stopSubtitles()");
+  const stop = extractFunctionBody(dashboard, "async function stopSubtitles({ waitForAcknowledgement = false } = {})");
 
   assert.match(dashboard, /message\.type === "subtitle:error"[\s\S]*handleSubtitleRuntimeError\(message\)/u);
   assert.match(errorHandler, /activeCaptionSessionOwner === "live-call"/u);
@@ -1541,6 +1814,35 @@ test("Live Call recovery keeps its controller and record while caption-only erro
     "recovery must retain the latest partial until a snapshot or newer canonical event replaces it");
   assert.match(stop, /state\.sessionId = null/u,
     "the explicit stop path remains the only path that finalizes the session");
+});
+
+test("non-translation runtime errors retain fatal cleanup, Live Call recovery, and start acknowledgement ownership", async () => {
+  const dashboard = readFileSync(path.join(rootDir, "public", "subtitle-dashboard.js"), "utf8");
+  const implementation = extractBalancedStatement(dashboard, "async function handleSubtitleRuntimeError(message)");
+  /** @type {string[]} */
+  const calls = [];
+  const context = {
+    captionRuntimeState: "running", activeCaptionSessionOwner: "caption-only",
+    liveBridgePreflightRequestId: "", state: { running: true },
+    t: (key) => key,
+    transitionCaptionRuntime() {}, setConnectionStatus() {}, setRealtimeApiStatus() {},
+    stopSubtitles: async () => { calls.push("stop"); },
+    reconnectLiveCallTranslation: async () => { calls.push("reconnect"); },
+    showError(error) { calls.push(error.message); },
+  };
+  const handle = vm.runInNewContext(`${implementation}; handleSubtitleRuntimeError;`, context);
+  await handle({ code: "SUBTITLE_RUNTIME_FAILED", message: "기존 오류 안내" });
+  assert.deepEqual(calls.splice(0), ["stop", "기존 오류 안내"]);
+  context.activeCaptionSessionOwner = "live-call";
+  await handle({ code: "SUBTITLE_RUNTIME_FAILED", message: "기존 오류 안내" });
+  assert.deepEqual(calls.splice(0), ["reconnect"]);
+  context.captionRuntimeState = "starting";
+  await handle({ code: "SUBTITLE_START_FAILED", message: "시작 실패" });
+  assert.deepEqual(calls, [], "the matching start promise still owns startup failure cleanup");
+  context.captionRuntimeState = "running";
+  context.liveBridgePreflightRequestId = "preflight-a";
+  await handle({ code: "SUBTITLE_PREFLIGHT_FAILED", message: "준비 실패" });
+  assert.deepEqual(calls, []);
 });
 
 test("Live Call requests one immediate recovery after two seconds of signalled input without captions", () => {
@@ -1606,6 +1908,50 @@ test("a local socket drop re-registers the same Live session without controller 
   assert.match(recover, /captionProducer: recoveredProducerKind/u);
   assert.match(recover, /activeCaptionProducer = recoveredProducerKind/u);
   assert.doesNotMatch(recover, /state\.sessionId = null|stopSubtitles\(|subtitle:stop/u);
+});
+
+test("gateway captions relay both speakers while hybrid remains participant-only with floor and session fences", () => {
+  const dashboard = readFileSync(path.join(rootDir, "public", "subtitle-dashboard.js"), "utf8");
+  const begin = dashboard.indexOf("// 2026-07-27 fix: The hidden dashboard can reconnect independently");
+  const end = dashboard.indexOf("// subtitle-workspace.js repaints", begin);
+  const registration = extractBalancedStatement(dashboard, "if (window.realtimeNoelDesktop?.onLiveCallCaption)");
+  for (const producer of ["gateway", "hybrid"]) {
+    const received = [];
+    /** @type {(caption: Record<string, unknown>) => void} */
+    let onCaption = () => { throw new Error("missing caption callback"); };
+    const context = {
+      activeCaptionProducer: producer, activeCaptionSessionOwner: "live-call", captionRuntimeState: "running",
+      activeLiveFloorSessionId: "current-call", activeLiveParticipantId: producer === "hybrid" ? "viewer-1" : "",
+      lastAuthorizedLiveParticipantId: "viewer-1", isLiveParticipantFloorActive: true,
+      liveFloorGateRevision: 1, appliedLiveFloorGateRevision: producer === "hybrid" ? 1 : -1,
+      liveCallProducerCapability: "safe-fixture-capability",
+      state: { running: true, sessionId: "live-current-call", ws: { readyState: 1, bufferedAmount: 0, send(value) { received.push(JSON.parse(value)); } } },
+      WebSocket: { OPEN: 1 }, t: () => "Participant",
+      window: { setTimeout, clearTimeout, realtimeNoelDesktop: { onLiveCallCaption(callback) { onCaption = callback; } } },
+    };
+    const ui = vm.runInNewContext(`${dashboard.slice(begin, end)}\n${registration}\n({ flushLiveCallCaptionRelayQueue });`, context);
+    const host = { sessionId: "current-call", language: "en", sourceLanguage: "ko", text: "Host final", isFinal: true, seq: 1, utteranceKey: "host-one", speakerRole: "host" };
+    const participant = { ...host, text: "Participant final", seq: 2, utteranceKey: "participant-two", speakerRole: "participant", speaker: { participantId: "viewer-1", name: "Participant", isParticipant: true } };
+    onCaption(host); onCaption(participant); onCaption(host); onCaption(participant);
+    assert.deepEqual(received.map((item) => item.translatedText), producer === "gateway" ? ["Host final", "Participant final"] : ["Participant final"]);
+    assert.ok(received.every((item) => item.producerCapability === "safe-fixture-capability" && item.sessionId === "current-call"));
+    const count = received.length;
+    onCaption({ ...host, sessionId: "old-call", utteranceKey: "old-host" });
+    context.activeCaptionSessionOwner = "caption-only";
+    onCaption({ ...participant, seq: 3, utteranceKey: "outside-live" });
+    assert.equal(received.length, count);
+    context.activeCaptionSessionOwner = "live-call";
+    if (producer === "hybrid") {
+      onCaption({ ...participant, seq: 4, utteranceKey: "wrong-speaker", speaker: { participantId: "viewer-other", isParticipant: true } });
+      context.appliedLiveFloorGateRevision = 0;
+      onCaption({ ...participant, seq: 5, utteranceKey: "awaiting-floor" });
+      assert.equal(received.length, count, "hybrid relays must still await the authorized floor acknowledgement");
+      context.appliedLiveFloorGateRevision = 1;
+      ui.flushLiveCallCaptionRelayQueue();
+      assert.equal(received.length, count + 1);
+      assert.equal(received.at(-1).utteranceKey, "awaiting-floor");
+    }
+  }
 });
 
 test("Live Call relay survives renderer socket stalls without losing finals or replaying stale partials", () => {
@@ -2042,4 +2388,38 @@ test("settings import rejects array and primitive subtitle/apiKeys sections", ()
   assertLocalized("error.importSectionShape", { ko: /항목은 객체여야 합니다/ });
   const saveIndex = importer.indexOf("await saveSettings(patch)");
   assert.ok(throwIndex >= 0 && throwIndex < saveIndex, "the shape check must run before the save");
+});
+
+
+test("dashboard boot preserves canonical server models and does not autosave an obsolete transcription default", async () => {
+  const source = readFileSync(path.join(rootDir, "public", "subtitle-dashboard.js"), "utf8");
+  const writes = [];
+  const errors = [];
+  const serverSettings = JSON.parse(JSON.stringify(DEFAULT_SUBTITLE_SETTINGS));
+  const context = vm.createContext({
+    DEFAULT_GLOSSARY_PRESET_ID: "default-cre-ai-en-ko", MAX_GLOSSARY_SELECTIONS: 5,
+    BUILT_IN_GLOSSARY_OPTIONS: [{ sourceId: "common_business" }],
+    state: { settings: {} },
+    fetch: async () => ({ json: async () => ({ settings: { subtitle: serverSettings } }) }),
+    saveSettings: async patch => { validateSubtitleSettings(patch.subtitle); writes.push(patch); },
+    showError: error => errors.push(error),
+    writeSettingsToForm() {}, hydrateOverlayEnabled: async () => {}, applyPreviewSettings() {},
+    updateOpenAIKeyPlaceholder() {}, updateGeminiKeyStatus() {}, updateGeminiSecondaryKeyStatus() {},
+    updateSonioxKeyStatus() {},
+    updateOpenAIKeyStatus() {}, updateSessionSummary() {}, updateServiceStrip() {},
+    updateAudioInspectorLabels() {}, syncCaptionPlayerController() {},
+  });
+  const constants = source.slice(source.indexOf("const DEFAULT_SUBTITLE ="), source.indexOf("const state ="));
+  vm.runInContext(constants + "\n" + extractBalancedStatement(source, "async function loadConfig()"), context);
+  await vm.runInContext("loadConfig()", context);
+  assert.equal(errors.length, 0, "canonical server settings must never be rewritten into a rejected model");
+  assert.equal(writes.length, 0, "boot does not create a redundant settings request");
+  const current = JSON.parse(vm.runInContext("JSON.stringify(state.settings)", context));
+  assert.deepEqual(current.engine, JSON.parse(JSON.stringify(DEFAULT_SUBTITLE_SETTINGS.engine)));
+  assert.doesNotThrow(() => validateSubtitleSettings(current));
+  serverSettings.translationProvider = "retired-provider";
+  await vm.runInContext("loadConfig()", context);
+  assert.equal(errors.length, 0);
+  assert.equal(writes.length, 1, "an actual retired setting may still be normalized once");
+  assert.deepEqual(writes[0].subtitle.engine, JSON.parse(JSON.stringify(DEFAULT_SUBTITLE_SETTINGS.engine)));
 });
