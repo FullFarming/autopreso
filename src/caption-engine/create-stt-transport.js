@@ -1,6 +1,7 @@
 import { selectGeminiTranscriptionVocabularyFromLegacyText } from "../../packages/caption-core/index.js";
 import { normalizeEngineSelection } from "../../packages/caption-core/caption-engine-catalog.js";
 import { createGeminiTranscribeTransport, geminiTranscribeContract } from "../gemini-live-transcribe.js";
+import { createSonioxTransport } from "./soniox-transport.js";
 
 /**
  * Picks the STT transport for the selected engine. Every transport exposes:
@@ -30,10 +31,11 @@ export function createSttTransport({ engine, settings = {}, apiKeys, createSonio
     });
   }
   if (selection.stt.provider === "soniox") {
-    // Task 5 supplies the real implementation; until then a Soniox selection
-    // fails loudly instead of silently falling back to a paid Gemini session.
-    if (typeof createSonioxTransportImpl !== "function") throw new Error("SONIOX_TRANSPORT_UNAVAILABLE");
-    return createSonioxTransportImpl({ engine: selection, settings, apiKey: apiKeys?.soniox ?? "" });
+    return (createSonioxTransportImpl ?? createSonioxTransport)({
+      engine: selection,
+      settings,
+      apiKey: apiKeys?.soniox ?? "",
+    });
   }
   throw new Error("ENGINE_SELECTION_INVALID");
 }

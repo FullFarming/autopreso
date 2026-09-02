@@ -39,14 +39,14 @@ class FakeSocket extends EventEmitter {
   }
 }
 
-function createHarness({ polish, settings = {}, ...options } = {}) {
+function createHarness({ polish, settings = {}, apiKeys = {}, ...options } = {}) {
   const sockets = [];
   const events = [];
   const manager = createSubtitleRealtimeManager({
     broadcast: (event) => events.push(event),
     settingsStore: {
       load: async () => ({
-        apiKeys: { gemini: "test-key", geminiSecondary: "" },
+        apiKeys: { gemini: "test-key", geminiSecondary: "", ...apiKeys },
         subtitle: {
           inputMode: "mic",
           translationLanguages: ["en", "ko", "ja"],
@@ -153,6 +153,119 @@ test("a provider-delivered translation is committed without a text-translation c
   assert.equal(committed[0].translationProvider, "soniox");
   assert.equal(committed[0].segmentId, "seg-1");
   assert.equal(committed[0].isAuthoritative, true);
+});
+
+// A provider translation is still model output: ruling 1 of Task 5 makes it
+// clear the same gates a Gemini final does.
+async function runProviderTranslation(translation, { settings = {} } = {}) {
+  const polishCalls = [];
+  const { manager, sockets, events } = createHarness({
+    settings: { translationLanguages: ["en", "ko"], glossary: "", ...settings },
+    polish: async (request) => { polishCalls.push(request); return "text-lane output that must never appear"; },
+    createSttTransport: () => createFakeCombinedTransport(),
+  });
+  await manager.start({ sessionId: "provider-translation-guards" });
+  try {
+    sockets[0].open();
+    sockets[0].emit("message", JSON.stringify({ ready: true }));
+    sockets[0].emit("message", JSON.stringify({ translation }));
+    await new Promise((resolve) => setTimeout(resolve, 30));
+  } finally { await manager.stop(); }
+  return { events, polishCalls };
+}
+
+test("a provider translation that merely echoes the source is dropped, not committed", async () => {
+  const { events, polishCalls } = await runProviderTranslation({
+    text: "Quarterly Revenue Report",
+    targetLanguage: "en",
+    sourceText: "Quarterly Revenue Report",
+    sourceLanguage: "ko",
+    isFinal: true,
+    provider: "soniox",
+    segmentId: "echo-1",
+  });
+  assert.equal(events.some((event) => event.type === "subtitle:committed"), false, JSON.stringify(events));
+  assert.equal(events.some((event) => event.code === "TEXT_TRANSLATION_FAILED"), false);
+  assert.deepEqual(polishCalls, [], "a dropped provider translation must not fall back to a Gemini call");
+});
+
+test("a provider translation whose source is already this lane's language clears the lane", async () => {
+  const { events } = await runProviderTranslation({
+    text: "안녕하세요 여러분",
+    targetLanguage: "ko",
+    sourceText: "안녕하세요 여러분",
+    sourceLanguage: "ko",
+    isFinal: true,
+    provider: "soniox",
+    segmentId: "same-lang-1",
+  });
+  const cleared = events.filter((event) => event.type === "subtitle:clear");
+  assert.equal(cleared.length, 1, JSON.stringify(events));
+  assert.equal(cleared[0].targetLanguage, "ko");
+  assert.equal(cleared[0].reason, "same_language_source");
+  assert.equal(events.some((event) => event.type === "subtitle:committed"), false);
+});
+
+test("a provider final that never reached the target language reports TEXT_TRANSLATION_FAILED", async () => {
+  const { events } = await runProviderTranslation({
+    text: "Revenue increased sharply.",
+    targetLanguage: "ko",
+    sourceText: "Our revenue increased sharply this quarter.",
+    sourceLanguage: "en",
+    isFinal: true,
+    provider: "soniox",
+    segmentId: "target-miss-1",
+  });
+  const failures = events.filter((event) => event.code === "TEXT_TRANSLATION_FAILED");
+  assert.equal(failures.length, 1, JSON.stringify(events));
+  assert.equal(failures[0].targetLanguage, "ko");
+  assert.equal(events.some((event) => event.type === "subtitle:committed"), false);
+});
+
+test("soniox engine sends config first, binary audio frames, and commits provider translations without Gemini calls", async () => {
+  let textCalls = 0;
+  const { manager, sockets, events } = createHarness({
+    settings: {
+      translationLanguages: ["en", "ko"],
+      glossary: "",
+      engine: {
+        stt: { provider: "soniox", model: "stt-rt-v5", languageMode: "auto" },
+        translation: { provider: "soniox", model: "stt-rt-v5" },
+        summary: { provider: "gemini", model: "gemini-3.6-flash" },
+      },
+    },
+    apiKeys: { soniox: "fixture-key" },
+    polish: async () => { textCalls += 1; return "text-lane output that must never appear"; },
+  });
+
+  await manager.start({ sessionId: "soniox-engine" });
+  try {
+    const socket = sockets.at(-1);
+    socket.open();
+    const config = JSON.parse(socket.sent[0]);
+    assert.equal(config.model, "stt-rt-v5");
+    assert.deepEqual(config.language_hints, ["ko", "en"]);
+    manager.sendAudio({
+      sessionId: "soniox-engine",
+      source: "mic",
+      audio: Buffer.alloc(4_800, 1).toString("base64"),
+    });
+    assert.ok(Buffer.isBuffer(socket.sent.at(-1)), "audio is a binary frame");
+    socket.emit("message", Buffer.from(JSON.stringify({ tokens: [
+      { text: "안녕하세요", is_final: true, translation_status: "original", language: "ko", start_ms: 0, end_ms: 800 },
+      { text: "Hello", is_final: true, translation_status: "translation", language: "en", source_language: "ko" },
+      { text: "<end>", is_final: true },
+    ] })));
+    await new Promise((resolve) => setTimeout(resolve, 30));
+
+    const committed = events.filter((event) => event.type === "subtitle:committed");
+    assert.equal(committed.length, 1, JSON.stringify(events));
+    assert.equal(committed[0].targetLanguage, "en");
+    assert.equal(committed[0].translatedText, "Hello");
+    assert.equal(committed[0].sourceText, "안녕하세요");
+    assert.equal(committed[0].translationProvider, "soniox");
+    assert.equal(textCalls, 0);
+  } finally { await manager.stop(); }
 });
 
 test("one source opens one Transcribe session and final source fans out through text translation", async () => {

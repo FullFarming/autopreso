@@ -77,3 +77,6 @@ export {
   captionEngineCatalogForClient, engineRequiredApiKeys, engineSelectionKey, findEngineEntry,
   isCombinedEngine, migrateLegacyEngineSelection, normalizeEngineSelection,
 } from "./caption-engine-catalog.js";
+export {
+  SONIOX_CONTROL, SONIOX_ENDPOINTS, SONIOX_MODEL, buildSonioxConfig, createSonioxTokenReducer,
+} from "./soniox-protocol.js";

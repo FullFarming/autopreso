@@ -41,6 +41,11 @@ const RECONNECT_BASE_MS = 500;
 const RECONNECT_MAX_MS = 5_000;
 const MAX_AUTO_RECONNECTS = 10;
 const MAX_TRANSCRIPT_CHARACTERS = 16_384;
+const KEEPALIVE_INTERVAL_MS = 4_000;
+const KEEPALIVE_IDLE_MS = 8_000;
+// Provider rejections that a retry cannot fix: reconnecting would only burn the
+// ladder and hide the real cause from the user.
+const NON_RETRYABLE_TRANSPORT_ERRORS = new Set(["SONIOX_UNAUTHENTICATED", "SONIOX_INVALID_REQUEST"]);
 
 function redactTransportDiagnostic(value) {
   return String(value ?? "")
@@ -345,10 +350,39 @@ function createSourceTranscriptionClient({
   let reconnectTimer = null;
   let reconnectAttempts = 0;
   let backpressureShedding = false;
+  // Providers with no setup ack (Soniox) never fail the setup handshake, so an
+  // unrecoverable rejection has to stop the reconnect ladder explicitly.
+  let noReconnect = false;
+  let keepaliveTimer = null;
+  let lastAudioSentAt = 0;
+  let replayOnNextOpen = false;
 
   function clearTimer(timer) {
     if (timer) clearTimeout(timer);
     return null;
+  }
+
+  // Binary-audio transports (Soniox) hand back Buffers that must travel as
+  // binary frames; JSON transports (Gemini) keep the single-argument call.
+  function sendTransportPayload(openedSocket, payload) {
+    if (transport.binaryAudio) openedSocket.send(payload, { binary: true });
+    else openedSocket.send(payload);
+  }
+
+  function stopKeepalive() {
+    if (keepaliveTimer) clearInterval(keepaliveTimer);
+    keepaliveTimer = null;
+  }
+
+  function startKeepalive(openedSocket) {
+    stopKeepalive();
+    if (typeof transport.keepalivePayload !== "function") return;
+    keepaliveTimer = setInterval(() => {
+      if (socket !== openedSocket || intentionalClose || !configured) return;
+      if (Date.now() - lastAudioSentAt <= KEEPALIVE_IDLE_MS) return;
+      try { openedSocket.send(transport.keepalivePayload()); } catch { stopKeepalive(); }
+    }, KEEPALIVE_INTERVAL_MS);
+    keepaliveTimer.unref?.();
   }
 
   function markTransportReady(openedSocket) {
@@ -356,14 +390,21 @@ function createSourceTranscriptionClient({
     setupAckTimer = clearTimer(setupAckTimer);
     configured = true;
     reconnectAttempts = 0;
+    // A rollover or reconnect drops audio the provider never transcribed; the
+    // transport's replay ring re-sends that tail so the segment survives.
+    if (replayOnNextOpen) {
+      for (const payload of transport.replayPayloads?.() ?? []) sendTransportPayload(openedSocket, payload);
+      replayOnNextOpen = false;
+    }
     const cutoff = Date.now() - MAX_PENDING_AUDIO_AGE_MS;
     for (const pending of pendingAudio) {
       if (pending.preserveThroughRollover || pending.enqueuedAt >= cutoff) {
-        openedSocket.send(transport.audioPayload(pending.audio));
+        sendTransportPayload(openedSocket, transport.audioPayload(pending.audio));
       }
     }
     pendingAudio = [];
     preservePendingAudio = false;
+    startKeepalive(openedSocket);
     rolloverTimer = clearTimer(rolloverTimer);
     rolloverTimer = setTimeout(() => {
       if (socket !== openedSocket || intentionalClose) return;
@@ -375,12 +416,14 @@ function createSourceTranscriptionClient({
   function requestGracefulRollover(openedSocket, reason) {
     if (socket !== openedSocket || intentionalClose || rolloverSocket === openedSocket) return;
     rolloverTimer = clearTimer(rolloverTimer);
+    stopKeepalive();
     configured = false;
     rolloverSocket = openedSocket;
     preservePendingAudio = true;
+    replayOnNextOpen = true;
     broadcast({ type: "subtitle:status", status: "reconnecting", source, reason });
     try {
-      openedSocket.send(transport.closePayload());
+      sendTransportPayload(openedSocket, transport.closePayload());
     } catch (error) {
       log.warn?.(`[subtitle] Transcribe rollover end failed for ${source}: ${redactTransportDiagnostic(error?.message ?? error)}`);
     }
@@ -406,7 +449,7 @@ function createSourceTranscriptionClient({
   }
 
   function scheduleReconnect() {
-    if (intentionalClose || reconnectTimer) return;
+    if (noReconnect || intentionalClose || reconnectTimer) return;
     if (reconnectAttempts >= MAX_AUTO_RECONNECTS) {
       broadcast({
         type: "subtitle:error",
@@ -417,6 +460,7 @@ function createSourceTranscriptionClient({
     }
     const delay = Math.min(reconnectBaseMs * 2 ** reconnectAttempts, RECONNECT_MAX_MS);
     reconnectAttempts += 1;
+    replayOnNextOpen = true;
     reconnectTimer = setTimeout(() => {
       reconnectTimer = null;
       if (intentionalClose) return;
@@ -437,7 +481,10 @@ function createSourceTranscriptionClient({
     openedSocket.on("open", () => {
       if (socket !== openedSocket || intentionalClose) return;
       for (const payload of transport.setupPayloads()) openedSocket.send(payload);
-      armSetupTimeout(openedSocket);
+      // Soniox acknowledges nothing: the config frame is accepted or the socket
+      // is rejected, so the session is ready the moment setup is on the wire.
+      if (transport.requiresSetupAck === false) markTransportReady(openedSocket);
+      else armSetupTimeout(openedSocket);
     });
     openedSocket.on("message", (raw) => {
       if (socket !== openedSocket || intentionalClose) return;
@@ -453,6 +500,16 @@ function createSourceTranscriptionClient({
         onBoundary: (kind) => { for (const lane of lanes) lane.onProviderBoundary?.(kind); },
         onServerGoAway: () => {
           requestGracefulRollover(openedSocket, "provider_go_away");
+        },
+        onError: (code, detail) => {
+          if (NON_RETRYABLE_TRANSPORT_ERRORS.has(code)) noReconnect = true;
+          broadcast({
+            type: "subtitle:error",
+            code,
+            message: `${providerLabel} 연결 오류: ${code}`,
+            source,
+            requestId: detail?.requestId ?? null,
+          });
         },
         broadcast,
       });
@@ -483,6 +540,7 @@ function createSourceTranscriptionClient({
       const didGracefulRollover = rolloverSocket === openedSocket;
       socket = null;
       configured = false;
+      stopKeepalive();
       setupAckTimer = clearTimer(setupAckTimer);
       rolloverTimer = clearTimer(rolloverTimer);
       rolloverDrainTimer = clearTimer(rolloverDrainTimer);
@@ -540,18 +598,21 @@ function createSourceTranscriptionClient({
         backpressureShedding = false;
         broadcast({ type: "subtitle:status", status: "listening", source });
       }
-      connection.send(transport.audioPayload(audio));
+      lastAudioSentAt = Date.now();
+      sendTransportPayload(connection, transport.audioPayload(audio));
     },
     async close({ graceful = false } = {}) {
       intentionalClose = true;
+      stopKeepalive();
       reconnectTimer = clearTimer(reconnectTimer);
       setupAckTimer = clearTimer(setupAckTimer);
       rolloverTimer = clearTimer(rolloverTimer);
       rolloverDrainTimer = clearTimer(rolloverDrainTimer);
       rolloverSocket = null;
       preservePendingAudio = false;
+      replayOnNextOpen = false;
       for (const lane of lanes) lane.close();
-      if (graceful && socket && configured) socket.send(transport.closePayload());
+      if (graceful && socket && configured) sendTransportPayload(socket, transport.closePayload());
       socket?.close();
       socket = null;
       configured = false;
@@ -731,6 +792,82 @@ function createTextTranslationLane({
     finalizer.release?.();
   }
 
+  // Combined providers (Soniox) deliver the translation themselves; the Gemini
+  // text lane never receives this. A provider translation is still model output,
+  // so it clears exactly the same gates a Gemini final does: same-language
+  // clear, placeholder drop, target-language check, and source-echo rejection.
+  function acceptProviderTranslationNow(event) {
+    if (closed) return;
+    const sourceText = boundTranscript(event.sourceText ?? "").trim();
+    const sourceLanguage = normalizeProviderLanguageCode(event.sourceLanguage)
+      || resolveSourceLanguage({ text: sourceText, languageCode: event.sourceLanguage });
+    if (sourceLanguage === targetLanguage) {
+      // The speaker is already speaking this lane's language: drop the lane so
+      // the overlay stops showing a stale rendition, exactly as commitNow does.
+      broadcast({
+        type: "subtitle:clear",
+        source,
+        targetLanguage,
+        reason: "same_language_source",
+        translationProvider: event.provider ?? "gemini",
+      });
+      return;
+    }
+    const translationRole = resolveTranslationRole(sourceText || event.text, sourceLanguage);
+    if (!translationRole) return;
+    const corrected = stripSubtitlePrefix(termRetriever.repair(boundTranscript(event.text).normalize("NFC"), {
+      language: targetLanguage,
+      isFinal: event.isFinal,
+    }));
+    if (!corrected || isEllipsisPlaceholder(corrected)) return;
+    if (!isTargetOutputSupported(corrected)) {
+      // A final that never reached the target language is a failed translation,
+      // not silence: surface it so the lane is not left mysteriously empty.
+      if (event.isFinal) {
+        broadcast({
+          type: "subtitle:error",
+          message: `${targetLanguage} 텍스트 번역을 확정하지 못했습니다.`,
+          code: "TEXT_TRANSLATION_FAILED",
+          source,
+          targetLanguage,
+        });
+      }
+      return;
+    }
+    if (isSourceEcho(sourceText, corrected)) return;
+    if (!event.isFinal) {
+      broadcast({
+        type: "subtitle:partial",
+        source,
+        targetLanguage,
+        sourceLanguage,
+        translationRole,
+        translationProvider: event.provider,
+        sourceText,
+        translatedText: corrected,
+        isAuthoritative: false,
+        segmentId: event.segmentId,
+      });
+      return;
+    }
+    broadcast({
+      type: "subtitle:committed",
+      source,
+      targetLanguage,
+      sourceLanguage,
+      translationRole,
+      translationProvider: event.provider,
+      sourceText,
+      translatedText: applyGlossaryCorrections(corrected, {
+        glossary: captionConfig.glossary,
+        sourceText,
+        targetLanguage,
+      }).trim(),
+      isAuthoritative: true,
+      segmentId: event.segmentId,
+    });
+  }
+
   return {
     preview,
     commit,
@@ -738,52 +875,18 @@ function createTextTranslationLane({
     close,
     targetLanguage,
     acceptProviderTranslation(event) {
-      // Combined providers (Soniox) deliver the translation themselves; the
-      // Gemini text lane never receives this. Partial -> preview text, final ->
-      // committed through the same glossary repair the text lane applies.
       if (closed) return;
-      const sourceText = boundTranscript(event.sourceText ?? "").trim();
-      const sourceLanguage = normalizeProviderLanguageCode(event.sourceLanguage)
-        || resolveSourceLanguage({ text: sourceText, languageCode: event.sourceLanguage });
-      const translationRole = resolveTranslationRole(sourceText || event.text, sourceLanguage);
-      if (!translationRole) return;
-      const corrected = stripSubtitlePrefix(termRetriever.repair(boundTranscript(event.text).normalize("NFC"), {
-        language: targetLanguage,
-        isFinal: event.isFinal,
-      }));
-      if (!corrected || !isTargetOutputSupported(corrected)) return;
-      if (!event.isFinal) {
-        broadcast({
-          type: "subtitle:partial",
-          source,
-          targetLanguage,
-          sourceLanguage,
-          translationRole,
-          translationProvider: event.provider,
-          sourceText,
-          translatedText: corrected,
-          isAuthoritative: false,
-          segmentId: event.segmentId,
-        });
+      // Partials stay on the immediate path; finals join the same promise chain
+      // as Gemini commits so a provider final can never overtake one in flight.
+      if (!event?.isFinal) {
+        acceptProviderTranslationNow(event);
         return;
       }
       invalidatePreview();
-      broadcast({
-        type: "subtitle:committed",
-        source,
-        targetLanguage,
-        sourceLanguage,
-        translationRole,
-        translationProvider: event.provider,
-        sourceText,
-        translatedText: applyGlossaryCorrections(corrected, {
-          glossary: captionConfig.glossary,
-          sourceText,
-          targetLanguage,
-        }).trim(),
-        isAuthoritative: true,
-        segmentId: event.segmentId,
-      });
+      finalTail = finalTail.then(
+        () => acceptProviderTranslationNow(event),
+        () => acceptProviderTranslationNow(event),
+      );
     },
     onProviderBoundary(kind) { if (kind === "interrupted") invalidatePreview(); },
   };
