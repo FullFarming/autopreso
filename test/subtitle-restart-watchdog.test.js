@@ -340,3 +340,33 @@ test("stall watchdog stays quiet while subtitles are flowing or nobody speaks", 
 
   await manager.stop();
 });
+
+// Task 6: engine hot swap must open the replacement socket before tearing
+// down the old one, so a settings save never produces a silent caption gap
+// wider than the new provider's connect time.
+test("restartChannels opens the replacement socket before closing the old one", async () => {
+  const sockets = [];
+  const broadcasts = [];
+  const manager = buildManager({ broadcasts, sockets });
+
+  await manager.start({ sessionId: "fixture" });
+  await new Promise((resolve) => setImmediate(resolve));
+  const first = sockets.at(-1);
+  first.emit("message", JSON.stringify({ setupComplete: {} }));
+
+  const restart = manager.restartChannels({ reason: "engine_change" });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(sockets.length, 2, "a new socket was created");
+  assert.equal(first.closed, undefined, "old socket still open while the new one connects");
+
+  sockets.at(-1).emit("message", JSON.stringify({ setupComplete: {} }));
+  assert.equal(await restart, true);
+  assert.equal(first.closed, true);
+  const statuses = broadcasts
+    .filter((message) => message.type === "subtitle:status")
+    .map((message) => `${message.status}:${message.reason ?? ""}`);
+  assert.ok(statuses.includes("recovering:engine_change"));
+  assert.equal(statuses.at(-1), "listening:");
+
+  await manager.stop();
+});

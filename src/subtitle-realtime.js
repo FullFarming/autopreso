@@ -262,6 +262,12 @@ export function createSubtitleRealtimeManager(options = {}) {
     for (const client of clients) void client.close();
   }
 
+  // Task 6: open the replacement channels BEFORE tearing down the old ones,
+  // so a settings save (e.g. an engine swap) bounds the caption gap by the new
+  // provider's connect time instead of by the old socket's drain time. The
+  // input mode itself is pinned to whatever is already running - a restart is
+  // for picking up an engine/key change, not for silently reshaping which
+  // audio sources are captured.
   async function restartChannels({ reason = "restart" } = {}) {
     if (!state.active || restartInFlight || !state.sessionId) return false;
     restartInFlight = true;
@@ -269,19 +275,35 @@ export function createSubtitleRealtimeManager(options = {}) {
     try {
       const saved = settingsStore ? await settingsStore.load() : {};
       if (!state.active || state.sessionId !== ownerSessionId) return false;
-      const normalizedSettings = normalizeSubtitleSettings({ ...(state.settings ?? {}), ...(saved.subtitle ?? {}) });
+      const normalizedSettings = normalizeSubtitleSettings({
+        ...(state.settings ?? {}),
+        ...(saved.subtitle ?? {}),
+        inputMode: state.settings.inputMode,
+      });
       const apiKeys = readApiKeys(saved);
       assertEngineApiKeys(normalizedSettings.engine, apiKeys);
-      const clients = [...state.clients.values()];
+      const previousClients = [...state.clients.values()];
       state.clients.clear();
       producerGeneration += 1;
+      const replacementGeneration = producerGeneration;
       state.settings = normalizedSettings;
       state.captionConfig = createGeminiCaptionConfig(normalizedSettings);
       state.apiKeys = apiKeys;
       broadcast?.({ type: "subtitle:status", status: "recovering", reason });
-      await Promise.all(clients.map((client) => client.close()));
-      if (!state.active || state.sessionId !== ownerSessionId) return false;
-      for (const source of sourcesForInputMode(normalizedSettings.inputMode)) ensureClient(source).open();
+      let replacements;
+      try {
+        replacements = sourcesForInputMode(normalizedSettings.inputMode).map((source) => ensureClient(source));
+        for (const client of replacements) client.open();
+      } catch (error) {
+        await Promise.all(previousClients.map((client) => client.close({ graceful: true })));
+        throw error;
+      }
+      await Promise.all(replacements.map((client) => client.waitUntilReady(2_500).catch(() => undefined)));
+      if (!state.active || state.sessionId !== ownerSessionId || producerGeneration !== replacementGeneration) {
+        await Promise.all(previousClients.map((client) => client.close({ graceful: true })));
+        return false;
+      }
+      await Promise.all(previousClients.map((client) => client.close({ graceful: true })));
       resetSourceLiveness();
       broadcast?.({ type: "subtitle:status", status: "listening" });
       return true;
@@ -340,6 +362,10 @@ function createSourceTranscriptionClient({
   }));
   let socket = null;
   let configured = false;
+  // Woken by markTransportReady (success) and by the socket "close" handler
+  // (gave up before ever becoming ready) - either way waitUntilReady must not
+  // hang a restart for its full timeout on a dead socket.
+  let readyWaiters = [];
   let intentionalClose = false;
   let pendingAudio = [];
   let setupAckTimer = null;
@@ -394,6 +420,7 @@ function createSourceTranscriptionClient({
     if (configured) return;
     setupAckTimer = clearTimer(setupAckTimer);
     configured = true;
+    for (const wake of readyWaiters.splice(0)) wake();
     reconnectAttempts = 0;
     // A rollover or reconnect drops audio the provider never transcribed; the
     // transport's replay ring re-sends that tail so the segment survives.
@@ -560,6 +587,10 @@ function createSourceTranscriptionClient({
       const didGracefulRollover = rolloverSocket === openedSocket;
       socket = null;
       configured = false;
+      // The socket died before ever becoming ready (or intentional close beat
+      // it there) - wake any restartChannels waiter now instead of leaving it
+      // to burn its full waitUntilReady timeout on a connection that is gone.
+      for (const wake of readyWaiters.splice(0)) wake();
       stopKeepalive();
       setupAckTimer = clearTimer(setupAckTimer);
       rolloverTimer = clearTimer(rolloverTimer);
@@ -597,6 +628,17 @@ function createSourceTranscriptionClient({
           code: "TRANSCRIBE_START_FAILED",
         });
       }
+    },
+    // Lets restartChannels bound the open-new-before-close-old gap by connect
+    // time: resolves immediately if already ready, and no later than
+    // timeoutMs even if the replacement socket never comes up.
+    waitUntilReady(timeoutMs = 2_500) {
+      if (configured) return Promise.resolve();
+      return new Promise((resolve) => {
+        const timer = setTimeout(resolve, timeoutMs);
+        timer.unref?.();
+        readyWaiters.push(() => { clearTimeout(timer); resolve(); });
+      });
     },
     sendAudio(audio) {
       // Audio arrives from an async WebSocket listener with no outer catch, so a

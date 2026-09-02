@@ -19,7 +19,12 @@ import {
 import { createMoonshineTranscription as createDefaultMoonshineTranscription } from "./moonshine-transcription.js";
 import { createOpenAITranscription as createDefaultOpenAITranscription } from "./openai-transcription.js";
 import { audioSecondsFromBase64Pcm16 } from "./session-cost.js";
-import { DEFAULT_SUBTITLE_SETTINGS, validateAgentInstructions, validateSubtitleSettings } from "./settings-store.js";
+import {
+  API_KEY_NAMES,
+  DEFAULT_SUBTITLE_SETTINGS,
+  validateAgentInstructions,
+  validateSubtitleSettings,
+} from "./settings-store.js";
 import { generateGeminiTextWithModelFallback } from "./gemini-text-generation.js";
 
 import { GLOSSARY_PRESETS } from "./glossary-presets.js";
@@ -31,6 +36,8 @@ import { getBuiltInGlossary } from "../packages/caption-core/index.js";
 import {
   captionEngineCatalogForClient,
   DEFAULT_ENGINE_SELECTION,
+  engineRequiredApiKeys,
+  engineSelectionKey,
   findEngineEntry,
 } from "../packages/caption-core/caption-engine-catalog.js";
 import { createSubtitlePolisher } from "./subtitle-polish.js";
@@ -741,17 +748,34 @@ export async function startServer(options) {
     res.json({ ok: true });
   });
 
-  // The engine selection is validated by the settings store and picked up on
-  // the next channel restart, so a model change no longer has to fence an
-  // active session.
   async function saveSettingsPatch(patch) {
     return options.settingsStore.save(patch);
+  }
+
+  // The engine selection (and the API keys it requires) is validated by the
+  // settings store, but a caption session already listening on the OLD engine
+  // will keep talking to it forever unless something notices the change and
+  // rebuilds the channels. Diff before/after the save so an unrelated field
+  // (font size, glossary, ...) never triggers a restart, and only fire it when
+  // captions are actually active - there is nothing to hot-swap otherwise.
+  async function saveSettingsAndApply(patch) {
+    const before = await options.settingsStore.load();
+    const beforeKey = engineSelectionKey(before.subtitle?.engine);
+    const beforeKeys = Object.fromEntries(API_KEY_NAMES.map((name) => [name, Boolean(before.apiKeys?.[name])]));
+    await saveSettingsPatch(patch);
+    const after = await options.settingsStore.load();
+    const engineChanged = engineSelectionKey(after.subtitle?.engine) !== beforeKey;
+    const keysChanged = engineRequiredApiKeys(after.subtitle?.engine)
+      .some((name) => beforeKeys[name] !== Boolean(after.apiKeys?.[name]));
+    if ((engineChanged || keysChanged) && subtitles._state?.active) {
+      await subtitles.restartChannels({ reason: "engine_change" });
+    }
   }
 
   app.put("/api/settings", async (req, res) => {
     if (!options.settingsStore) return res.status(404).json({ error: "Settings store not available." });
     try {
-      await saveSettingsPatch(req.body ?? {});
+      await saveSettingsAndApply(req.body ?? {});
       await transcription.applyCurrent();
       const sanitized = await options.settingsStore.getSanitized();
       res.json({ settings: sanitized, transcriptionEngine: transcription.getLabel() });
@@ -864,7 +888,7 @@ export async function startServer(options) {
       if (message.type === "settings:update" && options.settingsStore) {
         if (!hasTrustedBrowserOrigin) return;
         try {
-          await saveSettingsPatch(message.patch ?? {});
+          await saveSettingsAndApply(message.patch ?? {});
           await transcription.applyCurrent();
           const sanitized = await options.settingsStore.getSanitized();
           broadcast(wss, { type: "settings", settings: sanitized });

@@ -1335,7 +1335,10 @@ test("caption engine settings come from the server catalog and reject unknown se
   const { httpServer, url } = await startServer({
     host: "127.0.0.1", port: 0, moonshineModel: "medium", settingsStore: store,
     createTranscription: () => ({ ready: async () => {}, sendAudio() {}, stop() {}, close() {} }),
-    createSubtitleRealtimeManager: () => ({ _state: activeState, start() { providerStarts += 1; }, stop() {}, close() {}, sendAudio() {} }),
+    createSubtitleRealtimeManager: () => ({
+      _state: activeState, start() { providerStarts += 1; }, stop() {}, close() {}, sendAudio() {},
+      restartChannels: async () => true,
+    }),
   });
   try {
     const config = await fetch(`${url}/api/config`).then((response) => response.json());
@@ -1375,6 +1378,55 @@ test("caption engine settings come from the server catalog and reject unknown se
     assert.equal(saved.subtitle.engine.translation.model, "gemini-3.7-flash");
     assert.equal(saved.subtitle.engine.stt.model, "gemini-3.5-transcribe-live");
     assert.equal(providerStarts, 0, "reading or saving settings never starts a paid session");
+  } finally {
+    await new Promise((resolve) => httpServer.close(resolve));
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
+// Task 6: a settings save that actually changes the engine (or a key it
+// requires) while captions are running must trigger an immediate hot swap so
+// the live session picks up the new provider without a manual stop/start.
+test("saving a different engine while captions run triggers an immediate channel restart", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "nova-engine-hotswap-"));
+  const store = createSettingsStore({ filePath: path.join(dir, "settings.json"), env: {}, readCodexAuth: () => null });
+  await store.load();
+  await store.save({ apiKeys: { soniox: "fixture-key" } });
+  const calls = [];
+  const fakeManager = {
+    start: async () => {}, stop: async () => true, close() {}, sendAudio() {}, noteInputSignal() {},
+    restartChannels: async (args) => { calls.push(args); return true; },
+    _state: { active: true },
+  };
+  const { httpServer, url } = await startServer({
+    host: "127.0.0.1", port: 0, moonshineModel: "medium", settingsStore: store,
+    createTranscription: () => ({ ready: async () => {}, sendAudio() {}, stop() {}, close() {} }),
+    createSubtitleRealtimeManager: () => fakeManager,
+  });
+  try {
+    const response = await fetch(`${url}/api/settings`, {
+      method: "PUT",
+      headers: sameOriginHeaders(url, { "content-type": "application/json" }),
+      body: JSON.stringify({
+        subtitle: {
+          engine: {
+            stt: { provider: "soniox", model: "stt-rt-v5", languageMode: "ko" },
+            translation: { provider: "soniox", model: "stt-rt-v5" },
+            summary: { provider: "gemini", model: "gemini-3.6-flash" },
+          },
+        },
+      }),
+    });
+    assert.equal(response.status, 200);
+    assert.deepEqual(calls, [{ reason: "engine_change" }]);
+
+    const again = await fetch(`${url}/api/settings`, {
+      method: "PUT",
+      headers: sameOriginHeaders(url, { "content-type": "application/json" }),
+      body: JSON.stringify({ subtitle: { fontSize: 40 } }),
+    });
+    assert.equal(again.status, 200);
+    assert.equal(calls.length, 1, "unrelated settings do not restart the engine");
   } finally {
     await new Promise((resolve) => httpServer.close(resolve));
     await fs.rm(dir, { recursive: true, force: true });
