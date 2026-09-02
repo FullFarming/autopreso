@@ -51,6 +51,9 @@ venv/
 .codex-artifacts/
 .realtime-noel-dev/
 
+# Real-API spike script output and synthetic fixtures (scripts/engine-spike.mjs)
+scratch/
+
 # Vercel CLI project link (machine-local)
 .vercel/
 
