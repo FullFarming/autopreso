@@ -58,3 +58,16 @@
 공급자 추상화(접근안 A)에서 Soniox는 **1단계부터** 포함할 가치가 있다. 어댑터 하나(`soniox-realtime-adapter.js`)가 STT와 번역 두 역할을 동시에 채우므로, 카탈로그에 "결합 공급자(stt+translation in one stream)" 유형과 `languageMode`(auto/ko/en) capability를 추가한다. 핫스왑 규칙은 동일하다: 설정 저장 → 데스크톱 `restartChannels` / 게이트웨이 `update` → 새 소켓 교체. 언어 모드 전환도 같은 경로를 탄다.
 
 Gemini Transcribe Live + Flash는 폴백 공급자로 유지하고, Flash 텍스트 번역은 (가) 세 번째 언어(ja) 또는 (나) 가이드 §14.2처럼 Soniox 번역을 preview로 두고 확정 번역을 별도로 만들 때 쓴다. 어느 쪽인지는 spike 품질을 보고 정한다.
+
+## Spike result 2026-09-02 (합성 한·영 음성 17 s, US 엔드포인트)
+
+- 연결 520~650 ms(서울→US). JP 엔드포인트는 현재 키로 `unauthenticated`(키가 US 리전 프로젝트) → US 사용.
+- `language_hints ["ko","en"] + strict` 자동 모드: 원문 토큰 언어 정확(ko 구간 ko, en 구간 en), 타 스크립트 오인식 0건. `two_way` 번역 확정 토큰이 원문 확정과 거의 동시에 도착(첫 확정 4.79 s / 4.80 s). ko→en, en→ko 모두 정확. TTS가 "ARR"을 발음한 구간은 "어레인기드"로 오인식(Gemini Transcribe는 "recurring revenue"로 인식).
+- **경계 신호 실측**: 연속 발화 17 s 동안 `<end>` 0회. 2.0 s 디지털 무음 삽입 시 ~650 ms 뒤 `<end>`. `{"type":"finalize"}` 전송 시 ~300 ms 뒤 `<fin>`. 종료는 **빈 텍스트 프레임**으로 보내야 `<end>` + `finished`가 ~350 ms에 도착하고, 빈 바이너리 프레임은 종료되지 않음(8 s 대기 후 타임아웃).
+- 결론: 인식·번역 품질은 채택 가능 수준. 구현 계약 두 가지를 고쳐야 한다. (1) `closePayload`는 빈 텍스트 프레임. (2) 리듀서가 `<end>/<fin>`에서만 확정하므로, 새 토큰 없이 1.2 s가 지나고 미확정 최종 텍스트가 있으면(또는 세그먼트 15 s 초과) 앱이 `finalize`를 보내 `<fin>`으로 확정한다. 이 수정 후 spike를 재실행해 기본 공급자를 결정한다.
+
+## 재실행 2026-09-03 00:58 KST (수정 계약 적용, 커밋 2aca0cc)
+
+- 세 언어 모드 모두 `finished` 정상 수신(빈 텍스트 프레임), 타임아웃 0, 오류 0, 타 스크립트 오인식 0. 확정 1건/레인(17 s 연속 발화 → 종료 시 `<end>`), 첫 부분 자막 p50 669~703 ms, 확정 지연 p50 738~760 ms, 첫 번역 p50 ≈3.5 s. ko→en·en→ko 번역 모두 정확("ARR" 합성 발음만 "Arraigned"으로 오인식 — TTS 고유 결함, Gemini Transcribe 2건 확정·번역 없음).
+- `finalize` 전송 0회: 연속 발화 중 토큰이 계속 도착해 1.2 s 유휴가 생기지 않았고, 최초 확정 토큰(≈4.8 s)+15 s 상한이 클립 종료(≈17.6 s) 뒤였다. 스케줄러는 유휴·상한 조건에서만 동작하도록 설계된 대로다. 실제 회의처럼 문장 사이 멈춤이 있으면 `<end>`가 먼저 온다.
+- **기본 공급자 판정:** `DEFAULT_ENGINE_SELECTION`은 **Gemini Transcribe + Flash 유지**. 근거: (1) 합성 음성 1클립만으로 실제 마이크 한국어 정확도를 판정할 수 없다(ARR 오인식이 그 예). (2) Soniox 번역은 정확히 2개 언어 세션에만 적용되고, 3개 언어 세션은 Gemini 번역이 필요하다. (3) 배포된 게이트웨이에는 Plan 2 전까지 Soniox 레인이 없어 기본값을 바꾸면 데스크톱과 Live Call의 기본이 갈라진다. Soniox는 설정의 엔진 선택에서 "결합 공급자(권장: 한·영 2개 언어)"로 노출하고, 사용자가 실제 리허설 음성으로 확인한 뒤 기본값 전환을 다시 결정한다(한 줄 변경: `packages/caption-core/caption-engine-catalog.js`의 `DEFAULT_ENGINE_SELECTION`).
