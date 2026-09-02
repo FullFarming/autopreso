@@ -38,6 +38,7 @@ import { createDesktopLiveDemandController } from "./live-demand-controller.js";
 import { readDesktopSystemLanguage, persistDesktopSystemLanguage } from "./system-language-store.js";
 import { createDesktopHostSession } from "./desktop-host-session.js";
 import { openDesktopHostLogin } from "./desktop-host-login-window.js";
+import { createDesktopLoginState, findDesktopAuthDeepLink, isAllowedDesktopExternalLogin, parseDesktopAuthDeepLink } from "./desktop-auth-deep-link.js";
 // The renderer owns the UI language choice (localStorage); it pushes the value
 // over IPC so the application menu speaks the same language.
 import { normalizeLanguage, setLanguage, t as translate } from "../public/subtitle-i18n.js";
@@ -137,12 +138,28 @@ let desktopHostSession = null;
 let desktopLoginWindow = null;
 let desktopLoginPromise = null;
 let isHostLogoutPending = false;
+// Desktop Google login: the login window asks for the system browser, which
+// returns through the `nova://` scheme. `pendingDesktopLoginState` is the
+// one-shot CSRF binding between the URL we opened and the deep link we accept;
+// `desktopLoginControls` lets the main process finish the login window's
+// session verification once the code has been exchanged for the cookie.
+let pendingDesktopLoginState = "";
+let desktopLoginControls = null;
 const singleInstanceLock = app.requestSingleInstanceLock();
 
 if (!singleInstanceLock) {
   app.quit();
 } else {
-  app.on("second-instance", () => {
+  app.setAsDefaultProtocolClient("nova");
+  // macOS delivers the deep link to the running instance as an event.
+  app.on("open-url", (event, url) => {
+    event.preventDefault();
+    void handleDesktopAuthDeepLink(url);
+  });
+  // Windows/Linux launch a second instance whose argv carries the deep link.
+  app.on("second-instance", (_event, argv) => {
+    const deepLink = findDesktopAuthDeepLink(argv);
+    if (deepLink) { void handleDesktopAuthDeepLink(deepLink); return; }
     showDashboardWindow();
     if (overlayEnabled) maintainOverlayWindow();
   });
@@ -188,6 +205,7 @@ async function createApp() {
     baseUrl: resolveLiveWorkspaceUrl(),
     fetcher: (url, options) => session.defaultSession.fetch(url, options),
   });
+  registerDesktopLoginIpc();
   let authenticated = await desktopHostSession.ensureSession();
   if (!authenticated.ok) authenticated = await openHostLoginWindow();
   if (!authenticated.ok || isQuitting) { app.quit(); return; }
@@ -563,7 +581,9 @@ async function showDesktopLoginFailure(result) {
     title: translate("hostSession.loginTitle"),
     message: result.code === "RATE_LIMITED"
       ? translate("hostSession.rateLimited", { seconds: result.retryAfterSeconds ?? 60 })
-      : translate("hostSession.verifyFailed"),
+      : typeof result.code === "string" && result.code.startsWith("DESKTOP_LOGIN_")
+        ? translate("hostSession.deepLinkFailed")
+        : translate("hostSession.verifyFailed"),
     buttons: [translate("hostSession.retry"), translate("common.cancel")],
     defaultId: 0,
     cancelId: 1,
@@ -576,6 +596,7 @@ function openHostLoginWindow() {
   if (desktopLoginPromise) return desktopLoginPromise;
   if (isHostLogoutPending) return Promise.resolve({ ok: false, code: "HOST_LOGOUT_IN_PROGRESS" });
   if (!desktopHostSession || isQuitting) return Promise.resolve({ ok: false, code: "HOST_LOGIN_REQUIRED" });
+  pendingDesktopLoginState = createDesktopLoginState();
   desktopLoginPromise = openDesktopHostLogin({
     BrowserWindowClass: BrowserWindow,
     browserSession: session.defaultSession,
@@ -584,8 +605,70 @@ function openHostLoginWindow() {
     title: translate("hostSession.loginTitle"),
     onWindow: (window) => { desktopLoginWindow = window; },
     onFailure: showDesktopLoginFailure,
-  }).finally(() => { desktopLoginWindow = null; desktopLoginPromise = null; });
+    state: pendingDesktopLoginState,
+    onControls: (controls) => { desktopLoginControls = controls; },
+  }).finally(() => {
+    desktopLoginWindow = null;
+    desktopLoginPromise = null;
+    desktopLoginControls = null;
+    pendingDesktopLoginState = "";
+  });
   return desktopLoginPromise;
+}
+
+// `nova://auth/callback?code&state` arrives from the system browser after the
+// Google login finished on the workspace. The code is a one-shot secret and is
+// never logged; it is only forwarded to `/api/auth/desktop-exchange` over the
+// default session, so the `rnw_session` cookie lands in the same cookie jar
+// the login window and every later host request use.
+async function handleDesktopAuthDeepLink(url) {
+  const parsed = parseDesktopAuthDeepLink(url);
+  if (!parsed || !pendingDesktopLoginState || parsed.state !== pendingDesktopLoginState) {
+    if (desktopLoginWindow && !desktopLoginWindow.isDestroyed()) void showDesktopLoginFailure({ ok: false, code: "DESKTOP_LOGIN_STATE_MISMATCH" });
+    return;
+  }
+  pendingDesktopLoginState = "";
+  const baseUrl = resolveLiveWorkspaceUrl();
+  const origin = new URL(baseUrl).origin;
+  let ok = false;
+  try {
+    const response = await session.defaultSession.fetch(new URL("/api/auth/desktop-exchange", origin).href, {
+      method: "POST",
+      credentials: "include",
+      redirect: "error",
+      headers: { origin, "content-type": "application/json", "cache-control": "no-store" },
+      body: JSON.stringify({ code: parsed.code, state: parsed.state }),
+      signal: AbortSignal.timeout(15_000),
+    });
+    ok = response.ok;
+  } catch {
+    ok = false;
+  }
+  if (!ok) { void showDesktopLoginFailure({ ok: false, code: "DESKTOP_LOGIN_EXCHANGE_FAILED" }); return; }
+  desktopHostSession?.invalidate();
+  await desktopLoginControls?.verifyExternal();
+  if (desktopLoginWindow && !desktopLoginWindow.isDestroyed()) {
+    desktopLoginWindow.show();
+    desktopLoginWindow.focus();
+  }
+}
+
+// Registered before the first login window opens (the rest of the IPC surface
+// waits for cookie verification in registerOverlayIpc, but the login window
+// exists precisely because that verification has not passed yet).
+function registerDesktopLoginIpc() {
+  // The login window's only bridge: open the workspace's Google login in the
+  // system browser. Three gates - the caller is the login window, the URL is the
+  // allowlisted /login?client=desktop&auto=google on the workspace origin, and
+  // its state is the one this login attempt issued.
+  ipcMain.handle("desktop-login:open-external", (event, value) => {
+    if (!desktopLoginWindow || event.sender !== desktopLoginWindow.webContents) return false;
+    if (!isAllowedDesktopExternalLogin(value, resolveLiveWorkspaceUrl())) return false;
+    const state = new URL(value).searchParams.get("state");
+    if (!pendingDesktopLoginState || state !== pendingDesktopLoginState) return false;
+    void shell.openExternal(value).catch(() => {});
+    return true;
+  });
 }
 
 function parseLiveWorkspaceUrl(value) {

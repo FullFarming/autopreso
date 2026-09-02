@@ -22,8 +22,8 @@ class FakeWindow extends EventEmitter {
   async loadURL(url) { this.loadedUrl = url; }
 }
 
-/** @param {{verify?: () => Promise<import("../electron/desktop-host-session.js").HostSessionResult>, onFailure?: () => Promise<boolean>, BrowserWindowClass?: typeof FakeWindow}} [options] */
-function harness({ verify = async () => success, onFailure = async () => false, BrowserWindowClass = FakeWindow } = {}) {
+/** @param {{verify?: () => Promise<import("../electron/desktop-host-session.js").HostSessionResult>, onFailure?: () => Promise<boolean>, BrowserWindowClass?: typeof FakeWindow, state?: string, onControls?: (controls: { verifyExternal: () => Promise<void> }) => void}} [options] */
+function harness({ verify = async () => success, onFailure = async () => false, BrowserWindowClass = FakeWindow, state = "S".repeat(43), onControls } = {}) {
   /** @type {FakeWindow[]} */
   const windows = [];
   const browserSession = {};
@@ -35,22 +35,24 @@ function harness({ verify = async () => success, onFailure = async () => false, 
     title: "NOVA 로그인",
     onWindow: (window) => windows.push(window),
     onFailure,
+    state,
+    onControls,
   });
   const window = windows[0];
   assert.ok(window);
-  return { window, result, browserSession };
+  return { window, windows, result, browserSession, loginUrl: `${origin}login?client=desktop&state=${state}` };
 }
 
 test("the login window shares only the cookie session and exposes no native preload or media capability", async () => {
   const h = harness();
   assert.equal(h.window.options.webPreferences.session, h.browserSession);
-  assert.equal(h.window.options.webPreferences.preload, undefined);
+  assert.match(h.window.options.webPreferences.preload, /desktop-login-preload\.js$/u);
   assert.equal(h.window.options.webPreferences.nodeIntegration, false);
   assert.equal(h.window.options.webPreferences.contextIsolation, true);
   assert.equal(h.window.options.webPreferences.sandbox, true);
   assert.equal(h.window.options.webPreferences.webviewTag, false);
   assert.equal(h.window.visible, true);
-  assert.equal(h.window.loadedUrl, `${origin}login`);
+  assert.equal(h.window.loadedUrl, h.loginUrl);
   assert.deepEqual(h.window.webContents.openHandler({ url: "https://evil.test" }), { action: "deny" });
   h.window.destroy();
   assert.equal((await h.result).code, "LOGIN_CANCELLED");
@@ -64,7 +66,7 @@ test("admin navigation is stopped before remote admin code loads and requires a 
   assert.equal(prevented, true);
   assert.equal((await h.result).ok, true);
   assert.equal(checks, 1);
-  assert.equal(h.window.loadedUrl, `${origin}login`);
+  assert.equal(h.window.loadedUrl, h.loginUrl);
   assert.equal(h.window.destroyed, true);
 });
 
@@ -134,4 +136,19 @@ test("a failed load releases its timer before a later manual attempt starts", as
   assert.equal(h.window.webContents.stopped, true);
   h.window.destroy();
   await h.result;
+});
+
+test("login window loads the desktop login URL with state, attaches the login preload, and verifies external deep-link logins", async () => {
+  const state = "A".repeat(43);
+  /** @type {{ verifyExternal: () => Promise<void> } | undefined} */
+  let controls;
+  const { windows, result } = harness({ state, onControls: (c) => { controls = c; } });
+  await new Promise((r) => setImmediate(r));
+  assert.ok(controls);
+  assert.equal(windows[0].loadedUrl, `https://workspace.example.test/login?client=desktop&state=${state}`);
+  assert.match(windows[0].options.webPreferences.preload, /desktop-login-preload\.js$/u);
+  assert.equal(windows[0].options.webPreferences.sandbox, true);
+  await controls.verifyExternal();
+  assert.deepEqual(await result, success);
+  assert.equal(windows[0].destroyed, true);
 });

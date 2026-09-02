@@ -147,3 +147,14 @@ test("quit after async cleanup waits for the next event loop turn instead of ree
   queued[0]();
   assert.equal(quits, 1);
 });
+
+test("main registers the nova scheme, parses deep links on macOS and Windows, checks state, and exchanges the code over the default session", () => {
+  assert.match(main, /app\.setAsDefaultProtocolClient\("nova"\)/u);
+  assert.match(main, /app\.on\("open-url", \(event, url\) => \{\s*event\.preventDefault\(\);\s*void handleDesktopAuthDeepLink\(url\);/u);
+  assert.match(main, /findDesktopAuthDeepLink\(argv\)/u);
+  assert.match(main, /if \(!parsed \|\| !pendingDesktopLoginState \|\| parsed\.state !== pendingDesktopLoginState\)/u);
+  assert.match(main, /"\/api\/auth\/desktop-exchange"/u);
+  assert.match(main, /ipcMain\.handle\("desktop-login:open-external"/u);
+  assert.match(main, /isAllowedDesktopExternalLogin\(/u);
+  assert.doesNotMatch(main, /console\.[a-z]+\([^)]*(?:parsed\.code|deepLink|deep_link)/u, "codes and deep links are never logged");
+});

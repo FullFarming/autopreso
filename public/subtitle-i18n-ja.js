@@ -410,6 +410,7 @@ export const JA = {
   "settings.hostSharedLoginHelp": "Webと同じアカウントを使います。ログアウトするとアプリが再起動します。",
   "hostSession.loginTitle": "NOVAにログイン",
   "hostSession.verifyFailed": "ログイン状態を確認できませんでした。接続を確認してから再確認してください。",
+  "hostSession.deepLinkFailed": "ブラウザでのログインを確認できませんでした。もう一度お試しください。",
   "hostSession.rateLimited": "ログインリクエストが多すぎます。{seconds}秒後に再度お試しください。",
   "hostSession.retry": "再確認",
   "settings.hostId": "ホストID",

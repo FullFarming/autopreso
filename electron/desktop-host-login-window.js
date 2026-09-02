@@ -1,6 +1,10 @@
+import { fileURLToPath } from "node:url";
+import { buildDesktopLoginUrl } from "./desktop-auth-deep-link.js";
 import { classifyDesktopLoginNavigation } from "./desktop-host-session.js";
 
-export function openDesktopHostLogin({ BrowserWindowClass, browserSession, hostSession, baseUrl, title, onWindow, onFailure }) {
+const LOGIN_PRELOAD_PATH = fileURLToPath(new URL("./desktop-login-preload.js", import.meta.url));
+
+export function openDesktopHostLogin({ BrowserWindowClass, browserSession, hostSession, baseUrl, title, onWindow, onFailure, state, onControls }) {
   return new Promise((resolve) => {
     const window = new BrowserWindowClass({
       width: 1100,
@@ -11,6 +15,7 @@ export function openDesktopHostLogin({ BrowserWindowClass, browserSession, hostS
       show: true,
       webPreferences: {
         session: browserSession,
+        preload: LOGIN_PRELOAD_PATH,
         sandbox: true,
         contextIsolation: true,
         nodeIntegration: false,
@@ -23,6 +28,10 @@ export function openDesktopHostLogin({ BrowserWindowClass, browserSession, hostS
     let isSettled = false;
     let isVerifying = false;
     let loadTimer;
+    // A nova:// deep link lands in the main process, not in this window, so the
+    // main process needs the same "prove the cookie is real" step an
+    // authenticated navigation would trigger.
+    onControls?.({ verifyExternal: () => verifyNavigation(null, new URL("/admin", baseUrl).href) });
     function finish(result) {
       if (isSettled) return;
       isSettled = true;
@@ -62,7 +71,7 @@ export function openDesktopHostLogin({ BrowserWindowClass, browserSession, hostS
       let hasLoadFailed = false;
       try {
         await Promise.race([
-          window.loadURL(new URL("/login", baseUrl).href),
+          window.loadURL(buildDesktopLoginUrl(baseUrl, state)),
           new Promise((_resolve, reject) => {
             loadTimer = setTimeout(() => {
               if (!window.isDestroyed()) window.webContents.stop();

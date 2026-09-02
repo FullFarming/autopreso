@@ -49,6 +49,14 @@
     "appId": "com.realtime-noel.app",
     "productName": "NOVA",
     "icon": "assets/icon.png",
+    "protocols": [
+      {
+        "name": "NOVA",
+        "schemes": [
+          "nova"
+        ]
+      }
+    ],
     "files": [
       "assets/**",
       "electron/**",
