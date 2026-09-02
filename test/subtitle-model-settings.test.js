@@ -185,6 +185,42 @@ test("a second change while a save is in flight is dropped and the selects stay 
   assert.equal(h.status.textContent, "engine.appliesNow");
 });
 
+test("a saved engine the catalog no longer offers repaints the role default instead of an empty select", async () => {
+  // Mirrors a real <select>: assigning a value no option carries moves
+  // selectedIndex to -1, so reading it back yields "". That is what turned a
+  // stale saved engine into a dead form whose changes saved nothing.
+  class StrictSelect extends EventTarget {
+    constructor(ownerDocument) { super(); this.selected = ""; this.disabled = false; this.options = []; this.ownerDocument = ownerDocument; }
+    get value() { return this.selected; }
+    set value(next) { this.selected = this.options.some((entry) => entry.value === next) ? next : ""; }
+    replaceChildren(...children) {
+      const previous = this.selected;
+      this.options = children;
+      this.value = children.some((option) => option.value === previous) ? previous : children[0]?.value ?? "";
+    }
+  }
+  const ownerDocument = { createElement: () => ({ value: "", textContent: "", disabled: false }) };
+  const fields = Object.fromEntries(["engineStt", "engineLanguageMode", "engineTranslation", "engineSummary"]
+    .map((name) => [name, new StrictSelect(ownerDocument)]));
+  const status = { textContent: "" };
+  const saved = [];
+  const settings = { engine: { ...catalog.defaults, summary: { provider: "gemini", model: "gemini-9.9-retired" } } };
+  const controls = mountCaptionEngineSettings({
+    form: { elements: fields, ownerDocument, querySelector: () => status },
+    getSettings: () => settings,
+    save: async (patch) => { saved.push(patch); },
+    onSaved() {}, onError() {}, translate: (key) => key,
+  });
+  controls.setCatalog(catalog);
+  assert.equal(fields.engineSummary.value, "gemini:gemini-3.6-flash", "the retired role falls back to the catalog default");
+  assert.deepEqual(saved, [], "a repaint never writes settings on its own");
+  // The form is still live: a deliberate pick saves the whole engine.
+  fields.engineSummary.value = "gemini:gemini-3.7-flash";
+  fields.engineSummary.dispatchEvent(new Event("change"));
+  await tick();
+  assert.deepEqual(saved.at(-1), { engine: { ...catalog.defaults, summary: { provider: "gemini", model: "gemini-3.7-flash" } } });
+});
+
 test("a missing catalog fails closed without saving anything", () => {
   const h = harness();
   h.controls.setCatalog(null);

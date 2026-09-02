@@ -42,6 +42,9 @@ const EN = {
   "engine.saveFailed": "Could not save. Select again to retry.",
   "engine.appliesNow": "Changes apply immediately, including running captions.",
   "keys.soniox": "Soniox API key",
+  "keys.saveSoniox": "Save Soniox key",
+  "key.enterSoniox": "Enter the Soniox API key.",
+  "key.sonioxSaved": "Soniox API key saved.",
   "models.cost": "API usage is billed. Live API audio generation may incur charges even when translated audio is not played.",
   // ── Brand ───────────────────────────────────────────────────────────────
   "app.name": "NOVA",
@@ -635,6 +638,9 @@ const KO = {
   "engine.saveFailed": "저장하지 못했어요. 다시 선택해 주세요.",
   "engine.appliesNow": "변경은 진행 중인 자막에도 바로 적용됩니다.",
   "keys.soniox": "Soniox API 키",
+  "keys.saveSoniox": "Soniox 키 저장",
+  "key.enterSoniox": "Soniox API 키를 입력하세요.",
+  "key.sonioxSaved": "Soniox API 키를 저장했어요.",
   "models.cost": "API 사용 요금이 발생합니다. 번역 음성을 재생하지 않아도 Live API 음성 생성 비용이 발생할 수 있습니다.",
   // ── Brand ───────────────────────────────────────────────────────────────
   "app.name": "NOVA",

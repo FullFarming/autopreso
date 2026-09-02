@@ -230,6 +230,7 @@ const geminiSecondaryKeyInput = form.elements.geminiSecondaryKey;
 const saveGeminiSecondaryKeyButton = document.getElementById("save-gemini-secondary-key");
 const geminiSecondaryKeyStatus = document.getElementById("gemini-secondary-key-status");
 const sonioxKeyInput = form.elements.sonioxKey;
+const saveSonioxKeyButton = document.getElementById("save-soniox-key");
 const sonioxKeyStatus = document.getElementById("soniox-key-status");
 // The engine picker owns these fields end to end: the shared settings form
 // must not autosave them, and the API key inputs never enter `subtitle`.
@@ -339,6 +340,24 @@ form.addEventListener("change", (event) => {
     .catch(showError);
 });
 
+// Engine availability is computed server-side from the stored API keys and
+// only travels on /api/config. A key that appears or disappears changes which
+// options are selectable, so the catalog has to be re-read — otherwise a
+// freshly saved Soniox key leaves its engine disabled until the next reload.
+const ENGINE_KEY_FLAGS = ["hasGeminiKey", "hasSonioxKey"];
+function engineKeyFlagSignature() {
+  return ENGINE_KEY_FLAGS.map((name) => (state[name] ? "1" : "0")).join("");
+}
+async function refreshCaptionEngineCatalog() {
+  try {
+    const config = await fetch("/api/config").then((res) => res.json());
+    captionEngineSettings?.setCatalog(config.captionEngines);
+  } catch (error) {
+    // Keep the catalog we already hold; the picker stays usable.
+    console.warn(`[subtitle-engine] catalog refresh failed: ${error?.message ?? error}`);
+  }
+}
+
 captionEngineSettings = mountCaptionEngineSettings({
   form,
   getSettings: () => state.settings,
@@ -363,6 +382,7 @@ initCaptionControllerDrag();
 saveOpenAIKeyButton.addEventListener("click", saveOpenAIKey);
 saveGeminiKeyButton.addEventListener("click", saveGeminiKey);
 saveGeminiSecondaryKeyButton?.addEventListener("click", saveGeminiSecondaryKey);
+saveSonioxKeyButton?.addEventListener("click", saveSonioxKey);
 // Download the un-cleared translation history as an Excel-compatible CSV.
 document.getElementById("export-history")?.addEventListener("click", () => {
   window.location.href = "/api/subtitles/history/export.csv";
@@ -1672,6 +1692,9 @@ async function loadConfig() {
     syncCaptionPlayerController();
     if (shouldNormalizeCaptionSettings) await saveSettings({ subtitle: state.settings });
   } catch (error) {
+    // Without a catalog the picker must say so instead of sitting on
+    // "loading" forever.
+    captionEngineSettings?.setCatalog(null);
     showError(error);
   }
 }
@@ -2558,6 +2581,7 @@ function connectWebSocket() {
   ws.addEventListener("message", (event) => {
     const message = JSON.parse(event.data);
     if (message.type === "settings" && message.settings?.subtitle) {
+      const keyFlagsBefore = engineKeyFlagSignature();
       state.settings = normalizeCaptionSettings(message.settings.subtitle);
       state.hasOpenAIKey = Boolean(message.settings.hasOpenAIKey);
       state.hasGeminiKey = Boolean(message.settings.hasGeminiKey);
@@ -2571,8 +2595,10 @@ function connectWebSocket() {
       updateGeminiSecondaryKeyStatus();
       updateSonioxKeyStatus();
       // A settings broadcast carries no catalog, so repaint the engine picker
-      // from the new selection instead of re-normalizing a catalog we still hold.
-      captionEngineSettings?.refresh();
+      // from the new selection instead of re-normalizing a catalog we still hold
+      // — unless a key flag flipped, which changes which options are selectable.
+      if (engineKeyFlagSignature() !== keyFlagsBefore) void refreshCaptionEngineCatalog();
+      else captionEngineSettings?.refresh();
       updateSessionSummary();
       updateServiceStrip();
       updateAudioInspectorLabels();
@@ -3478,6 +3504,7 @@ async function saveSettings(patch) {
   const body = await res.json();
   if (!res.ok) throw new Error(body.error || t("error.saveSettingsFailed"));
   if (body.settings) {
+    const keyFlagsBefore = engineKeyFlagSignature();
     state.hasOpenAIKey = Boolean(body.settings.hasOpenAIKey);
     state.hasGeminiKey = Boolean(body.settings.hasGeminiKey);
     state.hasGeminiSecondaryKey = Boolean(body.settings.hasGeminiSecondaryKey);
@@ -3487,6 +3514,7 @@ async function saveSettings(patch) {
     updateGeminiKeyStatus();
     updateGeminiSecondaryKeyStatus();
     updateSonioxKeyStatus();
+    if (engineKeyFlagSignature() !== keyFlagsBefore) await refreshCaptionEngineCatalog();
   }
   return body;
 }
@@ -3782,6 +3810,27 @@ async function saveGeminiSecondaryKey() {
     showNotice(t("key.geminiSecondarySaved"));
   } catch (error) {
     updateGeminiSecondaryKeyStatus();
+    showError(error);
+  }
+}
+
+// Soniox has no validation endpoint of its own, so the key is stored and the
+// server's presence flag is the confirmation. The value goes nowhere but
+// apiKeys.soniox.
+async function saveSonioxKey() {
+  clearError();
+  const sonioxKey = sonioxKeyInput?.value.trim() ?? "";
+  if (!sonioxKey) {
+    showError(new Error(state.hasSonioxKey ? t("key.replaceHint") : t("key.enterSoniox")));
+    return;
+  }
+  try {
+    await saveSettings({ apiKeys: { soniox: sonioxKey } });
+    sonioxKeyInput.value = "";
+    updateSonioxKeyStatus();
+    showNotice(t("key.sonioxSaved"));
+  } catch (error) {
+    updateSonioxKeyStatus();
     showError(error);
   }
 }

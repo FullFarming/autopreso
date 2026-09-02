@@ -304,6 +304,36 @@ test("subtitle dashboard exposes main controls, Gemma recording, and settings dr
   assert.match(js, /hasGeminiSecondaryKey/);
   assert.match(js, /apiKeys: \{ geminiSecondary: geminiSecondaryKey \}/);
   assert.match(js, /saveGeminiSecondaryKey/);
+  // Soniox key: its own save button, so enabling the Soniox engine does not
+  // require a Go Live. No validate endpoint exists, so the server's presence
+  // flag is the only confirmation, and the value goes nowhere but apiKeys.
+  assert.match(html, /name="sonioxKey"[^>]*type="password"/);
+  assert.match(html, /id="save-soniox-key"[^>]*data-i18n="keys\.saveSoniox"/);
+  assert.match(html, /id="soniox-key-status"/);
+  assert.match(js, /saveSonioxKeyButton\?\.addEventListener\("click", saveSonioxKey\)/);
+  assert.match(js, /async function saveSonioxKey\(\)/);
+  const sonioxSave = extractFunctionBody(js, "async function saveSonioxKey()");
+  assert.match(sonioxSave, /await saveSettings\(\{ apiKeys: \{ soniox: sonioxKey \} \}\)/);
+  assert.doesNotMatch(sonioxSave, /subtitle:/, "a key save never rewrites the caption settings");
+  assert.equal((sonioxSave.match(/saveSettings\(/gu) ?? []).length, 1, "exactly one write per key save");
+  assert.match(sonioxSave, /sonioxKeyInput\.value = ""/);
+  assert.match(sonioxSave, /updateSonioxKeyStatus\(\)/);
+  assertLocalized("keys.saveSoniox", { en: /Save Soniox key/, ko: /Soniox 키 저장/ });
+  assertLocalized("key.enterSoniox", { en: /Enter the Soniox API key/, ko: /Soniox API 키를 입력/ });
+  assertLocalized("key.sonioxSaved", { en: /Soniox API key saved/, ko: /Soniox API 키를 저장/ });
+  // Engine availability is derived from the stored keys and only travels on
+  // /api/config, so a flipped key flag must re-read the catalog — otherwise a
+  // just-saved Soniox key leaves its engine disabled until a reload.
+  assert.match(js, /const ENGINE_KEY_FLAGS = \["hasGeminiKey", "hasSonioxKey"\]/);
+  const catalogRefresh = extractFunctionBody(js, "async function refreshCaptionEngineCatalog()");
+  assert.match(catalogRefresh, /fetch\("\/api\/config"\)/);
+  assert.match(catalogRefresh, /captionEngineSettings\?\.setCatalog\(config\.captionEngines\)/);
+  const settingsSave = extractFunctionBody(js, "async function saveSettings(patch)");
+  assert.match(settingsSave, /const keyFlagsBefore = engineKeyFlagSignature\(\)/);
+  assert.match(settingsSave, /if \(engineKeyFlagSignature\(\) !== keyFlagsBefore\) await refreshCaptionEngineCatalog\(\)/);
+  assert.match(js, /if \(engineKeyFlagSignature\(\) !== keyFlagsBefore\) void refreshCaptionEngineCatalog\(\);\s*\n\s*else captionEngineSettings\?\.refresh\(\);/);
+  // A failed /api/config leaves no catalog: the picker must say so.
+  assert.match(extractFunctionBody(js, "async function loadConfig()"), /captionEngineSettings\?\.setCatalog\(null\);\s*\n\s*showError\(error\);/);
   assert.doesNotMatch(html + js, /openaiSecondary|OpenAISecondary|openaiKey2|save-openai-secondary-key|openai-secondary-key-status/);
   assert.match(captureJs, /CAPTION_AUDIO_PROCESSOR_BUFFER_SIZE = 1_024/);
   // Key registration must be explicit for BOTH providers: a clear

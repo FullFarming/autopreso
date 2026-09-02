@@ -109,9 +109,18 @@ export function mountCaptionEngineSettings({ form, getSettings, save, onSaved, o
       if (status) status.textContent = translate("engine.saving");
       return;
     }
+    // A saved engine can name an entry this catalog no longer offers (a
+    // retired model, a build with a different catalog). Painting it anyway
+    // leaves a real <select> at value "" — every later change then compares
+    // equal to nothing and silently saves nothing — so fall back to the
+    // catalog default for that role. Nothing is written until the user picks.
+    const resolved = {};
+    for (const role of Object.keys(ROLE_FIELDS)) {
+      resolved[role] = entryFor(role, engine[role]) ?? entryFor(role, catalog.defaults[role]) ?? catalog[role][0];
+    }
     // The STT choice decides which input-language modes exist and whether a
     // combined STT+translation engine may be offered at all.
-    const sttEntry = entryFor("stt", engine.stt) ?? catalog.stt[0];
+    const sttEntry = resolved.stt;
     fillOptions(field(ROLE_FIELDS.stt), catalog.stt);
     fillOptions(field(ROLE_FIELDS.summary), catalog.summary);
     fillOptions(field(ROLE_FIELDS.translation), catalog.translation,
@@ -119,7 +128,7 @@ export function mountCaptionEngineSettings({ form, getSettings, save, onSaved, o
     for (const [role, name] of Object.entries(ROLE_FIELDS)) {
       const select = field(name);
       if (!select) continue;
-      select.value = roleKey(engine[role]);
+      select.value = optionValue(resolved[role]);
       select.disabled = false;
     }
     const modeSelect = field(LANGUAGE_MODE_FIELD);
