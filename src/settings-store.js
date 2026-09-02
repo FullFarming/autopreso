@@ -5,7 +5,14 @@ import path from "node:path";
 import { readCodexCliAuthSync } from "./codex-auth.js";
 import { DEFAULT_GLOSSARY_PRESET_ID, GLOSSARY_PRESETS } from "./glossary-presets.js";
 import { MAX_TRANSLATION_LANGUAGES, isSupportedSubtitleLanguage } from "./subtitle-languages.js";
-import { DEFAULT_ENGINE_SELECTION, engineSelectionKey, migrateLegacyEngineSelection, normalizeEngineSelection } from "../packages/caption-core/caption-engine-catalog.js";
+import {
+  DEFAULT_ENGINE_SELECTION,
+  ENGINE_ROLES,
+  engineSelectionKey,
+  migrateLegacyEngineSelection,
+  normalizeEngineSelection,
+  validateEngineForLanguages,
+} from "../packages/caption-core/caption-engine-catalog.js";
 
 export const MAX_AGENT_INSTRUCTIONS_CHARS = 100_000;
 
@@ -164,7 +171,15 @@ export function createSettingsStore({ filePath, env = process.env, readCodexAuth
       } catch {
         storedEngineKey = null;
       }
-      if (legacyPresent || storedEngineKey !== engineSelectionKey(migrated.subtitle.engine)) await writeToDisk(migrated);
+      if (legacyPresent || storedEngineKey !== engineSelectionKey(migrated.subtitle.engine)) {
+        // The rewrite is an optimization: it stops the same migration running on
+        // every boot. A read-only (or full) config directory must not turn
+        // load() into a rejected promise — on the desktop that is no window, no
+        // dialog, just a dock icon — so keep the migrated settings in memory.
+        try {
+          await writeToDisk(migrated);
+        } catch {}
+      }
       return migrated;
     } catch (error) {
       if (error.code === "ENOENT") return null;
@@ -236,7 +251,7 @@ export function createSettingsStore({ filePath, env = process.env, readCodexAuth
         ...partial,
         subtitle: {
           ...partial.subtitle,
-          engine: { ...cached.subtitle.engine, ...partial.subtitle.engine },
+          engine: mergeEnginePatch(cached.subtitle.engine, partial.subtitle.engine),
         },
       };
     }
@@ -262,8 +277,16 @@ export function createSettingsStore({ filePath, env = process.env, readCodexAuth
     if (retiredSubtitleKey) {
       throw new Error(`Subtitle ${retiredSubtitleKey} is retired in caption-only mode.`);
     }
-    const candidate = migrateSettings(deepMerge(cached, partial));
+    // strictEngine: the load path repairs an unusable stored engine by falling
+    // back to the catalog defaults (a corrupt file must still boot). On the save
+    // path that same fallback silently threw away the user's whole engine choice
+    // and still answered 200, so here an unusable merged engine is an error.
+    const candidate = migrateSettings(deepMerge(cached, partial), { strictEngine: true });
     if (partial?.subtitle) validateSubtitleSettings(candidate.subtitle);
+    // Capability constraints span two fields (Soniox two-way translation needs
+    // exactly two caption languages), so they are checked against the MERGED
+    // settings — either field may be the one the patch moved.
+    validateEngineForLanguages(candidate.subtitle.engine, candidate.subtitle.translationLanguages);
     cached = candidate;
     await writeToDisk(cached);
     return cached;
@@ -310,7 +333,43 @@ function deepMerge(target, source) {
   return result;
 }
 
-function migrateSettings(settings) {
+/**
+ * Merges a partial `subtitle.engine` patch over the CURRENTLY SAVED engine and
+ * validates the result strictly.
+ *
+ * Two rules the plain deep merge got wrong:
+ *  - roles are replaced whole, never field-merged. A patched `stt` used to
+ *    inherit the saved `languageMode` ("ko") from a Soniox engine onto a Gemini
+ *    engine that only allows "auto" — an invalid combo the save path then
+ *    "repaired" by resetting every role to its default.
+ *  - a patched `stt` that names the SAME provider/model without a languageMode
+ *    is not a request to reset the input language, so the saved mode is kept.
+ *
+ * Unknown keys and non-object roles are passed through untouched so
+ * normalizeEngineSelection rejects them instead of this function guessing.
+ *
+ * @param {Record<string, any>} savedEngine
+ * @param {Record<string, any>} patchEngine
+ */
+function mergeEnginePatch(savedEngine, patchEngine) {
+  const merged = { ...savedEngine, ...patchEngine };
+  const patchedStt = patchEngine.stt;
+  const savedStt = savedEngine?.stt;
+  if (isPlainObject(patchedStt) && patchedStt.languageMode === undefined && isPlainObject(savedStt)
+    && patchedStt.provider === savedStt.provider && patchedStt.model === savedStt.model
+    && typeof savedStt.languageMode === "string") {
+    merged.stt = { ...patchedStt, languageMode: savedStt.languageMode };
+  }
+  for (const role of ENGINE_ROLES) {
+    if (isPlainObject(merged[role])) merged[role] = { ...merged[role] };
+  }
+  // Throws EngineSelectionError on an unusable combination; the fully
+  // normalized result then replaces the saved engine role for role, so a stale
+  // field (a languageMode from the previous provider) cannot survive the merge.
+  return normalizeEngineSelection(merged);
+}
+
+function migrateSettings(settings, { strictEngine = false } = {}) {
   // A hand-edited, truncated, or half-written settings.json can hold
   // `"subtitle": null`, `"subtitle": []`, `"subtitle": "boom"`, or a number.
   // Every migration below assumed a plain object, so the very first assignment
@@ -339,15 +398,19 @@ function migrateSettings(settings) {
   settings.subtitle.outputMode = "captions";
   // 2026-09-02: per-role Gemini model fields are replaced by the engine catalog selection.
   let engine;
-  try {
-    engine = migrateLegacyEngineSelection({
-      engine: settings.subtitle.engine,
-      geminiTranscribeModel: settings.subtitle.geminiTranscribeModel,
-      geminiSummaryModel: settings.subtitle.geminiSummaryModel,
-      geminiPolishModel: settings.subtitle.geminiPolishModel,
-    });
-  } catch {
-    engine = DEFAULT_ENGINE_SELECTION;
+  const legacyEngineInput = {
+    engine: settings.subtitle.engine,
+    geminiTranscribeModel: settings.subtitle.geminiTranscribeModel,
+    geminiSummaryModel: settings.subtitle.geminiSummaryModel,
+    geminiPolishModel: settings.subtitle.geminiPolishModel,
+  };
+  if (strictEngine) engine = migrateLegacyEngineSelection(legacyEngineInput);
+  else {
+    try {
+      engine = migrateLegacyEngineSelection(legacyEngineInput);
+    } catch {
+      engine = DEFAULT_ENGINE_SELECTION;
+    }
   }
   settings.subtitle.engine = engine;
   for (const retiredKey of ["geminiTranscribeModel", "geminiSummaryModel", "geminiPolishModel", "audioLanguage", "audioVolume", "voiceProvider", "model", "geminiModel"]) {
@@ -378,6 +441,27 @@ function migrateSettings(settings) {
   }
   if (typeof settings.subtitle.overlayAllDisplays !== "boolean") {
     settings.subtitle.overlayAllDisplays = false;
+  }
+  // A stored combination can be individually valid yet unusable together: a
+  // file written before the caption-language rule existed can hold Soniox's
+  // two-way translation next to three languages. The load path repairs that by
+  // dropping the one role it cannot honour - leaving it in place would make
+  // every later save (which validates strictly) fail, locking the user out of
+  // the settings screen. strictEngine callers check this themselves.
+  if (!strictEngine) {
+    try {
+      validateEngineForLanguages(settings.subtitle.engine, settings.subtitle.translationLanguages);
+    } catch {
+      // Nothing on this path may throw: it runs while the desktop app boots.
+      let repaired = DEFAULT_ENGINE_SELECTION;
+      try {
+        repaired = validateEngineForLanguages(
+          { ...settings.subtitle.engine, translation: DEFAULT_ENGINE_SELECTION.translation },
+          settings.subtitle.translationLanguages,
+        );
+      } catch {}
+      settings.subtitle.engine = repaired;
+    }
   }
   return settings;
 }

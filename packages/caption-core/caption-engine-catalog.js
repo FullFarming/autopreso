@@ -35,7 +35,9 @@ export const CAPTION_ENGINE_CATALOG = deepFreeze({
     flash("gemini-3.5-flash-lite", "Gemini 3.5 Flash-Lite", ["gemini-3.6-flash"]),
     flash("gemini-3.6-flash", "Gemini 3.6 Flash", ["gemini-3.5-flash-lite"]),
     flash("gemini-3.7-flash", "Gemini 3.7 Flash", ["gemini-3.6-flash", "gemini-3.5-flash-lite"]),
-    { ...SONIOX_RT, label: "Soniox stt-rt-v5 (STT 결합)", requiresSttProvider: "soniox" },
+    // Soniox translates with `type: "two_way"`, which takes exactly one
+    // language pair: with 1 or 3+ caption languages there is no config to send.
+    { ...SONIOX_RT, label: "Soniox stt-rt-v5 (STT 결합)", requiresSttProvider: "soniox", requiredLanguageCount: 2 },
   ],
   summary: [
     flash("gemini-3.6-flash", "Gemini 3.6 Flash", ["gemini-3.7-flash"]),
@@ -92,6 +94,29 @@ export function normalizeEngineSelection(input) {
   const translationEntry = findEngineEntry("translation", translation.provider, translation.model);
   if (translationEntry.requiresSttProvider && translationEntry.requiresSttProvider !== stt.provider) throw new EngineSelectionError();
   return deepFreeze({ stt, translation, summary });
+}
+
+/**
+ * Some engines only work at one caption-language count (Soniox's two-way
+ * translation needs exactly a pair). The catalog owns that number so the
+ * settings store and the picker enforce the same rule instead of hard-coding a
+ * provider name, and so an invalid pair is refused at save time rather than
+ * dead-ending when the provider socket opens.
+ *
+ * @param {unknown} engine
+ * @param {unknown} translationLanguages
+ * @returns {ReturnType<typeof normalizeEngineSelection>}
+ */
+export function validateEngineForLanguages(engine, translationLanguages) {
+  const selection = normalizeEngineSelection(engine);
+  const count = Array.isArray(translationLanguages) ? translationLanguages.length : 0;
+  for (const role of ENGINE_ROLES) {
+    const required = findEngineEntry(role, selection[role].provider, selection[role].model)?.requiredLanguageCount;
+    if (typeof required === "number" && count !== required) {
+      throw new EngineSelectionError("Soniox 번역은 자막 언어가 정확히 2개일 때만 사용할 수 있습니다.");
+    }
+  }
+  return selection;
 }
 
 const LEGACY_SOURCE_TO_STT = Object.freeze({
@@ -153,6 +178,7 @@ export function captionEngineCatalogForClient({ hasApiKeys = {} } = {}) {
       available: hasApiKeys[entry.requiredApiKey] === true,
       languageModes: [...entry.capability.languageModes],
       ...(entry.requiresSttProvider ? { requiresSttProvider: entry.requiresSttProvider } : {}),
+      ...(typeof entry.requiredLanguageCount === "number" ? { requiredLanguageCount: entry.requiredLanguageCount } : {}),
     }));
   }
   view.defaults = DEFAULT_ENGINE_SELECTION;

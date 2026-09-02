@@ -16,7 +16,7 @@ export const JA = {
   "keys.saveSoniox": "Sonioxキーを保存",
   "key.enterSoniox": "Soniox APIキーを入力してください。",
   "key.sonioxSaved": "Soniox APIキーを保存しました。",
-  "models.cost": "APIの利用料金が発生します。翻訳音声を再生しなくても、Live APIの音声生成料金が発生する場合があります。",
+  "models.cost": "API 利用料金が発生します。",
   "app.name": "NOVA",
   "app.credit": "Realtime by Noel",
   "app.railLabel": "NOVA ワークスペース",

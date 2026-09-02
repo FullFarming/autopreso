@@ -259,29 +259,15 @@ marker on both.
 
 ## The root-vs-`public/` frontend duplication trap
 
-`public/` is the only copy that matters. `src/server.js` serves `PUBLIC_DIR`
-(`<repo>/public`) and nothing else, and both ship manifests - npm `files` and
-electron-builder `build.files` in `package.json` - list `public/`, never the repo
-root.
-
-There are nevertheless eight root-level `subtitle-*.{js,css,html}` files that are
-currently byte-identical duplicates of their `public/` counterparts, reached by no
-server route and no ship manifest. Only three are protected by a root-vs-`public`
-byte-equality assertion:
-
-| root copy | guard |
-| --- | --- |
-| `subtitle-dashboard.js` | `test/desktop-stage-window.test.js` and `test/session-transcripts.test.js` |
-| `subtitle.html` | `test/session-transcripts.test.js` |
-| `subtitle.css` | `test/session-transcripts.test.js` |
-| `subtitle-controller.{js,html}`, `subtitle-workspace.js`, `subtitle-overlay.js`, `subtitle-audio-player.js` | **none** |
-
-Every other test reads the `public/` copy (`read("public/subtitle-controller.js")`
-and friends in `test/live-ui.test.js`, `test/desktop-live-start.test.js`, ...).
-
-Practical consequence: **edit `public/`**. If you edit a root copy, mirror it to
-`public/` or the change does nothing at runtime - and for five of the eight files
-nothing will fail to tell you.
+`public/` is the only copy that matters, and now the only copy there is.
+`src/server.js` serves `PUBLIC_DIR` (`<repo>/public`) and nothing else, and both
+ship manifests - npm `files` and electron-builder `build.files` - list
+`public/`, never the repo root. The eight root-level
+`subtitle-*.{js,css,html}` duplicates that used to sit here are deleted: editing
+one changed nothing at runtime while looking like real work, and five were
+policed by no test. `test/subtitle-frontend.test.js` now asserts each of those
+filenames exists under `public/` and does **not** exist at the repo root, so a
+stale duplicate cannot come back.
 
 ## Testing conventions
 

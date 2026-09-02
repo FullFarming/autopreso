@@ -128,6 +128,9 @@ export function createSonioxTransport({ engine, settings, apiKey, endpoint = "us
   return {
     requiresSetupAck: false,
     binaryAudio: true,
+    // Tells the client this transport owns the translation: its source interims
+    // are transcript progress, not a cue to buy a Gemini preview translation.
+    providesTranslation: translation,
     providerLabel: "Soniox",
     maximumSessionMilliseconds: 18_000_000,
     // Soniox streams for 300 minutes; rolling at 290 keeps the desktop well

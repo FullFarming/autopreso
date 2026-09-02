@@ -47,7 +47,8 @@ const nonDefaultEngine = { ...catalog.defaults, summary: { provider: "gemini", m
 const option = (select, value) => select.options.find((entry) => entry.value === value);
 const tick = () => new Promise((resolve) => setImmediate(resolve));
 
-function harness({ engine = nonDefaultEngine, save = async () => {} } = {}) {
+/** @param {{engine?: any, save?: () => Promise<void>, translationLanguages?: string[]}} [input] */
+function harness({ engine = nonDefaultEngine, save = async () => {}, translationLanguages } = {}) {
   const ownerDocument = { createElement: () => ({ value: "", textContent: "", disabled: false }) };
   const fields = Object.fromEntries(["engineStt", "engineLanguageMode", "engineTranslation", "engineSummary"]
     .map((name) => [name, new FakeSelect(ownerDocument)]));
@@ -57,7 +58,7 @@ function harness({ engine = nonDefaultEngine, save = async () => {} } = {}) {
     ownerDocument,
     querySelector: (selector) => (selector === "[data-caption-engine-status]" ? status : null),
   };
-  let settings = { engine };
+  let settings = { engine, ...(translationLanguages ? { translationLanguages } : {}) };
   const saved = [];
   const errors = [];
   const controls = mountCaptionEngineSettings({
@@ -291,4 +292,42 @@ test("Go Live rejects a pending engine save before touching configuration or cap
   assert.equal(replies[1][1].ok, true);
   assert.deepEqual(context.state.settings.engine, catalog.defaults);
   assert.equal(operations.filter((operation) => operation === "relay-start").length, 1);
+});
+
+// Fix round 2 (I4): Soniox's two-way translation only exists for a language
+// PAIR. The picker reads that requirement from the catalog (never by
+// hard-coding "soniox") so the option cannot be selected into a dead end.
+const pairCatalog = {
+  ...catalog,
+  stt: catalog.stt.map((entry) => ({ ...entry, available: true })),
+  translation: catalog.translation.map((entry) => (entry.provider === "soniox"
+    ? { ...entry, available: true, requiredLanguageCount: 2 }
+    : { ...entry, available: true })),
+};
+
+test("a combined translation option is disabled unless the caption-language count matches the catalog", () => {
+  const two = harness({ engine: { ...catalog.defaults, stt: { provider: "soniox", model: "stt-rt-v5", languageMode: "auto" } }, translationLanguages: ["en", "ko"] });
+  two.controls.setCatalog(pairCatalog);
+  assert.equal(option(two.fields.engineTranslation, "soniox:stt-rt-v5").disabled, false);
+
+  for (const languages of [["en", "ko", "ja"], ["ko"], undefined]) {
+    const h = harness({ engine: { ...catalog.defaults, stt: { provider: "soniox", model: "stt-rt-v5", languageMode: "auto" } }, translationLanguages: languages });
+    h.controls.setCatalog(pairCatalog);
+    assert.equal(option(h.fields.engineTranslation, "soniox:stt-rt-v5").disabled, true, JSON.stringify(languages ?? null));
+  }
+  assert.equal(normalizeCaptionEngineCatalog(pairCatalog).translation.find((entry) => entry.provider === "soniox").requiredLanguageCount, 2);
+});
+
+test("a saved combined translation repaints as the catalog default when the language count changed, without saving", () => {
+  const h = harness({
+    engine: {
+      stt: { provider: "soniox", model: "stt-rt-v5", languageMode: "auto" },
+      translation: { provider: "soniox", model: "stt-rt-v5" },
+      summary: catalog.defaults.summary,
+    },
+    translationLanguages: ["en", "ko", "ja"],
+  });
+  h.controls.setCatalog(pairCatalog);
+  assert.equal(h.fields.engineTranslation.value, "gemini:gemini-3.6-flash", "the unusable saved pick falls back to the default");
+  assert.deepEqual(h.saved, [], "a repaint never writes settings on its own");
 });

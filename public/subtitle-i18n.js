@@ -45,7 +45,7 @@ const EN = {
   "keys.saveSoniox": "Save Soniox key",
   "key.enterSoniox": "Enter the Soniox API key.",
   "key.sonioxSaved": "Soniox API key saved.",
-  "models.cost": "API usage is billed. Live API audio generation may incur charges even when translated audio is not played.",
+  "models.cost": "API usage is billed.",
   // ── Brand ───────────────────────────────────────────────────────────────
   "app.name": "NOVA",
   "app.credit": "Realtime by Noel",
@@ -641,7 +641,7 @@ const KO = {
   "keys.saveSoniox": "Soniox 키 저장",
   "key.enterSoniox": "Soniox API 키를 입력하세요.",
   "key.sonioxSaved": "Soniox API 키를 저장했어요.",
-  "models.cost": "API 사용 요금이 발생합니다. 번역 음성을 재생하지 않아도 Live API 음성 생성 비용이 발생할 수 있습니다.",
+  "models.cost": "API 사용 요금이 발생합니다.",
   // ── Brand ───────────────────────────────────────────────────────────────
   "app.name": "NOVA",
   "app.credit": "Realtime by Noel",

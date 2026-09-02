@@ -262,17 +262,19 @@ function createSonioxHarness({ settings = {}, ...options } = {}) {
 const audioFrame = (value = 1) => Buffer.alloc(4_800, value).toString("base64");
 const settle = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
 
-test("a soniox engine that cannot build a config fails the session instead of throwing on open", async () => {
-  const { manager, sockets, events } = createSonioxHarness({
+// Fix round 2 (I4): the combined engine's language-PAIR constraint is refused
+// during normalization, so an unusable selection is rejected by start() before
+// a socket exists. The transport's own assertReady/setupPayloads guard (an
+// unusable config must never throw out of the "open" listener) is still there
+// and is covered directly by test/soniox-transport.test.js.
+test("a soniox engine that cannot build a config is refused before any socket opens", async () => {
+  const { manager, sockets } = createSonioxHarness({
     settings: { translationLanguages: ["en", "ko", "ja"] },
   });
-  await manager.start({ sessionId: "soniox-bad-pair" });
+  await assert.rejects(manager.start({ sessionId: "soniox-bad-pair" }), /자막 언어가 정확히 2개/u);
   try {
     await settle(10);
     assert.equal(sockets.length, 0, "no socket is opened for an unusable config");
-    const failures = events.filter((event) => event.code === "TRANSCRIBE_START_FAILED");
-    assert.equal(failures.length >= 1, true, JSON.stringify(events));
-    assert.match(failures[0].message, /SONIOX_TRANSLATION_PAIR_REQUIRED/u);
     // Audio keeps arriving from the renderer after a failed start; it must not
     // throw out of the async WebSocket listener that delivers it.
     assert.doesNotThrow(() => manager.sendAudio({
@@ -383,6 +385,55 @@ test("soniox engine sends config first, binary audio frames, and commits provide
     assert.equal(committed[0].sourceText, "안녕하세요");
     assert.equal(committed[0].translationProvider, "soniox");
     assert.equal(textCalls, 0);
+  } finally { await manager.stop(); }
+});
+
+// Fix round 2 (I2): the combined engine's SOURCE partials must not open the
+// Gemini text lane. Soniox emits them through onInterim, and the client used to
+// fan every interim to lane.preview() - which paid Gemini for a preview
+// translation of a line Soniox was about to translate itself, and painted that
+// preview with translationProvider "gemini" over the provider's own partial.
+test("a combined engine's source partials never reach the Gemini text lane", async () => {
+  let textCalls = 0;
+  const { manager, sockets, events } = createHarness({
+    settings: {
+      translationLanguages: ["en", "ko"],
+      glossary: "",
+      engine: {
+        stt: { provider: "soniox", model: "stt-rt-v5", languageMode: "auto" },
+        translation: { provider: "soniox", model: "stt-rt-v5" },
+        summary: { provider: "gemini", model: "gemini-3.6-flash" },
+      },
+    },
+    apiKeys: { soniox: "fixture-key" },
+    polish: async () => { textCalls += 1; return "text-lane output that must never appear"; },
+  });
+
+  await manager.start({ sessionId: "soniox-no-preview" });
+  try {
+    const socket = sockets.at(-1);
+    socket.open();
+    // A provisional source token: the only thing Soniox has produced so far.
+    socket.emit("message", Buffer.from(JSON.stringify({ tokens: [
+      { text: "안녕하", is_final: false, translation_status: "original", language: "ko" },
+    ] })));
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    assert.equal(textCalls, 0, "a source interim must not buy a Gemini preview");
+    assert.equal(events.some((event) => event.type === "subtitle:partial" && event.translationProvider === "gemini"), false,
+      JSON.stringify(events));
+
+    // The provider's own translation still flows, and the final still commits.
+    socket.emit("message", Buffer.from(JSON.stringify({ tokens: [
+      { text: "안녕하세요", is_final: true, translation_status: "original", language: "ko", start_ms: 0, end_ms: 800 },
+      { text: "Hello", is_final: true, translation_status: "translation", language: "en", source_language: "ko" },
+      { text: "<end>", is_final: true },
+    ] })));
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    assert.equal(textCalls, 0, "a provider-translated final is never re-translated");
+    const committed = events.filter((event) => event.type === "subtitle:committed");
+    assert.equal(committed.length, 1, JSON.stringify(events));
+    assert.equal(committed[0].translationProvider, "soniox");
+    assert.equal(events.some((event) => event.type === "subtitle:partial" && event.translationProvider === "gemini"), false);
   } finally { await manager.stop(); }
 });
 

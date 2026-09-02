@@ -4,6 +4,7 @@ import {
   CAPTION_ENGINE_CATALOG, DEFAULT_ENGINE_SELECTION, EngineSelectionError,
   captionEngineCatalogForClient, engineRequiredApiKeys, engineSelectionKey, findEngineEntry,
   isCombinedEngine, migrateLegacyEngineSelection, normalizeEngineSelection,
+  validateEngineForLanguages,
 } from "../packages/caption-core/caption-engine-catalog.js";
 
 test("default selection is Gemini Transcribe Live + Gemini 3.6 Flash + Gemini 3.6 Flash summary", () => {
@@ -81,4 +82,37 @@ test("client view marks entries unavailable when the key is missing", () => {
 test("selection key is stable across property order", () => {
   const a = engineSelectionKey({ summary: { model: "gemini-3.6-flash", provider: "gemini" }, translation: { provider: "gemini", model: "gemini-3.6-flash" }, stt: { languageMode: "auto", model: "gemini-3.5-transcribe-live", provider: "gemini" } });
   assert.equal(a, engineSelectionKey(DEFAULT_ENGINE_SELECTION));
+});
+
+// Fix round 2 (I4): Soniox two-way translation is only expressible with exactly
+// two caption languages, so the catalog carries that as a capability the store
+// and the picker both read - rather than letting the pair be saved and then
+// dead-end at socket open.
+test("the soniox translation entry declares a two-language requirement the helper enforces", () => {
+  const sonioxTranslation = findEngineEntry("translation", "soniox", "stt-rt-v5");
+  assert.equal(sonioxTranslation.requiredLanguageCount, 2);
+  assert.equal(findEngineEntry("stt", "soniox", "stt-rt-v5").requiredLanguageCount, undefined);
+  assert.equal(findEngineEntry("translation", "gemini", "gemini-3.6-flash").requiredLanguageCount, undefined);
+
+  const combined = {
+    stt: { provider: "soniox", model: "stt-rt-v5", languageMode: "auto" },
+    translation: { provider: "soniox", model: "stt-rt-v5" },
+    summary: { provider: "gemini", model: "gemini-3.6-flash" },
+  };
+  assert.doesNotThrow(() => validateEngineForLanguages(combined, ["en", "ko"]));
+  for (const languages of [["ko"], ["en", "ko", "ja"], []]) {
+    assert.throws(() => validateEngineForLanguages(combined, languages), EngineSelectionError, JSON.stringify(languages));
+    assert.throws(() => validateEngineForLanguages(combined, languages), /자막 언어가 정확히 2개/u, JSON.stringify(languages));
+  }
+  // A Gemini engine carries no such constraint at any language count.
+  for (const languages of [["ko"], ["en", "ko"], ["en", "ko", "ja"]]) {
+    assert.doesNotThrow(() => validateEngineForLanguages(DEFAULT_ENGINE_SELECTION, languages));
+  }
+});
+
+test("the client catalog view exposes requiredLanguageCount so the picker reads the constraint", () => {
+  const view = captionEngineCatalogForClient({ hasApiKeys: { gemini: true, soniox: true } });
+  const soniox = view.translation.find((entry) => entry.provider === "soniox");
+  assert.equal(soniox.requiredLanguageCount, 2);
+  assert.equal(Object.hasOwn(view.translation.find((entry) => entry.provider === "gemini"), "requiredLanguageCount"), false);
 });

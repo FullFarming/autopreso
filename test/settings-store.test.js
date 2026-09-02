@@ -884,3 +884,149 @@ test("a partial engine patch merges over the current selection instead of valida
   // The rejected patch must not have mutated the stored engine.
   assert.deepEqual((await store.load()).subtitle.engine, fullSonioxCombo);
 });
+
+// Fix round 2 (I3): a partial engine patch must never silently fall back to the
+// catalog defaults. deepMerge re-attached the SAVED stt languageMode ("ko") to
+// a patched Gemini stt that only allows "auto", migrateSettings caught the
+// resulting EngineSelectionError, and save() persisted the defaults while
+// returning 200 - the user's whole engine choice replaced by a shrug.
+test("a partial engine patch preserves untouched roles and never falls back to the defaults", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "settings-engine-strict-"));
+  const filePath = path.join(dir, "settings.json");
+  const store = createSettingsStore({ filePath, env: {}, readCodexAuth: noCodexAuth });
+  await store.load();
+  await store.save({ apiKeys: { soniox: "fixture-key" }, subtitle: { engine: {
+    stt: { provider: "soniox", model: "stt-rt-v5", languageMode: "ko" },
+    translation: { provider: "soniox", model: "stt-rt-v5" },
+    summary: { provider: "gemini", model: "gemini-3.7-flash" },
+  } } });
+
+  const saved = await store.save({ subtitle: { engine: {
+    stt: { provider: "gemini", model: "gemini-3.5-transcribe-live" },
+    translation: { provider: "gemini", model: "gemini-3.7-flash" },
+  } } });
+  const expected = {
+    stt: { provider: "gemini", model: "gemini-3.5-transcribe-live", languageMode: "auto" },
+    translation: { provider: "gemini", model: "gemini-3.7-flash" },
+    summary: { provider: "gemini", model: "gemini-3.7-flash" },
+  };
+  assert.deepEqual(saved.subtitle.engine, expected);
+  assert.deepEqual(JSON.parse(await fs.readFile(filePath, "utf8")).subtitle.engine, expected);
+  assert.deepEqual((await createSettingsStore({ filePath, env: {}, readCodexAuth: noCodexAuth }).load()).subtitle.engine, expected);
+});
+
+test("a patched stt keeps its saved languageMode when the provider and model are unchanged", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "settings-engine-mode-"));
+  const store = createSettingsStore({ filePath: path.join(dir, "settings.json"), env: {}, readCodexAuth: noCodexAuth });
+  await store.load();
+  await store.save({ apiKeys: { soniox: "fixture-key" }, subtitle: { engine: {
+    stt: { provider: "soniox", model: "stt-rt-v5", languageMode: "en" },
+    translation: { provider: "gemini", model: "gemini-3.5-flash-lite" },
+    summary: { provider: "gemini", model: "gemini-3.7-flash" },
+  } } });
+  // Re-stating the same stt without a languageMode is not a request to reset
+  // the input language to auto.
+  const same = await store.save({ subtitle: { engine: { stt: { provider: "soniox", model: "stt-rt-v5" } } } });
+  assert.equal(same.subtitle.engine.stt.languageMode, "en");
+  // Changing the stt engine does drop the old mode to the default, and leaves
+  // the roles the patch never named exactly as they were.
+  const switched = await store.save({ subtitle: { engine: { stt: { provider: "gemini", model: "gemini-3.5-transcribe-live" } } } });
+  assert.equal(switched.subtitle.engine.stt.languageMode, "auto");
+  assert.equal(switched.subtitle.engine.translation.model, "gemini-3.5-flash-lite");
+  assert.equal(switched.subtitle.engine.summary.model, "gemini-3.7-flash");
+});
+
+test("save rejects a merged engine combination the catalog refuses", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "settings-engine-invalid-"));
+  const store = createSettingsStore({ filePath: path.join(dir, "settings.json"), env: {}, readCodexAuth: noCodexAuth });
+  await store.load();
+  await store.save({ apiKeys: { soniox: "fixture-key" }, subtitle: { engine: {
+    stt: { provider: "soniox", model: "stt-rt-v5", languageMode: "auto" },
+    translation: { provider: "soniox", model: "stt-rt-v5" },
+    summary: { provider: "gemini", model: "gemini-3.6-flash" },
+  } } });
+  // An stt that cannot restrict the input language may not inherit "ko".
+  await assert.rejects(store.save({ subtitle: { engine: {
+    stt: { provider: "gemini", model: "gemini-3.5-transcribe-live", languageMode: "ko" },
+  } } }), /엔진 조합/u);
+  assert.equal((await store.load()).subtitle.engine.stt.provider, "soniox");
+});
+
+// Fix round 2 (I4): Soniox's two-way translation only exists for a language
+// PAIR, so saving it alongside 1 or 3 caption languages produced a selection
+// that could only fail when the provider socket opened.
+test("save refuses soniox translation unless exactly two caption languages are selected", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "settings-engine-langs-"));
+  const store = createSettingsStore({ filePath: path.join(dir, "settings.json"), env: {}, readCodexAuth: noCodexAuth });
+  await store.load();
+  const combined = {
+    stt: { provider: "soniox", model: "stt-rt-v5", languageMode: "auto" },
+    translation: { provider: "soniox", model: "stt-rt-v5" },
+    summary: { provider: "gemini", model: "gemini-3.6-flash" },
+  };
+  await store.save({ apiKeys: { soniox: "fixture-key" }, subtitle: { translationLanguages: ["en", "ko"], engine: combined } });
+  await assert.rejects(
+    store.save({ subtitle: { translationLanguages: ["en", "ko", "ja"] } }),
+    /자막 언어가 정확히 2개/u,
+    "a third caption language must not strand the combined engine",
+  );
+  assert.deepEqual((await store.load()).subtitle.translationLanguages, ["en", "ko"]);
+  // The same rule applies when the engine is the field being changed.
+  await store.save({ subtitle: { engine: { translation: { provider: "gemini", model: "gemini-3.6-flash" } } } });
+  await store.save({ subtitle: { translationLanguages: ["en", "ko", "ja"] } });
+  await assert.rejects(store.save({ subtitle: { engine: { translation: { provider: "soniox", model: "stt-rt-v5" } } } }),
+    /자막 언어가 정확히 2개/u);
+});
+
+// Fix round 2 (I5): the migration rewrite is an optimization. A read-only
+// config directory must not turn load() into a rejected promise - which on the
+// desktop means no window, no dialog, just a dock icon.
+test("load survives a failed migration rewrite and keeps the migrated engine in memory", async (t) => {
+  if (process.getuid?.() === 0) return t.skip("root bypasses directory permissions");
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "settings-readonly-"));
+  const filePath = path.join(dir, "settings.json");
+  await fs.writeFile(filePath, JSON.stringify({ subtitle: { geminiPolishModel: "gemini-3.7-flash", tone: "business" } }), "utf8");
+  await fs.chmod(dir, 0o500);
+  t.after(async () => {
+    await fs.chmod(dir, 0o700);
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+  const loaded = await createSettingsStore({ filePath, env: {}, readCodexAuth: noCodexAuth }).load();
+  assert.equal(loaded.subtitle.engine.translation.model, "gemini-3.7-flash");
+  assert.equal(loaded.subtitle.tone, "business");
+  assert.equal(Object.hasOwn(loaded.subtitle, "geminiPolishModel"), false);
+  // The file itself is untouched: nothing was written.
+  assert.equal(Object.hasOwn(JSON.parse(await fs.readFile(filePath, "utf8")).subtitle, "geminiPolishModel"), true);
+});
+
+// A file written BEFORE the language-count rule existed can hold a combined
+// engine next to three caption languages. The load path has to repair that the
+// same way it repairs an unknown model - otherwise every later save is rejected
+// and the user is locked out of their own settings screen.
+test("load repairs a stored combined engine that no longer matches the caption-language count", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "settings-engine-repair-"));
+  const filePath = path.join(dir, "settings.json");
+  await fs.writeFile(filePath, JSON.stringify({
+    apiKeys: { soniox: "fixture-key" },
+    subtitle: {
+      translationLanguages: ["en", "ko", "ja"],
+      engine: {
+        stt: { provider: "soniox", model: "stt-rt-v5", languageMode: "ko" },
+        translation: { provider: "soniox", model: "stt-rt-v5" },
+        summary: { provider: "gemini", model: "gemini-3.7-flash" },
+      },
+    },
+  }), "utf8");
+  const store = createSettingsStore({ filePath, env: {}, readCodexAuth: noCodexAuth });
+  const loaded = await store.load();
+  assert.deepEqual(loaded.subtitle.engine, {
+    stt: { provider: "soniox", model: "stt-rt-v5", languageMode: "ko" },
+    translation: DEFAULT_SUBTITLE_SETTINGS.engine.translation,
+    summary: { provider: "gemini", model: "gemini-3.7-flash" },
+  }, "only the role that cannot be honoured falls back");
+  // The repair is persisted, and unrelated saves keep working.
+  assert.deepEqual(JSON.parse(await fs.readFile(filePath, "utf8")).subtitle.engine.translation,
+    DEFAULT_SUBTITLE_SETTINGS.engine.translation);
+  const after = await store.save({ subtitle: { tone: "business" } });
+  assert.equal(after.subtitle.tone, "business");
+});

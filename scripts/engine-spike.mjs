@@ -57,10 +57,35 @@ export function summarizeMetrics(m) {
 
 const isOtherScript = (text) => /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Cyrillic}\p{Script=Thai}\p{Script=Arabic}]/u.test(text) || /[àảãáạăằẳẵắặâầẩẫấậđèẻẽéẹêềểễếệìỉĩíịòỏõóọôồổỗốộơờởỡớợùủũúụưừửữứựỳỷỹýỵ]/iu.test(text);
 
+/**
+ * Reads one `NAME=value` line out of a dotenv-style file. Editors and shells
+ * leave shapes a raw regex kept verbatim - a trailing CR from a CRLF file,
+ * wrapping single/double quotes, whitespace around the `=` - and every one of
+ * them makes the provider answer "unauthenticated", which reads as an outage.
+ * Returns "" when the name is absent. Never logs the value.
+ *
+ * @param {unknown} text
+ * @param {string} name
+ * @returns {string}
+ */
+export function parseEnvValue(text, name) {
+  for (const line of String(text ?? "").split("\n")) {
+    const trimmed = line.trim();
+    const separator = trimmed.indexOf("=");
+    if (separator === -1 || trimmed.slice(0, separator).trim() !== name) continue;
+    const value = trimmed.slice(separator + 1).trim();
+    const quote = value.slice(0, 1);
+    return (value.length >= 2 && (quote === '"' || quote === "'") && value.endsWith(quote))
+      ? value.slice(1, -1).trim()
+      : value;
+  }
+  return "";
+}
+
 async function readKeys() {
   const home = os.homedir();
   let soniox = process.env.SONIOX_API_KEY ?? "";
-  try { const env = await fs.readFile(path.join(home, ".config/realtime-noel/soniox.env"), "utf8"); soniox ||= (env.match(/^SONIOX_API_KEY=(.+)$/mu)?.[1] ?? "").trim(); } catch {}
+  try { const env = await fs.readFile(path.join(home, ".config/realtime-noel/soniox.env"), "utf8"); soniox ||= parseEnvValue(env, "SONIOX_API_KEY"); } catch {}
   let gemini = process.env.GEMINI_API_KEY ?? "";
   try { const settings = JSON.parse(await fs.readFile(path.join(home, ".config/realtime-noel/settings.json"), "utf8")); gemini ||= settings.apiKeys?.gemini ?? ""; } catch {}
   return { soniox, gemini };

@@ -20,6 +20,24 @@ test("config: auto mode restricts to ko+en, single modes pin one language, two_w
   assert.throws(() => buildSonioxConfig({ apiKey: "k", languageMode: "auto", languages: ["en", "ko", "ja"], translation: true }), /SONIOX_TRANSLATION_PAIR/u);
 });
 
+// Fix round 2 (M5): translation_terms is bounded by pair COUNT and by total
+// characters. 200 pairs of long phrases would otherwise blow past what the
+// provider accepts for the context payload.
+test("config: translation_terms are capped at 200 pairs and 3,000 combined characters", () => {
+  /** @param {Record<string, unknown>} config @returns {Array<{source: string, target: string}>} */
+  const pairs = (config) => /** @type {any} */ (config.context).translation_terms;
+  const short = Array.from({ length: 260 }, (_, index) => ({ source: `s${index}`, target: `t${index}` }));
+  const capped = buildSonioxConfig({ apiKey: "fixture-key", languageMode: "auto", languages: ["en", "ko"], context: { translationTerms: short } });
+  assert.equal(pairs(capped).length, 200);
+
+  const long = Array.from({ length: 200 }, (_, index) => ({ source: `s${index}`.padEnd(40, "x"), target: `t${index}`.padEnd(40, "y") }));
+  const trimmed = buildSonioxConfig({ apiKey: "fixture-key", languageMode: "auto", languages: ["en", "ko"], context: { translationTerms: long } });
+  const characters = pairs(trimmed).reduce((total, pair) => total + pair.source.length + pair.target.length, 0);
+  assert.ok(characters <= 3_000, `combined characters ${characters}`);
+  assert.equal(pairs(trimmed).length, 37, "stops adding pairs once the character budget is spent");
+  assert.deepEqual(pairs(trimmed)[0], { source: long[0].source, target: long[0].target });
+});
+
 // Event order note (Task 5 ruling 4): partials fire once per `apply()` after the
 // token loop, while `<end>` closes the segment *inside* that loop. A translation
 // token that is already final in the same frame as `<end>` therefore never

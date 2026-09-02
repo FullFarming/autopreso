@@ -748,25 +748,25 @@ export async function startServer(options) {
     res.json({ ok: true });
   });
 
-  async function saveSettingsPatch(patch) {
-    return options.settingsStore.save(patch);
-  }
-
   // The engine selection (and the API keys it requires) is validated by the
   // settings store, but a caption session already listening on the OLD engine
   // will keep talking to it forever unless something notices the change and
   // rebuilds the channels. Diff before/after the save so an unrelated field
   // (font size, glossary, ...) never triggers a restart, and only fire it when
   // captions are actually active - there is nothing to hot-swap otherwise.
+  //
+  // The key diff compares the actual VALUES, in process and never logged: a
+  // presence-only check missed a REPLACED key (a rotated or corrected one), and
+  // the live channels then kept using the old, rejected credential.
   async function saveSettingsAndApply(patch) {
     const before = await options.settingsStore.load();
     const beforeKey = engineSelectionKey(before.subtitle?.engine);
-    const beforeKeys = Object.fromEntries(API_KEY_NAMES.map((name) => [name, Boolean(before.apiKeys?.[name])]));
-    await saveSettingsPatch(patch);
+    const beforeKeys = Object.fromEntries(API_KEY_NAMES.map((name) => [name, String(before.apiKeys?.[name] ?? "")]));
+    await options.settingsStore.save(patch);
     const after = await options.settingsStore.load();
     const engineChanged = engineSelectionKey(after.subtitle?.engine) !== beforeKey;
     const keysChanged = engineRequiredApiKeys(after.subtitle?.engine)
-      .some((name) => beforeKeys[name] !== Boolean(after.apiKeys?.[name]));
+      .some((name) => beforeKeys[name] !== String(after.apiKeys?.[name] ?? ""));
     if ((engineChanged || keysChanged) && subtitles._state?.active) {
       await subtitles.restartChannels({ reason: "engine_change" });
     }

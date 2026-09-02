@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { parseSpikeArgs, readWav16kMono, summarizeMetrics } from "../scripts/engine-spike.mjs";
+import { parseEnvValue, parseSpikeArgs, readWav16kMono, summarizeMetrics } from "../scripts/engine-spike.mjs";
 
 test("args default to soniox+gemini, modes auto/ko/en, us endpoint", () => {
   const args = parseSpikeArgs(["--wav", "a.wav"]);
@@ -25,4 +25,20 @@ test("metrics summarize p50/p95 and counts", () => {
   assert.equal(summary.firstPartialMs.p50, 200);
   assert.equal(summary.finalLagMs.p95, 700);
   assert.equal(summary.otherScriptFinals, 1);
+});
+
+// Fix round 2 (M7): a key file written by an editor on Windows, or quoted the
+// way shell env files usually are, produced a key with a trailing \r or wrapping
+// quotes - which the provider rejects as an unauthenticated request while the
+// spike reports a provider outage. Values here are fixtures, never real keys.
+test("env parsing strips wrapping quotes, trailing CR, and surrounding whitespace", () => {
+  assert.equal(parseEnvValue("SONIOX_API_KEY=plain-fixture\n", "SONIOX_API_KEY"), "plain-fixture");
+  assert.equal(parseEnvValue("SONIOX_API_KEY=crlf-fixture\r\n", "SONIOX_API_KEY"), "crlf-fixture");
+  assert.equal(parseEnvValue('SONIOX_API_KEY="quoted-fixture"\r\n', "SONIOX_API_KEY"), "quoted-fixture");
+  assert.equal(parseEnvValue("SONIOX_API_KEY='single-fixture'\n", "SONIOX_API_KEY"), "single-fixture");
+  assert.equal(parseEnvValue("  SONIOX_API_KEY =spaced-fixture  \n", "SONIOX_API_KEY"), "spaced-fixture");
+  assert.equal(parseEnvValue("# SONIOX_API_KEY=commented\nSONIOX_API_KEY=real-fixture\n", "SONIOX_API_KEY"), "real-fixture");
+  assert.equal(parseEnvValue("OTHER_KEY=nope\n", "SONIOX_API_KEY"), "");
+  assert.equal(parseEnvValue(undefined, "SONIOX_API_KEY"), "");
+  assert.equal(parseEnvValue('SONIOX_API_KEY=""\n', "SONIOX_API_KEY"), "");
 });

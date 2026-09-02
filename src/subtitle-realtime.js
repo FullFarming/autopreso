@@ -7,6 +7,7 @@ import { DEFAULT_SUBTITLE_SETTINGS } from "./settings-store.js";
 import {
   engineRequiredApiKeys,
   normalizeEngineSelection,
+  validateEngineForLanguages,
 } from "../packages/caption-core/caption-engine-catalog.js";
 import {
   applyGlossaryCorrections,
@@ -551,7 +552,14 @@ function createSourceTranscriptionClient({
       if (socket !== openedSocket || intentionalClose) return;
       transport.handleMessage(raw, {
         onTransportReady: () => markTransportReady(openedSocket),
-        onInterim: (event) => { for (const lane of lanes) lane.preview(event); },
+        // A transport that provides its own translations (Soniox combined) emits
+        // SOURCE interims here. Feeding those to lane.preview() would pay Gemini
+        // for a preview of a line the provider is about to translate itself and
+        // paint it as translationProvider "gemini" over the provider's partial.
+        onInterim: (event) => {
+          if (transport.providesTranslation === true) return;
+          for (const lane of lanes) lane.preview(event);
+        },
         onFinal: (event) => { for (const lane of lanes) lane.commit(event); },
         // Combined STT+translation providers surface the translation themselves;
         // Gemini Transcribe never fires these two.
@@ -1070,7 +1078,10 @@ export function normalizeSubtitleSettings(settings = {}) {
     translationLanguages,
     outputMode: "captions",
     translationProvider: "gemini",
-    engine: normalizeEngineSelection(merged.engine),
+    // Capability constraints that span both fields (Soniox two-way translation
+    // needs exactly two caption languages) are checked here so a start or
+    // restart fails loudly instead of opening a socket the provider rejects.
+    engine: validateEngineForLanguages(merged.engine, translationLanguages),
     displayMode: ["translation_only", "translation_source"].includes(merged.displayMode)
       ? merged.displayMode
       : DEFAULT_SUBTITLE_SETTINGS.displayMode,

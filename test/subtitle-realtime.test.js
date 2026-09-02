@@ -51,6 +51,25 @@ test("an explicitly selected engine survives normalization instead of being pinn
   assert.equal(settings.engine.summary.model, "gemini-3.7-flash");
 });
 
+// Fix round 2 (I4): a combined Soniox engine can only be configured for a
+// language PAIR. Start/restart must refuse the invalid pair here rather than
+// opening a socket that the provider rejects.
+test("normalization refuses a soniox translation engine unless exactly two caption languages are set", () => {
+  const combined = {
+    stt: { provider: "soniox", model: "stt-rt-v5", languageMode: "auto" },
+    translation: { provider: "soniox", model: "stt-rt-v5" },
+    summary: { provider: "gemini", model: "gemini-3.6-flash" },
+  };
+  const ok = normalizeSubtitleSettings({ engine: combined, translationLanguages: ["en", "ko"] });
+  assert.equal(ok.engine.translation.provider, "soniox");
+  assert.throws(
+    () => normalizeSubtitleSettings({ engine: combined, translationLanguages: ["en", "ko", "ja"] }),
+    /자막 언어가 정확히 2개/u,
+  );
+  // A Gemini engine is unaffected by the caption-language count.
+  assert.equal(normalizeSubtitleSettings({ translationLanguages: ["en", "ko", "ja"] }).engine.translation.provider, "gemini");
+});
+
 test("language detection remains stable for code-switching and proper nouns", () => {
   assert.equal(detectSourceLanguage("We look at ADR and GOP this quarter 그"), "en");
   assert.equal(detectSourceLanguage("쿠시먼앤드웨이크필드 코리아가 ADR과 GOP를 봅니다"), "ko");

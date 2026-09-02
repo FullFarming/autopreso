@@ -1427,6 +1427,35 @@ test("saving a different engine while captions run triggers an immediate channel
     });
     assert.equal(again.status, 200);
     assert.equal(calls.length, 1, "unrelated settings do not restart the engine");
+
+    // Fix round 2 (M6): the key diff compared PRESENCE only, so REPLACING a
+    // live key (a rotated or corrected one) left the running channels talking
+    // to the provider with the old, rejected credential forever.
+    const rotated = await fetch(`${url}/api/settings`, {
+      method: "PUT",
+      headers: sameOriginHeaders(url, { "content-type": "application/json" }),
+      body: JSON.stringify({ apiKeys: { soniox: "fixture-key-rotated" } }),
+    });
+    assert.equal(rotated.status, 200);
+    assert.deepEqual(calls, [{ reason: "engine_change" }, { reason: "engine_change" }]);
+
+    // A key the selected engine does not use is still not a reason to restart.
+    const unrelatedKey = await fetch(`${url}/api/settings`, {
+      method: "PUT",
+      headers: sameOriginHeaders(url, { "content-type": "application/json" }),
+      body: JSON.stringify({ apiKeys: { openai: "sk-unrelated" } }),
+    });
+    assert.equal(unrelatedKey.status, 200);
+    assert.equal(calls.length, 2, "a key no selected engine requires never restarts the channels");
+
+    // Re-saving the SAME key value is not a change either.
+    const sameKey = await fetch(`${url}/api/settings`, {
+      method: "PUT",
+      headers: sameOriginHeaders(url, { "content-type": "application/json" }),
+      body: JSON.stringify({ apiKeys: { soniox: "fixture-key-rotated" } }),
+    });
+    assert.equal(sameKey.status, 200);
+    assert.equal(calls.length, 2, "an unchanged key value never restarts the channels");
   } finally {
     await new Promise((resolve) => httpServer.close(resolve));
     await fs.rm(dir, { recursive: true, force: true });

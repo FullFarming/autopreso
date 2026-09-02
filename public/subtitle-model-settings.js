@@ -40,6 +40,12 @@ export function normalizeCaptionEngineCatalog(value) {
         available: entry.available,
         languageModes: entry.languageModes.filter((mode) => LANGUAGE_MODES.includes(mode)),
         requiresSttProvider: typeof entry.requiresSttProvider === "string" ? entry.requiresSttProvider : null,
+        // Some engines only work at one caption-language count (Soniox's
+        // two-way translation needs exactly a pair). The number comes from the
+        // catalog so this module never hard-codes a provider name.
+        requiredLanguageCount: Number.isInteger(entry.requiredLanguageCount) && entry.requiredLanguageCount > 0
+          ? entry.requiredLanguageCount
+          : null,
       });
     }
   }
@@ -68,6 +74,12 @@ export function mountCaptionEngineSettings({ form, getSettings, save, onSaved, o
     const candidate = isRecord(engine) && isRecord(engine.stt) && isRecord(engine.translation) && isRecord(engine.summary)
       ? engine : catalog?.defaults;
     return candidate ?? null;
+  }
+  // null when no caption languages are known: an engine that demands an exact
+  // count is then unavailable rather than optimistically offered.
+  function translationLanguageCount() {
+    const languages = getSettings()?.translationLanguages;
+    return Array.isArray(languages) ? languages.length : null;
   }
   function selectedEntry(role) {
     const value = field(ROLE_FIELDS[role])?.value ?? "";
@@ -115,16 +127,26 @@ export function mountCaptionEngineSettings({ form, getSettings, save, onSaved, o
     // equal to nothing and silently saves nothing — so fall back to the
     // catalog default for that role. Nothing is written until the user picks.
     const resolved = {};
-    for (const role of Object.keys(ROLE_FIELDS)) {
+    for (const role of ["stt", "summary"]) {
       resolved[role] = entryFor(role, engine[role]) ?? entryFor(role, catalog.defaults[role]) ?? catalog[role][0];
     }
     // The STT choice decides which input-language modes exist and whether a
-    // combined STT+translation engine may be offered at all.
+    // combined STT+translation engine may be offered at all; the caption
+    // languages decide it too, for an engine that requires an exact count.
     const sttEntry = resolved.stt;
+    const isTranslationBlocked = (entry) =>
+      (Boolean(entry.requiresSttProvider) && entry.requiresSttProvider !== sttEntry.provider)
+      || (entry.requiredLanguageCount !== null && entry.requiredLanguageCount !== translationLanguageCount());
+    // A saved translation the current context can no longer support (the
+    // caption-language count changed under it) repaints as the catalog default
+    // rather than sitting on a disabled option no later change can move.
+    // Nothing is written until the user picks.
+    const savedTranslation = entryFor("translation", engine.translation);
+    resolved.translation = (savedTranslation && !isTranslationBlocked(savedTranslation) ? savedTranslation : null)
+      ?? entryFor("translation", catalog.defaults.translation) ?? catalog.translation[0];
     fillOptions(field(ROLE_FIELDS.stt), catalog.stt);
     fillOptions(field(ROLE_FIELDS.summary), catalog.summary);
-    fillOptions(field(ROLE_FIELDS.translation), catalog.translation,
-      (entry) => Boolean(entry.requiresSttProvider) && entry.requiresSttProvider !== sttEntry.provider);
+    fillOptions(field(ROLE_FIELDS.translation), catalog.translation, isTranslationBlocked);
     for (const [role, name] of Object.entries(ROLE_FIELDS)) {
       const select = field(name);
       if (!select) continue;
@@ -149,9 +171,12 @@ export function mountCaptionEngineSettings({ form, getSettings, save, onSaved, o
     const stt = selectedEntry("stt");
     const summary = selectedEntry("summary");
     let translation = selectedEntry("translation");
-    // A combined engine is only valid alongside its own STT; switching the STT
-    // away from it must fall back instead of submitting a rejected pair.
-    if (translation?.requiresSttProvider && translation.requiresSttProvider !== stt?.provider) {
+    // A combined engine is only valid alongside its own STT and at the caption
+    // language count it requires; switching either away from it must fall back
+    // instead of submitting a pair the server rejects.
+    if ((translation?.requiresSttProvider && translation.requiresSttProvider !== stt?.provider)
+      || (translation?.requiredLanguageCount !== null && translation?.requiredLanguageCount !== undefined
+        && translation.requiredLanguageCount !== translationLanguageCount())) {
       translation = entryFor("translation", catalog.defaults.translation);
     }
     if (!stt || !translation || !summary) { refresh(); return; }

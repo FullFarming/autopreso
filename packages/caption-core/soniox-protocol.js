@@ -10,6 +10,9 @@ export const SONIOX_CONTROL = Object.freeze({ finalize: '{"type":"finalize"}', k
 const AUTO_LANGUAGES = Object.freeze(["ko", "en"]);
 const MAX_CONTEXT_CHARACTERS = 9_000; // documented cap ~10,000 chars / 8,000 tokens; stay under it
 const MAX_TRANSLATION_TERMS = 200;
+// 200 pairs of long phrases would still overflow the context payload, so the
+// pair count and the combined character budget are both enforced.
+const MAX_TRANSLATION_TERM_CHARACTERS = 3_000;
 // Control and format characters never belong in a provider prompt payload.
 const UNSAFE_TEXT_PATTERN = /[\u0000-\u001f\u007f\p{Cf}]/u;
 
@@ -26,6 +29,32 @@ function boundedTerms(values, limit) {
     seen.add(key);
     out.push(value);
     used += value.length;
+  }
+  return out;
+}
+
+/**
+ * `translation_terms` obey two caps: at most MAX_TRANSLATION_TERMS pairs, and
+ * at most MAX_TRANSLATION_TERM_CHARACTERS characters counting both sides of
+ * every pair. Pairs are taken in order and adding stops at the first pair that
+ * would exceed either bound.
+ *
+ * @param {unknown} values
+ * @returns {Array<{source: string, target: string}>}
+ */
+function boundedTermPairs(values) {
+  const out = [];
+  let used = 0;
+  for (const pair of Array.isArray(values) ? values : []) {
+    if (out.length >= MAX_TRANSLATION_TERMS) break;
+    if (!pair || typeof pair.source !== "string" || typeof pair.target !== "string") continue;
+    if (UNSAFE_TEXT_PATTERN.test(pair.source) || UNSAFE_TEXT_PATTERN.test(pair.target)) continue;
+    const source = pair.source.trim();
+    const target = pair.target.trim();
+    if (!source || !target) continue;
+    if (used + source.length + target.length > MAX_TRANSLATION_TERM_CHARACTERS) break;
+    used += source.length + target.length;
+    out.push({ source, target });
   }
   return out;
 }
@@ -69,12 +98,7 @@ export function buildSonioxConfig({
     ...(clientReferenceId ? { client_reference_id: String(clientReferenceId).slice(0, 128) } : {}),
   });
   const terms = boundedTerms(context.terms, MAX_CONTEXT_CHARACTERS / 2);
-  const translationTerms = (Array.isArray(context.translationTerms) ? context.translationTerms : [])
-    .filter((pair) => pair && typeof pair.source === "string" && typeof pair.target === "string"
-      && pair.source.trim() && pair.target.trim())
-    .filter((pair) => !UNSAFE_TEXT_PATTERN.test(pair.source) && !UNSAFE_TEXT_PATTERN.test(pair.target))
-    .slice(0, MAX_TRANSLATION_TERMS)
-    .map((pair) => ({ source: pair.source.trim(), target: pair.target.trim() }));
+  const translationTerms = boundedTermPairs(context.translationTerms);
   const general = typeof context.domain === "string" && context.domain.trim()
     ? [{ key: "domain", value: context.domain.trim().slice(0, 500) }]
     : [];
