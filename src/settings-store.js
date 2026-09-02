@@ -223,6 +223,23 @@ export function createSettingsStore({ filePath, env = process.env, readCodexAuth
     if (partial?.subtitle !== undefined && !isPlainObject(partial.subtitle)) {
       throw new Error("Subtitle settings must be a plain object.");
     }
+    // A partial `engine` patch may only name the role the caller actually
+    // changed (e.g. `{ translation: {...} }`). Validating that patch in
+    // isolation would normalize the OMITTED roles to the Gemini defaults, and
+    // a combo check (Soniox translation's requiresSttProvider) can then fail
+    // against a phantom default stt role the caller never touched. Merge the
+    // patch role-by-role over the CURRENTLY SAVED engine before any
+    // validation or persistence sees it, so "change translation only" reads
+    // as exactly that, not as "reset every other role to its default too."
+    if (isPlainObject(partial?.subtitle) && isPlainObject(partial.subtitle.engine)) {
+      partial = {
+        ...partial,
+        subtitle: {
+          ...partial.subtitle,
+          engine: { ...cached.subtitle.engine, ...partial.subtitle.engine },
+        },
+      };
+    }
     if (partial?.subtitle) validateSubtitleSettings(partial.subtitle);
     validateApiKeys(partial?.apiKeys);
     // fontFamily is checked against the RAW patch: migrateSettings self-heals a
@@ -240,7 +257,7 @@ export function createSettingsStore({ filePath, env = process.env, readCodexAuth
     if (partial?.subtitle?.translationProvider !== undefined && partial.subtitle.translationProvider !== "gemini") {
       throw new Error("Subtitle translationProvider must remain gemini.");
     }
-    const retiredSubtitleKeys = ["audioLanguage", "audioVolume", "voiceProvider", "model", "geminiModel"];
+    const retiredSubtitleKeys = ["audioLanguage", "audioVolume", "voiceProvider", "model"];
     const retiredSubtitleKey = retiredSubtitleKeys.find((key) => partial?.subtitle?.[key] !== undefined);
     if (retiredSubtitleKey) {
       throw new Error(`Subtitle ${retiredSubtitleKey} is retired in caption-only mode.`);

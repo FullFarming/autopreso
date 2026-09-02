@@ -845,3 +845,42 @@ test("save validates engine selections and soniox key slot", async () => {
   assert.equal(sanitized.hasSonioxKey, true);
   assert.equal(Object.hasOwn(sanitized, "apiKeys"), false);
 });
+
+// Fix round 1: a partial `engine` patch that only names one role must be
+// merged over the CURRENTLY SAVED engine before validation, not validated in
+// isolation -- otherwise the omitted roles normalize to the Gemini defaults
+// and a combo check (Soniox translation's requiresSttProvider) fails against
+// a phantom default stt role the caller never touched.
+test("a partial engine patch merges over the current selection instead of validating in isolation", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "settings-engine-"));
+  const store = createSettingsStore({ filePath: path.join(dir, "settings.json"), env: {}, readCodexAuth: () => null });
+  await store.load();
+
+  const fullSonioxCombo = {
+    stt: { provider: "soniox", model: "stt-rt-v5", languageMode: "auto" },
+    translation: { provider: "soniox", model: "stt-rt-v5" },
+    summary: { provider: "gemini", model: "gemini-3.6-flash" },
+  };
+  await store.save({ apiKeys: { soniox: "fixture-key" }, subtitle: { engine: fullSonioxCombo } });
+
+  // A translation-only patch must not be validated as if stt/summary were
+  // absent (which would normalize stt to the Gemini default and break the
+  // Soniox translation entry's requiresSttProvider check).
+  const afterPartial = await store.save({ subtitle: { engine: {
+    translation: { provider: "soniox", model: "stt-rt-v5" },
+  } } });
+  assert.deepEqual(afterPartial.subtitle.engine, fullSonioxCombo);
+  const reloaded = await store.load();
+  assert.deepEqual(reloaded.subtitle.engine, fullSonioxCombo);
+
+  // A partial patch that DOES make the merged combo invalid must still fail
+  // closed with the engine-combination error, not silently succeed.
+  await assert.rejects(
+    store.save({ subtitle: { engine: {
+      stt: { provider: "gemini", model: "gemini-3.5-transcribe-live", languageMode: "auto" },
+    } } }),
+    /엔진 조합/u,
+  );
+  // The rejected patch must not have mutated the stored engine.
+  assert.deepEqual((await store.load()).subtitle.engine, fullSonioxCombo);
+});
