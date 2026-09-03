@@ -1,6 +1,6 @@
 // Stateless HMAC-signed session token. Uses Web Crypto so the same code runs
 // in the Edge middleware runtime and in Node route handlers.
-import { HOST_ID_PATTERN, isCurrentHostSessionUser } from "./security/host-session-policy";
+import { HOST_ID_PATTERN, isCurrentHostSessionUser, isProfileBackedHostId } from "./security/host-session-policy";
 
 export const SESSION_COOKIE = "rnw_session";
 export const SESSION_TTL_SECONDS = 30 * 24 * 60 * 60;
@@ -75,7 +75,10 @@ export async function readSessionToken(token: string | undefined | null): Promis
   const parts = payload.split("|");
   if (parts.length !== 2 && (parts.length !== 5 || parts[4] !== "v2")) return null;
   const userId = parts[0];
-  if (!HOST_ID_PATTERN.test(userId) || !isCurrentHostSessionUser(userId)) return null;
+  // A profile-backed host carries its auth uuid as the cookie subject and is not in ADMIN_USER_IDS.
+  // Revocation for uuid hosts is the `requireHost` / session-route status gate (60 s cache, Task 4);
+  // the Edge middleware stays cookie-only and never queries the profile store.
+  if (!HOST_ID_PATTERN.test(userId) || !(isCurrentHostSessionUser(userId) || isProfileBackedHostId(userId))) return null;
   const numericParts = parts.length === 2 ? parts.slice(1) : parts.slice(1, 4);
   if (numericParts.some((value) => !/^[1-9][0-9]{0,15}$/u.test(value) || !Number.isSafeInteger(Number(value)))) return null;
   const expiresAt = Number(parts[1]);

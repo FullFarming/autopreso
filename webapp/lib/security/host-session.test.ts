@@ -5,14 +5,18 @@ import test from "node:test";
 import vm from "node:vm";
 import ts from "typescript";
 
+import * as statusCache from "../auth/profile-status-cache";
 import * as sessions from "../session";
 import { assertStrictOrigin, isPublicUnauthenticatedPath } from "./csrf";
 import { readHostLoginConfig } from "./host-login-config";
+import { isProfileBackedHostId } from "./host-session-policy";
 import { HostLoginRateLimitError, enforceHostLoginCredentialRateLimits, enforceHostLoginRateLimit } from "./live-rate-limit";
 import { LiveAdmissionError } from "./live-admission-store";
 
 const DAY = 86_400_000;
 const START = Date.UTC(2026, 7, 31);
+// An auth.users uuid: the `profiles.host_id` a non-bootstrap approved profile carries in its cookie.
+const PROFILE_HOST_ID = "00000000-0000-4000-8000-000000000011";
 const environmentKeys = ["ADMIN_USER_IDS", "ADMIN_PASSWORD", "ADMIN_PASSWORD_HASH", "LIVE_ALLOW_WEAK_TEST_LOGIN", "ALLOWED_ORIGINS"];
 
 async function withSessionEnvironment(run: (setNow: (value: number) => void) => Promise<void>) {
@@ -51,6 +55,48 @@ test("host sessions expire after 30 days and removed IDs immediately lose all se
     process.env.ADMIN_USER_IDS = "operator";
     setNow(START + 30 * DAY);
     assert.equal(await sessions.verifySessionToken(token), false);
+  });
+});
+
+test("a cookie for a profile-backed auth user id reads back without an ADMIN_USER_IDS entry; other unknown ids stay rejected", async () => {
+  await withSessionEnvironment(async () => {
+    assert.equal(isProfileBackedHostId(PROFILE_HOST_ID), true);
+    assert.equal(isProfileBackedHostId(PROFILE_HOST_ID.toUpperCase()), true);
+    assert.equal(isProfileBackedHostId("operator"), false);
+    assert.equal(isProfileBackedHostId("00000000-0000-4000-8000-00000000001"), false);
+    assert.equal(isProfileBackedHostId("00000000-0000-4000-0000-000000000011"), false);
+    const token = await sessions.createSessionToken(PROFILE_HOST_ID);
+    assert.equal((await sessions.readSessionToken(token))?.userId, PROFILE_HOST_ID);
+    assert.equal(await sessions.verifySessionToken(token), true);
+    const stranger = await sessions.createSessionToken("not-an-admin");
+    assert.equal(await sessions.readSessionToken(stranger), null);
+    assert.equal(await sessions.verifySessionToken(stranger), false);
+  });
+});
+
+test("session route reports role and accepts a profile-backed host that is not in ADMIN_USER_IDS", async () => {
+  await withSessionEnvironment(async () => {
+    const route = loadRoute("auth/session");
+    const profile = (status: "approved" | "pending", role: "admin" | "host") =>
+      ({ id: PROFILE_HOST_ID, email: "a@b.io", displayName: null, status, role, hostId: PROFILE_HOST_ID });
+    statusCache.__setProfileReaderForTests(async (hostId: string) => (hostId === PROFILE_HOST_ID ? profile("approved", "admin") : null));
+    try {
+      const token = await sessions.createSessionToken(PROFILE_HOST_ID);
+      const response = await route.GET(request(token));
+      assert.equal(response.status, 200);
+      const body = response.body as { data: { userId: string; role: string } };
+      assert.equal(body.data.userId, PROFILE_HOST_ID);
+      assert.equal(body.data.role, "admin");
+      const legacy = await route.GET(request(await sessions.createSessionToken("operator")));
+      assert.equal(legacy.status, 200);
+      assert.equal((legacy.body as { data: { role: string } }).data.role, "legacy");
+      statusCache.__setProfileReaderForTests(async () => profile("pending", "host"));
+      assert.equal((await route.GET(request(token))).status, 401);
+      statusCache.__setProfileReaderForTests(async () => null);
+      assert.equal((await route.GET(request(token))).status, 401, "a uuid subject with no profile row is not an allowlisted legacy host");
+    } finally {
+      statusCache.__setProfileReaderForTests(null);
+    }
   });
 });
 
@@ -132,6 +178,7 @@ function loadRoute(name: "auth/session" | "logout" | "login", overrides: Record<
     "@/lib/session": sessions,
     "@/lib/security/csrf": { assertStrictOrigin },
     "@/lib/security/host-login-config": { readHostLoginConfig },
+    "@/lib/auth/profile-status-cache": { assertHostApproved: statusCache.assertHostApproved },
     "@/lib/security/api-response": {
       apiSuccess: (data: unknown, init?: ResponseInit) => new TestResponse({ ok: true, data }, init?.status, init?.headers),
       apiError: (error: string, code: string, status: number, headers?: HeadersInit) => new TestResponse({ ok: false, error, code }, status, headers),
@@ -155,7 +202,7 @@ test("session GET never refreshes and successful GET/POST have private no-store 
     setNow(START + 24 * DAY);
     const result = await route.GET(request(token));
     assert.equal(result.status, 200);
-    assert.deepEqual(JSON.parse(JSON.stringify(result.body)), { ok: true, data: { userId: "operator", expiresAt: new Date(START + 30 * DAY).toISOString() } });
+    assert.deepEqual(JSON.parse(JSON.stringify(result.body)), { ok: true, data: { userId: "operator", expiresAt: new Date(START + 30 * DAY).toISOString(), role: "legacy" } });
     assert.equal(result.cookiesWritten.length, 0);
     assert.match(result.headers.get("cache-control") ?? "", /no-store/);
     assert.doesNotMatch(JSON.stringify(result.body), /password|token|secret/i);

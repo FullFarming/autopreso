@@ -1,6 +1,7 @@
 import type { NextRequest } from "next/server";
 
 import { SESSION_COOKIE, verifySessionToken } from "../session";
+import { assertHostApproved } from "./profile-status-cache";
 import { LIVE_GATEWAY_TOKEN_SECRET, LIVE_VIEWER_TOKEN_SECRET } from "../security/config";
 import { hmacHex, timingSafeEqual } from "../security/hmac";
 
@@ -288,8 +289,10 @@ export async function requireHost(request: Pick<NextRequest, "cookies">): Promis
     const payload = atob(token.slice(0, separator));
     const [hostId] = payload.split("|");
     if (!hostId) throw new Error("missing host id");
+    await assertHostApproved(hostId);
     return { hostId };
-  } catch {
+  } catch (error) {
+    if (error instanceof AuthenticationError) throw error;
     throw new AuthenticationError("호스트 인증 정보가 올바르지 않습니다.");
   }
 }

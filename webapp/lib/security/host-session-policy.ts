@@ -9,6 +9,14 @@ export function parseHostUserIds(value: string | undefined): ReadonlySet<string>
   return new Set(userIds);
 }
 
+// An auth.users uuid — the `profiles.host_id` a non-bootstrap approved profile carries in its
+// cookie. Bootstrap admins keep their ADMIN_USER_IDS entry as host_id, so they never match here.
+const PROFILE_HOST_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
+
+export function isProfileBackedHostId(userId: string): boolean {
+  return PROFILE_HOST_ID_PATTERN.test(userId);
+}
+
 export function isCurrentHostSessionUser(userId: string): boolean {
   try {
     const nodeEnvironment = process.env.NODE_ENV?.trim() ?? "development";

@@ -1,6 +1,7 @@
 import type { NextRequest } from "next/server";
 
 import { SESSION_COOKIE, readSessionToken, refreshSessionToken } from "@/lib/session";
+import { assertHostApproved } from "@/lib/auth/profile-status-cache";
 import { apiError, apiSuccess } from "@/lib/security/api-response";
 import { assertStrictOrigin } from "@/lib/security/csrf";
 import { readHostLoginConfig } from "@/lib/security/host-login-config";
@@ -15,13 +16,17 @@ async function respondWithSession(request: NextRequest, shouldRefresh: boolean) 
 
   const token = request.cookies.get(SESSION_COOKIE)?.value;
   const session = await readSessionToken(token);
-  if (!session || !config.isEnabled || !config.userIds.has(session.userId)) {
-    return apiError("호스트 로그인이 필요합니다.", "AUTH_REQUIRED", 401, NO_STORE);
-  }
+  if (!session || !config.isEnabled) return apiError("호스트 로그인이 필요합니다.", "AUTH_REQUIRED", 401, NO_STORE);
+  let role: "admin" | "host" | "legacy";
+  try {
+    const approved = await assertHostApproved(session.userId);
+    role = approved.role;
+    if (role === "legacy" && !config.userIds.has(session.userId)) return apiError("호스트 로그인이 필요합니다.", "AUTH_REQUIRED", 401, NO_STORE);
+  } catch { return apiError("호스트 로그인이 필요합니다.", "AUTH_REQUIRED", 401, NO_STORE); }
   const renewed = shouldRefresh ? await refreshSessionToken(token) : null;
   const current = renewed?.session ?? session;
   if (current.expiresAt <= Date.now()) return apiError("호스트 로그인이 필요합니다.", "AUTH_REQUIRED", 401, NO_STORE);
-  const response = apiSuccess({ userId: current.userId, expiresAt: new Date(current.expiresAt).toISOString() }, { headers: NO_STORE });
+  const response = apiSuccess({ userId: current.userId, expiresAt: new Date(current.expiresAt).toISOString(), role }, { headers: NO_STORE });
   if (renewed) {
     response.cookies.set(SESSION_COOKIE, renewed.token, {
       httpOnly: true,
