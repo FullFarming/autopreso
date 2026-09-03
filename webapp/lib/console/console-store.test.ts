@@ -1,0 +1,139 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+import { DEFAULT_ENGINE_SELECTION } from "../../../packages/caption-core/caption-engine-catalog.js";
+import { ConsoleStoreError, SupabaseConsoleStore, __setConsoleStoreForTests, getConsoleStore } from "./console-store";
+
+const ADMIN = "00000000-0000-4000-8000-000000000011";
+const TARGET = "00000000-0000-4000-8000-000000000022";
+const SESSION = "00000000-0000-4000-8000-000000000033";
+const access = () => ({ url: "https://project.supabase.test", credential: { key: "fixture-secret", kind: "secret" as const } });
+
+function storeWith(handler: (url: string, init: RequestInit) => Response | Promise<Response>) {
+  const calls: Array<{ url: string; init: RequestInit }> = [];
+  const store = new SupabaseConsoleStore({
+    fetchFn: async (input, init) => { calls.push({ url: String(input), init: init ?? {} }); return handler(String(input), init ?? {}); },
+    getServerAccess: access,
+  });
+  return { store, calls };
+}
+const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
+const body = (call: { init: RequestInit }) => JSON.parse(String(call.init.body));
+
+test("listProfiles posts { p_status, p_limit, p_before } with the secret credential and maps snake_case rows", async () => {
+  const { store, calls } = storeWith(() => json([{
+    id: TARGET, email: "b@x.io", display_name: "Bee", status: "pending", role: "host", host_id: TARGET,
+    created_at: "2026-09-02T00:00:00+00:00", last_login_at: null, approved_at: null,
+  }]));
+  const rows = await store.listProfiles({ status: "pending", limit: 20, before: "2026-09-03T00:00:00.000Z" });
+  assert.equal(calls[0].url, "https://project.supabase.test/rest/v1/rpc/list_profiles_admin_v1");
+  assert.deepEqual(body(calls[0]), { p_status: "pending", p_limit: 20, p_before: "2026-09-03T00:00:00.000Z" });
+  assert.equal(new Headers(calls[0].init.headers).get("apikey"), "fixture-secret");
+  assert.deepEqual(rows, [{
+    id: TARGET, email: "b@x.io", displayName: "Bee", status: "pending", role: "host", hostId: TARGET,
+    createdAt: "2026-09-02T00:00:00+00:00", lastLoginAt: null, approvedAt: null,
+  }]);
+  const all = storeWith(() => json([]));
+  assert.deepEqual(await all.store.listProfiles({}), []);
+  assert.deepEqual(body(all.calls[0]), { p_status: null, p_limit: 50, p_before: null });
+});
+
+test("countPending returns the scalar and rejects non-integers", async () => {
+  assert.equal(await storeWith(() => json(3)).store.countPending(), 3);
+  await assert.rejects(storeWith(() => json("many")).store.countPending(), (e: ConsoleStoreError) => e.code === "CONSOLE_ROW_INVALID" && e.status === 502);
+});
+
+test("setProfileStatus posts actor/profile/status/reason and maps SQL guard tokens to typed errors", async () => {
+  const { store, calls } = storeWith(() => json([{ id: TARGET, status: "approved", role: "host" }]));
+  assert.deepEqual(await store.setProfileStatus({ actorId: ADMIN, profileId: TARGET, status: "approved" }), { id: TARGET, status: "approved", role: "host" });
+  assert.equal(calls[0].url, "https://project.supabase.test/rest/v1/rpc/set_profile_status_v1");
+  assert.deepEqual(body(calls[0]), { p_actor_id: ADMIN, p_profile_id: TARGET, p_status: "approved", p_reason: null });
+  // PostgREST surfaces `raise exception 'LAST_ADMIN_PROTECTED' using errcode = '42501'` as HTTP 403 with the token in `message`.
+  await assert.rejects(
+    storeWith(() => json({ message: "LAST_ADMIN_PROTECTED", code: "42501", details: null, hint: null }, 403)).store.setProfileStatus({ actorId: ADMIN, profileId: TARGET, status: "disabled", reason: "bye" }),
+    (e: ConsoleStoreError) => e instanceof ConsoleStoreError && e.code === "LAST_ADMIN_PROTECTED" && e.status === 409,
+  );
+  const cases: Array<[string, string, number]> = [
+    ["ACTOR_NOT_ADMIN", "42501", 403], ["SELF_CHANGE_FORBIDDEN", "42501", 403], ["INVALID_TRANSITION", "22023", 409],
+    ["PROFILE_NOT_FOUND", "P0002", 404], ["INVALID_ROLE", "22023", 400], ["ENGINE_INVALID", "22023", 400],
+  ];
+  for (const [token, sqlstate, status] of cases) {
+    await assert.rejects(
+      storeWith(() => json({ message: token, code: sqlstate }, 400)).store.setProfileRole({ actorId: ADMIN, profileId: TARGET, role: "admin" }),
+      (e: ConsoleStoreError) => e.code === token && e.status === status,
+      token,
+    );
+  }
+});
+
+test("setProfileRole posts p_role and maps the returned row", async () => {
+  const { store, calls } = storeWith(() => json([{ id: TARGET, status: "approved", role: "admin" }]));
+  assert.deepEqual(await store.setProfileRole({ actorId: ADMIN, profileId: TARGET, role: "admin" }), { id: TARGET, status: "approved", role: "admin" });
+  assert.deepEqual(body(calls[0]), { p_actor_id: ADMIN, p_profile_id: TARGET, p_role: "admin" });
+});
+
+test("listSessions posts { p_since, p_limit } and maps aggregates, coercing bigint counts", async () => {
+  const { store, calls } = storeWith(() => json([{
+    id: SESSION, title: null, host_id: "noel", host_email: "a@x.io", mode: "meeting", status: "ended", languages: ["ko", "en"],
+    created_at: "2026-09-01T00:00:00+00:00", ended_at: "2026-09-01T01:00:00+00:00", utterance_count: "12", participant_count: 3, summary_status: "succeeded",
+  }]));
+  const rows = await store.listSessions({ since: "2026-08-27T00:00:00.000Z", limit: 200 });
+  assert.deepEqual(body(calls[0]), { p_since: "2026-08-27T00:00:00.000Z", p_limit: 200 });
+  assert.deepEqual(rows, [{
+    id: SESSION, title: null, hostId: "noel", hostEmail: "a@x.io", mode: "meeting", status: "ended", languages: ["ko", "en"],
+    createdAt: "2026-09-01T00:00:00+00:00", endedAt: "2026-09-01T01:00:00+00:00", utteranceCount: 12, participantCount: 3, summaryStatus: "succeeded",
+  }]);
+  const all = storeWith(() => json([]));
+  await all.store.listSessions({});
+  assert.deepEqual(body(all.calls[0]), { p_since: null, p_limit: 100 });
+});
+
+test("readSettings maps a fresh project (engine null, no updater) and a configured one", async () => {
+  const fresh = await storeWith(() => json([{ legacy_password_login_enabled: true, engine: null, engine_updated_at: null, engine_updated_by_email: null }])).store.readSettings();
+  assert.deepEqual(fresh, { legacyPasswordLoginEnabled: true, engine: null, engineUpdatedAt: null, engineUpdatedByEmail: null });
+  const set = await storeWith(() => json([{ legacy_password_login_enabled: false, engine: DEFAULT_ENGINE_SELECTION, engine_updated_at: "2026-09-03T00:00:00+00:00", engine_updated_by_email: "a@x.io" }])).store.readSettings();
+  assert.deepEqual(set, { legacyPasswordLoginEnabled: false, engine: DEFAULT_ENGINE_SELECTION, engineUpdatedAt: "2026-09-03T00:00:00+00:00", engineUpdatedByEmail: "a@x.io" });
+  await assert.rejects(storeWith(() => json([])).store.readSettings(), (e: ConsoleStoreError) => e.code === "CONSOLE_ROW_INVALID" && e.status === 502);
+});
+
+test("setEngineDefaults normalizes through the catalog before sending p_engine and refuses an invalid selection without a request", async () => {
+  const { store, calls } = storeWith(() => json(true));
+  await store.setEngineDefaults({ actorId: ADMIN, engine: { stt: { provider: "soniox", model: "stt-rt-v5", languageMode: "ko" }, translation: { provider: "gemini", model: "gemini-3.7-flash" }, summary: { provider: "gemini", model: "gemini-3.7-flash" } } });
+  assert.equal(calls[0].url, "https://project.supabase.test/rest/v1/rpc/set_engine_defaults_v1");
+  assert.deepEqual(body(calls[0]), {
+    p_actor_id: ADMIN,
+    p_engine: { stt: { provider: "soniox", model: "stt-rt-v5", languageMode: "ko" }, translation: { provider: "gemini", model: "gemini-3.7-flash" }, summary: { provider: "gemini", model: "gemini-3.7-flash" } },
+  });
+  const invalid = storeWith(() => json(true));
+  await assert.rejects(
+    invalid.store.setEngineDefaults({ actorId: ADMIN, engine: { stt: { provider: "gemini", model: "nope" } } as never }),
+    (e: ConsoleStoreError) => e.code === "ENGINE_INVALID" && e.status === 400,
+  );
+  assert.equal(invalid.calls.length, 0);
+  await assert.rejects(storeWith(() => json(false)).store.setEngineDefaults({ actorId: ADMIN, engine: DEFAULT_ENGINE_SELECTION }), (e: ConsoleStoreError) => e.code === "CONSOLE_WRITE_FAILED");
+});
+
+test("setLegacyPasswordLogin posts p_enabled and requires a true ack", async () => {
+  const { store, calls } = storeWith(() => json(true));
+  await store.setLegacyPasswordLogin({ actorId: ADMIN, enabled: false });
+  assert.deepEqual(body(calls[0]), { p_actor_id: ADMIN, p_enabled: false });
+  await assert.rejects(storeWith(() => json(false)).store.setLegacyPasswordLogin({ actorId: ADMIN, enabled: true }), (e: ConsoleStoreError) => e.code === "CONSOLE_WRITE_FAILED" && e.status === 503);
+});
+
+test("unknown RPC failures and network errors map to 503 CONSOLE_STORE_UNAVAILABLE without leaking the body", async () => {
+  await assert.rejects(storeWith(() => json({ message: "boom secret", code: "PGRST202" }, 404)).store.countPending(), (e: ConsoleStoreError) => e.code === "CONSOLE_STORE_UNAVAILABLE" && e.status === 503 && !e.message.includes("boom"));
+  await assert.rejects(storeWith(() => { throw new TypeError("fetch failed"); }).store.countPending(), (e: ConsoleStoreError) => e.code === "CONSOLE_STORE_UNAVAILABLE" && e.status === 503);
+});
+
+test("getConsoleStore returns one module singleton and the test seam swaps it", () => {
+  const fake = storeWith(() => json([])).store;
+  try {
+    __setConsoleStoreForTests(fake);
+    assert.equal(getConsoleStore(), fake);
+  } finally {
+    __setConsoleStoreForTests(null);
+  }
+  const real = getConsoleStore();
+  assert.ok(real instanceof SupabaseConsoleStore);
+  assert.notEqual(real, fake);
+  assert.equal(getConsoleStore(), real);
+});

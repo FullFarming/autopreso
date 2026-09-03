@@ -46,6 +46,11 @@ async function defaultReader(hostId: string): Promise<ProfileRecord | null> {
 export const profileStatusCache = createProfileStatusCache({ read: defaultReader });
 /** Test seam: swap the reader without touching the singleton cache. */
 export function __setProfileReaderForTests(next: Reader | null): void { reader = next; profileStatusCache.invalidate(); }
+/**
+ * The full profile row through the same (seam-aware) reader the cache uses. The cache keeps only
+ * status/role; `requireAdmin` needs the row's id as the console RPC actor, so it reads uncached.
+ */
+export async function readHostProfile(hostId: string): Promise<ProfileRecord | null> { return defaultReader(hostId); }
 
 export async function assertHostApproved(hostId: string, cache = profileStatusCache): Promise<{ role: ProfileRole | "legacy" }> {
   const profile = await cache.get(hostId);
