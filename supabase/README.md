@@ -34,6 +34,18 @@ project. The core sequence is:
    identity fields through the v3 RPC overloads. Valid utterance start/end
    pairs also accumulate per-participant speaking seconds for recap analytics;
    negative or longer-than-one-hour segments are ignored.
+9. `202609020002_auth_profiles_desktop_codes.sql` makes Supabase Auth the host
+   identity provider: `profiles` (approval `status`, `role`, and the `host_id`
+   string the `rnw_session` cookie carries), append-only `profile_events`,
+   one-shot `desktop_login_codes`, RLS, and the service-role RPCs
+   `upsert_profile_on_login_v1`, `read_profile_by_host_id_v1`,
+   `issue_desktop_login_code_v1`, and `consume_desktop_login_code_v1`. See
+   "Authentication 설정" below.
+10. `202609020003_console_rpcs.sql` adds the admin console tables
+    `engine_defaults` and `console_settings` plus the admin-only RPCs for
+    signup approval, roles, session aggregates, global engine defaults, and
+    the legacy password-login switch (`set_legacy_password_login_v1`). It
+    depends on `profiles` from the previous migration.
 
 ## Deployment region policy and current audit
 
@@ -492,3 +504,57 @@ It exercises real v2 persistence, unchanged replay, conflicting observation,
 stale media epoch, private projections, role grants, revocation, and six-hour
 expiry; this is not a hosted-database or paid-provider validation. Roll back
 application callers first and retain the additive column and rows.
+
+## Authentication 설정
+
+Migrations `202609020002` and `202609020003` make Supabase Auth the identity
+provider for hosts. The browser signs in with Google or email/password (PKCE)
+and posts the access token to `POST /api/auth/exchange`; the server verifies it
+against `GET /auth/v1/user`, upserts `profiles` through
+`upsert_profile_on_login_v1`, and issues the existing `rnw_session` cookie only
+when `profiles.status = 'approved'`. The cookie subject is `profiles.host_id`,
+never the raw auth UUID: emails listed in `ADMIN_BOOTSTRAP_EMAILS` become
+approved admins on first login and inherit the first `ADMIN_USER_IDS` entry as
+their `host_id`, so their existing `live_sessions` rows stay owned; every other
+profile gets `host_id = id::text`. `requireHost` re-reads the status through
+`read_profile_by_host_id_v1` behind a 60-second cache, so rejecting or
+disabling a profile locks that host out within a minute, and a UUID host id
+with no profile row is rejected rather than treated as legacy. The legacy
+`ADMIN_USER_IDS` / `ADMIN_PASSWORD_HASH` login keeps working until
+`set_legacy_password_login_v1` turns it off from the console.
+
+`profiles` intentionally has **no** `grant select ... to authenticated`. The
+`profiles_self_select` policy exists but is inert until a browser-side read is
+ever needed; every read today goes through service-role RPCs.
+
+Dashboard steps, performed by the project owner. Never paste client secrets,
+API keys, deep-link codes, or `state` values into chat, commits, or this file.
+
+1. Google Cloud Console: create an OAuth 2.0 client (Web application) and add
+   the Supabase callback `https://<project-ref>.supabase.co/auth/v1/callback`
+   to its authorized redirect URIs.
+2. Supabase Dashboard → Authentication → Providers: enable Google and enter
+   that client ID and secret.
+3. Authentication → URL Configuration: add
+   `https://realtime-noel-web.vercel.app/auth/callback` to the redirect
+   allowlist and keep email confirmation enabled. Desktop logins return through
+   the same page (`?client=desktop&state=...`), which then hands the browser
+   off to `nova://auth/callback?code&state`.
+4. Vercel: set `ADMIN_BOOTSTRAP_EMAILS` (comma-separated) for Production and
+   any Preview environment that should accept those admins.
+
+Deploy order: apply both migrations by hand in filename order → deploy the
+webapp with legacy login still enabled → confirm the first Google login of a
+bootstrap admin creates an approved `profiles` row → ship the desktop DMG that
+registers the `nova` scheme (`electron/main.js` registers it only when
+`app.isPackaged` or `NOVA_DEV_DEEP_LINK=1`) → disable legacy login from the
+console once stable. Password reset currently lands on `/auth/callback` and
+exchanges the recovery session like a login; there is no "set a new password"
+screen yet. Rollback is application-first: redeploy the previous webapp and
+leave the additive tables in place.
+
+Local SQL verification without a linked project:
+
+```sh
+NOVA_PGLITE_MODULE=/path/to/pglite/dist/index.js node --test test/auth-profiles-sql.test.js
+```

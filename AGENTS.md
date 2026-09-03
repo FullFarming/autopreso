@@ -184,6 +184,20 @@ desktop's own local engine; `electron/main.js` fans those to all renderers as
   `viewer_grants`, `live_utterances`, `live_meeting_summaries`, snapshots, and
   rate limits. Nearly everything goes through `security definer` RPCs rather
   than table writes.
+- **Host identity.** Supabase Auth is the identity provider only. The browser
+  signs in (Google or email/password, PKCE) and posts the access token to
+  `POST /api/auth/exchange`, which verifies it server-side, upserts `profiles`
+  via RPC, and issues the existing `rnw_session` cookie only for
+  `status = 'approved'`. The cookie subject is `profiles.host_id`, not the auth
+  UUID: bootstrap admins (`ADMIN_BOOTSTRAP_EMAILS`) inherit the first
+  `ADMIN_USER_IDS` entry, so `host_id` ownership queries never changed.
+  `requireHost` (`webapp/lib/auth/live-auth.ts`) re-checks approval through a
+  60 s status cache and rejects a UUID host with no profile row;
+  `/api/auth/session` reports `role`. The legacy `ADMIN_USER_IDS` password
+  login stays until the console switch. Desktop login runs Google in the system
+  browser and returns via `nova://auth/callback?code&state`, which
+  `electron/main.js` trades for the cookie at `POST /api/auth/desktop-exchange`
+  (the scheme is registered only when packaged or `NOVA_DEV_DEEP_LINK=1`).
 
 ### Two supported HOST connection paths (do NOT tighten one to "fix" the other)
 
