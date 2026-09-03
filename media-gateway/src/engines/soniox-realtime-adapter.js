@@ -43,6 +43,26 @@ const ERROR_CODES = Object.freeze({
   max_duration_reached: "SONIOX_MAX_DURATION",
 });
 
+const STABLE_ERROR_CODE = /^(?:STT|SONIOX)_[A-Z_]+$/u;
+const MAX_REQUEST_ID_LENGTH = 128;
+
+/** Only our own stable codes may travel as an error message; anything the `ws`
+ *  library or the runtime produced is replaced by `fallback` so raw socket text
+ *  never reaches logs or clients. */
+function safeError(error, fallback) {
+  return error instanceof Error && STABLE_ERROR_CODE.test(error.message) ? error : new Error(fallback);
+}
+
+/** Provider error → stable code, with `request_id` attached as a property
+ *  (never in the message) when it is a short string. */
+function providerError(message) {
+  const error = new Error(ERROR_CODES[message.error_type] ?? "SONIOX_PROVIDER_FAILED");
+  if (typeof message.request_id === "string" && message.request_id.length <= MAX_REQUEST_ID_LENGTH) {
+    error.requestId = message.request_id;
+  }
+  return error;
+}
+
 // A pending timer must never be what keeps the gateway process alive.
 function setUnrefTimer(callback, delay) {
   const timer = setTimeout(callback, delay);
@@ -268,15 +288,17 @@ export class SonioxRealtimeAdapter {
       if (terminalError || didClose) return;
       let message;
       try {
-        const encoded = Buffer.isBuffer(raw) ? raw.toString("utf8") : String(raw);
-        if (Buffer.byteLength(encoded, "utf8") > MAX_MESSAGE_BYTES) throw new Error("too large");
-        message = JSON.parse(encoded);
+        // Byte length is checked BEFORE decoding so an oversized frame never
+        // costs a UTF-8 pass or a JSON parse.
+        const byteLength = Buffer.isBuffer(raw) ? raw.length : Buffer.byteLength(String(raw), "utf8");
+        if (byteLength > MAX_MESSAGE_BYTES) throw new Error("too large");
+        message = JSON.parse(Buffer.isBuffer(raw) ? raw.toString("utf8") : String(raw));
       } catch {
         fail(new Error("SONIOX_MESSAGE_INVALID"));
         return;
       }
       if (message && typeof message.error_type === "string") {
-        fail(new Error(ERROR_CODES[message.error_type] ?? "SONIOX_PROVIDER_FAILED"));
+        fail(providerError(message));
         return;
       }
       reducer.apply(message);
@@ -292,17 +314,23 @@ export class SonioxRealtimeAdapter {
         if (reducer.hasPendingFinalText()) reducer.apply({ tokens: [{ text: "<fin>", is_final: true }] });
         scheduler.noteBoundary();
         resolveFinished();
+        // A `finished` nobody asked for means the provider ended the stream on
+        // its own: a dead socket, not a drain. The utterance just committed is
+        // delivered first, then the owner learns the stream is gone and reopens.
+        if (!isClosing) callbackTail.then(() => fail(new Error("STT_PROVIDER_CLOSED")));
       }
     };
 
     socket.on("message", handleMessage);
+    // Only a `finished` inside OUR drain makes a later error/close expected.
+    const isExpectedClosure = () => didClose || (finishedReceived && isClosing);
     socket.on("error", () => {
-      if (isClosing || didClose || finishedReceived) return;
+      if (isExpectedClosure()) return;
       fail(new Error(connectionTimer !== null ? "STT_CONNECT_FAILED" : "STT_PROVIDER_FAILED"));
     });
     socket.on("close", () => {
       resolveSocketClosed();
-      if (!isClosing && !finishedReceived && !terminalError) {
+      if (!terminalError && !isExpectedClosure()) {
         fail(new Error(connectionTimer !== null ? "STT_CONNECT_FAILED" : "STT_PROVIDER_CLOSED"));
       }
       clearTimers();
@@ -350,9 +378,9 @@ export class SonioxRealtimeAdapter {
       pendingFrames += 1;
       const work = writeTail.then(async () => {
         if (terminalError) throw terminalError;
-        await task();
+        try { await task(); } catch (error) { throw safeError(error, "STT_PROVIDER_WRITE_FAILED"); }
       });
-      writeTail = work.catch((error) => { fail(error instanceof Error ? error : new Error("STT_PROVIDER_WRITE_FAILED")); });
+      writeTail = work.catch((error) => { fail(error); });
       return work.finally(() => { pendingFrames -= 1; });
     };
 
@@ -370,19 +398,30 @@ export class SonioxRealtimeAdapter {
       drainPromise = (async () => {
         await writeTail;
         if (terminalError) throw terminalError;
-        if (finishedReceived) return;
-        try { sendText(""); } catch (error) { fail(error); throw error; }
-        let deadline;
-        try {
-          await Promise.race([finished, new Promise((_, reject) => {
-            deadline = setTimer(() => reject(new Error("STT_DRAIN_TIMEOUT")), drainTimeoutMilliseconds);
-          })]);
-        } catch (error) {
-          fail(error instanceof Error ? error : new Error("STT_DRAIN_FAILED"));
-          throw terminalError;
-        } finally {
-          if (deadline !== undefined) clearTimer(deadline);
+        if (!finishedReceived) {
+          try { sendText(""); } catch (error) {
+            fail(safeError(error, "STT_PROVIDER_WRITE_FAILED"));
+            throw terminalError;
+          }
+          let deadline;
+          try {
+            await Promise.race([
+              finished,
+              // A socket that dies mid-drain is reported now, not at the deadline.
+              socketClosed.then(() => { throw terminalError ?? new Error("STT_PROVIDER_CLOSED"); }),
+              new Promise((_, reject) => {
+                deadline = setTimer(() => reject(new Error("STT_DRAIN_TIMEOUT")), drainTimeoutMilliseconds);
+              }),
+            ]);
+          } catch (error) {
+            fail(safeError(error, "STT_DRAIN_FAILED"));
+            throw terminalError;
+          } finally {
+            if (deadline !== undefined) clearTimer(deadline);
+          }
         }
+        // Whether `finished` arrived now or before the drain began, the final
+        // utterance it may have committed must be delivered before we resolve.
         await callbackTail;
       })();
       return drainPromise;
@@ -435,6 +474,8 @@ export class SonioxRealtimeAdapter {
           } catch {
             // drain() already recorded the terminal error; assertDrained surfaces it.
           } finally {
+            // Never let `didClose` cut off an utterance already handed to the owner.
+            await callbackTail;
             clearTimers();
             scheduler.dispose();
             closeSocket();

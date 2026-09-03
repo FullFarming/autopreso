@@ -414,3 +414,130 @@ test("a rejected final-utterance callback and an unexpected socket close both te
   assert.throws(() => dropped.stream.assertDrained(), /STT_PROVIDER_CLOSED/u);
   assert.equal(dropped.clock.pending().length, 0);
 });
+
+test("(M1/M2) an unsolicited finished commits pending text, close waits for that callback, and the stream fails STT_PROVIDER_CLOSED", async () => {
+  let release;
+  let settled = false;
+  const gate = new Promise((resolve) => { release = resolve; });
+  const seen = [];
+  const { socket, stream } = await openAdapter({ callbacks: { onFinalUtterance: async (utterance) => { seen.push(utterance); await gate; settled = true; } } });
+  socket.message({ tokens: [sourceFinal("서버가 끝낸 문장")], finished: true });
+  await flush();
+  assert.equal(seen.length, 1, "committed text is closed like a <fin> before the stream is failed");
+  assert.equal(seen[0].text, "서버가 끝낸 문장");
+  let closed = false;
+  const closing = stream.close().then((result) => { closed = true; return result; });
+  await flush();
+  await flush();
+  assert.equal(closed, false, "close resolves only after the utterance callback settled");
+  release();
+  const result = await closing;
+  assert.equal(settled, true);
+  assert.equal(result.transportClosed, true);
+  assert.throws(() => stream.assertDrained(), /STT_PROVIDER_CLOSED/u, "a finished nobody asked for is a dead socket");
+
+  const idle = await openAdapter();
+  idle.socket.message({ tokens: [], finished: true });
+  await flush();
+  assert.throws(() => idle.stream.assertDrained(), /STT_PROVIDER_CLOSED/u);
+  assert.equal(idle.socket.readyState, WebSocket.CLOSED);
+  assert.equal(idle.finals.length, 0);
+});
+
+test("(M3) a socket that closes mid-drain fails STT_PROVIDER_CLOSED at once instead of waiting out the drain deadline", async () => {
+  const { clock, socket, stream } = await openAdapter();
+  const draining = assert.rejects(stream.gracefulDrain(), /STT_PROVIDER_CLOSED/u);
+  await flush();
+  assert.equal(socket.sent.at(-1), "");
+  socket.close();
+  await draining;
+  assert.throws(() => stream.assertDrained(), /STT_PROVIDER_CLOSED/u);
+  assert.equal(clock.pending().length, 0, "the drain deadline and the keepalive are both gone");
+});
+
+test("(M4) raw ws send failures surface as STT_PROVIDER_WRITE_FAILED, never as the socket's own message", async () => {
+  const { socket, stream } = await openAdapter();
+  socket.send = () => { throw new Error("WebSocket is not open: readyState 3 (CLOSED) internal detail"); };
+  await assert.rejects(stream.sendAudio(new Uint8Array(FRAME)), (error) => error.message === "STT_PROVIDER_WRITE_FAILED");
+  assert.throws(() => stream.assertDrained(), (error) => error.message === "STT_PROVIDER_WRITE_FAILED");
+
+  const draining = await openAdapter();
+  draining.socket.send = () => { throw new Error("raw ws failure"); };
+  await assert.rejects(draining.stream.gracefulDrain(), (error) => error.message === "STT_PROVIDER_WRITE_FAILED");
+  assert.throws(() => draining.stream.assertDrained(), (error) => error.message === "STT_PROVIDER_WRITE_FAILED");
+});
+
+test("(M5) an oversized provider frame is rejected as SONIOX_MESSAGE_INVALID before it is decoded", async () => {
+  const { socket, stream } = await openAdapter();
+  socket.emit("message", Buffer.alloc(1_048_577, 0x20), false);
+  await flush();
+  assert.throws(() => stream.assertDrained(), /SONIOX_MESSAGE_INVALID/u);
+  assert.equal(socket.readyState, WebSocket.CLOSED);
+});
+
+test("(M6) the 65th in-flight frame is refused with STT_AUDIO_BACKPRESSURE without failing the stream", async () => {
+  const { socket, stream } = await openAdapter();
+  const results = Array.from({ length: 65 }, () => stream.sendAudio(new Uint8Array(FRAME)));
+  await assert.rejects(results[64], /STT_AUDIO_BACKPRESSURE/u);
+  await Promise.all(results.slice(0, 64));
+  assert.doesNotThrow(() => stream.assertDrained());
+  assert.equal(socket.sent.filter(Buffer.isBuffer).length, 64);
+  await stream.sendAudio(new Uint8Array(FRAME));
+  assert.equal(stream.getUsage().inputAudioMilliseconds, 65 * 40);
+  stream.abort();
+});
+
+test("(M6) a partial callback that throws or rejects fails the stream with STT_PARTIAL_CALLBACK_FAILED", async () => {
+  const throwing = await openAdapter({ callbacks: { onPartialTranscript: () => { throw new Error("RENDER_FAILED"); } } });
+  throwing.socket.message({ tokens: [sourceProvisional("임시")] });
+  await flush();
+  assert.throws(() => throwing.stream.assertDrained(), (error) => error.message === "STT_PARTIAL_CALLBACK_FAILED");
+
+  const rejecting = await openAdapter({ callbacks: { onPartialTranslation: async () => { throw new Error("PUBLISH_FAILED"); } } });
+  rejecting.socket.message({ tokens: [translationToken("Hel", { is_final: false })] });
+  await flush();
+  await flush();
+  assert.throws(() => rejecting.stream.assertDrained(), (error) => error.message === "STT_PARTIAL_CALLBACK_FAILED");
+});
+
+test("(M6) an owner signal aborted after open fails the stream with STT_DRAIN_ABORTED and closes the socket", async () => {
+  const controller = new AbortController();
+  const { socket, stream } = await openAdapter({ callbacks: { signal: controller.signal } });
+  await stream.sendAudio(new Uint8Array(FRAME));
+  controller.abort();
+  await flush();
+  assert.throws(() => stream.assertDrained(), /STT_DRAIN_ABORTED/u);
+  assert.equal(socket.readyState, WebSocket.CLOSED);
+  await assert.rejects(stream.sendAudio(new Uint8Array(FRAME)), /STT_DRAIN_ABORTED/u);
+});
+
+test("(M6) consecutive segments never share translation lanes", async () => {
+  const { socket, stream, finals } = await openAdapter();
+  socket.message({ tokens: [sourceFinal("첫째", { start_ms: 0, end_ms: 500 }), translationToken("First", { is_final: true }), { text: "<end>", is_final: true }] });
+  socket.message({ tokens: [sourceFinal("둘째", { start_ms: 600, end_ms: 1_100 }), { text: "<end>", is_final: true }] });
+  await flush();
+  assert.equal(finals.length, 2);
+  assert.deepEqual(finals[0].translations, { en: { text: "First", sourceLanguage: "ko" } });
+  assert.deepEqual(finals[1].translations, {});
+  assert.equal("en" in finals[1].translations, false);
+  assert.equal(finals[1].sourceStartOffsetMs, 600);
+  stream.abort();
+});
+
+test("(M8) provider errors carry request_id as a property, never inside the message", async () => {
+  const tagged = await openAdapter();
+  tagged.socket.message({ error_type: "limit_exceeded", error_message: "quota", request_id: "req-42" });
+  await flush();
+  let caught = null;
+  try { tagged.stream.assertDrained(); } catch (error) { caught = error; }
+  assert.equal(caught?.message, "SONIOX_RATE_LIMITED");
+  assert.equal(caught?.requestId, "req-42");
+
+  const oversized = await openAdapter();
+  oversized.socket.message({ error_type: "service_unavailable", request_id: "x".repeat(129) });
+  await flush();
+  caught = null;
+  try { oversized.stream.assertDrained(); } catch (error) { caught = error; }
+  assert.equal(caught?.message, "SONIOX_UNAVAILABLE");
+  assert.equal("requestId" in caught, false);
+});
