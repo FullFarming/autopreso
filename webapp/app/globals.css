@@ -1844,3 +1844,31 @@ input:focus-visible {
   .viewer-notebook .viewer-microphone-capsule:not(:disabled):active,
   .viewer-notebook .viewer-microphone-capsule:not(:disabled):hover:active { animation: none; transition: none; transform: none; }
 }
+
+/* 2026-09-03 feat(auth): login card (Google, email/password, signup), /auth/callback, /pending.
+   One primary action (Google); the credential form and the footer links stay quiet. */
+.auth-card { display: flex; flex-direction: column; gap: 12px; max-width: 26rem; }
+.auth-card .auth-button { min-height: 44px; width: 100%; display: inline-flex; align-items: center; justify-content: center; gap: 10px; padding: 0 16px; border-radius: 12px; font: var(--nova-ui-font); font-weight: 600; letter-spacing: var(--nova-ui-letter-spacing); cursor: pointer; }
+.auth-card .auth-button:disabled { cursor: default; }
+.auth-card .auth-google { min-height: 52px; }
+.auth-google svg { width: 18px; height: 18px; flex: none; }
+.auth-card .auth-secondary,
+.auth-card .auth-submit { border: 1px solid var(--nova-hairline-strong); background: transparent; color: inherit; text-decoration: none; }
+.auth-card .auth-submit:disabled,
+.auth-card .auth-secondary:disabled { opacity: .45; }
+.auth-divider { display: flex; align-items: center; gap: 12px; margin: 4px 0; color: var(--muted); font: var(--nova-ui-font); font-size: 0.875rem; letter-spacing: var(--nova-ui-letter-spacing); }
+.auth-divider::before, .auth-divider::after { content: ""; flex: 1; height: 1px; background: currentColor; opacity: 0.35; }
+.auth-form { display: flex; flex-direction: column; gap: 12px; }
+.auth-password { position: relative; }
+.auth-card .auth-password input { padding-right: 52px; }
+.auth-password .auth-password-toggle { position: absolute; right: 2px; bottom: 0; display: inline-flex; align-items: center; justify-content: center; min-width: 44px; min-height: 44px; padding: 0; background: transparent; border: 0; border-radius: var(--nova-r-sm); color: var(--muted); cursor: pointer; }
+.auth-password .auth-password-toggle[aria-pressed="true"] { color: inherit; }
+.auth-password .auth-password-toggle:disabled { cursor: default; opacity: .45; }
+.auth-notice { margin: 0; display: grid; gap: 6px; font: var(--nova-ui-font); font-size: 0.9375rem; line-height: 1.5; letter-spacing: var(--nova-ui-letter-spacing); }
+.auth-notice p { margin: 0; }
+.auth-links { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 8px; }
+.auth-links a, .auth-links button { min-height: 44px; display: inline-flex; align-items: center; padding: 0 8px; background: transparent; border: 0; color: inherit; text-decoration: underline; text-underline-offset: 3px; cursor: pointer; font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
+.auth-links button:disabled { cursor: default; opacity: .45; }
+.auth-card button:focus-visible,
+.auth-card a:focus-visible { outline: 2px solid var(--nova-system-default, var(--nova-blue)); outline-offset: 2px; }
+@media (max-width: 767px) { .auth-card { max-width: none; } }

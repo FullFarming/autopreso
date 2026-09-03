@@ -11,6 +11,7 @@ import { isPublicUnauthenticatedPath } from "../../lib/security/csrf";
 // visible instead of requiring a memorized URL.
 const viewerSource = readFileSync(resolve(process.cwd(), "components/live/LiveViewer.tsx"), "utf8");
 const loginSource = readFileSync(resolve(process.cwd(), "app/(login)/login/page.tsx"), "utf8");
+const cardSource = readFileSync(resolve(process.cwd(), "components/auth/LoginCard.tsx"), "utf8");
 const styles = readFileSync(resolve(process.cwd(), "app/globals.css"), "utf8");
 
 test("the first visit is public while administrator and record surfaces stay protected", () => {
@@ -26,7 +27,8 @@ test("the landing page opens participant entry and the protected admin route own
   assert.doesNotMatch(home, /LiveHostDashboard/u);
   const admin = readFileSync(resolve(process.cwd(), "app/admin/page.tsx"), "utf8");
   assert.match(admin, /<LiveHostDashboard\s*\/>/u);
-  assert.match(loginSource, /window\.location\.assign\("\/admin"\)/u);
+  // The legacy-id branch of the login card still lands on the protected dashboard by document navigation.
+  assert.match(cardSource, /window\.location\.assign\("\/admin"\)/u);
 });
 
 test("participant join screen offers the admin sign-in route", () => {
@@ -38,9 +40,10 @@ test("participant join screen offers the admin sign-in route", () => {
 });
 
 test("admin sign-in page names the admin role and routes back to participant join", () => {
-  assert.match(loginSource, /관리자\(호스트\) 로그인/u);
-  assert.match(loginSource, /href="\/watch"/u);
-  assert.match(loginSource, /참가자로 입장/u);
+  assert.match(loginSource, /<LoginCard\s*\/>/u);
+  assert.match(cardSource, /aria-label=\{t\("signInFormLabel"\)\}/u);
+  assert.match(cardSource, /href="\/watch"/u);
+  assert.match(cardSource, /t\("participantEntry"\)/u);
 });
 
 test("the join screen admin link is styled as a quiet secondary action", () => {

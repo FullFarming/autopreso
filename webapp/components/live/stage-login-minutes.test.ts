@@ -5,7 +5,7 @@ import { compositeColors, contrastRatio, createCssColorResolver, readCssDeclarat
 import { test } from "node:test";
 
 const stage = readFileSync(resolve(process.cwd(), "components/live/LiveStageView.tsx"), "utf8");
-const login = readFileSync(resolve(process.cwd(), "app/(login)/login/page.tsx"), "utf8");
+const login = readFileSync(resolve(process.cwd(), "components/auth/LoginCard.tsx"), "utf8");
 const minutes = readFileSync(resolve(process.cwd(), "components/live/MeetingMinutes.tsx"), "utf8");
 const summarySkeleton = readFileSync(resolve(process.cwd(), "components/live/SummarySkeleton.tsx"), "utf8");
 const controls = readFileSync(resolve(process.cwd(), "components/ui/FormControls.tsx"), "utf8");
@@ -56,10 +56,11 @@ test("login composes shared accessible controls with only the required credentia
   assert.match(login, /FormButton/u);
   assert.match(login, /FormError/u);
   assert.match(login, /JSON\.stringify\(\{ id, password \}\)/u);
-  assert.doesNotMatch(login, /name="name"/u);
+  // The name field exists only in signup mode; sign-in asks for the credentials alone.
+  assert.match(login, /mode === "signup" \? \(\s*<FormField id="signup-name" name="name"/u);
   for (const field of [
-    ['name="id"', 'autoComplete="username"'],
-    ['name="password"', 'autoComplete="current-password"'],
+    ['name="identifier"', '"username"'],
+    ['name="password"', '"current-password"'],
   ]) {
     assert.match(login, new RegExp(`${field[0]}[\\s\\S]{0,180}${field[1]}|${field[1]}[\\s\\S]{0,180}${field[0]}`, "u"));
   }

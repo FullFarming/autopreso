@@ -10,8 +10,10 @@ import { formatSystemRecordDate, formatSystemRecordTime, recordsMessages } from 
 import { authMessages } from "../../../lib/system-language/auth-messages";
 import * as hostSessionClient from "../../../lib/auth/host-session-client";
 import * as loginRetry from "../../../app/(login)/login/login-retry";
+import * as loginCardModel from "../../../components/auth/login-card-model";
+import { loginMessages } from "../../../lib/system-language/login-messages";
 
-const componentFiles = ["./LiveRecordsList.tsx", "./LiveRecordDetail.tsx", "./LiveRecordsRoute.tsx", "./RecordContentPanels.tsx", "./RecordPeopleTable.tsx", "../../GlassTopBar.tsx", "../../../app/(login)/login/page.tsx",
+const componentFiles = ["./LiveRecordsList.tsx", "./LiveRecordDetail.tsx", "./LiveRecordsRoute.tsx", "./RecordContentPanels.tsx", "./RecordPeopleTable.tsx", "../../GlassTopBar.tsx", "../../../app/(login)/login/page.tsx", "../../../components/auth/LoginCard.tsx",
   "../MeetingMinutes.tsx", "../MeetingSummaryCard.tsx", "../quality/MeetingTopicPresentation.tsx", "../earnings/EarningsCallHeader.tsx", "../earnings/EarningsCallContext.tsx", "../earnings/EarningsSectionNav.tsx", "../earnings/SelectedTranscriptSearch.tsx", "../earnings/GlossaryMatchDisclosure.tsx", "../earnings/GroundedPostCallIndex.tsx"];
 
 test("records and login dictionaries cover three languages with identical interpolation contracts", () => {
@@ -119,19 +121,29 @@ test("actual list and summary renders translate controls while preserving meetin
 
 test("actual login labels and topbar status translate without changing endpoint or credentials", () => {
   for (const language of ["ko", "en", "ja"] as const) {
-    const { default: LoginPage } = loadComponent("../../../app/(login)/login/page.tsx", language, {
-      "@/components/ui/FormControls": {
-        FormField: ({ label, ...props }: Record<string, unknown>) => createElement("label", null, String(label), createElement("input", props)),
-        FormButton: (props: Record<string, unknown>) => createElement("button", props),
-        FormError: (props: Record<string, unknown>) => createElement("p", props),
-      },
+    const formControls = {
+      FormField: ({ label, ...props }: Record<string, unknown>) => createElement("label", null, String(label), createElement("input", props)),
+      FormButton: (props: Record<string, unknown>) => createElement("button", props),
+      FormError: (props: Record<string, unknown>) => createElement("p", props),
+    };
+    const { LoginCard } = loadComponent("../../../components/auth/LoginCard.tsx", language, {
+      "@/components/ui/FormControls": formControls,
+      "@/app/(login)/login/login-retry": loginRetry,
+      "@/lib/system-language/login-messages": { loginMessages },
+      "@/lib/auth/supabase-browser": { getBrowserSupabase: () => { throw new Error("SUPABASE_PUBLIC_CONFIG_MISSING"); } },
+      "./AuthShell": loadComponent("../../../components/auth/AuthShell.tsx", language),
+      "./GoogleIcon": loadComponent("../../../components/auth/GoogleIcon.tsx", language),
+      "./login-card-model": loginCardModel,
     });
-    const login = renderToStaticMarkup(createElement(LoginPage));
-    assert.ok(login.includes(recordsMessages[language]["관리자 로그인"]));
-    assert.ok(login.includes(recordsMessages[language]["비밀번호"]));
-    assert.match(login, /name="id"/u);
+    const login = renderToStaticMarkup(createElement(LoginCard));
+    assert.ok(login.includes(loginMessages[language].title));
+    assert.ok(login.includes(loginMessages[language].password));
+    assert.ok(login.includes(loginMessages[language].googleContinue));
+    assert.match(login, /data-auth-action="google"/u);
+    assert.match(login, /name="identifier"/u);
     assert.match(login, /name="password"/u);
     assert.match(login, /href="\/watch"/u);
+    assert.doesNotMatch(login, /name="name"/u, "sign-in mode asks for credentials only");
     const { default: GlassTopBar } = loadComponent("../../GlassTopBar.tsx", language, { "next/navigation": { useRouter: () => ({}) } });
     const topbar = renderToStaticMarkup(createElement(GlassTopBar, { status: "connecting" }));
     assert.ok(topbar.includes(recordsMessages[language]["연결 중"]));

@@ -16,7 +16,8 @@ test("Retry-After accepts server seconds and HTTP dates without inventing a wait
 });
 
 test("login waits for explicit submission and erases password state before navigation", () => {
-  const source = readFileSync(new URL("./page.tsx", import.meta.url), "utf8");
+  // The credential form now lives in the shared login card; the page only mounts it.
+  const source = readFileSync(new URL("../../../components/auth/LoginCard.tsx", import.meta.url), "utf8");
   assert.match(source, /headers\.get\("Retry-After"\)/u);
   assert.match(source, /retryUntilRef\.current > Date\.now\(\)/u);
   assert.match(source, /disabled=\{submitting \|\| retrySeconds > 0\}/u);
