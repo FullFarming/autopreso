@@ -675,7 +675,8 @@ test("participant speaking controls are capability-gated while demo stays captio
   assert.match(viewer, /prepareSpeakCapture/u);
   assert.match(viewer, /canUseSpeakingFloor/u);
   const participantButton = await read("webapp/components/live/ParticipantSpeakButton.tsx");
-  assert.match(viewer, /canUseSpeakingFloor && <ParticipantSpeakButton state=\{speakState\}/u);
+  assert.match(viewer, /canUseSpeakingFloor && <div className="viewer-microphone-slot">\s*<ParticipantSpeakButton state=\{speakState\}/u);
+  assert.match(demo, /previewState !== "denied" && <div className="viewer-microphone-slot">/u);
   assert.match(participantButton, /aria-pressed=\{state !== "idle"\}/u);
   assert.match(demo, /ViewerReadingFeed/u);
   assert.doesNotMatch(demo, /SpeakControl|floorHolder|getUserMedia|prepareSpeakCapture/u);
@@ -1142,20 +1143,24 @@ test("viewer schedule formatting is deterministic across browser engines and hyd
 });
 
 test("login surface localizes NOVA system labels while preserving credential field contracts", async () => {
-  const [login, controls] = await Promise.all([
+  // 2026-09-03 auth: the login page renders <LoginCard /> (Supabase Auth + legacy id login in one card).
+  const [page, login, controls] = await Promise.all([
     read("webapp/app/(login)/login/page.tsx"),
+    read("webapp/components/auth/LoginCard.tsx"),
     read("webapp/components/ui/FormControls.tsx"),
   ]);
 
+  assert.match(page, /<LoginCard \/>/u);
   assert.doesNotMatch(login, /라이브 콜을 시작하고 운영합니다/);
-  assert.doesNotMatch(login, /id="login-name"|name="name"/);
-  assert.match(login, /id="login-id" name="id" label=\{t\("아이디"\)\} type="text" autoComplete="username"/);
-  assert.match(login, /id="login-password" name="password" label=\{t\("비밀번호"\)\} type="password" autoComplete="current-password"/);
-  assert.match(login, /<FormButton\b[\s\S]*?\{t\(submitting \? "로그인 중…" : "로그인"\)\}[\s\S]*?<\/FormButton>/u);
-  assert.match(login, /<FormError>\{t\(error\)\}<\/FormError>/u);
+  assert.match(login, /id="login-identifier" name="identifier" label=\{t\(mode === "signup" \? "email" : "identifier"\)\}/u);
+  assert.match(login, /autoComplete=\{mode === "signup" \? "email" : "username"\}/u);
+  assert.match(login, /id="login-password" name="password" label=\{t\("password"\)\} type=\{showPassword \? "text" : "password"\}/u);
+  assert.match(login, /autoComplete=\{mode === "signup" \? "new-password" : "current-password"\}/u);
+  assert.match(login, /<FormButton type="submit"[^>]*data-auth-action="submit"/u);
+  assert.match(login, /<FormError>\{error\}<\/FormError>/u);
   assert.match(controls, /role="alert"/u);
-  assert.match(login, /관리자 로그인/);
-  assert.match(login, /href="\/watch">\{t\("참가자로 입장"\)\}/);
+  assert.match(login, /aria-label=\{t\("signInFormLabel"\)\}/u);
+  assert.match(login, /href="\/watch">\{t\("participantEntry"\)\}/u);
   assert.doesNotMatch(login, /label="Display name"|label="Password"|>Sign in|Internal access only/);
 });
 
