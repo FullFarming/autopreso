@@ -38,3 +38,9 @@ test("a store outage does not lock out a host whose last known status was approv
   await cache.get("h1"); fail = true; now = 120_000;
   assert.deepEqual(await assertHostApproved("h1", cache), { role: "host" });
 });
+
+test("a profile-backed host id whose profile row is gone is rejected, while a legacy password host id still falls through", async () => {
+  const cache = createProfileStatusCache({ read: async () => null });
+  await assert.rejects(assertHostApproved("00000000-0000-4000-8000-000000000011", cache), AuthenticationError);
+  assert.deepEqual(await assertHostApproved("noel", cache), { role: "legacy" });
+});

@@ -1,4 +1,5 @@
 import { LiveSecurityConfigurationError } from "../security/config";
+import { isProfileBackedHostId } from "../security/host-session-policy";
 import { AuthenticationError } from "./live-auth";
 import { SupabaseProfileStore, type ProfileRecord, type ProfileRole, type ProfileStatus } from "./profile-store";
 
@@ -48,7 +49,13 @@ export function __setProfileReaderForTests(next: Reader | null): void { reader =
 
 export async function assertHostApproved(hostId: string, cache = profileStatusCache): Promise<{ role: ProfileRole | "legacy" }> {
   const profile = await cache.get(hostId);
-  if (profile === null) return { role: "legacy" };
+  if (profile === null) {
+    // `profiles.id` cascades from auth.users: deleting the auth user removes the row while a signed
+    // cookie may still be in circulation. A uuid subject without a profile therefore fails closed;
+    // only non-uuid ids (ADMIN_USER_IDS password hosts) are the legacy path.
+    if (isProfileBackedHostId(hostId)) throw new AuthenticationError("호스트 계정을 찾을 수 없습니다.");
+    return { role: "legacy" };
+  }
   if (profile.status !== "approved") throw new AuthenticationError("호스트 계정이 승인되지 않았거나 비활성화되었습니다.");
   return { role: profile.role };
 }
