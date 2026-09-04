@@ -4,8 +4,8 @@ import test from "node:test";
 import { isHostSessionPage } from "./host-session-pages";
 
 test("session maintenance excludes login, participants, demos, and similarly named routes", () => {
-  for (const path of ["/admin", "/records", "/m/records"]) assert.equal(isHostSessionPage(path), true, path);
-  for (const path of [null, "/stage/session-id", "/", "/login", "/watch", "/m/watch", "/m/watch/demo", "/admin-other", "/records/demo", "/stage", "/stage/a/child", "/stage/"]) assert.equal(isHostSessionPage(path), false, String(path));
+  for (const path of ["/admin", "/records", "/m/records", "/console", "/console/users", "/console/engine"]) assert.equal(isHostSessionPage(path), true, path);
+  for (const path of [null, "/stage/session-id", "/", "/login", "/watch", "/m/watch", "/m/watch/demo", "/admin-other", "/records/demo", "/stage", "/stage/a/child", "/stage/", "/consoles", "/console-x"]) assert.equal(isHostSessionPage(path), false, String(path));
 });
 
 test("maintenance pauses on errors, never forces navigation, and does not restart when UI language changes", () => {

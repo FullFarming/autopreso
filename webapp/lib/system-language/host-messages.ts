@@ -96,6 +96,7 @@ const entries: readonly (readonly [string, string, string, string?])[] = [
   ["호스트 작업 영역", "Host workspace", "ホスト作業エリア"],
   ["라이브", "Live", "ライブ"],
   ["라이브콜 기록", "Live Call records", "ライブコールの記録"],
+  ["콘솔", "Console", "コンソール"],
   ["설정", "Settings", "設定"],
   ["참가자로 입장", "Join as a participant", "参加者として入場"],
   ["세션 완료", "Session complete", "セッション完了"],

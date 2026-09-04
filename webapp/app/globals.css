@@ -1876,3 +1876,115 @@ input:focus-visible {
 .auth-card button:focus-visible,
 .auth-card a:focus-visible { outline: 2px solid var(--nova-system-default, var(--nova-blue)); outline-offset: 2px; }
 @media (max-width: 767px) { .auth-card { max-width: none; } }
+
+/* 2026-09-04 feat(console): admin console (/console/users, /sessions, /engine). Scoped to
+   .console-shell; the rail reuses .live-host-rail (its 58px / 44px targets stay in force). */
+.console-shell .live-host-rail nav a { gap: 10px; justify-content: space-between; text-decoration: none; }
+.console-shell .live-host-rail nav a[aria-current="page"] { background: var(--nova-web-action); color: var(--nova-web-text); }
+.console-shell .live-host-rail nav a:focus-visible { outline: 2px solid var(--nova-system-default); outline-offset: 2px; }
+.console-badge { display: inline-grid; min-width: 24px; height: 24px; place-items: center; padding: 0 7px; border-radius: var(--nova-r-pill); background: var(--nova-status-error); color: var(--nova-web-text); font-size: 12px; font-weight: 600; line-height: 1; font-variant-numeric: tabular-nums; }
+.console-shell .live-host-rail nav a[aria-current="page"] .console-badge { background: var(--nova-web-text); color: var(--nova-web-action); }
+.console-rail-account { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.console-workspace { display: grid; gap: 20px; align-content: start; }
+.console-panel { display: grid; gap: 16px; }
+.console-panel h2 { margin: 0; color: var(--nova-fg-primary); font-size: var(--nova-font-size-t4, 20px); line-height: var(--nova-line-height-t4, 29px); }
+.console-panel .live-help { margin: 0; color: var(--nova-fg-secondary); font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
+.console-panel .live-error { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px; margin: 0; }
+.console-chips { display: flex; flex-wrap: wrap; gap: 8px; }
+.console-chips button { display: inline-flex; min-height: 44px; align-items: center; gap: 6px; padding: 0 16px; border: 1px solid var(--nova-surface-hairline); border-radius: var(--nova-r-pill); background: transparent; color: var(--nova-fg-secondary); font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
+.console-chips button[aria-pressed="true"] { border-color: var(--nova-web-action); background: var(--nova-web-action); color: var(--nova-web-text); }
+.console-chips button:focus-visible { outline: 2px solid var(--nova-system-default); outline-offset: 2px; }
+.console-table-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+.console-table { width: 100%; min-width: 640px; border-collapse: collapse; color: var(--nova-fg-primary); font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
+.console-table caption { padding: 0 0 8px; color: var(--nova-fg-secondary); text-align: left; font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
+.console-table th,
+.console-table td { padding: 12px 14px; border-top: 1px solid var(--nova-surface-hairline); text-align: left; vertical-align: top; }
+.console-table th { color: var(--nova-fg-secondary); font-weight: 500; white-space: nowrap; }
+.console-table tbody tr[aria-busy="true"] { opacity: .55; }
+.console-table td.console-num span { display: block; }
+.console-num { font-variant-numeric: tabular-nums; }
+th.console-num, td.console-num { text-align: right; }
+.console-empty { color: var(--nova-fg-secondary); text-align: center; }
+.console-status { display: inline-flex; min-height: 28px; align-items: center; padding: 0 10px; border: 1px solid var(--nova-surface-hairline); border-radius: var(--nova-r-pill); color: var(--nova-fg-secondary); font-size: 13px; white-space: nowrap; }
+.console-status-pending,
+.console-status-preparing { border-color: color-mix(in srgb, var(--nova-web-action) 60%, transparent); color: var(--nova-fg-primary); }
+.console-status-approved,
+.console-status-live,
+.console-result-switched { border-color: color-mix(in srgb, var(--nova-status-ok) 60%, transparent); color: var(--nova-status-ok); }
+.console-status-rejected,
+.console-status-disabled,
+.console-status-failed,
+.console-result-failed { border-color: color-mix(in srgb, var(--nova-status-error) 60%, transparent); color: var(--nova-status-error); }
+.console-row-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.console-row-actions button,
+.console-row-actions select,
+.console-reject-form input,
+.console-field select { min-height: 44px; border-radius: var(--nova-radius-sm); font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
+.console-row-actions .live-primary-action { min-height: 44px; padding: 0 18px; border-radius: var(--nova-radius-sm); }
+.console-row-actions .glass-btn { padding: 0 16px; }
+.console-row-actions select,
+.console-field select,
+.console-reject-form input { padding: 0 12px; border: 1px solid var(--nova-surface-hairline); background: var(--nova-surface-base); color: var(--nova-fg-primary); }
+.console-row-actions select:focus-visible,
+.console-field select:focus-visible,
+.console-reject-form input:focus-visible,
+.console-panel button:focus-visible,
+.console-panel a:focus-visible { outline: 2px solid var(--nova-system-default); outline-offset: 2px; }
+.console-inline-field { display: inline-flex; align-items: center; gap: 8px; color: var(--nova-fg-secondary); }
+.console-danger { display: inline-flex; min-height: 44px; align-items: center; justify-content: center; padding: 0 16px; border: 1px solid var(--nova-status-error); border-radius: var(--nova-radius-sm); background: transparent; color: var(--nova-status-error); font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
+.console-danger:disabled { opacity: .45; cursor: not-allowed; }
+.console-reject-form { display: grid; flex-basis: 100%; gap: 10px; padding: 12px; border: 1px solid var(--nova-surface-hairline); border-radius: var(--nova-radius-sm); }
+.console-reject-form label { display: grid; gap: 6px; color: var(--nova-fg-secondary); }
+.console-row-error { margin: 8px 0 0; color: var(--nova-status-error); font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
+.console-row-link { display: grid; gap: 2px; color: inherit; text-decoration: none; }
+.console-row-link strong { text-decoration: underline; text-underline-offset: 3px; }
+.console-row-link small { color: var(--nova-fg-secondary); }
+.console-summary-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
+.console-summary-card { display: grid; gap: 6px; padding: 16px; border: 1px solid var(--nova-surface-hairline); border-radius: var(--nova-radius-sm); }
+.console-summary-card span { color: var(--nova-fg-secondary); font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
+.console-summary-card strong { color: var(--nova-fg-primary); font-size: 28px; line-height: 1.2; }
+.console-engine-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+.console-field { display: grid; gap: 6px; color: var(--nova-fg-secondary); font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
+.console-field select { width: 100%; }
+.console-field select:disabled { opacity: .55; }
+.console-deploy-row { display: flex; flex-wrap: wrap; align-items: center; gap: 14px; }
+.console-deploy-row .live-primary-action { min-height: 46px; border-radius: var(--nova-radius-sm); }
+.console-last-change { flex: 1 1 240px; }
+.console-status-line { margin: 0; color: var(--nova-status-ok); font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
+.console-switch-row { cursor: pointer; }
+.console-switch-row small { display: block; white-space: normal; }
+.console-dialog { width: min(92vw, 440px); padding: 24px; border: 1px solid var(--nova-surface-hairline); border-radius: var(--nova-radius-md, 12px); background: var(--nova-surface-base); color: var(--nova-fg-primary); }
+.console-dialog::backdrop { background: rgba(0, 0, 0, .55); }
+.console-dialog h2 { margin: 0 0 12px; font-size: var(--nova-font-size-t4, 20px); line-height: var(--nova-line-height-t4, 29px); overflow-wrap: anywhere; }
+.console-dialog-body { color: var(--nova-fg-secondary); font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
+.console-dialog-body p { margin: 0; }
+.console-dialog-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 20px; }
+.console-dialog-actions button { min-height: 44px; padding: 0 18px; border-radius: var(--nova-radius-sm); }
+.console-dialog-actions .glass-btn { border-color: var(--nova-surface-hairline); background: transparent; color: var(--nova-fg-primary); }
+.console-dialog button:focus-visible { outline: 2px solid var(--nova-system-default); outline-offset: 2px; }
+@media (max-width: 1023px) {
+  .console-shell { display: block; width: 100%; }
+  .console-shell .live-host-rail { position: static; width: 100%; height: auto; flex-direction: row; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; padding: 14px; border-right: 0; border-bottom: 1px solid var(--nova-surface-hairline); }
+  .console-shell .live-host-rail > strong { padding: 0; }
+  .console-shell .live-host-rail nav { display: flex; flex-direction: row; flex-basis: 100%; gap: 4px; overflow-x: auto; }
+  .console-shell .live-host-rail nav a { min-height: 44px; flex: 0 0 auto; padding: 0 14px; }
+  .console-shell .live-host-rail .live-host-participant-link { margin: 0; padding: 0; }
+  .console-shell .live-host-rail .live-join-credit { display: none; }
+  .console-shell .console-workspace { width: min(100% - 28px, 960px); padding-top: 20px; }
+}
+@media (max-width: 767px) {
+  .console-summary-grid,
+  .console-engine-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  /* Users table becomes a card per row; the header cells are announced through data-label. */
+  .console-users-table { min-width: 0; }
+  .console-users-table thead { position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0; border: 0; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+  .console-users-table tbody tr { display: grid; gap: 8px; padding: 14px 0; border-top: 1px solid var(--nova-surface-hairline); }
+  .console-users-table tbody td { display: grid; grid-template-columns: minmax(96px, .4fr) minmax(0, 1fr); gap: 10px; padding: 0; border: 0; text-align: left; }
+  .console-users-table tbody td.console-empty { display: block; }
+  .console-users-table tbody td::before { content: attr(data-label); color: var(--nova-fg-secondary); }
+  .console-users-table tbody td.console-empty::before { content: none; }
+  .console-users-table tbody td.console-num { text-align: left; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .console-dialog { animation: none; }
+}

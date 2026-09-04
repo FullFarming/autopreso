@@ -1705,6 +1705,18 @@ export default function LiveHostDashboard() {
               : session?.status === "preparing" && (scheduledStartState === "connecting" || scheduledStartState === "confirming") ? "connecting"
                 : isBusy ? "warming" : session?.status === "live" ? "connecting" : "idle";
 
+  // Task 4 (admin console): the rail offers /console only to admins. One GET on mount; the
+  // response's `role` is the only signal, so a failed or non-admin answer simply shows no link.
+  const [isConsoleAdmin, setIsConsoleAdmin] = useState(false);
+  useEffect(() => {
+    const controller = new AbortController();
+    void fetch("/api/auth/session", { method: "GET", credentials: "same-origin", cache: "no-store", signal: controller.signal })
+      .then((response) => response.json() as Promise<{ ok: boolean; data?: { role?: string } }>)
+      .then((payload) => { if (!controller.signal.aborted) setIsConsoleAdmin(payload.ok === true && payload.data?.role === "admin"); })
+      .catch(() => undefined);
+    return () => controller.abort();
+  }, []);
+
   if (!LIVE_CALL_ENABLED) {
     return (
       <main className="live-host-shell">
@@ -1727,6 +1739,7 @@ export default function LiveHostDashboard() {
         <nav aria-label={t("호스트 작업 영역")}>
           <button type="button" className="is-current" aria-current="page">{t("라이브")}</button>
           <a href="/records">{t("라이브콜 기록")}</a>
+          {isConsoleAdmin && <a href="/console">{t("콘솔")}</a>}
           <button type="button" disabled>{t("설정")}</button>
         </nav>
         <p className="live-join-admin live-host-participant-link"><a href="/watch">{t("참가자로 입장")}</a></p>
