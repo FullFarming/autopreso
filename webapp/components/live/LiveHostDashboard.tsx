@@ -25,6 +25,7 @@ import type {
 } from "@/lib/live-contract";
 import { LANGUAGE_CODES, LANGUAGE_LABELS } from "@/lib/languageDetect";
 import { LIVE_CALL_ENABLED } from "@/lib/live/feature-flag";
+import { formatEngineLabel } from "@/lib/live/engine-label";
 import { mergeLanguageCaptionCache } from "@/lib/live/caption-feed";
 import { createHostDemandControl } from "./host-demand-control";
 import {
@@ -1705,6 +1706,20 @@ export default function LiveHostDashboard() {
               : session?.status === "preparing" && (scheduledStartState === "connecting" || scheduledStartState === "confirming") ? "connecting"
                 : isBusy ? "warming" : session?.status === "live" ? "connecting" : "idle";
 
+  // Spec §9: the admin's global engine is the ONLY Live Call engine. Hosts see it read-only
+  // (a session shows its own stored engine, a new call the published default); nothing on this
+  // page can change it - the console deploy does, and running sessions follow.
+  const [engineDefaults, setEngineDefaults] = useState<unknown>(null);
+  useEffect(() => {
+    const controller = new AbortController();
+    void fetch("/api/live-config", { method: "GET", credentials: "same-origin", cache: "no-store", signal: controller.signal })
+      .then((response) => response.json() as Promise<{ ok: boolean; data?: { engineDefaults?: unknown } }>)
+      .then((payload) => { if (!controller.signal.aborted && payload.ok === true) setEngineDefaults(payload.data?.engineDefaults ?? null); })
+      .catch(() => undefined);
+    return () => controller.abort();
+  }, []);
+  const engineStatusLabel = formatEngineLabel(session?.modelPreferences?.engine ?? engineDefaults);
+
   // Task 4 (admin console): the rail offers /console only to admins. One GET on mount; the
   // response's `role` is the only signal, so a failed or non-admin answer simply shows no link.
   const [isConsoleAdmin, setIsConsoleAdmin] = useState(false);
@@ -1864,6 +1879,10 @@ export default function LiveHostDashboard() {
             {!session && scheduleNow !== null && scheduleValidation.error && (
               <p id="live-schedule-error" className="live-error" role="alert">{t(scheduleValidation.error)}</p>
             )}
+            <p className="live-engine-status" data-engine-status aria-live="polite">
+              <span>{t("자막 엔진")}</span>
+              <strong title={engineStatusLabel}>{t("관리자 지정")} · {engineStatusLabel}</strong>
+            </p>
             <section className="live-context-panel" aria-labelledby="live-context-heading">
               <div className="live-field-label">
                 <strong id="live-context-heading">{t("행사 컨텍스트")}</strong>

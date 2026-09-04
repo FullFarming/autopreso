@@ -1,3 +1,5 @@
+import type { TranslationCapture } from "./live/translation-capture";
+import type { LiveModelPreferences } from "./live/model-preferences";
 import type { LanguageObservation, SourceEvent, SourceDraftEvent, SourceDraftClearEvent } from "./live/source-contract";
 export type { LanguageObservation, SourceEvent, SourceSnapshot, SourceDraftEvent, SourceDraftClearEvent } from "./live/source-contract";
 
@@ -64,6 +66,7 @@ export interface LiveSession {
   fiscalPeriod?: string | null;
   eventType?: LiveEventType | null;
   agenda?: LiveAgendaItem[];
+  modelPreferences?: LiveModelPreferences;
   activeSection?: LiveSessionSection;
   sectionStartedAt?: string | null;
   /** Host-owned pre-call capability. Viewers may request the shared floor only
@@ -183,6 +186,8 @@ export interface LiveFloorHolder {
 }
 
 export interface CaptionEvent {
+  translationCapture?: TranslationCapture;
+  observedSourceLanguage?: string | null;
   type: "caption";
   seq: number;
   sessionId: string;
@@ -248,6 +253,7 @@ export interface RecordingStatusEvent {
 }
 
 export type LiveControlEvent =
+  | { type: "source-status"; sessionId: string; status: "unavailable"; code: "SOURCE_RECORDING_UNAVAILABLE" }
   | { type: "session-status"; sessionId: string; status: LiveSessionStatus; code?: string }
   | { type: "floor"; sessionId: string; holder: LiveFloorHolder | null }
   | { type: "language-status"; sessionId: string; language: string; status: "preparing" | "ready" | "unavailable"; code?: string }

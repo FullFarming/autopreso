@@ -1,6 +1,47 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { HostDemandControl, HostMediaRuntime } from "./host-demand-control";
+import type { SourceEvent } from "../../lib/live/source-contract";
+import { createGeminiCaptionConfig } from "../../../packages/caption-core/gemini-caption-contract.js";
+import { DEFAULT_ENGINE_SELECTION } from "../../../packages/caption-core/caption-engine-catalog.js";
+
+test("host original callbacks accept only canonical same-meeting sources and fixed failure status", async () => {
+  FakeWebSocket.instances = [];
+  FakeWebSocket.shouldOpen = true;
+  const restore = [replaceGlobal("window", globalThis), replaceGlobal("WebSocket", FakeWebSocket),
+    replaceGlobal("AudioContext", FakeAudioContext), replaceGlobal("AudioWorkletNode", FakeAudioWorkletNode),
+    replaceGlobal("fetch", async () => new Response(null, { status: 204 })),
+    replaceGlobal("navigator", { mediaDevices: { async getUserMedia() { return { getTracks: () => [{ stop() {} }] }; } } })];
+  const sessionId = "0192d0f4-9f72-7a36-91f5-6a76ef736f41";
+  const credentials = { token: "host-token", gatewayUrl: "wss://gateway.example.test/live", expiresAt: new Date(Date.now() + 900000).toISOString() };
+  const sources: SourceEvent[] = [];
+  const statuses: string[] = [];
+  let client: LiveAudioClient | null = null;
+  try {
+    client = await startLiveAudioClient({ sessionId, version: 1, sessionType: "presentation", languages: ["ko", "en"],
+      inputSource: "mic", outputMode: "captions", voiceProvider: "gemini", maxViewers: 50, glossaryPack: "general_cre", credentials,
+      async refreshCredentials() { return credentials; }, onCaption() {}, onStatus() {}, onError() {}, onSpeakers() {}, onLanguageStatus() {},
+      onSource: (source) => sources.push(source), onSourceStatus: (status) => statuses.push(status) });
+    const socket = FakeWebSocket.instances[0]; assert.ok(socket);
+    const send = (event: object) => socket.dispatchEvent(new MessageEvent("message", { data: JSON.stringify(event) }));
+    const original: SourceEvent = { type: "source", sessionId, sourceSeq: 1, sourceUtteranceId: "11111111-1111-4111-8111-111111111111",
+      utteranceKey: "canonical-source-1", text: "실제 원문", sourceLanguage: "ko", languageObservation: null,
+      speaker: { role: "host", label: "호스트" }, isFinal: true, sourceStartedAt: null,
+      sourceEndedAt: "2026-09-01T00:00:01.000Z", emittedAt: "2026-09-01T00:00:02.000Z" };
+    send({ ...original, sourceText: "translation pretending to be original" });
+    send({ ...original, sessionId: "0192d0f4-9f72-7a36-91f5-6a76ef736f42" });
+    send({ ...original, isFinal: false });
+    send({ ...original, sourceSeq: 0 });
+    assert.equal(sources.length, 0);
+    send(original); send(original);
+    assert.deepEqual(sources.map((source) => source.text), ["실제 원문"]);
+    const unavailable = { type: "source-status", sessionId, status: "unavailable", code: "SOURCE_RECORDING_UNAVAILABLE" };
+    send({ ...unavailable, code: "fake" }); send({ ...unavailable, sessionId: "other" }); send(unavailable);
+    assert.deepEqual(statuses, ["unavailable"]);
+    await client.stop(); send({ ...original, sourceSeq: 2 }); send(unavailable);
+    assert.equal(sources.length, 1); assert.equal(statuses.length, 1);
+  } finally { await client?.stop(); for (const reset of restore.reverse()) reset(); }
+});
 
 import {
   LiveAudioRecoveryError,
@@ -20,7 +61,63 @@ interface GatewayMessage {
   glossaryPack?: string;
   inputSource?: string;
   demandEnabled?: boolean;
+  captionConfig?: { engine: typeof DEFAULT_ENGINE_SELECTION; models: { transcription: string; summary: string; polish: string } };
 }
+
+test("web host start, update, reconnect and manual restart carry the session engine into every gateway captionConfig", async () => {
+  FakeWebSocket.instances = []; FakeWebSocket.shouldOpen = true;
+  const restore = [replaceGlobal("window", globalThis), replaceGlobal("WebSocket", FakeWebSocket),
+    replaceGlobal("AudioContext", FakeAudioContext), replaceGlobal("AudioWorkletNode", FakeAudioWorkletNode),
+    replaceGlobal("fetch", async () => new Response(null, { status: 204 })),
+    replaceGlobal("navigator", { mediaDevices: { async getUserMedia() { return { getTracks: () => [{ stop() {} }] }; } } })];
+  // The server hands the host the normalized `{ engine, engineHistory }`; the translation role
+  // differs from the default so the test proves the whole engine travels, not just the model ids.
+  const engine = { ...DEFAULT_ENGINE_SELECTION, translation: { provider: "gemini", model: "gemini-3.7-flash" } };
+  const preferences = { engine, engineHistory: [] };
+  const credentials = { token: "host-token", gatewayUrl: "wss://gateway.example.test/live", expiresAt: new Date(Date.now() + 900000).toISOString() };
+  const settings = { version: 2, sessionStatus: "live" as const, sessionType: "presentation" as const, languages: ["ko", "en"],
+    outputMode: "captions" as const, voiceProvider: "gemini" as const, maxViewers: 50, glossaryPack: "general_cre" as const, modelPreferences: preferences };
+  let client: LiveAudioClient | null = null;
+  try {
+    client = await startLiveAudioClient({ ...settings, sessionId: "0192d0f4-9f72-7a36-91f5-6a76ef736f41", inputSource: "mic", credentials,
+      refreshCredentials: async () => credentials, refreshSettings: async () => settings,
+      onStatus() {}, onError() {}, onSpeakers() {}, onLanguageStatus() {} });
+    const first = FakeWebSocket.instances[0]; assert.ok(first);
+    assert.deepEqual(first.messages.find((message) => message.type === "start")?.captionConfig?.engine, engine);
+    await client.update({ ...settings, version: 3, modelPreferences: undefined });
+    assert.deepEqual(first.messages.find((message) => message.type === "update")?.captionConfig?.engine, engine, "an update without preferences keeps the current engine");
+    first.close();
+    await waitUntil(() => FakeWebSocket.instances.some((socket) => socket !== first && socket.messages.some((message) => message.type === "start")));
+    const second = FakeWebSocket.instances.at(-1); assert.ok(second);
+    assert.deepEqual(second.messages.find((message) => message.type === "start")?.captionConfig?.engine, engine);
+    await client.restart();
+    const restart = second.messages.find((message) => message.type === "restart");
+    assert.deepEqual(restart?.captionConfig?.engine, engine);
+    assert.deepEqual(restart?.captionConfig?.models, { transcription: engine.stt.model, summary: engine.summary.model, polish: "gemini-3.7-flash" });
+  } finally { await client?.stop(); for (const reset of restore.reverse()) reset(); }
+});
+
+test("invalid or legacy web model preferences fail before gateway warmup, sockets, or microphone capture", async () => {
+  FakeWebSocket.instances = [];
+  let externalCalls = 0;
+  const restore = [replaceGlobal("window", globalThis), replaceGlobal("WebSocket", FakeWebSocket),
+    replaceGlobal("fetch", async () => { externalCalls += 1; return new Response(null, { status: 204 }); }),
+    replaceGlobal("navigator", { mediaDevices: { async getUserMedia() { externalCalls += 1; throw new Error("must not capture"); } } })];
+  const options = { sessionId: "0192d0f4-9f72-7a36-91f5-6a76ef736f41", version: 1, sessionType: "presentation", languages: ["en", "ko"],
+    inputSource: "mic", outputMode: "captions", voiceProvider: "gemini", maxViewers: 50, glossaryPack: "general_cre",
+    credentials: { token: "host-token", gatewayUrl: "wss://gateway.example.test/live", expiresAt: new Date(Date.now() + 900000).toISOString() },
+    onStatus() {}, onError() {}, onSpeakers() {}, onLanguageStatus() {} };
+  try {
+    // The server always normalizes to `{ engine, engineHistory }`, so the browser accepts nothing else -
+    // not even the legacy per-role pin, and never an engine outside the catalog.
+    for (const modelPreferences of [null, {}, { engine: null }, { engine: { stt: { provider: "nope", model: "x", languageMode: "auto" } } },
+      { engine: DEFAULT_ENGINE_SELECTION, override: true }, { source: "gemini-3.5-transcribe-live", summary: "gemini-3.6-flash" }]) {
+      await assert.rejects(() => Reflect.apply(startLiveAudioClient, undefined, [{ ...options, modelPreferences }]), /지원하지|올바르지/u);
+    }
+    assert.equal(FakeWebSocket.instances.length, 0);
+    assert.equal(externalCalls, 0);
+  } finally { for (const reset of restore.reverse()) reset(); }
+});
 
 class FakeWebSocket extends EventTarget {
   static readonly CONNECTING = 0;
@@ -74,6 +171,7 @@ class FakeWebSocket extends EventTarget {
       && !FakeWebSocket.ignoredReplyTypes.has(message.type)
       && !FakeWebSocket.errorReplyTypes.has(message.type)) this.reply("resumed");
     if (FakeWebSocket.errorReplyTypes.has(message.type)) this.reply("error");
+    if (message.type === "drain" && !FakeWebSocket.errorReplyTypes.has(message.type) && !FakeWebSocket.ignoredReplyTypes.has(message.type)) this.reply("drained", { sessionId: message.sessionId });
     if (message.type === "audioStreamEnd" && !FakeWebSocket.ignoredReplyTypes.has(message.type)) this.reply("audio-stream-ended");
     if (message.type === "stop" && !FakeWebSocket.ignoredReplyTypes.has(message.type)) this.reply("stopped");
   }
@@ -1053,6 +1151,7 @@ test("host sends the persisted session version on start, update, and reconnect",
     const firstSocket = FakeWebSocket.instances[0];
     assert.ok(firstSocket);
     assert.deepEqual(firstSocket.messages.find((message) => message.type === "start"), {
+      captionConfig: createGeminiCaptionConfig({ languages: ["en"], glossaryPack: "general_cre", domainText: "Company: NOVA\nEvent type: 글로벌 타운홀" }),
       type: "start",
       sessionId: "0192d0f4-9f72-7a36-91f5-6a76ef736f41",
       version: 4,
@@ -1078,6 +1177,7 @@ test("host sends the persisted session version on start, update, and reconnect",
       domainText: "Company: NOVA\nAgenda 1: Global expansion",
     });
     assert.deepEqual(firstSocket.messages.find((message) => message.type === "update"), {
+      captionConfig: createGeminiCaptionConfig({ languages: ["ko", "en"], glossaryPack: "hotel", domainText: "Company: NOVA\nAgenda 1: Global expansion" }),
       type: "update",
       sessionId: "0192d0f4-9f72-7a36-91f5-6a76ef736f41",
       version: 5,
@@ -1098,6 +1198,7 @@ test("host sends the persisted session version on start, update, and reconnect",
     const initialStart = firstSocket.messages.find((message) => message.type === "start");
     assert.equal(refreshCount, 1);
     assert.deepEqual(reconnectStart, {
+      captionConfig: createGeminiCaptionConfig({ languages: ["ko", "en"], glossaryPack: "hotel", domainText: "Company: NOVA\nAgenda 1: Global expansion" }),
       type: "start",
       sessionId: "0192d0f4-9f72-7a36-91f5-6a76ef736f41",
       version: 4,
@@ -1298,6 +1399,19 @@ test("host caption and status callbacks enforce session, configured-language, se
     statuses.length = 0;
     const first = FakeWebSocket.instances[0];
     assert.ok(first);
+    const translationCapture = { kind: "independent-live-translation", streamGeneration: "10000000-0000-4000-8000-000000000001",
+      captureEpoch: "10000000-0000-4000-8000-000000000002", captureStartedAt: null,
+      captureEndedAt: "2026-08-15T00:00:01.000Z", finalization: "application-sentence-boundary" };
+    for (const overrides of [
+      { translationCapture: { ...translationCapture, captureEpoch: "malformed" }, sourceText: "Fake source", sourceLanguage: "en" },
+      { translationCapture, sourceText: "Fake source" },
+      { translationCapture, sourceLanguage: "en" },
+      { translationCapture, origin: "source" },
+      { translationCapture, authoritativeSourceId: "10000000-0000-4000-8000-000000000003" },
+    ]) first.dispatchEvent(new MessageEvent("message", { data: JSON.stringify(caption({
+      text: "invalid provenance", translationStatus: "translated", isFinal: true, ...overrides,
+    })) }));
+    assert.equal(captions.length, 0, "invalid capture cannot advance the final cursor or reach the host UI");
     first.dispatchEvent(new MessageEvent("message", { data: JSON.stringify(caption({})) }));
     first.dispatchEvent(new MessageEvent("message", { data: JSON.stringify(caption({ sessionId: "other-session", text: "cross session" })) }));
     first.dispatchEvent(new MessageEvent("message", { data: JSON.stringify(caption({ language: "ja", text: "not configured" })) }));
@@ -1305,7 +1419,7 @@ test("host caption and status callbacks enforce session, configured-language, se
     first.dispatchEvent(new MessageEvent("message", { data: JSON.stringify(caption({ utteranceKey: "other-utterance", text: "identity collision" })) }));
     first.dispatchEvent(new MessageEvent("message", { data: JSON.stringify(caption({ text: "확정", isFinal: true })) }));
     first.dispatchEvent(new MessageEvent("message", { data: JSON.stringify(caption({ text: "duplicate final", isFinal: true })) }));
-    first.dispatchEvent(new MessageEvent("message", { data: JSON.stringify(caption({ language: "en", text: "Translation", isFinal: true })) }));
+    first.dispatchEvent(new MessageEvent("message", { data: JSON.stringify(caption({ language: "en", text: "Translation", isFinal: true, translationStatus: "translated", translationCapture, sourceText: null, sourceLanguage: null })) }));
     first.dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "session-status", sessionId: "other-session", status: "paused" }) }));
     first.dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "session-status", sessionId, status: "paused" }) }));
     first.dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "language-status", sessionId, language: "ja", status: "unavailable" }) }));
@@ -1810,4 +1924,92 @@ test("an enabled demand session cannot silently downgrade to legacy mode after a
     assert.equal(harness.timers.size, 0);
     assert.equal(client.isWaitingForParticipants?.(), true);
   } finally { await client?.stop(); harness.restore(); }
+});
+
+test("host drains canonical source before end, blocks more PCM and leaves transport for post-DELETE stop", async () => {
+  const harness = createDemandAudioHarness({ read: async () => ({ enabled: false }), setSourceReady: async () => {} });
+  let client: LiveAudioClient | null = null;
+  try {
+    client = await harness.start();
+    const socket = FakeWebSocket.instances[0];
+    assert.ok(socket);
+    const before = socket.binaryByteLengths.length;
+    await Promise.all([client.drain(), client.drain()]);
+    harness.emitFrame();
+    assert.equal(socket.binaryByteLengths.length, before);
+    assert.equal(socket.messages.filter((message) => message.type === "drain").length, 1);
+    assert.equal(socket.messages.some((message) => message.type === "stop"), false);
+    assert.equal(socket.closeCallCount, 0);
+    await client.stop();
+    assert.equal(socket.messages.filter((message) => message.type === "stop").length, 1);
+  } finally { await client?.stop(); harness.restore(); }
+});
+
+test("drain rejection prevents terminal caller progress and never retries the provider", async () => {
+  const harness = createDemandAudioHarness({ read: async () => ({ enabled: false }), setSourceReady: async () => {} });
+  let client: LiveAudioClient | null = null;
+  try {
+    client = await harness.start();
+    FakeWebSocket.errorReplyTypes.add("drain");
+    let deleted = false;
+    await assert.rejects(async () => { await client?.drain(); deleted = true; }, /gateway/u);
+    assert.equal(deleted, false);
+    assert.equal(FakeWebSocket.instances.length, 1);
+    assert.equal(FakeWebSocket.instances[0].messages.filter((message) => message.type === "drain").length, 1);
+  } finally { FakeWebSocket.errorReplyTypes.clear(); await client?.stop(); harness.restore(); }
+});
+
+test("host end callback never deletes before drain or without fresh idle evidence", async () => {
+  const { readFile } = await import("node:fs/promises");
+  const { runInNewContext } = await import("node:vm");
+  const ts = await import("typescript");
+  const source = await readFile(new URL("./LiveHostDashboard.tsx", import.meta.url), "utf8");
+  const start = source.indexOf("  const stopSession = useCallback(async () => {");
+  const end = source.indexOf("  }, [resetHostSummaryLifecycle, session, stopBroadcast]);", start);
+  assert.ok(start >= 0 && end > start);
+  const body = source.slice(start, end).replace("  const stopSession = useCallback(async () => {", "async function runStop() {") + "\n}";
+  const code = ts.transpileModule(body, { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText;
+  for (const scenario of ["active", "sleeping", "preparing", "wrong-session", "drained", "drain-failed"]) {
+    const operations: string[] = []; const errors: string[] = [];
+    const noOp = () => {};
+    const client = scenario.startsWith("drain") ? {
+      async drain() { operations.push("drain"); if (scenario === "drain-failed") throw new Error("drain failed"); },
+      async stop() { operations.push("stop"); },
+    } : null;
+    const context = {
+      session: { id: "meeting", languages: ["ko", "en"] }, recoveryListGenerationRef: { current: 0 },
+      recoveryAttemptSessionIdRef: { current: null }, audioClientRef: { current: client }, currentSessionIdRef: { current: "meeting" },
+      setIsBusy: noOp, setError: (value: string) => errors.push(value), setIsEndConfirmVisible: noOp, resetHostSummaryLifecycle: noOp,
+      setEndedSession: noOp, setSession: noOp, setAdmission: noOp, setInvite: noOp, setSpeakers: noOp, setParticipants: noOp,
+      setHostSourceLedger: noOp, createHostSourceLedger: noOp, stopBroadcast: noOp, AbortSignal,
+      fetch: async (_url: string, options: { method: string }) => { operations.push(options.method); return {
+        id: scenario === "wrong-session" ? "other" : "meeting", status: scenario === "preparing" ? "preparing" : "live" }; },
+      readResponse: async (value: unknown) => value,
+      createHostDemandControl: () => ({ read: async () => ({ enabled: true, state: scenario === "sleeping" ? "sleeping" : "active" }) }),
+    };
+    const run: unknown = runInNewContext(`${code}\nrunStop`, context);
+    assert.equal(typeof run, "function");
+    if (typeof run !== "function") throw new Error("missing host end callback");
+    await run();
+    if (scenario === "drained") assert.deepEqual(operations, ["drain", "DELETE", "stop"]);
+    else if (scenario === "sleeping" || scenario === "preparing") assert.deepEqual(operations, ["GET", "DELETE"]);
+    else { assert.equal(operations.includes("DELETE"), false); assert.ok(errors.at(-1)); }
+  }
+});
+
+test("drain ignores another meeting ACK and fails within its bounded deadline", async () => {
+  const harness = createDemandAudioHarness({ read: async () => ({ enabled: false }), setSourceReady: async () => {} });
+  let client: LiveAudioClient | null = null;
+  try {
+    client = await harness.start(); FakeWebSocket.ignoredReplyTypes.add("drain");
+    const pending = client.drain(); const rejected = assert.rejects(pending, /timed out/u);
+    await Promise.resolve();
+    const socket = FakeWebSocket.instances[0];
+    socket.dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "drained", sessionId: "other-meeting" }) }));
+    const deadline = [...harness.timers].find(([, timer]) => timer.delay === 12_000);
+    assert.ok(deadline, "cross-meeting ACK must not clear the deadline");
+    deadline[1].callback(); await rejected;
+    assert.equal(socket.messages.filter((message) => message.type === "drain").length, 1);
+    assert.equal(socket.messages.some((message) => message.type === "stop"), false);
+  } finally { FakeWebSocket.ignoredReplyTypes.clear(); await client?.stop(); harness.restore(); }
 });

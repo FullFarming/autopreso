@@ -1,6 +1,8 @@
 import { after, NextRequest } from "next/server";
 
 import { AuthenticationError, requireHost } from "@/lib/auth/live-auth";
+import { isAdminRequest } from "@/lib/auth/require-admin";
+import { resolveEngineDefaultsOrFallback } from "@/lib/console/engine-defaults";
 import { toLiveFailure } from "@/lib/live/errors";
 import { isLiveCallEnabled } from "@/lib/live/feature-flag";
 import { LiveSessionService } from "@/lib/live/service";
@@ -50,6 +52,9 @@ export async function POST(request: NextRequest) {
     const parsed = createLiveSessionInputSchema.safeParse(await readBoundedJsonBody(request));
     if (!parsed.success) return apiError("요청 형식이 올바르지 않습니다.", "INVALID_REQUEST", 400);
     const input = parsed.data;
+    // Spec §9: the global engine is the only Live Call engine; a non-admin's
+    // `modelPreferences.engine` is replaced by it inside the service.
+    const [engineDefaults, isAdmin] = await Promise.all([resolveEngineDefaultsOrFallback(), isAdminRequest(request)]);
     const session = await new LiveSessionService(getLiveSessionStore()).create(hostId, {
       title: input.title,
       scheduledAt: input.scheduledAt,
@@ -65,7 +70,8 @@ export async function POST(request: NextRequest) {
       fiscalPeriod: input.fiscalPeriod,
       eventType: input.eventType,
       agenda: input.agenda,
-    });
+      modelPreferences: input.modelPreferences,
+    }, { engineDefaults, isAdmin });
     scheduleLiveSheetSyncAfterCommit(after);
     return apiSuccess(session, { status: 201 });
   } catch (error: unknown) {

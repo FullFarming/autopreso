@@ -2,32 +2,23 @@ import { WebSocket } from "ws";
 
 const LIVE_ENDPOINT = "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent";
 const TRANSCRIBE_MODEL = "gemini-3.5-transcribe-live";
-const TRANSLATE_MODEL = "gemini-3.5-live-translate-preview";
 const MAXIMUM_MESSAGE_BYTES = 1_048_576;
 
 function isRecord(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
+// Only the Transcribe Live model may be opened here. The direct Live Translate
+// path (`gemini-3.5-live-translate-preview`, AUDIO responses, translationConfig)
+// was removed in Plan 2 Task 3; its setup shape is refused like any other.
 function serializeSetup(model, config) {
-  const allowed = new Set(["responseModalities", "inputAudioTranscription", "outputAudioTranscription", "translationConfig", "abortSignal"]);
-  if (![TRANSCRIBE_MODEL, TRANSLATE_MODEL].includes(model) || !isRecord(config)
+  const allowed = new Set(["responseModalities", "inputAudioTranscription", "abortSignal"]);
+  if (model !== TRANSCRIBE_MODEL || !isRecord(config)
     || Object.keys(config).some((key) => !allowed.has(key))) throw new Error("GOOGLE_LIVE_CONFIG_INVALID");
-  const isTranslation = model === TRANSLATE_MODEL;
-  if (JSON.stringify(config.responseModalities) !== JSON.stringify([isTranslation ? "AUDIO" : "TEXT"])
+  if (JSON.stringify(config.responseModalities) !== JSON.stringify(["TEXT"])
     || !isRecord(config.inputAudioTranscription)) throw new Error("GOOGLE_LIVE_CONFIG_INVALID");
   const transcription = config.inputAudioTranscription;
-  if (isTranslation) {
-    if (Object.keys(transcription).length || !isRecord(config.outputAudioTranscription)
-      || Object.keys(config.outputAudioTranscription).length || !isRecord(config.translationConfig)
-      || Object.keys(config.translationConfig).sort().join() !== "echoTargetLanguage,targetLanguageCode"
-      || typeof config.translationConfig.echoTargetLanguage !== "boolean"
-      || typeof config.translationConfig.targetLanguageCode !== "string"
-      || !/^[a-z]{2,3}(?:-[A-Za-z0-9]{2,8})*$/u.test(config.translationConfig.targetLanguageCode)) {
-      throw new Error("GOOGLE_LIVE_CONFIG_INVALID");
-    }
-  } else if (config.translationConfig !== undefined || config.outputAudioTranscription !== undefined
-    || Object.keys(transcription).some((key) => !["mode", "languageCodes", "customVocabulary"].includes(key))
+  if (Object.keys(transcription).some((key) => !["mode", "languageCodes", "customVocabulary"].includes(key))
     || transcription.mode !== "VERBATIM"
     || !Array.isArray(transcription.languageCodes) || transcription.languageCodes.length > 3
     || transcription.languageCodes.some((language) => typeof language !== "string" || !/^[a-z]{2,3}(?:-[A-Za-z0-9]{2,8})*$/u.test(language))
@@ -38,12 +29,8 @@ function serializeSetup(model, config) {
   }
   const payload = JSON.stringify({ setup: {
     model: `models/${model}`,
-    generationConfig: {
-      responseModalities: config.responseModalities,
-      ...(isTranslation ? { translationConfig: config.translationConfig } : {}),
-    },
+    generationConfig: { responseModalities: config.responseModalities },
     inputAudioTranscription: transcription,
-    ...(isTranslation ? { outputAudioTranscription: {} } : {}),
   } });
   if (Buffer.byteLength(payload) > 256_000) throw new Error("GOOGLE_LIVE_CONFIG_INVALID");
   return payload;

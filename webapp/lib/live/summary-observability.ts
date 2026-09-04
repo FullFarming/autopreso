@@ -1,6 +1,9 @@
+import { readGeminiSelectedModel } from "../../../packages/caption-core/gemini-model-catalog.js";
+import type { EngineSelection } from "./model-preferences";
+
 export interface GeminiSummaryMetricEvent {
   workload: "recap";
-  model: "gemini-3.7-flash";
+  model: EngineSelection["summary"]["model"];
   result: "ok" | "error";
   latencyMilliseconds: number;
   usageKnown: boolean;
@@ -34,9 +37,11 @@ function parseGeminiSummaryMetric(event: unknown): GeminiSummaryMetricEvent | nu
   ])) return null;
   if (record.name !== "live.summary.gemini"
     || record.workload !== "recap"
-    || record.model !== "gemini-3.7-flash"
+    || typeof record.model !== "string"
     || record.result !== "ok" && record.result !== "error"
     || record.usageKnown !== undefined && typeof record.usageKnown !== "boolean") return null;
+  let model;
+  try { model = readGeminiSelectedModel("summary", record.model); } catch { return null; }
   const latencyMilliseconds = safeMetricNumber(record.latencyMilliseconds);
   const usageKnown = record.usageKnown === true;
   const inputTokens = usageKnown ? safeTokenCount(record.inputTokens) : null;
@@ -45,7 +50,7 @@ function parseGeminiSummaryMetric(event: unknown): GeminiSummaryMetricEvent | nu
   if (latencyMilliseconds === null || usageKnown && (inputTokens === null || outputTokens === null || totalTokens === null)) return null;
   return {
     workload: "recap",
-    model: "gemini-3.7-flash",
+    model,
     result: record.result,
     latencyMilliseconds,
     usageKnown,

@@ -1,3 +1,5 @@
+import { readLiveModelPreferences, type LiveModelPreferences } from "./model-preferences";
+import { hasValidTranslationCaptureProvenance, readTranslationCapture } from "./translation-capture";
 import type { LanguageObservation, CaptionEvent, LiveAgendaItem, LiveEventType, LiveSession, LiveSessionGlossaryPin, LiveSessionGlossaryPinSelection, LiveSessionGlossaryPins, LiveSessionSection, LiveSnapshot, LiveTopicSnapshot, SpeakerAssignment } from "../live-contract";
 import { BUILTIN_GLOSSARY_IDS } from "../glossary-presets/types";
 import { LANGUAGE_CODES } from "../languageDetect";
@@ -13,7 +15,7 @@ const CANONICAL_LANGUAGE_CODES = new Set<string>(LANGUAGE_CODES);
 export interface LiveSessionStore {
   create(session: LiveSession): Promise<LiveSession>;
   get(sessionId: string, options?: { signal?: AbortSignal }): Promise<LiveSession | null>;
-  getOwned(sessionId: string, hostId: string): Promise<LiveSession | null>;
+  getOwned(sessionId: string, hostId: string, options?: { signal?: AbortSignal }): Promise<LiveSession | null>;
   renewAccessOwned(sessionId: string, hostId: string, expectedVersion: number): Promise<LiveSession | null>;
   updateOwned(
     sessionId: string,
@@ -67,7 +69,7 @@ const SECTION_TRANSITION_STATUSES: ReadonlyArray<LiveSession["status"]> = ["live
 type LiveSessionUpdatePatch = Pick<LiveSession,
   "title" | "scheduledAt" | "sessionType" | "outputMode" | "voiceProvider" | "languages" | "maxViewers" | "glossaryPack"
   | "participantSpeakingEnabled"
-  | "companyName" | "ticker" | "fiscalPeriod" | "eventType" | "agenda"
+  | "companyName" | "ticker" | "fiscalPeriod" | "eventType" | "agenda" | "modelPreferences"
 >;
 
 /** Keyset page size for complete snapshot history reconstruction. */
@@ -76,6 +78,7 @@ const TOPIC_TRANSCRIPT_PAGE_SIZE = 1_000;
 const MAX_TOPIC_TRANSCRIPT_ROWS = 100_000;
 
 interface UtteranceRow {
+  translation_capture?: unknown;
   seq: number;
   authoritative_source_id?: string | null;
   languageObservation?: LanguageObservation;
@@ -84,6 +87,7 @@ interface UtteranceRow {
   speaker_name: string | null;
   text: string;
   source_text: string | null;
+  source_started_at?: string | null;
   source_language: string | null;
   origin: string | null;
   utterance_key: string | null;
@@ -97,6 +101,13 @@ interface UtteranceRow {
  *  SpeakerAssignment field and silently drops captions whose speaker shape is
  *  partial, so replayed history has to carry the complete shape. */
 function captionFromUtterance(sessionId: string, language: string, row: UtteranceRow): CaptionEvent {
+  // SQL NULL is a legacy row, but a present invalid capture must never lose its provenance guard.
+  const capture = row.translation_capture ?? undefined;
+  if (!hasValidTranslationCaptureProvenance({ translationCapture: capture, translationStatus: row.translation_status,
+    sourceText: row.source_text, sourceLanguage: row.source_language, sourceStartedAt: row.source_started_at,
+    origin: row.origin, authoritativeSourceId: row.authoritative_source_id, languageObservation: row.languageObservation })) {
+    throw new LiveSessionError("번역 기록의 출처 정보를 확인할 수 없습니다.", "INVALID_TRANSLATION_CAPTURE", 503);
+  }
   const caption: CaptionEvent = {
     type: "caption",
     seq: Number(row.seq),
@@ -114,6 +125,7 @@ function captionFromUtterance(sessionId: string, language: string, row: Utteranc
       : null,
     text: row.text,
     isFinal: true,
+    translationCapture: readTranslationCapture(capture),
     sourceText: row.source_text ?? null,
     sourceLanguage: row.source_language ?? null,
     ...(row.languageObservation ? { languageObservation: row.languageObservation } : {}),
@@ -479,11 +491,11 @@ export class SupabaseLiveSessionStore implements LiveSessionStore {
     return rows[0] ? applyEventContext(fromRow(rows[0]), eventContext) : null;
   }
 
-  async getOwned(sessionId: string, hostId: string): Promise<LiveSession | null> {
+  async getOwned(sessionId: string, hostId: string, options: { signal?: AbortSignal } = {}): Promise<LiveSession | null> {
     const query = new URLSearchParams({ id: `eq.${sessionId}`, host_id: `eq.${hostId}`, archive_deleted_at: "is.null", limit: "1" });
     const [rows, eventContext] = await Promise.all([
-      this.request<SupabaseSessionRow[]>(`/rest/v1/live_sessions?${query}`, { method: "GET" }),
-      this.readEventContext(sessionId),
+      this.request<SupabaseSessionRow[]>(`/rest/v1/live_sessions?${query}`, { method: "GET", signal: options.signal }),
+      this.readEventContext(sessionId, options.signal),
     ]);
     return rows[0] ? applyEventContext(fromRow(rows[0]), eventContext) : null;
   }
@@ -507,6 +519,22 @@ export class SupabaseLiveSessionStore implements LiveSessionStore {
   }
 
   async updateOwned(sessionId: string, hostId: string, expectedVersion: number, patch: LiveSessionUpdatePatch): Promise<LiveSession | null> {
+    const metadataQuery = new URLSearchParams({ id: `eq.${sessionId}`, host_id: `eq.${hostId}`,
+      version: `eq.${expectedVersion}`, status: "eq.preparing", archive_deleted_at: "is.null", select: "event_metadata", limit: "1" });
+    const metadataRows = await this.request<Array<{ event_metadata: Record<string, unknown> }>>(
+      `/rest/v1/live_sessions?${metadataQuery}`, { method: "GET" });
+    if (!metadataRows[0]) return null;
+    const existingMetadata = metadataRows[0].event_metadata;
+    if (existingMetadata !== undefined && existingMetadata !== null && (typeof existingMetadata !== "object" || Array.isArray(existingMetadata))) {
+      throw new LiveSessionError("저장된 이벤트 메타데이터가 올바르지 않습니다.", "INVALID_STORED_SESSION", 500);
+    }
+
+    // The service owns engine authority and history (Plan 2 Task 4); the store
+    // writes what it is given and keeps the stored preferences when the patch
+    // carries none, so unrelated edits never reset the engine.
+    const modelPreferences = patch.modelPreferences === undefined
+      ? parseStoredEventMetadata(existingMetadata).modelPreferences
+      : readLiveModelPreferences(patch.modelPreferences);
     const rows = await this.request<SupabaseSessionRow[]>("/rest/v1/rpc/update_live_session_with_event_v2", {
       method: "POST",
       body: JSON.stringify({
@@ -524,7 +552,7 @@ export class SupabaseLiveSessionStore implements LiveSessionStore {
         p_scheduled_at: patch.scheduledAt,
         p_event_company_name: patch.companyName ?? null,
         p_event_reporting_period: patch.fiscalPeriod ?? null,
-        p_event_metadata: eventMetadataBody(patch),
+        p_event_metadata: { ...existingMetadata, ...eventMetadataBody({ ...patch, modelPreferences }) },
       }),
     });
     return rows[0] ? fromRow(rows[0]) : null;
@@ -771,6 +799,9 @@ export class SupabaseLiveSessionStore implements LiveSessionStore {
       .map((row) => captionFromUtterance(sessionId, language, row));
     const snapshotCaptions = rows[0]?.captions ?? [];
     const captions = history.length > 0 ? history : snapshotCaptions;
+    if (captions.some(caption => !hasValidTranslationCaptureProvenance(caption))) {
+      throw new LiveSessionError("번역 기록의 출처 정보를 확인할 수 없습니다.", "INVALID_TRANSLATION_CAPTURE", 503);
+    }
     return {
       session,
       language,
@@ -861,7 +892,7 @@ export class SupabaseLiveSessionStore implements LiveSessionStore {
     const query = new URLSearchParams({
       session_id: `eq.${sessionId}`,
       language: `eq.${language}`,
-      select: "seq,participant_id,speaker_label,speaker_name,text,source_text,source_language,origin,utterance_key,translation_status,source_ended_at,emitted_at,authoritative_source_id",
+      select: "seq,participant_id,speaker_label,speaker_name,text,source_text,source_language,source_started_at,origin,utterance_key,translation_status,source_ended_at,emitted_at,authoritative_source_id,translation_capture",
       // 2026-07-26 fix: Serve the oldest bounded window, then let the gateway
       // keyset-replay every later page. One giant snapshot exceeded 5 seconds.
       order: "seq.asc",
@@ -1185,11 +1216,12 @@ function hasExactKeys(record: Record<string, unknown>, expected: ReadonlySet<str
   return keys.length === expected.size && keys.every((key) => expected.has(key));
 }
 
-function eventMetadataBody(metadata: Pick<LiveSession, "ticker" | "eventType" | "agenda">): Record<string, unknown> {
+function eventMetadataBody(metadata: Pick<LiveSession, "ticker" | "eventType" | "agenda" | "modelPreferences">): Record<string, unknown> {
   return {
     ticker: metadata.ticker ?? null,
     eventType: metadata.eventType ?? null,
     agenda: metadata.agenda ?? [],
+    modelPreferences: readLiveModelPreferences(metadata.modelPreferences),
   };
 }
 
@@ -1208,6 +1240,7 @@ function applyEventContext(session: LiveSession, context: SupabaseSessionEventCo
     fiscalPeriod: parseStoredNullableText(context.event_reporting_period, 80, "event_reporting_period"),
     eventType: eventMetadata.eventType,
     agenda: eventMetadata.agenda,
+    modelPreferences: eventMetadata.modelPreferences,
     activeSection,
     sectionStartedAt: activeStartedAt,
   };
@@ -1302,25 +1335,32 @@ function fromRow(row: SupabaseSessionRow): LiveSession {
     fiscalPeriod: parseStoredNullableText(row.event_reporting_period, 80, "event_reporting_period"),
     eventType: eventMetadata.eventType,
     agenda: eventMetadata.agenda,
+    modelPreferences: eventMetadata.modelPreferences,
     activeSection: "prepared_remarks",
     sectionStartedAt: null,
   };
 }
 
 function parseStoredEventMetadata(value: unknown): {
+  modelPreferences: LiveModelPreferences;
   ticker: string | null;
   eventType: LiveEventType | null;
   agenda: LiveAgendaItem[];
 } {
-  if (value === undefined || value === null) return { ticker: null, eventType: null, agenda: [] };
+  if (value === undefined || value === null) return { ticker: null, eventType: null, agenda: [], modelPreferences: readLiveModelPreferences(undefined) };
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     throw new LiveSessionError("저장된 이벤트 메타데이터가 올바르지 않습니다.", "INVALID_STORED_SESSION", 500);
   }
   const record = value as Record<string, unknown>;
+  let modelPreferences: LiveModelPreferences;
+  try { modelPreferences = readLiveModelPreferences(record.modelPreferences); } catch {
+    throw new LiveSessionError("저장된 모델 설정이 올바르지 않습니다.", "INVALID_STORED_SESSION", 500);
+  }
   return {
     ticker: parseStoredTicker(record.ticker),
     eventType: parseStoredEventType(record.eventType),
     agenda: parseStoredAgenda(record.agenda),
+    modelPreferences,
   };
 }
 

@@ -3,7 +3,14 @@ import { readFile } from "node:fs/promises";
 import test from "node:test";
 
 import { generateSessionSummariesAfterEnd, generateSummaryForLanguage } from "./post-session-summary";
-import { SummaryError } from "./summary";
+import { readLiveModelPreferences } from "./model-preferences";
+import { SummaryError, type MeetingSummary } from "./summary";
+
+// Session engine as the store returns it (Plan 2 Task 4): the summary role names the recap model.
+const sessionEngine = (summary = "gemini-3.6-flash") => readLiveModelPreferences({
+  engine: { stt: { provider: "gemini", model: "gemini-3.5-transcribe-live", languageMode: "auto" },
+    translation: { provider: "gemini", model: "gemini-3.6-flash" }, summary: { provider: "gemini", model: summary } },
+});
 
 const storedSummary = {
   title: "Ready",
@@ -57,7 +64,7 @@ test("ready and non-reclaimable claims never invoke Gemini generation", async ()
     let generationCalls = 0;
     const outcome = await generateSummaryForLanguage("session-1", "host-1", "ko", {
       claim: async () => ({ status }),
-      read: async () => status === "ready" ? { summary: storedSummary, model: "gemini-3.7-flash", createdAt: "now" } : null,
+      read: async () => status === "ready" ? { summary: storedSummary, model: "gemini-3.6-flash", createdAt: "now" } : null,
       generate: async () => {
         generationCalls += 1;
         throw new Error("Gemini must not run");
@@ -81,7 +88,8 @@ test("one transient provider failure is recorded without hidden retry", async ()
       },
       fetchUtterances: async () => [testUtterance],
       fetchTopicTranscript: async () => topicSnapshot,
-      buildRoster: async () => [],
+      fetchSessionContext: async () => ({ title: "Pinned", companyName: null, ticker: null, fiscalPeriod: null, eventType: null, agenda: [], modelPreferences: sessionEngine() }),
+    buildRoster: async () => [],
       generate: async () => {
         generationCalls += 1;
         throw new SummaryError("temporary", "SUMMARY_PROVIDER_UNAVAILABLE", 502);
@@ -114,7 +122,8 @@ test("non-transient provider failure is recorded without retry", async () => {
       claim: async () => ({ status: "claimed", generationToken: "token-1" }),
       fetchUtterances: async () => [testUtterance],
       fetchTopicTranscript: async () => topicSnapshot,
-      buildRoster: async () => [],
+      fetchSessionContext: async () => ({ title: "Pinned", companyName: null, ticker: null, fiscalPeriod: null, eventType: null, agenda: [], modelPreferences: sessionEngine() }),
+    buildRoster: async () => [],
       generate: async () => {
         generationCalls += 1;
         throw new SummaryError("invalid", "SUMMARY_PARSE_FAILED", 502);
@@ -137,13 +146,14 @@ test("successful generation uses authoritative topic transcript and session fenc
     claim: async () => ({ status: "claimed", generationToken: "token-1" }),
     fetchUtterances: async () => [testUtterance],
     fetchTopicTranscript: async () => topicSnapshot,
+    fetchSessionContext: async () => ({ title: "Pinned", companyName: null, ticker: null, fiscalPeriod: null, eventType: null, agenda: [], modelPreferences: sessionEngine() }),
     buildRoster: async () => [],
     generate: async (input) => {
       generationCalls += 1;
       assert.equal(input.sessionId, sessionId);
       assert.equal(input.topicSnapshot, topicSnapshot);
       assert.equal(input.utterances[0]?.utteranceKey, "utt-1");
-      return { summary: storedSummary, model: "gemini-3.7-flash" };
+      return { summary: storedSummary, model: "gemini-3.6-flash" };
     },
     complete: async (_sessionId, _language, _generationToken, _summary, model) => {
       completedModel = model;
@@ -152,7 +162,7 @@ test("successful generation uses authoritative topic transcript and session fenc
   });
   assert.equal(outcome.status, "saved");
   assert.equal(generationCalls, 1);
-  assert.equal(completedModel, "gemini-3.7-flash");
+  assert.equal(completedModel, "gemini-3.6-flash");
 });
 
 test("post-session summaries run languages with bounded concurrency exactly once", async () => {
@@ -173,7 +183,7 @@ test("post-session summaries run languages with bounded concurrency exactly once
       if (language === "ko") return {
         status: "saved" as const,
         summary: storedSummary,
-        model: "gemini-3.7-flash",
+        model: "gemini-3.6-flash",
         utteranceCount: 1,
       };
       if (language === "en") return { status: "running" as const };
@@ -203,10 +213,11 @@ test("post-session summaries share one bounded topic context read across languag
         topicReads.push(language);
         return topicSnapshot;
       },
-      buildRoster: async () => [],
+      fetchSessionContext: async () => ({ title: "Pinned", companyName: null, ticker: null, fiscalPeriod: null, eventType: null, agenda: [], modelPreferences: sessionEngine() }),
+    buildRoster: async () => [],
       generate: async (input, language) => {
         generations.push(`${language}:${input.topicSnapshot === topicSnapshot}`);
-        return { summary: storedSummary, model: "gemini-3.7-flash" };
+        return { summary: storedSummary, model: "gemini-3.6-flash" };
       },
       complete: async () => true,
     },
@@ -235,13 +246,14 @@ test("post-session hung summary reads fail before provider dispatch or completio
         signalSeen = signalSeen && options?.signal instanceof AbortSignal;
         options?.signal?.addEventListener("abort", () => resolve(topicSnapshot), { once: true });
       }),
-      buildRoster: async (_sessionId, _hostId, options) => new Promise((resolve) => {
+      fetchSessionContext: async () => ({ title: "Pinned", companyName: null, ticker: null, fiscalPeriod: null, eventType: null, agenda: [], modelPreferences: sessionEngine() }),
+    buildRoster: async (_sessionId, _hostId, options) => new Promise((resolve) => {
         signalSeen = signalSeen && options?.signal instanceof AbortSignal;
         options?.signal?.addEventListener("abort", () => resolve([]), { once: true });
       }),
       generate: async () => {
         generateCalls += 1;
-        return { summary: storedSummary, model: "gemini-3.7-flash" };
+        return { summary: storedSummary, model: "gemini-3.6-flash" };
       },
       complete: async () => {
         completeCalls += 1;
@@ -268,6 +280,67 @@ test("session end route attaches summary lifecycle with Next after instead of a 
   assert.equal(source.includes("summary scheduling failed (${id})"), false);
   assert.doesNotMatch(source, /console\.error\([^;]*,\s*summaryError/u);
   assert.match(source, /console\.error\(`live post-session summary scheduling failed \$\{safeSummarySchedulingCode\(summaryError\)\}`\)/u);
+});
+
+test("missing Gemini server configuration is recorded explicitly with no provider request or retry", async () => {
+  const previousKey = process.env.GEMINI_API_KEY;
+  const previousFetch = globalThis.fetch;
+  let requests = 0;
+  const failures: string[] = [];
+  delete process.env.GEMINI_API_KEY;
+  globalThis.fetch = async () => { requests++; throw new Error("must not call a provider"); };
+  try {
+    await assert.rejects(generateSummaryForLanguage(sessionId, "host-1", "ko", {
+      claim: async () => ({ status: "claimed", generationToken: "token-1" }),
+      fetchUtterances: async () => [testUtterance],
+      fetchTopicTranscript: async () => topicSnapshot,
+      fetchSessionContext: async () => ({ title: "Owned meeting", companyName: null, ticker: null, fiscalPeriod: null, eventType: null, agenda: [] }),
+      buildRoster: async () => [],
+      fail: async (_session, _language, _token, code) => { failures.push(code); return true; },
+    }), (error: unknown) => error instanceof SummaryError && error.code === "SUMMARY_NOT_CONFIGURED" && error.status === 503);
+    assert.deepEqual(failures, ["SUMMARY_NOT_CONFIGURED"]);
+    assert.equal(requests, 0);
+  } finally {
+    if (previousKey === undefined) delete process.env.GEMINI_API_KEY;
+    else process.env.GEMINI_API_KEY = previousKey;
+    globalThis.fetch = previousFetch;
+  }
+});
+
+test("ended canonical source flows through real recap parsing, persists Gemini 3.6 and refresh reads without generation", async () => {
+  const { generateMeetingSummary } = await import("./summary");
+  const { createGeminiSummaryGenerator } = await import("./summary-gemini-adapter");
+  let calls = 0;
+  const config = { apiKey: ["synthetic", "ended", "source"].join("-"), model: "gemini-3.6-flash", maxOutputTokens: 2048, timeoutMilliseconds: 1000 };
+  const generator = createGeminiSummaryGenerator(config, { fetchFn: async (url, init) => {
+    calls += 1;
+    assert.match(String(url), /gemini-3\.6-flash:generateContent$/u);
+    const body = JSON.parse(String(init?.body)) as { contents: Array<{ parts: Array<{ text: string }> }> };
+    assert.match(body.contents[0].parts[0].text, /실제로 확정된 원문/u);
+    assert.doesNotMatch(body.contents[0].parts[0].text, /FAKE_TRANSLATION|Topic note/u);
+    return Response.json({ candidates: [{ finishReason: "STOP", content: { parts: [{ text: JSON.stringify({
+      title: "회의", overview: "실제로 확정된 원문", chapters: [], decisions: [], actionItems: [], speakerHighlights: [],
+    }) }] } }], usageMetadata: { promptTokenCount: 10, candidatesTokenCount: 10, totalTokenCount: 20 } });
+  } });
+  let ready: { summary: MeetingSummary; model: string; createdAt: string } | null = null;
+  const dependencies = {
+    claim: async () => ready ? { status: "ready" as const } : { status: "claimed" as const, generationToken: "source-token" },
+    fetchUtterances: async () => [{ ...testUtterance, utteranceKey: "authoritative-source:1", text: "실제로 확정된 원문" }],
+    fetchTopicTranscript: async () => ({ topics: [], topicMemberships: [] }), buildRoster: async () => [],
+    fetchSessionContext: async () => ({ title: "Meeting", companyName: null, ticker: null, fiscalPeriod: null, eventType: null, agenda: [],
+      modelPreferences: sessionEngine("gemini-3.6-flash") }),
+    generate: (input: Parameters<typeof generateMeetingSummary>[0], language: string) => generateMeetingSummary(input, language, generator, config),
+    complete: async (_id: string, _language: string, token: string, summary: MeetingSummary, model: string) => {
+      assert.equal(token, "source-token"); assert.equal(model, "gemini-3.6-flash");
+      ready = { summary, model, createdAt: "2026-09-01T00:00:00Z" }; return true;
+    },
+    read: async () => ready,
+    fail: async () => { throw new Error("unexpected summary failure"); },
+  };
+  assert.equal((await generateSummaryForLanguage(sessionId, "host-1", "ko", dependencies)).status, "saved");
+  const reloaded = await generateSummaryForLanguage(sessionId, "host-1", "ko", dependencies);
+  assert.equal(reloaded.status, "ready");
+  assert.equal(calls, 1);
 });
 
 test("a session with no recorded speech ends as an empty record, never as a generation failure", async () => {

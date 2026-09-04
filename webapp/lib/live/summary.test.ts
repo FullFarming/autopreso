@@ -8,6 +8,7 @@ import {
   completeMeetingSummaryGeneration,
   failMeetingSummaryGeneration,
   fetchSummaryUtterances,
+  fetchMeetingSessionContext,
   fetchTopicTranscript,
   fetchUtterances,
   generateMeetingSummary,
@@ -23,6 +24,8 @@ import {
   type MeetingUtterance,
 } from "./summary";
 import { getMeetingSummaryConfig } from "./config";
+import { readLiveModelPreferences } from "./model-preferences";
+import { DEFAULT_ENGINE_SELECTION } from "../../../packages/caption-core/caption-engine-catalog.js";
 import { createGeminiSummaryGenerator, resetGeminiSummaryGeneratorCacheForTests } from "./summary-gemini-adapter";
 import { getGeminiSummaryMetricSnapshotForTests, recordGeminiSummaryMetric, resetGeminiSummaryMetricsForTests } from "./summary-observability";
 import { LiveSecurityConfigurationError } from "../security/config";
@@ -399,11 +402,11 @@ test("Gemini recap adapter receives fixed model, strict schema, and no provider-
     summaryInput,
     "en",
     generator,
-    { apiKey: "gemini-key", model: "gemini-3.7-flash", maxOutputTokens: 4_000, timeoutMilliseconds: 45_000 },
+    { apiKey: "gemini-key", model: "gemini-3.6-flash", maxOutputTokens: 4_000, timeoutMilliseconds: 45_000 },
   );
 
   assert.deepEqual(generated.summary, expectedGeneratedSummary);
-  assert.equal(generated.model, "gemini-3.7-flash");
+  assert.equal(generated.model, "gemini-3.6-flash");
   assert.equal(requests.length, 1);
   const request = requests[0] as {
     prompt?: string;
@@ -459,13 +462,13 @@ test("default Gemini REST recap path succeeds through one server-only fetch with
       summaryInput,
       "en",
       undefined,
-      { apiKey: "gemini-key", model: "gemini-3.7-flash", maxOutputTokens: 4_000, timeoutMilliseconds: 45_000 },
+      { apiKey: "gemini-key", model: "gemini-3.6-flash", maxOutputTokens: 4_000, timeoutMilliseconds: 45_000 },
     );
 
     assert.deepEqual(generated.summary, expectedGeneratedSummary);
-    assert.equal(generated.model, "gemini-3.7-flash");
+    assert.equal(generated.model, "gemini-3.6-flash");
     assert.equal(calls.length, 1);
-    assert.match(String(calls[0].input), /generativelanguage\.googleapis\.com\/v1beta\/models\/gemini-3\.7-flash:generateContent/u);
+    assert.match(String(calls[0].input), /generativelanguage\.googleapis\.com\/v1beta\/models\/gemini-3\.6-flash:generateContent/u);
     const headers = calls[0].init?.headers as Record<string, string>;
     assert.equal(headers["x-goog-api-key"], "gemini-key");
     assert.equal(headers["content-type"], "application/json");
@@ -480,13 +483,73 @@ test("default Gemini REST recap path succeeds through one server-only fetch with
   }
 });
 
+test("the session engine's summary role selects the recap model and legacy pins migrate without rewriting stored metadata", async () => {
+  const previousFetch = globalThis.fetch;
+  const calls: string[] = [];
+  globalThis.fetch = async (input) => {
+    calls.push(String(input));
+    return Response.json({ candidates: [{ finishReason: "STOP", content: { parts: [{ text: JSON.stringify(generatedSummary) }] } }] });
+  };
+  resetGeminiSummaryGeneratorCacheForTests();
+  resetGeminiSummaryMetricsForTests();
+  try {
+    // The session engine's summary role picks the recap model (catalog summary
+    // entries only); a legacy 3.5-flash pin was already migrated to 3.6 at read time.
+    for (const [stored, expected] of [
+      [{ engine: { ...DEFAULT_ENGINE_SELECTION, summary: { provider: "gemini", model: "gemini-3.6-flash" } } }, "gemini-3.6-flash"],
+      [{ engine: { ...DEFAULT_ENGINE_SELECTION, summary: { provider: "gemini", model: "gemini-3.7-flash" } } }, "gemini-3.7-flash"],
+      [{ source: "gemini-3.7-flash", summary: "gemini-3.5-flash" }, "gemini-3.6-flash"],
+    ] as const) {
+      const result = await generateMeetingSummary({ ...summaryInput, sessionContext: {
+        title: "Pinned", companyName: null, ticker: null, fiscalPeriod: null, eventType: null, agenda: [],
+        modelPreferences: readLiveModelPreferences(stored),
+      } }, "en", undefined, { apiKey: ["selected", "model", "key"].join("-"), model: "gemini-3.6-flash", maxOutputTokens: 4000, timeoutMilliseconds: 45000 });
+      assert.equal(result.model, expected);
+      assert.equal(calls.at(-1), `https://generativelanguage.googleapis.com/v1beta/models/${expected}:generateContent`);
+      assert.equal(getGeminiSummaryMetricSnapshotForTests()?.model, expected);
+    }
+    assert.equal(calls.length, 3);
+  } finally {
+    globalThis.fetch = previousFetch;
+    resetGeminiSummaryGeneratorCacheForTests();
+    resetGeminiSummaryMetricsForTests();
+  }
+});
+
+test("recap context reads the owned archived-time record and migrates its legacy model pin; failed reads never default", async () => {
+  await withSupabaseTestEnvironment(async () => {
+    const sessionId = crypto.randomUUID();
+    const modelPreferences = { source: "gemini-3.6-flash", summary: "gemini-3.5-flash" };
+    const fetchFn: typeof fetch = async (input) => {
+      const url = new URL(String(input));
+      if (url.pathname.includes("/rpc/")) return Response.json([]);
+      assert.equal(url.searchParams.get("host_id"), "eq.host-owner");
+      assert.equal(url.searchParams.has("expires_at"), false);
+      assert.equal(url.searchParams.get("archive_deleted_at"), "is.null");
+      return Response.json([{
+        id: sessionId, host_id: "host-owner", title: "Saved", session_type: "meeting", output_mode: "captions",
+        voice_provider: "gemini", status: "stopped", languages: ["en"], viewer_count: 0, version: 3,
+        admission_open_until: null, expires_at: "2026-01-01T00:00:00Z", event_metadata: { modelPreferences },
+      }]);
+    };
+    const context = await fetchMeetingSessionContext(sessionId, "host-owner", { fetchFn });
+    // A legacy per-role pin reads back as the engine it meant (3.5-flash summary -> catalog 3.6), history empty.
+    assert.deepEqual(context?.modelPreferences, readLiveModelPreferences(modelPreferences));
+    assert.equal(context?.modelPreferences?.engine.summary.model, "gemini-3.6-flash");
+    for (const response of [Response.json([]), Response.json({ message: "private failure" }, { status: 503 })]) {
+      await assert.rejects(fetchMeetingSessionContext(sessionId, "host-owner", { fetchFn: async () => response.clone() }),
+        (error: unknown) => error instanceof SummaryError && error.code === "SUMMARY_CONTEXT_UNAVAILABLE");
+    }
+  });
+});
+
 test("Gemini REST recap observations expose only safe fixed metric fields", async () => {
   const observations: unknown[] = [];
   const generated = await generateMeetingSummary(
     summaryInput,
     "en",
     createGeminiSummaryGenerator(
-      { apiKey: "gemini-key", model: "gemini-3.7-flash", maxOutputTokens: 4_000, timeoutMilliseconds: 45_000 },
+      { apiKey: "gemini-key", model: "gemini-3.6-flash", maxOutputTokens: 4_000, timeoutMilliseconds: 45_000 },
       {
         observe: (event) => observations.push(event),
         now: () => 1_000,
@@ -506,14 +569,14 @@ test("Gemini REST recap observations expose only safe fixed metric fields", asyn
         }) as Response,
       },
     ),
-    { apiKey: "gemini-key", model: "gemini-3.7-flash", maxOutputTokens: 4_000, timeoutMilliseconds: 45_000 },
+    { apiKey: "gemini-key", model: "gemini-3.6-flash", maxOutputTokens: 4_000, timeoutMilliseconds: 45_000 },
   );
 
-  assert.equal(generated.model, "gemini-3.7-flash");
+  assert.equal(generated.model, "gemini-3.6-flash");
   assert.deepEqual(observations, [{
     name: "live.summary.gemini",
     workload: "recap",
-    model: "gemini-3.7-flash",
+    model: "gemini-3.6-flash",
     result: "ok",
     latencyMilliseconds: 0,
     inputTokens: 11,
@@ -528,12 +591,15 @@ test("summary observations preserve known paid failure usage and retain unknown 
   const observations: unknown[] = [];
   let calls = 0;
   const generator = createGeminiSummaryGenerator(
-    { apiKey: "fixture", model: "gemini-3.7-flash", maxOutputTokens: 4_000, timeoutMilliseconds: 45_000 },
+    { apiKey: "fixture", model: "gemini-3.6-flash", maxOutputTokens: 4_000, timeoutMilliseconds: 45_000 },
     { observe(event) { observations.push(event); recordGeminiSummaryMetric(event); },
       fetchFn: async () => {
         calls++;
         if (calls === 2) throw new Error("NETWORK_FAILED");
-        return Response.json({ text: "<unsafe>", usageMetadata: { promptTokenCount: 11, candidatesTokenCount: 4, totalTokenCount: 18 } });
+        return Response.json({
+          candidates: [{ finishReason: "STOP", content: { parts: [{ text: "<unsafe>" }] } }],
+          usageMetadata: { promptTokenCount: 11, candidatesTokenCount: 4, totalTokenCount: 18 },
+        });
       } },
   );
   const request = { sessionId: "usage-fixture", prompt: "Summarize.", schema: { type: "object", additionalProperties: false, properties: {} },
@@ -542,7 +608,7 @@ test("summary observations preserve known paid failure usage and retain unknown 
   try {
     await assert.rejects(generator.generateContent(request), /GEMINI_OUTPUT_UNSAFE/u);
     assert.deepEqual(getGeminiSummaryMetricSnapshotForTests(), {
-      workload: "recap", model: "gemini-3.7-flash", result: "error", latencyMilliseconds: getGeminiSummaryMetricSnapshotForTests()?.latencyMilliseconds,
+      workload: "recap", model: "gemini-3.6-flash", result: "error", latencyMilliseconds: getGeminiSummaryMetricSnapshotForTests()?.latencyMilliseconds,
       usageKnown: true, inputTokens: 11, outputTokens: 4, totalTokens: 18,
     });
     await assert.rejects(generator.generateContent(request), /GEMINI_PROVIDER_FAILED/u);
@@ -557,7 +623,7 @@ test("summary observations preserve known paid failure usage and retain unknown 
 });
 
 test("legacy and explicitly unknown summary observations never turn compatibility zeros into measured usage", () => {
-  const base = { name: "live.summary.gemini", workload: "recap", model: "gemini-3.7-flash", result: "ok",
+  const base = { name: "live.summary.gemini", workload: "recap", model: "gemini-3.6-flash", result: "ok",
     latencyMilliseconds: 10, inputTokens: 0, outputTokens: 0, totalTokens: 0 };
   try {
     for (const event of [base, { ...base, usageKnown: false }, { ...base, usageKnown: false, inputTokens: 11, totalTokens: 11 }]) {
@@ -598,7 +664,7 @@ test("default Gemini REST recap path records bounded safe server metrics", async
       summaryInput,
       "en",
       undefined,
-      { apiKey: "gemini-key", model: "gemini-3.7-flash", maxOutputTokens: 4_000, timeoutMilliseconds: 45_000 },
+      { apiKey: "gemini-key", model: "gemini-3.6-flash", maxOutputTokens: 4_000, timeoutMilliseconds: 45_000 },
     );
     const snapshot = getGeminiSummaryMetricSnapshotForTests();
     assert.ok(snapshot);
@@ -619,7 +685,7 @@ test("default Gemini REST recap path records bounded safe server metrics", async
       latencyMilliseconds: 0,
     }, {
       workload: "recap",
-      model: "gemini-3.7-flash",
+      model: "gemini-3.6-flash",
       result: "ok",
       latencyMilliseconds: 0,
       inputTokens: 11,
@@ -646,7 +712,7 @@ test("cached Gemini REST recap generator preserves same-session admission state 
   };
   resetGeminiSummaryGeneratorCacheForTests();
   target.fetch = fakeFetch;
-  const config = { apiKey: "gemini-key", model: "gemini-3.7-flash", maxOutputTokens: 4_000, timeoutMilliseconds: 45_000 };
+  const config = { apiKey: "gemini-key", model: "gemini-3.6-flash", maxOutputTokens: 4_000, timeoutMilliseconds: 45_000 };
   try {
     const first = generateMeetingSummary(summaryInput, "en", undefined, config);
     const second = generateMeetingSummary(summaryInput, "en", undefined, config);
@@ -677,7 +743,7 @@ test("cached Gemini REST recap generator preserves same-session admission state 
 test("Gemini REST recap session rate budget persists through completion and connection release", async () => {
   let fetchCalls = 0;
   const generator = createGeminiSummaryGenerator(
-    { apiKey: "gemini-key", model: "gemini-3.7-flash", maxOutputTokens: 4_000, timeoutMilliseconds: 45_000 },
+    { apiKey: "gemini-key", model: "gemini-3.6-flash", maxOutputTokens: 4_000, timeoutMilliseconds: 45_000 },
     {
       limits: {
         globalOutstanding: 4,
@@ -700,7 +766,7 @@ test("Gemini REST recap session rate budget persists through completion and conn
       },
     },
   );
-  const config = { apiKey: "gemini-key", model: "gemini-3.7-flash", maxOutputTokens: 4_000, timeoutMilliseconds: 45_000 };
+  const config = { apiKey: "gemini-key", model: "gemini-3.6-flash", maxOutputTokens: 4_000, timeoutMilliseconds: 45_000 };
 
   await generateMeetingSummary(summaryInput, "en", generator, config);
   await generateMeetingSummary(summaryInput, "en", generator, config);
@@ -723,7 +789,7 @@ test("Gemini recap refusals are surfaced without attempting JSON parsing", async
       async generateContent() {
         return { candidates: [{ finishReason: "SAFETY", content: { parts: [] } }] };
       },
-    }, { apiKey: "gemini-key", model: "gemini-3.7-flash", maxOutputTokens: 4_000, timeoutMilliseconds: 45_000 }),
+    }, { apiKey: "gemini-key", model: "gemini-3.6-flash", maxOutputTokens: 4_000, timeoutMilliseconds: 45_000 }),
     (error: unknown) => error instanceof SummaryError && error.code === "SUMMARY_REFUSED",
   );
 });
@@ -732,7 +798,7 @@ test("summary config bounds timeout/output tokens and keeps the fixed Gemini rec
   const config = getMeetingSummaryConfig({ GEMINI_API_KEY: "gemini-key" });
   assert.deepEqual(config, {
     apiKey: "gemini-key",
-    model: "gemini-3.7-flash",
+    model: "gemini-3.6-flash",
     maxOutputTokens: 4_000,
     timeoutMilliseconds: 45_000,
   });
@@ -773,7 +839,7 @@ test("Gemini recap errors are classified once per attempt with one bounded alter
           calls += 1;
           return entry.output();
         },
-      }, { apiKey: "gemini-key", model: "gemini-3.7-flash", maxOutputTokens: 4_000, timeoutMilliseconds: 45_000 }, { sleep: async () => {} }),
+      }, { apiKey: "gemini-key", model: "gemini-3.6-flash", maxOutputTokens: 4_000, timeoutMilliseconds: 45_000 }, { sleep: async () => {} }),
       (error: unknown) => error instanceof SummaryError && error.code === entry.code,
     );
     assert.equal(calls, entry.calls);
@@ -796,7 +862,7 @@ test("Gemini recap output rejects unknown keys, markup, controls, bidi, non-NFC,
         async generateContent() {
           return { text: JSON.stringify(output) };
         },
-      }, { apiKey: "gemini-key", model: "gemini-3.7-flash", maxOutputTokens: 4_000, timeoutMilliseconds: 45_000 }),
+      }, { apiKey: "gemini-key", model: "gemini-3.6-flash", maxOutputTokens: 4_000, timeoutMilliseconds: 45_000 }),
       (error: unknown) => error instanceof SummaryError && error.code === "SUMMARY_PARSE_FAILED",
     );
   }
@@ -817,7 +883,7 @@ test("Gemini recap output redacts hostile string leaves before persistence", asy
         }),
       };
     },
-  }, { apiKey: "gemini-key", model: "gemini-3.7-flash", maxOutputTokens: 4_000, timeoutMilliseconds: 45_000 });
+  }, { apiKey: "gemini-key", model: "gemini-3.6-flash", maxOutputTokens: 4_000, timeoutMilliseconds: 45_000 });
   const serialized = JSON.stringify(generated.summary);
 
   assert.doesNotMatch(serialized, /user@example\.com|11111111-1111-4111-8111-111111111111|aaaabbbb\.ccccdddd\.eeeeffff|grant:abc:def|grant:viewer:secret|invite code 123456|인증 코드 123456/u);
@@ -834,7 +900,7 @@ test("Gemini recap timeout aborts every attempt and spends exactly one alternate
           request.signal.addEventListener("abort", () => reject(request.signal.reason), { once: true });
         });
       },
-    }, { apiKey: "gemini-key", model: "gemini-3.7-flash", maxOutputTokens: 4_000, timeoutMilliseconds: 5 }),
+    }, { apiKey: "gemini-key", model: "gemini-3.6-flash", maxOutputTokens: 4_000, timeoutMilliseconds: 5 }),
     (error: unknown) => error instanceof SummaryError && error.code === "SUMMARY_TIMEOUT",
   );
   assert.equal(calls, 2, "one 20s-bounded attempt per model, and never a third");
@@ -850,7 +916,7 @@ test("Gemini recap timeout stays authoritative for each attempt while the provid
           request.signal.addEventListener("abort", () => resolve({ text: JSON.stringify(generatedSummary) }), { once: true });
         });
       },
-    }, { apiKey: "gemini-key", model: "gemini-3.7-flash", maxOutputTokens: 4_000, timeoutMilliseconds: 5 }),
+    }, { apiKey: "gemini-key", model: "gemini-3.6-flash", maxOutputTokens: 4_000, timeoutMilliseconds: 5 }),
     (error: unknown) => error instanceof SummaryError && error.code === "SUMMARY_TIMEOUT",
   );
   assert.equal(calls, 2, "one 20s-bounded attempt per model, and never a third");
@@ -922,7 +988,7 @@ test("Gemini adapter request contains no email/company/department/jobTitle field
       requestSeen.push(request);
       return { text: JSON.stringify(generatedSummary) };
     },
-  }, { apiKey: "gemini-key", model: "gemini-3.7-flash", maxOutputTokens: 4_000, timeoutMilliseconds: 45_000 });
+  }, { apiKey: "gemini-key", model: "gemini-3.6-flash", maxOutputTokens: 4_000, timeoutMilliseconds: 45_000 });
   assert.doesNotMatch(JSON.stringify(requestSeen), /email|company|department|jobTitle|consent|grant-1|grant-2|Noel Kim|Mina Lee/iu);
 });
 
@@ -940,7 +1006,7 @@ test("summary generation RPC wrappers enforce the shared claim/complete/fail sha
       status: "claimed", generationToken: "token-1",
     });
     assert.equal(await completeMeetingSummaryGeneration(
-      "session-1", "ko", "token-1", structuredSummary, "gemini-3.7-flash", fetchFn,
+      "session-1", "ko", "token-1", structuredSummary, "gemini-3.6-flash", fetchFn,
     ), true);
     assert.equal(await failMeetingSummaryGeneration("session-1", "ko", "token-1", "SUMMARY_TIMEOUT", fetchFn), true);
     assert.deepEqual(calls.map((call) => call.path), [
@@ -1212,7 +1278,20 @@ test("summary read fetches are cancellable and use the bounded topic context RPC
   });
 });
 
-test("each summary attempt is bounded at 20s inside a 60s deadline and exactly one retry is spent", async () => {
+test("recap excludes unlinked legacy topics and all AI topic notes from canonical source evidence", () => {
+  const input = { sessionId, language: "ko", utterances: [{ ...utteranceRow(1), seq: 1, text: "The board rejected the project.",
+    participantId: null, speakerName: null, speakerLabel: null, speakerDepartment: null, speakerJobTitle: null,
+    sourceStartedAt: null, sourceEndedAt: "2026-09-01T00:00:00Z", emittedAt: "2026-09-01T00:00:00Z", utteranceKey: "authoritative-source:1" }],
+    participants: [], topicSnapshot: { topics: [{ ...topicSnapshot.topics[0], title: "LEGACY_APPROVAL", summary: "FABRICATED_APPROVED" }], topicMemberships: [] } };
+  const unlinked = buildSummaryPrompt(input, "ko");
+  assert.doesNotMatch(unlinked, /LEGACY_APPROVAL|FABRICATED_APPROVED/u);
+  const linked = buildSummaryPrompt({ ...input, topicSnapshot: { ...input.topicSnapshot,
+    topicMemberships: [{ sessionId, topicId: input.topicSnapshot.topics[0].id, utteranceKey: "authoritative-source:1", position: 1 }] } }, "ko");
+  assert.doesNotMatch(linked, /FABRICATED_APPROVED/u);
+  assert.match(linked, /The board rejected/u);
+});
+
+test("each summary attempt is bounded at 20s inside a 60s deadline and one alternate model is tried", async () => {
   assert.equal(SUMMARY_ATTEMPT_TIMEOUT_MILLISECONDS, 20_000);
   assert.equal(SUMMARY_TOTAL_DEADLINE_MILLISECONDS, 60_000);
   let attempts = 0;
@@ -1228,14 +1307,14 @@ test("each summary attempt is bounded at 20s inside a 60s deadline and exactly o
   // of the two, so a 20ms configuration exercises the same code path.
   await assert.rejects(
     generateMeetingSummary(summaryInput, "en", hangingGenerator, {
-      apiKey: "gemini-key", model: "gemini-3.7-flash", maxOutputTokens: 4_000, timeoutMilliseconds: 20,
+      apiKey: "gemini-key", model: "gemini-3.6-flash", maxOutputTokens: 4_000, timeoutMilliseconds: 20,
     }),
     (error: unknown) => error instanceof SummaryError && error.code === "SUMMARY_TIMEOUT" && error.status === 504,
   );
-  assert.equal(attempts, 2, "a timeout must spend exactly one bounded retry, never a third attempt");
+  assert.equal(attempts, 2, "a timeout must spend exactly one bounded alternate-model attempt");
 });
 
-test("only transient provider failures are retried, and the recorded model is the one that answered", async () => {
+test("only transient provider failures fall back, and the recorded model is the one that answered", async () => {
   for (const transientCode of ["SUMMARY_TIMEOUT", "SUMMARY_PROVIDER_UNAVAILABLE", "SUMMARY_PROVIDER_RATE_LIMITED"] as const) {
     let attempts = 0;
     const generator = {
@@ -1246,7 +1325,7 @@ test("only transient provider failures are retried, and the recorded model is th
       },
     };
     const generated = await generateMeetingSummary(summaryInput, "en", generator, {
-      apiKey: "gemini-key", model: "gemini-3.7-flash", maxOutputTokens: 4_000, timeoutMilliseconds: 45_000,
+      apiKey: "gemini-key", model: "gemini-3.6-flash", maxOutputTokens: 4_000, timeoutMilliseconds: 45_000,
     }, { sleep: async () => {} });
     assert.equal(attempts, 2);
     assert.equal(generated.model, "gemini-3.7-flash");
@@ -1262,15 +1341,15 @@ test("only transient provider failures are retried, and the recorded model is th
     };
     await assert.rejects(
       generateMeetingSummary(summaryInput, "en", generator, {
-        apiKey: "gemini-key", model: "gemini-3.7-flash", maxOutputTokens: 4_000, timeoutMilliseconds: 45_000,
+        apiKey: "gemini-key", model: "gemini-3.6-flash", maxOutputTokens: 4_000, timeoutMilliseconds: 45_000,
       }),
       (error: unknown) => error instanceof SummaryError && error.code === finalCode,
     );
-    assert.equal(attempts, 1, `${finalCode} is deterministic and must never be retried`);
+    assert.equal(attempts, 1, `${finalCode} is deterministic and must never retry on another model`);
   }
 });
 
-test("the bounded retry reaches the provider transport exactly twice and no further", async () => {
+test("the summary fallback chain reaches the alternate model over the real provider transport exactly once", async () => {
   const previousFetch = globalThis.fetch;
   const calls: string[] = [];
   globalThis.fetch = async (input) => {
@@ -1281,13 +1360,12 @@ test("the bounded retry reaches the provider transport exactly twice and no furt
   resetGeminiSummaryGeneratorCacheForTests();
   try {
     const generated = await generateMeetingSummary(summaryInput, "en", undefined, {
-      apiKey: "gemini-key", model: "gemini-3.7-flash", maxOutputTokens: 4_000, timeoutMilliseconds: 45_000,
+      apiKey: "gemini-key", model: "gemini-3.6-flash", maxOutputTokens: 4_000, timeoutMilliseconds: 45_000,
     });
-    // The recap transport pins the recap model, so the retry repeats it; the
-    // recorded model therefore always matches what was really requested.
     assert.equal(generated.model, "gemini-3.7-flash");
     assert.equal(calls.length, 2);
-    for (const call of calls) assert.match(call, /models\/gemini-3\.7-flash:generateContent/u);
+    assert.match(calls[0] ?? "", /models\/gemini-3\.6-flash:generateContent/u);
+    assert.match(calls[1] ?? "", /models\/gemini-3\.7-flash:generateContent/u);
   } finally {
     globalThis.fetch = previousFetch;
     resetGeminiSummaryGeneratorCacheForTests();
@@ -1329,7 +1407,7 @@ test("host summary reset targets the owned session lane and never invents a resu
 
 test("a rate-limited attempt backs off 1.5s before its single retry, clamped to the deadline; other availability failures retry at once", async () => {
   assert.equal(SUMMARY_RATE_LIMIT_RETRY_DELAY_MILLISECONDS, 1_500);
-  const config = { apiKey: "gemini-key", model: "gemini-3.7-flash", maxOutputTokens: 4_000, timeoutMilliseconds: 45_000 };
+  const config = { apiKey: "gemini-key", model: "gemini-3.6-flash", maxOutputTokens: 4_000, timeoutMilliseconds: 45_000 };
   const cases = [
     ["SUMMARY_PROVIDER_RATE_LIMITED", [1_500]],
     ["SUMMARY_PROVIDER_UNAVAILABLE", []],

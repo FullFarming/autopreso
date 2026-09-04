@@ -4,7 +4,7 @@ import { readFileSync } from "node:fs";
 import vm from "node:vm";
 import { EventEmitter } from "node:events";
 import { createGeminiCaptionConfig, geminiCaptionConfigFingerprint } from "../packages/caption-core/index.js";
-import { GeminiModelSelectionError, migrateLegacyGeminiModelSelection } from "../packages/caption-core/gemini-model-catalog.js";
+import { DEFAULT_ENGINE_SELECTION, EngineSelectionError, normalizeEngineSelection } from "../packages/caption-core/caption-engine-catalog.js";
 
 const modulePath = "../electron/live-demand-controller.js";
 const { createDesktopLiveDemandController } = await import(modulePath);
@@ -174,7 +174,7 @@ test("desktop start intent retains activation identity and rejects a demand-to-l
   const calls = [];
   const intent = vm.runInNewContext(`${mainSection("function readLiveCallModelPreferences", "function sanitizeLiveCallDraft")}
 ${mainSection("async function requestDesktopLiveStartIntent", "async function startDesktopLiveDemand")}; requestDesktopLiveStartIntent`, {
-    createGeminiCaptionConfig, geminiCaptionConfigFingerprint, GeminiModelSelectionError, migrateLegacyGeminiModelSelection,
+    createGeminiCaptionConfig, geminiCaptionConfigFingerprint, DEFAULT_ENGINE_SELECTION, EngineSelectionError, normalizeEngineSelection,
     liveCallSession: session,
     liveCallApi: async (_base, path, input) => {
       calls.push({ path, input });

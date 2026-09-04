@@ -125,18 +125,16 @@ test("physical connection admission counts pending handshakes and is released on
   assert.equal(h.sockets.length, 2);
 });
 
-test("Live Translate setup keeps target config and transcriptions separate", async () => {
+test("the retired Live Translate model and its AUDIO/translationConfig setup are refused before any socket opens", async () => {
   const h = harness();
-  const pending = h.client.live.connect({ model: "gemini-3.5-live-translate-preview", config: {
+  await assert.rejects(h.client.live.connect({ model: "gemini-3.5-live-translate-preview", config: {
     responseModalities: ["AUDIO"], inputAudioTranscription: {}, outputAudioTranscription: {},
     translationConfig: { targetLanguageCode: "ko", echoTargetLanguage: true },
-  } });
-  const socket = h.sockets[0]; socket.open(); socket.message({ setupComplete: {} });
-  const session = await pending;
-  assert.deepEqual(socket.sent[0].setup.generationConfig.translationConfig, { targetLanguageCode: "ko", echoTargetLanguage: true });
-  assert.deepEqual(socket.sent[0].setup.inputAudioTranscription, {});
-  assert.deepEqual(socket.sent[0].setup.outputAudioTranscription, {});
-  session.close();
+  } }), /GOOGLE_LIVE_CONFIG_INVALID/);
+  await assert.rejects(h.client.live.connect({ model, config: { ...config, translationConfig: { targetLanguageCode: "ko", echoTargetLanguage: true } } }), /GOOGLE_LIVE_CONFIG_INVALID/);
+  await assert.rejects(h.client.live.connect({ model, config: { ...config, outputAudioTranscription: {} } }), /GOOGLE_LIVE_CONFIG_INVALID/);
+  await assert.rejects(h.client.live.connect({ model, config: { ...config, responseModalities: ["AUDIO"] } }), /GOOGLE_LIVE_CONFIG_INVALID/);
+  assert.equal(h.sockets.length, 0);
 });
 
 test("aborting a connection rejects pending sends even when the transport never calls back", async () => {

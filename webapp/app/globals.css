@@ -421,6 +421,9 @@ input:focus-visible {
 .live-review-list div { min-width: 0; padding: 12px; border: 1px solid var(--hairline); border-radius: 12px; background: var(--nova-web-background); }
 .live-review-list dt { color: var(--muted); font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
 .live-review-list dd { margin: 5px 0 0; overflow: hidden; color: var(--ink); text-overflow: ellipsis; white-space: nowrap; font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
+.live-engine-status { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 8px 0 0; padding: 10px 12px; border: 1px solid var(--hairline); border-radius: 12px; background: var(--nova-web-background); font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
+.live-engine-status span { flex: none; color: var(--muted); }
+.live-engine-status strong { min-width: 0; overflow: hidden; color: var(--ink); text-overflow: ellipsis; white-space: nowrap; font-weight: 600; }
 .live-session-panel { margin-top: 16px; }
 .live-language-panel,
 .live-session-panel { min-height: 280px; }

@@ -31,8 +31,7 @@ import {
   geminiCaptionConfigFingerprint,
 } from "../packages/caption-core/index.js";
 import { createLiveCallArchive, readLiveArchiveSessionId } from "../src/live-call-archive.js";
-import { GeminiModelSelectionError, migrateLegacyGeminiModelSelection } from "../packages/caption-core/gemini-model-catalog.js";
-import { DEFAULT_ENGINE_SELECTION, normalizeEngineSelection } from "../packages/caption-core/caption-engine-catalog.js";
+import { DEFAULT_ENGINE_SELECTION, EngineSelectionError, normalizeEngineSelection } from "../packages/caption-core/caption-engine-catalog.js";
 import { registerLiveInterpreterIpc, resolveLiveInterpreterEnabled } from "./live-interpreter-ipc.js";
 import { registerMeetingCoachIpc } from "./meeting-coach-ipc.js";
 import { createDesktopLiveDemandController } from "./live-demand-controller.js";
@@ -1141,37 +1140,27 @@ async function liveCallApiWithHostSession(baseUrl, pathname, options) {
   return liveCallApi(baseUrl, pathname, options);
 }
 
+// Plan 2 Task 4: a Live Call's `modelPreferences` is `{ engine, engineHistory }`
+// (webapp/lib/live/model-preferences.ts). The desktop keeps only the engine -
+// history is server-owned and never sent back - and validates it against the
+// shared catalog; an absent value is the catalog default.
 function readLiveCallModelPreferences(value) {
-  if (value !== undefined && (!value || typeof value !== "object" || Array.isArray(value)
-    || typeof value.source !== "string" || typeof value.summary !== "string")) {
-    throw new GeminiModelSelectionError();
+  if (value === undefined) return Object.freeze({ engine: DEFAULT_ENGINE_SELECTION });
+  if (!value || typeof value !== "object" || Array.isArray(value)
+    || !value.engine || typeof value.engine !== "object" || Array.isArray(value.engine)
+    || Object.keys(value).some((key) => key !== "engine" && key !== "engineHistory")) {
+    throw new EngineSelectionError();
   }
-  return Object.freeze({
-    source: migrateLegacyGeminiModelSelection("source", value?.source),
-    summary: migrateLegacyGeminiModelSelection("summary", value?.summary),
-  });
+  return Object.freeze({ engine: normalizeEngineSelection(value.engine) });
 }
 
+// The DB engine is the ONLY Live Call engine (spec §9). The local
+// `subtitle.engine` and any legacy `models` pins in the saved settings never
+// reach the gateway config; everything else (glossary, tone, domain) does.
 function pinLiveCallModelSettings(settings, modelPreferences) {
-  const selected = readLiveCallModelPreferences(modelPreferences);
-  // 2026-09-01 fix: 알려진 과거 설정만 현재 역할 계약으로 이행한다.
-  // DB의 당시 설정 기록은 변경하지 않는다.
-  return {
-    ...settings,
-    // Plan 2 replaces `modelPreferences` with the engine selection end to end.
-    // Until then the gateway only knows Gemini, so a pinned Live Call always
-    // runs the Gemini STT/summary the DB recorded.
-    engine: {
-      stt: { provider: "gemini", model: selected.source, languageMode: "auto" },
-      // A Soniox translation is only valid alongside the Soniox STT, which the
-      // pin above never selects — carrying it over would make every Live Call
-      // config build throw ENGINE_SELECTION_INVALID.
-      translation: settings?.engine?.translation?.provider === "gemini"
-        ? settings.engine.translation : { provider: "gemini", model: "gemini-3.6-flash" },
-      summary: { provider: "gemini", model: selected.summary },
-    },
-    models: { ...settings?.models, transcription: selected.source, summary: selected.summary },
-  };
+  const { engine } = readLiveCallModelPreferences(modelPreferences);
+  const { engine: _localEngine, models: _legacyModels, ...rest } = settings ?? {};
+  return { ...rest, engine };
 }
 
 function sanitizeLiveCallDraft(draft, subtitleSettings = {}, modelPreferences = undefined) {
@@ -1247,13 +1236,7 @@ async function seedLiveCallEngineDefaults(baseUrl) {
     console.warn(`[live] global engine default unusable, using the catalog default: ${error?.message ?? error}`);
     engineDefaults = DEFAULT_ENGINE_SELECTION;
   }
-  // Until Plan 2 the gateway runs Gemini only, so a Soniox global STT has no
-  // source model to name here; the catalog default source stands in and the
-  // summary still follows the admin.
-  return readLiveCallModelPreferences({
-    source: engineDefaults.stt.provider === "gemini" ? engineDefaults.stt.model : DEFAULT_ENGINE_SELECTION.stt.model,
-    summary: engineDefaults.summary.model,
-  });
+  return readLiveCallModelPreferences({ engine: engineDefaults });
 }
 
 async function openLiveStageOverlay(baseUrl, sessionId, invite) {
@@ -1689,7 +1672,7 @@ const DESKTOP_GO_LIVE_FAILURE_STAGES = new Set([
 const DESKTOP_GO_LIVE_FAILURE_CODES = new Set([
   "NETWORK_UNAVAILABLE", "HOST_LOGIN_REQUIRED", "HOST_AUTH_REQUIRED", "FORBIDDEN", "CSRF_ORIGIN_FORBIDDEN",
   "INVALID_REQUEST", "VERSION_CONFLICT", "SESSION_NOT_FOUND", "SESSION_NOT_STARTABLE", "SESSION_PAUSED",
-  "RATE_LIMITED", "LIVE_CALL_DISABLED", "INVALID_GEMINI_MODEL_SELECTION", "INVALID_START_RESPONSE",
+  "RATE_LIMITED", "LIVE_CALL_DISABLED", "ENGINE_SELECTION_INVALID", "INVALID_START_RESPONSE",
   "MEDIA_DEMAND_DISABLED", "MEDIA_CONTROL_FAILED", "MEDIA_START_FAILED", "NOT_ARMED", "NOT_PREPARING", "NOT_LIVE",
   "SESSION_ENDED", "LIVE_CAPTION_RENDERER_UNAVAILABLE", "LIVE_CAPTION_PREFLIGHT_TIMEOUT", "LIVE_CAPTION_PREFLIGHT_FAILED",
   "LIVE_CALL_AUDIO_CAPTURE_FAILED", "LIVE_CALL_SUBTITLE_PREFLIGHT_FAILED", "SUBTITLE_SETTINGS_SAVE_PENDING",
@@ -1722,7 +1705,7 @@ async function requestDesktopLiveStartIntent(armedSession) {
       armedSession.gatewaySettings?.captionConfig ?? armedSession.gatewaySettings ?? {}, modelPreferences,
     ));
   } catch {
-    return { ok: false, error: "통화에 저장된 모델 설정을 확인해 주세요.", code: "INVALID_GEMINI_MODEL_SELECTION" };
+    return { ok: false, error: "통화에 저장된 자막 엔진 설정을 확인해 주세요.", code: "ENGINE_SELECTION_INVALID" };
   }
   const result = await liveCallApi(armedSession.baseUrl, `${pathname}/start`, {
     body: { version: current.data.version, demandEnabled: true },
@@ -3171,7 +3154,7 @@ function registerOverlayIpc(settingsStore, { localAppOrigin, liveWorkspaceUrl, l
     try {
       modelPreferences = readLiveCallModelPreferences(sessionData.modelPreferences);
     } catch {
-      return { ok: false, error: "통화에 저장된 모델 설정을 확인해 주세요.", code: "INVALID_GEMINI_MODEL_SELECTION" };
+      return { ok: false, error: "통화에 저장된 자막 엔진 설정을 확인해 주세요.", code: "ENGINE_SELECTION_INVALID" };
     }
     const invite = await liveCallApi(liveWorkspaceUrl, `/api/live-sessions/${encodeURIComponent(sessionData.id)}/invites`, {
       body: { action: "create" },

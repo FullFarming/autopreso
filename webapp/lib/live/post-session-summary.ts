@@ -38,7 +38,7 @@ export interface SummaryLanguageGenerationDependencies {
   fail: typeof failMeetingSummaryGeneration;
   fetchUtterances: (sessionId: string, language: string, options?: { signal?: AbortSignal }) => Promise<MeetingUtterance[]>;
   fetchTopicTranscript: (sessionId: string, language: string, options?: { signal?: AbortSignal }) => Promise<LiveTopicSnapshot>;
-  fetchSessionContext: (sessionId: string, options?: { signal?: AbortSignal }) => Promise<MeetingSessionContext | null>;
+  fetchSessionContext: (sessionId: string, hostId: string, options?: { signal?: AbortSignal }) => Promise<MeetingSessionContext | null>;
   buildRoster: (sessionId: string, hostId: string, options?: { signal?: AbortSignal }) => Promise<LiveHostParticipantActivity[]>;
   generate: typeof generateMeetingSummary;
   read: typeof readMeetingSummary;
@@ -51,7 +51,7 @@ const defaultLanguageDependencies: SummaryLanguageGenerationDependencies = {
   fail: failMeetingSummaryGeneration,
   fetchUtterances: (sessionId, language, options) => fetchSummaryUtterances(sessionId, language, fetch, options),
   fetchTopicTranscript: (sessionId, language, options) => fetchTopicTranscript(sessionId, language, options),
-  fetchSessionContext: (sessionId, options) => fetchMeetingSessionContext(sessionId, options),
+  fetchSessionContext: (sessionId, hostId, options) => fetchMeetingSessionContext(sessionId, hostId, options),
   buildRoster: (sessionId, hostId, options) => buildParticipantRoster(sessionId, hostId, fetch, undefined, options),
   generate: generateMeetingSummary,
   read: readMeetingSummary,
@@ -85,7 +85,7 @@ export async function generateSummaryForLanguage(
         deps.fetchUtterances(sessionId, language, { signal }),
         deps.buildRoster(sessionId, hostId, { signal }),
         deps.fetchTopicTranscript(sessionId, language, { signal }),
-        deps.fetchSessionContext(sessionId, { signal }),
+        deps.fetchSessionContext(sessionId, hostId, { signal }),
       ]),
       deps.readTimeoutMilliseconds,
     );

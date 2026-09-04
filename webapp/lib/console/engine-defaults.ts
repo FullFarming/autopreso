@@ -1,13 +1,11 @@
-import { DEFAULT_ENGINE_SELECTION, normalizeEngineSelection } from "../../../packages/caption-core/caption-engine-catalog.js";
-import { readGeminiSelectedModel } from "../../../packages/caption-core/gemini-model-catalog.js";
+import { DEFAULT_ENGINE_SELECTION, captionEngineCatalogForClient, normalizeEngineSelection } from "../../../packages/caption-core/caption-engine-catalog.js";
 import { LiveSecurityConfigurationError } from "../security/config";
+import type { EngineRoleSelection, EngineSelection, SttEngineSelection } from "../live/model-preferences";
 import { __onConsoleStoreSwapped, getConsoleStore, type ConsoleSettings } from "./console-store";
 
-// Mirrors the shape `normalizeEngineSelection` returns (caption-engine-catalog.js):
-// roles stt / translation / summary, only stt carries languageMode.
-export interface EngineRoleSelection { provider: string; model: string }
-export interface SttEngineSelection extends EngineRoleSelection { languageMode: string }
-export interface EngineSelection { stt: SttEngineSelection; translation: EngineRoleSelection; summary: EngineRoleSelection }
+// The engine types live with the session's `modelPreferences` (lib/live/model-preferences.ts)
+// so the client-side Live Call code can import them without pulling the console store in.
+export type { EngineRoleSelection, EngineSelection, SttEngineSelection };
 
 /** Stored engine defaults re-validated against the catalog; anything unreadable is the catalog default. */
 export function readStoredEngineDefaults(value: unknown): EngineSelection {
@@ -19,18 +17,14 @@ export function readStoredEngineDefaults(value: unknown): EngineSelection {
 }
 
 /**
- * Seed for a new Live Call session's `modelPreferences` (webapp/lib/live/model-preferences.ts):
- * a Gemini stt model is the `source`; any other stt provider maps to the catalog's default
- * Gemini source because the session runtime only understands Gemini model ids there.
+ * Catalog view for clients (`/api/live-config.captionEngines`): every entry with
+ * `available` = whether this server holds that provider's key. Booleans only -
+ * key values never leave the server.
  */
-export function engineDefaultsToModelPreferences(engine: EngineSelection): { source: string; summary: string } {
-  const fallback = { source: readGeminiSelectedModel("source", undefined), summary: readGeminiSelectedModel("summary", undefined) };
-  try {
-    const source = engine.stt.provider === "gemini" ? engine.stt.model : fallback.source;
-    return { source: readGeminiSelectedModel("source", source), summary: readGeminiSelectedModel("summary", engine.summary.model) };
-  } catch {
-    return fallback;
-  }
+export function captionEngineAvailability(environment: Readonly<Record<string, string | undefined>> = process.env): ReturnType<typeof captionEngineCatalogForClient> {
+  return captionEngineCatalogForClient({
+    hasApiKeys: { gemini: Boolean(environment.GEMINI_API_KEY), soniox: Boolean(environment.SONIOX_API_KEY) },
+  });
 }
 
 /** What an unconfigured or unmigrated project behaves like: legacy login stays on, no engine override. */

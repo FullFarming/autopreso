@@ -1,3 +1,8 @@
+import { hasValidTranslationCaptureProvenance } from "../../lib/live/translation-capture";
+import { sourceEventSchema, type SourceEvent } from "../../lib/live/source-contract";
+import { createGeminiCaptionConfig } from "../../../packages/caption-core/gemini-caption-contract.js";
+import { normalizeEngineSelection } from "../../../packages/caption-core/caption-engine-catalog.js";
+import type { EngineSelection, LiveModelPreferences } from "../../lib/live/model-preferences";
 import type { CaptionEvent, GlossaryPack, LiveOutputMode, LiveSessionStatus, LiveSessionType, LiveVoiceProvider, SpeakerAssignment } from "@/lib/live-contract";
 import {
   getReconnectDelayMilliseconds,
@@ -36,6 +41,7 @@ interface AudioClientOptions {
   maxViewers: number;
   glossaryPack: GlossaryPack;
   domainText?: string;
+  modelPreferences?: LiveModelPreferences;
   activationKey?: string | null;
   initialControl?: "start" | "restart";
   sessionStatus?: LiveSessionStatus;
@@ -46,6 +52,8 @@ interface AudioClientOptions {
   refreshSettings?: () => Promise<LiveAudioSettings>;
   demandControl?: HostDemandControl;
   onCaption?: (caption: CaptionEvent) => void;
+  onSource?: (source: SourceEvent) => void;
+  onSourceStatus?: (status: "unavailable") => void;
   onStatus: (status: string) => void;
   onError: (message: string) => void;
   onManualRestartRequired?: () => void;
@@ -67,6 +75,31 @@ export interface LiveAudioSettings {
   maxViewers: number;
   glossaryPack: GlossaryPack;
   domainText?: string;
+  modelPreferences?: LiveModelPreferences;
+}
+
+const INVALID_ENGINE_MESSAGE = "자막 엔진 선택이 올바르지 않습니다.";
+
+// The server always returns the normalized `{ engine, engineHistory }` shape
+// (lib/live/model-preferences.ts); the client re-validates the engine against
+// the catalog and carries nothing else - history is server-owned.
+function readHostModelPreferences(value: unknown): LiveModelPreferences {
+  if (value === undefined) return { engine: normalizeEngineSelection(undefined) as EngineSelection, engineHistory: [] };
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(INVALID_ENGINE_MESSAGE);
+  const preferences = value as Record<string, unknown>;
+  if (Object.keys(preferences).some((key) => key !== "engine" && key !== "engineHistory")
+    || !preferences.engine || typeof preferences.engine !== "object" || Array.isArray(preferences.engine)) throw new Error(INVALID_ENGINE_MESSAGE);
+  try {
+    return { engine: normalizeEngineSelection(preferences.engine) as EngineSelection, engineHistory: [] };
+  } catch {
+    throw new Error(INVALID_ENGINE_MESSAGE);
+  }
+}
+
+function buildHostCaptionConfig(settings: LiveAudioSettings) {
+  const { engine } = readHostModelPreferences(settings.modelPreferences);
+  return createGeminiCaptionConfig({ languages: settings.languages, outputMode: settings.outputMode,
+    glossaryPack: settings.glossaryPack, domainText: settings.domainText ?? "", engine });
 }
 
 interface OpenedGatewaySocket {
@@ -148,6 +181,7 @@ function isHostCaptionEvent(
     && (utteranceKey === undefined
       || (typeof utteranceKey === "string" && utteranceKey.length >= 1 && utteranceKey.length <= 256))
     && (caption.sourceText === undefined || caption.sourceText === null || typeof caption.sourceText === "string")
+    && hasValidTranslationCaptureProvenance(caption)
     && (caption.sourceLanguage === undefined || caption.sourceLanguage === null || typeof caption.sourceLanguage === "string")
     && (caption.translationStatus === undefined
       || caption.translationStatus === "verbatim"
@@ -294,7 +328,7 @@ function waitForSocketOpen(socket: WebSocket): Promise<void> {
   });
 }
 
-function waitForMessage(socket: WebSocket, expectedType: string, timeoutMilliseconds = 5_000): Promise<void> {
+function waitForMessage(socket: WebSocket, expectedType: string, timeoutMilliseconds = 5_000, expectedSessionId?: string): Promise<void> {
   return new Promise((resolve, reject) => {
     const cleanup = () => {
       window.clearTimeout(timeout);
@@ -312,6 +346,7 @@ function waitForMessage(socket: WebSocket, expectedType: string, timeoutMillisec
         const type = (value as Record<string, unknown>).type;
         if (type === "error") { fail(new Error("The media gateway rejected the request.")); return; }
         if (type !== expectedType) return;
+        if (expectedSessionId && (value as Record<string, unknown>).sessionId !== expectedSessionId) return;
         cleanup();
         resolve();
       } catch {
@@ -367,6 +402,7 @@ async function openSocket(
   isManualRestart = false,
 ): Promise<OpenedGatewaySocket> {
   assertSessionVersion(settings.version);
+  const captionConfig = buildHostCaptionConfig(settings);
   assertSessionVersion(activationVersion);
   if (activationKey !== null) assertActivationKey(activationKey);
   const hasReadinessActivation = activationKey !== null && (!isManualRestart || settings.sessionStatus === "preparing");
@@ -396,6 +432,7 @@ async function openSocket(
       maxViewers: settings.maxViewers,
       glossaryPack: settings.glossaryPack,
       domainText: settings.domainText ?? "",
+      captionConfig,
       inputSource: options.inputSource,
     }));
     const startedAck = await started;
@@ -456,6 +493,7 @@ export interface LiveAudioClient {
   pause(): Promise<void>;
   resume(): Promise<void>;
   disconnect(): Promise<void>;
+  drain(): Promise<void>;
   stop(): Promise<void>;
 }
 
@@ -479,6 +517,7 @@ export async function startLiveAudioClient(options: AudioClientOptions): Promise
   let isReplacing = false;
   let isStopped = false;
   let stopPromise: Promise<void> | null = null;
+  let drainPromise: Promise<void> | null = null;
   let isLocalMediaReleased = false;
   let demandTimer: number | null = null;
   let isDemandEnabled = false;
@@ -497,6 +536,7 @@ export async function startLiveAudioClient(options: AudioClientOptions): Promise
     maxViewers: options.maxViewers,
     glossaryPack: options.glossaryPack,
     domainText: options.domainText ?? "",
+    modelPreferences: readHostModelPreferences(options.modelPreferences),
   };
   const socketListenerDisposers = new WeakMap<WebSocket, () => void>();
   const captionCursors = new Map<string, {
@@ -615,6 +655,7 @@ export async function startLiveAudioClient(options: AudioClientOptions): Promise
     else options.onError("다른 기기에서 호스트로 접속해 이 기기의 송출이 중지되었습니다.");
   };
 
+  let lastSourceSeq = 0;
   const attachPersistentListeners = (candidate: WebSocket) => {
     const existingDisposer = socketListenerDisposers.get(candidate);
     if (existingDisposer) return existingDisposer;
@@ -624,6 +665,19 @@ export async function startLiveAudioClient(options: AudioClientOptions): Promise
         const value: unknown = JSON.parse(event.data);
         if (!value || typeof value !== "object") return;
         const message = value as Record<string, unknown>;
+        if (message.type === "source") {
+          const source = sourceEventSchema.safeParse(message);
+          if (isStopped || !source.success || source.data.sessionId !== options.sessionId || source.data.sourceSeq <= lastSourceSeq) return;
+          lastSourceSeq = source.data.sourceSeq;
+          options.onSource?.(source.data);
+          return;
+        }
+        if (message.type === "source-status") {
+          if (!isStopped && message.sessionId === options.sessionId && message.status === "unavailable"
+            && message.code === "SOURCE_RECORDING_UNAVAILABLE"
+            && Object.keys(message).every((key) => ["type", "sessionId", "status", "code"].includes(key))) options.onSourceStatus?.("unavailable");
+          return;
+        }
         if (message.type === "media-idle" && message.sessionId === options.sessionId && isDemandEnabled) {
           candidate.send(JSON.stringify({ type: "media-idle-ack", epoch: message.epoch }));
           enterMediaIdle();
@@ -738,7 +792,7 @@ export async function startLiveAudioClient(options: AudioClientOptions): Promise
     if (!options.refreshSettings) throw new Error("최신 회의 설정을 확인할 수 없습니다.");
     const fresh = await options.refreshSettings();
     assertSessionVersion(fresh.version);
-    currentSettings = { ...fresh, languages: [...fresh.languages] };
+    currentSettings = { ...fresh, languages: [...fresh.languages], modelPreferences: readHostModelPreferences(fresh.modelPreferences) };
   };
 
   const reconnect = async (throwOnError = false): Promise<void> => {
@@ -858,9 +912,11 @@ export async function startLiveAudioClient(options: AudioClientOptions): Promise
     return {
       isWaitingForParticipants: () => isMediaIdle,
       async update(settings) {
+        const modelPreferences = readHostModelPreferences(settings.modelPreferences === undefined ? currentSettings.modelPreferences : settings.modelPreferences);
+        const captionConfig = buildHostCaptionConfig({ ...settings, modelPreferences });
         if (isDemandEnabled && isMediaIdle) {
           assertSessionVersion(settings.version);
-          currentSettings = { ...settings, languages: [...settings.languages] };
+          currentSettings = { ...settings, languages: [...settings.languages], modelPreferences };
           return;
         }
         if (!socket || socket.readyState !== WebSocket.OPEN) throw new Error("The media gateway is not connected.");
@@ -877,6 +933,7 @@ export async function startLiveAudioClient(options: AudioClientOptions): Promise
           maxViewers: settings.maxViewers,
           glossaryPack: settings.glossaryPack,
           domainText: settings.domainText ?? "",
+          captionConfig,
           inputSource: options.inputSource,
         }));
         await updated;
@@ -889,6 +946,7 @@ export async function startLiveAudioClient(options: AudioClientOptions): Promise
           maxViewers: settings.maxViewers,
           glossaryPack: settings.glossaryPack,
           domainText: settings.domainText ?? "",
+          modelPreferences,
         };
       },
       async restart() {
@@ -916,6 +974,7 @@ export async function startLiveAudioClient(options: AudioClientOptions): Promise
               version: currentSettings.version, sessionType: currentSettings.sessionType, languages: currentSettings.languages,
               outputMode: currentSettings.outputMode, voiceProvider: currentSettings.voiceProvider,
               maxViewers: currentSettings.maxViewers, glossaryPack: currentSettings.glossaryPack, domainText: currentSettings.domainText ?? "",
+              captionConfig: buildHostCaptionConfig(currentSettings),
               ...(currentSettings.sessionStatus === "preparing" && activationKey !== null ? { activationKey } : {}),
               ...(isDemandEnabled ? { demandEnabled: true } : {}), inputSource: options.inputSource }));
             const ack = await restarted;
@@ -972,6 +1031,25 @@ export async function startLiveAudioClient(options: AudioClientOptions): Promise
           }
         })();
         return stopPromise;
+      },
+      async drain() {
+        if (drainPromise) return drainPromise;
+        isStopped = true;
+        isCapturePaused = true;
+        clearReconnectTimers();
+        frameSpool = [];
+        drainPromise = (async () => {
+          await context?.suspend();
+          if (isDemandEnabled && isMediaIdle && !socket) return;
+          const activeSocket = socket;
+          if (!activeSocket || activeSocket.readyState !== WebSocket.OPEN) {
+            throw new Error("원문 저장을 확인할 연결이 없습니다. 회의 종료를 다시 시도해 주세요.");
+          }
+          const drained = waitForMessage(activeSocket, "drained", 12_000, options.sessionId);
+          activeSocket.send(JSON.stringify({ type: "drain", sessionId: options.sessionId }));
+          await drained;
+        })().catch((error: unknown) => { drainPromise = null; throw error; });
+        return drainPromise;
       },
       async stop() {
         if (stopPromise) return stopPromise;

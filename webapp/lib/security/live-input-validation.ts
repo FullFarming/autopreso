@@ -1,3 +1,4 @@
+import { liveModelPreferencesSchema } from "../live/model-preferences";
 import { z } from "zod";
 
 import { LANGUAGE_CODES, normalizeLanguageCode } from "../languageDetect";
@@ -94,6 +95,7 @@ export const createLiveSessionInputSchema = z
     fiscalPeriod: publicMetadataSchema(80),
     eventType: liveEventTypeInputSchema.nullable().optional(),
     agenda: agendaInputSchema,
+    modelPreferences: liveModelPreferencesSchema.optional(),
   })
   .strict();
 
@@ -114,6 +116,7 @@ export const updateLiveSessionInputSchema = z
     fiscalPeriod: publicMetadataSchema(80),
     eventType: liveEventTypeInputSchema.nullable().optional(),
     agenda: agendaInputSchema,
+    modelPreferences: liveModelPreferencesSchema.optional(),
   })
   .strict()
   .refine(
@@ -130,7 +133,8 @@ export const updateLiveSessionInputSchema = z
       || input.ticker !== undefined
       || input.fiscalPeriod !== undefined
       || input.eventType !== undefined
-      || input.agenda !== undefined,
+      || input.agenda !== undefined
+      || input.modelPreferences !== undefined,
     { message: "변경할 라이브 설정이 필요합니다." },
   );
 

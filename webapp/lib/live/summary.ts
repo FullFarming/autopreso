@@ -3,8 +3,11 @@ import { LANGUAGE_LABELS } from "../languageDetect";
 import { getSupabaseServerAccess, supabaseAdminHeaders } from "../security/supabase-server-access";
 import { redactGeminiSensitiveText } from "../../../packages/caption-core/index.js";
 
-import { GEMINI_RECAP_MODEL, getMeetingSummaryConfig, getLiveStoreConfig, type MeetingSummaryConfig } from "./config";
+import { getMeetingSummaryConfig, getLiveStoreConfig, type MeetingSummaryConfig } from "./config";
+import { LiveSecurityConfigurationError } from "../security/config";
 import { SupabaseLiveSessionStore } from "./store";
+import { findEngineEntry } from "../../../packages/caption-core/caption-engine-catalog.js";
+import type { LiveModelPreferences } from "./model-preferences";
 import {
   getCachedGeminiSummaryGenerator,
   type GeminiSummaryContentGenerator,
@@ -38,6 +41,7 @@ export interface MeetingUtterance {
 }
 
 export interface MeetingSessionContext {
+  modelPreferences?: LiveModelPreferences;
   title: string;
   companyName: string | null;
   ticker: string | null;
@@ -386,14 +390,16 @@ export async function fetchTopicTranscript(
 
 export async function fetchMeetingSessionContext(
   sessionId: string,
+  hostId: string,
   options: SummaryStoredReadOptions & { fetchFn?: typeof fetch } = {},
 ): Promise<MeetingSessionContext | null> {
   try {
     const config = getLiveStoreConfig();
     const store = new SupabaseLiveSessionStore(config.baseUrl, config.credential, options.fetchFn ?? fetch);
-    const session: LiveSession | null = await store.get(sessionId, { signal: options.signal });
-    if (!session) return null;
+    const session: LiveSession | null = await store.getOwned(sessionId, hostId, { signal: options.signal });
+    if (!session) throw new Error("SESSION_CONTEXT_UNAVAILABLE");
     return {
+      modelPreferences: session.modelPreferences,
       title: session.title,
       companyName: session.companyName ?? null,
       ticker: session.ticker ?? null,
@@ -402,9 +408,8 @@ export async function fetchMeetingSessionContext(
       agenda: session.agenda ?? [],
     };
   } catch {
-    // Session context improves terminology and structure, but a missing context
-    // must never block the best-effort post-call recap.
-    return null;
+    // A missing model pin must never silently select a different paid model.
+    throw new SummaryError("회의의 저장된 모델 설정을 확인할 수 없습니다.", "SUMMARY_CONTEXT_UNAVAILABLE", 503);
   }
 }
 
@@ -505,11 +510,12 @@ function buildTopicTranscriptLines(input: MeetingSummaryInput): TopicTranscriptL
   const lines: TopicTranscriptLine[] = [];
   const topics = [...input.topicSnapshot.topics].sort((left, right) => left.ordinal - right.ordinal);
   for (const topic of topics) {
-    lines.push({ speakerLabel: null, text: `Chapter ${topic.ordinal}: ${topic.title}` });
-    if (topic.summary) lines.push({ speakerLabel: null, text: `Topic note: ${topic.summary}` });
     const memberships = input.topicSnapshot.topicMemberships
-      .filter((membership) => membership.topicId === topic.id)
+      .filter((membership) => membership.topicId === topic.id && utteranceByKey.has(membership.utteranceKey))
       .sort((left, right) => left.position - right.position);
+    if (memberships.length === 0) continue;
+    // Topic summaries are generated evidence; only canonical linked text grounds the recap.
+    lines.push({ speakerLabel: null, text: `Chapter ${topic.ordinal}: ${topic.title}` });
     for (const membership of memberships) {
       const utterance = utteranceByKey.get(membership.utteranceKey);
       if (!utterance) continue;
@@ -699,47 +705,65 @@ function sleepForMilliseconds(milliseconds: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 /**
- * Only availability failures earn the second attempt. A parse, refusal or
- * configuration failure is deterministic - repeating it just spends the
- * deadline and the host's patience twice.
+ * Only availability failures earn the alternate model. A parse, refusal or
+ * configuration failure is deterministic - retrying it on another model just
+ * spends the deadline and the host's patience twice.
  */
-const SUMMARY_RETRY_ERROR_CODES: readonly string[] = [
+const SUMMARY_MODEL_FALLBACK_CODES: readonly string[] = [
   "SUMMARY_TIMEOUT",
   "SUMMARY_PROVIDER_UNAVAILABLE",
   "SUMMARY_PROVIDER_RATE_LIMITED",
 ];
-/**
- * Two bounded attempts inside one deadline: 20s + 20s beats a single 45s wait
- * on an unavailable provider, and the host's "다시 생성" is not the first
- * retry any more. The engine catalog names an alternate summary model, but the
- * recap transport still pins the recap model, so the second attempt reuses the
- * configured one - which is also the model the completed job records.
- */
-const SUMMARY_MAX_ATTEMPTS = 2;
+
+/** The catalog owns the alternate model; exactly one alternate is attempted. */
+function summaryModelChain(model: string): string[] {
+  const entry = findEngineEntry("summary", "gemini", model) as { fallbackModels?: readonly string[] } | null;
+  const alternate = (entry?.fallbackModels ?? []).find((candidate) => candidate !== model);
+  return alternate ? [model, alternate] : [model];
+}
 
 export async function generateMeetingSummary(
   input: MeetingSummaryInput,
   language: string,
   generator?: GeminiSummaryContentGenerator,
-  config: MeetingSummaryConfig = getMeetingSummaryConfig(),
+  config?: MeetingSummaryConfig,
   options: MeetingSummaryGenerationOptions = {},
 ): Promise<{ summary: MeetingSummary; model: string }> {
-  if (config.model !== GEMINI_RECAP_MODEL) {
+  let summaryConfig: MeetingSummaryConfig;
+  try {
+    summaryConfig = config ?? getMeetingSummaryConfig();
+    if (!summaryConfig.apiKey.trim()) throw new LiveSecurityConfigurationError("GEMINI_API_KEY가 설정되지 않았습니다.");
+  } catch (error: unknown) {
+    if (error instanceof LiveSecurityConfigurationError) {
+      throw new SummaryError("요약 서비스의 서버 설정을 확인해 주세요.", "SUMMARY_NOT_CONFIGURED", 503);
+    }
+    throw error;
+  }
+  let selectedConfig: MeetingSummaryConfig;
+  try {
+    // The session's engine names its summary model (Plan 2 Task 4); the recap
+    // config model is the fallback for sessions without one. Both must be
+    // catalog summary entries - nothing else ever reaches the REST call.
+    const selectedModel = input.sessionContext?.modelPreferences?.engine?.summary?.model ?? summaryConfig.model;
+    if (!findEngineEntry("summary", "gemini", summaryConfig.model) || !findEngineEntry("summary", "gemini", selectedModel)) throw new Error("SUMMARY_MODEL_NOT_ALLOWED");
+    selectedConfig = { ...summaryConfig, model: selectedModel };
+  } catch {
     throw new SummaryError("요약 모델 설정이 올바르지 않습니다.", "SUMMARY_MODEL_NOT_ALLOWED", 500);
   }
   const prompt = buildSummaryPrompt(input, language);
-  const attemptCeiling = Math.min(SUMMARY_ATTEMPT_TIMEOUT_MILLISECONDS, config.timeoutMilliseconds);
+  const attemptCeiling = Math.min(SUMMARY_ATTEMPT_TIMEOUT_MILLISECONDS, selectedConfig.timeoutMilliseconds);
   const now = options.now ?? Date.now;
   const sleep = options.sleep ?? sleepForMilliseconds;
   const deadlineAt = now() + SUMMARY_TOTAL_DEADLINE_MILLISECONDS;
+  const chain = summaryModelChain(selectedConfig.model);
   let lastError: SummaryError = new SummaryError("요약 서비스에 연결할 수 없습니다.", "SUMMARY_PROVIDER_UNAVAILABLE", 502);
-  for (let attempt = 1; attempt <= SUMMARY_MAX_ATTEMPTS; attempt += 1) {
+  for (const [index, model] of chain.entries()) {
     const remaining = deadlineAt - now();
     if (remaining <= 0) break;
     try {
       const payload = await runSummaryGenerationAttempt(
-        generator ?? getCachedGeminiSummaryGenerator(config),
-        { sessionId: input.sessionId, prompt, maxOutputTokens: config.maxOutputTokens },
+        generator ?? getCachedGeminiSummaryGenerator({ ...selectedConfig, model }),
+        { sessionId: input.sessionId, prompt, maxOutputTokens: selectedConfig.maxOutputTokens },
         Math.min(attemptCeiling, remaining),
       );
       const summary = parseGeneratedMeetingSummaryPayload(payload);
@@ -748,15 +772,15 @@ export async function generateMeetingSummary(
           ...summary,
           participationStats: deriveParticipationStats(input.utterances),
         },
-        // The model that answered, so the completed job records it.
-        model: config.model,
+        // The model that actually answered, so the completed job records it.
+        model,
       };
     } catch (error: unknown) {
       lastError = error instanceof SummaryError
         ? error
         : new SummaryError("요약 서비스에 연결할 수 없습니다.", "SUMMARY_PROVIDER_UNAVAILABLE", 502);
-      const isLastAttempt = attempt === SUMMARY_MAX_ATTEMPTS;
-      if (isLastAttempt || !SUMMARY_RETRY_ERROR_CODES.includes(lastError.code)) throw lastError;
+      const isLastAttempt = index === chain.length - 1;
+      if (isLastAttempt || !SUMMARY_MODEL_FALLBACK_CODES.includes(lastError.code)) throw lastError;
       if (lastError.code === "SUMMARY_PROVIDER_RATE_LIMITED") {
         const backoff = Math.min(SUMMARY_RATE_LIMIT_RETRY_DELAY_MILLISECONDS, deadlineAt - now());
         if (backoff > 0) await sleep(backoff);

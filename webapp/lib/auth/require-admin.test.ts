@@ -3,7 +3,7 @@ import test from "node:test";
 import { AuthenticationError, AuthorizationError } from "./live-auth";
 import { __setProfileReaderForTests } from "./profile-status-cache";
 import type { ProfileRecord, ProfileRole, ProfileStatus } from "./profile-store";
-import { requireAdmin, requireAdminFromCookieValue } from "./require-admin";
+import { isAdminRequest, requireAdmin, requireAdminFromCookieValue } from "./require-admin";
 import { SESSION_COOKIE, createSessionToken } from "../session";
 
 const ADMIN_UUID = "00000000-0000-4000-8000-000000000011";
@@ -69,5 +69,18 @@ test("requireAdminFromCookieValue applies the same gate to a raw cookie value fo
     assert.equal(actor.profile.role, "admin");
     await assert.rejects(requireAdminFromCookieValue(await createSessionToken(HOST_UUID)), AuthorizationError);
     await assert.rejects(requireAdminFromCookieValue(undefined), AuthenticationError);
+  });
+});
+
+test("isAdminRequest never throws: true only for an approved admin, false for hosts, pending admins, legacy hosts, and no cookie", async () => {
+  await withProfiles({ [ADMIN_UUID]: profile(ADMIN_UUID, "approved", "admin"), [HOST_UUID]: profile(HOST_UUID, "approved", "host") }, async () => {
+    assert.equal(await isAdminRequest(request(await createSessionToken(ADMIN_UUID))), true);
+    assert.equal(await isAdminRequest(request(await createSessionToken(HOST_UUID))), false);
+    assert.equal(await isAdminRequest(request(await createSessionToken("noel"))), false, "a legacy password host has no profile row");
+    assert.equal(await isAdminRequest(request(undefined)), false);
+    assert.equal(await isAdminRequest(request("forged.token")), false);
+  });
+  await withProfiles({ [ADMIN_UUID]: profile(ADMIN_UUID, "pending", "admin") }, async () => {
+    assert.equal(await isAdminRequest(request(await createSessionToken(ADMIN_UUID))), false);
   });
 });

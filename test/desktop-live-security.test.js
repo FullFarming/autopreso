@@ -3,7 +3,7 @@ import { EventEmitter } from "node:events";
 import { readFileSync } from "node:fs";
 import test from "node:test";
 import vm from "node:vm";
-import { GeminiModelSelectionError, readGeminiSelectedModel, migrateLegacyGeminiModelSelection } from "../packages/caption-core/gemini-model-catalog.js";
+import { DEFAULT_ENGINE_SELECTION, EngineSelectionError, normalizeEngineSelection } from "../packages/caption-core/caption-engine-catalog.js";
 
 import {
   sanitizeLiveCaptionDisplayLanguage,
@@ -308,7 +308,7 @@ ${sourceBetween("async function preflightLiveCallCaptionSession", "function requ
         webContents: { isDestroyed: () => false },
       },
       validateSubtitleSettings: () => {},
-      GeminiModelSelectionError, readGeminiSelectedModel, migrateLegacyGeminiModelSelection,
+      DEFAULT_ENGINE_SELECTION, EngineSelectionError, normalizeEngineSelection,
       createGeminiCaptionConfig,
       geminiCaptionConfigFingerprint,
       resolveLiveCallLanguages,

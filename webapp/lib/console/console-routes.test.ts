@@ -395,7 +395,15 @@ test("GET /api/live-config adds the normalized engine defaults next to gatewayUr
     try {
       const route = loadRoute("live-config");
       const { data } = bodyOf(await route.GET(request("/api/live-config")));
-      assert.deepEqual(data, { gatewayUrl: "wss://gateway.test/live", engineDefaults: { ...DEFAULT_ENGINE_SELECTION, translation: { provider: "gemini", model: "gemini-3.5-flash-lite" } } });
+      const captionEngines = captionEngineCatalog.captionEngineCatalogForClient({
+        hasApiKeys: { gemini: Boolean(process.env.GEMINI_API_KEY), soniox: Boolean(process.env.SONIOX_API_KEY) },
+      });
+      assert.deepEqual(data, { gatewayUrl: "wss://gateway.test/live", engineDefaults: { ...DEFAULT_ENGINE_SELECTION, translation: { provider: "gemini", model: "gemini-3.5-flash-lite" } }, captionEngines });
+      // Plan 2 Task 4: hosts learn which engines this deployment can run - availability booleans, never key values.
+      for (const role of ["stt", "translation", "summary"] as const) {
+        for (const entry of (data as unknown as { captionEngines: Record<typeof role, Array<Record<string, unknown>>> }).captionEngines[role]) assert.equal(typeof entry.available, "boolean");
+      }
+      assert.doesNotMatch(JSON.stringify(data), /AIza|sk-|apiKey/u);
       fake.failWith = new ConsoleStoreError("down", "CONSOLE_STORE_UNAVAILABLE", 503);
       engineDefaults.consoleSettingsCache.invalidate();
       const degraded = bodyOf(await route.GET(request("/api/live-config")));

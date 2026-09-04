@@ -1,5 +1,14 @@
 import type { GlossaryPack, LiveAgendaItem, LiveEventType, LiveOutputMode, LiveSession, LiveSessionGlossaryPin, LiveSessionGlossaryPins, LiveSessionSection, LiveSessionType, LiveSnapshot, LiveVoiceProvider } from "../live-contract";
+import { validateEngineForLanguages } from "../../../packages/caption-core/caption-engine-catalog.js";
 import { LiveSessionError } from "./errors";
+import {
+  applyEngineSelection,
+  defaultEngineSelection,
+  readLiveModelPreferences,
+  readNewLiveModelPreferences,
+  type EngineSelection,
+  type LiveModelPreferences,
+} from "./model-preferences";
 import type { LiveSessionStore } from "./store";
 import {
   parseAgenda,
@@ -47,7 +56,7 @@ export class LiveSessionService {
     this.now = now;
   }
 
-  async create(hostId: string, input: CreateServiceInput): Promise<LiveSession> {
+  async create(hostId: string, input: CreateServiceInput, options: CreateServiceOptions = {}): Promise<LiveSession> {
     const { sessionType, outputMode, voiceProvider } = normalizeSessionSettings(input);
     const participantSpeakingEnabled = parseParticipantSpeakingEnabled(input.participantSpeakingEnabled, false);
     assertParticipantSpeakingConfiguration(sessionType, participantSpeakingEnabled);
@@ -55,6 +64,9 @@ export class LiveSessionService {
     const title = parseTitle(input.title ?? "Live Session");
     const scheduledAt = parseScheduledAt(input.scheduledAt);
     const eventMetadata = parseEventMetadata(input);
+    const engine = resolveEngineAuthority(readRequestedEngine(input.modelPreferences), options, options.engineDefaults ?? defaultEngineSelection());
+    assertEngineForLanguages(engine, languages);
+    const modelPreferences: LiveModelPreferences = { engine, engineHistory: [] };
     const scheduledTimestamp = scheduledAt === null ? this.now() : Date.parse(scheduledAt);
     if (scheduledTimestamp > this.now() + MAX_SCHEDULE_AHEAD_MILLISECONDS) {
       throw new LiveSessionError("라이브 일정은 30일 이내로 예약하세요.", "SCHEDULE_TOO_FAR", 400);
@@ -79,6 +91,7 @@ export class LiveSessionService {
       endedAt: null,
       hasCoverImage: false,
       ...eventMetadata,
+      modelPreferences,
       activeSection: "prepared_remarks",
       sectionStartedAt: null,
     };
@@ -104,7 +117,7 @@ export class LiveSessionService {
     throw new LiveSessionError("다른 커버가 먼저 저장되었습니다. 다시 시도하세요.", "COVER_FINALIZE_CONFLICT", 409);
   }
 
-  async update(hostId: string, sessionId: string, input: UpdateServiceInput): Promise<LiveSession> {
+  async update(hostId: string, sessionId: string, input: UpdateServiceInput, options: UpdateServiceOptions = {}): Promise<LiveSession> {
     const version = parseVersion(input.version);
     const current = await this.store.get(sessionId);
     if (!current || current.hostId !== hostId) throw new LiveSessionError("세션을 찾을 수 없습니다.", "SESSION_NOT_FOUND", 404);
@@ -128,6 +141,14 @@ export class LiveSessionService {
     );
     assertParticipantSpeakingConfiguration(sessionType, participantSpeakingEnabled);
     const eventMetadata = parseEventMetadata(input, current);
+    // Plan 2 Task 4: the engine may change while the session is live (the
+    // gateway swaps pipelines on `update`); each change lands in engineHistory.
+    const currentPreferences = readLiveModelPreferences(current.modelPreferences);
+    const engine = resolveEngineAuthority(readRequestedEngine(input.modelPreferences), options, currentPreferences.engine);
+    assertEngineForLanguages(engine, languages);
+    const modelPreferences = applyEngineSelection(currentPreferences, engine, {
+      changedAt: new Date(this.now()).toISOString(), byHostId: hostId,
+    });
     const updated = await this.store.updateOwned(sessionId, hostId, version, {
       sessionType,
       outputMode,
@@ -139,6 +160,7 @@ export class LiveSessionService {
       participantSpeakingEnabled,
       glossaryPack,
       ...eventMetadata,
+      modelPreferences,
     });
     if (!updated) throw new LiveSessionError("다른 변경이 먼저 저장되었습니다. 새로고침 후 다시 시도하세요.", "VERSION_CONFLICT", 409);
     return updated;
@@ -314,7 +336,47 @@ interface LegacySessionSettingsInput {
   voiceOutputMode?: unknown;
 }
 
+/**
+ * Spec §9 (2026-09-04): the admin console's global engine is the only Live Call
+ * engine. Routes pass the resolved global default plus whether the caller is an
+ * admin; the service is the authority, not the client.
+ */
+export interface EngineAuthorityOptions {
+  /** `resolveEngineDefaultsOrFallback()`; absent only for direct callers (tests) - then the client's engine stands. */
+  engineDefaults?: EngineSelection;
+  /** Admins (the console deploy path) may set an explicit engine. */
+  isAdmin?: boolean;
+}
+export type CreateServiceOptions = EngineAuthorityOptions;
+export type UpdateServiceOptions = EngineAuthorityOptions;
+
+function readRequestedEngine(value: unknown): EngineSelection | undefined {
+  return value === undefined ? undefined : readNewLiveModelPreferences(value).engine;
+}
+
+/**
+ * - nothing requested -> `fallback` (the global default on create, the current engine on update)
+ * - admin request -> honoured
+ * - non-admin request -> REPLACED by the global default (not rejected: server authority)
+ */
+function resolveEngineAuthority(requested: EngineSelection | undefined, options: EngineAuthorityOptions, fallback: EngineSelection): EngineSelection {
+  if (requested === undefined) return fallback;
+  if (options.isAdmin === true) return requested;
+  return options.engineDefaults ?? requested;
+}
+
+// Soniox two-way translation needs exactly two caption languages; refuse the
+// combination here instead of dead-ending when the gateway opens the socket.
+function assertEngineForLanguages(engine: EngineSelection, languages: readonly string[]): void {
+  try {
+    validateEngineForLanguages(engine, languages);
+  } catch (error: unknown) {
+    throw new LiveSessionError(error instanceof Error && error.message ? error.message : "자막 엔진 선택이 올바르지 않습니다.", "ENGINE_LANGUAGE_COUNT_INVALID", 400);
+  }
+}
+
 interface CreateServiceInput extends LegacySessionSettingsInput {
+  modelPreferences?: unknown;
   title?: unknown;
   scheduledAt?: unknown;
   sessionType?: unknown;
@@ -332,6 +394,7 @@ interface CreateServiceInput extends LegacySessionSettingsInput {
 }
 
 interface UpdateServiceInput extends LegacySessionSettingsInput {
+  modelPreferences?: unknown;
   version: unknown;
   title?: unknown;
   scheduledAt?: unknown;

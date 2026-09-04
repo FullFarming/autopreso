@@ -23,7 +23,7 @@ export type GoogleSheetsConfig =
     privateKey: string;
   };
 
-export const GEMINI_RECAP_MODEL = "gemini-3.7-flash";
+export const GEMINI_RECAP_MODEL = "gemini-3.6-flash";
 const DEFAULT_SUMMARY_MAX_OUTPUT_TOKENS = 4_000;
 const DEFAULT_SUMMARY_TIMEOUT_MILLISECONDS = 45_000;
 

@@ -4,7 +4,7 @@ import { DEFAULT_ENGINE_SELECTION } from "../../../packages/caption-core/caption
 import { LiveSecurityConfigurationError } from "../security/config";
 import { ConsoleStoreError, SupabaseConsoleStore, __setConsoleStoreForTests, type ConsoleSettings } from "./console-store";
 import {
-  CONSOLE_SETTINGS_FALLBACK, consoleSettingsCache, createConsoleSettingsCache, engineDefaultsToModelPreferences,
+  CONSOLE_SETTINGS_FALLBACK, consoleSettingsCache, createConsoleSettingsCache,
   readStoredEngineDefaults, resolveEngineDefaults,
 } from "./engine-defaults";
 
@@ -25,12 +25,6 @@ test("garbage stored values fall back to the default without throwing", () => {
   for (const garbage of ["gemini", 42, [], { stt: { provider: "gemini", model: "nope" } }, { bogus: true }, { stt: { provider: "soniox", model: "stt-rt-v5", languageMode: "fr" } }]) {
     assert.deepEqual(readStoredEngineDefaults(garbage), DEFAULT_ENGINE_SELECTION, JSON.stringify(garbage));
   }
-});
-
-test("engineDefaultsToModelPreferences maps a Gemini stt model to source and Soniox stt to the catalog's default Gemini source", () => {
-  const soniox = readStoredEngineDefaults({ stt: { provider: "soniox", model: "stt-rt-v5", languageMode: "ko" }, translation: { provider: "soniox", model: "stt-rt-v5" }, summary: { provider: "gemini", model: "gemini-3.7-flash" } });
-  assert.deepEqual(engineDefaultsToModelPreferences(soniox), { source: DEFAULT_ENGINE_SELECTION.stt.model, summary: "gemini-3.7-flash" });
-  assert.deepEqual(engineDefaultsToModelPreferences(readStoredEngineDefaults(null)), { source: "gemini-3.5-transcribe-live", summary: "gemini-3.6-flash" });
 });
 
 test("createConsoleSettingsCache memoizes for 60 s, dedupes concurrent reads, and invalidates", async () => {

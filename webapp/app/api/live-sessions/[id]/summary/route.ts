@@ -106,7 +106,7 @@ export async function POST(request: NextRequest, context: { params: Promise<{ id
         fetchSummaryUtterances(sessionId, language, fetch, { signal }),
         buildParticipantRoster(sessionId, hostId, fetch, undefined, { signal }),
         fetchTopicTranscript(sessionId, language, { signal }),
-        fetchMeetingSessionContext(sessionId, { signal }),
+        fetchMeetingSessionContext(sessionId, hostId, { signal }),
       ]));
       if (utterances.length === 0) {
         // Nothing was said: the job records NO_UTTERANCES (DB contract) but the

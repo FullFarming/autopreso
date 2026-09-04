@@ -2,7 +2,8 @@ import { LiveTopicCoordinator } from "./live-topic-coordinator.js";
 import { resolveBuiltInGlossaryDocument } from "./glossary-packs.js";
 import { compileGlossaryDocumentV1, mergeCompiledGlossariesV1 } from "../../packages/caption-core/index.js";
 import { createGeminiCaptionConfig } from "../../packages/caption-core/gemini-caption-contract.js";
-import { readGeminiSelectedModel, migrateLegacyGeminiModelSelection } from "../../packages/caption-core/gemini-model-catalog.js";
+import { engineSelectionKey, migrateLegacyEngineSelection, normalizeEngineSelection } from "../../packages/caption-core/caption-engine-catalog.js";
+import { readStoredGeminiModelSelection } from "../../packages/caption-core/gemini-model-catalog.js";
 
 export { LiveTopicCoordinator };
 
@@ -262,7 +263,7 @@ export class SupabaseLivePublisher {
       throw new Error("AUTHORITATIVE_SOURCE_LANE_FAILED");
     }
     try {
-      const rpcVersion = normalized.sourceProvenance !== null ? "v3" : normalized.languageObservation === null ? "v1" : "v2";
+      const rpcVersion = normalized.languageObservation === null ? "v1" : "v2";
       const value = await this.#requestSnapshotGuard(
         `/rest/v1/rpc/persist_authoritative_live_source_utterance_${rpcVersion}${mediaFence ? "_fenced_v1" : ""}`,
         {
@@ -275,7 +276,6 @@ export class SupabaseLivePublisher {
             p_normalized_text: normalized.normalizedText,
             p_source_language: normalized.sourceLanguage,
             ...(rpcVersion === "v1" ? {} : { p_language_observation: normalized.languageObservation }),
-            ...(normalized.sourceProvenance === null ? {} : { p_source_provenance: normalized.sourceProvenance }),
             p_speaker_role: normalized.speakerRole,
             p_speaker_label: normalized.speakerLabel,
             p_speaker_name: normalized.speakerName,
@@ -890,6 +890,33 @@ function hasRequiredKeys(value, keys) {
   return keys.every((key) => Object.hasOwn(value, key));
 }
 
+/**
+ * `event_metadata.modelPreferences` → the engine the session must run, or
+ * `null` when the stored value is malformed. Absent → catalog default;
+ * `{ engine, engineHistory? }` → the normalized engine; legacy `{ source,
+ * summary }` → the engine those known historical ids migrate to.
+ */
+function readStoredEngineSelection(preferences) {
+  if (preferences === undefined) return normalizeEngineSelection(undefined);
+  if (!isPlainRecord(preferences)) return null;
+  if (hasExactKeys(preferences, ["source", "summary"])) {
+    try {
+      readStoredGeminiModelSelection("source", preferences.source);
+      readStoredGeminiModelSelection("summary", preferences.summary);
+    } catch {
+      return null;
+    }
+    return migrateLegacyEngineSelection({ geminiTranscribeModel: preferences.source, geminiSummaryModel: preferences.summary });
+  }
+  if (!Object.hasOwn(preferences, "engine") || !isPlainRecord(preferences.engine)
+    || Object.keys(preferences).some((key) => key !== "engine" && key !== "engineHistory")) return null;
+  try {
+    return normalizeEngineSelection(preferences.engine);
+  } catch {
+    return null;
+  }
+}
+
 function replayTranslationStatus(row) {
   if (["verbatim", "translated", "failed"].includes(row.translation_status)) {
     return row.translation_status;
@@ -944,7 +971,6 @@ function normalizeAuthoritativeSourceInput(input) {
   if (input.sourceProvenance !== undefined && input.sourceProvenance !== null) {
     throw new Error("INVALID_AUTHORITATIVE_SOURCE_INPUT");
   }
-  const sourceProvenance = null;
   if (!AUTHORITATIVE_STT_PROVIDERS.has(input.sttProvider)) throw new Error("INVALID_AUTHORITATIVE_SOURCE_INPUT");
   return {
     sessionId: input.sessionId,
@@ -953,7 +979,6 @@ function normalizeAuthoritativeSourceInput(input) {
     normalizedText,
     sourceLanguage,
     languageObservation: normalizeLanguageObservation(input.languageObservation, sourceLanguage),
-    sourceProvenance,
     speakerRole: input.speakerRole,
     speakerLabel: optionalSnapshot(input.speakerLabel, 80),
     speakerName: optionalSnapshot(input.speakerName, 40),
@@ -1341,22 +1366,25 @@ export class SupabaseHostAuthorizer {
       return false;
     }
     const row = rows[0];
-    // 2026-09-01 fix: migrate only known historical DB pins for the approved role change.
-    // A caller's canonical runtime models stay strict and cannot choose the former paid path.
+    // Plan 2 Task 4: the DB engine (`event_metadata.modelPreferences.engine`,
+    // spec §9: set by the admin console) is the only engine a host may run. The
+    // caller's captionConfig must name exactly that engine; legacy per-role
+    // pins are read as the engine they migrate to, and unknown ids fail closed.
     try {
       const metadata = row.event_metadata;
       if (metadata != null && !isPlainRecord(metadata)) return false;
-      const preferences = metadata?.modelPreferences;
-      if (preferences !== undefined && (!isPlainRecord(preferences)
-        || !hasExactKeys(preferences, ["source", "summary"])
-        || typeof preferences.source !== "string" || typeof preferences.summary !== "string")) return false;
-      if (settings.captionConfig?.models) {
-        readGeminiSelectedModel("source", settings.captionConfig.models.transcription);
-        readGeminiSelectedModel("summary", settings.captionConfig.models.summary);
-      }
+      const storedEngine = readStoredEngineSelection(metadata?.modelPreferences);
+      if (storedEngine === null) return false;
       const config = createGeminiCaptionConfig(settings.captionConfig ?? settings);
-      if (config.models.transcription !== migrateLegacyGeminiModelSelection("source", preferences?.source)
-        || config.models.summary !== migrateLegacyGeminiModelSelection("summary", preferences?.summary)) return false;
+      // A caller may still send the derived `models`; they must agree with the engine.
+      const models = settings.captionConfig?.models;
+      if (models !== undefined && (!isPlainRecord(models)
+        || (models.transcription !== undefined && models.transcription !== config.engine.stt.model)
+        || (models.summary !== undefined && models.summary !== config.engine.summary.model))) return false;
+      if (engineSelectionKey(config.engine) !== engineSelectionKey(storedEngine)) {
+        console.warn(`[host-authorize] rejected: engine mismatch session=${settings.sessionId}`);
+        return false;
+      }
     } catch {
       return false;
     }

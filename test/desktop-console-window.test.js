@@ -4,8 +4,7 @@ import { readFileSync } from "node:fs";
 import test from "node:test";
 import vm from "node:vm";
 import { classifyDesktopConsoleNavigation, openDesktopConsoleWindow } from "../electron/desktop-console-window.js";
-import { DEFAULT_ENGINE_SELECTION, normalizeEngineSelection } from "../packages/caption-core/caption-engine-catalog.js";
-import { GeminiModelSelectionError, migrateLegacyGeminiModelSelection, readGeminiSelectedModel } from "../packages/caption-core/gemini-model-catalog.js";
+import { DEFAULT_ENGINE_SELECTION, EngineSelectionError, normalizeEngineSelection } from "../packages/caption-core/caption-engine-catalog.js";
 import { resolveLiveCallLanguages } from "../src/subtitle-languages.js";
 import { MESSAGES } from "../public/subtitle-i18n.js";
 import { JA } from "../public/subtitle-i18n-ja.js";
@@ -183,13 +182,13 @@ const sonioxEngine = normalizeEngineSelection({
   translation: { provider: "soniox", model: "stt-rt-v5" },
   summary: { provider: "gemini", model: "gemini-3.7-flash" },
 });
-const catalogDefaultPreferences = { source: DEFAULT_ENGINE_SELECTION.stt.model, summary: DEFAULT_ENGINE_SELECTION.summary.model };
+// Plan 2 Task 4: preferences travel as `{ engine }` (history is server-owned).
+const catalogDefaultPreferences = { engine: DEFAULT_ENGINE_SELECTION };
 const plain = (value) => JSON.parse(JSON.stringify(value));
 
 function liveCallContext(extra = {}) {
   return {
-    DEFAULT_ENGINE_SELECTION, normalizeEngineSelection, URL,
-    GeminiModelSelectionError, migrateLegacyGeminiModelSelection, readGeminiSelectedModel,
+    DEFAULT_ENGINE_SELECTION, EngineSelectionError, normalizeEngineSelection, URL,
     resolveLiveCallLanguages, LIVE_DRAFT_LANGUAGES: new Set(["ko", "en", "ja"]),
     sanitizeLiveCallGlossaries: (value) => value ?? [], sanitizeLiveCaptionDisplayLanguage: () => "all",
     console: { warn: () => {} },
@@ -214,12 +213,10 @@ test("a new Live Call takes its engine from the admin's global default published
   const h = seedHarness();
   const preferences = await h.seed();
   assert.deepEqual(h.calls.api.map((call) => [call.baseUrl, call.pathname, call.options.method]), [[origin, "/api/live-config", "GET"]]);
-  assert.deepEqual(plain(preferences), { source: "gemini-3.5-transcribe-live", summary: "gemini-3.7-flash" });
-  // A Soniox global STT has no Gemini source model to name yet (the gateway's
-  // Soniox lane is Plan 2); the catalog default source stands in, the summary
-  // still follows the admin.
+  assert.deepEqual(plain(preferences), { engine: plain(globalDefault) });
+  // A Soniox global engine travels as-is; the gateway builds the provider from it (Plan 2).
   const soniox = seedHarness({ config: { ok: true, data: { gatewayUrl: "wss://gw.example.test", engineDefaults: sonioxEngine } } });
-  assert.deepEqual(plain(await soniox.seed()), { source: DEFAULT_ENGINE_SELECTION.stt.model, summary: "gemini-3.7-flash" });
+  assert.deepEqual(plain(await soniox.seed()), { engine: plain(sonioxEngine) });
 });
 
 test("an absent, invalid, or unreachable global default falls back to the catalog default — never to the local caption engine", async () => {
@@ -234,7 +231,7 @@ test("an absent, invalid, or unreachable global default falls back to the catalo
     { ok: false, code: "HOST_LOGIN_REQUIRED" },
   ]) {
     const h = seedHarness({ config });
-    assert.deepEqual(plain(await h.seed()), catalogDefaultPreferences, JSON.stringify(config));
+    assert.deepEqual(plain(await h.seed()), plain(catalogDefaultPreferences), JSON.stringify(config));
   }
   const seedSource = section("async function seedLiveCallEngineDefaults", "async function openLiveStageOverlay");
   assert.doesNotMatch(seedSource, /subtitle|settingsStore|engineDefaultsSeen|\.save\(/u, "the seed reads no local settings and persists nothing");
@@ -243,13 +240,13 @@ test("an absent, invalid, or unreachable global default falls back to the catalo
 
 test("the local caption engine never reaches the Live Call body: a Soniox subtitle.engine still submits the admin engine", () => {
   const build = vm.runInNewContext(`${modelHelpers}\n${liveCallBuilders}\n(draft, subtitle, preferences) => toLiveCallApiInput(sanitizeLiveCallDraft(draft, subtitle, preferences))`, liveCallContext());
-  const adminPreferences = { source: "gemini-3.5-transcribe-live", summary: "gemini-3.7-flash" };
+  const adminPreferences = { engine: globalDefault };
   const localSoniox = Object.freeze({ engine: sonioxEngine, translationLanguages: ["ko", "en"] });
-  assert.deepEqual(plain(build({ title: "Synthetic", modelPreferences: { source: "untrusted", summary: "untrusted" } }, localSoniox, adminPreferences).modelPreferences), adminPreferences);
+  assert.deepEqual(plain(build({ title: "Synthetic", modelPreferences: { engine: sonioxEngine } }, localSoniox, adminPreferences).modelPreferences), plain(adminPreferences));
   const localCustomised = { engine: globalDefault, translationLanguages: ["ko", "en"] };
-  assert.deepEqual(plain(build({}, localCustomised, catalogDefaultPreferences).modelPreferences), catalogDefaultPreferences,
-    "a customised local summary model does not leak into the body when the admin engine is the catalog default");
-  assert.deepEqual(plain(build({}, localCustomised, undefined).modelPreferences), catalogDefaultPreferences, "no seeded engine → catalog default");
+  assert.deepEqual(plain(build({}, localCustomised, catalogDefaultPreferences).modelPreferences), plain(catalogDefaultPreferences),
+    "a customised local engine does not leak into the body when the admin engine is the catalog default");
+  assert.deepEqual(plain(build({}, localCustomised, undefined).modelPreferences), plain(catalogDefaultPreferences), "no seeded engine → catalog default");
   assert.equal(localCustomised.engine, globalDefault, "sanitizing never rewrites the local engine");
   assert.doesNotMatch(section("function sanitizeLiveCallDraft", "function toLiveCallApiInput"), /subtitleSettings\.engine|readGeminiSelectedModel/u);
 });

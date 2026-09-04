@@ -722,7 +722,7 @@ test("summary POST rejects unauthenticated and non-owning callers before claim o
   assert.match(post, /fetchSummaryUtterances\(sessionId, language, fetch, \{ signal \}\)/u);
   assert.match(post, /buildParticipantRoster\(sessionId, hostId, fetch, undefined, \{ signal \}\)/u);
   assert.match(post, /fetchTopicTranscript\(sessionId, language, \{ signal \}\)/u);
-  assert.match(post, /fetchMeetingSessionContext\(sessionId, \{ signal \}\)/u);
+  assert.match(post, /fetchMeetingSessionContext\(sessionId, hostId, \{ signal \}\)/u);
   assert.doesNotMatch(post, /buildParticipantActivity/u);
   assert.doesNotMatch(post, /authorizeParticipantRecordRequest/u,
     "participant recap credentials must never authorize summary generation");
@@ -832,7 +832,7 @@ test("legacy live polish endpoint is removed while recap uses the fixed Gemini s
   const summary = readFileSync(new URL("../live/summary.ts", import.meta.url), "utf8");
 
   assert.equal(existsSync(legacyRoute), false);
-  assert.match(summaryConfig, /GEMINI_RECAP_MODEL = "gemini-3\.7-flash"/u);
+  assert.match(summaryConfig, /GEMINI_RECAP_MODEL = "gemini-3\.6-flash"/u);
   assert.match(summary, /<untrusted_topic_transcript>[\s\S]*<\/untrusted_topic_transcript>/u);
   assert.match(summary, /redactGeminiSensitiveText/u);
   assert.doesNotMatch(`${summaryConfig}\n${summary}`, /OPENAI|gpt-5\.6|luna/iu);
@@ -2601,8 +2601,10 @@ test("transcript route exposes only the public event metadata shape after author
   assert.doesNotMatch(transcriptRead.slice(eventIndex, eventIndex + 500), /email|summaryConsent|grant|accessCode|inviteToken/iu);
 });
 
-test("Gemini Transcribe Live and 3.7 generation workloads are fixed, deterministic, redacted, bounded, and single-attempt", () => {
+test("engine-catalog governed Gemini workloads are allowlisted, deterministic, redacted, bounded, and single-attempt", () => {
   const captionPolicy = readFileSync(new URL("../../../packages/caption-core/gemini-caption-contract.js", import.meta.url), "utf8");
+  const engineCatalog = readFileSync(new URL("../../../packages/caption-core/caption-engine-catalog.js", import.meta.url), "utf8");
+  const modelCatalog = readFileSync(new URL("../../../packages/caption-core/gemini-model-catalog.js", import.meta.url), "utf8");
   const serverPolicy = readFileSync(new URL("../../../packages/gemini-server/policy.js", import.meta.url), "utf8");
   const sdkRuntime = readFileSync(new URL("../../../packages/gemini-server/sdk-runtime.js", import.meta.url), "utf8");
   const recapRest = readFileSync(new URL("../../../packages/gemini-server/rest-recap.js", import.meta.url), "utf8");
@@ -2612,16 +2614,36 @@ test("Gemini Transcribe Live and 3.7 generation workloads are fixed, determinist
   const gatewayMetrics = readFileSync(new URL("../../../media-gateway/src/server.js", import.meta.url), "utf8");
   const summaryMetrics = readFileSync(new URL("../live/summary-observability.ts", import.meta.url), "utf8");
   const summary = readFileSync(new URL("../live/summary.ts", import.meta.url), "utf8");
+  const modelPreferences = readFileSync(new URL("../live/model-preferences.ts", import.meta.url), "utf8");
 
+  // Plan 2: every runtime model id comes from the engine catalog; the caption contract only derives.
   assert.match(captionPolicy, /transcription: DEFAULT_TRANSCRIPTION_MODEL/u);
-  assert.match(captionPolicy, /DEFAULT_TRANSCRIPTION_MODEL = "gemini-3\.5-transcribe-live"/u);
-  for (const workload of ["glossaryExtraction", "topic", "translation", "polish", "recap"]) {
-    assert.match(captionPolicy, new RegExp(`${workload}: (?:DEFAULT_(?:GENERATION|POLISH)_MODEL|"gemini-3\\.7-flash")`, "u"));
-  }
-  const modelSources = [captionPolicy, recapRest, pdfRest, translation, polish, gatewayMetrics, summaryMetrics, summary].join("\n");
+  assert.match(captionPolicy, /DEFAULT_TRANSCRIPTION_MODEL = DEFAULT_ENGINE_SELECTION\.stt\.model/u);
+  assert.match(captionPolicy, /DEFAULT_POLISH_MODEL = "gemini-3\.7-flash"/u);
+  assert.match(captionPolicy, /DEFAULT_ANALYSIS_MODEL = DEFAULT_ENGINE_SELECTION\.summary\.model/u);
+  assert.match(captionPolicy, /translation: DEFAULT_ENGINE_SELECTION\.translation\.model/u);
+  assert.match(captionPolicy, /polish: DEFAULT_POLISH_MODEL/u);
+  assert.match(captionPolicy, /glossaryExtraction: DEFAULT_POLISH_MODEL/u);
+  for (const workload of ["topic", "recap"]) assert.match(captionPolicy, new RegExp(`${workload}: DEFAULT_ANALYSIS_MODEL`, "u"));
+  assert.match(captionPolicy, /input\.engine !== undefined\s*\? normalizeEngineSelection\(input\.engine\)\s*: migrateLegacyEngineSelection\(/u);
+  assert.match(engineCatalog, /stt: \{ provider: "gemini", model: "gemini-3\.5-transcribe-live", languageMode: "auto" \},\s*translation: \{ provider: "gemini", model: "gemini-3\.6-flash" \},\s*summary: \{ provider: "gemini", model: "gemini-3\.6-flash" \}/u);
+  assert.match(modelCatalog, /Compatibility shim over caption-engine-catalog\.js/u);
+  const runtimeModelReader = modelCatalog.slice(modelCatalog.indexOf("export function readGeminiSelectedModel("), modelCatalog.indexOf("export function readStoredGeminiModelSelection("));
+  assert.match(runtimeModelReader, /if \(typeof value === "string" && allowed\(role\)\.includes\(value\)\) return value;\s*throw new GeminiModelSelectionError\(\)/u);
+  // The webapp validates every engine through the catalog and fails closed on unknown legacy ids.
+  assert.match(modelPreferences, /normalizeEngineSelection\(value\)/u);
+  assert.match(modelPreferences, /readStoredGeminiModelSelection\(role, value\) === value/u);
+  assert.doesNotMatch(modelPreferences, /gemini-3\./u, "the webapp hard-codes no model id");
+  assert.match(serverPolicy, /GENERATE_WORKLOADS = new Set\(\["topic", "translation", "polish", "recap"\]\)/u);
+  assert.match(sdkRuntime, /if \(!GENERATE_WORKLOADS\.has\(input\.workload\)\) throw new Error\("INVALID_GEMINI_WORKLOAD"\)/u);
+  assert.match(recapRest, /resolveGeminiWorkloadModel\("recap", model\)/u);
+  // Summary generation takes the session engine's summary role, validated against the catalog.
+  assert.match(summary, /input\.sessionContext\?\.modelPreferences\?\.engine\?\.summary\?\.model \?\? summaryConfig\.model/u);
+  assert.match(summary, /findEngineEntry\("summary", "gemini", selectedModel\)/u);
+  const modelSources = [modelCatalog, captionPolicy, recapRest, pdfRest, translation, polish, gatewayMetrics, summaryMetrics, summary].join("\n");
   const modelLiterals = new Set(modelSources.match(/gemini-3\.[a-z0-9.-]+/gu) ?? []);
-  assert.deepEqual([...modelLiterals].sort(), ["gemini-3.5-transcribe-live", "gemini-3.7-flash"]);
-  assert.doesNotMatch(modelSources, /gemini-(?:[^\s"']*(?:latest|preview-[0-9])|3\.6|3\.5-flash-lite)/iu);
+  assert.deepEqual([...modelLiterals].sort(), ["gemini-3.5-flash", "gemini-3.5-live-translate-preview", "gemini-3.5-transcribe-live", "gemini-3.6-flash", "gemini-3.7-flash"]);
+  assert.doesNotMatch(modelSources, /gemini-(?:[^\s"']*(?:latest|preview-[0-9]))/iu);
 
   assert.match(serverPolicy, /glossaryExtraction: "medium"[\s\S]*topic: "low"[\s\S]*translation: "low"[\s\S]*polish: "low"[\s\S]*recap: "medium"/u);
   assert.match(sdkRuntime, /thinkingConfig: \{ thinkingLevel: GEMINI_WORKLOAD_THINKING_LEVELS\[request\.workload\] \}/u);
@@ -2681,8 +2703,8 @@ test("browser source cannot bundle a direct Gemini transport while compatibility
   const browserSource = productionSources.join("\n");
   const clientReachableSource = clientReachableSources.join("\n");
   const serverGeminiPackage = readFileSync(new URL("../../../packages/gemini-server/rest-recap.js", import.meta.url), "utf8");
-  assert.match(serverGeminiPackage, /GEMINI_RECAP_REST_MODEL = "gemini-3\.7-flash"/u);
-  assert.match(serverGeminiPackage, /GEMINI_RECAP_REST_URL = `https:\/\/generativelanguage\.googleapis\.com\/v1beta\/models\/\$\{GEMINI_RECAP_REST_MODEL\}:generateContent`/u);
+  assert.match(serverGeminiPackage, /const selectedModel = resolveGeminiWorkloadModel\("recap", model\)/u);
+  assert.match(serverGeminiPackage, /const url = `https:\/\/generativelanguage\.googleapis\.com\/v1beta\/models\/\$\{selectedModel\}:generateContent`/u);
   assert.doesNotMatch(browserSource, /@google\/genai/u);
   assert.doesNotMatch(browserSource, /generativelanguage\.googleapis\.com/u);
   assert.doesNotMatch(clientReachableSource, /summary-gemini-adapter|gemini-server|@google\/genai|generativelanguage\.googleapis\.com/u);

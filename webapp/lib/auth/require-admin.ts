@@ -27,3 +27,17 @@ export async function requireAdminFromCookieValue(token: string | undefined): Pr
   const cookies = { get: (name: string) => (name === SESSION_COOKIE && token ? { name, value: token } : undefined) };
   return requireAdmin({ cookies } as unknown as Pick<NextRequest, "cookies">);
 }
+
+/**
+ * Spec §9 server authority: Live Call routes ask whether the caller may set an
+ * explicit engine. Never throws - a non-admin, unauthenticated, or failed lookup
+ * is simply `false`, and the route then applies the global engine default.
+ */
+export async function isAdminRequest(request: Pick<NextRequest, "cookies">): Promise<boolean> {
+  try {
+    await requireAdmin(request);
+    return true;
+  } catch {
+    return false;
+  }
+}

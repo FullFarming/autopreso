@@ -27,6 +27,26 @@ import {
 import type { CreateGlossaryPresetInput } from "../glossary-presets/schema";
 import type { GlossaryPreset } from "../glossary-presets/types";
 import { fingerprintGlossaryDocumentV1 } from "../../../packages/caption-core/index.js";
+import { DEFAULT_ENGINE_SELECTION } from "../../../packages/caption-core/caption-engine-catalog.js";
+import { readStoredEngineDefaults } from "../console/engine-defaults";
+import { readLiveModelPreferences } from "./model-preferences";
+
+// Spec §9: the console's global engine is the ONLY Live Call engine. The detailed
+// authority matrix (admin vs host, legacy input, history) lives in model-preferences.test.ts.
+test("create stores the console engine defaults as `modelPreferences.engine` for hosts, whatever the client sent", async () => {
+  const store = new MemoryLiveSessionStore();
+  const service = new LiveSessionService(store);
+  const engineDefaults = readStoredEngineDefaults({ stt: { provider: "gemini", model: "gemini-3.5-transcribe-live", languageMode: "auto" }, translation: { provider: "gemini", model: "gemini-3.7-flash" }, summary: { provider: "gemini", model: "gemini-3.7-flash" } });
+  const seeded = await service.create("host-1", { sessionType: "meeting", languages: ["ko"] }, { engineDefaults });
+  assert.deepEqual(seeded.modelPreferences, { engine: engineDefaults, engineHistory: [] });
+  const explicit = await service.create("host-1", { sessionType: "meeting", languages: ["ko"], modelPreferences: { engine: DEFAULT_ENGINE_SELECTION } }, { engineDefaults });
+  assert.deepEqual(explicit.modelPreferences, { engine: engineDefaults, engineHistory: [] }, "a host's own engine is replaced by the global default (server authority, not an error)");
+  const soniox = readStoredEngineDefaults({ stt: { provider: "soniox", model: "stt-rt-v5", languageMode: "ko" }, translation: { provider: "soniox", model: "stt-rt-v5" }, summary: { provider: "gemini", model: "gemini-3.7-flash" } });
+  const fromSoniox = await service.create("host-1", { sessionType: "meeting", languages: ["ko"] }, { engineDefaults: soniox });
+  assert.deepEqual(fromSoniox.modelPreferences, { engine: soniox, engineHistory: [] }, "a Soniox global engine travels as-is; the gateway builds the provider from it");
+  const unseeded = await service.create("host-1", { sessionType: "meeting", languages: ["ko"] });
+  assert.deepEqual(unseeded.modelPreferences, readLiveModelPreferences(undefined), "no options keeps the catalog default");
+});
 
 test("participant speaking is disabled by default and only the owning host can enable it", async () => {
   const now = Date.UTC(2026, 7, 22, 0, 0, 0);
@@ -1299,6 +1319,7 @@ test("Supabase session writes use atomic canonical RPC contracts", async () => {
     "https://dev-ref.supabase.co",
     { key: `sb_secret_${"a".repeat(24)}`, kind: "secret" },
     async (url, init) => {
+      if (String(url).includes("select=event_metadata")) return Response.json([{ event_metadata: {} }]);
       requests.push({ url: String(url), body: JSON.parse(String(init?.body)) as Record<string, unknown> });
       return Response.json([{ ...row, version: requests.length }]);
     },
@@ -1349,6 +1370,7 @@ test("Supabase session writes use atomic canonical RPC contracts", async () => {
     p_event_company_name: null,
     p_event_reporting_period: null,
     p_event_metadata: {
+      modelPreferences: { engine: DEFAULT_ENGINE_SELECTION, engineHistory: [] },
       ticker: null,
       eventType: null,
       agenda: [],
@@ -1366,6 +1388,7 @@ test("Supabase session writes use atomic canonical RPC contracts", async () => {
   assert.equal(requests[1]?.body.p_event_company_name, null);
   assert.equal(requests[1]?.body.p_event_reporting_period, null);
   assert.deepEqual(requests[1]?.body.p_event_metadata, {
+    modelPreferences: { engine: DEFAULT_ENGINE_SELECTION, engineHistory: [] },
     ticker: null,
     eventType: null,
     agenda: [],
@@ -1404,6 +1427,7 @@ test("Supabase session store sends earnings-call metadata and section transition
     "https://dev-ref.supabase.co",
     { key: `sb_secret_${"a".repeat(24)}`, kind: "secret" },
     async (url, init) => {
+      if (String(url).includes("select=event_metadata")) return Response.json([{ event_metadata: {} }]);
       requests.push({
         url: String(url),
         method: String(init?.method ?? "GET").toUpperCase(),
@@ -1509,6 +1533,7 @@ test("Supabase session store sends earnings-call metadata and section transition
     p_event_company_name: "Cushman & Wakefield",
     p_event_reporting_period: "Q2 2026",
     p_event_metadata: {
+      modelPreferences: { engine: DEFAULT_ENGINE_SELECTION, engineHistory: [] },
       ticker: "CWK",
       eventType: "earnings_call",
       agenda: [{ ordinal: 1, label: "Prepared remarks" }],
@@ -1519,6 +1544,7 @@ test("Supabase session store sends earnings-call metadata and section transition
   assert.equal(requests[1]?.body.p_participant_speaking_enabled, true);
   assert.equal(requests[1]?.body.p_event_reporting_period, "Q2 2026");
   assert.deepEqual(requests[1]?.body.p_event_metadata, {
+    modelPreferences: { engine: DEFAULT_ENGINE_SELECTION, engineHistory: [] },
     ticker: "CWK",
     eventType: "other",
     agenda: [],
