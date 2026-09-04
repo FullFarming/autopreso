@@ -41,12 +41,26 @@ test("caption polish canary assignment is stable across all three policy buckets
   assert.throws(() => createCaptionPolishPolicyResolver({ policyWeights: { off: -1, selective: 10_000, full: 0 } }), /INVALID_CAPTION_POLISH_CANARY/u);
 });
 
-test("media gateway gives caption polish the same six-second quality budget as desktop", async () => {
+test("media gateway builds STT and text translation from the session engine and never constructs a second Flash source worker", async () => {
   const source = await readFile(new URL("../src/server.js", import.meta.url), "utf8");
 
-  assert.match(source, /createCaptionPolisher\(\{[^}]*timeoutMs:\s*6_000/u);
-  assert.doesNotMatch(source, /timeoutMs:\s*4_000/u);
-  assert.doesNotMatch(source, /timeoutMs:\s*1_500/u);
+  assert.match(source, /const engine = captionConfig\.engine;/u);
+  assert.match(source, /assertEngineKeys\(engine,/u);
+  assert.match(source, /speechToText:\s*createSpeechToText\(\{[\s\S]*?engine,[\s\S]*?liveClient,[\s\S]*?compiledGlossary,/u);
+  assert.match(source, /const textTranslate = createTextTranslate\(\{ engine, geminiRuntime, sessionId: message\.sessionId \}\);/u);
+  assert.match(source, /dependencies: \{[\s\S]*?textTranslate,[\s\S]*?publisher:/u);
+  assert.match(source, /TEXT_TRANSLATE_REQUIRED/u);
+  assert.doesNotMatch(source, /createLiveTranslationSession|GeminiLiveTranslateAdapter/u);
+  assert.doesNotMatch(source, /createSessionClient\(message\.sessionId, "source"/u);
+  assert.match(source, /bindTopicModel\(message\.sessionId, captionConfig\.models\.summary\)/u);
+  assert.doesNotMatch(source, /createSourceRecorder|createGeminiSourceAudioRecorder|createGeminiSourceTranscriber/u);
+  assert.doesNotMatch(source, /new GeminiTextTranslateAdapter\(|new GeminiLiveTranscriptionAdapter\(|createCaptionPolisher\(/u);
+});
+
+test("a missing provider key is a host-facing gateway error, never a raw factory token", async () => {
+  const source = await readFile(new URL("../src/gateway-server.js", import.meta.url), "utf8");
+  assert.match(source, /code === "ENGINE_KEY_MISSING"\) return "선택한 엔진의 API 키가 서버에 없습니다\.";/u);
+  assert.match(source, /code === "ENGINE_SELECTION_INVALID"\) return "/u);
 });
 
 test("media gateway uses the session policy resolver instead of forcing full polish", async () => {
@@ -61,8 +75,34 @@ test("media gateway constructs its publisher with a live topic detector", async 
   const source = await readFile(new URL("../src/server.js", import.meta.url), "utf8");
 
   assert.match(source, /createLiveTopicDetector\(\{[\s\S]*?generate:\s*\(request,\s*context\)\s*=>\s*runtimeLoader\.generateTopic\(request,\s*context\)/u);
-  assert.match(source, /if \(!topicGenerate\) topicGenerate = createGeminiTopicGenerate\(\{ runtime: geminiRuntime \}\)/u);
+  assert.match(source, /topicGenerators\.set\(sessionId, createGeminiTopicGenerate\(\{ client \}\)\)/u);
   assert.match(source, /new SupabaseLivePublisher\(\{[\s\S]*?topicDetector,/u);
+});
+
+test("gateway topic model is captured per session and removed on release rather than silently defaulted", async () => {
+  const calls = [];
+  class Client {
+    live = { connect() {} };
+    models = { async generateContent(request) {
+      calls.push(request); return { candidates: [{ finishReason: "STOP", content: { parts: [{ text: '{"decision":"same_topic"}' }] } }] };
+    } };
+  }
+  const loader = createMediaGatewayRuntimeLoader({ config: mediaGatewayConfig(), getGateway: () => null,
+    importGoogleGenAI: async () => ({ GoogleGenAI: Client }) });
+  const request = { store: false, input: [{ role: "system", content: "System" }, { role: "user", content: "User" }],
+    text: { format: { type: "json_schema", name: "live_topic_decision", strict: true,
+      schema: { type: "object", additionalProperties: false, properties: { decision: { type: "string" } } } } } };
+  await assert.rejects(loader.generateTopic(request, { sessionId: "meeting" }), /GEMINI_TOPIC_MODEL_NOT_BOUND/u);
+  assert.equal(calls.length, 0);
+  await loader.bindTopicModel("meeting", "gemini-3.6-flash");
+  await loader.generateTopic(request, { sessionId: "meeting" });
+  assert.equal(calls[0].model, "gemini-3.6-flash");
+  await assert.rejects(loader.bindTopicModel("meeting", "gemini-3.5-flash"), /INVALID_GEMINI_MODEL_SELECTION/u);
+  await loader.generateTopic(request, { sessionId: "meeting" });
+  assert.equal(calls[1].model, "gemini-3.6-flash");
+  await loader.releaseSession("meeting");
+  await assert.rejects(loader.generateTopic(request, { sessionId: "meeting" }), /GEMINI_TOPIC_MODEL_NOT_BOUND/u);
+  assert.equal(calls.length, 2);
 });
 
 test("media gateway listens before loading Google providers for Cloud Run cold starts", async () => {
@@ -113,7 +153,7 @@ test("media gateway loads the authoritative pinned glossary once per pipeline st
     /pinnedGlossaryLoader\.load\(message\.sessionId,\s*\{\s*signal:\s*options\.signal\s*\}\)/u,
   );
   assert.match(source, /new LiveMediaPipeline\(\{[\s\S]*?compiledGlossary,/u);
-  assert.match(source, /new GeminiLiveTranscriptionAdapter\(\{[\s\S]*?compiledGlossary,/u);
+  assert.doesNotMatch(source, /new GeminiLiveTranslateAdapter\(\{[^}]*compiledGlossary/u);
   assert.doesNotMatch(source, /compiledGlossary:\s*(?:message|hostMessage)\./u);
 });
 
@@ -134,8 +174,8 @@ test("media gateway shares a cancellable Live transport separately from the text
 test("media gateway shares one bounded server Gemini runtime across workloads", async () => {
   const source = await readFile(new URL("../src/server.js", import.meta.url), "utf8");
   assert.match(source, /createGeminiServerRuntime\(\{[\s\S]*?GoogleGenAI,[\s\S]*?apiKey:\s*config\.geminiApiKey/u);
-  assert.match(source, /createSessionClient\(message\.sessionId,\s*["']translation["']\)/u);
-  assert.match(source, /createSessionClient\(message\.sessionId,\s*["']polish["']\)/u);
+  assert.doesNotMatch(source, /createSessionClient\(message\.sessionId,\s*["']source["']/u);
+  assert.doesNotMatch(source, /createSessionClient\(message\.sessionId,\s*["'](?:translation|polish)["']\)/u);
   assert.match(source, /releaseGeminiSession:\s*\(sessionId\)\s*=>\s*runtimeLoader\.releaseSession\(sessionId\)/u);
   assert.match(source, /loadedRuntime\?\.geminiRuntime\.releaseSession\(sessionId\)/u);
   assert.doesNotMatch(source, /new GoogleGenAI\(/u);
@@ -174,12 +214,30 @@ test("Gemini observations emit only fixed workload, model, result, latency, and 
 test("unknown billed usage is counted as unknown and never recorded as zero tokens", () => {
   const calls = [];
   observeGeminiRuntimeMetrics({ increment: (name) => calls.push(name), observe: (name) => calls.push(name) }, {
-    workload: "translation", model: "gemini-3.7-flash", code: "GEMINI_PROVIDER_FAILED",
+    workload: "source", model: "gemini-3.7-flash", code: "GEMINI_PROVIDER_FAILED",
     latencyMilliseconds: 20, inputTokens: 0, outputTokens: 0, totalTokens: 0, usageKnown: false,
   });
-  assert.ok(calls.includes("gemini_translation_usage_unknown_total"));
-  assert.ok(calls.includes("gemini_translation_result_provider_failed_total"));
+  assert.ok(calls.includes("gemini_source_usage_unknown_total"));
+  assert.ok(calls.includes("gemini_source_result_provider_failed_total"));
   assert.equal(calls.some((name) => /_tokens$/u.test(name)), false);
+});
+
+test("selected source and summary metrics preserve each actual model and reject unknown attribution", () => {
+  for (const workload of ["source", "topic", "recap"]) for (const version of ["3.7", "3.6", "3.5"]) {
+    const calls = [];
+    const metrics = { increment: (name) => calls.push(name), observe: (name) => calls.push(name) };
+    const event = { workload, model: `gemini-${version}-flash`, code: "OK", latencyMilliseconds: 12,
+      inputTokens: 8, outputTokens: 3, totalTokens: 11, usageKnown: true };
+    observeGeminiRuntimeMetrics(metrics, event);
+    assert.deepEqual(calls, [
+      `gemini_${workload}_model_flash_${version.replace(".", "")}_total`, `gemini_${workload}_result_ok_total`,
+      `gemini_${workload}_latency_ms`, `gemini_${workload}_input_tokens`,
+      `gemini_${workload}_output_tokens`, `gemini_${workload}_total_tokens`,
+    ]);
+    calls.length = 0;
+    observeGeminiRuntimeMetrics(metrics, { ...event, model: "gemini-latest" });
+    assert.deepEqual(calls, []);
+  }
 });
 
 test("Gemini topic provider uses only the fixed model and strict JSON request", async () => {

@@ -24,6 +24,7 @@ test("quality runner is a no-network Gemini-only shared-engine check", async () 
 
   const metrics = await runGeminiCaptionQualityCheck();
   assert.equal(metrics.code, "OK");
+  assert.equal(metrics.profile, "legacy-injected-finalizer");
   assert.equal(metrics.provider, "gemini");
   assert.equal(metrics.transcriptionModel, "gemini-3.5-transcribe-live");
   assert.equal(metrics.textModel, "gemini-3.7-flash");
@@ -34,5 +35,5 @@ test("quality runner is a no-network Gemini-only shared-engine check", async () 
   assert.equal(metrics.transcriptionSessions, 1);
   assert.equal(metrics.committedCaptions, metrics.utterances * 2);
   assert.equal(metrics.translatedCaptions, metrics.utterances);
-  assert.match(metrics.configFingerprint, /^gemini-caption-v2-[0-9a-f]{16}$/u);
+  assert.match(metrics.configFingerprint, /^gemini-caption-v5-[0-9a-f]{16}$/u);
 });

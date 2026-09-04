@@ -12,7 +12,7 @@ import {
   createCommittedCaptionFinalizer,
   createSourceLanguageConsensus,
   crossChannelEchoContract,
-  GEMINI_WORKLOAD_MODEL_MATRIX,
+  isCombinedEngine,
 } from "../../packages/caption-core/index.js";
 export { evaluateCaptionPolish } from "../../packages/caption-core/index.js";
 import {
@@ -61,6 +61,9 @@ const MAX_SUPPRESSED_SOURCE_TEXTS = 256;
 const ENGLISH_LETTER = /[A-Za-z]/u;
 const KOREAN_LETTER = /[가-힣ㄱ-ㅎㅏ-ㅣ]/u;
 const LANGUAGE_DRIFT_RECONNECT_THRESHOLD = 2;
+/** `sttProvider` spelling for the authoritative source ledger, keyed by the
+ *  engine catalog's stt provider. `supabase-adapters.js` accepts exactly these. */
+const STT_PROVIDER_LABELS = Object.freeze({ gemini: "gemini-transcribe-live", soniox: "soniox" });
 
 function isEnglishKoreanPair(languages) {
   return languages.length === 2 && languages.includes("en") && languages.includes("ko");
@@ -132,6 +135,9 @@ export class LiveMediaPipeline {
    *  keep their antecedents; the current utterance is never its own context. */
   #recentSourceFinals = [];
   #stt = null;
+  #sourceRecordingFailed = false;
+  #sourceGapTasks = new Set();
+  #sourceGapIds = new Set();
   #hostAudioSource = null;
   /** Finalized caption sequence per language: (sessionId, language) monotonic, starts at 1. */
   #captionSeq = new Map();
@@ -231,10 +237,20 @@ export class LiveMediaPipeline {
     this.glossaryText = this.captionConfig.glossary;
     this.translationTone = this.captionConfig.tone;
     this.domainText = this.captionConfig.domain;
-    this.transcriptionModel = this.captionConfig.models.transcription;
-    this.translationModel = GEMINI_WORKLOAD_MODEL_MATRIX.translation;
+    // The engine selection is the only source of provider/model identity: it
+    // decides whether translation is a separate text call or arrives attached
+    // to each STT final, and it is what the source ledger records as provenance.
+    this.engine = this.captionConfig.engine;
+    this.isCombined = isCombinedEngine(this.engine);
+    this.transcriptionModel = this.engine.stt.model;
+    this.sttProvider = STT_PROVIDER_LABELS[this.engine.stt.provider];
+    if (!this.sttProvider) throw new Error("ENGINE_SELECTION_INVALID");
+    this.translationModel = this.engine.translation.model;
     this.languages = this.captionConfig.languages;
     this.dependencies = dependencies;
+    if (!this.isCombined && typeof dependencies?.textTranslate?.translate !== "function") {
+      throw new Error("TEXT_TRANSLATE_REQUIRED");
+    }
     this.captionFinalizer = createCommittedCaptionFinalizer({
       sessionId: this.sessionId,
       compiledGlossary,
@@ -280,7 +296,7 @@ export class LiveMediaPipeline {
   }
 
   get lastSequence() {
-    return Math.max(0, ...this.#captionSeq.values());
+    return Math.max(0, ...Object.values(this.lastSequences));
   }
 
   /** Per-language last finalized caption seq, e.g. { ko: 12, en: 11 }. */
@@ -406,7 +422,9 @@ export class LiveMediaPipeline {
   async #openSpeechSession() {
     this.#sourceStreamGeneration = randomUUID();
     // Production Live Call is captions-only. One host PCM stream is transcribed
-    // once, then committed text is translated into at most three caption lanes.
+    // once, then committed text is translated into at most three caption lanes
+    // - by a separate text model, or, for a combined engine, by the
+    // translations the STT provider attaches to each final.
     this.#stt = new RollingSpeechSession({
       provider: {
         open: (options) => this.dependencies.speechToText.open({
@@ -414,10 +432,15 @@ export class LiveMediaPipeline {
           // Live Call has exactly one host input device. Speaker diarization is
           // unnecessary and makes rollover attribution harder to keep stable.
           diarization: false,
+          // A provider that had to drop committed source text (terminal stream
+          // failure mid-segment) leaves a hole in the original record; say so
+          // once instead of letting the ledger look complete.
+          onContinuityDiscard: (event) => this.#reportSourceRecordingFailure(event ?? {}),
         }),
       },
       onFinalUtterance: (utterance) => this.acceptFinalUtterance(utterance),
       onPartialTranscript: (partial) => this.acceptPartialTranscript(partial),
+      onPartialTranslation: (partial) => this.acceptPartialTranslation(partial),
       onRemap: (mapping) => {
         for (const [nextLabel, previousLabel] of mapping) this.speakers.alias(nextLabel, previousLabel);
       },
@@ -425,6 +448,39 @@ export class LiveMediaPipeline {
       now: this.now,
     });
     await this.#stt.start({ signal: this.#lifecycleAbort.signal });
+  }
+
+  #reportSourceRecordingFailure(failure = {}) {
+    this.#recordKnownSourceGap(failure);
+    if (this.#sourceRecordingFailed || this.#isStopped) return;
+    this.#sourceRecordingFailed = true;
+    this.observeLatency?.("source_recording_failures_total", 1);
+    const event = { type: "source-status", sessionId: this.sessionId,
+      status: "unavailable", code: "SOURCE_RECORDING_UNAVAILABLE" };
+    this.onHostEvent?.(event);
+    void Promise.resolve(this.dependencies.publisher.publishSourceStatus?.(event)).catch(() => {});
+  }
+
+  #recordKnownSourceGap(failure) {
+    if (!failure || typeof failure.segmentId !== "string" || !Number.isFinite(Date.parse(failure.sourceStartedAt))
+      || !Number.isFinite(Date.parse(failure.sourceEndedAt))) return;
+    if (this.#sourceGapIds.has(failure.segmentId)) return;
+    if (this.#sourceGapIds.size >= 2048 || this.#sourceGapTasks.size >= 8
+      || typeof this.dependencies.publisher.persistSourceRecordingGap !== "function") {
+      this.#reportSourceGapWriteFailure(); return;
+    }
+    this.#sourceGapIds.add(failure.segmentId);
+    const task = Promise.resolve().then(() => this.dependencies.publisher.persistSourceRecordingGap({
+      sessionId: this.sessionId, segmentId: failure.segmentId,
+      sourceStartedAt: failure.sourceStartedAt, sourceEndedAt: failure.sourceEndedAt,
+    })).catch(() => this.#reportSourceGapWriteFailure())
+      .finally(() => this.#sourceGapTasks.delete(task));
+    this.#sourceGapTasks.add(task);
+  }
+
+  #reportSourceGapWriteFailure() {
+    this.observeLatency?.("source_gap_persist_failures_total", 1);
+    console.warn("SOURCE_GAP_PERSIST_FAILED");
   }
 
   #reservePresentationFinal(language) {
@@ -502,22 +558,7 @@ export class LiveMediaPipeline {
       text: normalizedText, sourceLanguage: normalizedSourceLanguage, languageObservation,
       speaker: { role: floor ? "participant" : "host", label: floor ? "참여자" : "발표자" },
       emittedAt: new Date(this.now()).toISOString() });
-    // Partials share one synthetic "live" lane (or the floor holder's lane) so
-    // the viewer can replace them in place; finals clear the "live" lane.
-    // Must be a COMPLETE SpeakerAssignment: the viewer contract validates
-    // every field (colorToken/voiceName/voiceStatus/lastSeenAt) and silently
-    // drops captions whose speaker shape is partial.
-    const speaker = floor
-      ? this.#floorSpeakerAssignment(floor)
-      : {
-        speakerId: "live",
-        label: "",
-        name: "",
-        colorToken: "speaker-teal",
-        voiceName: null,
-        voiceStatus: "disabled",
-        lastSeenAt: new Date(this.now()).toISOString(),
-      };
+    const speaker = this.#interimSpeaker(floor);
     for (const language of this.languages) {
       // Cost guard: interim speech is published only on its verbatim source
       // lane. Target-language Gemini calls wait for the committed STT result,
@@ -539,6 +580,58 @@ export class LiveMediaPipeline {
     }
   }
 
+  /** Streams a combined engine's interim translation (Soniox emits target-
+   *  language tokens while the speaker is still talking) as an isFinal:false
+   *  caption on that target lane. Contract C1: the interim carries the seq the
+   *  coming final will take and never consumes one. The lane's epoch gate makes
+   *  the committed final supersede any interim still queued behind it. */
+  /** @param {{language?: unknown, text?: unknown, sourceLanguage?: unknown}} [value] */
+  acceptPartialTranslation({ language, text, sourceLanguage } = {}) {
+    if (this.#isStopped || this.#isPaused || !hasCaptionOutput(this.outputMode)) return;
+    const targetLanguage = normalizeLiveLanguage(language);
+    if (!targetLanguage || !this.languages.includes(targetLanguage)) return;
+    const normalizedText = String(text ?? "").normalize("NFC").trim();
+    if (!normalizedText) return;
+    const normalizedSourceLanguage = normalizeLiveLanguage(sourceLanguage) || null;
+    // Same-language "translation" is the source lane's verbatim interim, which
+    // acceptPartialTranscript already publishes; a second copy would flicker.
+    if (normalizedSourceLanguage === targetLanguage) return;
+    const floor = this.#floorAttribution(Number.NaN);
+    const lane = this.#partialLane(targetLanguage);
+    lane.pending = {
+      kind: "translation",
+      normalizedText,
+      normalizedSourceLanguage,
+      languageObservation: null,
+      speaker: this.#interimSpeaker(floor),
+      speakerMetadata: this.#liveCaptionSpeakerMetadata(floor),
+      epoch: lane.epoch,
+    };
+    if (!lane.inFlight) {
+      lane.inFlight = true;
+      void this.#drainPartialLane(targetLanguage, lane).finally(() => { lane.inFlight = false; });
+    }
+  }
+
+  /** Partials share one synthetic "live" lane (or the floor holder's lane) so
+   *  the viewer can replace them in place; finals clear the "live" lane. Must
+   *  be a COMPLETE SpeakerAssignment: the viewer contract validates every field
+   *  (colorToken/voiceName/voiceStatus/lastSeenAt) and silently drops captions
+   *  whose speaker shape is partial. */
+  #interimSpeaker(floor) {
+    return floor
+      ? this.#floorSpeakerAssignment(floor)
+      : {
+        speakerId: "live",
+        label: "",
+        name: "",
+        colorToken: "speaker-teal",
+        voiceName: null,
+        voiceStatus: "disabled",
+        lastSeenAt: new Date(this.now()).toISOString(),
+      };
+  }
+
   #partialLane(language) {
     let lane = this.#partialLanes.get(language);
     if (!lane) {
@@ -556,11 +649,58 @@ export class LiveMediaPipeline {
     });
   }
 
+  /** Output-language gate shared by translated interims and finals. */
+  #isTranslatedOutputAcceptable(text, language) {
+    return language === "ko"
+      ? this.#supportsFixedTargetOutput(text, language)
+      : isSessionOutputInTargetLanguage(text, language, this.languages);
+  }
+
+  /** One text translation through the engine's translator. `translateWithProvenance`
+   *  reports the model that actually produced the text (the fallback chain may
+   *  have moved off the primary); a plain `translate` seam is credited to the
+   *  engine's configured model. */
+  async #translateText(input) {
+    const translator = this.dependencies.textTranslate;
+    if (typeof translator.translateWithProvenance === "function") {
+      const produced = await translator.translateWithProvenance(input);
+      const model = typeof produced?.model === "string" && produced.model.trim() ? produced.model : this.translationModel;
+      return { text: String(produced?.text ?? ""), model };
+    }
+    return { text: await translator.translate(input), model: this.translationModel };
+  }
+
   async #drainPartialLane(language, lane) {
     while (lane.pending && !this.#isStopped && !this.#isPaused) {
       const partial = lane.pending;
       lane.pending = null;
       try {
+        if (partial.kind === "translation") {
+          // Deterministic terminology only: an interim never earns a text-model
+          // call, and the output-language gate is the same one finals pass.
+          const textOut = this.termRetriever.repair(partial.normalizedText, { language, isFinal: false });
+          if (partial.epoch !== lane.epoch) continue;
+          if (lane.lastText === textOut) continue;
+          if (!this.#isTranslatedOutputAcceptable(textOut, language)) continue;
+          lane.lastText = textOut;
+          await this.#publishCaption(language, {
+            type: "caption",
+            seq: this.#peekCaptionSeq(language),
+            sessionId: this.sessionId,
+            language,
+            speaker: partial.speaker,
+            ...partial.speakerMetadata,
+            text: textOut,
+            isFinal: false,
+            sourceText: null,
+            sourceLanguage: partial.normalizedSourceLanguage,
+            translationStatus: "translated",
+            translationModel: this.translationModel,
+            sourceEndedAt: new Date(this.now()).toISOString(),
+            emittedAt: new Date(this.now()).toISOString(),
+          }, { mirrorToHost: true });
+          continue;
+        }
         // Same detection-backed decision as the final path: an interim must not
         // flash raw English on the KO lane just because the STT labelled
         // contaminated English as Korean.
@@ -757,7 +897,7 @@ export class LiveMediaPipeline {
       };
   }
 
-  async #processFinalUtterance({ speakerLabel, text, rawText = null, sourceLanguage, sourceStartOffsetMs, sourceEndOffsetMs, sourceEndedAt, pcmWindow = null }, draftRevision, sourceGeneration) {
+  async #processFinalUtterance({ speakerLabel, text, rawText = null, sourceLanguage, sourceStartOffsetMs, sourceEndOffsetMs, sourceEndedAt, pcmWindow = null, translations = null }, draftRevision, sourceGeneration) {
     this.#assertRunning();
     if (this.#authoritativeSourceLaneFailed) throw new Error("AUTHORITATIVE_SOURCE_LANE_FAILED");
     const finalizedAt = this.now();
@@ -843,7 +983,8 @@ export class LiveMediaPipeline {
           const isSourceLane = canPassThroughSourceObservation(languageObservation, language)
             && (language !== "ko" || this.#supportsFixedTargetOutput(repairedSourceText, language));
           let translatedText = repairedSourceText;
-          const translationStatus = isSourceLane ? "verbatim" : "translated";
+          let translationStatus = isSourceLane ? "verbatim" : "translated";
+          let translationModel = this.translationModel;
           if (!isSourceLane && !cooldownActive) {
             try {
               const translationGlossary = this.termRetriever.retrieve({
@@ -851,18 +992,28 @@ export class LiveMediaPipeline {
                 targetLanguage: language,
                 isFinal: true,
               });
-              translatedText = await this.dependencies.textTranslate.translate({
-                text: repairedSourceText,
-                language,
-                // A misdetected source poisons translation; let the provider
-                // auto-detect when the text does not match the detected script.
-                sourceLanguage: languageObservation.state === "single" ? normalizedSourceLanguage : undefined,
-                signal: requestSignal,
-                glossaryText: translationGlossary,
-                sessionContext: this.domainText,
-                recentSourceText: recentSourceContext,
-                intent: "final",
-              });
+              if (this.isCombined) {
+                // The STT provider translated this segment itself; the lane text
+                // arrived on the same final. No text-model call is made here.
+                const laneText = String(translations?.[language]?.text ?? "").normalize("NFC").trim();
+                if (!laneText) throw new Error("COMBINED_TRANSLATION_MISSING");
+                translatedText = laneText;
+              } else {
+                const produced = await this.#translateText({
+                  text: repairedSourceText,
+                  language,
+                  // A misdetected source poisons translation; let the provider
+                  // auto-detect when the text does not match the detected script.
+                  sourceLanguage: languageObservation.state === "single" ? normalizedSourceLanguage : undefined,
+                  signal: requestSignal,
+                  glossaryText: translationGlossary,
+                  sessionContext: this.domainText,
+                  recentSourceText: recentSourceContext,
+                  intent: "final",
+                });
+                translatedText = produced.text;
+                translationModel = produced.model;
+              }
               const finalized = await this.captionFinalizer.finalize({
                 translatedText,
                 sourceText: repairedSourceText,
@@ -877,15 +1028,24 @@ export class LiveMediaPipeline {
               translatedText = finalized.text;
             } catch (error) {
               if (requestSignal.aborted) return { ttsCompletion: null };
-              translationFailureCode = safeProviderErrorIdentifier(error, "GEMINI_TRANSLATE_FAILED");
+              translationFailureCode = safeProviderErrorIdentifier(error,
+                this.isCombined ? "COMBINED_TRANSLATION_FAILED" : "GEMINI_TRANSLATE_FAILED");
               await this.#publishLanguageStatus(language, "unavailable", "LANGUAGE_UNAVAILABLE");
-              return { ttsCompletion: null };
+              // A combined engine cannot be asked again: there is no separate
+              // translator to retry. Keep the record whole by publishing the
+              // original on this lane, labelled so no display path renders it
+              // as a translation.
+              if (!(this.isCombined && hasErrorCode(error, new Set(["COMBINED_TRANSLATION_MISSING"])))) {
+                return { ttsCompletion: null };
+              }
+              translatedText = repairedSourceText;
+              translationStatus = "failed";
             }
           }
           if (!isSourceLane && cooldownActive) return { ttsCompletion: null };
           if (requestSignal.aborted) return { ttsCompletion: null };
           this.#assertRunning();
-          if (!isSourceLane && !this.#supportsFixedTargetOutput(translatedText, language)) {
+          if (!isSourceLane && translationStatus !== "failed" && !this.#supportsFixedTargetOutput(translatedText, language)) {
             translationFailureCode = "TRANSLATION_LANGUAGE_MISMATCH";
             await this.#publishLanguageStatus(language, "unavailable", "LANGUAGE_UNAVAILABLE");
             return { ttsCompletion: null };
@@ -905,6 +1065,7 @@ export class LiveMediaPipeline {
             sourceLanguage: normalizedSourceLanguage || null,
             languageObservation,
             translationStatus,
+            ...(isSourceLane ? {} : { translationModel }),
             ...(authoritativeSource.sourceUtteranceId ? {
               authoritativeSourceId: authoritativeSource.sourceUtteranceId,
               sourceSequence: authoritativeSource.sourceSeq,
@@ -977,7 +1138,7 @@ export class LiveMediaPipeline {
         sourceStartedAt: input.sourceStartedAt,
         sourceEndedAt: input.sourceEndedAt,
         providerCommittedAt: input.providerCommittedAt,
-        sttProvider: "gemini-live-transcription",
+        sttProvider: this.sttProvider,
         sttModel: this.transcriptionModel,
         translationModel: this.translationModel,
         pipelineConfigFingerprint: /^sha256:[a-f0-9]{64}$/u.test(this.captionConfigFingerprint ?? "")
@@ -1677,8 +1838,12 @@ export class LiveMediaPipeline {
         ...[...this.#translationQueues.values()].map((queue) => queue.drain()),
         ...this.#presentationFinalTails.values(),
         ...partialPublications,
+        ...this.#sourceGapTasks,
       ]);
     } finally {
+      // Keep the source write fence until bounded gap IO settles, even if a
+      // translation transport fails to close cleanly.
+      await Promise.allSettled([...this.#sourceGapTasks]);
       this.captionFinalizer.release();
     }
   }

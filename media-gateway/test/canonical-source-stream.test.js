@@ -9,7 +9,7 @@ const input = { sessionId, utteranceKey: 'utterance-1', rawText: '매출 revenue
   languageObservation: observation, speakerRole: 'host', speakerLabel: '1', speakerName: 'Private Owner',
   speakerDepartment: 'Private Department', speakerJobTitle: null, participantId: null,
   sourceStartedAt: null, sourceEndedAt: '2026-08-31T00:00:01.000Z', providerCommittedAt: '2026-08-31T00:00:01.100Z',
-  sttProvider: 'google-cloud-speech-v2', sttModel: null, translationModel: null, pipelineConfigFingerprint: null };
+  sttProvider: 'gemini-transcribe-live', sttModel: null, translationModel: null, pipelineConfigFingerprint: null };
 
 test('canonical source broadcasts only after durable commit, once, independently of target lanes', async () => {
   const calls = []; const events = [];

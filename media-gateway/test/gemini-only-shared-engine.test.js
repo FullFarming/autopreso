@@ -70,14 +70,20 @@ const KOREAN_FINAL = Object.freeze({
   sourceEndedAt: "2026-08-27T09:00:00.000Z",
 });
 
-test("Live Call canonical config is Gemini caption-only Transcribe v2", async () => {
+test("Live Call canonical config pins the catalog default engine (Transcribe Live + Flash) in v5", async () => {
   const harness = createPipelineHarness();
   assert.equal(harness.pipeline.captionConfig.provider, "gemini");
   assert.equal(harness.pipeline.captionConfig.voiceProvider, null);
   assert.equal(harness.pipeline.captionConfig.outputMode, "captions");
+  assert.deepEqual(harness.pipeline.captionConfig.engine.stt, { provider: "gemini", model: "gemini-3.5-transcribe-live", languageMode: "auto" });
+  assert.deepEqual(harness.pipeline.captionConfig.engine.translation, { provider: "gemini", model: "gemini-3.6-flash" });
   assert.equal(harness.pipeline.captionConfig.models.transcription, "gemini-3.5-transcribe-live");
+  assert.equal(harness.pipeline.captionConfig.models.summary, "gemini-3.6-flash");
+  assert.equal(Object.hasOwn(harness.pipeline.captionConfig.models, "live"), false, "the direct Live Translate lane no longer exists");
+  assert.equal(harness.pipeline.isCombined, false);
+  assert.equal(harness.pipeline.translationModel, "gemini-3.6-flash");
   assert.equal(Object.isFrozen(harness.pipeline.captionConfig), true);
-  assert.match(harness.pipeline.captionConfigFingerprint, /^gemini-caption-v2-[a-f0-9]{16}$/u);
+  assert.match(harness.pipeline.captionConfigFingerprint, /^gemini-caption-v5-[a-f0-9]{16}$/u);
   await harness.pipeline.start();
   assert.equal(harness.speechSessions.length, 1, "one source STT stream serves every caption lane");
   await harness.pipeline.close();

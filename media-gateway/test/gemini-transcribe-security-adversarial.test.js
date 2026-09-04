@@ -19,10 +19,28 @@ async function settleCallbacks(ticks = 4) {
   }
 }
 
-test("production gateway has one Gemini transcription path and no Cloud STT fallback", async () => {
-  const source = await readFile(new URL("../src/server.js", import.meta.url), "utf8");
+test("production gateway builds STT and translation from the session engine without extra Flash audio or fallback", async () => {
+  const [source, pipeline] = await Promise.all([
+    readFile(new URL("../src/server.js", import.meta.url), "utf8"),
+    readFile(new URL("../src/live-media-pipeline.js", import.meta.url), "utf8"),
+  ]);
 
-  assert.match(source, /new GeminiLiveTranscriptionAdapter\(\{/u);
+  // Key presence is checked before any adapter or pipeline exists; the factory
+  // module is the only place a provider is chosen.
+  assert.match(source, /assertEngineKeys\(engine,/u);
+  assert.match(source, /speechToText:\s*createSpeechToText\(\{/u);
+  assert.match(source, /const textTranslate = createTextTranslate\(\{/u);
+  assert.match(source, /bindTopicModel\(message\.sessionId, captionConfig\.models\.summary\)/u);
+  assert.doesNotMatch(source, /GeminiLiveTranslateAdapter|createLiveTranslationSession|gemini-live-translate-adapter/u);
+  // The direct Live Translate lane is gone from the pipeline: originals come
+  // from the STT final, translations from the text model or the combined
+  // provider's attached lanes, and interim translations never consume a seq.
+  assert.doesNotMatch(pipeline, /DirectLiveTranslationSession|persistIndependentSource|publishIndependentTranslation|createLiveTranslationSession/u);
+  assert.match(pipeline, /translations\?\.\[language\]\?\.text/u);
+  assert.match(pipeline, /acceptPartialTranslation\(/u);
+  assert.match(pipeline, /translateWithProvenance/u);
+  assert.doesNotMatch(source, /createGeminiSourceAudioRecorder|transcribeAudio|createSessionClient\([^\n]*"source"/u);
+  assert.doesNotMatch(source, /new GeminiLiveTranscriptionAdapter|new GeminiTextTranslateAdapter|new GeminiCaptionPolisher/u);
   assert.match(source, /createGoogleLiveClient\(\{ apiKey: config.geminiApiKey \}\)/u);
   assert.doesNotMatch(source, /CloudSpeechToTextAdapter|@google-cloud\/speech|SpeechClient|speechClient|importSpeechModule/u);
   assert.doesNotMatch(source, /fallback[\s\S]{0,200}(?:cloud|speech)/iu);

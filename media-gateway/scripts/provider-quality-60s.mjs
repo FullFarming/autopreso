@@ -36,8 +36,9 @@ const QUALITY_CASES = Object.freeze([
 
 /**
  * Runs a 60-second-equivalent, no-network caption contract check. Provider
- * results are injected so CI validates Transcribe Live -> Gemini text
- * translation -> terminology repair without credentials or quota use.
+ * results are injected so CI retains the optional text finalizer/terminology
+ * contract without credentials or quota use. Production builds the same two
+ * pipeline dependencies from the session engine in src/engines/create-engines.js.
  */
 export async function runGeminiCaptionQualityCheck() {
   const config = createGeminiCaptionConfig({
@@ -71,6 +72,7 @@ export async function runGeminiCaptionQualityCheck() {
   const liveMetrics = await runLiveCaptionCheck(config, utteranceCount);
   const metrics = Object.freeze({
     code: "OK",
+    profile: "legacy-injected-finalizer",
     provider: config.provider,
     transcriptionModel: config.models.transcription,
     textModel: config.models.polish,
@@ -84,7 +86,7 @@ export async function runGeminiCaptionQualityCheck() {
   });
   if (metrics.provider !== "gemini") throw new Error("QUALITY_NON_GEMINI_PROVIDER");
   if (metrics.transcriptionModel !== GEMINI_WORKLOAD_MODEL_MATRIX.transcription
-    || metrics.textModel !== GEMINI_WORKLOAD_MODEL_MATRIX.translation) {
+    || metrics.textModel !== GEMINI_WORKLOAD_MODEL_MATRIX.polish) {
     throw new Error("QUALITY_MODEL_MATRIX_MISMATCH");
   }
   if (metrics.finalized !== utteranceCount || metrics.polishCalls !== utteranceCount) {

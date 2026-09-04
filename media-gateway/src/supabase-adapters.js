@@ -1,6 +1,8 @@
 import { LiveTopicCoordinator } from "./live-topic-coordinator.js";
 import { resolveBuiltInGlossaryDocument } from "./glossary-packs.js";
 import { compileGlossaryDocumentV1, mergeCompiledGlossariesV1 } from "../../packages/caption-core/index.js";
+import { createGeminiCaptionConfig } from "../../packages/caption-core/gemini-caption-contract.js";
+import { readGeminiSelectedModel, migrateLegacyGeminiModelSelection } from "../../packages/caption-core/gemini-model-catalog.js";
 
 export { LiveTopicCoordinator };
 
@@ -104,8 +106,10 @@ export class SupabaseLivePublisher {
   withMediaFence(mediaFence, { pipelineGeneration = null } = {}) {
     return {
       publish: (sessionId, language, event, options) => this.publish(sessionId, language, event, { ...options, mediaFence }),
+      persistSourceRecordingGap: (input) => this.persistSourceRecordingGap(input, { mediaFence }),
       persistAuthoritativeSource: (input) => this.persistAuthoritativeSource(input, { mediaFence, pipelineGeneration }),
       publishSourceDraft: (event) => this.publishSourceDraft(event, { mediaFence, pipelineGeneration }),
+      publishSourceStatus: (event) => this.publishSourceStatus(event, { mediaFence, pipelineGeneration }),
       replayAuthoritativeSourceCaptions: (...args) => this.replayAuthoritativeSourceCaptions(...args),
       startTopicSession: (...args) => this.startTopicSession(...args),
       pauseTopicSession: (...args) => this.pauseTopicSession(...args),
@@ -143,6 +147,9 @@ export class SupabaseLivePublisher {
         delete durableEvent.speakerJobTitle;
         // Language evidence is stored once on the linked authoritative source.
         delete durableEvent.languageObservation;
+        // Producing-model provenance rides on the live event for the host and
+        // metrics; the durable row records it on the authoritative source.
+        delete durableEvent.translationModel;
         // The final flag is delivered only after this atomic commit succeeds.
         durableResult = await this.#requestSnapshotGuard(mediaFence
           ? "/rest/v1/rpc/persist_live_final_caption_if_active_fenced_v1"
@@ -200,6 +207,35 @@ export class SupabaseLivePublisher {
     }
   }
 
+  async publishSourceStatus(event, { mediaFence = null, pipelineGeneration = null } = {}) {
+    if (!isPlainRecord(event) || !hasExactKeys(event, ["type", "sessionId", "status", "code"])
+      || event.type !== "source-status" || !isUuid(event.sessionId) || event.status !== "unavailable"
+      || event.code !== "SOURCE_RECORDING_UNAVAILABLE") throw new Error("INVALID_SOURCE_STATUS");
+    if (this.sourceEventFanout) await this.sourceEventFanout({ ...event }, { mediaFence, pipelineGeneration });
+  }
+
+  async persistSourceRecordingGap(input, { mediaFence = null } = {}) {
+    if (!isPlainRecord(input) || !hasExactKeys(input, ["sessionId", "segmentId", "sourceStartedAt", "sourceEndedAt"])
+      || !isUuid(input.sessionId) || !isUuid(input.segmentId) || !isIsoInstant(input.sourceStartedAt)
+      || !isIsoInstant(input.sourceEndedAt) || Date.parse(input.sourceEndedAt) <= Date.parse(input.sourceStartedAt)
+      || Date.parse(input.sourceEndedAt) - Date.parse(input.sourceStartedAt) > 60_000
+      || (mediaFence !== null && (!Number.isSafeInteger(mediaFence.epoch) || mediaFence.epoch < 0 || !isUuid(mediaFence.ownerId)))) {
+      throw new Error("INVALID_SOURCE_GAP");
+    }
+    try {
+      const result = await this.#requestSnapshotGuard("/rest/v1/rpc/record_live_source_gap_v1", {
+        method: "POST", body: JSON.stringify({ p_session_id: input.sessionId, p_segment_id: input.segmentId,
+          p_started_at: input.sourceStartedAt, p_ended_at: input.sourceEndedAt,
+          p_epoch: mediaFence?.epoch ?? null, p_owner_id: mediaFence?.ownerId ?? null }),
+      });
+      if (!isPlainRecord(result) || !hasExactKeys(result, ["id", "sessionId", "startedAt", "endedAt", "reason", "idempotent"])
+        || result.id !== input.segmentId || result.sessionId !== input.sessionId || result.reason !== "source_recording_failed"
+        || typeof result.idempotent !== "boolean" || Date.parse(result.startedAt) !== Date.parse(input.sourceStartedAt)
+        || Date.parse(result.endedAt) !== Date.parse(input.sourceEndedAt)) throw new Error("INVALID_SOURCE_GAP_RESPONSE");
+      return result;
+    } catch { throw new Error("SOURCE_GAP_PERSIST_FAILED"); }
+  }
+
   async publishSourceDraft(event, { mediaFence = null, pipelineGeneration = null } = {}) {
     if (!isPlainRecord(event) || !["source-draft", "source-draft-clear"].includes(event.type)
       || !isUuid(event.sessionId) || !isUuid(event.generation)
@@ -226,7 +262,7 @@ export class SupabaseLivePublisher {
       throw new Error("AUTHORITATIVE_SOURCE_LANE_FAILED");
     }
     try {
-      const rpcVersion = normalized.languageObservation === null ? "v1" : "v2";
+      const rpcVersion = normalized.sourceProvenance !== null ? "v3" : normalized.languageObservation === null ? "v1" : "v2";
       const value = await this.#requestSnapshotGuard(
         `/rest/v1/rpc/persist_authoritative_live_source_utterance_${rpcVersion}${mediaFence ? "_fenced_v1" : ""}`,
         {
@@ -238,7 +274,8 @@ export class SupabaseLivePublisher {
             p_raw_text: normalized.rawText,
             p_normalized_text: normalized.normalizedText,
             p_source_language: normalized.sourceLanguage,
-            ...(normalized.languageObservation === null ? {} : { p_language_observation: normalized.languageObservation }),
+            ...(rpcVersion === "v1" ? {} : { p_language_observation: normalized.languageObservation }),
+            ...(normalized.sourceProvenance === null ? {} : { p_source_provenance: normalized.sourceProvenance }),
             p_speaker_role: normalized.speakerRole,
             p_speaker_label: normalized.speakerLabel,
             p_speaker_name: normalized.speakerName,
@@ -548,7 +585,7 @@ export class SupabaseLivePublisher {
       session_id: `eq.${sessionId}`,
       language: `eq.${language}`,
       seq: `gt.${afterSeq}`,
-      select: "seq,participant_id,speaker_label,speaker_name,text,source_text,source_language,origin,utterance_key,translation_status,source_ended_at,emitted_at,authoritative_source_id",
+      select: "seq,participant_id,speaker_label,speaker_name,text,source_text,source_language,origin,utterance_key,translation_status,source_ended_at,emitted_at,authoritative_source_id,translation_capture",
       order: "seq.asc",
       limit: String(limit),
     });
@@ -585,6 +622,7 @@ export class SupabaseLivePublisher {
       sourceText: row.source_text ?? null,
       sourceLanguage: row.source_language ?? null,
       translationStatus: replayTranslationStatus(row),
+      ...(row.translation_capture == null ? {} : { translationCapture: normalizeTranslationCapture(row.translation_capture) }),
       ...(observations.get(row.authoritative_source_id) ? { languageObservation: observations.get(row.authoritative_source_id) } : {}),
       ...(row.origin === "source" ? { origin: "source" } : {}),
       ...(typeof row.utterance_key === "string" && row.utterance_key.length > 0
@@ -615,6 +653,23 @@ export class SupabaseLivePublisher {
     const text = await response.text();
     return text.length > 0 ? JSON.parse(text) : undefined;
   }
+}
+
+function translationInstant(value) {
+  if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z$/u.test(value)
+    || !Number.isFinite(Date.parse(value))) throw new Error("INVALID_INDEPENDENT_TRANSLATION");
+  return value;
+}
+
+function normalizeTranslationCapture(value) {
+  if (!isPlainRecord(value) || !hasExactKeys(value, ["kind", "streamGeneration", "captureEpoch", "captureStartedAt", "captureEndedAt", "finalization"])
+    || value.kind !== "independent-live-translation" || value.finalization !== "application-sentence-boundary"
+    || !isUuid(value.streamGeneration) || !isUuid(value.captureEpoch)) throw new Error("INVALID_INDEPENDENT_TRANSLATION");
+  translationInstant(value.captureEndedAt);
+  if (value.captureStartedAt !== null && Date.parse(translationInstant(value.captureStartedAt)) > Date.parse(value.captureEndedAt)) {
+    throw new Error("INVALID_INDEPENDENT_TRANSLATION");
+  }
+  return { ...value };
 }
 
 function parseTopicContextResponse(value, expectedSessionId) {
@@ -842,6 +897,11 @@ function replayTranslationStatus(row) {
   return row.source_text ? "translated" : "verbatim";
 }
 
+/** STT engines that may author an authoritative source row. The label is the
+ *  engine catalog's stt provider spelled for the ledger: Gemini rows come from
+ *  the Transcribe Live model, Soniox rows from stt-rt-v5. */
+const AUTHORITATIVE_STT_PROVIDERS = new Set(["gemini-transcribe-live", "soniox"]);
+
 function normalizeAuthoritativeSourceInput(input) {
   if (!isPlainRecord(input) || !isUuid(input.sessionId)) {
     throw new Error("INVALID_AUTHORITATIVE_SOURCE_INPUT");
@@ -878,6 +938,14 @@ function normalizeAuthoritativeSourceInput(input) {
     || endedMilliseconds > committedMilliseconds) {
     throw new Error("INVALID_AUTHORITATIVE_SOURCE_INPUT");
   }
+  // The direct Live Translate path that stamped `live-input-transcription`
+  // provenance is gone; every source row now comes from the STT engine the
+  // session selected, so provenance rides in sttProvider/sttModel alone.
+  if (input.sourceProvenance !== undefined && input.sourceProvenance !== null) {
+    throw new Error("INVALID_AUTHORITATIVE_SOURCE_INPUT");
+  }
+  const sourceProvenance = null;
+  if (!AUTHORITATIVE_STT_PROVIDERS.has(input.sttProvider)) throw new Error("INVALID_AUTHORITATIVE_SOURCE_INPUT");
   return {
     sessionId: input.sessionId,
     utteranceKey,
@@ -885,6 +953,7 @@ function normalizeAuthoritativeSourceInput(input) {
     normalizedText,
     sourceLanguage,
     languageObservation: normalizeLanguageObservation(input.languageObservation, sourceLanguage),
+    sourceProvenance,
     speakerRole: input.speakerRole,
     speakerLabel: optionalSnapshot(input.speakerLabel, 80),
     speakerName: optionalSnapshot(input.speakerName, 40),
@@ -894,7 +963,7 @@ function normalizeAuthoritativeSourceInput(input) {
     sourceStartedAt,
     sourceEndedAt,
     providerCommittedAt,
-    sttProvider: requirePattern(input.sttProvider, /^[a-z0-9][a-z0-9._-]{0,63}$/u, 64),
+    sttProvider: input.sttProvider,
     sttModel: optionalModel(input.sttModel),
     translationModel: optionalModel(input.translationModel),
     pipelineConfigFingerprint: input.pipelineConfigFingerprint === null
@@ -1254,7 +1323,7 @@ export class SupabaseHostAuthorizer {
     const query = new URLSearchParams({
       id: `eq.${settings.sessionId}`,
       expires_at: `gt.${new Date().toISOString()}`,
-      select: "id,host_id,status,version,session_type,output_mode,voice_provider,max_viewers,mode,languages,voice_output_mode,pinned_glossary_fingerprint",
+      select: "id,host_id,status,version,session_type,output_mode,voice_provider,max_viewers,mode,languages,voice_output_mode,pinned_glossary_fingerprint,event_metadata",
       limit: "1",
     });
     const response = await this.fetchFn(`${this.baseUrl}/rest/v1/live_sessions?${query}`, {
@@ -1272,6 +1341,25 @@ export class SupabaseHostAuthorizer {
       return false;
     }
     const row = rows[0];
+    // 2026-09-01 fix: migrate only known historical DB pins for the approved role change.
+    // A caller's canonical runtime models stay strict and cannot choose the former paid path.
+    try {
+      const metadata = row.event_metadata;
+      if (metadata != null && !isPlainRecord(metadata)) return false;
+      const preferences = metadata?.modelPreferences;
+      if (preferences !== undefined && (!isPlainRecord(preferences)
+        || !hasExactKeys(preferences, ["source", "summary"])
+        || typeof preferences.source !== "string" || typeof preferences.summary !== "string")) return false;
+      if (settings.captionConfig?.models) {
+        readGeminiSelectedModel("source", settings.captionConfig.models.transcription);
+        readGeminiSelectedModel("summary", settings.captionConfig.models.summary);
+      }
+      const config = createGeminiCaptionConfig(settings.captionConfig ?? settings);
+      if (config.models.transcription !== migrateLegacyGeminiModelSelection("source", preferences?.source)
+        || config.models.summary !== migrateLegacyGeminiModelSelection("summary", preferences?.summary)) return false;
+    } catch {
+      return false;
+    }
     const rowSessionType = row.session_type ?? (row.mode === "presentation" ? "presentation" : "meeting");
     const rowOutputMode = row.output_mode
       ?? (row.mode === "townhall" || ["fixed_voice", "auto_voice"].includes(row.voice_output_mode) ? "audio" : "captions");

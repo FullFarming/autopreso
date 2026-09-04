@@ -5,10 +5,27 @@ import { remapRolloverSpeakers } from "./speaker-registry.js";
 
 const FRAME_BYTES = AUDIO_CONFIG.inputSampleRate * 2 * AUDIO_CONFIG.chunkMilliseconds / 1_000;
 const CLOSE_TIMEOUT_MILLISECONDS = 5_000;
+/** A provider that advertises its own connection limit is rolled this long
+ *  before that limit so the replacement is already carrying audio when the
+ *  provider would otherwise cut the stream mid-utterance. */
+const ROLLOVER_LEAD_MILLISECONDS = 30_000;
+/** Never roll faster than this, whatever a provider claims: each roll opens a
+ *  second paid connection and drains the old tail in the background. */
+const MINIMUM_ROLLOVER_MILLISECONDS = 60_000;
+
+/** Rollover clock for one open stream. Gemini streams advertise no limit and
+ *  keep the 540 s `STT_CONFIG.rolloverMilliseconds`; Soniox advertises
+ *  `maxConnectionMilliseconds` (290 min) and rolls shortly before it. */
+export function resolveRolloverMilliseconds(stream) {
+  const limit = stream?.maxConnectionMilliseconds;
+  if (!Number.isFinite(limit) || limit <= 0) return STT_CONFIG.rolloverMilliseconds;
+  return Math.max(MINIMUM_ROLLOVER_MILLISECONDS, limit - ROLLOVER_LEAD_MILLISECONDS);
+}
 
 export class RollingSpeechSession {
   #stream = null;
   #startedAt = 0;
+  #rolloverMilliseconds = STT_CONFIG.rolloverMilliseconds;
   #overlapFrames = [];
   #terminalError = null;
   #pcmRing = null;
@@ -29,13 +46,14 @@ export class RollingSpeechSession {
   #removeExternalAbort = null;
 
   constructor({
-    provider, onFinalUtterance, onPartialTranscript = null, onRemap,
+    provider, onFinalUtterance, onPartialTranscript = null, onPartialTranslation = null, onRemap,
     capturePcmWindows = false, now = Date.now,
     maxPendingUtterances = 64,
   }) {
     this.provider = provider;
     this.onFinalUtterance = onFinalUtterance;
     this.onPartialTranscript = onPartialTranscript;
+    this.onPartialTranslation = onPartialTranslation;
     this.onRemap = onRemap;
     this.capturePcmWindows = capturePcmWindows;
     this.now = now;
@@ -59,10 +77,12 @@ export class RollingSpeechSession {
         generation: 0,
         onFinalUtterance: (utterance) => this.#handleFinalUtterance(utterance, pcmRing),
         onPartialTranscript: this.onPartialTranscript,
+        onPartialTranslation: this.onPartialTranslation,
       });
       this.#pcmRing = pcmRing;
       this.#streamAudioOffsetMs = 0;
       this.#startedAt = this.now();
+      this.#rolloverMilliseconds = resolveRolloverMilliseconds(this.#stream);
     })().catch((error) => { this.#terminalError = error; throw error; });
     return this.#startPromise;
   }
@@ -85,6 +105,9 @@ export class RollingSpeechSession {
         },
         onPartialTranscript: (value) => {
           if (!admission.isRetired && !controller.signal.aborted && !this.#isClosing && !this.#isClosed) return options.onPartialTranscript?.(value);
+        },
+        onPartialTranslation: (value) => {
+          if (!admission.isRetired && !controller.signal.aborted && !this.#isClosing && !this.#isClosed) return options.onPartialTranslation?.(value);
         },
       });
     }).then(async (stream) => {
@@ -112,7 +135,7 @@ export class RollingSpeechSession {
     const work = this.#writeTail.then(async () => {
       if (this.#terminalError) throw this.#terminalError;
       if (this.#isClosed) throw new Error("STT_STREAM_CLOSED");
-      if (!this.#isClosing && this.now() - this.#startedAt >= STT_CONFIG.rolloverMilliseconds) await this.#rollover();
+      if (!this.#isClosing && this.now() - this.#startedAt >= this.#rolloverMilliseconds) await this.#rollover();
       await this.#stream.sendAudio(ownedFrame);
       this.#pcmRing?.push(ownedFrame, this.#streamAudioOffsetMs);
       this.#streamAudioOffsetMs += AUDIO_CONFIG.chunkMilliseconds;
@@ -152,6 +175,9 @@ export class RollingSpeechSession {
       onPartialTranscript: (value) => {
         if (!isOverlapReplay) return this.onPartialTranscript?.(value);
       },
+      onPartialTranslation: (value) => {
+        if (!isOverlapReplay) return this.onPartialTranslation?.(value);
+      },
     });
     try {
       const shouldRemap = previous.supportsRolloverRemap !== false && next.supportsRolloverRemap !== false;
@@ -164,6 +190,7 @@ export class RollingSpeechSession {
         this.#pcmRing = nextPcmRing;
         this.#streamAudioOffsetMs = 0;
         this.#startedAt = this.now();
+        this.#rolloverMilliseconds = resolveRolloverMilliseconds(next);
         this.#clearOverlapFrames();
         this.#drainPrevious(previous, previousPcmRing);
         return;
@@ -187,6 +214,7 @@ export class RollingSpeechSession {
       this.#pcmRing = nextPcmRing;
       this.#streamAudioOffsetMs = nextAudioOffsetMs;
       this.#startedAt = this.now();
+      this.#rolloverMilliseconds = resolveRolloverMilliseconds(next);
     } catch (error) {
       await Promise.allSettled([this.#closeStreamOnce(previous), this.#closeStreamOnce(next)]);
       previousPcmRing?.clear();

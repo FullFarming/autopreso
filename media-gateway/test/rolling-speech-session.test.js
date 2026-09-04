@@ -487,3 +487,81 @@ test("graceful close drains accepted audio before closing and rejects new audio"
   await closing;
   assert.deepEqual(sent, [1, 2, 3, "closed"]);
 });
+
+test("a stream advertising maxConnectionMilliseconds rolls thirty seconds before that limit instead of at 540 s", async () => {
+  let now = 0;
+  let opens = 0;
+  const session = new RollingSpeechSession({ now: () => now, onFinalUtterance() {}, onRemap() {},
+    provider: { async open() { opens += 1; return {
+      supportsRolloverRemap: false, maxConnectionMilliseconds: 17_400_000,
+      async sendAudio() {}, async close() {},
+    }; } } });
+  await session.start();
+  now = 550_000;
+  await session.sendAudio(new Uint8Array(1_280));
+  assert.equal(opens, 1, "the Gemini 540 s clock must not roll a provider with a longer connection limit");
+  now = 17_400_000 - 30_000 - 1;
+  await session.sendAudio(new Uint8Array(1_280));
+  assert.equal(opens, 1);
+  now = 17_400_000 - 30_000;
+  await session.sendAudio(new Uint8Array(1_280));
+  assert.equal(opens, 2, "the roll happens shortly before the provider limit, never at or after it");
+  await session.close();
+});
+
+test("a stream without a connection limit keeps the 540 s Gemini rollover clock", async () => {
+  let now = 0;
+  let opens = 0;
+  const session = new RollingSpeechSession({ now: () => now, onFinalUtterance() {}, onRemap() {},
+    provider: { async open() { opens += 1; return { supportsRolloverRemap: false, async sendAudio() {}, async close() {} }; } } });
+  await session.start();
+  now = 539_999;
+  await session.sendAudio(new Uint8Array(1_280));
+  assert.equal(opens, 1);
+  now = 540_000;
+  await session.sendAudio(new Uint8Array(1_280));
+  assert.equal(opens, 2);
+  await session.close();
+});
+
+test("a short provider connection limit still leaves at least sixty seconds per stream", async () => {
+  let now = 0;
+  let opens = 0;
+  const session = new RollingSpeechSession({ now: () => now, onFinalUtterance() {}, onRemap() {},
+    provider: { async open() { opens += 1; return {
+      supportsRolloverRemap: false, maxConnectionMilliseconds: 80_000, async sendAudio() {}, async close() {},
+    }; } } });
+  await session.start();
+  now = 59_999;
+  await session.sendAudio(new Uint8Array(1_280));
+  assert.equal(opens, 1);
+  now = 60_000;
+  await session.sendAudio(new Uint8Array(1_280));
+  assert.equal(opens, 2);
+  await session.close();
+});
+
+test("partial translations flow from the active stream only and never from a retired one", async () => {
+  let now = 0;
+  const callbacks = [];
+  const translations = [];
+  const session = new RollingSpeechSession({ now: () => now, onFinalUtterance() {}, onRemap() {},
+    onPartialTranslation(value) { translations.push(value); },
+    provider: { async open(options) {
+      callbacks.push(options.onPartialTranslation);
+      return { supportsRolloverRemap: false, async sendAudio() {}, async close() {} };
+    } } });
+  await session.start();
+  assert.equal(typeof callbacks[0], "function", "onPartialTranslation must reach the provider open contract");
+  callbacks[0]({ language: "en", text: "Hel", sourceLanguage: "ko" });
+  now = 550_000;
+  await session.sendAudio(new Uint8Array(1_280));
+  await new Promise((resolve) => setImmediate(resolve));
+  callbacks[0]({ language: "en", text: "retired", sourceLanguage: "ko" });
+  callbacks[1]({ language: "en", text: "Hello", sourceLanguage: "ko" });
+  assert.deepEqual(translations, [
+    { language: "en", text: "Hel", sourceLanguage: "ko" },
+    { language: "en", text: "Hello", sourceLanguage: "ko" },
+  ]);
+  await session.close();
+});

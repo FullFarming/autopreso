@@ -2,16 +2,11 @@ import { pathToFileURL } from "node:url";
 
 import { createGeminiCaptionConfig, geminiCaptionConfigFingerprint, GEMINI_WORKLOAD_MODEL_MATRIX } from "../../packages/caption-core/index.js";
 import { createGeminiServerRuntime } from "../../packages/gemini-server/index.js";
-import { createCaptionPolisher } from "./caption-polish.js";
-import { buildDefaultDomainInstruction } from "./glossary-packs.js";
 import { readGatewayEnvironment } from "./config.js";
 import { createGatewayServer } from "./gateway-server.js";
 import { installGatewayShutdown } from "./gateway-shutdown.js";
 import { createGoogleLiveClient } from "./google-live-client.js";
-import {
-  GeminiLiveTranscriptionAdapter,
-  GeminiTextTranslateAdapter,
-} from "./google-provider-adapters.js";
+import { assertEngineKeys, createSpeechToText, createTextTranslate, isCombinedEngine } from "./engines/create-engines.js";
 import { LiveMediaPipeline } from "./live-media-pipeline.js";
 import { createLiveTopicDetector } from "./live-topic-detector.js";
 import {
@@ -27,13 +22,8 @@ export function listenMediaGateway(server, config) {
   return new Promise((resolve) => server.listen(config.port, config.host, resolve));
 }
 
-/** Gemini admission budget sized for the densest supported Live Call: one
- *  committed final on a three-language session holds up to four concurrent
- *  workload calls (two lane translations + selective polish + topic), and
- *  clause-level segmentation can commit ~20 finals a minute. The library
- *  defaults (2 outstanding / 30 per minute) were sized for one-shot REST
- *  workloads and made dense sessions throw GEMINI_SESSION_BUDGET_EXHAUSTED,
- *  publishing verbatim source text on translated lanes. */
+/** Paragraph summaries use the process admission cap. Live input/output
+ * transcription shares bounded target connections without Flash audio requests. */
 export const GATEWAY_GEMINI_LIMITS = Object.freeze({
   globalOutstanding: 16,
   sessionOutstanding: 6,
@@ -50,7 +40,7 @@ export function createMediaGatewayRuntimeLoader({
   if (!config || typeof getGateway !== "function") throw new Error("INVALID_GATEWAY_RUNTIME_LOADER");
   let flight = null;
   let loadedRuntime = null;
-  let topicGenerate = null;
+  const topicGenerators = new Map();
 
   const load = async () => {
     if (!flight) {
@@ -79,12 +69,19 @@ export function createMediaGatewayRuntimeLoader({
 
   return Object.freeze({
     load,
-    async generateTopic(request, context) {
+    async bindTopicModel(sessionId, model) {
       const { geminiRuntime } = await load();
-      if (!topicGenerate) topicGenerate = createGeminiTopicGenerate({ runtime: geminiRuntime });
-      return topicGenerate(request, context);
+      if (!topicGenerators.has(sessionId) && topicGenerators.size >= GATEWAY_GEMINI_LIMITS.maximumTrackedSessions) throw new Error("GEMINI_TOPIC_MODEL_STATE_EXHAUSTED");
+      const client = geminiRuntime.createSessionClient(sessionId, "topic", { model });
+      topicGenerators.set(sessionId, createGeminiTopicGenerate({ client }));
+    },
+    async generateTopic(request, context) {
+      const generate = topicGenerators.get(context?.sessionId);
+      if (!generate) throw new Error("GEMINI_TOPIC_MODEL_NOT_BOUND");
+      return generate(request, context);
     },
     async releaseSession(sessionId) {
+      topicGenerators.delete(sessionId);
       loadedRuntime?.geminiRuntime.releaseSession(sessionId);
     },
   });
@@ -117,8 +114,8 @@ export function createCaptionPolishPolicyResolver({
   };
 }
 
-export function createGeminiTopicGenerate({ runtime }) {
-  if (typeof runtime?.generateContent !== "function") {
+export function createGeminiTopicGenerate({ runtime = undefined, client = undefined }) {
+  if (typeof runtime?.generateContent !== "function" && typeof client?.models?.generateContent !== "function") {
     throw new Error("INVALID_TOPIC_PROVIDER");
   }
   return async (request, { signal, sessionId } = {}) => {
@@ -126,7 +123,7 @@ export function createGeminiTopicGenerate({ runtime }) {
     if (signal !== undefined && !(signal instanceof AbortSignal)) {
       throw new Error("INVALID_TOPIC_PROVIDER_REQUEST");
     }
-    const response = await runtime.generateContent({
+    const dispatch = {
       sessionId,
       workload: "topic",
       contents: [{ role: "user", parts: [{ text: input.user }] }],
@@ -137,7 +134,13 @@ export function createGeminiTopicGenerate({ runtime }) {
         maxOutputTokens: 512,
       },
       signal,
-    });
+    };
+    if (client) {
+      const response = await client.models.generateContent({ contents: dispatch.contents,
+        config: { ...dispatch.config, abortSignal: signal } });
+      return { outputText: response.text };
+    }
+    const response = await runtime.generateContent(dispatch);
     return { outputText: response.outputText };
   };
 }
@@ -176,11 +179,13 @@ function isPlainObject(value) {
     && Object.getPrototypeOf(value) === Object.prototype;
 }
 
+const FLASH_MODEL_METRICS = Object.freeze({ "gemini-3.7-flash": "flash_37", "gemini-3.6-flash": "flash_36", "gemini-3.5-flash": "flash_35" });
 const GEMINI_METRIC_POLICY = Object.freeze({
-  topic: Object.freeze({ model: "gemini-3.7-flash", modelMetric: "flash_37" }),
-  translation: Object.freeze({ model: "gemini-3.7-flash", modelMetric: "flash_37" }),
-  polish: Object.freeze({ model: "gemini-3.7-flash", modelMetric: "flash_37" }),
-  recap: Object.freeze({ model: "gemini-3.7-flash", modelMetric: "flash_37" }),
+  topic: FLASH_MODEL_METRICS,
+  source: FLASH_MODEL_METRICS,
+  translation: FLASH_MODEL_METRICS,
+  polish: Object.freeze({ [GEMINI_WORKLOAD_MODEL_MATRIX.polish]: "flash_37" }),
+  recap: FLASH_MODEL_METRICS,
 });
 const GEMINI_RESULT_METRICS = Object.freeze({
   OK: "ok",
@@ -197,13 +202,14 @@ const GEMINI_RESULT_METRICS = Object.freeze({
 
 export function observeGeminiRuntimeMetrics(metrics, event) {
   const policy = GEMINI_METRIC_POLICY[event?.workload];
+  const modelMetric = policy && Object.hasOwn(policy, event?.model) ? policy[event.model] : null;
   const resultMetric = GEMINI_RESULT_METRICS[event?.code];
-  if (!policy || event?.model !== policy.model || !resultMetric
+  if (typeof modelMetric !== "string" || !resultMetric
     || !Number.isFinite(event?.latencyMilliseconds) || event.latencyMilliseconds < 0
     || [event?.inputTokens, event?.outputTokens, event?.totalTokens]
       .some((value) => !Number.isSafeInteger(value) || value < 0)) return;
   const prefix = `gemini_${event.workload}`;
-  metrics.increment(`${prefix}_model_${policy.modelMetric}_total`);
+  metrics.increment(`${prefix}_model_${modelMetric}_total`);
   metrics.increment(`${prefix}_result_${resultMetric}_total`);
   metrics.observe(`${prefix}_latency_ms`, event.latencyMilliseconds);
   if (event.usageKnown !== true) {
@@ -235,7 +241,7 @@ export async function startMediaGateway(config = readGatewayEnvironment(), {
     ...config,
     topicDetector,
     observeTopicFailure() { gateway?.metrics.increment("topic_side_effect_failures_total"); },
-    eventFanout(sessionId, language, event) { return gateway.broadcastEvent(sessionId, language, event); },
+    eventFanout(sessionId, language, event, context) { return gateway.broadcastEvent(sessionId, language, event, context); },
     sourceEventFanout(event, context) { return gateway.broadcastSourceEvent(event, context); },
   });
   const floorController = new SupabaseFloorController(config);
@@ -259,7 +265,7 @@ export async function startMediaGateway(config = readGatewayEnvironment(), {
       // restarts. Durable-failure recovery is stricter: the failed final has
       // already consumed an in-memory seq but its commit outcome is unknown,
       // so only the reconciled durable max may seed the replacement.
-      const [{ geminiRuntime, liveClient }, initialSequences, compiledGlossary] = await Promise.all([
+      const [{ liveClient, geminiRuntime }, initialSequences, compiledGlossary] = await Promise.all([
         runtimeLoader.load(),
         resolvePipelineInitialSequences({
           publisher,
@@ -283,6 +289,16 @@ export async function startMediaGateway(config = readGatewayEnvironment(), {
         }),
         captionPolishPolicy,
       });
+      // The session's engine selection picks the STT provider and the text
+      // translator. A selection whose provider key is absent is refused here,
+      // before any paid connection or pipeline exists; the host sees
+      // ENGINE_KEY_MISSING through gatewayMessage. Key values are only tested
+      // for presence and never copied into a pipeline or a log.
+      const engine = captionConfig.engine;
+      assertEngineKeys(engine, { GEMINI_API_KEY: config.geminiApiKey, SONIOX_API_KEY: config.sonioxApiKey });
+      const textTranslate = createTextTranslate({ engine, geminiRuntime, sessionId: message.sessionId });
+      if (textTranslate === null && !isCombinedEngine(engine)) throw new Error("TEXT_TRANSLATE_REQUIRED");
+      await runtimeLoader.bindTopicModel(message.sessionId, captionConfig.models.summary);
       return new LiveMediaPipeline({
         sessionId: message.sessionId,
         sessionType: message.sessionType,
@@ -304,32 +320,21 @@ export async function startMediaGateway(config = readGatewayEnvironment(), {
         onHostEvent,
         onFatalError: options.onFatalError,
         dependencies: {
-          // One host audio stream is transcribed once. Translation starts from
-          // committed text, so captions-only Live Call never asks Gemini Live
-          // to synthesize paid audio that the product does not deliver.
-          speechToText: new GeminiLiveTranscriptionAdapter({
-            client: liveClient,
-            model: GEMINI_WORKLOAD_MODEL_MATRIX.transcription,
+          // One host STT stream per session (Gemini Transcribe Live, or Soniox
+          // which also attaches per-lane translations to every final); the
+          // pipeline translates committed text into the other caption lanes.
+          speechToText: createSpeechToText({
+            engine,
+            liveClient,
+            sonioxApiKey: config.sonioxApiKey,
             languageCodes: config.sttLanguageCodes,
             compiledGlossary,
+            glossaryText: captionConfig.glossary,
+            domainText: captionConfig.domain,
+            translationLanguages: captionConfig.languages,
           }),
-          // Finals use Gemini Flash, with no alternate translation engine.
-          textTranslate: new GeminiTextTranslateAdapter({
-            client: geminiRuntime.createSessionClient(message.sessionId, "translation"),
-            model: GEMINI_WORKLOAD_MODEL_MATRIX.translation,
-          }),
-          // Keep the desktop caption finalizer's six-second quality budget.
-          // This optional selective pass runs only on committed text and never
-          // requests or publishes translated audio.
-          captionPolish: createCaptionPolisher({
-            client: geminiRuntime.createSessionClient(message.sessionId, "polish"),
-            model: GEMINI_WORKLOAD_MODEL_MATRIX.polish,
-            timeoutMs: 6_000,
-            // CRE is the product default, so it is the standing domain
-            // instruction; per-session terminology arrives via pinned
-            // compiled glossaries, never via glossaryPack.
-            defaultDomain: buildDefaultDomainInstruction(),
-          }),
+          // null for a combined engine: translation then rides on the STT final.
+          textTranslate,
           publisher: publisher.withMediaFence(options.mediaFence ?? null, { pipelineGeneration: options.pipelineGeneration }),
         },
       });

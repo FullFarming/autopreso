@@ -761,9 +761,19 @@ export function createGatewayServer({
   };
   // JSON live-events funnel through here so a viewer that is replaying missed
   // captions buffers concurrent live events instead of receiving them early.
-  const deliverEvent = (sessionId, language, payload) => {
+  const createMediaEventGuard = (sessionId, context = {}) => {
+    const owner = hostSessions.get(sessionId);
+    return () => Boolean(owner && !isShuttingDown && hostSessions.get(sessionId) === owner
+      && context.pipelineGeneration === owner.pipelineGeneration
+      && !owner.isDetaching && owner.pipeline.isPaused !== true && owner.pipeline.isStopped !== true
+      && (context.mediaFence == null
+        ? owner.demandEpoch === null
+        : owner.demandEpoch === context.mediaFence.epoch && demand?.ownerId === context.mediaFence.ownerId));
+  };
+  const deliverEvent = (sessionId, language, payload, canDeliver = () => true) => {
     const serialized = serializeJson({ type: "live-event", payload });
     return deliverToAuthorizedViewers(sessionId, language, (viewer) => {
+      if (!canDeliver()) return;
       const metadata = viewerMetadata.get(viewer);
       if (metadata?.replayBuffer) {
         // Bounded on purpose. This buffer exists only to hold live events for
@@ -777,7 +787,7 @@ export function createGatewayServer({
           metrics.increment("replay_buffer_overflow_total");
           metadata.replayBuffer = null;
         } else {
-          metadata.replayBuffer.push({ payload, serialized });
+          metadata.replayBuffer.push({ payload, serialized, canDeliver });
           return;
         }
       }
@@ -921,6 +931,53 @@ export function createGatewayServer({
     if (notifyHolder) sendJson(holder.webSocket, { type: "speak-ended", sessionId, reason });
     if (broadcast) await broadcastFloor(sessionId, null);
   });
+  const drainOwnedHostSession = (sessionId, webSocket) => {
+    const current = hostSessions.get(sessionId);
+    if (!current || current.webSocket !== webSocket || current.isDetaching) return Promise.reject(new Error("SESSION_NOT_STARTED"));
+    if (current.drainFlight) return current.drainFlight;
+    // Close admission synchronously; queued PCM already owns its capture/floor
+    // context and must finish before the provider receives audioStreamEnd.
+    current.isDraining = true;
+    current.drainFlight = withHostSessionLock(sessionId, async () => {
+      let timer;
+      try {
+        await Promise.race([
+          (async () => {
+            const participantTails = await withFloorSessionLock(sessionId, () => [
+              ...(current.participantAudioTails ?? []), floorHolders.get(sessionId)?.audioTail,
+            ]);
+            await drainHostAudioLanes(current);
+            await Promise.all(participantTails);
+            if (hostSessions.get(sessionId) !== current || current.isDetaching || webSocket.readyState !== WebSocket.OPEN) throw new Error("HOST_CONNECTION_CLOSED");
+            await current.pipeline.gracefulDrain?.({ timeoutMilliseconds: 10_000 });
+            if (hostSessions.get(sessionId) !== current || current.isDetaching || webSocket.readyState !== WebSocket.OPEN) throw new Error("HOST_CONNECTION_CLOSED");
+            current.isDrained = true;
+          })(),
+          new Promise((_, reject) => { timer = setTimeoutFn(() => reject(new Error("MEDIA_DRAIN_TIMEOUT")), 10_000); }),
+        ]);
+        metrics.increment("host_drains_total");
+      } catch (error) {
+        const code = error?.message === "MEDIA_DRAIN_TIMEOUT"
+          ? "MEDIA_DRAIN_TIMEOUT" : "MEDIA_DRAIN_FAILED";
+        current.isDetaching = true;
+        stopHostLease(current);
+        const failure = { cleanupComplete: false };
+        failedHostSessions.set(sessionId, failure);
+        try { current.pipeline.abortMedia?.(); } catch { /* close still owns cleanup */ }
+        await releaseFloor(sessionId, { reason: "pipeline-failed" }).catch(() => undefined);
+        try {
+          await closePipelineOnce(current.pipeline);
+          failure.cleanupComplete = true;
+          await releaseGeminiSessionOnce(current);
+        } catch { metrics.increment("pipeline_close_failures_total"); }
+        if (hostSessions.get(sessionId) === current) hostSessions.delete(sessionId);
+        metrics.set("host_sessions", hostSessions.size);
+        metrics.increment("host_drain_failures_total");
+        throw new Error(code);
+      } finally { clearTimeoutFn(timer); }
+    }, { bypassQueueLimit: true });
+    return current.drainFlight;
+  };
   const stopOwnedHostSession = async (sessionId, webSocket) => withHostSessionLock(sessionId, async () => {
     const current = hostSessions.get(sessionId);
     if (!current) return false;
@@ -1017,7 +1074,7 @@ export function createGatewayServer({
   heartbeatTimer.unref();
   const tickTimer = setInterval(() => {
     for (const state of hostSessions.values()) {
-      if (!state.isDetaching) void state.pipeline.tick().catch(() => failOwnedPipeline(state.settings.sessionId, state.pipeline));
+      if (!state.isDetaching && !state.isDraining) void state.pipeline.tick().catch(() => failOwnedPipeline(state.settings.sessionId, state.pipeline));
     }
     // Release a floor that has gone silent. Host audio is dropped outright while
     // ANY participant holds the floor, so a holder whose client died without
@@ -1027,6 +1084,7 @@ export function createGatewayServer({
     // automatic recovery. Releasing hands the floor back and notifies the holder
     // so their UI resets instead of showing a live mic that is not connected.
     for (const [sessionId, holder] of floorHolders) {
+      if (hostSessions.get(sessionId)?.isDraining) continue;
       if (now() - holder.lastFrameAt < floorIdleReleaseMilliseconds) continue;
       metrics.increment("floor_idle_releases_total");
       void releaseFloor(sessionId, { grantId: holder.grantId, reason: "idle" }).catch(() => undefined);
@@ -1215,6 +1273,7 @@ export function createGatewayServer({
           if (isBinary) {
             const state = hostSessions.get(claims.sessionId);
             if (!state || state.webSocket !== webSocket || state.isDetaching) throw new Error("SESSION_NOT_STARTED");
+            if (state.isDraining) { metrics.increment("dropped_audio_frames_total"); return; }
             const decoded = decodeHostAudioFrame(data);
             if (floorHolders.has(claims.sessionId)) {
               // A participant holds the speaking floor: their audio wins.
@@ -1245,13 +1304,37 @@ export function createGatewayServer({
                   decoded.source,
                 );
               })
-              .catch(() => failOwnedPipeline(claims.sessionId, state.pipeline))
+              .catch(() => {
+                // Failure cleanup takes the host lock; an admitted audio tail
+                // must not wait on that same lock while drain is awaiting it.
+                void failOwnedPipeline(claims.sessionId, state.pipeline).catch(() => undefined);
+              })
               .finally(() => { audioLane.pendingFrames -= 1; });
             metrics.increment("audio_frames_total");
             return;
           }
           const message = parseJson(data);
           const active = hostSessions.get(claims.sessionId);
+          if (message.type === "drain") {
+            if (message.sessionId !== claims.sessionId || Object.keys(message).sort().join(",") !== "sessionId,type") {
+              sendJson(webSocket, { type: "error", sessionId: claims.sessionId, code: "INVALID_DRAIN", message: gatewayMessage("INVALID_DRAIN") }); return;
+            }
+            try {
+              await drainOwnedHostSession(claims.sessionId, webSocket);
+              sendJson(webSocket, { type: "drained", sessionId: claims.sessionId });
+            } catch (error) {
+              const code = ["MEDIA_DRAIN_FAILED", "MEDIA_DRAIN_TIMEOUT", "SESSION_NOT_STARTED"].includes(error?.message) ? error.message : "MEDIA_DRAIN_FAILED";
+              sendJson(webSocket, { type: "error", sessionId: claims.sessionId, code, message: gatewayMessage(code),
+                ...(code === "SESSION_NOT_STARTED" ? {} : { requiresManualRestart: true }) });
+              if (code !== "SESSION_NOT_STARTED" && demand && active?.demandEpoch != null) {
+                await demand.fail(claims.sessionId, active.demandEpoch, code).catch(() => metrics.increment("media_failure_fence_failures_total"));
+              }
+            }
+            return;
+          }
+          if (active?.isDraining && !["stop", "detach"].includes(message.type)) {
+            sendJson(webSocket, { type: "error", sessionId: claims.sessionId, code: "MEDIA_DRAINING", message: gatewayMessage("MEDIA_DRAINING") }); return;
+          }
           if (message.type === "audioStreamEnd" && active?.webSocket === webSocket) {
             await drainHostAudioLanes(active);
             await active.pipeline.endAudioStream();
@@ -1259,6 +1342,7 @@ export function createGatewayServer({
             return;
           }
           if (message.type === "host-speak") {
+            if (active?.webSocket !== webSocket) throw new Error("SESSION_NOT_STARTED");
             // The host reclaims the speaking floor from a participant (e.g.
             // the guest finished talking but never pressed Stop). Releasing
             // reopens the HOST binary-audio gate above; with no holder this
@@ -1275,17 +1359,19 @@ export function createGatewayServer({
             try {
               await withHostSessionLock(claims.sessionId, async () => {
                 if (hostSessions.get(claims.sessionId) !== active || active.isDetaching) throw new Error("SESSION_NOT_STARTED");
+                if (active.isDraining) throw new Error("MEDIA_DRAINING");
                 assertHostSocketActive();
                 if (message.type === "pause") await active.pipeline.pause?.();
                 else await active.pipeline.resume?.();
                 assertHostSocketActive();
                 if (hostSessions.get(claims.sessionId) !== active || active.isDetaching) throw new Error("SESSION_NOT_STARTED");
+                if (active.isDraining) throw new Error("MEDIA_DRAINING");
                 const status = message.type === "pause" ? "paused" : "live";
                 sendJson(webSocket, { type: message.type === "pause" ? "paused" : "resumed", sessionId: claims.sessionId });
                 await broadcastSessionStatus(claims.sessionId, status);
               });
             } catch (error) {
-              if (error?.message === "SESSION_NOT_STARTED" || error?.message === "HOST_CONNECTION_CLOSED") {
+              if (["SESSION_NOT_STARTED", "HOST_CONNECTION_CLOSED", "MEDIA_DRAINING"].includes(error?.message)) {
                 sendJson(webSocket, { type: "error", code: error.message, message: gatewayMessage(error.message) });
               } else {
                 await failOwnedPipeline(claims.sessionId, active.pipeline);
@@ -1305,6 +1391,17 @@ export function createGatewayServer({
             // transient socket close: providers are released immediately and
             // no reconnect-grace pipeline is retained.
             webSocket.immediateTeardown = true;
+            if (active?.webSocket === webSocket) {
+              try { await drainOwnedHostSession(claims.sessionId, webSocket); }
+              catch (error) {
+                const code = error?.message === "MEDIA_DRAIN_TIMEOUT" ? "MEDIA_DRAIN_TIMEOUT" : "MEDIA_DRAIN_FAILED";
+                sendJson(webSocket, { type: "error", sessionId: claims.sessionId, code, message: gatewayMessage(code), requiresManualRestart: true });
+                if (demand && active.demandEpoch != null) {
+                  await demand.fail(claims.sessionId, active.demandEpoch, code).catch(() => metrics.increment("media_failure_fence_failures_total"));
+                }
+                return;
+              }
+            }
             const stopped = await stopOwnedHostSession(claims.sessionId, webSocket);
             if (stopped) metrics.increment("host_intentional_stops_total");
             else metrics.increment("host_stop_idempotent_total");
@@ -1327,6 +1424,7 @@ export function createGatewayServer({
               if (shutdownAbortController.signal.aborted) throw shutdownAbortController.signal.reason;
               assertHostSocketActive();
               const previous = hostSessions.get(claims.sessionId);
+              if (previous?.isDraining) throw new Error("MEDIA_DRAINING");
               const priorFailure = failedHostSessions.get(claims.sessionId);
               if (sessionCleanupFailures.has(claims.sessionId)) throw new Error("PIPELINE_CLEANUP_FAILED");
               if (priorFailure && message.type !== "restart") throw new Error("PIPELINE_RESTART_REQUIRED");
@@ -1453,7 +1551,12 @@ export function createGatewayServer({
                 const factoryPromise = Promise.resolve().then(() => pipelineFactory(
                   hostMessage,
                   previous?.pipeline ?? null,
-                  (event) => sendHostEvent(hostOutput, event),
+                  (event) => {
+                    if (event?.translationCapture != null && !createMediaEventGuard(claims.sessionId, {
+                      pipelineGeneration, mediaFence: demandEpoch === null ? null : { epoch: demandEpoch, ownerId: demand.ownerId },
+                    })()) return;
+                    sendHostEvent(hostOutput, event);
+                  },
                   {
                     signal: operationAbortController.signal,
                     pipelineGeneration,
@@ -1493,7 +1596,9 @@ export function createGatewayServer({
                     activationKey: message.activationKey,
                     sessionType: hostMessage.sessionType,
                     outputMode: hostMessage.outputMode,
-                    voiceProvider: hostMessage.voiceProvider,
+                    // 2026-09-01 fix: The DB retains its required legacy provider
+                    // metadata; captions-only media itself must remain voiceless.
+                    voiceProvider: hostMessage.outputMode === "captions" ? "gemini" : hostMessage.voiceProvider,
                     languages: [...hostMessage.languages],
                     maxViewers: hostMessage.maxViewers,
                     glossaryPack: hostMessage.glossaryPack,
@@ -1552,6 +1657,7 @@ export function createGatewayServer({
                 webSocket,
                 hostOutput,
                 audioLanes: new Map(),
+                participantAudioTails: new Set(),
                 settings: {
                   sessionId: claims.sessionId,
                   version: hostMessage.authoritativeVersion,
@@ -1685,6 +1791,7 @@ export function createGatewayServer({
           }
           const state = hostSessions.get(claims.sessionId);
           if (!state || state.isDetaching) throw new Error("SESSION_NOT_STARTED");
+          if (state.isDraining) { metrics.increment("dropped_audio_frames_total"); return; }
           if (data.byteLength !== INPUT_FRAME_BYTES) throw new Error("INVALID_AUDIO_FRAME");
           if (state.pipeline?.isPaused === true) {
             // Same paused-drop as host frames: never charge the byte budget
@@ -1707,7 +1814,7 @@ export function createGatewayServer({
             return;
           }
           holder.pendingFrames += 1;
-          holder.audioTail = holder.audioTail
+          const audioTail = holder.audioTail
             .then(async () => {
               if (state.isDetaching) return;
               return state.pipeline.acceptAudio(
@@ -1717,12 +1824,17 @@ export function createGatewayServer({
                 "participant",
               );
             })
-            .catch(() => failOwnedPipeline(claims.sessionId, state.pipeline))
-            .finally(() => { holder.pendingFrames -= 1; });
+            .catch(() => { void failOwnedPipeline(claims.sessionId, state.pipeline).catch(() => undefined); })
+            .finally(() => { holder.pendingFrames -= 1; state.participantAudioTails.delete(audioTail); });
+          holder.audioTail = audioTail;
+          state.participantAudioTails.add(audioTail);
           metrics.increment("floor_audio_frames_total");
           return;
         }
         const message = parseJson(data);
+        if (["speak-start", "speak-end"].includes(message.type) && hostSessions.get(claims.sessionId)?.isDraining) {
+          sendJson(webSocket, { type: "error", sessionId: claims.sessionId, code: "MEDIA_DRAINING", message: gatewayMessage("MEDIA_DRAINING") }); return;
+        }
         if (message.type === "speak-start") {
           const metadata = viewerMetadata.get(webSocket);
           if (!metadata || !await runParticipantSpeakingAuthorization(claims.sessionId)) {
@@ -1733,7 +1845,7 @@ export function createGatewayServer({
             const speakStartReceivedAt = now();
             if (!floorController) throw new Error("FLOOR_UNAVAILABLE");
             const state = hostSessions.get(claims.sessionId);
-            if (!state || state.isDetaching) {
+            if (!state || state.isDetaching || state.isDraining) {
               sendJson(webSocket, {
                 type: "error",
                 code: "SESSION_NOT_STARTED",
@@ -1783,10 +1895,18 @@ export function createGatewayServer({
               sendJson(webSocket, { type: "error", code, message: gatewayMessage(code) });
               return;
             }
+            if (hostSessions.get(claims.sessionId) !== state || state.isDetaching || state.isDraining) {
+              await floorController.release(claims.sessionId, claims.grantId).catch(() => undefined);
+              sendJson(webSocket, { type: "error", sessionId: claims.sessionId, code: "MEDIA_DRAINING", message: gatewayMessage("MEDIA_DRAINING") }); return;
+            }
             const participantId = typeof result.participantId === "string" && result.participantId
               ? result.participantId
               : claims.grantId;
             const profile = await lookupParticipantProfile(claims.sessionId, participantId);
+            if (hostSessions.get(claims.sessionId) !== state || state.isDetaching || state.isDraining) {
+              await floorController.release(claims.sessionId, claims.grantId).catch(() => undefined);
+              sendJson(webSocket, { type: "error", sessionId: claims.sessionId, code: "MEDIA_DRAINING", message: gatewayMessage("MEDIA_DRAINING") }); return;
+            }
             const previous = floorHolders.get(claims.sessionId);
             const holder = {
               webSocket,
@@ -1972,7 +2092,8 @@ export function createGatewayServer({
           if (currentReplayGeneration !== replayGeneration || viewerMetadata.get(webSocket) !== metadata) return;
           const buffered = metadata.replayBuffer ?? [];
           metadata.replayBuffer = null;
-          for (const { payload, serialized } of buffered) {
+          for (const { payload, serialized, canDeliver } of buffered) {
+            if (canDeliver && !canDeliver()) continue;
             if (payload.type === "caption" && Number.isFinite(payload.seq) && payload.seq <= replayedThroughSeq) continue;
             deliverSerializedEvent(webSocket, payload, serialized);
           }
@@ -2051,7 +2172,12 @@ export function createGatewayServer({
     subscriberCount(sessionId, language) {
       return viewerTopics.get(`${sessionId}:${language}`)?.size ?? 0;
     },
-    async broadcastEvent(sessionId, language, event) {
+    async broadcastEvent(sessionId, language, event, context = {}) {
+      // 2026-09-01 fix: An already committed old-generation response can finish
+      // after stop/replacement; retain its owner guard through auth and replay.
+      const canDeliver = event?.translationCapture != null
+        ? createMediaEventGuard(sessionId, context) : () => true;
+      if (!canDeliver()) return;
       const state = hostSessions.get(sessionId);
       if (state?.hostOutput.clientKind === "browser"
         && event?.type === "caption"
@@ -2060,20 +2186,20 @@ export function createGatewayServer({
         && state.settings.languages.includes(language)) {
         sendHostEvent(state.hostOutput, event, { isPublishedEvent: true });
       }
-      await deliverEvent(sessionId, language, event);
+      await deliverEvent(sessionId, language, event, canDeliver);
     },
     async broadcastSourceEvent(event, context = {}) {
-      if (!["source", "source-draft", "source-draft-clear"].includes(event?.type)
+      if (!["source", "source-draft", "source-draft-clear", "source-status"].includes(event?.type)
         || !UUID_PATTERN.test(String(event.sessionId ?? ""))) throw new Error("INVALID_SOURCE_EVENT");
+      if (event.type === "source-status" && (event.status !== "unavailable"
+        || event.code !== "SOURCE_RECORDING_UNAVAILABLE"
+        || Object.keys(event).some(key => !["type", "sessionId", "status", "code"].includes(key)))) {
+        throw new Error("INVALID_SOURCE_EVENT");
+      }
       const sessionId = event.sessionId;
       const serialized = serializeJson({ type: "live-event", payload: event });
       const owner = hostSessions.get(sessionId);
-      const canDeliver = () => owner && hostSessions.get(sessionId) === owner
-        && context.pipelineGeneration === owner.pipelineGeneration
-        && !owner.isDetaching && owner.pipeline.isPaused !== true
-        && (context.mediaFence == null
-          ? owner.demandEpoch === null
-          : owner.demandEpoch === context.mediaFence.epoch && demand?.ownerId === context.mediaFence.ownerId);
+      const canDeliver = createMediaEventGuard(sessionId, context);
       if (!canDeliver()) return;
       sendHostEvent(owner.hostOutput, event);
       // 2026-08-31 feat: 원문 구독은 언어별 번역 토픽과 분리하되 기존 참여자 권한을 재검증한다.
@@ -2138,6 +2264,7 @@ export function createGatewayServer({
       if (viewer.readyState !== WebSocket.OPEN) return;
       const metadata = viewerMetadata.get(viewer);
       if (!metadata || !await metadata.ensureAuthorized()) return;
+      if (viewerMetadata.get(viewer) !== metadata || metadata.sessionId !== sessionId || metadata.language !== language) return;
       if (viewer.readyState === WebSocket.OPEN) deliver(viewer);
     }));
   }
@@ -2238,6 +2365,8 @@ function fingerprintGatewaySettings(settings) {
 }
 
 function gatewayMessage(code) {
+  if (code === "MEDIA_DRAINING") return "원문 기록을 마무리하고 있습니다. 완료될 때까지 기다려 주세요.";
+  if (code === "MEDIA_DRAIN_FAILED" || code === "MEDIA_DRAIN_TIMEOUT") return "원문 기록을 마무리하지 못했습니다. 회의를 종료하지 않았습니다.";
   if (code === "GRANT_REVOKED") return "시청 권한이 만료되었거나 회수되었습니다.";
   if (code === "UNAUTHORIZED") return "게이트웨이 인증에 실패했습니다.";
   if (code === "TOKEN_EXPIRED") return "게이트웨이 인증이 만료되었습니다.";
@@ -2253,6 +2382,8 @@ function gatewayMessage(code) {
   if (code === "GRANT_INVALID") return "발언 권한이 확인되지 않았습니다. 다시 입장해 주세요.";
   if (code === "FLOOR_UNAVAILABLE") return "이 게이트웨이에서는 발언 기능을 사용할 수 없습니다.";
   if (code === "SESSION_NOT_STARTED") return "라이브 세션이 아직 시작되지 않았습니다.";
+  if (code === "ENGINE_KEY_MISSING") return "선택한 엔진의 API 키가 서버에 없습니다.";
+  if (code === "ENGINE_SELECTION_INVALID") return "선택한 자막 엔진 구성이 올바르지 않습니다.";
   if (code === "INVALID_ACTIVATION_KEY") return "라이브 시작 요청 식별자가 올바르지 않습니다.";
   if (code === "GATEWAY_READINESS_CONFLICT" || code === "GATEWAY_READINESS_FAILED"
     || code === "INVALID_GATEWAY_READINESS_INPUT" || code === "INVALID_GATEWAY_READINESS_RESPONSE") {
