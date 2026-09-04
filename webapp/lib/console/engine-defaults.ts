@@ -82,3 +82,13 @@ __onConsoleStoreSwapped(() => consoleSettingsCache.invalidate());
 export async function resolveEngineDefaults(): Promise<EngineSelection> {
   return readStoredEngineDefaults((await consoleSettingsCache.get()).engine);
 }
+
+/**
+ * Same, but a cold console outage (store configured yet unreachable, nothing memoized) yields the
+ * catalog default instead of throwing: engine defaults are advisory, and neither go-live
+ * (`/api/live-config`) nor session creation may be blocked by the console being down.
+ */
+export async function resolveEngineDefaultsOrFallback(): Promise<EngineSelection> {
+  try { return await resolveEngineDefaults(); }
+  catch { return readStoredEngineDefaults(null); }
+}

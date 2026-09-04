@@ -1,6 +1,7 @@
 import { NextRequest } from "next/server";
 
 import { SESSION_COOKIE, SESSION_TTL_SECONDS, createSessionToken } from "@/lib/session";
+import { consoleSettingsCache } from "@/lib/console/engine-defaults";
 import { apiError, apiSuccess } from "@/lib/security/api-response";
 import { BoundedJsonBodyError, readBoundedJsonBody } from "@/lib/security/bounded-json-body";
 import { readHostLoginConfig } from "@/lib/security/host-login-config";
@@ -43,6 +44,18 @@ export async function POST(request: NextRequest) {
     hostLoginConfig = readHostLoginConfig();
   } catch {
     return apiError("호스트 로그인 환경변수 설정이 올바르지 않습니다.", "HOST_LOGIN_CONFIG_INVALID", 503);
+  }
+
+  // Console switch (Plan B): an admin can turn the ADMIN_USER_IDS password login off. The memo
+  // falls open to "enabled" only when no console exists (no Supabase env); a cold outage of a
+  // configured store fails closed so a downed console never re-enables password login.
+  try {
+    const settings = await consoleSettingsCache.get();
+    if (!settings.legacyPasswordLoginEnabled) {
+      return apiError("비밀번호 로그인이 비활성화되었습니다. Google 또는 이메일 로그인을 사용해 주세요.", "LEGACY_LOGIN_DISABLED", 403);
+    }
+  } catch {
+    return apiError("로그인 보안 서비스를 사용할 수 없습니다.", "LOGIN_SECURITY_UNAVAILABLE", 503);
   }
 
   let body: unknown;

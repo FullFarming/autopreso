@@ -179,6 +179,7 @@ function loadRoute(name: "auth/session" | "logout" | "login", overrides: Record<
     "@/lib/security/csrf": { assertStrictOrigin },
     "@/lib/security/host-login-config": { readHostLoginConfig },
     "@/lib/auth/profile-status-cache": { assertHostApproved: statusCache.assertHostApproved },
+    "@/lib/console/engine-defaults": { consoleSettingsCache: { get: async () => ({ legacyPasswordLoginEnabled: true }), invalidate: () => undefined } },
     "@/lib/security/api-response": {
       apiSuccess: (data: unknown, init?: ResponseInit) => new TestResponse({ ok: true, data }, init?.status, init?.headers),
       apiError: (error: string, code: string, status: number, headers?: HeadersInit) => new TestResponse({ ok: false, error, code }, status, headers),
