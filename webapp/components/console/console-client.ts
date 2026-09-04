@@ -1,5 +1,6 @@
 import type { ApiResponse } from "@/lib/live-contract";
-import { CONSOLE_ERROR_MESSAGE_KEYS } from "@/lib/system-language/console-messages";
+// Relative on purpose: console-layout.test.ts imports this module under the node loader, which knows no `@/` alias.
+import { CONSOLE_ERROR_MESSAGE_KEYS } from "../../lib/system-language/console-messages";
 
 /** A `/api/console/*` failure envelope surfaced to the panels; `code` selects the console copy. */
 export class ConsoleRequestError extends Error {
@@ -26,6 +27,9 @@ export async function consoleFetch<T>(url: string, init: { method?: "GET" | "PAT
   });
   let payload: ApiResponse<T> | null = null;
   try { payload = await response.json() as ApiResponse<T>; } catch { payload = null; }
+  // The cookie is gone or expired (`HOST_AUTH_REQUIRED`): the server layout would redirect on the next
+  // navigation anyway, so do it now instead of leaving the operator with an inline error they cannot fix here.
+  if (response.status === 401 && typeof window !== "undefined") window.location.assign("/login");
   if (!payload || typeof payload !== "object") throw new ConsoleRequestError("invalid response", "INVALID_RESPONSE", response.status);
   if (!payload.ok) throw new ConsoleRequestError(payload.error, payload.code, response.status);
   return payload.data;

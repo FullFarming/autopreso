@@ -2,6 +2,8 @@
 // with a fixed `now` in console-model.test.ts, and the panels only render what these return.
 
 import type { EngineSelection } from "@/lib/console/engine-defaults";
+// Relative on purpose: the node test loader resolves no `@/` alias, and this is the module's only value import.
+import { CONSOLE_ERROR_MESSAGE_KEYS } from "../../lib/system-language/console-messages";
 
 export type ConsoleRange = "7d" | "30d" | "all";
 export type ProfileFilter = "pending" | "approved" | "rejected" | "disabled";
@@ -137,6 +139,18 @@ export function languageModeLabelKey(mode: string): string {
   return "자동 감지";
 }
 
+const DEPLOY_RESULT_LABEL_KEYS: Readonly<Record<string, string>> = Object.freeze({ switched: "전환됨", queued: "대기열", failed: "실패" });
+
+/** Per-session deploy outcome (spec §9). Anything the client does not recognise is shown as 실패 rather than a blank pill. */
+export function deployResultLabelKey(result: string): string {
+  return DEPLOY_RESULT_LABEL_KEYS[result] ?? "실패";
+}
+
+/** A known server code reads as console copy; an unknown gateway code stays verbatim so the operator can search for it. */
+export function deployCodeLabelKey(code: string): string {
+  return Object.hasOwn(CONSOLE_ERROR_MESSAGE_KEYS, code) ? CONSOLE_ERROR_MESSAGE_KEYS[code] : code;
+}
+
 export function emptyStateKey(filter: ProfileFilter): string {
   if (filter === "pending") return "대기 중인 가입이 없습니다.";
   if (filter === "approved") return "승인된 사용자가 없습니다.";
@@ -154,5 +168,6 @@ export function formatConsoleDate(value: string | null, locale: string): string 
   if (!value) return "";
   const time = Date.parse(value);
   if (!Number.isFinite(time)) return "";
-  return new Intl.DateTimeFormat(locale, { timeZone: "Asia/Seoul", year: "numeric", month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" }).format(new Date(time));
+  // Every console time is Seoul wall time regardless of the viewer's zone, so the zone is spelled out.
+  return new Intl.DateTimeFormat(locale, { timeZone: "Asia/Seoul", timeZoneName: "short", year: "numeric", month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" }).format(new Date(time));
 }

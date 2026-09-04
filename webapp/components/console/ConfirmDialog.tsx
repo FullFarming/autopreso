@@ -43,8 +43,16 @@ export function ConfirmDialog({ open, title, body, confirmLabel, busy = false, o
     if (!busy) onCancel();
   }
 
+  function handleClose() {
+    // Chromium ignores preventDefault() on a second Escape and closes the element anyway. If React
+    // still believes the dialog is open, `open && !dialog.open` never becomes true again and the
+    // dialog can never reopen - so any native close resyncs state, busy or not (the element is
+    // already gone; keeping the request's busy flag alive is the panel's job).
+    if (open) onCancel();
+  }
+
   return (
-    <dialog ref={dialogRef} className="console-dialog" aria-labelledby={titleId} onCancel={handleCancel}>
+    <dialog ref={dialogRef} className="console-dialog" aria-labelledby={titleId} onCancel={handleCancel} onClose={handleClose}>
       <h2 id={titleId}>{title}</h2>
       <div className="console-dialog-body">{body}</div>
       <div className="console-dialog-actions">

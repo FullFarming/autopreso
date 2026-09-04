@@ -1884,6 +1884,8 @@ input:focus-visible {
 .console-shell .live-host-rail nav a:focus-visible { outline: 2px solid var(--nova-system-default); outline-offset: 2px; }
 .console-badge { display: inline-grid; min-width: 24px; height: 24px; place-items: center; padding: 0 7px; border-radius: var(--nova-r-pill); background: var(--nova-status-error); color: var(--nova-web-text); font-size: 12px; font-weight: 600; line-height: 1; font-variant-numeric: tabular-nums; }
 .console-shell .live-host-rail nav a[aria-current="page"] .console-badge { background: var(--nova-web-text); color: var(--nova-web-action); }
+/* Text that belongs to an accessible name but not to the layout (the pending count inside the 사용자 link). */
+.console-sr-only { position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0; border: 0; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
 .console-rail-account { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .console-workspace { display: grid; gap: 20px; align-content: start; }
 .console-panel { display: grid; gap: 16px; }

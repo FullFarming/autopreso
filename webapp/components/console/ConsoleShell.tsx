@@ -45,7 +45,13 @@ export function ConsoleShell({ email, initialPendingCount, children }: { email: 
               return (
                 <Link key={item.href} href={item.href} aria-current={isCurrent ? "page" : undefined} className={isCurrent ? "is-current" : undefined}>
                   <span>{t(item.key)}</span>
-                  {badge !== null && <span className="console-badge" aria-label={t("대기 중인 가입 {count}건", { count: badge })}>{badge}</span>}
+                  {/* The count joins the Link's accessible name ("사용자, 대기 중인 가입 3건"); an aria-label on a plain span would be ignored. */}
+                  {badge !== null && (
+                    <>
+                      <span className="console-badge" aria-hidden="true">{badge}</span>
+                      <span className="console-sr-only">{t("대기 중인 가입 {count}건", { count: badge })}</span>
+                    </>
+                  )}
                 </Link>
               );
             })}

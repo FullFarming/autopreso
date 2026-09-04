@@ -11,6 +11,8 @@ import { ConfirmDialog } from "./ConfirmDialog";
 import { consoleErrorKey, consoleFetch } from "./console-client";
 import {
   countActiveSessions,
+  deployCodeLabelKey,
+  deployResultLabelKey,
   filterTranslationOptions,
   formatConsoleDate,
   isEngineDirty,
@@ -27,8 +29,6 @@ interface DeployResult { sessionId: string; result: "switched" | "queued" | "fai
 interface EnginePutResponse { engine: EngineSelection; results?: DeployResult[] }
 interface SettingsResponse { legacyPasswordLoginEnabled: boolean; warning?: string }
 interface SessionsResponse { sessions: { status: string }[] }
-
-const RESULT_LABEL_KEYS: Record<DeployResult["result"], string> = { switched: "전환됨", queued: "대기열", failed: "실패" };
 
 function entryKey(entry: Pick<ConsoleEngineCatalogEntry, "provider" | "model">): string {
   return `${entry.provider}/${entry.model}`;
@@ -108,7 +108,8 @@ export function EnginePanel() {
     setIsCounting(true);
     setDeployError(null);
     try {
-      const data = await consoleFetch<SessionsResponse>("/api/console/sessions?range=7d");
+      // A deploy switches every preparing/live session, however old - so count over the whole history.
+      const data = await consoleFetch<SessionsResponse>("/api/console/sessions?range=all");
       setActiveCount(countActiveSessions(data.sessions));
     } catch {
       // The count is advisory; the dialog still opens and says the number is unknown.
@@ -127,7 +128,6 @@ export function EnginePanel() {
     setResults(null);
     try {
       const data = await consoleFetch<EnginePutResponse>("/api/console/engine-defaults", { method: "PUT", body: { engine: draft } });
-      setIsConfirmOpen(false);
       setSaved(data.engine);
       setDraft(data.engine);
       if (Array.isArray(data.results)) setResults(data.results);
@@ -137,6 +137,8 @@ export function EnginePanel() {
     } catch (error) {
       setDeployError(consoleErrorKey(error, "엔진을 배포하지 못했습니다."));
     } finally {
+      // Close on failure as well, so the inline alert is not hidden behind the dialog backdrop.
+      setIsConfirmOpen(false);
       setIsDeploying(false);
     }
   }
@@ -147,12 +149,12 @@ export function EnginePanel() {
     setSettingsStatus(null);
     try {
       const data = await consoleFetch<SettingsResponse>("/api/console/settings", { method: "PUT", body: { legacyPasswordLoginEnabled: enabled } });
-      setIsLegacyConfirmOpen(false);
       setLegacyLogin(data.legacyPasswordLoginEnabled);
       setSettingsStatus(data.warning === "LEGACY_LOGIN_DISABLED_WARNING" ? "레거시 로그인이 꺼졌습니다. 비밀번호 로그인은 더 이상 동작하지 않습니다." : "설정을 저장했습니다.");
     } catch (error) {
       setSettingsError(consoleErrorKey(error, "설정을 저장하지 못했습니다."));
     } finally {
+      setIsLegacyConfirmOpen(false);
       setIsSavingSettings(false);
     }
   }
@@ -234,7 +236,8 @@ export function EnginePanel() {
         {deployError && <p className="live-error" role="alert">{t(deployError)}</p>}
         {deployStatus && <p className="console-status-line" role="status">{t(deployStatus)}</p>}
         {results && (
-          <div className="console-table-wrap">
+          // Announced like the "배포했습니다." line above: the operator hears the outcome either way.
+          <div className="console-table-wrap" role="status">
             <table className="console-table" aria-label={t("세션별 전환 결과")}>
               <caption>{t("세션별 전환 결과")}</caption>
               <thead>
@@ -247,9 +250,9 @@ export function EnginePanel() {
               <tbody>
                 {results.map((row) => (
                   <tr key={row.sessionId}>
-                    <td className="console-num">{row.sessionId}</td>
-                    <td><span className={`console-status console-result-${row.result}`}>{t(RESULT_LABEL_KEYS[row.result])}</span></td>
-                    <td>{row.code ?? "—"}</td>
+                    <td>{row.sessionId}</td>
+                    <td><span className={`console-status console-result-${row.result}`}>{t(deployResultLabelKey(row.result))}</span></td>
+                    <td>{row.code === undefined ? "—" : t(deployCodeLabelKey(row.code))}</td>
                   </tr>
                 ))}
               </tbody>
@@ -259,7 +262,7 @@ export function EnginePanel() {
         <ConfirmDialog
           open={isConfirmOpen}
           title={t("엔진 배포")}
-          body={<p>{t("진행 중인 세션 {count}개가 즉시 전환됩니다.", { count: activeCount === null ? "?" : activeCount })}</p>}
+          body={<p>{activeCount === null ? t("진행 중인 세션 수를 확인할 수 없습니다. 진행 중인 세션은 모두 즉시 전환됩니다.") : t("진행 중인 세션 {count}개가 즉시 전환됩니다.", { count: activeCount })}</p>}
           confirmLabel={t("배포")}
           busy={isDeploying}
           onCancel={() => setIsConfirmOpen(false)}

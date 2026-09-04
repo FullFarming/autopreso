@@ -64,11 +64,13 @@ export function UsersPanel() {
     try {
       await consoleFetch<{ id: string; status: string; role: string }>("/api/console/users", { method: "PATCH", body });
       setRejecting(null);
-      setDisableTarget(null);
       await loadProfiles(filter);
     } catch (error) {
       setRowErrors((current) => ({ ...current, [body.profileId]: consoleErrorKey(error, "변경하지 못했습니다.") }));
     } finally {
+      // Close the disable dialog on failure too: the row's inline alert would otherwise sit behind the
+      // modal backdrop. The reject form stays open on failure so the typed note is not lost.
+      setDisableTarget(null);
       setBusyId(null);
     }
   }
@@ -146,33 +148,34 @@ export function UsersPanel() {
       )}
       <div className="console-table-wrap" aria-busy={isLoading}>
         <table className="console-table console-users-table">
+          {/* Roles are explicit because the ≤767px card layout sets display: grid on rows and cells, which drops the implicit table semantics. */}
           <thead>
-            <tr>
-              <th scope="col">{t("이메일")}</th>
-              <th scope="col">{t("이름")}</th>
-              <th scope="col">{t("가입일")}</th>
-              <th scope="col">{t("상태")}</th>
-              <th scope="col">{t("역할")}</th>
-              <th scope="col">{t("마지막 로그인")}</th>
-              <th scope="col">{t("작업")}</th>
+            <tr role="row">
+              <th scope="col" role="columnheader">{t("이메일")}</th>
+              <th scope="col" role="columnheader">{t("이름")}</th>
+              <th scope="col" role="columnheader">{t("가입일")}</th>
+              <th scope="col" role="columnheader">{t("상태")}</th>
+              <th scope="col" role="columnheader">{t("역할")}</th>
+              <th scope="col" role="columnheader">{t("마지막 로그인")}</th>
+              <th scope="col" role="columnheader">{t("작업")}</th>
             </tr>
           </thead>
           <tbody>
             {!isLoading && !listError && profiles.length === 0 && (
-              <tr><td colSpan={7} className="console-empty">{t(emptyStateKey(filter))}</td></tr>
+              <tr role="row"><td role="cell" colSpan={7} className="console-empty">{t(emptyStateKey(filter))}</td></tr>
             )}
             {isLoading && profiles.length === 0 && (
-              <tr><td colSpan={7} className="console-empty" role="status">{t("불러오는 중…")}</td></tr>
+              <tr role="row"><td colSpan={7} className="console-empty" role="status">{t("불러오는 중…")}</td></tr>
             )}
             {profiles.map((row) => (
-              <tr key={row.id} aria-busy={busyId === row.id}>
-                <td data-label={t("이메일")}>{row.email}</td>
-                <td data-label={t("이름")}>{row.displayName ?? "—"}</td>
-                <td data-label={t("가입일")} className="console-num">{formatConsoleDate(row.createdAt, locale)}</td>
-                <td data-label={t("상태")}><span className={`console-status console-status-${row.status}`}>{t(statusLabelKey(row.status))}</span></td>
-                <td data-label={t("역할")}>{row.role === "admin" ? t("관리자") : t("호스트")}</td>
-                <td data-label={t("마지막 로그인")} className="console-num">{formatConsoleDate(row.lastLoginAt, locale) || t("없음")}</td>
-                <td data-label={t("작업")}>
+              <tr key={row.id} role="row" aria-busy={busyId === row.id}>
+                <td role="cell" data-label={t("이메일")}>{row.email}</td>
+                <td role="cell" data-label={t("이름")}>{row.displayName ?? "—"}</td>
+                <td role="cell" data-label={t("가입일")} className="console-num">{formatConsoleDate(row.createdAt, locale)}</td>
+                <td role="cell" data-label={t("상태")}><span className={`console-status console-status-${row.status}`}>{t(statusLabelKey(row.status))}</span></td>
+                <td role="cell" data-label={t("역할")}>{row.role === "admin" ? t("관리자") : t("호스트")}</td>
+                <td role="cell" data-label={t("마지막 로그인")} className="console-num">{formatConsoleDate(row.lastLoginAt, locale) || t("없음")}</td>
+                <td role="cell" data-label={t("작업")}>
                   {renderActions(row)}
                   {rowErrors[row.id] && <p className="console-row-error" role="alert">{t(rowErrors[row.id])}</p>}
                 </td>

@@ -54,6 +54,10 @@ const entries: readonly (readonly [string, string, string])[] = [
   ["사용자를 찾을 수 없습니다.", "User not found.", "ユーザーが見つかりません。"],
   ["관리자 권한이 필요합니다.", "Admin access is required.", "管理者権限が必要です。"],
   ["콘솔 저장소에 연결할 수 없습니다.", "The console store is unavailable.", "コンソールのデータベースに接続できません。"],
+  ["로그인이 만료되었습니다. 다시 로그인해 주세요.", "Your sign-in has expired. Please sign in again.", "ログインの有効期限が切れました。もう一度ログインしてください。"],
+  ["요청 출처를 확인할 수 없습니다. 페이지를 새로 고친 뒤 다시 시도하세요.", "The request origin could not be verified. Reload the page and try again.", "リクエストの送信元を確認できませんでした。ページを再読み込みして再試行してください。"],
+  ["요청 형식이 올바르지 않습니다.", "The request was not valid.", "リクエストの形式が正しくありません。"],
+  ["서버 응답을 해석할 수 없습니다.", "The server response could not be read.", "サーバーの応答を解釈できませんでした。"],
   ["없음", "None", "なし"],
   // Sessions
   ["세션 현황", "Session overview", "セッション概況"],
@@ -99,6 +103,7 @@ const entries: readonly (readonly [string, string, string])[] = [
   ["배포 중…", "Deploying…", "デプロイ中…"],
   ["엔진 배포", "Deploy engine", "エンジンをデプロイ"],
   ["진행 중인 세션 {count}개가 즉시 전환됩니다.", "{count} running sessions will switch immediately.", "進行中のセッション {count}件がすぐに切り替わります。"],
+  ["진행 중인 세션 수를 확인할 수 없습니다. 진행 중인 세션은 모두 즉시 전환됩니다.", "The number of running sessions could not be checked. Every running session will switch immediately.", "進行中のセッション数を確認できませんでした。進行中のセッションはすべてすぐに切り替わります。"],
   ["마지막 변경: {email} · {time}", "Last changed: {email} · {time}", "最終変更: {email} · {time}"],
   ["아직 배포한 적이 없습니다. 카탈로그 기본값이 적용됩니다.", "Never deployed yet. The catalog default applies.", "まだデプロイされていません。カタログの既定値が適用されます。"],
   ["배포했습니다.", "Deployed.", "デプロイしました。"],
@@ -139,4 +144,9 @@ export const CONSOLE_ERROR_MESSAGE_KEYS: Readonly<Record<string, string>> = Obje
   ADMIN_REQUIRED: "관리자 권한이 필요합니다.",
   CONSOLE_STORE_UNAVAILABLE: "콘솔 저장소에 연결할 수 없습니다.",
   ENGINE_INVALID: "지원하지 않는 엔진 조합입니다.",
+  // Guard and envelope codes shared with the rest of the host API (`lib/console/console-route.ts`).
+  HOST_AUTH_REQUIRED: "로그인이 만료되었습니다. 다시 로그인해 주세요.",
+  CSRF_REJECTED: "요청 출처를 확인할 수 없습니다. 페이지를 새로 고친 뒤 다시 시도하세요.",
+  INVALID_REQUEST: "요청 형식이 올바르지 않습니다.",
+  INVALID_RESPONSE: "서버 응답을 해석할 수 없습니다.",
 });
