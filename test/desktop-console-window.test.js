@@ -4,7 +4,9 @@ import { readFileSync } from "node:fs";
 import test from "node:test";
 import vm from "node:vm";
 import { classifyDesktopConsoleNavigation, openDesktopConsoleWindow } from "../electron/desktop-console-window.js";
-import { DEFAULT_ENGINE_SELECTION, engineSelectionKey, normalizeEngineSelection } from "../packages/caption-core/caption-engine-catalog.js";
+import { DEFAULT_ENGINE_SELECTION, normalizeEngineSelection } from "../packages/caption-core/caption-engine-catalog.js";
+import { GeminiModelSelectionError, migrateLegacyGeminiModelSelection, readGeminiSelectedModel } from "../packages/caption-core/gemini-model-catalog.js";
+import { resolveLiveCallLanguages } from "../src/subtitle-languages.js";
 import { MESSAGES } from "../public/subtitle-i18n.js";
 import { JA } from "../public/subtitle-i18n-ja.js";
 
@@ -167,96 +169,102 @@ test("main, preload, dashboard markup, and all three UI languages carry the cons
   for (const table of [MESSAGES.ko, MESSAGES.en, JA]) assert.equal(typeof table["settings.consoleOpenFailed"], "string");
 });
 
-// ── Global engine defaults seed a NEW Live Call (spec §6) ────────────────────
+// ── The admin's global engine is the ONLY Live Call engine (spec §9) ────────
+// The desktop `subtitle.engine` is local-captions-only: it never reaches the
+// `/api/live-sessions` body and the seed never writes into it.
 
 const globalDefault = normalizeEngineSelection({
   stt: { provider: "gemini", model: "gemini-3.5-transcribe-live", languageMode: "auto" },
   translation: { provider: "gemini", model: "gemini-3.6-flash" },
   summary: { provider: "gemini", model: "gemini-3.7-flash" },
 });
-const customised = normalizeEngineSelection({
-  stt: { provider: "gemini", model: "gemini-3.5-transcribe-live", languageMode: "auto" },
-  translation: { provider: "gemini", model: "gemini-3.7-flash" },
-  summary: { provider: "gemini", model: "gemini-3.6-flash" },
+const sonioxEngine = normalizeEngineSelection({
+  stt: { provider: "soniox", model: "stt-rt-v5", languageMode: "ko" },
+  translation: { provider: "soniox", model: "stt-rt-v5" },
+  summary: { provider: "gemini", model: "gemini-3.7-flash" },
 });
+const catalogDefaultPreferences = { source: DEFAULT_ENGINE_SELECTION.stt.model, summary: DEFAULT_ENGINE_SELECTION.summary.model };
+const plain = (value) => JSON.parse(JSON.stringify(value));
 
-/** @param {{ config?: { ok: boolean, code?: string, data?: Record<string, unknown> }, save?: (patch: unknown) => Promise<unknown> }} [options] */
-function seedHarness({ config = { ok: true, data: { gatewayUrl: "wss://gw.example.test", engineDefaults: globalDefault } }, save = async (patch) => patch } = {}) {
-  const calls = { api: [], saves: [] };
-  const context = {
-    engineSelectionKey, normalizeEngineSelection, URL,
-    liveCallApi: async (baseUrl, pathname, options) => { calls.api.push({ baseUrl, pathname, options }); return config; },
+function liveCallContext(extra = {}) {
+  return {
+    DEFAULT_ENGINE_SELECTION, normalizeEngineSelection, URL,
+    GeminiModelSelectionError, migrateLegacyGeminiModelSelection, readGeminiSelectedModel,
+    resolveLiveCallLanguages, LIVE_DRAFT_LANGUAGES: new Set(["ko", "en", "ja"]),
+    sanitizeLiveCallGlossaries: (value) => value ?? [], sanitizeLiveCaptionDisplayLanguage: () => "all",
     console: { warn: () => {} },
+    ...extra,
   };
-  const seed = vm.runInNewContext(`${section("async function seedLiveCallEngineDefaults", "async function openLiveStageOverlay")}\nseedLiveCallEngineDefaults`, context);
-  const settingsStore = { save: async (patch) => { calls.saves.push(patch); return save(patch); } };
-  return { calls, seed: (subtitle) => seed(origin, settingsStore, subtitle) };
+}
+const modelHelpers = section("function readLiveCallModelPreferences", "function pinLiveCallModelSettings");
+const liveCallBuilders = section("function sanitizeLiveCallDraft", "async function openLiveStageOverlay");
+
+/** @param {{ config?: { ok: boolean, code?: string, data?: Record<string, unknown> } }} [options] */
+function seedHarness({ config = { ok: true, data: { gatewayUrl: "wss://gw.example.test", engineDefaults: globalDefault } } } = {}) {
+  const calls = { api: [], saves: [] };
+  const context = liveCallContext({
+    liveCallApi: async (baseUrl, pathname, options) => { calls.api.push({ baseUrl, pathname, options }); return config; },
+    settingsStore: { save: async (patch) => { calls.saves.push(patch); return patch; } },
+  });
+  const seed = vm.runInNewContext(`${modelHelpers}\n${liveCallBuilders}\nseedLiveCallEngineDefaults`, context);
+  return { calls, seed: () => seed(origin) };
 }
 
-test("a host still on the last global default follows the new global default and remembers it", async () => {
+test("a new Live Call takes its engine from the admin's global default published by /api/live-config", async () => {
   const h = seedHarness();
-  const subtitle = { engine: DEFAULT_ENGINE_SELECTION, translationLanguages: ["ko", "en"], tone: "business" };
-  const seeded = await h.seed(subtitle);
-  assert.equal(h.calls.api[0].pathname, "/api/live-config");
-  assert.equal(h.calls.api[0].options.method, "GET");
-  assert.equal(engineSelectionKey(seeded.engine), engineSelectionKey(globalDefault));
-  assert.equal(engineSelectionKey(seeded.engineDefaultsSeen), engineSelectionKey(globalDefault));
-  assert.equal(seeded.tone, "business", "unrelated subtitle settings pass through");
-  assert.deepEqual(JSON.parse(JSON.stringify(h.calls.saves)), JSON.parse(JSON.stringify([{ subtitle: { engine: globalDefault, engineDefaultsSeen: globalDefault } }])));
-  assert.equal(subtitle.engine, DEFAULT_ENGINE_SELECTION, "the caller's settings object is not mutated");
-  // Next call: local == seen == global, nothing to persist again.
-  const again = seedHarness();
-  await again.seed({ engine: globalDefault, engineDefaultsSeen: globalDefault });
-  assert.deepEqual(again.calls.saves, []);
+  const preferences = await h.seed();
+  assert.deepEqual(h.calls.api.map((call) => [call.baseUrl, call.pathname, call.options.method]), [[origin, "/api/live-config", "GET"]]);
+  assert.deepEqual(plain(preferences), { source: "gemini-3.5-transcribe-live", summary: "gemini-3.7-flash" });
+  // A Soniox global STT has no Gemini source model to name yet (the gateway's
+  // Soniox lane is Plan 2); the catalog default source stands in, the summary
+  // still follows the admin.
+  const soniox = seedHarness({ config: { ok: true, data: { gatewayUrl: "wss://gw.example.test", engineDefaults: sonioxEngine } } });
+  assert.deepEqual(plain(await soniox.seed()), { source: DEFAULT_ENGINE_SELECTION.stt.model, summary: "gemini-3.7-flash" });
 });
 
-test("a host who customised the engine away from the last global default keeps the local selection", async () => {
-  const h = seedHarness();
-  const subtitle = { engine: customised, engineDefaultsSeen: DEFAULT_ENGINE_SELECTION };
-  const seeded = await h.seed(subtitle);
-  assert.equal(seeded, subtitle);
-  assert.deepEqual(h.calls.saves, []);
-  const never = seedHarness();
-  const unseen = { engine: customised };
-  assert.equal(await never.seed(unseen), unseen, "no recorded default: the catalog default stands in for the previous global default");
-  assert.deepEqual(never.calls.saves, []);
-});
-
-test("a missing, invalid, or unreachable global default leaves the local selection alone", async () => {
-  const subtitle = { engine: DEFAULT_ENGINE_SELECTION };
+test("an absent, invalid, or unreachable global default falls back to the catalog default — never to the local caption engine", async () => {
   for (const config of [
     { ok: true, data: { gatewayUrl: "wss://gw.example.test" } },
     { ok: true, data: { gatewayUrl: "wss://gw.example.test", engineDefaults: null } },
     { ok: true, data: { gatewayUrl: "wss://gw.example.test", engineDefaults: { stt: { provider: "nope", model: "x", languageMode: "auto" } } } },
     { ok: true, data: { gatewayUrl: "wss://gw.example.test", engineDefaults: "gemini" } },
+    { ok: true, data: { gatewayUrl: "wss://gw.example.test", engineDefaults: [] } },
+    { ok: true, data: null },
     { ok: false, code: "NETWORK_UNAVAILABLE" },
     { ok: false, code: "HOST_LOGIN_REQUIRED" },
   ]) {
     const h = seedHarness({ config });
-    assert.equal(await h.seed(subtitle), subtitle, JSON.stringify(config));
-    assert.deepEqual(h.calls.saves, []);
+    assert.deepEqual(plain(await h.seed()), catalogDefaultPreferences, JSON.stringify(config));
   }
+  const seedSource = section("async function seedLiveCallEngineDefaults", "async function openLiveStageOverlay");
+  assert.doesNotMatch(seedSource, /subtitle|settingsStore|engineDefaultsSeen|\.save\(/u, "the seed reads no local settings and persists nothing");
+  assert.match(seedSource, /DEFAULT_ENGINE_SELECTION/u);
 });
 
-test("a global default the local store refuses is not adopted", async () => {
-  const h = seedHarness({ save: async () => { throw new Error("지원하지 않는 엔진 조합입니다."); } });
-  const subtitle = { engine: DEFAULT_ENGINE_SELECTION, translationLanguages: ["ko", "en", "ja"] };
-  assert.equal(await h.seed(subtitle), subtitle);
-  assert.equal(h.calls.saves.length, 1);
+test("the local caption engine never reaches the Live Call body: a Soniox subtitle.engine still submits the admin engine", () => {
+  const build = vm.runInNewContext(`${modelHelpers}\n${liveCallBuilders}\n(draft, subtitle, preferences) => toLiveCallApiInput(sanitizeLiveCallDraft(draft, subtitle, preferences))`, liveCallContext());
+  const adminPreferences = { source: "gemini-3.5-transcribe-live", summary: "gemini-3.7-flash" };
+  const localSoniox = Object.freeze({ engine: sonioxEngine, translationLanguages: ["ko", "en"] });
+  assert.deepEqual(plain(build({ title: "Synthetic", modelPreferences: { source: "untrusted", summary: "untrusted" } }, localSoniox, adminPreferences).modelPreferences), adminPreferences);
+  const localCustomised = { engine: globalDefault, translationLanguages: ["ko", "en"] };
+  assert.deepEqual(plain(build({}, localCustomised, catalogDefaultPreferences).modelPreferences), catalogDefaultPreferences,
+    "a customised local summary model does not leak into the body when the admin engine is the catalog default");
+  assert.deepEqual(plain(build({}, localCustomised, undefined).modelPreferences), catalogDefaultPreferences, "no seeded engine → catalog default");
+  assert.equal(localCustomised.engine, globalDefault, "sanitizing never rewrites the local engine");
+  assert.doesNotMatch(section("function sanitizeLiveCallDraft", "function toLiveCallApiInput"), /subtitleSettings\.engine|readGeminiSelectedModel/u);
 });
 
-test("both desktop create paths seed from the global default before the draft is built, and running sessions are untouched", () => {
+test("both desktop create paths log in, seed from the global default, then build the draft with the seeded engine; the local engine and running sessions are untouched", () => {
   for (const [start, end] of [['  ipcMain.handle("live-call:start"', "  async function armPreparedLiveSession"], ['  ipcMain.handle("live-call:register"', '  ipcMain.handle("live-call:list-registered"']]) {
     const handler = section(start, end);
     const login = handler.indexOf("const login = await ensureDesktopHostSession(liveWorkspaceUrl)");
-    const seed = handler.indexOf("await seedLiveCallEngineDefaults(liveWorkspaceUrl, settingsStore, savedSettings?.subtitle)");
-    const draft = handler.indexOf("sanitizeLiveCallDraft(draft, ");
-    assert.ok(login >= 0 && login < seed && seed < draft, `${start} must log in, seed, then sanitize`);
+    const seed = handler.indexOf("const modelPreferences = await seedLiveCallEngineDefaults(liveWorkspaceUrl)");
+    const draft = handler.indexOf("sanitizeLiveCallDraft(draft, savedSettings?.subtitle, modelPreferences)");
+    assert.ok(login >= 0 && login < seed && seed < draft, `${start} must log in, seed, then sanitize with the seeded engine`);
+    assert.doesNotMatch(handler, /settingsStore\.save|engineDefaultsSeen/u, `${start} never writes into subtitle.engine`);
   }
-  const seedSource = section("async function seedLiveCallEngineDefaults", "async function openLiveStageOverlay");
-  assert.match(seedSource, /engineDefaultsSeen/u);
-  assert.match(seedSource, /liveCallApi\(baseUrl, "\/api\/live-config", \{ method: "GET" \}\)/u);
+  assert.doesNotMatch(main, /engineDefaultsSeen|engineSelectionKey/u);
   for (const untouched of [section("  async function armPreparedLiveSession", "  // Pre-registration:"), section("async function requestDesktopLiveStartIntent", "async function startDesktopLiveDemand")]) {
-    assert.doesNotMatch(untouched, /seedLiveCallEngineDefaults|engineDefaultsSeen/u);
+    assert.doesNotMatch(untouched, /seedLiveCallEngineDefaults/u);
   }
 });

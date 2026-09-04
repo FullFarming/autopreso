@@ -1031,28 +1031,28 @@ test("load repairs a stored combined engine that no longer matches the caption-l
   assert.equal(after.subtitle.tone, "business");
 });
 
-// Plan B Task 5: the console's global engine default is remembered as
-// `subtitle.engineDefaultsSeen` so a new Live Call can tell "the host still
-// follows the global default" from "the host customised the engine".
-test("subtitle.engineDefaultsSeen is optional, normalized on save, and dropped when the stored value is unusable", async () => {
+// Spec §9 (2026-09-04): the Live Call engine is the admin's global value; the
+// desktop never remembers it. A `subtitle.engineDefaultsSeen` that 852c486
+// left on disk is dropped like any other retired key, and a save that still
+// carries it persists nothing under that name.
+test("subtitle.engineDefaultsSeen is a retired key: dropped on load and never persisted by save", async () => {
   const filePath = await tempPath();
   const store = createSettingsStore({ filePath, env: {}, readCodexAuth: noCodexAuth });
-  assert.equal((await store.load()).subtitle.engineDefaultsSeen, undefined);
+  const initial = await store.save({ subtitle: { tone: "business" } });
   const seen = {
     stt: { provider: "gemini", model: "gemini-3.5-transcribe-live", languageMode: "auto" },
     translation: { provider: "gemini", model: "gemini-3.6-flash" },
     summary: { provider: "gemini", model: "gemini-3.7-flash" },
   };
-  await store.save({ subtitle: { engineDefaultsSeen: seen } });
-  const reloaded = await createSettingsStore({ filePath, env: {}, readCodexAuth: noCodexAuth }).load();
-  assert.deepEqual(reloaded.subtitle.engineDefaultsSeen, seen);
-  assert.equal(reloaded.subtitle.engine.summary.model, "gemini-3.6-flash", "remembering a default never changes the active engine");
-  await assert.rejects(store.save({ subtitle: { engineDefaultsSeen: { stt: { provider: "nope", model: "x", languageMode: "auto" } } } }), /엔진 조합/u);
-  assert.throws(() => validateSubtitleSettings({ engineDefaultsSeen: [] }), /엔진 조합/u);
   const onDisk = JSON.parse(await fs.readFile(filePath, "utf8"));
-  onDisk.subtitle.engineDefaultsSeen = { summary: { provider: "gemini", model: "retired-model" } };
+  onDisk.subtitle.engineDefaultsSeen = seen;
   await fs.writeFile(filePath, JSON.stringify(onDisk));
-  const repaired = await createSettingsStore({ filePath, env: {}, readCodexAuth: noCodexAuth }).load();
-  assert.equal(repaired.subtitle.engineDefaultsSeen, undefined);
-  assert.equal(repaired.subtitle.engine.stt.model, "gemini-3.5-transcribe-live");
+  const reloaded = await createSettingsStore({ filePath, env: {}, readCodexAuth: noCodexAuth }).load();
+  assert.equal(reloaded.subtitle.engineDefaultsSeen, undefined);
+  assert.deepEqual(reloaded.subtitle.engine, initial.subtitle.engine, "dropping the retired key never touches the local caption engine");
+  const saved = await store.save({ subtitle: { engineDefaultsSeen: seen, tone: "natural" } });
+  assert.equal(saved.subtitle.engineDefaultsSeen, undefined);
+  assert.equal(saved.subtitle.tone, "natural");
+  assert.equal(JSON.parse(await fs.readFile(filePath, "utf8")).subtitle.engineDefaultsSeen, undefined);
+  assert.equal(validateSubtitleSettings({ engineDefaultsSeen: [] }), undefined, "no validation branch is left behind for the retired key");
 });

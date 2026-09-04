@@ -23,9 +23,9 @@ function context(overrides = {}) {
     validateSubtitleSettings: () => {}, console: { warn: () => {} }, ...overrides,
   };
 }
-function draftInput(draft, subtitleSettings) {
-  const build = vm.runInNewContext(`${helpers}\n${section("function sanitizeLiveCallDraft", "async function openLiveStageOverlay")}\n(draft, saved) => toLiveCallApiInput(sanitizeLiveCallDraft(draft, saved))`, context());
-  return build(draft, subtitleSettings);
+function draftInput(draft, subtitleSettings, seededPreferences) {
+  const build = vm.runInNewContext(`${helpers}\n${section("function sanitizeLiveCallDraft", "async function openLiveStageOverlay")}\n(draft, saved, seeded) => toLiveCallApiInput(sanitizeLiveCallDraft(draft, saved, seeded))`, context());
+  return build(draft, subtitleSettings, seededPreferences);
 }
 // Historical DB metadata: values the current role contract no longer offers,
 // which must migrate to the fixed runtime roles rather than being replayed.
@@ -37,6 +37,9 @@ const geminiEngine = (sttModel, summaryModel) => ({
 });
 const localSettings = { engine: geminiEngine("gemini-3.5-transcribe-live", "gemini-3.7-flash"), translationLanguages: ["ko", "en"] };
 const runtimePreferences = { source: "gemini-3.5-transcribe-live", summary: "gemini-3.6-flash" };
+// Spec §9: the admin's global engine (seeded from /api/live-config) is the only
+// Live Call engine; the local subtitle.engine is local-captions-only.
+const adminPreferences = { source: "gemini-3.5-transcribe-live", summary: "gemini-3.7-flash" };
 function assertModels(config, expected = runtimePreferences) {
   assert.equal(config.models.transcription, expected.source);
   assert.equal(config.models.summary, expected.summary);
@@ -45,30 +48,29 @@ function assertModels(config, expected = runtimePreferences) {
   assert.equal(config.engine.summary.model, expected.summary);
 }
 
-test("new desktop Live Call ignores renderer model preferences and submits the fixed saved roles", () => {
+test("new desktop Live Call ignores renderer model preferences and submits the seeded admin engine", () => {
   const input = draftInput({ title: "Synthetic meeting", modelPreferences: { source: "untrusted", summary: "untrusted" } }, {
     ...localSettings, engine: geminiEngine(runtimePreferences.source, runtimePreferences.summary),
-  });
-  assert.deepEqual(JSON.parse(JSON.stringify(input.modelPreferences)), runtimePreferences);
+  }, adminPreferences);
+  assert.deepEqual(JSON.parse(JSON.stringify(input.modelPreferences)), adminPreferences);
   assert.equal(input.outputMode, undefined);
 });
 
-test("new desktop Live Call defaults absent selections and rejects a persisted unknown engine", () => {
+test("new desktop Live Call defaults an absent seed to the catalog default and rejects a malformed seed", () => {
   const input = draftInput({}, {});
   assert.deepEqual(JSON.parse(JSON.stringify(input.modelPreferences)), runtimePreferences);
-  assert.throws(() => draftInput({}, { engine: geminiEngine("gemini-3.5-transcribe-live", "gemini-unknown") }),
-    { code: "INVALID_GEMINI_MODEL_SELECTION" });
+  assert.throws(() => draftInput({}, localSettings, { source: "gemini-3.5-transcribe-live" }), { code: "INVALID_GEMINI_MODEL_SELECTION" });
 });
 
-test("a Soniox desktop engine pins the Live Call to the Gemini default the gateway can run", () => {
+test("the local desktop engine — Soniox or a customised Gemini summary — never changes the Live Call body", () => {
   const soniox = {
     stt: { provider: "soniox", model: "stt-rt-v5", languageMode: "ko" },
     translation: { provider: "soniox", model: "stt-rt-v5" },
     summary: { provider: "gemini", model: "gemini-3.7-flash" },
   };
-  const input = draftInput({}, { ...localSettings, engine: soniox });
-  assert.deepEqual(JSON.parse(JSON.stringify(input.modelPreferences)),
-    { source: runtimePreferences.source, summary: "gemini-3.7-flash" });
+  assert.deepEqual(JSON.parse(JSON.stringify(draftInput({}, { ...localSettings, engine: soniox }, runtimePreferences).modelPreferences)), runtimePreferences);
+  assert.deepEqual(JSON.parse(JSON.stringify(draftInput({}, localSettings, runtimePreferences).modelPreferences)), runtimePreferences,
+    "a local gemini-3.7-flash summary does not leak into a Live Call whose admin engine summarises with gemini-3.6-flash");
 });
 
 test("GoLive preflight migrates known session preferences without rewriting metadata or local aliases", async () => {

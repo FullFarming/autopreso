@@ -8,7 +8,6 @@ import { MAX_TRANSLATION_LANGUAGES, isSupportedSubtitleLanguage } from "./subtit
 import {
   DEFAULT_ENGINE_SELECTION,
   ENGINE_ROLES,
-  EngineSelectionError,
   engineSelectionKey,
   migrateLegacyEngineSelection,
   normalizeEngineSelection,
@@ -414,18 +413,9 @@ function migrateSettings(settings, { strictEngine = false } = {}) {
     }
   }
   settings.subtitle.engine = engine;
-  // `engineDefaultsSeen` is advisory: an unusable stored value is dropped (the
-  // desktop then treats the catalog default as the last global default), never
-  // repaired into something the console did not publish.
-  if (settings.subtitle.engineDefaultsSeen !== undefined) {
-    try {
-      if (!isPlainObject(settings.subtitle.engineDefaultsSeen)) throw new EngineSelectionError();
-      settings.subtitle.engineDefaultsSeen = normalizeEngineSelection(settings.subtitle.engineDefaultsSeen);
-    } catch {
-      delete settings.subtitle.engineDefaultsSeen;
-    }
-  }
-  for (const retiredKey of ["geminiTranscribeModel", "geminiSummaryModel", "geminiPolishModel", "audioLanguage", "audioVolume", "voiceProvider", "model", "geminiModel"]) {
+  // `engineDefaultsSeen` (852c486) is retired by spec §9: the Live Call engine
+  // is the admin's global value and the desktop never remembers it.
+  for (const retiredKey of ["geminiTranscribeModel", "geminiSummaryModel", "geminiPolishModel", "audioLanguage", "audioVolume", "voiceProvider", "model", "geminiModel", "engineDefaultsSeen"]) {
     delete settings.subtitle[retiredKey];
   }
   if (settings.subtitle?.tonePolishModel === "gpt-4o-mini") {
@@ -732,13 +722,6 @@ export function validateSubtitleSettings(value) {
     if (value[legacy] !== undefined) throw new Error("Subtitle model fields moved to subtitle.engine.");
   }
   if (value.engine !== undefined) normalizeEngineSelection(value.engine);
-  // The last console-wide engine default this desktop adopted (Plan B spec §6).
-  // Optional; `null` clears it. Same catalog shape as `engine`, validated the
-  // same way so a stale or foreign value can never be mistaken for a default.
-  if (value.engineDefaultsSeen !== undefined && value.engineDefaultsSeen !== null) {
-    if (!isPlainObject(value.engineDefaultsSeen)) throw new EngineSelectionError();
-    normalizeEngineSelection(value.engineDefaultsSeen);
-  }
   if (value.tonePolishModel !== undefined && typeof value.tonePolishModel !== "string") {
     throw new Error("Subtitle tonePolishModel must be a string.");
   }

@@ -31,8 +31,8 @@ import {
   geminiCaptionConfigFingerprint,
 } from "../packages/caption-core/index.js";
 import { createLiveCallArchive, readLiveArchiveSessionId } from "../src/live-call-archive.js";
-import { GeminiModelSelectionError, readGeminiSelectedModel, migrateLegacyGeminiModelSelection } from "../packages/caption-core/gemini-model-catalog.js";
-import { engineSelectionKey, normalizeEngineSelection } from "../packages/caption-core/caption-engine-catalog.js";
+import { GeminiModelSelectionError, migrateLegacyGeminiModelSelection } from "../packages/caption-core/gemini-model-catalog.js";
+import { DEFAULT_ENGINE_SELECTION, normalizeEngineSelection } from "../packages/caption-core/caption-engine-catalog.js";
 import { registerLiveInterpreterIpc, resolveLiveInterpreterEnabled } from "./live-interpreter-ipc.js";
 import { registerMeetingCoachIpc } from "./meeting-coach-ipc.js";
 import { createDesktopLiveDemandController } from "./live-demand-controller.js";
@@ -1174,7 +1174,7 @@ function pinLiveCallModelSettings(settings, modelPreferences) {
   };
 }
 
-function sanitizeLiveCallDraft(draft, subtitleSettings = {}) {
+function sanitizeLiveCallDraft(draft, subtitleSettings = {}, modelPreferences = undefined) {
   const source = draft && typeof draft === "object" ? draft : {};
   const title = typeof source.title === "string" && source.title.trim()
     ? source.title.trim().slice(0, 100)
@@ -1196,13 +1196,12 @@ function sanitizeLiveCallDraft(draft, subtitleSettings = {}) {
     title,
     scheduledAt,
     sessionType: "meeting",
-    // A Soniox STT selection pins the Live Call to the Gemini default: the
-    // deployed gateway has no Soniox lane until Plan 2.
-    modelPreferences: readLiveCallModelPreferences({
-      source: readGeminiSelectedModel("source", subtitleSettings.engine?.stt?.provider === "gemini"
-        ? subtitleSettings.engine.stt.model : undefined),
-      summary: readGeminiSelectedModel("summary", subtitleSettings.engine?.summary?.model),
-    }),
+    // Spec §9: the Live Call engine is the admin's global default, seeded by
+    // `seedLiveCallEngineDefaults`. The local `subtitle.engine` is
+    // local-captions-only and never reaches this body; with no seed the
+    // catalog default applies (the server overwrites it with the global value
+    // anyway).
+    modelPreferences: readLiveCallModelPreferences(modelPreferences),
     outputMode: "captions",
     // The webapp schema is .strict() and glossaryPack is REQUIRED — omitting
     // it turns every create into a 400.
@@ -1230,40 +1229,31 @@ function toLiveCallApiInput(config) {
   };
 }
 
-// Global engine defaults (Plan B spec §6). The console publishes one
-// catalog-normalized engine selection through `/api/live-config`; a NEW Live
-// Call follows it for as long as the host has not customised the engine away
-// from the last global default this desktop adopted (`engineDefaultsSeen`).
-// With nothing recorded yet, the catalog default stands in for "the previous
-// global default", so a never-customised install follows the console and a
-// host who already picked their own models keeps them. Adoption moves both
-// `engine` and `engineDefaultsSeen`, which is what keeps the two equal for the
-// next comparison. The write goes through the settings store only: a running
-// caption session is never restarted from here (hot swap is Plan 2), and a
-// store that refuses the default (unusable combo, missing key) means the local
-// selection stays. Never throws — a console outage must not block go-live.
-async function seedLiveCallEngineDefaults(baseUrl, settingsStore, subtitleSettings) {
-  const configResult = await liveCallApi(baseUrl, "/api/live-config", { method: "GET" });
-  const published = configResult.ok ? configResult.data?.engineDefaults : undefined;
-  if (published === undefined || published === null || typeof published !== "object") return subtitleSettings;
-  let engineDefaults;
-  let followsGlobalDefault;
+// Global engine defaults (spec §9, 2026-09-04): the console's engine is the
+// ONLY Live Call engine. A NEW Live Call is created with the model preferences
+// derived from `/api/live-config.engineDefaults`; the desktop `subtitle.engine`
+// is local-captions-only and is neither read here nor written. When the
+// workspace is unreachable or publishes nothing usable, the catalog default
+// stands in (the server overwrites a non-admin `modelPreferences.engine` with
+// the global value anyway). Never throws — a console outage must not block
+// go-live.
+async function seedLiveCallEngineDefaults(baseUrl) {
+  let engineDefaults = DEFAULT_ENGINE_SELECTION;
   try {
-    engineDefaults = normalizeEngineSelection(published);
-    followsGlobalDefault = engineSelectionKey(subtitleSettings?.engine) === engineSelectionKey(subtitleSettings?.engineDefaultsSeen);
-    if (!followsGlobalDefault) return subtitleSettings;
-    if (engineSelectionKey(subtitleSettings?.engineDefaultsSeen) === engineSelectionKey(engineDefaults)
-      && engineSelectionKey(subtitleSettings?.engine) === engineSelectionKey(engineDefaults)) return subtitleSettings;
-  } catch {
-    return subtitleSettings;
-  }
-  try {
-    await settingsStore.save({ subtitle: { engine: engineDefaults, engineDefaultsSeen: engineDefaults } });
+    const configResult = await liveCallApi(baseUrl, "/api/live-config", { method: "GET" });
+    const published = configResult.ok ? configResult.data?.engineDefaults : undefined;
+    if (published && typeof published === "object" && !Array.isArray(published)) engineDefaults = normalizeEngineSelection(published);
   } catch (error) {
-    console.warn(`[live] global engine default not adopted: ${error?.message ?? error}`);
-    return subtitleSettings;
+    console.warn(`[live] global engine default unusable, using the catalog default: ${error?.message ?? error}`);
+    engineDefaults = DEFAULT_ENGINE_SELECTION;
   }
-  return { ...subtitleSettings, engine: engineDefaults, engineDefaultsSeen: engineDefaults };
+  // Until Plan 2 the gateway runs Gemini only, so a Soniox global STT has no
+  // source model to name here; the catalog default source stands in and the
+  // summary still follows the admin.
+  return readLiveCallModelPreferences({
+    source: engineDefaults.stt.provider === "gemini" ? engineDefaults.stt.model : DEFAULT_ENGINE_SELECTION.stt.model,
+    summary: engineDefaults.summary.model,
+  });
 }
 
 async function openLiveStageOverlay(baseUrl, sessionId, invite) {
@@ -3143,8 +3133,8 @@ function registerOverlayIpc(settingsStore, { localAppOrigin, liveWorkspaceUrl, l
     if (!login.ok) {
       return login;
     }
-    const seededSubtitle = await seedLiveCallEngineDefaults(liveWorkspaceUrl, settingsStore, savedSettings?.subtitle);
-    const input = sanitizeLiveCallDraft(draft, seededSubtitle);
+    const modelPreferences = await seedLiveCallEngineDefaults(liveWorkspaceUrl);
+    const input = sanitizeLiveCallDraft(draft, savedSettings?.subtitle, modelPreferences);
     const created = await liveCallApi(liveWorkspaceUrl, "/api/live-sessions", { body: toLiveCallApiInput(input) });
     if (!created.ok) return created;
     const sessionData = created.data;
@@ -3284,8 +3274,8 @@ function registerOverlayIpc(settingsStore, { localAppOrigin, liveWorkspaceUrl, l
       if (!login.ok) {
         return login;
       }
-      const seededSubtitle = await seedLiveCallEngineDefaults(liveWorkspaceUrl, settingsStore, savedSettings?.subtitle);
-      const input = sanitizeLiveCallDraft(draft, seededSubtitle);
+      const modelPreferences = await seedLiveCallEngineDefaults(liveWorkspaceUrl);
+      const input = sanitizeLiveCallDraft(draft, savedSettings?.subtitle, modelPreferences);
       const created = await liveCallApi(liveWorkspaceUrl, "/api/live-sessions", { body: toLiveCallApiInput(input) });
       if (!created.ok) return created;
       const sessionData = created.data;
