@@ -137,3 +137,48 @@ test("getConsoleStore returns one module singleton and the test seam swaps it", 
   assert.notEqual(real, fake);
   assert.equal(getConsoleStore(), real);
 });
+
+test("listActiveSessions posts {} to list_live_session_ids_admin_v1 and maps id/status/languages", async () => {
+  const { store, calls } = storeWith(() => json([
+    { id: SESSION, status: "live", languages: ["ko", "en"] },
+    { id: TARGET, status: "preparing", languages: ["ja"] },
+  ]));
+  assert.deepEqual(await store.listActiveSessions(), [
+    { id: SESSION, status: "live", languages: ["ko", "en"] },
+    { id: TARGET, status: "preparing", languages: ["ja"] },
+  ]);
+  assert.equal(calls[0].url, "https://project.supabase.test/rest/v1/rpc/list_live_session_ids_admin_v1");
+  assert.deepEqual(body(calls[0]), {});
+  assert.deepEqual(await storeWith(() => json([])).store.listActiveSessions(), []);
+  await assert.rejects(storeWith(() => json([{ id: "not-a-uuid", status: "live", languages: [] }])).store.listActiveSessions(), (e: ConsoleStoreError) => e.code === "CONSOLE_ROW_INVALID" && e.status === 502);
+  await assert.rejects(storeWith(() => json({ id: SESSION })).store.listActiveSessions(), (e: ConsoleStoreError) => e.code === "CONSOLE_ROW_INVALID");
+});
+
+test("setSessionEngineAsAdmin normalizes the engine, posts actor/session/engine, maps the row, and returns null for no match", async () => {
+  const engine = { stt: { provider: "soniox", model: "stt-rt-v5", languageMode: "ko" }, translation: { provider: "gemini", model: "gemini-3.7-flash" }, summary: { provider: "gemini", model: "gemini-3.7-flash" } };
+  const { store, calls } = storeWith(() => json([{ id: SESSION, status: "live", version: 4 }]));
+  assert.deepEqual(await store.setSessionEngineAsAdmin({ actorId: ADMIN, sessionId: SESSION, engine }), { id: SESSION, status: "live", version: 4 });
+  assert.equal(calls[0].url, "https://project.supabase.test/rest/v1/rpc/set_live_session_engine_admin_v1");
+  assert.deepEqual(body(calls[0]), { p_actor_id: ADMIN, p_session_id: SESSION, p_engine: engine });
+  // the RPC returns no row for stopped / archived / unknown sessions: not an error
+  assert.equal(await storeWith(() => json([])).store.setSessionEngineAsAdmin({ actorId: ADMIN, sessionId: SESSION, engine: DEFAULT_ENGINE_SELECTION }), null);
+  // a non-catalog engine is refused locally without a request
+  const invalid = storeWith(() => json([]));
+  await assert.rejects(
+    invalid.store.setSessionEngineAsAdmin({ actorId: ADMIN, sessionId: SESSION, engine: { stt: { provider: "gemini", model: "nope" } } as never }),
+    (e: ConsoleStoreError) => e.code === "ENGINE_INVALID" && e.status === 400,
+  );
+  assert.equal(invalid.calls.length, 0);
+  // SQL guard tokens surface as typed errors
+  await assert.rejects(
+    storeWith(() => json({ message: "ENGINE_INVALID", code: "22023" }, 400)).store.setSessionEngineAsAdmin({ actorId: ADMIN, sessionId: SESSION, engine: DEFAULT_ENGINE_SELECTION }),
+    (e: ConsoleStoreError) => e.code === "ENGINE_INVALID" && e.status === 400,
+  );
+  await assert.rejects(
+    storeWith(() => json({ message: "ACTOR_NOT_ADMIN", code: "42501" }, 403)).store.setSessionEngineAsAdmin({ actorId: ADMIN, sessionId: SESSION, engine: DEFAULT_ENGINE_SELECTION }),
+    (e: ConsoleStoreError) => e.code === "ACTOR_NOT_ADMIN" && e.status === 403,
+  );
+  // malformed rows (two rows, non-integer version) are a 502
+  await assert.rejects(storeWith(() => json([{ id: SESSION, status: "live", version: 4 }, { id: TARGET, status: "live", version: 1 }])).store.setSessionEngineAsAdmin({ actorId: ADMIN, sessionId: SESSION, engine: DEFAULT_ENGINE_SELECTION }), (e: ConsoleStoreError) => e.code === "CONSOLE_ROW_INVALID");
+  await assert.rejects(storeWith(() => json([{ id: SESSION, status: "live", version: "4" }])).store.setSessionEngineAsAdmin({ actorId: ADMIN, sessionId: SESSION, engine: DEFAULT_ENGINE_SELECTION }), (e: ConsoleStoreError) => e.code === "CONSOLE_ROW_INVALID");
+});

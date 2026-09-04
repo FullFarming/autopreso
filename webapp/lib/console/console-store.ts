@@ -11,6 +11,10 @@ export interface ConsoleSessionRow {
 }
 export interface ConsoleSettings { legacyPasswordLoginEnabled: boolean; engine: unknown; engineUpdatedAt: string | null; engineUpdatedByEmail: string | null }
 export interface ProfileMutationResult { id: string; status: ProfileStatus; role: ProfileRole }
+/** A session the deploy push can switch: `list_live_session_ids_admin_v1` returns only preparing/live, not archived. */
+export interface ActiveSessionRow { id: string; status: string; languages: string[] }
+/** Row returned by `set_live_session_engine_admin_v1`; `version` is the bumped value. */
+export interface SessionEngineSwitchResult { id: string; status: string; version: number }
 
 export class ConsoleStoreError extends Error {
   readonly code: string;
@@ -91,6 +95,32 @@ function mapSessionRow(row: unknown): ConsoleSessionRow {
   };
 }
 
+function mapActiveSessionRow(row: unknown): ActiveSessionRow {
+  if (!isRecord(row) || typeof row.id !== "string" || !UUID.test(row.id) || typeof row.status !== "string" || !Array.isArray(row.languages)) throw rowInvalid();
+  return { id: row.id, status: row.status, languages: row.languages.filter((v): v is string => typeof v === "string") };
+}
+
+function mapSessionEngineSwitchRows(rows: unknown): SessionEngineSwitchResult | null {
+  if (!Array.isArray(rows) || rows.length > 1) throw rowInvalid();
+  if (rows.length === 0) return null;
+  const row: unknown = rows[0];
+  if (!isRecord(row) || typeof row.id !== "string" || !UUID.test(row.id) || typeof row.status !== "string"
+    || typeof row.version !== "number" || !Number.isSafeInteger(row.version) || row.version < 1) {
+    throw rowInvalid();
+  }
+  return { id: row.id, status: row.status, version: row.version };
+}
+
+// The catalog decides what an engine may be; a rejection never leaves the process as a request.
+function normalizeEngineOrThrow(engine: EngineSelection): EngineSelection {
+  try {
+    return normalizeEngineSelection(engine) as EngineSelection;
+  } catch (error) {
+    if (error instanceof EngineSelectionError) throw new ConsoleStoreError(KNOWN_FAILURES.ENGINE_INVALID[0], "ENGINE_INVALID", 400);
+    throw error;
+  }
+}
+
 export class SupabaseConsoleStore {
   private readonly fetchFn: typeof fetch;
   private readonly getServerAccess: typeof getSupabaseServerAccess;
@@ -163,14 +193,27 @@ export class SupabaseConsoleStore {
   }
 
   async setEngineDefaults(input: { actorId: string; engine: EngineSelection }): Promise<void> {
-    let engine: EngineSelection;
-    try {
-      engine = normalizeEngineSelection(input.engine) as EngineSelection;
-    } catch (error) {
-      if (error instanceof EngineSelectionError) throw new ConsoleStoreError(KNOWN_FAILURES.ENGINE_INVALID[0], "ENGINE_INVALID", 400);
-      throw error;
-    }
+    const engine = normalizeEngineOrThrow(input.engine);
     await this.rpcAck("set_engine_defaults_v1", { p_actor_id: input.actorId, p_engine: engine });
+  }
+
+  /** Sessions the deploy push targets: `status in ('preparing','live')`, not archive-deleted, oldest first. */
+  async listActiveSessions(): Promise<ActiveSessionRow[]> {
+    const rows = await this.rpc("list_live_session_ids_admin_v1", {});
+    if (!Array.isArray(rows)) throw rowInvalid();
+    return rows.map(mapActiveSessionRow);
+  }
+
+  /**
+   * Switches one running session's engine as an admin (the host PATCH RPC locks
+   * `preparing`). `null` means the RPC matched no row - the session stopped or was
+   * archived between the list and the push - which the caller reports, not throws.
+   */
+  async setSessionEngineAsAdmin(input: { actorId: string; sessionId: string; engine: EngineSelection }): Promise<SessionEngineSwitchResult | null> {
+    const engine = normalizeEngineOrThrow(input.engine);
+    return mapSessionEngineSwitchRows(await this.rpc("set_live_session_engine_admin_v1", {
+      p_actor_id: input.actorId, p_session_id: input.sessionId, p_engine: engine,
+    }));
   }
 
   async setLegacyPasswordLogin(input: { actorId: string; enabled: boolean }): Promise<void> {
