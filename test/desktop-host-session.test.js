@@ -124,3 +124,13 @@ test("an absolute session lifetime cap does not cause repeated renewal writes", 
   await manager.ensureSession({ force: true });
   assert.deepEqual(calls, ["GET", "POST", "GET", "GET"]);
 });
+
+test("the session role is passed through only as admin, host, or legacy", async () => {
+  for (const [role, expected] of [["admin", "admin"], ["host", "host"], ["legacy", "legacy"], [undefined, "legacy"], ["owner", "legacy"], [42, "legacy"]]) {
+    const manager = createDesktopHostSession({ baseUrl: origin, fetcher: async () => Response.json({ ok: true, data: { ...sessionData, role } }) });
+    const result = await manager.ensureSession();
+    assert.equal(result.ok, true);
+    assert.equal(result.data.role, expected, String(role));
+    assert.equal(manager.getSnapshot().data.role, expected, String(role));
+  }
+});

@@ -3,7 +3,24 @@ const FAILURE_COOLDOWN_MS = 5_000;
 const REQUEST_TIMEOUT_MS = 15_000;
 const RENEW_WITHIN_MS = 7 * 86_400_000;
 
-/** @typedef {{ ok: boolean, data?: { userId: string, expiresAt: string }, code?: string, retryAfterSeconds?: number }} HostSessionResult */
+/** @typedef {"admin" | "host" | "legacy"} HostSessionRole */
+/**
+ * `role` is always present on a result this module produces; it stays optional
+ * in the type because callers only ever read it as `data?.role === "admin"` and
+ * older fixtures describe sessions without one.
+ * @typedef {{ ok: boolean, data?: { userId: string, expiresAt: string, role?: HostSessionRole }, code?: string, retryAfterSeconds?: number }} HostSessionResult
+ */
+
+const HOST_SESSION_ROLES = new Set(["admin", "host", "legacy"]);
+
+/**
+ * `/api/auth/session` reports the profile role; anything unknown collapses to
+ * `legacy` so a future role name can never unlock an admin-only surface here.
+ * @returns {HostSessionRole}
+ */
+function readHostSessionRole(value) {
+  return typeof value === "string" && HOST_SESSION_ROLES.has(value) ? /** @type {HostSessionRole} */ (value) : "legacy";
+}
 
 export function classifyDesktopLoginNavigation(value, baseUrl) {
   try {
@@ -62,7 +79,7 @@ export function createDesktopHostSession({ baseUrl, fetcher, now = Date.now }) {
         || /[\u0000-\u001f\u007f]/u.test(data.userId)
         || typeof data.expiresAt !== "string" || !Number.isFinite(Date.parse(data.expiresAt))
         || Date.parse(data.expiresAt) <= now()) return { ok: false, code: "INVALID_SESSION_RESPONSE" };
-      return { ok: true, data: { userId: data.userId, expiresAt: data.expiresAt } };
+      return { ok: true, data: { userId: data.userId, expiresAt: data.expiresAt, role: readHostSessionRole(data.role) } };
     } catch {
       return { ok: false, code: "NETWORK_UNAVAILABLE" };
     }

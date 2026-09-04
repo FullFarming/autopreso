@@ -3,8 +3,8 @@ import { readFileSync } from "node:fs";
 import vm from "node:vm";
 import test from "node:test";
 
-/** @typedef {{ ok: true, data?: { userId: string, expiresAt?: string } } | { ok: false, code: string, retryAfterSeconds?: number }} HostSessionReply */
-/** @typedef {{ getHostSession: () => Promise<HostSessionReply>, openHostLogin?: () => Promise<HostSessionReply>, logoutHostSession?: () => Promise<HostSessionReply> }} HostSessionBridge */
+/** @typedef {{ ok: true, data?: { userId: string, expiresAt?: string, role?: string } } | { ok: false, code: string, retryAfterSeconds?: number }} HostSessionReply */
+/** @typedef {{ getHostSession: () => Promise<HostSessionReply>, openHostLogin?: () => Promise<HostSessionReply>, logoutHostSession?: () => Promise<HostSessionReply>, openConsole?: () => Promise<{ ok: boolean, code?: string }> }} HostSessionBridge */
 
 const workspace = readFileSync(new URL("../public/subtitle-workspace.js", import.meta.url), "utf8");
 const html = readFileSync(new URL("../public/subtitle.html", import.meta.url), "utf8");
@@ -12,7 +12,7 @@ const html = readFileSync(new URL("../public/subtitle.html", import.meta.url), "
 /** @param {HostSessionBridge} bridge */
 function mount(bridge) {
   const nodes = new Map();
-  for (const id of ["live-host-login-section", "live-host-login-status", "live-host-account", "open-live-host-login", "logout-live-host-session"]) nodes.set(id, {
+  for (const id of ["live-host-login-section", "live-host-login-status", "live-host-account", "open-live-host-login", "logout-live-host-session", "open-live-console"]) nodes.set(id, {
     textContent: "", hidden: false, disabled: false, dataset: {}, listeners: {},
     classList: { toggle() {} }, setAttribute() {}, removeAttribute() {},
     addEventListener(name, handler) { this.listeners[name] = handler; },
@@ -127,4 +127,40 @@ test("unavailable logout preserves account and rate limiting never opens sign-in
   await h.refresh();
   assert.match(h.nodes.get("live-host-login-status").textContent, /rateLimited.*900/u);
   assert.equal(opens, 0);
+});
+
+test("the console button appears only for an admin session and opens the console through the bridge", async () => {
+  let opens = 0;
+  /** @type {HostSessionBridge} */
+  const bridge = { getHostSession: async () => ({ ok: true, data: { userId: "noel", expiresAt: "2099-01-01T00:00:00Z", role: "admin" } }),
+    openConsole: async () => { opens += 1; return { ok: true }; } };
+  assert.match(html, /<button id="open-live-console"[^>]*hidden/u);
+  assert.match(html, /id="open-live-console"[^>]*data-i18n="settings\.openConsole"/u);
+  const h = mount(bridge);
+  await h.refresh();
+  const button = h.nodes.get("open-live-console");
+  assert.equal(button.hidden, false);
+  await button.listeners.click();
+  assert.equal(opens, 1);
+  bridge.getHostSession = async () => ({ ok: true, data: { userId: "host-a", expiresAt: "2099-01-01T00:00:00Z", role: "host" } });
+  await h.refresh();
+  assert.equal(button.hidden, true);
+  bridge.getHostSession = async () => ({ ok: true, data: { userId: "legacy-a", expiresAt: "2099-01-01T00:00:00Z" } });
+  await h.refresh();
+  assert.equal(button.hidden, true);
+  bridge.getHostSession = async () => ({ ok: false, code: "HOST_LOGIN_REQUIRED" });
+  await h.refresh();
+  assert.equal(button.hidden, true);
+});
+
+test("a refused console open hides the button again instead of looping", async () => {
+  let opens = 0;
+  const h = mount({ getHostSession: async () => ({ ok: true, data: { userId: "noel", expiresAt: "2099-01-01T00:00:00Z", role: "admin" } }),
+    openConsole: async () => { opens += 1; return { ok: false, code: "ADMIN_REQUIRED" }; } });
+  await h.refresh();
+  const button = h.nodes.get("open-live-console");
+  await button.listeners.click();
+  assert.equal(opens, 1);
+  assert.equal(button.hidden, true);
+  assert.match(h.nodes.get("live-host-login-status").textContent, /consoleOpenFailed/u);
 });

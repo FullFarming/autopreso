@@ -1030,3 +1030,29 @@ test("load repairs a stored combined engine that no longer matches the caption-l
   const after = await store.save({ subtitle: { tone: "business" } });
   assert.equal(after.subtitle.tone, "business");
 });
+
+// Plan B Task 5: the console's global engine default is remembered as
+// `subtitle.engineDefaultsSeen` so a new Live Call can tell "the host still
+// follows the global default" from "the host customised the engine".
+test("subtitle.engineDefaultsSeen is optional, normalized on save, and dropped when the stored value is unusable", async () => {
+  const filePath = await tempPath();
+  const store = createSettingsStore({ filePath, env: {}, readCodexAuth: noCodexAuth });
+  assert.equal((await store.load()).subtitle.engineDefaultsSeen, undefined);
+  const seen = {
+    stt: { provider: "gemini", model: "gemini-3.5-transcribe-live", languageMode: "auto" },
+    translation: { provider: "gemini", model: "gemini-3.6-flash" },
+    summary: { provider: "gemini", model: "gemini-3.7-flash" },
+  };
+  await store.save({ subtitle: { engineDefaultsSeen: seen } });
+  const reloaded = await createSettingsStore({ filePath, env: {}, readCodexAuth: noCodexAuth }).load();
+  assert.deepEqual(reloaded.subtitle.engineDefaultsSeen, seen);
+  assert.equal(reloaded.subtitle.engine.summary.model, "gemini-3.6-flash", "remembering a default never changes the active engine");
+  await assert.rejects(store.save({ subtitle: { engineDefaultsSeen: { stt: { provider: "nope", model: "x", languageMode: "auto" } } } }), /엔진 조합/u);
+  assert.throws(() => validateSubtitleSettings({ engineDefaultsSeen: [] }), /엔진 조합/u);
+  const onDisk = JSON.parse(await fs.readFile(filePath, "utf8"));
+  onDisk.subtitle.engineDefaultsSeen = { summary: { provider: "gemini", model: "retired-model" } };
+  await fs.writeFile(filePath, JSON.stringify(onDisk));
+  const repaired = await createSettingsStore({ filePath, env: {}, readCodexAuth: noCodexAuth }).load();
+  assert.equal(repaired.subtitle.engineDefaultsSeen, undefined);
+  assert.equal(repaired.subtitle.engine.stt.model, "gemini-3.5-transcribe-live");
+});

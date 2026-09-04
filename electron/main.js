@@ -32,12 +32,14 @@ import {
 } from "../packages/caption-core/index.js";
 import { createLiveCallArchive, readLiveArchiveSessionId } from "../src/live-call-archive.js";
 import { GeminiModelSelectionError, readGeminiSelectedModel, migrateLegacyGeminiModelSelection } from "../packages/caption-core/gemini-model-catalog.js";
+import { engineSelectionKey, normalizeEngineSelection } from "../packages/caption-core/caption-engine-catalog.js";
 import { registerLiveInterpreterIpc, resolveLiveInterpreterEnabled } from "./live-interpreter-ipc.js";
 import { registerMeetingCoachIpc } from "./meeting-coach-ipc.js";
 import { createDesktopLiveDemandController } from "./live-demand-controller.js";
 import { readDesktopSystemLanguage, persistDesktopSystemLanguage } from "./system-language-store.js";
 import { createDesktopHostSession } from "./desktop-host-session.js";
 import { openDesktopHostLogin } from "./desktop-host-login-window.js";
+import { openDesktopConsoleWindow } from "./desktop-console-window.js";
 import { createDesktopLoginState, findDesktopAuthDeepLink, isAllowedDesktopExternalLogin, parseDesktopAuthDeepLink } from "./desktop-auth-deep-link.js";
 // The renderer owns the UI language choice (localStorage); it pushes the value
 // over IPC so the application menu speaks the same language.
@@ -137,6 +139,9 @@ let isHostLoginPending = false;
 let desktopHostSession = null;
 let desktopLoginWindow = null;
 let desktopLoginPromise = null;
+// Admin console (Plan B): at most one window, opened from the dashboard's
+// "콘솔" button and gated on the verified session's role in `console:open`.
+let consoleWindow = null;
 let isHostLogoutPending = false;
 // Desktop Google login: the login window asks for the system browser, which
 // returns through the `nova://` scheme. `pendingDesktopLoginState` is the
@@ -674,6 +679,26 @@ function registerDesktopLoginIpc() {
   });
 }
 
+// The console is the remote workspace's `/console` area in a sandboxed window
+// on the default session (same cookie jar the boot login verified). It gets no
+// preload and no media grant; the IPC gate that reaches this function has
+// already checked the caller origin, authentication, and the admin role.
+function openConsoleWindow() {
+  const window = openDesktopConsoleWindow({
+    BrowserWindowClass: BrowserWindow,
+    browserSession: session.defaultSession,
+    baseUrl: resolveLiveWorkspaceUrl(),
+    title: translate("settings.openConsole"),
+    existing: consoleWindow,
+    openExternal: openAllowedExternal,
+  });
+  if (window !== consoleWindow) {
+    consoleWindow = window;
+    window.on("closed", () => { if (consoleWindow === window) consoleWindow = null; });
+  }
+  return window;
+}
+
 function parseLiveWorkspaceUrl(value) {
   let target;
   try {
@@ -1203,6 +1228,42 @@ function toLiveCallApiInput(config) {
     participantSpeakingEnabled: config.participantSpeakingEnabled === true,
     languages: config.languages,
   };
+}
+
+// Global engine defaults (Plan B spec §6). The console publishes one
+// catalog-normalized engine selection through `/api/live-config`; a NEW Live
+// Call follows it for as long as the host has not customised the engine away
+// from the last global default this desktop adopted (`engineDefaultsSeen`).
+// With nothing recorded yet, the catalog default stands in for "the previous
+// global default", so a never-customised install follows the console and a
+// host who already picked their own models keeps them. Adoption moves both
+// `engine` and `engineDefaultsSeen`, which is what keeps the two equal for the
+// next comparison. The write goes through the settings store only: a running
+// caption session is never restarted from here (hot swap is Plan 2), and a
+// store that refuses the default (unusable combo, missing key) means the local
+// selection stays. Never throws — a console outage must not block go-live.
+async function seedLiveCallEngineDefaults(baseUrl, settingsStore, subtitleSettings) {
+  const configResult = await liveCallApi(baseUrl, "/api/live-config", { method: "GET" });
+  const published = configResult.ok ? configResult.data?.engineDefaults : undefined;
+  if (published === undefined || published === null || typeof published !== "object") return subtitleSettings;
+  let engineDefaults;
+  let followsGlobalDefault;
+  try {
+    engineDefaults = normalizeEngineSelection(published);
+    followsGlobalDefault = engineSelectionKey(subtitleSettings?.engine) === engineSelectionKey(subtitleSettings?.engineDefaultsSeen);
+    if (!followsGlobalDefault) return subtitleSettings;
+    if (engineSelectionKey(subtitleSettings?.engineDefaultsSeen) === engineSelectionKey(engineDefaults)
+      && engineSelectionKey(subtitleSettings?.engine) === engineSelectionKey(engineDefaults)) return subtitleSettings;
+  } catch {
+    return subtitleSettings;
+  }
+  try {
+    await settingsStore.save({ subtitle: { engine: engineDefaults, engineDefaultsSeen: engineDefaults } });
+  } catch (error) {
+    console.warn(`[live] global engine default not adopted: ${error?.message ?? error}`);
+    return subtitleSettings;
+  }
+  return { ...subtitleSettings, engine: engineDefaults, engineDefaultsSeen: engineDefaults };
 }
 
 async function openLiveStageOverlay(baseUrl, sessionId, invite) {
@@ -3048,6 +3109,17 @@ function registerOverlayIpc(settingsStore, { localAppOrigin, liveWorkspaceUrl, l
     void shell.openExternal("x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture");
     return true;
   });
+  // Admin console entry point. Three gates, checked in order: the caller is a
+  // local dashboard renderer, the desktop holds a verified host session, and
+  // the LAST verified session snapshot carries the admin role (the renderer's
+  // button visibility is a convenience, not the authority).
+  ipcMain.handle("console:open", (event) => {
+    if (!isAllowedOrigin(event.sender.getURL(), new Set([localAppOrigin]))) return { ok: false, code: "FORBIDDEN" };
+    if (!isDesktopAuthenticated || isQuitting) return { ok: false, code: "HOST_LOGIN_REQUIRED" };
+    if (desktopHostSession?.getSnapshot().data?.role !== "admin") return { ok: false, code: "ADMIN_REQUIRED" };
+    openConsoleWindow();
+    return { ok: true };
+  });
   ipcMain.handle("live-workspace:get-enabled", (event) => (
     isAllowedOrigin(event.sender.getURL(), new Set([localAppOrigin]))
       ? liveCallEnabled === true
@@ -3067,11 +3139,12 @@ function registerOverlayIpc(settingsStore, { localAppOrigin, liveWorkspaceUrl, l
     const cover = validateLiveCoverImage(draft?.coverImage);
     if (!cover.ok) return cover;
     const savedSettings = await settingsStore.load();
-    const input = sanitizeLiveCallDraft(draft, savedSettings?.subtitle);
     const login = await ensureDesktopHostSession(liveWorkspaceUrl);
     if (!login.ok) {
       return login;
     }
+    const seededSubtitle = await seedLiveCallEngineDefaults(liveWorkspaceUrl, settingsStore, savedSettings?.subtitle);
+    const input = sanitizeLiveCallDraft(draft, seededSubtitle);
     const created = await liveCallApi(liveWorkspaceUrl, "/api/live-sessions", { body: toLiveCallApiInput(input) });
     if (!created.ok) return created;
     const sessionData = created.data;
@@ -3207,11 +3280,12 @@ function registerOverlayIpc(settingsStore, { localAppOrigin, liveWorkspaceUrl, l
       const cover = validateLiveCoverImage(draft?.coverImage);
       if (!cover.ok) return cover;
       const savedSettings = await settingsStore.load();
-      const input = sanitizeLiveCallDraft(draft, savedSettings?.subtitle);
       const login = await ensureDesktopHostSession(liveWorkspaceUrl);
       if (!login.ok) {
         return login;
       }
+      const seededSubtitle = await seedLiveCallEngineDefaults(liveWorkspaceUrl, settingsStore, savedSettings?.subtitle);
+      const input = sanitizeLiveCallDraft(draft, seededSubtitle);
       const created = await liveCallApi(liveWorkspaceUrl, "/api/live-sessions", { body: toLiveCallApiInput(input) });
       if (!created.ok) return created;
       const sessionData = created.data;

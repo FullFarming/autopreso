@@ -79,6 +79,7 @@ contextBridge.exposeInMainWorld("realtimeNoelDesktop", {
   getHostSession: () => ipcRenderer.invoke("host-session:get"),
   openHostLogin: () => ipcRenderer.invoke("host-session:open-login"),
   logoutHostSession: () => ipcRenderer.invoke("host-session:logout"),
+  openConsole: () => ipcRenderer.invoke("console:open"),
   listGlossaryPresets: () => ipcRenderer.invoke("glossary-presets:list"),
   createGlossaryPreset: (input) => ipcRenderer.invoke("glossary-presets:create", input),
   updateGlossaryPreset: (input) => ipcRenderer.invoke("glossary-presets:update", input),

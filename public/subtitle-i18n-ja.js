@@ -408,6 +408,8 @@ export const JA = {
   "settings.hostLoginCancelled": "ログインをキャンセルしました。ログインボタンから再度お試しください。",
   "settings.hostLogoutLive": "進行中のライブ通話を終了してからアカウントを変更してください。",
   "settings.hostSharedLoginHelp": "Webと同じアカウントを使います。ログアウトするとアプリが再起動します。",
+  "settings.openConsole": "コンソール",
+  "settings.consoleOpenFailed": "コンソールを開けませんでした。ログイン状態を確認してから再度お試しください。",
   "hostSession.loginTitle": "NOVAにログイン",
   "hostSession.verifyFailed": "ログイン状態を確認できませんでした。接続を確認してから再確認してください。",
   "hostSession.deepLinkFailed": "ブラウザでのログインを確認できませんでした。もう一度お試しください。",

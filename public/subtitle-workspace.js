@@ -550,7 +550,11 @@ const hostLoginStatus = document.getElementById("live-host-login-status");
 const hostAccount = document.getElementById("live-host-account");
 const openHostLoginButton = document.getElementById("open-live-host-login");
 const logoutHostSessionButton = document.getElementById("logout-live-host-session");
+const openConsoleButton = document.getElementById("open-live-console");
 let hostAccountId = "";
+// Role of the verified session ("admin" | "host" | "legacy"); only admins see
+// the console button. The main process re-checks the role on `console:open`.
+let hostAccountRole = "";
 let hostLoginNotice = { key: "settings.hostSessionChecking", values: undefined, isError: false };
 let hostSessionRequest = null;
 let isHostSessionActionPending = false;
@@ -564,7 +568,8 @@ function renderHostLoginStatus() {
   }
   if (openHostLoginButton) openHostLoginButton.hidden = Boolean(hostAccountId);
   if (logoutHostSessionButton) logoutHostSessionButton.hidden = !hostAccountId;
-  for (const button of [openHostLoginButton, logoutHostSessionButton]) {
+  if (openConsoleButton) openConsoleButton.hidden = !(hostAccountId && hostAccountRole === "admin" && window.realtimeNoelDesktop?.openConsole);
+  for (const button of [openHostLoginButton, logoutHostSessionButton, openConsoleButton]) {
     if (!button) continue;
     button.disabled = isHostSessionActionPending;
     if (isHostSessionActionPending) button.setAttribute("aria-busy", "true");
@@ -594,11 +599,13 @@ renumberConfigSections();
 function acceptHostSession(result) {
   if (result?.ok && typeof result.data?.userId === "string" && result.data.userId) {
     hostAccountId = result.data.userId;
+    hostAccountRole = result.data.role === "admin" ? "admin" : result.data.role === "host" ? "host" : "legacy";
     setHostLoginNotice("settings.hostSessionReady");
     return true;
   }
   if (result?.code === "HOST_LOGIN_REQUIRED" || result?.code === "HOST_LOGIN_REJECTED") {
     hostAccountId = "";
+    hostAccountRole = "";
     setHostLoginNotice("settings.hostSignedOut", true);
   } else if (result?.code === "RATE_LIMITED" && Number.isSafeInteger(result.retryAfterSeconds) && result.retryAfterSeconds > 0) {
     setHostLoginNotice("hostSession.rateLimited", true, { seconds: result.retryAfterSeconds });
@@ -647,9 +654,27 @@ logoutHostSessionButton?.addEventListener("click", async () => {
     const result = await bridge.logoutHostSession();
     if (result?.ok) {
       hostAccountId = "";
+      hostAccountRole = "";
       setHostLoginNotice("settings.hostSignedOut");
     } else setHostLoginNotice(result?.code === "LIVE_SESSION_ACTIVE" ? "settings.hostLogoutLive" : "settings.hostSessionUnavailable", true);
   } catch { setHostLoginNotice("settings.hostSessionUnavailable", true); }
+  finally { isHostSessionActionPending = false; renderHostLoginStatus(); }
+});
+
+openConsoleButton?.addEventListener("click", async () => {
+  const bridge = window.realtimeNoelDesktop;
+  if (!bridge?.openConsole || isHostSessionActionPending) return;
+  isHostSessionActionPending = true;
+  renderHostLoginStatus();
+  try {
+    const result = await bridge.openConsole();
+    if (!result?.ok) {
+      // The main process is the authority on the role: a refusal means the
+      // button was stale, so drop it rather than offering the same click again.
+      if (result?.code === "ADMIN_REQUIRED" || result?.code === "HOST_LOGIN_REQUIRED") hostAccountRole = "";
+      setHostLoginNotice("settings.consoleOpenFailed", true);
+    }
+  } catch { setHostLoginNotice("settings.consoleOpenFailed", true); }
   finally { isHostSessionActionPending = false; renderHostLoginStatus(); }
 });
 window.addEventListener("focus", () => {
