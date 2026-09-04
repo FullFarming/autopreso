@@ -8,6 +8,7 @@ import {
   findEngineEntry,
   isCombinedEngine,
   normalizeEngineSelection,
+  validateEngineForLanguages,
 } from "../../../packages/caption-core/caption-engine-catalog.js";
 import { GeminiLiveTranscriptionAdapter, GeminiTextTranslateAdapter } from "../google-provider-adapters.js";
 import { SonioxRealtimeAdapter } from "./soniox-realtime-adapter.js";
@@ -46,6 +47,21 @@ export function assertEngineKeys(engine, environment = process.env) {
     if (!envName || !String(environment?.[envName] ?? "").trim()) throw codedError("ENGINE_KEY_MISSING");
   }
   return selection;
+}
+
+/**
+ * Rejects a selection the catalog only supports at one caption-language count
+ * (Soniox's pair translation) for any other count, before any adapter exists.
+ * The settings store enforces the same rule at save time; this is the gateway's
+ * own check so a stale or forged session config cannot dead-end at the socket.
+ */
+export function assertEngineForLanguages(engine, translationLanguages) {
+  try {
+    return validateEngineForLanguages(engine, translationLanguages);
+  } catch (error) {
+    if (error?.code === "ENGINE_SELECTION_INVALID") throw codedError("ENGINE_SELECTION_INVALID");
+    throw error;
+  }
 }
 
 export function createSpeechToText({

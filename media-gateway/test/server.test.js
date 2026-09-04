@@ -46,6 +46,10 @@ test("media gateway builds STT and text translation from the session engine and 
 
   assert.match(source, /const engine = captionConfig\.engine;/u);
   assert.match(source, /assertEngineKeys\(engine,/u);
+  // Language-count validation sits right after the key check and before any
+  // adapter or translator is built, so a Soniox pair on a three-language
+  // session is refused as ENGINE_SELECTION_INVALID with no paid connection.
+  assert.match(source, /assertEngineKeys\(engine,[^\n]*\n\s*assertEngineForLanguages\(engine, captionConfig\.languages\);\n\s*const textTranslate = createTextTranslate\(/u);
   assert.match(source, /speechToText:\s*createSpeechToText\(\{[\s\S]*?engine,[\s\S]*?liveClient,[\s\S]*?compiledGlossary,/u);
   assert.match(source, /const textTranslate = createTextTranslate\(\{ engine, geminiRuntime, sessionId: message\.sessionId \}\);/u);
   assert.match(source, /dependencies: \{[\s\S]*?textTranslate,[\s\S]*?publisher:/u);

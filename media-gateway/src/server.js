@@ -6,7 +6,7 @@ import { readGatewayEnvironment } from "./config.js";
 import { createGatewayServer } from "./gateway-server.js";
 import { installGatewayShutdown } from "./gateway-shutdown.js";
 import { createGoogleLiveClient } from "./google-live-client.js";
-import { assertEngineKeys, createSpeechToText, createTextTranslate, isCombinedEngine } from "./engines/create-engines.js";
+import { assertEngineForLanguages, assertEngineKeys, createSpeechToText, createTextTranslate, isCombinedEngine } from "./engines/create-engines.js";
 import { LiveMediaPipeline } from "./live-media-pipeline.js";
 import { createLiveTopicDetector } from "./live-topic-detector.js";
 import {
@@ -293,9 +293,12 @@ export async function startMediaGateway(config = readGatewayEnvironment(), {
       // translator. A selection whose provider key is absent is refused here,
       // before any paid connection or pipeline exists; the host sees
       // ENGINE_KEY_MISSING through gatewayMessage. Key values are only tested
-      // for presence and never copied into a pipeline or a log.
+      // for presence and never copied into a pipeline or a log. A selection the
+      // catalog only supports at one caption-language count (Soniox's pair) is
+      // refused the same way as ENGINE_SELECTION_INVALID.
       const engine = captionConfig.engine;
       assertEngineKeys(engine, { GEMINI_API_KEY: config.geminiApiKey, SONIOX_API_KEY: config.sonioxApiKey });
+      assertEngineForLanguages(engine, captionConfig.languages);
       const textTranslate = createTextTranslate({ engine, geminiRuntime, sessionId: message.sessionId });
       if (textTranslate === null && !isCombinedEngine(engine)) throw new Error("TEXT_TRANSLATE_REQUIRED");
       await runtimeLoader.bindTopicModel(message.sessionId, captionConfig.models.summary);

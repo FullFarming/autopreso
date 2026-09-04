@@ -90,7 +90,13 @@ export class RollingSpeechSession {
   async #openStream(options) {
     const controller = new AbortController();
     const sourceGeneration = randomUUID();
-    const admission = { isRetired: false };
+    // `partialsRetired` flips at swap time, the moment a replacement stream
+    // owns the lanes; `isRetired` flips only once close() has resolved. A
+    // draining socket may keep emitting for seconds in between, and its
+    // partials would otherwise race the new stream's on the same lane (both
+    // peek the same coming seq). Its finals stay welcome until the real
+    // retire: delivering the tail is the whole reason the drain exists.
+    const admission = { isRetired: false, partialsRetired: false };
     this.#pendingOpens.add(controller);
     let rejectAborted;
     const aborted = new Promise((_, reject) => { rejectAborted = reject; });
@@ -104,10 +110,10 @@ export class RollingSpeechSession {
           if (!admission.isRetired && !controller.signal.aborted && !this.#isClosed) return options.onFinalUtterance({ ...utterance, sourceGeneration });
         },
         onPartialTranscript: (value) => {
-          if (!admission.isRetired && !controller.signal.aborted && !this.#isClosing && !this.#isClosed) return options.onPartialTranscript?.(value);
+          if (!admission.partialsRetired && !admission.isRetired && !controller.signal.aborted && !this.#isClosing && !this.#isClosed) return options.onPartialTranscript?.(value);
         },
         onPartialTranslation: (value) => {
-          if (!admission.isRetired && !controller.signal.aborted && !this.#isClosing && !this.#isClosed) return options.onPartialTranslation?.(value);
+          if (!admission.partialsRetired && !admission.isRetired && !controller.signal.aborted && !this.#isClosing && !this.#isClosed) return options.onPartialTranslation?.(value);
         },
       });
     }).then(async (stream) => {
@@ -192,6 +198,7 @@ export class RollingSpeechSession {
         this.#startedAt = this.now();
         this.#rolloverMilliseconds = resolveRolloverMilliseconds(next);
         this.#clearOverlapFrames();
+        this.#retirePartials(previous);
         this.#drainPrevious(previous, previousPcmRing);
         return;
       }
@@ -208,6 +215,7 @@ export class RollingSpeechSession {
       ]);
       const mapping = remapRolloverSpeakers(normalizeOverlap(previousWords, true), normalizeOverlap(nextWords, false));
       this.onRemap(mapping);
+      this.#retirePartials(previous);
       await this.#closeStreamOnce(previous);
       previousPcmRing?.clear();
       this.#stream = next;
@@ -275,6 +283,13 @@ export class RollingSpeechSession {
     for (const stream of this.#retiringStreams) stream.abort?.();
     this.#clearOverlapFrames();
     this.#pcmRing?.clear();
+  }
+
+  /** The stream no longer owns the caption lanes: drop its partials from now
+   *  on while its finals keep flowing until `#closeStreamOnce` retires it. */
+  #retirePartials(stream) {
+    const admission = this.#streamAdmissions.get(stream);
+    if (admission) admission.partialsRetired = true;
   }
 
   #closeStreamOnce(stream) {

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { assertEngineKeys, createSpeechToText, createTextTranslate, isCombinedEngine } from "../src/engines/create-engines.js";
+import { assertEngineForLanguages, assertEngineKeys, createSpeechToText, createTextTranslate, isCombinedEngine } from "../src/engines/create-engines.js";
 import { DEFAULT_ENGINE_SELECTION } from "../../packages/caption-core/caption-engine-catalog.js";
 
 const soniox = { stt: { provider: "soniox", model: "stt-rt-v5", languageMode: "auto" }, translation: { provider: "soniox", model: "stt-rt-v5" }, summary: { provider: "gemini", model: "gemini-3.6-flash" } };
@@ -76,4 +76,15 @@ test("factory errors carry a machine code the gateway can map", () => {
   ]) {
     assert.throws(run, (error) => error instanceof Error && error.code === "ENGINE_KEY_MISSING" && error.message === "ENGINE_KEY_MISSING");
   }
+});
+
+test("an engine that needs an exact caption-language count is refused for other counts before any adapter is built", () => {
+  assert.throws(() => assertEngineForLanguages(soniox, ["ko", "en", "ja"]),
+    (error) => error instanceof Error && error.code === "ENGINE_SELECTION_INVALID" && error.message === "ENGINE_SELECTION_INVALID");
+  assert.throws(() => assertEngineForLanguages(soniox, ["ko"]), /ENGINE_SELECTION_INVALID/u);
+  assert.doesNotThrow(() => assertEngineForLanguages(soniox, ["ko", "en"]));
+  assert.doesNotThrow(() => assertEngineForLanguages(DEFAULT_ENGINE_SELECTION, ["ko", "en", "ja"]));
+  assert.doesNotThrow(() => assertEngineForLanguages(DEFAULT_ENGINE_SELECTION, ["ko"]));
+  const forged = { ...DEFAULT_ENGINE_SELECTION, stt: { provider: "gemini", model: "attacker-model", languageMode: "auto" } };
+  assert.throws(() => assertEngineForLanguages(forged, ["ko", "en"]), /ENGINE_SELECTION_INVALID/u);
 });

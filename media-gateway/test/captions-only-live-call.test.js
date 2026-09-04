@@ -415,8 +415,78 @@ test("combined engine: a final missing its target lane publishes the original la
   assert.equal(english.translationStatus, "failed");
   assert.equal(english.text, KOREAN_SOURCE);
   assert.equal(english.seq, 1);
+  assert.equal(Object.hasOwn(english, "translationModel"), false, "a fail-open caption names no model: nothing translated it");
   assert.ok(h.events.some((event) => event.type === "language-status" && event.language === "en"
     && event.status === "unavailable" && event.code === "LANGUAGE_UNAVAILABLE"));
+});
+
+test("combined engine: consecutive missing lanes stay fail-open and never enter the three-strike cooldown", async () => {
+  const h = createEngineHarness({ engine: SONIOX_ENGINE, textTranslate: null });
+  await h.pipeline.start();
+  for (let index = 0; index < 4; index += 1) {
+    await h.stream.onFinalUtterance(koreanFinal({
+      text: `${KOREAN_SOURCE} ${index + 1}`,
+      translations: {},
+      sourceStartOffsetMs: index * 2_000,
+      sourceEndOffsetMs: index * 2_000 + 1_000,
+      sourceEndedAt: `2026-09-03T01:00:0${index + 1}.000Z`,
+    }));
+    await h.tick();
+  }
+  await h.pipeline.close();
+  const english = h.events.filter((event) => event.type === "caption" && event.isFinal && event.language === "en");
+  assert.deepEqual(english.map((event) => event.seq), [1, 2, 3, 4], "every missing lane still publishes a durable final");
+  assert.deepEqual(english.map((event) => event.translationStatus), ["failed", "failed", "failed", "failed"]);
+  assert.deepEqual(english.map((event) => event.text), [1, 2, 3, 4].map((n) => `${KOREAN_SOURCE} ${n}`));
+  assert.equal(english.some((event) => Object.hasOwn(event, "translationModel")), false);
+  assert.equal(h.events.some((event) => event.type === "language-status" && event.code === "LANGUAGE_COOLDOWN"), false,
+    "a provider that cannot be re-asked must not be cooled down; the lane would go dark for 30 s");
+  const korean = h.events.filter((event) => event.type === "caption" && event.isFinal && event.language === "ko");
+  assert.deepEqual(korean.map((event) => event.seq), [1, 2, 3, 4]);
+});
+
+test("combined engine: the first translated lane after a run of misses re-announces the lane ready", async () => {
+  const h = createEngineHarness({ engine: SONIOX_ENGINE, textTranslate: null });
+  await h.pipeline.start();
+  await h.stream.onFinalUtterance(koreanFinal({ translations: {} }));
+  await h.tick();
+  await h.stream.onFinalUtterance(koreanFinal({
+    text: `${KOREAN_SOURCE} 둘`,
+    translations: { en: { text: "This is the second business update." } },
+    sourceStartOffsetMs: 2_000,
+    sourceEndOffsetMs: 3_000,
+    sourceEndedAt: "2026-09-03T01:00:03.000Z",
+  }));
+  await h.tick();
+  await h.pipeline.close();
+  const statuses = h.events.filter((event) => event.type === "language-status" && event.language === "en").map((event) => event.status);
+  assert.deepEqual(statuses, ["ready", "unavailable", "ready"], "start-up ready, the miss, then the recovery re-announced");
+  const english = h.events.filter((event) => event.type === "caption" && event.isFinal && event.language === "en");
+  assert.deepEqual(english.map((event) => [event.seq, event.translationStatus]), [[1, "failed"], [2, "translated"]]);
+  assert.equal(english[1].translationModel, "stt-rt-v5");
+});
+
+test("gemini engine: three consecutive translator failures still cool the lane down and the fourth final publishes nothing there", async () => {
+  const h = createEngineHarness({
+    engine: DEFAULT_ENGINE_SELECTION,
+    textTranslate: { async translate() { throw new Error("GEMINI_TRANSLATE_FAILED"); } },
+  });
+  await h.pipeline.start();
+  for (let index = 0; index < 4; index += 1) {
+    await h.stream.onFinalUtterance(koreanFinal({
+      text: `${KOREAN_SOURCE} ${index + 1}`,
+      sourceStartOffsetMs: index * 2_000,
+      sourceEndOffsetMs: index * 2_000 + 1_000,
+      sourceEndedAt: `2026-09-03T01:00:0${index + 1}.000Z`,
+    }));
+    await h.tick();
+  }
+  await h.pipeline.close();
+  assert.equal(h.events.filter((event) => event.type === "caption" && event.isFinal && event.language === "en").length, 0,
+    "the Gemini path stays fail-closed: no caption on a lane whose translator failed");
+  assert.equal(h.events.filter((event) => event.type === "language-status" && event.language === "en" && event.code === "LANGUAGE_COOLDOWN").length, 1);
+  const korean = h.events.filter((event) => event.type === "caption" && event.isFinal && event.language === "ko");
+  assert.deepEqual(korean.map((event) => event.seq), [1, 2, 3, 4]);
 });
 
 test("gemini engine: provenance names Transcribe Live and the model that actually produced each translation", async () => {

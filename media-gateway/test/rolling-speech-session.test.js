@@ -565,3 +565,101 @@ test("partial translations flow from the active stream only and never from a ret
   ]);
   await session.close();
 });
+
+test("a retiring transcribe-only stream stops emitting partials at swap time, before its close resolves, while its final still lands", async () => {
+  let now = 0;
+  const streams = [];
+  const partials = [];
+  const translations = [];
+  const finals = [];
+  const session = new RollingSpeechSession({ now: () => now, onRemap() {},
+    onFinalUtterance(utterance) { finals.push(utterance.text); },
+    onPartialTranscript(value) { partials.push(value.text); },
+    onPartialTranslation(value) { translations.push(value.text); },
+    provider: { async open(options) {
+      let releaseClose;
+      const closed = new Promise((resolve) => { releaseClose = resolve; });
+      const stream = {
+        supportsRolloverRemap: false,
+        callbacks: options,
+        releaseClose,
+        async sendAudio() {},
+        async close() { await closed; },
+      };
+      streams.push(stream);
+      return stream;
+    } } });
+  await session.start();
+  streams[0].callbacks.onPartialTranscript({ text: "live-1" });
+  streams[0].callbacks.onPartialTranslation({ language: "en", text: "live-1-en", sourceLanguage: "ko" });
+  now = 550_000;
+  await session.sendAudio(new Uint8Array(1_280));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(streams.length, 2, "the swap happened");
+  // The old socket is still draining (close() has not resolved), yet it must
+  // no longer paint partials on the lanes the new stream now owns.
+  streams[0].callbacks.onPartialTranscript({ text: "stale" });
+  streams[0].callbacks.onPartialTranslation({ language: "en", text: "stale-en", sourceLanguage: "ko" });
+  streams[1].callbacks.onPartialTranscript({ text: "live-2" });
+  streams[1].callbacks.onPartialTranslation({ language: "en", text: "live-2-en", sourceLanguage: "ko" });
+  // Its tail final is the whole point of draining: it must still be delivered.
+  await streams[0].callbacks.onFinalUtterance({ speakerLabel: "A", text: "tail final", sourceStartOffsetMs: 0, sourceEndOffsetMs: 1_000 });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(partials, ["live-1", "live-2"]);
+  assert.deepEqual(translations, ["live-1-en", "live-2-en"]);
+  assert.deepEqual(finals, ["tail final"]);
+  streams[0].releaseClose();
+  await new Promise((resolve) => setImmediate(resolve));
+  await streams[0].callbacks.onFinalUtterance({ speakerLabel: "A", text: "after retire", sourceStartOffsetMs: 0, sourceEndOffsetMs: 1_000 });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(finals, ["tail final"], "a fully retired stream delivers nothing");
+  streams[1].releaseClose();
+  await session.close();
+});
+
+test("a remapped previous stream stops emitting partials before its close resolves", async () => {
+  let now = 0;
+  const streams = [];
+  const partials = [];
+  const translations = [];
+  const session = new RollingSpeechSession({
+    now: () => now,
+    onRemap() {},
+    async onFinalUtterance() {},
+    onPartialTranscript(value) { partials.push(value.text); },
+    onPartialTranslation(value) { translations.push(value.text); },
+    provider: {
+      async open(options) {
+        const isRollover = streams.length > 0;
+        let releaseClose;
+        const closed = new Promise((resolve) => { releaseClose = resolve; });
+        const stream = {
+          callbacks: options,
+          releaseClose,
+          async sendAudio() {},
+          async getFinalWords() { return isRollover ? overlapWords("next-A") : overlapWords("old-A"); },
+          async waitForFinalWords() { return overlapWords("next-A"); },
+          async close() { await closed; },
+        };
+        streams.push(stream);
+        return stream;
+      },
+    },
+  });
+  await session.start();
+  await session.sendAudio(new Uint8Array(1_280));
+  streams[0].callbacks.onPartialTranscript({ text: "live-1" });
+  now = 550_000;
+  const rolling = session.sendAudio(new Uint8Array(1_280));
+  for (let index = 0; index < 5; index += 1) await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(streams.length, 2, "the replacement is open and the previous close is pending");
+  streams[0].callbacks.onPartialTranscript({ text: "stale" });
+  streams[0].callbacks.onPartialTranslation({ language: "en", text: "stale-en", sourceLanguage: "ko" });
+  streams[0].releaseClose();
+  await rolling;
+  streams[1].callbacks.onPartialTranscript({ text: "live-2" });
+  assert.deepEqual(partials, ["live-1", "live-2"]);
+  assert.deepEqual(translations, []);
+  streams[1].releaseClose();
+  await session.close();
+});

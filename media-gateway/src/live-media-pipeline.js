@@ -4,7 +4,6 @@ import { AUDIO_CONFIG, normalizeLiveLanguage, textPlausiblyInLanguage, validateL
 import { OrderedTaskQueue } from "./ordered-task-queue.js";
 import { RollingSpeechSession } from "./rolling-speech-session.js";
 import { safeProviderErrorIdentifier } from "./caption-polish.js";
-import { applyGlossaryCorrections } from "./glossary-corrections.js";
 import { detectSourceLanguage, isOutputInTargetLanguage, sourceLaneMatches } from "./language-gate.js";
 import { SpeakerRegistry } from "./speaker-registry.js";
 import {
@@ -649,7 +648,11 @@ export class LiveMediaPipeline {
     });
   }
 
-  /** Output-language gate shared by translated interims and finals. */
+  /** Output-language gate for translated interims. It is the same test the
+   *  source-partial path applies (fixed-target check on ko, session-language
+   *  check elsewhere); finals run the stricter `#supportsFixedTargetOutput`
+   *  on every target lane, so an interim can pass here and its final still be
+   *  refused. */
   #isTranslatedOutputAcceptable(text, language) {
     return language === "ko"
       ? this.#supportsFixedTargetOutput(text, language)
@@ -677,7 +680,8 @@ export class LiveMediaPipeline {
       try {
         if (partial.kind === "translation") {
           // Deterministic terminology only: an interim never earns a text-model
-          // call, and the output-language gate is the same one finals pass.
+          // call. The gate below is the source-partial output gate, not the
+          // finals gate (finals additionally require fixed-target output).
           const textOut = this.termRetriever.repair(partial.normalizedText, { language, isFinal: false });
           if (partial.epoch !== lane.epoch) continue;
           if (lane.lastText === textOut) continue;
@@ -972,6 +976,13 @@ export class LiveMediaPipeline {
       const recovery = this.#languageRecovery.get(language);
       const cooldownActive = Boolean(recovery && recovery.cooldownUntil > this.now());
       let translationFailureCode = null;
+      // Set when a combined engine's final simply lacked this lane. The
+      // original is published as `failed` (fail-open, contract ruling 2) and
+      // the lane is reported unavailable, but the miss must not count toward
+      // the three-strike cooldown: the provider cannot be re-asked, and after
+      // three misses `cooldownActive` would short-circuit BEFORE the fail-open
+      // publish, leaving the lane silent for 30 s with no seq consumed.
+      let isFailOpenMiss = false;
       try {
           const { ttsCompletion } = await queue.enqueue(async (signal) => {
             const requestSignal = AbortSignal.any([signal, processingSignal]);
@@ -1038,6 +1049,7 @@ export class LiveMediaPipeline {
               if (!(this.isCombined && hasErrorCode(error, new Set(["COMBINED_TRANSLATION_MISSING"])))) {
                 return { ttsCompletion: null };
               }
+              isFailOpenMiss = true;
               translatedText = repairedSourceText;
               translationStatus = "failed";
             }
@@ -1065,7 +1077,9 @@ export class LiveMediaPipeline {
             sourceLanguage: normalizedSourceLanguage || null,
             languageObservation,
             translationStatus,
-            ...(isSourceLane ? {} : { translationModel }),
+            // Only a translated caption names a model: nothing produced the
+            // text of a fail-open caption, and the source lane IS the original.
+            ...(translationStatus === "translated" ? { translationModel } : {}),
             ...(authoritativeSource.sourceUtteranceId ? {
               authoritativeSourceId: authoritativeSource.sourceUtteranceId,
               sourceSequence: authoritativeSource.sourceSeq,
@@ -1093,7 +1107,9 @@ export class LiveMediaPipeline {
           return { ttsCompletion: null };
         });
         if (ttsCompletion) await ttsCompletion;
-        if (translationFailureCode) {
+        if (isFailOpenMiss) {
+          this.#noteFailOpenMiss(language);
+        } else if (translationFailureCode) {
           await this.#recordLanguageFailure(language, translationFailureCode);
         } else if (!cooldownActive) {
           await this.#markLanguageRecovered(language);
@@ -1276,6 +1292,14 @@ export class LiveMediaPipeline {
     }
     recovery.status = "preparing";
     await this.#publishLanguageStatus(language, "preparing", statusCode);
+  }
+
+  /** A combined-engine final that lacked this lane: neither a strike nor a
+   *  recovery. Viewers were told `unavailable`, so remember that here and let
+   *  the next translated final re-announce `ready`. */
+  #noteFailOpenMiss(language) {
+    const recovery = this.#languageRecovery.get(language);
+    if (recovery) recovery.status = "unavailable";
   }
 
   async #markLanguageRecovered(language) {
