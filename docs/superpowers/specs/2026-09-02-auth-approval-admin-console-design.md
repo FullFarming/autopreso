@@ -97,3 +97,13 @@ create table public.desktop_login_codes (
 - 사용자 작업 체크리스트: (1) Google Cloud Console에서 OAuth 2.0 클라이언트(웹) 생성, 승인된 리디렉션 URI에 Supabase 콜백(`https://qahzljufcqbzwkdweeji.supabase.co/auth/v1/callback`) 등록. (2) Supabase Dashboard → Authentication → Providers → Google 활성화, 클라이언트 ID/시크릿 입력. (3) Authentication → URL Configuration에 `https://realtime-noel-web.vercel.app/auth/callback` 추가, 이메일 확인 활성화. (4) Vercel 환경변수 `ADMIN_BOOTSTRAP_EMAILS` 추가. 비밀 값은 채팅으로 전달하지 않는다.
 - 배포 순서: 마이그레이션 적용(수동, 파일명 순) → Vercel 배포(레거시 로그인 병행) → 시드 관리자 첫 구글 로그인으로 프로필 생성 확인 → 데스크톱 DMG(`nova` 스킴 등록) → 안정화 후 콘솔에서 레거시 로그인 비활성화.
 - 롤백: 마이그레이션은 추가 전용(기존 테이블 무변경)이라 웹 이전 배포로 되돌리면 동작 복구; 새 테이블은 유지.
+
+## 9. 개정 2026-09-04 — 엔진 배포 권한 (사용자 결정)
+
+사용자 결정: **전역 기본값 하나** · **호스트는 바꿀 수 없음(잠금)** · **진행 중인 세션에도 즉시 적용**.
+
+- **단일 권위.** `engine_defaults.engine`이 Live Call의 유일한 엔진이다. 호스트(웹·데스크톱)의 Live Call 엔진 선택은 읽기 전용 표시("관리자 지정: Soniox stt-rt-v5")로 바뀐다. `POST /api/live-sessions`·`PATCH /api/live-sessions/:id`에서 관리자 아닌 호출자가 보낸 `modelPreferences.engine`은 서버가 전역값으로 덮어쓴다(오류 아님, 서버 권위). 데스크톱 `subtitle.engine`은 **로컬 자막 전용**이며 Live Call 생성은 항상 `/api/live-config.engineDefaults`를 쓴다. §6의 `engineDefaultsSeen` 규칙은 폐기한다.
+- **배포 = 즉시 전환.** 콘솔 "배포" 버튼 → `PUT /api/console/engine-defaults { engine }` → (1) `set_engine_defaults_v1` 저장, (2) `status in ('preparing','live')`인 모든 세션의 `modelPreferences.engine` 갱신 + `engineHistory` 추가(Plan 2 Task 4의 필드), (3) 세션마다 게이트웨이 내부 엔드포인트 `POST /internal/sessions/:id/engine { engine }` 호출(기존 prewarm 내부 호출과 같은 공유 비밀 인증), (4) 게이트웨이는 새 파이프라인을 열어 준비되면 이전 것을 닫고(seq 계약 C1 유지, 기존 `update` 경로 재사용), 호스트에 `engine-status`, 뷰어에 `language-status preparing→ready`를 보낸다. 응답은 세션별 결과 목록 `{ sessionId, result: "switched" | "queued" | "failed", code? }`이며 콘솔은 이를 표로 보여 준다. 게이트웨이가 세션을 모르면(콜드) `queued` — 다음 활성화 때 DB 값이 적용된다.
+- **Plan 2 Task 5 재정의.** "데스크톱 설정 변경 → Live Call 핫스왑" 경로는 만들지 않는다. 대신 게이트웨이 내부 엔진 갱신 엔드포인트 + `engine-status` 이벤트 + 웹/데스크톱 호스트 UI의 읽기 전용 엔진 상태 표시.
+- **Plan B 조정.** Task 3의 `PUT`은 DB 저장까지(진행 중). 새 Task 6 "배포 푸시"가 (2)(3)을 맡고 Plan 2 Task 5 이후에 실행한다. Task 4 UI: 버튼 라벨 "배포", 확인 다이얼로그("진행 중인 세션 n개가 즉시 전환됩니다"), 결과 표. Task 5 데스크톱: 시드 규칙 대신 항상 전역값 사용(진행 중인 구현은 완료 후 수정 라운드에서 단순화).
+- **감사.** 배포마다 `profile_events.engine_defaults` 페이로드에 `{ engine, sessionsSwitched, sessionsFailed }`를 남긴다.
