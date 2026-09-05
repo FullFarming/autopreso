@@ -62,7 +62,17 @@
 
 NOVA 종료 → `/Applications/NOVA.app` 백업 → `dist/NOVA-0.2.3-arm64.dmg`로 교체(DMG 빌드만으로는 설치 앱이 바뀌지 않는다). 첫 실행에서 마이크·화면 권한을 다시 물을 수 있다. 확인: 설정에 엔진 선택이 **없고** 현재 배정 엔진이 읽기 전용으로 표시되는지, Google 로그인 → 시스템 브라우저 → `nova://` 복귀, Live Call 1회.
 
-## 4. 마이그레이션 확인 뒤 제가 실행할 것 (순서 고정)
+## 4. 실행 완료 (2026-09-05 밤)
+
+| 단계 | 결과 |
+|---|---|
+| 마이그레이션 | Supabase 커넥터 재연결 후 프로젝트 `qahzljufcqbzwkdweeji`(서울) 확인. `202609010001`~`202609050005`는 이미 적용되어 있었고, `202609050006`만 `apply_migration`으로 적용. 콘솔 RPC 12개 모두 `service_role` EXECUTE 확인 |
+| Vercel 프로덕션 | 배포 `dpl_6QRFkajqpQkfdcTvsF2uwYypJ1Yg` READY, `https://realtime-noel-web.vercel.app` 별칭 완료. `/login` 200(Google·회원가입 렌더), `/api/live-config` 익명 401(호스트 전용, 정상) |
+| Cloud Run | 트래픽 `realtime-noel-media-gateway-nova-20260905=100`, `/health` 200 |
+| 남은 사용자 단계 | §3-2 Google/Supabase 인증 설정(가이드 문서), §3-3 Soniox 한도, §3-4 DMG 설치, §6 실음성 검증 |
+
+원래 계획(참고):
+
 
 1. 리포 루트에서 `vercel deploy --prod`. 확인: `/api/live-config`(`captionEngines` 포함), `/login` 카드, `/console/users`에서 사용자별 엔진 전환 응답 표.
 2. 게이트웨이 트래픽 전환:
