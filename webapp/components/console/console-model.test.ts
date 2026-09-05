@@ -3,46 +3,22 @@ import test from "node:test";
 
 import {
   countActiveSessions,
+  countActiveSessionsForHost,
   deployCodeLabelKey,
   deployResultLabelKey,
-  filterTranslationOptions,
   formatConsoleDate,
   formatRange,
-  isEngineDirty,
-  languageModesFor,
-  reconcileEngineSelection,
   rejectReasons,
   sessionStatusLabelKey,
   statusLabelKey,
   summarizeSessions,
   summaryStatusLabelKey,
-  type ConsoleEngineCatalog,
+  voiceProviderLabel,
   type ConsoleSessionSummaryRow,
 } from "./console-model";
 
 const NOW = Date.parse("2026-09-04T09:30:00.000Z");
 const DAY = 24 * 60 * 60 * 1000;
-
-const catalog: ConsoleEngineCatalog = {
-  stt: [
-    { provider: "gemini", model: "gemini-3.5-transcribe-live", label: "Gemini 3.5 Transcribe Live", requiredApiKey: "gemini", available: true, languageModes: ["auto"] },
-    { provider: "soniox", model: "stt-rt-v5", label: "Soniox stt-rt-v5", requiredApiKey: "soniox", available: false, languageModes: ["auto", "ko", "en"] },
-  ],
-  translation: [
-    { provider: "gemini", model: "gemini-3.6-flash", label: "Gemini 3.6 Flash", requiredApiKey: "gemini", available: true, languageModes: [] },
-    { provider: "gemini", model: "gemini-3.7-flash", label: "Gemini 3.7 Flash", requiredApiKey: "gemini", available: true, languageModes: [] },
-    { provider: "soniox", model: "stt-rt-v5", label: "Soniox stt-rt-v5 (STT 결합)", requiredApiKey: "soniox", available: false, languageModes: ["auto", "ko", "en"], requiresSttProvider: "soniox", requiredLanguageCount: 2 },
-  ],
-  summary: [
-    { provider: "gemini", model: "gemini-3.6-flash", label: "Gemini 3.6 Flash", requiredApiKey: "gemini", available: true, languageModes: [] },
-  ],
-};
-
-const geminiEngine = {
-  stt: { provider: "gemini", model: "gemini-3.5-transcribe-live", languageMode: "auto" },
-  translation: { provider: "gemini", model: "gemini-3.6-flash" },
-  summary: { provider: "gemini", model: "gemini-3.6-flash" },
-};
 
 function session(overrides: Partial<ConsoleSessionSummaryRow>): ConsoleSessionSummaryRow {
   return { status: "stopped", createdAt: new Date(NOW - 3 * DAY).toISOString(), utteranceCount: 0, summaryStatus: null, ...overrides };
@@ -71,32 +47,21 @@ test("countActiveSessions is the number a deploy will switch immediately: prepar
   assert.equal(countActiveSessions([]), 0);
 });
 
-test("filterTranslationOptions hides combined engines whose STT provider is not selected", () => {
-  assert.deepEqual(filterTranslationOptions(catalog, "gemini").map((entry) => entry.model), ["gemini-3.6-flash", "gemini-3.7-flash"]);
-  assert.deepEqual(filterTranslationOptions(catalog, "soniox").map((entry) => `${entry.provider}/${entry.model}`), ["gemini/gemini-3.6-flash", "gemini/gemini-3.7-flash", "soniox/stt-rt-v5"]);
+test("countActiveSessionsForHost counts only that host's preparing/live sessions - what a per-user switch will touch", () => {
+  const rows = [
+    { hostId: "a", status: "live" }, { hostId: "a", status: "preparing" }, { hostId: "a", status: "ended" },
+    { hostId: "b", status: "live" }, { hostId: "b", status: "paused" },
+  ];
+  assert.equal(countActiveSessionsForHost(rows, "a"), 2);
+  assert.equal(countActiveSessionsForHost(rows, "b"), 1);
+  assert.equal(countActiveSessionsForHost(rows, "c"), 0);
+  assert.equal(countActiveSessionsForHost([], "a"), 0);
 });
 
-test("languageModesFor follows the STT entry and falls back to auto for an unknown entry", () => {
-  assert.deepEqual(languageModesFor(catalog, "gemini", "gemini-3.5-transcribe-live"), ["auto"]);
-  assert.deepEqual(languageModesFor(catalog, "soniox", "stt-rt-v5"), ["auto", "ko", "en"]);
-  assert.deepEqual(languageModesFor(catalog, "nope", "x"), ["auto"]);
-});
-
-test("reconcileEngineSelection repairs a translation or language mode the new STT no longer allows", () => {
-  const sonioxCombined = { ...geminiEngine, stt: { provider: "soniox", model: "stt-rt-v5", languageMode: "ko" }, translation: { provider: "soniox", model: "stt-rt-v5" } };
-  const backToGemini = reconcileEngineSelection(catalog, { ...sonioxCombined, stt: { provider: "gemini", model: "gemini-3.5-transcribe-live", languageMode: "ko" } });
-  assert.deepEqual(backToGemini, geminiEngine);
-  // A valid selection is returned unchanged (same reference), so a dirty check stays honest.
-  assert.equal(reconcileEngineSelection(catalog, geminiEngine), geminiEngine);
-  assert.equal(reconcileEngineSelection(catalog, sonioxCombined), sonioxCombined);
-});
-
-test("isEngineDirty compares the three roles plus the STT language mode structurally", () => {
-  assert.equal(isEngineDirty(geminiEngine, { ...geminiEngine }), false);
-  assert.equal(isEngineDirty(geminiEngine, { ...geminiEngine, stt: { ...geminiEngine.stt, languageMode: "ko" } }), true);
-  assert.equal(isEngineDirty(geminiEngine, { ...geminiEngine, translation: { provider: "gemini", model: "gemini-3.7-flash" } }), true);
-  assert.equal(isEngineDirty(geminiEngine, null), false);
-  assert.equal(isEngineDirty(null, geminiEngine), false);
+test("voiceProviderLabel shows the brand names and never falls through to a raw value", () => {
+  assert.equal(voiceProviderLabel("soniox"), "Soniox");
+  assert.equal(voiceProviderLabel("gemini"), "Gemini");
+  assert.equal(voiceProviderLabel(undefined), "Soniox", "an unset assignment is the D2 default");
 });
 
 test("label keys map every status to a message key and never fall through to raw values", () => {

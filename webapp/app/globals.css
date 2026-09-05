@@ -1960,6 +1960,13 @@ th.console-num, td.console-num { text-align: right; }
 .console-deploy-row .live-primary-action { min-height: var(--nova-control-height); border-radius: var(--nova-radius-sm); }
 .console-last-change { flex: 1 1 240px; }
 .console-status-line { margin: 0; color: var(--nova-status-ok); font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
+/* D1: per-session engine switch results shown under a user's engine select. */
+.console-row-status { display: grid; gap: 6px; margin-top: 8px; }
+.console-row-status .console-status-line { color: var(--nova-fg-secondary); }
+.console-row-results { display: grid; gap: 4px; margin: 0; padding: 0; list-style: none; }
+.console-row-results li { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
+.console-row-results code { font-variant-numeric: tabular-nums; color: var(--nova-fg-secondary); word-break: break-all; }
+.console-result-code { color: var(--nova-fg-secondary); }
 .console-switch-row { cursor: pointer; }
 .console-switch-row small { display: block; white-space: normal; }
 .console-dialog { width: min(92vw, 440px); padding: 24px; border: 1px solid var(--nova-surface-hairline); border-radius: var(--nova-radius-md, 12px); background: var(--nova-surface-base); color: var(--nova-fg-primary); }

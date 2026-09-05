@@ -1,30 +1,12 @@
 // Pure helpers for the admin console panels. No React, no fetch: everything here is unit-tested
 // with a fixed `now` in console-model.test.ts, and the panels only render what these return.
 
-import type { EngineSelection } from "@/lib/console/engine-defaults";
 // Relative on purpose: the node test loader resolves no `@/` alias, and this is the module's only value import.
 import { CONSOLE_ERROR_MESSAGE_KEYS } from "../../lib/system-language/console-messages";
 
 export type ConsoleRange = "7d" | "30d" | "all";
 export type ProfileFilter = "pending" | "approved" | "rejected" | "disabled";
 export type RejectReason = "unverified" | "duplicate" | "other";
-
-/** One catalog entry as `GET /api/console/engine-defaults` returns it (`captionEngineCatalogForClient`). */
-export interface ConsoleEngineCatalogEntry {
-  provider: string;
-  model: string;
-  label: string;
-  requiredApiKey: string;
-  available: boolean;
-  languageModes: readonly string[];
-  requiresSttProvider?: string;
-  requiredLanguageCount?: number;
-}
-export interface ConsoleEngineCatalog {
-  stt: readonly ConsoleEngineCatalogEntry[];
-  translation: readonly ConsoleEngineCatalogEntry[];
-  summary: readonly ConsoleEngineCatalogEntry[];
-}
 
 /** The subset of `ConsoleSessionRow` the summary and deploy-count helpers read. */
 export interface ConsoleSessionSummaryRow {
@@ -64,47 +46,19 @@ export function summarizeSessions(rows: readonly ConsoleSessionSummaryRow[], now
   return summary;
 }
 
-/** Sessions a deploy switches immediately (spec §9): `preparing` and `live`. */
+/** Sessions a switch touches immediately (spec §9): `preparing` and `live`. */
 export function countActiveSessions(rows: readonly Pick<ConsoleSessionSummaryRow, "status">[]): number {
   return rows.reduce((count, row) => count + (row.status === "preparing" || row.status === "live" ? 1 : 0), 0);
 }
 
-/** Translation entries usable with the selected STT provider: combined engines need their own STT. */
-export function filterTranslationOptions(catalog: ConsoleEngineCatalog, sttProvider: string): ConsoleEngineCatalogEntry[] {
-  return catalog.translation.filter((entry) => entry.requiresSttProvider === undefined || entry.requiresSttProvider === sttProvider);
+/** D1: a per-user engine change switches only that host's running sessions - the number the confirm dialog quotes. */
+export function countActiveSessionsForHost(rows: readonly { hostId: string; status: string }[], hostId: string): number {
+  return countActiveSessions(rows.filter((row) => row.hostId === hostId));
 }
 
-/** Language modes the selected STT entry allows; an unknown entry only offers auto. */
-export function languageModesFor(catalog: ConsoleEngineCatalog, sttProvider: string, sttModel: string): string[] {
-  const entry = catalog.stt.find((candidate) => candidate.provider === sttProvider && candidate.model === sttModel);
-  return entry && entry.languageModes.length > 0 ? [...entry.languageModes] : ["auto"];
-}
-
-/**
- * After an STT change the translation or language mode may no longer be allowed; fall back to the
- * first valid option so the form never submits a combination the catalog would reject. Returns the
- * same reference when nothing needs fixing so dirty-tracking stays exact.
- */
-export function reconcileEngineSelection(catalog: ConsoleEngineCatalog, engine: EngineSelection): EngineSelection {
-  const translations = filterTranslationOptions(catalog, engine.stt.provider);
-  const translationValid = translations.some((entry) => entry.provider === engine.translation.provider && entry.model === engine.translation.model);
-  const modes = languageModesFor(catalog, engine.stt.provider, engine.stt.model);
-  const modeValid = modes.includes(engine.stt.languageMode);
-  if (translationValid && modeValid) return engine;
-  const fallbackTranslation = translations.find((entry) => entry.available) ?? translations[0];
-  return {
-    stt: modeValid ? engine.stt : { ...engine.stt, languageMode: modes[0] ?? "auto" },
-    translation: translationValid || !fallbackTranslation ? engine.translation : { provider: fallbackTranslation.provider, model: fallbackTranslation.model },
-    summary: engine.summary,
-  };
-}
-
-/** Structural comparison of the three roles plus the STT language mode; `false` while either side is not loaded. */
-export function isEngineDirty(saved: EngineSelection | null, draft: EngineSelection | null): boolean {
-  if (!saved || !draft) return false;
-  return saved.stt.provider !== draft.stt.provider || saved.stt.model !== draft.stt.model || saved.stt.languageMode !== draft.stt.languageMode
-    || saved.translation.provider !== draft.translation.provider || saved.translation.model !== draft.translation.model
-    || saved.summary.provider !== draft.summary.provider || saved.summary.model !== draft.summary.model;
+/** Provider brand names are not translated; an unset assignment reads as the D2 default. */
+export function voiceProviderLabel(provider: string | undefined): string {
+  return provider === "gemini" ? "Gemini" : "Soniox";
 }
 
 export function statusLabelKey(status: string): string {
@@ -131,12 +85,6 @@ export function summaryStatusLabelKey(status: ConsoleSessionSummaryRow["summaryS
 
 export function sessionModeLabelKey(mode: string): string {
   return mode === "meeting" ? "회의" : "발표";
-}
-
-export function languageModeLabelKey(mode: string): string {
-  if (mode === "ko") return "한국어";
-  if (mode === "en") return "영어";
-  return "자동 감지";
 }
 
 const DEPLOY_RESULT_LABEL_KEYS: Readonly<Record<string, string>> = Object.freeze({ switched: "전환됨", queued: "대기열", failed: "실패" });

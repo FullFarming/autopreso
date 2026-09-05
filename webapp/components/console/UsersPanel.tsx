@@ -3,25 +3,36 @@
 import { useCallback, useEffect, useId, useRef, useState } from "react";
 
 import { useSystemLanguage, useSystemText } from "@/components/system-language/SystemLanguageProvider";
-import type { ConsoleProfileRow } from "@/lib/console/console-store";
+import type { ConsoleProfileRow, ConsoleSessionRow, EngineDeploySummary, VoiceProvider } from "@/lib/console/console-store";
 import { SYSTEM_LOCALES } from "@/lib/system-language";
 import { consoleMessages } from "@/lib/system-language/console-messages";
 
 import { ConfirmDialog } from "./ConfirmDialog";
 import { consoleErrorKey, consoleFetch } from "./console-client";
 import { useConsolePending } from "./ConsoleShell";
-import { buildRejectReason, emptyStateKey, formatConsoleDate, REJECT_REASON_LABEL_KEYS, rejectReasons, statusLabelKey, type ProfileFilter, type RejectReason } from "./console-model";
+import {
+  buildRejectReason, countActiveSessionsForHost, deployCodeLabelKey, deployResultLabelKey, emptyStateKey, formatConsoleDate, REJECT_REASON_LABEL_KEYS, rejectReasons, statusLabelKey, voiceProviderLabel,
+  type ProfileFilter, type RejectReason,
+} from "./console-model";
 
 interface UsersResponse { profiles: ConsoleProfileRow[]; pendingCount: number }
-type PatchBody = { profileId: string; status: "approved" | "rejected" | "disabled"; reason?: string } | { profileId: string; role: "host" | "admin" } | { profileId: string; voiceProvider: "soniox" | "gemini" };
+interface SessionsResponse { sessions: ConsoleSessionRow[] }
+type PatchBody = { profileId: string; status: "approved" | "rejected" | "disabled"; reason?: string } | { profileId: string; role: "host" | "admin" };
+/** `PATCH { voiceProvider }` answer (D1): the profile plus what happened to each of that user's running sessions. */
+interface VoiceAssignmentResult { sessionId: string; result: "switched" | "queued" | "failed"; code?: string }
+interface VoiceAssignmentResponse { id: string; status: string; role: string; voiceProvider: VoiceProvider; results: VoiceAssignmentResult[]; summary: EngineDeploySummary }
+interface VoiceAssignmentOutcome { voiceProvider: VoiceProvider; results: VoiceAssignmentResult[]; summary: EngineDeploySummary }
+/** The pending engine switch: `activeCount` is `null` while the session list loads and `"unknown"` when it could not be read. */
+interface VoiceTarget { row: ConsoleProfileRow; voiceProvider: VoiceProvider; activeCount: number | null | "unknown" }
 
 const FILTERS: readonly ProfileFilter[] = ["pending", "approved", "rejected", "disabled"];
 const FILTER_LABEL_KEYS: Record<ProfileFilter, string> = { pending: "대기", approved: "승인", rejected: "반려", disabled: "비활성" };
 
 /**
- * `/console/users`: signup approval, roles, disable/reactivate. Nothing is patched locally -
- * every mutation is followed by a fresh `GET`, so the table and the rail badge only ever show
- * what the server confirmed. One request in flight per row (`aria-busy`), errors inline per row.
+ * `/console/users`: signup approval, roles, disable/reactivate, and the per-user Live Call engine
+ * (D1: operator-assigned, applied to the user's running sessions immediately). Nothing is patched
+ * locally - every mutation is followed by a fresh `GET`, so the table and the rail badge only ever
+ * show what the server confirmed. One request in flight per row (`aria-busy`), errors inline per row.
  */
 export function UsersPanel() {
   const t = useSystemText(consoleMessages);
@@ -36,6 +47,8 @@ export function UsersPanel() {
   const [rowErrors, setRowErrors] = useState<Record<string, string>>({});
   const [rejecting, setRejecting] = useState<{ id: string; reason: RejectReason; note: string } | null>(null);
   const [disableTarget, setDisableTarget] = useState<ConsoleProfileRow | null>(null);
+  const [voiceTarget, setVoiceTarget] = useState<VoiceTarget | null>(null);
+  const [voiceOutcomes, setVoiceOutcomes] = useState<Record<string, VoiceAssignmentOutcome>>({});
   const requestSerial = useRef(0);
   const headingId = useId();
 
@@ -73,6 +86,63 @@ export function UsersPanel() {
       setDisableTarget(null);
       setBusyId(null);
     }
+  }
+
+  /**
+   * The select is controlled by the server row, so a cancelled confirm simply re-renders the old
+   * value. The confirm quotes how many of this host's sessions are running (all-time list, filtered
+   * client-side); a failed count still allows the switch with the "every running session" copy.
+   */
+  async function openVoiceConfirm(row: ConsoleProfileRow, voiceProvider: VoiceProvider) {
+    setVoiceTarget({ row, voiceProvider, activeCount: null });
+    let activeCount: number | "unknown" = "unknown";
+    try {
+      const data = await consoleFetch<SessionsResponse>("/api/console/sessions?range=all");
+      activeCount = countActiveSessionsForHost(data.sessions, row.hostId);
+    } catch {
+      activeCount = "unknown";
+    }
+    setVoiceTarget((current) => (current && current.row.id === row.id && current.voiceProvider === voiceProvider ? { ...current, activeCount } : current));
+  }
+
+  async function assignVoiceProvider(row: ConsoleProfileRow, voiceProvider: VoiceProvider) {
+    setBusyId(row.id);
+    setRowErrors((current) => { const next = { ...current }; delete next[row.id]; return next; });
+    setVoiceOutcomes((current) => { const next = { ...current }; delete next[row.id]; return next; });
+    try {
+      const data = await consoleFetch<VoiceAssignmentResponse>("/api/console/users", { method: "PATCH", body: { profileId: row.id, voiceProvider } });
+      setVoiceOutcomes((current) => ({ ...current, [row.id]: { voiceProvider: data.voiceProvider, results: data.results, summary: data.summary } }));
+      await loadProfiles(filter);
+    } catch (error) {
+      setRowErrors((current) => ({ ...current, [row.id]: consoleErrorKey(error, "엔진을 바꾸지 못했습니다.") }));
+    } finally {
+      // Close on failure as well, so the row's inline alert is not hidden behind the dialog backdrop.
+      setVoiceTarget(null);
+      setBusyId(null);
+    }
+  }
+
+  function renderVoiceOutcome(outcome: VoiceAssignmentOutcome) {
+    return (
+      <div className="console-row-status" role="status">
+        <p className="console-status-line">
+          {t("{engine}(으)로 전환: 전환됨 {switched} · 대기열 {queued} · 실패 {failed}", {
+            engine: voiceProviderLabel(outcome.voiceProvider), switched: outcome.summary.switched, queued: outcome.summary.queued, failed: outcome.summary.failed,
+          })}
+        </p>
+        {outcome.results.length > 0 && (
+          <ul className="console-row-results" aria-label={t("세션별 전환 결과")}>
+            {outcome.results.map((entry) => (
+              <li key={entry.sessionId}>
+                <code>{entry.sessionId}</code>
+                <span className={`console-status console-result-${entry.result}`}>{t(deployResultLabelKey(entry.result))}</span>
+                {entry.code !== undefined && <span className="console-result-code">{t(deployCodeLabelKey(entry.code))}</span>}
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>
+    );
   }
 
   function renderActions(row: ConsoleProfileRow) {
@@ -156,7 +226,7 @@ export function UsersPanel() {
               <th scope="col" role="columnheader">{t("가입일")}</th>
               <th scope="col" role="columnheader">{t("상태")}</th>
               <th scope="col" role="columnheader">{t("역할")}</th>
-              <th scope="col" role="columnheader">다음 세션 엔진</th>
+              <th scope="col" role="columnheader">{t("라이브 콜 엔진")}</th>
               <th scope="col" role="columnheader">{t("마지막 로그인")}</th>
               <th scope="col" role="columnheader">{t("작업")}</th>
             </tr>
@@ -175,18 +245,19 @@ export function UsersPanel() {
                 <td role="cell" data-label={t("가입일")} className="console-num">{formatConsoleDate(row.createdAt, locale)}</td>
                 <td role="cell" data-label={t("상태")}><span className={`console-status console-status-${row.status}`}>{t(statusLabelKey(row.status))}</span></td>
                 <td role="cell" data-label={t("역할")}>{row.role === "admin" ? t("관리자") : t("호스트")}</td>
-                <td role="cell" data-label="다음 세션 엔진">
+                <td role="cell" data-label={t("라이브 콜 엔진")}>
                   <label className="console-inline-field">
-                    <span className="sr-only">{row.email} 다음 세션 엔진</span>
-                    <select aria-label={`${row.email} 다음 세션 엔진`} value={row.voiceProvider ?? "soniox"} disabled={busyId === row.id}
+                    <span className="console-sr-only">{t("{email} 라이브 콜 엔진", { email: row.email })}</span>
+                    <select value={row.voiceProvider ?? "soniox"} disabled={busyId === row.id}
                       onChange={(event) => {
                         const voiceProvider = event.currentTarget.value;
-                        if (voiceProvider === "soniox" || voiceProvider === "gemini") void patchProfile({ profileId: row.id, voiceProvider });
+                        if ((voiceProvider === "soniox" || voiceProvider === "gemini") && voiceProvider !== (row.voiceProvider ?? "soniox")) void openVoiceConfirm(row, voiceProvider);
                       }}>
-                      <option value="soniox">Soniox</option>
-                      <option value="gemini">Gemini</option>
+                      <option value="soniox">{voiceProviderLabel("soniox")}</option>
+                      <option value="gemini">{voiceProviderLabel("gemini")}</option>
                     </select>
                   </label>
+                  {voiceOutcomes[row.id] && renderVoiceOutcome(voiceOutcomes[row.id])}
                 </td>
                 <td role="cell" data-label={t("마지막 로그인")} className="console-num">{formatConsoleDate(row.lastLoginAt, locale) || t("없음")}</td>
                 <td role="cell" data-label={t("작업")}>
@@ -207,6 +278,22 @@ export function UsersPanel() {
         busy={disableTarget !== null && busyId === disableTarget.id}
         onCancel={() => setDisableTarget(null)}
         onConfirm={() => { if (disableTarget) return patchProfile({ profileId: disableTarget.id, status: "disabled" }); }}
+      />
+      <ConfirmDialog
+        variant="primary"
+        open={voiceTarget !== null}
+        title={t("{email}의 엔진을 {engine}(으)로 바꿀까요?", { email: voiceTarget?.row.email ?? "", engine: voiceProviderLabel(voiceTarget?.voiceProvider) })}
+        body={(
+          <p>
+            {voiceTarget?.activeCount === null && t("불러오는 중…")}
+            {voiceTarget?.activeCount === "unknown" && t("진행 중인 세션 수를 확인할 수 없습니다. 이 사용자의 진행 중인 세션은 모두 즉시 전환됩니다.")}
+            {typeof voiceTarget?.activeCount === "number" && t("이 사용자의 진행 중인 세션 {count}개가 즉시 전환됩니다. 다음 세션부터도 이 엔진을 사용합니다.", { count: voiceTarget.activeCount })}
+          </p>
+        )}
+        confirmLabel={t("전환")}
+        busy={voiceTarget !== null && (voiceTarget.activeCount === null || busyId === voiceTarget.row.id)}
+        onCancel={() => setVoiceTarget(null)}
+        onConfirm={() => { if (voiceTarget) return assignVoiceProvider(voiceTarget.row, voiceTarget.voiceProvider); }}
       />
     </section>
   );

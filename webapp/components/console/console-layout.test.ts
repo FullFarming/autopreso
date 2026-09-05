@@ -76,29 +76,37 @@ test("tables scroll inside their wrapper, numbers are tabular, rows report busy 
   assert.match(sessions, /className="console-num"/u);
 });
 
-test("engine defaults apply next session and user assignments expose two providers", () => {
-  assert.doesNotMatch(engine, /console\/sessions\?range=all/u);
-  assert.doesNotMatch(engine, /즉시 전환됩니다/u);
-  assert.match(engine, /다음 세션부터 적용됩니다/u);
-  assert.match(users, /voiceProvider/u);
-  assert.match(users, /다음 세션 엔진/u);
-  assert.match(engine, /<ConfirmDialog/u);
-  assert.match(engine, /results/u);
-  assert.match(engine, /role="status"/u);
-  // M-2: the results table never falls through on an unexpected result or code, the id cell is not a
-  // number, and the table itself is announced like the no-results status line.
-  assert.match(engine, /deployResultLabelKey\(row\.result\)/u);
-  assert.match(engine, /deployCodeLabelKey\(row\.code\)/u);
-  assert.doesNotMatch(engine, /RESULT_LABEL_KEYS\[/u);
-  assert.doesNotMatch(engine, /<td className="console-num">\{row\.sessionId\}/u);
-  assert.match(engine, /<div className="console-table-wrap" role="status">/u);
-  // I-2: both dialogs close in finally, so a failure alert renders in front of the operator.
-  assert.match(engine, /finally \{[^}]*setIsConfirmOpen\(false\)/u);
-  assert.match(engine, /finally \{[^}]*setIsLegacyConfirmOpen\(false\)/u);
-  assert.match(engine, /isEngineDirty\(/u);
-  assert.match(engine, /disabled=\{[^}]*available === false/u, "unavailable catalog entries are disabled options");
+test("D1: the engine page has no global engine control; per-user engines are switched from the users table behind a confirm and report per-session results", () => {
+  // The dead global select, its 저장/배포 button and its confirm are gone: engine_defaults decides nothing.
+  assert.doesNotMatch(engine, /<select/u);
+  assert.doesNotMatch(engine, /engine-defaults/u);
+  assert.doesNotMatch(engine, /isEngineDirty|reconcileEngineSelection|ConsoleEngineCatalog/u);
+  assert.doesNotMatch(engine, /setIsConfirmOpen|deploy\(/u);
+  assert.equal(engine.match(/<ConfirmDialog/gu)?.length, 1, "only the legacy-login confirm remains");
+  assert.match(engine, /t\("기본 엔진: Soniox 인식\+번역\. 사용자별 엔진은 사용자 탭에서 바꾸며 즉시 적용됩니다\."\)/u);
+  assert.match(engine, /href="\/console\/users"/u);
+  // The account section (legacy login switch) is untouched.
   assert.match(engine, /legacyPasswordLoginEnabled/u);
   assert.match(engine, /method: "PUT"/u);
+  assert.match(engine, /finally \{[^}]*setIsLegacyConfirmOpen\(false\)/u);
+
+  // Users: the voiceProvider select opens a confirm that counts this host's running sessions from the all-time session list.
+  assert.match(users, /voiceProvider/u);
+  assert.match(users, /console\/sessions\?range=all/u);
+  assert.match(users, /countActiveSessionsForHost\(/u);
+  assert.equal(users.match(/<ConfirmDialog/gu)?.length, 2, "disable confirm + engine switch confirm");
+  assert.match(users, /t\("이 사용자의 진행 중인 세션 \{count\}개가 즉시 전환됩니다\. 다음 세션부터도 이 엔진을 사용합니다\.", \{ count: /u);
+  assert.match(users, /t\("진행 중인 세션 수를 확인할 수 없습니다\. 이 사용자의 진행 중인 세션은 모두 즉시 전환됩니다\."\)/u);
+  // A cancelled confirm leaves the controlled select on the server value: nothing is patched locally.
+  assert.doesNotMatch(users, /setProfiles\(\(current\)/u);
+  // Per-session results render inline in the row and are announced; labels never fall through.
+  assert.match(users, /role="status"/u);
+  assert.match(users, /deployResultLabelKey\(/u);
+  assert.match(users, /deployCodeLabelKey\(/u);
+  assert.match(users, /finally \{[^}]*setVoiceTarget\(null\)/u, "the engine confirm closes on failure too");
+  // The old "next session engine" framing is gone from both panels.
+  assert.doesNotMatch(users, /다음 세션 엔진/u);
+  assert.doesNotMatch(engine, /다음 세션부터 적용됩니다|다음 세션 설정/u);
 });
 
 test("the confirm dialog is a native dialog opened with showModal, cancel first and focused, escape closes", () => {
@@ -131,6 +139,14 @@ test("every console string goes through the three-language console dictionary an
     for (const match of source.matchAll(/\bt\("([^"]+)"/gu)) {
       assert.ok(Object.hasOwn(consoleMessages.ko, match[1]), `${name}: missing console message "${match[1]}"`);
     }
+    // Every Korean literal is a dictionary key (so the panel never shows Korean to an en/ja operator), and no Korean sits in JSX text or template strings.
+    const code = source.replace(/\/\*[\s\S]*?\*\//gu, "").replace(/^\s*\/\/.*$/gmu, "");
+    for (const match of code.matchAll(/"([^"\n]*[가-힣][^"\n]*)"/gu)) {
+      assert.ok(Object.hasOwn(consoleMessages.ko, match[1]), `${name}: Korean literal outside the dictionary "${match[1]}"`);
+    }
+    // `${t("…")}` inside a template is dictionary copy; only the literal parts must be Korean-free.
+    for (const match of code.matchAll(/`[^`]*`/gu)) assert.doesNotMatch(match[0].replace(/\$\{[^}]*\}/gu, ""), /[가-힣]/u, `${name}: Korean inside a template literal`);
+    assert.doesNotMatch(code, />[^<{}]*[가-힣][^<{}]*</u, `${name}: raw Korean JSX text`);
     assert.doesNotMatch(source, /[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}]/u, `${name}: no emoji icons`);
     assert.doesNotMatch(source, /console\.(log|info|warn|error)\(/u, name);
   }
