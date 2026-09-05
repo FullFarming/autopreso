@@ -651,7 +651,7 @@ export default function LiveViewer({ compact = false }: { compact?: boolean }) {
         const missingResource = summaryRecord || isSummaryEmpty ? "transcript" : isTranscriptLoaded ? "summary" : "both";
         return loadMinutes(languageRef.current, missingResource);
       },
-      onExhausted: () => { setMinutesPollingState("exhausted"); setSummaryError("요약 상태 확인이 지연되고 있습니다. 다시 확인해 주세요."); },
+      onExhausted: (reason) => { setMinutesPollingState("exhausted"); setSummaryError(getSafeSummaryErrorMessage(reason)); },
       onError: () => {
         setMinutesPollingState("failed");
         setSummaryError(getSafeSummaryErrorMessage(undefined));

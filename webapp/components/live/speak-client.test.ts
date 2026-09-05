@@ -6,7 +6,10 @@ import {
   SpeakCaptureError,
   prepareSpeakCapture,
 } from "./speak-client";
-import { getSummaryPollDelayMilliseconds, startSummaryPollLoop } from "./meeting-summary-polling";
+import { getSummaryPollDelayMilliseconds, MAX_POLLING_WALL_CLOCK_MS, startSummaryPollLoop } from "./meeting-summary-polling";
+import { getSafeSummaryErrorMessage, shouldResetSummaryGeneration } from "./useHostSummaryLifecycle";
+import { recordsMessages } from "../../lib/system-language/records-messages";
+import { viewerMessages } from "../../lib/system-language/viewer-messages";
 
 function replaceGlobal(name: string, value: unknown): () => void {
   const descriptor = Object.getOwnPropertyDescriptor(globalThis, name);
@@ -713,7 +716,7 @@ test("authoritative pending stays pollable beyond six rounds while hidden pages 
   let reads = 0; let exhausted = 0; let hidden = false; let pending = true;
   const stop = startSummaryPollLoop({
     poll: async () => { reads += 1; return pending ? "pending" : true; },
-    onExhausted: () => { exhausted += 1; }, onError: () => assert.fail("unexpected error"),
+    onExhausted: (reason) => { exhausted += 1; assert.equal(reason, "SUMMARY_READ_EXHAUSTED"); }, onError: () => assert.fail("unexpected error"),
     isHidden: () => hidden, random: () => 1,
     timerApi: { setTimeout: (callback, delay) => { assert.ok(delay <= 25_000); timers.push(callback); return timers.length; }, clearTimeout: () => {} },
   });
@@ -724,4 +727,36 @@ test("authoritative pending stays pollable beyond six rounds while hidden pages 
   hidden = false; pending = false;
   for (let round = 0; round < 6; round += 1) await tick();
   assert.equal(exhausted, 1); assert.equal(timers.length, 0); stop();
+});
+
+test("summary polling gives up with SUMMARY_GENERATION_STALLED once pending answers pass the 30 minute wall clock", async () => {
+  assert.equal(MAX_POLLING_WALL_CLOCK_MS, 30 * 60_000);
+  const timers: Array<{ callback: () => void; delay: number }> = [];
+  let nowMs = 1_000_000; let reads = 0; const reasons: string[] = [];
+  startSummaryPollLoop({
+    poll: async () => { reads += 1; return "pending"; },
+    onExhausted: (reason) => { reasons.push(reason); }, onError: () => assert.fail("unexpected error"),
+    isHidden: () => false, random: () => 0, now: () => nowMs,
+    timerApi: { setTimeout: (callback, delay) => { timers.push({ callback, delay }); return timers.length; }, clearTimeout: () => {} },
+  });
+  const tick = async () => { const timer = timers.shift(); assert.ok(timer); nowMs += timer.delay; timer.callback(); await Promise.resolve(); await Promise.resolve(); };
+  while (reasons.length === 0) { assert.ok(reads < 200, "the cap must trigger within a bounded number of polls"); await tick(); }
+  assert.deepEqual(reasons, ["SUMMARY_GENERATION_STALLED"]);
+  const elapsed = nowMs - 1_000_000;
+  assert.ok(elapsed >= MAX_POLLING_WALL_CLOCK_MS && elapsed < MAX_POLLING_WALL_CLOCK_MS + 25_000, `stops at the cap, not a poll later (${elapsed})`);
+  assert.equal(timers.length, 0, "no further poll is scheduled after the cap");
+
+  // Both surfaces map the reason through the shared copy so the existing
+  // "다시 확인" retry (a new pollingRound) restarts the clock.
+  const hostLifecycle = readFileSync(new URL("./useHostSummaryLifecycle.ts", import.meta.url), "utf8");
+  const viewer = readFileSync(new URL("./LiveViewer.tsx", import.meta.url), "utf8");
+  assert.match(hostLifecycle, /onExhausted: \(reason\) => \{[\s\S]*?setSummaryError\(getSafeSummaryErrorMessage\(reason\)\)/u);
+  assert.match(viewer, /onExhausted: \(reason\) => \{[\s\S]*?setSummaryError\(getSafeSummaryErrorMessage\(reason\)\)/u);
+  assert.equal(getSafeSummaryErrorMessage("SUMMARY_GENERATION_STALLED"), "요약 생성이 30분이 지나도 끝나지 않았습니다. 다시 확인해 주세요.");
+  assert.equal(getSafeSummaryErrorMessage("SUMMARY_READ_EXHAUSTED"), "요약 상태 확인이 지연되고 있습니다. 다시 확인해 주세요.");
+  assert.equal(shouldResetSummaryGeneration("SUMMARY_GENERATION_STALLED"), false, "retry re-polls; it does not reset the job");
+  for (const language of ["ko", "en", "ja"] as const) {
+    assert.ok(viewerMessages[language]["요약 생성이 30분이 지나도 끝나지 않았습니다. 다시 확인해 주세요."]?.trim(), `viewer ${language}`);
+    assert.ok(recordsMessages[language]["요약 생성이 30분이 지나도 끝나지 않았습니다. 다시 확인해 주세요."]?.trim(), `records ${language}`);
+  }
 });

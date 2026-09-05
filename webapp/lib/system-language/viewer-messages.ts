@@ -3,6 +3,7 @@ import type { SystemMessages, SystemTextValues } from "../system-language";
 export const viewerMessages: SystemMessages = {
   "ko": {
     "요약 상태 확인이 지연되고 있습니다. 다시 확인해 주세요.": "요약 상태 확인이 지연되고 있습니다. 다시 확인해 주세요.",
+    "요약 생성이 30분이 지나도 끝나지 않았습니다. 다시 확인해 주세요.": "요약 생성이 30분이 지나도 끝나지 않았습니다. 다시 확인해 주세요.",
     "English": "영어",
     "Korean": "한국어",
     "Japanese": "일본어",
@@ -220,6 +221,7 @@ export const viewerMessages: SystemMessages = {
   },
   "en": {
     "요약 상태 확인이 지연되고 있습니다. 다시 확인해 주세요.": "Checking the summary is taking longer. Please check again.",
+    "요약 생성이 30분이 지나도 끝나지 않았습니다. 다시 확인해 주세요.": "The summary has not finished after 30 minutes. Please check again.",
     "English": "English",
     "Korean": "Korean",
     "Japanese": "Japanese",
@@ -437,6 +439,7 @@ export const viewerMessages: SystemMessages = {
   },
   "ja": {
     "요약 상태 확인이 지연되고 있습니다. 다시 확인해 주세요.": "要約の状態確認が遅れています。もう一度確認してください。",
+    "요약 생성이 30분이 지나도 끝나지 않았습니다. 다시 확인해 주세요.": "要約の生成が30分を過ぎても完了していません。もう一度確認してください。",
     "English": "英語",
     "Korean": "韓国語",
     "Japanese": "日本語",

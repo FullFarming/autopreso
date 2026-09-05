@@ -47,6 +47,10 @@ export function getSafeSummaryErrorMessage(code: string | undefined): string {
   // An empty record is a state, not an error: it carries no failure copy.
   if (isSummaryEmptyCode(code)) return "";
   if (code === "SUMMARY_FORBIDDEN") return "회의 요약을 볼 권한이 없습니다.";
+  // Polling gave up on its own: reads kept failing, or the job stayed RUNNING
+  // past the 30 minute wall-clock cap. Both keep the "다시 확인" retry path.
+  if (code === "SUMMARY_READ_EXHAUSTED") return "요약 상태 확인이 지연되고 있습니다. 다시 확인해 주세요.";
+  if (code === "SUMMARY_GENERATION_STALLED") return "요약 생성이 30분이 지나도 끝나지 않았습니다. 다시 확인해 주세요.";
   if (code === "SUMMARY_GENERATION_RETRYABLE_FAILED"
     || code === "SUMMARY_PROVIDER_RATE_LIMITED"
     || code === "SUMMARY_PROVIDER_UNAVAILABLE"
@@ -220,7 +224,11 @@ export function useHostSummaryLifecycle(endedSession: EndedSessionReference | nu
       if (isDisposed || !shouldContinue) return;
       stopPolling = startSummaryPollLoop({
         poll: loadSummary,
-        onExhausted: () => { setPollingState("exhausted"); setSummaryFailureCode(SUMMARY_REQUEST_FAILURE_CODE); setSummaryError("요약 상태 확인이 지연되고 있습니다. 다시 확인해 주세요."); },
+        onExhausted: (reason) => {
+          setPollingState("exhausted");
+          setSummaryFailureCode(reason === "SUMMARY_GENERATION_STALLED" ? reason : SUMMARY_REQUEST_FAILURE_CODE);
+          setSummaryError(getSafeSummaryErrorMessage(reason));
+        },
         onError: () => { setPollingState("failed"); setSummaryFailureCode(SUMMARY_REQUEST_FAILURE_CODE); setSummaryError(getSafeSummaryErrorMessage(undefined)); },
       });
     });
