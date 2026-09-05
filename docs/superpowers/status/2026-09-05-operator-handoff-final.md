@@ -47,7 +47,7 @@
 
 1. Google Cloud Console → OAuth 클라이언트(웹) 생성. 승인된 리디렉션 URI에 Supabase 콜백(`https://<project-ref>.supabase.co/auth/v1/callback`)을 넣는다.
 2. Supabase → Authentication → Providers → Google 활성화, 위 클라이언트 ID/시크릿 입력.
-3. Supabase → Authentication → URL Configuration: Site URL `https://realtime-noel-web.vercel.app`, Redirect URLs에 `https://realtime-noel-web.vercel.app/auth/callback`, `https://realtime-noel-web.vercel.app/**`, 그리고 데스크톱용 `nova://auth/callback`.
+3. Supabase → Authentication → URL Configuration: Site URL `https://realtime-noel-web.vercel.app`, Redirect URLs는 `2026-09-05-supabase-google-auth-setup-guide.md` §3 표대로(`nova://`는 넣지 않는다. 딥링크는 웹앱이 만든다).
 4. Supabase → Authentication → Email: "Confirm email" 활성화(회원가입 → 이메일 확인 → 관리자 승인 흐름).
 5. `ADMIN_BOOTSTRAP_EMAILS`에 등록한 이메일(운영자 본인)로 첫 Google 로그인을 하면 `profiles` 행이 `role=admin, host_id=noel`로 생성된다.
 
