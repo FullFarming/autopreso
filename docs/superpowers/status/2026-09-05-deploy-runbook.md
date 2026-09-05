@@ -1,5 +1,15 @@
 # 배포 런북 — 엔진 재설계 + 인증/콘솔 (2026-09-05)
 
+> **갱신 2026-09-05 저녁 (통합 브랜치 `codex/nova-integration-20260905`).** 아래 본문은 오전 판(전역 엔진 "배포" 모델)이다. 사용자 결정 D1~D5 이후의 실제 절차는 이 절이 우선한다.
+>
+> - **엔진 모델**: 기본 Soniox. 운영자가 `/console/users`에서 사용자별로 Soniox/Gemini를 바꾸면 그 사용자의 진행 중 세션이 **즉시** 전환되고 이후 세션에도 유지된다(`set_profile_voice_provider_v3` → `set_live_session_engine_admin_v3` → 게이트웨이 `POST /internal/sessions/:id/engine`). 전역 "배포" 버튼과 `PUT /api/console/engine-defaults`는 폐기(410).
+> - **이미 끝난 것(제가 실행)**: Vercel 프로덕션 환경변수 `ADMIN_BOOTSTRAP_EMAILS`, `SONIOX_API_KEY` 등록; 게이트웨이 이미지 빌드(Cloud Build e2aca266) 및 리비전 `realtime-noel-media-gateway-nova-20260905` 생성(트래픽 0%, 태그 `nova-review`, `/health` 200, `SONIOX_API_KEY` 시크릿 연결, `GEMINI_LIVE_MODEL` 제거); 웹앱 프로덕션 빌드 로컬 검증; DMG `dist/NOVA-0.2.3-arm64.dmg` 빌드.
+> - **마이그레이션(사용자, SQL Editor)**: 상태 점검 쿼리는 `2026-09-05-cross-session-analysis-and-user-actions.md` 이후 대화에서 제공한 것을 사용. `false`인 파일을 파일명 순으로 적용: `202609020001`~`202609020005` → `202609050001`~`202609050006`(0006은 T2b 수정 라운드에서 추가). 모두 추가 전용·재실행 안전.
+> - **마이그레이션 완료 후(제가 실행, 순서)**: ① `vercel deploy --prod` → `/api/live-config`·`/login` 확인, 부트스트랩 관리자 Google 첫 로그인 → `/console/users`에서 사용자별 엔진 전환 확인 ② `gcloud run services update-traffic … --to-revisions realtime-noel-media-gateway-nova-20260905=100` → 웹 호스트 Live Call 1회 ③ DMG 설치는 사용자(NOVA 종료 → `/Applications/NOVA.app` 백업·교체).
+> - **롤백**: 트래픽 `--to-revisions realtime-noel-media-gateway-live-input-20260901=100`; Vercel 이전 배포 Promote; 마이그레이션은 유지.
+> - **사용자 확인 사항**: Soniox 계정 동시 연결 한도(입력당 최대 3, 교체 시 최대 6, 마이크+시스템 2배 → 20 이상 권장); Google OAuth·Supabase Google 공급자·이메일 확인 설정(§0-3); 실음성 리허설(P0).
+
+
 대상 커밋: 브랜치 `codex/engine-hardening-20260905` HEAD(`ec128de` 이후). 실행 위치는 이 브랜치가 체크아웃된 워크트리(메인 트리에 다른 워크스트림의 미커밋 변경이 있어 메인 트리에서 빌드하지 않는다). 모든 운영 변경 단계는 **사용자 "진행" 승인 후** 실행한다. 비밀 값은 어디에도 붙이지 않는다.
 
 ## 0. 사전 확인 (읽기 전용)
