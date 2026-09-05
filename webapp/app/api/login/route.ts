@@ -1,4 +1,4 @@
-import { readBootstrapAdminConfig } from "@/lib/auth/bootstrap-admins";
+import { readBootstrapAdminConfig, warnBreakGlassLogin } from "@/lib/auth/bootstrap-admins";
 import { SupabaseProfileStore, ProfileStoreError } from "@/lib/auth/profile-store";
 import { profileStatusCache } from "@/lib/auth/profile-status-cache";
 import { NextRequest } from "next/server";
@@ -117,21 +117,47 @@ export async function POST(request: NextRequest) {
     return apiError("아이디 또는 비밀번호가 올바르지 않습니다.", "INVALID_CREDENTIALS", 401);
   }
 
+  // Bootstrap admin linkage. `role` in the response reflects what actually happened: "admin"
+  // only when the ADMIN_USER_IDS id is linked to an approved admin profile, otherwise "legacy".
+  let role: "admin" | "legacy" = "legacy";
   if (process.env.LIVE_ALLOW_WEAK_TEST_LOGIN !== "true") {
+    let bootstrap;
     try {
-      const bootstrap = readBootstrapAdminConfig();
-      if (bootstrap.legacyHostId !== id) return apiError("관리자 로그인 아이디 설정을 확인해 주세요.", "ADMIN_BOOTSTRAP_CONFIG_REQUIRED", 503);
-      await new SupabaseProfileStore().ensureLegacyAdmin({ hostId: id, bootstrapEmail: [...bootstrap.emails][0] ?? "" });
-      profileStatusCache.invalidate(id);
-    } catch (error: unknown) {
-      if (error instanceof ProfileStoreError) return apiError(error.message, error.code, error.status);
+      bootstrap = readBootstrapAdminConfig();
+    } catch {
       return apiError("관리자 계정 설정을 확인해 주세요.", "ADMIN_BOOTSTRAP_UNAVAILABLE", 503);
+    }
+    // No ADMIN_BOOTSTRAP_EMAILS: the pre-console legacy login - a cookie for any ADMIN_USER_IDS id,
+    // no Supabase call, nothing linked, so nothing to report as admin.
+    if (bootstrap.emails.size > 0) {
+      if (bootstrap.legacyHostId !== id) return apiError("관리자 로그인 아이디 설정을 확인해 주세요.", "ADMIN_BOOTSTRAP_CONFIG_REQUIRED", 503);
+      try {
+        await new SupabaseProfileStore().ensureLegacyAdmin({ hostId: id, bootstrapEmail: [...bootstrap.emails][0] ?? "" });
+        profileStatusCache.invalidate(id);
+        role = "admin";
+      } catch (error: unknown) {
+        // A definitive store answer (disabled profile, linkage conflict, missing config) stands.
+        if (error instanceof ProfileStoreError && error.status < 500) return apiError(error.message, error.code, error.status);
+        // Store outage. Break-glass only for the bootstrap id (checked above) and only when the
+        // approval cache still holds a last-known approved admin status for it - the store said so
+        // within the bounded grace window, so no privilege is minted from the username alone.
+        let lastKnown: { status: string; role: string } | null | undefined;
+        try { lastKnown = profileStatusCache.lastKnown(id); } catch { lastKnown = undefined; }
+        if (lastKnown === undefined || lastKnown === null) {
+          return apiError("관리자 계정 설정을 확인해 주세요.", "ADMIN_BOOTSTRAP_UNAVAILABLE", 503);
+        }
+        if (lastKnown.status !== "approved" || lastKnown.role !== "admin") {
+          return apiError("관리자 계정이 비활성화되었거나 권한이 없습니다.", "ADMIN_PROFILE_DISABLED", 403);
+        }
+        warnBreakGlassLogin("ADMIN_BOOTSTRAP_BREAK_GLASS");
+        role = "admin";
+      }
     }
   }
 
   loginRateLimiter.clear(request.headers);
   const token = await createSessionToken(id);
-  const response = apiSuccess({ userId: id, role: "admin", next: "/admin" }, { headers: { "cache-control": "private, no-store" } });
+  const response = apiSuccess({ userId: id, role, next: "/admin" }, { headers: { "cache-control": "private, no-store" } });
   response.cookies.set("rnw_name", name, {
     sameSite: "lax", secure: process.env.NODE_ENV === "production", path: "/", maxAge: SESSION_TTL_SECONDS,
   });

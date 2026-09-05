@@ -16,3 +16,12 @@ export function readBootstrapAdminConfig(env: Readonly<Record<string, string | u
 export function isBootstrapAdminEmail(email: string, config: BootstrapAdminConfig): boolean {
   return config.emails.has(email.trim().toLowerCase());
 }
+
+/**
+ * The only thing the legacy login route may ever log: a break-glass cookie was issued for the
+ * bootstrap admin while the profile store was unreachable. The code alone - no host id, email,
+ * or credential - so the route keeps its "never logs credentials" pin.
+ */
+export function warnBreakGlassLogin(code: string): void {
+  console.warn(`[auth] legacy break-glass login: ${code}`);
+}

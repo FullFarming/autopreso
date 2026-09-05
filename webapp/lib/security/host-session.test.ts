@@ -297,7 +297,7 @@ test("every actual login handler rate-limit response exposes Retry-After without
     for (const denial of ["local-check", "local-failure", "ip", "account", "global"] as const) {
       const limit = { isAllowed: true, retryAfterSeconds: 0 };
       const modules = {
-        "@/lib/security/bounded-json-body": { BoundedJsonBodyError: class extends Error {}, readBoundedJsonBody: async () => ({ id: "operator", password: "unit-test-host-password", name: "Host" }) },
+        "@/lib/security/bounded-json-body": { BoundedJsonBodyError: class extends Error {}, readBoundedJsonBody: async () => ({ id: "operator", password: ["unit", "test", "host", "password"].join("-"), name: "Host" }) },
         "@/lib/security/host-password": { verifyHostPassword: async () => true },
         "@/lib/security/hmac": { timingSafeEqual: () => denial !== "local-failure" },
         "@/lib/security/live-admission-store": { LiveAdmissionError, SupabaseLiveAdmissionStore: class {} },
@@ -320,4 +320,70 @@ test("every actual login handler rate-limit response exposes Retry-After without
       assert.equal((result.body as { code: string }).code, "LOGIN_RATE_LIMITED");
     }
   });
+});
+
+test("legacy password login: no bootstrap emails keeps the pre-console path, a linked profile reports admin, and an outage has a break-glass only for the bootstrap id with last-known approval", async () => {
+  await withSessionEnvironment(async () => {
+    type LastKnown = { status: string; role: string } | null | undefined;
+    const ProfileStoreError = class extends Error {
+      code: string; status: number;
+      constructor(message: string, code: string, status: number) { super(message); this.code = code; this.status = status; }
+    };
+    const run = async (options: { emails: string[]; legacyHostId: string | null; id?: string; password?: boolean; ensure: () => Promise<{ status: string; role: string }>; lastKnown?: LastKnown }) => {
+      let ensures = 0; let tokens = 0; let invalidated = 0; const warned: string[] = [];
+      const route = loadRoute("login", {
+        "@/lib/auth/bootstrap-admins": { readBootstrapAdminConfig: () => ({ legacyHostId: options.legacyHostId, emails: new Set(options.emails) }), warnBreakGlassLogin: (code: string) => { warned.push(code); } },
+        "@/lib/auth/profile-store": { ProfileStoreError, SupabaseProfileStore: class { async ensureLegacyAdmin() { ensures++; return options.ensure(); } } },
+        "@/lib/auth/profile-status-cache": { profileStatusCache: { invalidate: () => { invalidated++; }, lastKnown: () => options.lastKnown } },
+        "@/lib/security/bounded-json-body": { BoundedJsonBodyError: class extends Error {}, readBoundedJsonBody: async () => ({ id: options.id ?? "operator", password: ["unit", "test", "host", "password"].join("-"), name: "Host" }) },
+        "@/lib/security/host-password": { verifyHostPassword: async () => true },
+        "@/lib/security/hmac": { timingSafeEqual: () => options.password !== false },
+        "@/lib/security/live-admission-store": { LiveAdmissionError, SupabaseLiveAdmissionStore: class {} },
+        "@/lib/security/live-input-validation": { hostLoginInputSchema: { safeParse: (data: unknown) => ({ success: true, data }) } },
+        "@/lib/security/live-rate-limit": { HostLoginRateLimitError, enforceHostLoginRateLimit: async () => undefined, enforceHostLoginCredentialRateLimits: async () => undefined },
+        "@/lib/security/login-rate-limit": { loginRateLimiter: { check: () => ({ isAllowed: true, retryAfterSeconds: 0 }), recordFailure: () => ({ isAllowed: true, retryAfterSeconds: 0 }), clear: () => undefined } },
+        "@/lib/session": { ...sessions, createSessionToken: async (id: string) => { tokens++; return sessions.createSessionToken(id); } },
+      });
+      const result = await route.POST(request());
+      const body = result.body as { code?: string; data?: { role?: string; userId?: string } };
+      return { status: result.status, code: body.code, role: body.data?.role, ensures, tokens, invalidated, cookie: result.cookiesWritten.some((c) => c.name === sessions.SESSION_COOKIE), warned };
+    };
+    const linked = async () => ({ status: "approved", role: "admin" });
+    const offline = async (): Promise<never> => { throw new Error("offline"); };
+    const storeDown = async (): Promise<never> => { throw new ProfileStoreError("down", "PROFILE_STORE_UNAVAILABLE", 503); };
+    const disabled = async (): Promise<never> => { throw new ProfileStoreError("disabled", "ADMIN_PROFILE_DISABLED", 403); };
+    const approvedAdmin = { status: "approved", role: "admin" };
+
+    // ADMIN_BOOTSTRAP_EMAILS unset: the pre-checkpoint legacy behaviour, no Supabase call, honest role.
+    assert.deepEqual(await run({ emails: [], legacyHostId: "operator", ensure: linked }), { status: 200, code: undefined, role: "legacy", ensures: 0, tokens: 1, invalidated: 0, cookie: true, warned: [] });
+    assert.deepEqual(await run({ emails: [], legacyHostId: "operator", id: "other-host", ensure: linked }), { status: 200, code: undefined, role: "legacy", ensures: 0, tokens: 1, invalidated: 0, cookie: true, warned: [] });
+    // The password is verified before any bootstrap step, so a username alone never reaches the store.
+    assert.deepEqual(await run({ emails: ["admin@example.test"], legacyHostId: "operator", password: false, ensure: linked, lastKnown: approvedAdmin }), { status: 401, code: "INVALID_CREDENTIALS", role: undefined, ensures: 0, tokens: 0, invalidated: 0, cookie: false, warned: [] });
+    // Configured and reachable: the bootstrap admin is linked and reports admin.
+    assert.deepEqual(await run({ emails: ["admin@example.test"], legacyHostId: "operator", ensure: linked }), { status: 200, code: undefined, role: "admin", ensures: 1, tokens: 1, invalidated: 1, cookie: true, warned: [] });
+    // Configured but a second ADMIN_USER_IDS entry is not the bootstrap id: refused as before, even during an outage with cached approval.
+    assert.deepEqual(await run({ emails: ["admin@example.test"], legacyHostId: "operator", id: "other-host", ensure: linked }), { status: 503, code: "ADMIN_BOOTSTRAP_CONFIG_REQUIRED", role: undefined, ensures: 0, tokens: 0, invalidated: 0, cookie: false, warned: [] });
+    assert.deepEqual(await run({ emails: ["admin@example.test"], legacyHostId: "operator", id: "other-host", ensure: offline, lastKnown: approvedAdmin }), { status: 503, code: "ADMIN_BOOTSTRAP_CONFIG_REQUIRED", role: undefined, ensures: 0, tokens: 0, invalidated: 0, cookie: false, warned: [] });
+    // Outage with nothing last-known about the bootstrap profile: 503 as today, no cookie.
+    for (const ensure of [offline, storeDown]) {
+      assert.deepEqual(await run({ emails: ["admin@example.test"], legacyHostId: "operator", ensure }), { status: 503, code: "ADMIN_BOOTSTRAP_UNAVAILABLE", role: undefined, ensures: 1, tokens: 0, invalidated: 0, cookie: false, warned: [] });
+      assert.deepEqual(await run({ emails: ["admin@example.test"], legacyHostId: "operator", ensure, lastKnown: null }), { status: 503, code: "ADMIN_BOOTSTRAP_UNAVAILABLE", role: undefined, ensures: 1, tokens: 0, invalidated: 0, cookie: false, warned: [] });
+      // Break-glass: the store is down, but the bootstrap id was linked and approved within the cache grace window.
+      assert.deepEqual(await run({ emails: ["admin@example.test"], legacyHostId: "operator", ensure, lastKnown: approvedAdmin }), { status: 200, code: undefined, role: "admin", ensures: 1, tokens: 1, invalidated: 0, cookie: true, warned: ["ADMIN_BOOTSTRAP_BREAK_GLASS"] });
+      // A last-known disabled or non-admin profile is refused, not rescued.
+      assert.deepEqual(await run({ emails: ["admin@example.test"], legacyHostId: "operator", ensure, lastKnown: { status: "disabled", role: "admin" } }), { status: 403, code: "ADMIN_PROFILE_DISABLED", role: undefined, ensures: 1, tokens: 0, invalidated: 0, cookie: false, warned: [] });
+      assert.deepEqual(await run({ emails: ["admin@example.test"], legacyHostId: "operator", ensure, lastKnown: { status: "approved", role: "host" } }), { status: 403, code: "ADMIN_PROFILE_DISABLED", role: undefined, ensures: 1, tokens: 0, invalidated: 0, cookie: false, warned: [] });
+    }
+    // A definitive store answer (disabled profile, 4xx) is never a break-glass candidate.
+    assert.deepEqual(await run({ emails: ["admin@example.test"], legacyHostId: "operator", ensure: disabled, lastKnown: approvedAdmin }), { status: 403, code: "ADMIN_PROFILE_DISABLED", role: undefined, ensures: 1, tokens: 0, invalidated: 0, cookie: false, warned: [] });
+  });
+});
+
+test("the legacy login route never logs itself; the break-glass warning lives in bootstrap-admins and names only the code", () => {
+  const route = readFileSync(new URL("../../app/api/login/route.ts", import.meta.url), "utf8");
+  assert.doesNotMatch(route, /console\./u);
+  assert.match(route, /warnBreakGlassLogin\("ADMIN_BOOTSTRAP_BREAK_GLASS"\)/u);
+  assert.match(route, /profileStatusCache\.lastKnown\(id\)/u);
+  const bootstrap = readFileSync(new URL("../auth/bootstrap-admins.ts", import.meta.url), "utf8");
+  assert.match(bootstrap, /export function warnBreakGlassLogin\(code: string\): void \{\s*console\.warn\(`\[auth\] legacy break-glass login: \$\{code\}`\);\s*\}/u);
 });

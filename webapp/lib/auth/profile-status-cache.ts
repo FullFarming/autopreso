@@ -4,6 +4,14 @@ import { AuthenticationError } from "./live-auth";
 import { SupabaseProfileStore, type ProfileRecord, type ProfileRole, type ProfileStatus } from "./profile-store";
 
 const DEFAULT_TTL_MS = 60_000;
+/**
+ * How long past its TTL a cached status may still be served while the profile store is down.
+ * Ruling 2026-09-05: a Supabase outage must not turn into a mass 401 for every host the moment
+ * the 60 s entry lapses, but a stale approval must also not live forever - 10 min past expiry
+ * the entry is gone and the host fails closed like a cold miss. Paid provider keys are unaffected
+ * either way: the managed-caption broker re-reads `profiles.status` through its own RPCs.
+ */
+export const STALE_GRACE_MS = 10 * 60_000;
 type Reader = (hostId: string) => Promise<ProfileRecord | null>;
 type Entry = { value: { status: ProfileStatus; role: ProfileRole } | null; expiresAt: number };
 
@@ -22,9 +30,15 @@ export function createProfileStatusCache(opts: { read: Reader; ttlMs?: number; n
         if (entries.size > 5_000) entries.delete(entries.keys().next().value as string);
         return value;
       } catch {
-        // 2026-09-05 fix: 만료된 승인 캐시는 유료 자막 키 발급 권한을 연장할 수 없다.
+        // Store outage: serve the last-known answer, but only inside the bounded grace window.
+        if (hit && hit.expiresAt + STALE_GRACE_MS >= now()) return hit.value;
         throw new AuthenticationError("호스트 상태를 확인할 수 없습니다.");
       }
+    },
+    /** The last-known status if it is still inside the grace window; never touches the store. */
+    lastKnown(hostId: string): { status: ProfileStatus; role: ProfileRole } | null | undefined {
+      const hit = entries.get(hostId);
+      return hit && hit.expiresAt + STALE_GRACE_MS >= now() ? hit.value : undefined;
     },
     invalidate(hostId?: string) { if (hostId) entries.delete(hostId); else entries.clear(); },
   };
