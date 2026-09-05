@@ -315,7 +315,7 @@ test("initial desktop activation uses the latest preparing version and the engin
   const authorizer = new SupabaseHostAuthorizer({ baseUrl: "https://fixture.invalid", serviceRoleKey: "fixture",
     fetchFn: async () => Response.json([{ id: "call-a", host_id: "fixture-host", status: "preparing", version: 9,
       session_type: "meeting", output_mode: "captions", languages: ["en"], pinned_glossary_fingerprint: null,
-      event_metadata: { modelPreferences: { source: "gemini-3.6-flash", summary: "gemini-3.6-flash" } } }]),
+      event_metadata: { modelPreferences: { source: "gemini-3.5-live-translate-preview", summary: "gemini-3.6-flash" } } }]),
   });
   const authorized = await authorizer.authorize({ role: "HOST", sub: "fixture-host", sessionId: "call-a" }, request, { readinessStart: true });
   assert.notEqual(authorized, false, "a refreshed version must reach the real gateway authorization boundary");

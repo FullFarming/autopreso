@@ -7,9 +7,11 @@ import { SupabaseHostAuthorizer } from "../src/supabase-adapters.js";
 const claims = { role: "HOST", sub: "host-1", sessionId: "session-1" };
 const settings = { sessionId: "session-1", version: 7, sessionType: "meeting", outputMode: "captions", maxViewers: 50, languages: ["ko", "en"] };
 const baseRow = { id: "session-1", host_id: "host-1", status: "live", version: 7, session_type: "meeting", output_mode: "captions", max_viewers: 50, languages: ["ko", "en"], pinned_glossary_fingerprint: null };
-// Ids the pre-Plan-2 webapp stored per role. All of them are "known historical"
-// (readStoredGeminiModelSelection); as a SOURCE they all migrate to Transcribe Live.
+// Ids the pre-Plan-2 webapp stored per role. Summary pins are the flash ids;
+// source pins are the two Live models (readStoredGeminiModelSelection is per
+// role: a flash id as a SOURCE was never written and fails closed — Task 4 fix M1).
 const legacyModels = ["gemini-3.7-flash", "gemini-3.6-flash", "gemini-3.5-flash"];
+const legacySources = ["gemini-3.5-transcribe-live", "gemini-3.5-live-translate-preview"];
 const soniox = {
   stt: { provider: "soniox", model: "stt-rt-v5", languageMode: "ko" },
   translation: { provider: "soniox", model: "stt-rt-v5" },
@@ -47,7 +49,7 @@ test("the stored engine is the only engine a host may run: same engine authorize
 });
 
 test("known historical per-role pins migrate to the engine they meant and stay untouched; a caller sending that engine is authorized", async () => {
-  for (const source of [...legacyModels, "gemini-3.5-transcribe-live", "gemini-3.5-live-translate-preview"]) {
+  for (const source of legacySources) {
     for (const summary of legacyModels) {
       const preferences = { source, summary };
       const { authorizer, queries } = harness({ ...baseRow, event_metadata: { modelPreferences: preferences } });
@@ -86,7 +88,7 @@ test("forged model overrides beside the engine are denied for preparation, first
       assert.equal(await authorize({ ...baseRow, event_metadata: { modelPreferences: { engine: DEFAULT_ENGINE_SELECTION } } }, change, options), false, JSON.stringify(engineChange));
     }
   }
-  const { authorizer } = harness({ ...baseRow, status: "preparing", event_metadata: { modelPreferences: { source: legacyModels[1], summary: legacyModels[2] } } });
+  const { authorizer } = harness({ ...baseRow, status: "preparing", event_metadata: { modelPreferences: { source: legacySources[1], summary: legacyModels[2] } } });
   assert.deepEqual(await authorizer.authorize(claims, settings, { readinessStart: true }), {
     pinnedGlossaryFingerprint: null, readinessMode: "activate", sessionStatus: "preparing",
   }, "a prepared call whose legacy pin migrates to the catalog default can start without a captionConfig");
@@ -104,6 +106,8 @@ test("absent preferences mean the catalog default; malformed, unknown, or partia
   for (const metadata of [[], "invalid", { modelPreferences: null }, { modelPreferences: {} }, { modelPreferences: [] },
     { modelPreferences: { source: legacyModels[0] } }, { modelPreferences: { source: legacyModels[0], summary: "https://169.254.169.254/model" } },
     { modelPreferences: { source: "unknown-model", summary: legacyModels[0] } },
+    { modelPreferences: { source: legacyModels[0], summary: legacyModels[0] } }, { modelPreferences: { source: legacyModels[1], summary: legacyModels[2] } },
+    { modelPreferences: { source: legacySources[0], summary: legacySources[0] } },
     { modelPreferences: { source: legacyModels[0], summary: legacyModels[0], model: legacyModels[1] } },
     { modelPreferences: { source: legacyModels[0], summary: legacyModels[0], engine: DEFAULT_ENGINE_SELECTION } },
     { modelPreferences: { engine: null } }, { modelPreferences: { engine: "gemini" } }, { modelPreferences: { engine: [] } },

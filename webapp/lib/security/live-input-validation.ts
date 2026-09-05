@@ -138,6 +138,18 @@ export const updateLiveSessionInputSchema = z
     { message: "변경할 라이브 설정이 필요합니다." },
   );
 
+/**
+ * HTTP failure code for a rejected create/update body. A body whose only
+ * problem is `modelPreferences` is a malformed engine selection and gets its
+ * own code (Task 4 fix M2) so clients can tell "wrong engine" from "wrong
+ * request"; any other issue is the generic malformed request.
+ */
+export function liveSessionInputErrorCode(error: z.ZodError): "INVALID_ENGINE_SELECTION" | "INVALID_REQUEST" {
+  const issues = error.issues;
+  if (issues.length > 0 && issues.every((issue) => issue.path[0] === "modelPreferences")) return "INVALID_ENGINE_SELECTION";
+  return "INVALID_REQUEST";
+}
+
 export const admissionActionInputSchema = z
   .object({
     action: z.enum(["open", "close"]),

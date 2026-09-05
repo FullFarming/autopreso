@@ -10,7 +10,7 @@ import { getLiveSessionStore } from "@/lib/live/store";
 import { scheduleLiveSheetSyncAfterCommit } from "@/lib/live-sheet-sync/runtime";
 import { apiError, apiSuccess } from "@/lib/security/api-response";
 import { BoundedJsonBodyError, readBoundedJsonBody } from "@/lib/security/bounded-json-body";
-import { createLiveSessionInputSchema, liveSessionRecoveryQuerySchema } from "@/lib/security/live-input-validation";
+import { createLiveSessionInputSchema, liveSessionInputErrorCode, liveSessionRecoveryQuerySchema } from "@/lib/security/live-input-validation";
 
 /** Host session recovery: `?scope=mine` lists the authenticated host's
  *  active (preparing / live / paused) sessions for dashboard rehydration. */
@@ -50,7 +50,10 @@ export async function POST(request: NextRequest) {
     if (!isLiveCallEnabled()) return apiError("Live Call 기능이 비활성화되어 있습니다.", "LIVE_CALL_DISABLED", 403);
     const { hostId } = await requireHost(request);
     const parsed = createLiveSessionInputSchema.safeParse(await readBoundedJsonBody(request));
-    if (!parsed.success) return apiError("요청 형식이 올바르지 않습니다.", "INVALID_REQUEST", 400);
+    if (!parsed.success) {
+      const code = liveSessionInputErrorCode(parsed.error);
+      return apiError(code === "INVALID_ENGINE_SELECTION" ? "자막 엔진 선택이 올바르지 않습니다." : "요청 형식이 올바르지 않습니다.", code, 400);
+    }
     const input = parsed.data;
     // Spec §9: the global engine is the only Live Call engine; a non-admin's
     // `modelPreferences.engine` is replaced by it inside the service.

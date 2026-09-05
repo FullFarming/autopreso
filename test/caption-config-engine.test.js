@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { createGeminiCaptionConfig, geminiCaptionConfigFingerprint } from "../packages/caption-core/index.js";
-import { DEFAULT_GEMINI_MODEL_SELECTION, migrateLegacyGeminiModelSelection, readGeminiSelectedModel } from "../packages/caption-core/gemini-model-catalog.js";
+import { DEFAULT_GEMINI_MODEL_SELECTION, migrateLegacyGeminiModelSelection, readGeminiSelectedModel, readStoredGeminiModelSelection } from "../packages/caption-core/gemini-model-catalog.js";
 
 test("caption config carries a canonical engine and derives legacy models from it", () => {
   const config = createGeminiCaptionConfig({ translationLanguages: ["en", "ko"], engine: {
@@ -34,4 +34,20 @@ test("legacy gemini model shim now defaults to Transcribe Live", () => {
   assert.equal(migrateLegacyGeminiModelSelection("source", "gemini-3.5-live-translate-preview"), "gemini-3.5-transcribe-live");
   assert.equal(readGeminiSelectedModel("summary", "gemini-3.7-flash"), "gemini-3.7-flash");
   assert.throws(() => readGeminiSelectedModel("source", "gemini-3.5-live-translate-preview"));
+});
+
+test("stored legacy source pins accept only the historical Live models; flash ids are summary evidence only (Task 4 fix M1)", () => {
+  for (const model of ["gemini-3.5-transcribe-live", "gemini-3.5-live-translate-preview"]) {
+    assert.equal(readStoredGeminiModelSelection("source", model), model);
+    assert.throws(() => readStoredGeminiModelSelection("summary", model), /INVALID_GEMINI_MODEL_SELECTION|모델/u);
+  }
+  for (const model of ["gemini-3.7-flash", "gemini-3.6-flash", "gemini-3.5-flash"]) {
+    assert.equal(readStoredGeminiModelSelection("summary", model), model);
+    assert.throws(() => readStoredGeminiModelSelection("source", model), /INVALID_GEMINI_MODEL_SELECTION|모델/u, model);
+  }
+  for (const model of ["gemini-3.5-flash-lite", "", null, undefined, 3]) {
+    assert.throws(() => readStoredGeminiModelSelection("source", model));
+    assert.throws(() => readStoredGeminiModelSelection("summary", model));
+  }
+  assert.throws(() => readStoredGeminiModelSelection("translation", "gemini-3.6-flash"));
 });

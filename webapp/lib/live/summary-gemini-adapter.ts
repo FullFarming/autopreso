@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import type { MeetingSummaryConfig } from "./config";
 import { recordGeminiSummaryMetric, type GeminiSummaryMetricEvent } from "./summary-observability";
 import { createGeminiRestRecapGenerator as createUntypedGeminiRestRecapGenerator } from "../../../packages/gemini-server/index.js";
+import { readGeminiSelectedModel } from "../../../packages/caption-core/gemini-model-catalog.js";
 
 export interface GeminiSummaryGeneratorLimits {
   globalOutstanding: number;
@@ -24,6 +25,9 @@ export interface GeminiRecapRequest<T> {
 
 export interface GeminiRecapRuntime {
   generateRecap<T>(request: GeminiRecapRequest<T>): Promise<T>;
+  createSessionClient?(sessionId: string, workload: "recap", options: { model: string }): {
+    generateRecap<T>(request: Omit<GeminiRecapRequest<T>, "sessionId">): Promise<T>;
+  };
 }
 
 export interface GeminiSummaryContentRequest {
@@ -52,6 +56,7 @@ interface SafeGeminiSummaryObservation extends GeminiSummaryMetricEvent {
 
 type GeminiRestRecapFactory = (options: {
   apiKey: string;
+  model: string;
   fetchFn?: typeof fetch;
   limits?: GeminiSummaryGeneratorLimits;
   observe?: (event: unknown) => void;
@@ -67,15 +72,18 @@ export function createRuntimeBackedSummaryGenerator(
 ): GeminiSummaryContentGenerator {
   return {
     async generateContent(request) {
-      return runtime.generateRecap({
-        sessionId: request.sessionId,
+      const recap = {
         systemInstruction: "Produce a grounded meeting record. Follow the supplied JSON schema exactly.",
         prompt: request.prompt,
         responseJsonSchema: request.schema,
         validate,
         signal: request.signal,
         maxOutputCodepoints: config.maxOutputTokens,
-      });
+      };
+      const model = readGeminiSelectedModel("summary", config.model);
+      if (runtime.createSessionClient) return runtime.createSessionClient(request.sessionId, "recap", { model }).generateRecap(recap);
+      if (model !== "gemini-3.6-flash") throw new Error("SUMMARY_SELECTED_MODEL_RUNTIME_REQUIRED");
+      return runtime.generateRecap({ ...recap, sessionId: request.sessionId });
     },
   };
 }
@@ -86,6 +94,7 @@ export function createGeminiSummaryGenerator(
 ): GeminiSummaryContentGenerator {
   return createGeminiRestRecapGenerator({
     apiKey: config.apiKey,
+    model: readGeminiSelectedModel("summary", config.model),
     fetchFn: options.fetchFn,
     limits: options.limits,
     observe: createSafeGeminiSummaryObserver(options.observe),
@@ -107,14 +116,17 @@ function createSafeGeminiSummaryObserver(
 function safeGeminiSummaryObservation(event: unknown): SafeGeminiSummaryObservation | null {
   if (!event || typeof event !== "object" || Array.isArray(event)) return null;
   const record = event as Record<string, unknown>;
-  if (record.workload !== "recap" || record.model !== "gemini-3.7-flash") return null;
+  if (record.workload !== "recap") return null;
+  let model;
+  try { model = readGeminiSelectedModel("summary", record.model); } catch { return null; }
+  if (typeof record.model !== "string") return null;
   const usageKnown = record.usageKnown === true
     && [record.inputTokens, record.outputTokens, record.totalTokens]
       .every((value) => typeof value === "number" && Number.isSafeInteger(value) && value >= 0);
   return {
     name: "live.summary.gemini",
     workload: "recap",
-    model: "gemini-3.7-flash",
+    model,
     result: record.code === "OK" ? "ok" : "error",
     latencyMilliseconds: safeNonNegativeNumber(record.latencyMilliseconds),
     usageKnown,
@@ -131,7 +143,7 @@ function safeNonNegativeNumber(value: unknown): number {
 let cachedGenerator: { keyHash: string; generator: GeminiSummaryContentGenerator } | null = null;
 
 export function getCachedGeminiSummaryGenerator(config: MeetingSummaryConfig): GeminiSummaryContentGenerator {
-  const keyHash = createHash("sha256").update(config.apiKey).digest("hex");
+  const keyHash = createHash("sha256").update(config.apiKey).update("\u0000").update(readGeminiSelectedModel("summary", config.model)).digest("hex");
   if (!cachedGenerator || cachedGenerator.keyHash !== keyHash) {
     cachedGenerator = {
       keyHash,

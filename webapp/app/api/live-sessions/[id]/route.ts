@@ -13,7 +13,7 @@ import { parseSessionId } from "@/lib/live/validation";
 import { scheduleLiveSheetSyncAfterCommit } from "@/lib/live-sheet-sync/runtime";
 import { apiError, apiSuccess } from "@/lib/security/api-response";
 import { BoundedJsonBodyError, readBoundedJsonBody } from "@/lib/security/bounded-json-body";
-import { updateLiveSessionInputSchema } from "@/lib/security/live-input-validation";
+import { liveSessionInputErrorCode, updateLiveSessionInputSchema } from "@/lib/security/live-input-validation";
 
 interface RouteContext {
   params: Promise<{ id: string }>;
@@ -45,7 +45,10 @@ export async function PATCH(request: NextRequest, context: RouteContext) {
     const [{ hostId }, params] = await Promise.all([requireHost(request), context.params]);
     const id = parseSessionId(params.id);
     const parsed = updateLiveSessionInputSchema.safeParse(await readBoundedJsonBody(request));
-    if (!parsed.success) return apiError("요청 형식이 올바르지 않습니다.", "INVALID_REQUEST", 400);
+    if (!parsed.success) {
+      const code = liveSessionInputErrorCode(parsed.error);
+      return apiError(code === "INVALID_ENGINE_SELECTION" ? "자막 엔진 선택이 올바르지 않습니다." : "요청 형식이 올바르지 않습니다.", code, 400);
+    }
     const input = parsed.data;
     // Spec §9: a non-admin's `modelPreferences.engine` is replaced by the global engine (server authority).
     const [engineDefaults, isAdmin] = input.modelPreferences === undefined

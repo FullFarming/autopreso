@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { register } from "node:module";
 import test from "node:test";
 
 import { shouldDisplayLiveCaption } from "../src/live-caption-display-policy.js";
@@ -7,6 +8,7 @@ import { shouldDisplayLiveCaption } from "../src/live-caption-display-policy.js"
 // integration test as a TypeScript source import.
 const captionFeedModulePath = "../webapp/lib/live/caption-feed.ts";
 const deterministicGatewayModulePath = "../media-gateway/scripts/local-live-call-e2e-gateway.mjs";
+register("../webapp/lib/security/test-typescript-loader.mjs", import.meta.url);
 const {
   getCachedLanguageCaptions,
   isDisplayableCaption,
@@ -51,7 +53,7 @@ test("host and participant speech keep one opposite desktop line and both canoni
   for (const events of utterances.values()) {
     assert.equal(events.length, 2, "each utterance must have one source and one translated lane");
     for (const historicalDisplayLanguage of ["ko", "en"]) {
-      const desktop = events.filter((event) => shouldDisplayLiveCaption(event, historicalDisplayLanguage));
+      const desktop = events.filter((event) => shouldDisplayLiveCaption(event, historicalDisplayLanguage, "gateway"));
       assert.equal(desktop.length, 1, "desktop must render exactly one line");
       assert.notEqual(desktop[0].language, desktop[0].sourceLanguage);
       assert.notEqual(desktop[0].origin, "source");

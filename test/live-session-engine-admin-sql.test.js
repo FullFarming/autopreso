@@ -27,7 +27,7 @@ test('live session engine admin migration is additive, service-role only, mirror
   assert.match(sql, /security definer set search_path = ''/u);
 });
 
-test('admin engine switch rewrites engine, appends capped history, bumps version, and skips inactive sessions', {
+test('admin engine switch rewrites engine, appends capped + byte-budgeted history with reason admin, bumps version, and skips inactive sessions', {
   skip: !process.env.NOVA_PGLITE_MODULE && 'Set NOVA_PGLITE_MODULE for isolated PostgreSQL validation',
 }, async (t) => {
   const { PGlite } = await import(pathToFileURL(process.env.NOVA_PGLITE_MODULE).href);
@@ -84,9 +84,10 @@ test('admin engine switch rewrites engine, appends capped history, bumps version
   assert.deepEqual(row.event_metadata.modelPreferences.engine, ENGINE_B);
   assert.equal(row.event_metadata.modelPreferences.engineHistory.length, 1);
   const entry = row.event_metadata.modelPreferences.engineHistory[0];
-  assert.deepEqual(Object.keys(entry).sort(), ['byHostId', 'changedAt', 'engine']);
+  assert.deepEqual(Object.keys(entry).sort(), ['byHostId', 'changedAt', 'engine', 'reason']);
   assert.deepEqual(entry.engine, ENGINE_B);
   assert.equal(entry.byHostId, 'noel');
+  assert.equal(entry.reason, 'admin');
   assert.ok(Number.isFinite(Date.parse(entry.changedAt)), entry.changedAt);
   assert.match(entry.changedAt, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/u);
 
@@ -117,18 +118,37 @@ test('admin engine switch rewrites engine, appends capped history, bumps version
   assert.deepEqual((await db.query('select event_metadata from public.live_sessions where id = $1', [deleted])).rows[0].event_metadata, {});
   assert.deepEqual((await db.query('select * from public.set_live_session_engine_admin_v1($1,$2,$3::jsonb)', [admin, '00000000-0000-4000-8000-0000000000ff', JSON.stringify(ENGINE_B)])).rows, []);
 
-  // history is capped at 64, oldest dropped
+  // history is capped at 8 (Task 4 fix I1), oldest dropped
   for (let i = 0; i < 65; i += 1) {
     const engine = { ...ENGINE_A, stt: { ...ENGINE_A.stt, languageMode: `m${i}` } };
     await db.query('select * from public.set_live_session_engine_admin_v1($1,$2,$3::jsonb)', [admin, preparing, JSON.stringify(engine)]);
   }
-  row = (await db.query('select event_metadata, version from public.live_sessions where id = $1', [preparing])).rows[0];
+  row = (await db.query('select event_metadata, version, octet_length(event_metadata::text) as bytes from public.live_sessions where id = $1', [preparing])).rows[0];
   const history = row.event_metadata.modelPreferences.engineHistory;
-  assert.equal(history.length, 64);
-  assert.equal(history[0].engine.stt.languageMode, 'm1'); // the seed entry and m0 fell off
-  assert.equal(history[63].engine.stt.languageMode, 'm64');
+  assert.equal(history.length, 8);
+  assert.equal(history[0].engine.stt.languageMode, 'm57'); // the seed entry and m0..m56 fell off
+  assert.equal(history[7].engine.stt.languageMode, 'm64');
+  assert.ok(history.every((e) => e.reason === 'admin'));
   assert.equal(row.event_metadata.modelPreferences.engine.stt.languageMode, 'm64');
   assert.equal(row.version, 2 + 65);
+  assert.ok(row.bytes <= 3800, String(row.bytes));
+
+  // byte budget: with the largest agenda (20 × 120 chars) the whole body stays ≤ 3800 bytes; newest entries kept, agenda untouched
+  const budgeted = '00000000-0000-4000-8000-0000000000a6';
+  const agenda = Array.from({ length: 20 }, (_, i) => ({ ordinal: i + 1, label: 'a'.repeat(120) }));
+  await db.query(`insert into public.live_sessions(id,host_id,status,languages,version,event_metadata) values ($1,'h1','live','{ko,en}',1,$2::jsonb)`,
+    [budgeted, JSON.stringify({ ticker: 'ACME', eventType: 'earnings_call', agenda, modelPreferences: { engine: ENGINE_A, engineHistory: [] } })]);
+  for (let i = 0; i < 12; i += 1) {
+    const engine = { ...ENGINE_B, stt: { ...ENGINE_B.stt, languageMode: i % 2 === 0 ? 'ko' : 'en' } };
+    await db.query('select * from public.set_live_session_engine_admin_v1($1,$2,$3::jsonb)', [admin, budgeted, JSON.stringify(engine)]);
+    const state = (await db.query('select event_metadata, octet_length(event_metadata::text) as bytes from public.live_sessions where id = $1', [budgeted])).rows[0];
+    assert.ok(state.bytes <= 3800, `${i}: ${state.bytes}`);
+    const kept = state.event_metadata.modelPreferences.engineHistory;
+    assert.ok(kept.length >= 1 && kept.length <= 8, String(kept.length));
+    assert.equal(kept.at(-1).engine.stt.languageMode, i % 2 === 0 ? 'ko' : 'en', 'the newest change is always kept');
+    assert.deepEqual(state.event_metadata.agenda, agenda);
+    assert.equal(state.event_metadata.ticker, 'ACME');
+  }
 
   // list returns only preparing/live, not archive-deleted, oldest first
   const listed = (await db.query('select * from public.list_live_session_ids_admin_v1()')).rows;
@@ -136,5 +156,6 @@ test('admin engine switch rewrites engine, appends capped history, bumps version
     { id: live, status: 'live', languages: ['ko', 'en'] },
     { id: preparing, status: 'preparing', languages: ['ko'] },
     { id: legacy, status: 'live', languages: ['ja'] },
+    { id: budgeted, status: 'live', languages: ['ko', 'en'] },
   ]);
 });

@@ -3,6 +3,7 @@ import {
   assertSafeOutputValue, GEMINI_SERVER_WORKLOAD_MODELS, GEMINI_WORKLOAD_THINKING_LEVELS, GENERATE_WORKLOADS, isPlainObject,
   matchesJsonSchema, parseUsage, readStrictOutputText, safeErrorCode, sanitizeContents,
   sanitizeGenerationConfig, validateSessionId, WORKLOAD_OUTPUT_CODEPOINTS,
+  resolveGeminiWorkloadModel,
 } from "./policy.js";
 
 /**
@@ -25,14 +26,16 @@ export function createGeminiServerRuntime({ GoogleGenAI, apiKey, limits = DEFAUL
   if (typeof client?.models?.generateContent !== "function" || typeof client?.live?.connect !== "function") throw new Error("INVALID_GEMINI_SERVER_CLIENT");
   const admission = createGeminiAdmissionController({ limits: normalizedLimits, now });
 
-  async function generateContent(input = {}) {
+  async function dispatchContent(input = {}, boundModel = undefined) {
     const request = prepareDispatch(input);
+    const model = boundModel ?? GEMINI_SERVER_WORKLOAD_MODELS[request.workload];
+    if (request.signal?.aborted) throw new Error("GEMINI_REQUEST_ABORTED");
     admission.acquire(request.sessionId);
     const startedAt = now();
     let usage = parseUsage(undefined);
     try {
       const response = await client.models.generateContent({
-        model: GEMINI_SERVER_WORKLOAD_MODELS[request.workload],
+        model,
         contents: request.contents,
         config: {
           ...request.config,
@@ -42,12 +45,12 @@ export function createGeminiServerRuntime({ GoogleGenAI, apiKey, limits = DEFAUL
       });
       usage = parseUsage(response?.usageMetadata);
       const outputText = readStrictOutputText(response, WORKLOAD_OUTPUT_CODEPOINTS[request.workload]);
-      safelyObserve({ workload: request.workload, model: GEMINI_SERVER_WORKLOAD_MODELS[request.workload],
+      safelyObserve({ workload: request.workload, model,
         latencyMilliseconds: elapsedMilliseconds(startedAt), ...usage, code: "OK" });
       return { outputText };
     } catch (error) {
       const code = safeErrorCode(error);
-      safelyObserve({ workload: request.workload, model: GEMINI_SERVER_WORKLOAD_MODELS[request.workload],
+      safelyObserve({ workload: request.workload, model,
         latencyMilliseconds: elapsedMilliseconds(startedAt), ...usage, code });
       throw new Error(code);
     } finally {
@@ -55,19 +58,19 @@ export function createGeminiServerRuntime({ GoogleGenAI, apiKey, limits = DEFAUL
     }
   }
 
-  async function generateRecap(input = {}) {
+  async function dispatchRecap(input = {}, boundModel = undefined) {
     const allowedKeys = new Set(["maxOutputCodepoints", "prompt", "responseJsonSchema", "sessionId", "signal", "systemInstruction", "validate"]);
     if (!isPlainObject(input) || Object.keys(input).some((key) => !allowedKeys.has(key)) || typeof input.validate !== "function"
       || !isPlainObject(input.responseJsonSchema) || input.responseJsonSchema.type !== "object"
       || input.responseJsonSchema.additionalProperties !== false) throw new Error("INVALID_GEMINI_RECAP_REQUEST");
     const maxOutputCodepoints = input.maxOutputCodepoints ?? WORKLOAD_OUTPUT_CODEPOINTS.recap;
     if (!Number.isSafeInteger(maxOutputCodepoints) || maxOutputCodepoints < 1 || maxOutputCodepoints > WORKLOAD_OUTPUT_CODEPOINTS.recap) throw new Error("INVALID_GEMINI_RECAP_REQUEST");
-    const { outputText } = await generateContent({
+    const { outputText } = await dispatchContent({
       sessionId: input.sessionId, workload: "recap",
       contents: [{ role: "user", parts: [{ text: input.prompt }] }],
       config: { systemInstruction: input.systemInstruction, responseMimeType: "application/json",
         responseJsonSchema: input.responseJsonSchema, maxOutputTokens: 4_096 }, signal: input.signal,
-    });
+    }, boundModel);
     if (Array.from(outputText).length > maxOutputCodepoints) throw new Error("GEMINI_OUTPUT_TOO_LARGE");
     let parsed;
     try { parsed = JSON.parse(outputText); } catch { throw new Error("GEMINI_OUTPUT_SCHEMA_INVALID"); }
@@ -78,16 +81,23 @@ export function createGeminiServerRuntime({ GoogleGenAI, apiKey, limits = DEFAUL
     return validated;
   }
 
-  function createSessionClient(sessionId, workload) {
+  function createSessionClient(sessionId, workload, options = {}) {
     validateSessionId(sessionId);
     if (!GENERATE_WORKLOADS.has(workload)) throw new Error("INVALID_GEMINI_WORKLOAD");
-    return Object.freeze({ models: Object.freeze({
+    if (!isPlainObject(options) || Object.keys(options).some((key) => key !== "model")) throw new Error("INVALID_GEMINI_MODEL_SELECTION");
+    const selectedModel = resolveGeminiWorkloadModel(workload, options.model);
+    return Object.freeze({
+      async generateRecap(input = {}) {
+        if (workload !== "recap" || !isPlainObject(input) || Object.hasOwn(input, "sessionId")) throw new Error("INVALID_GEMINI_RECAP_REQUEST");
+        return dispatchRecap({ ...input, sessionId }, selectedModel);
+      },
+      models: Object.freeze({
       async generateContent(request = {}) {
         if (!isPlainObject(request) || Object.keys(request).some((key) => !["config", "contents"].includes(key))) throw new Error("INVALID_GEMINI_DISPATCH");
         const config = { ...(request.config ?? {}) };
         const signal = config.abortSignal;
         delete config.abortSignal;
-        const { outputText } = await generateContent({ sessionId, workload, contents: request.contents, config, signal });
+        const { outputText } = await dispatchContent({ sessionId, workload, contents: request.contents, config, signal }, selectedModel);
         return { text: outputText };
       },
     }) });
@@ -109,6 +119,7 @@ export function createGeminiServerRuntime({ GoogleGenAI, apiKey, limits = DEFAUL
   }
   function safelyObserve(event) { try { observe(Object.freeze(event)); } catch { /* Metrics never alter provider semantics. */ } }
 
-  return Object.freeze({ generateContent, generateRecap, createSessionClient, getLiveClient() { return client; },
+  return Object.freeze({ generateContent: (input = {}) => dispatchContent(input), generateRecap: (input = {}) => dispatchRecap(input),
+    createSessionClient, getLiveClient() { return client; },
     releaseSession(sessionId) { admission.releaseSession(sessionId); } });
 }

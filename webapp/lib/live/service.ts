@@ -148,6 +148,9 @@ export class LiveSessionService {
     assertEngineForLanguages(engine, languages);
     const modelPreferences = applyEngineSelection(currentPreferences, engine, {
       changedAt: new Date(this.now()).toISOString(), byHostId: hostId,
+      // A non-admin never reaches here with its own engine: whatever it sent was
+      // replaced by the global default above, and that is what the entry records.
+      reason: options.isAdmin === true ? "admin" : "server-default",
     });
     const updated = await this.store.updateOwned(sessionId, hostId, version, {
       sessionType,
@@ -359,10 +362,13 @@ function readRequestedEngine(value: unknown): EngineSelection | undefined {
  * - admin request -> honoured
  * - non-admin request -> REPLACED by the global default (not rejected: server authority)
  */
+// Spec §9: only an admin's request is honoured. A non-admin's engine is
+// replaced by the console's global engine, or — when no defaults resolved —
+// by the catalog default; it is never the requested engine (Task 4 fix M3).
 function resolveEngineAuthority(requested: EngineSelection | undefined, options: EngineAuthorityOptions, fallback: EngineSelection): EngineSelection {
   if (requested === undefined) return fallback;
   if (options.isAdmin === true) return requested;
-  return options.engineDefaults ?? requested;
+  return options.engineDefaults ?? defaultEngineSelection();
 }
 
 // Soniox two-way translation needs exactly two caption languages; refuse the

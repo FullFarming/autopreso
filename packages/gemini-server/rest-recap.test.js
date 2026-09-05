@@ -24,7 +24,7 @@ test("REST recap retains paid usage through schema rejection and does not invent
     async fetchFn() {
       calls++;
       if (calls === 2) throw new Error("NETWORK_FAILED");
-      return fakeResponse({ json: { text: '{"summary":false,"actions":[]}',
+      return fakeResponse({ json: { candidates: [{ finishReason: "STOP", content: { parts: [{ text: '{"summary":false,"actions":[]}' }] } }],
         usageMetadata: { promptTokenCount: 10, candidatesTokenCount: 3, totalTokenCount: 16 } } });
     } });
   const request = { sessionId: "usage-fixture", prompt: "Summarize.", schema: recapSchema, maxOutputTokens: 512 };
@@ -66,7 +66,7 @@ test("REST recap uses the fixed model, header-only key, redacted prompt, signal,
 
   assert.deepEqual(result, { outputText: '{"summary":"정상 요약","actions":["검토"]}' });
   assert.equal(calls.length, 1);
-  assert.equal(calls[0].url, "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.7-flash:generateContent");
+  assert.equal(calls[0].url, "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent");
   assert.equal(calls[0].url.includes("server-api-key"), false);
   assert.deepEqual(calls[0].options.headers, {
     "content-type": "application/json",
@@ -84,7 +84,7 @@ test("REST recap uses the fixed model, header-only key, redacted prompt, signal,
   assert.deepEqual(body.generationConfig.thinkingConfig, { thinkingLevel: "medium" });
   assert.deepEqual(observations, [{
     workload: "recap",
-    model: "gemini-3.7-flash",
+    model: "gemini-3.6-flash",
     latencyMilliseconds: 5,
     inputTokens: 12,
     outputTokens: 5,
@@ -105,7 +105,7 @@ test("REST recap redacts a raw six-digit prompt field before its single fetch", 
     async fetchFn(_url, options) {
       body = JSON.parse(options.body);
       return fakeResponse({
-        json: { candidates: [{ content: { parts: [{ text: '{"summary":"safe","actions":[]}' }] } }] },
+        json: { candidates: [{ finishReason: "STOP", content: { parts: [{ text: '{"summary":"safe","actions":[]}' }] } }] },
       });
     },
   });
@@ -137,9 +137,9 @@ test("REST recap makes one request and maps transport, refusal, schema, and usag
   const fixtures = [
     { response: fakeResponse({ ok: false, status: 429, json: { error: { message: "private@example.com" } } }), code: "GEMINI_PROVIDER_RATE_LIMITED" },
     { response: fakeResponse({ json: { promptFeedback: { blockReason: "SAFETY" } } }), code: "GEMINI_PROVIDER_REFUSAL" },
-    { response: fakeResponse({ json: { candidates: [{ content: { parts: [{ text: '{"summary":"safe","actions":[],"unknown":true}' }] } }] } }), code: "GEMINI_OUTPUT_SCHEMA_INVALID" },
-    { response: fakeResponse({ json: { candidates: [{ content: { parts: [{ text: '{"summary":"<b>bad</b>","actions":[]}' }] } }] } }), code: "GEMINI_OUTPUT_UNSAFE" },
-    { response: fakeResponse({ json: { candidates: [{ content: { parts: [{ text: '{"summary":"safe","actions":[]}' }] } }], usageMetadata: { promptTokenCount: "secret" } } }), code: "GEMINI_USAGE_INVALID" },
+    { response: fakeResponse({ json: { candidates: [{ finishReason: "STOP", content: { parts: [{ text: '{"summary":"safe","actions":[],"unknown":true}' }] } }] } }), code: "GEMINI_OUTPUT_SCHEMA_INVALID" },
+    { response: fakeResponse({ json: { candidates: [{ finishReason: "STOP", content: { parts: [{ text: '{"summary":"<b>bad</b>","actions":[]}' }] } }] } }), code: "GEMINI_OUTPUT_UNSAFE" },
+    { response: fakeResponse({ json: { candidates: [{ finishReason: "STOP", content: { parts: [{ text: '{"summary":"safe","actions":[]}' }] } }], usageMetadata: { promptTokenCount: "secret" } } }), code: "GEMINI_USAGE_INVALID" },
   ];
   for (const fixture of fixtures) {
     let calls = 0;
@@ -199,7 +199,7 @@ test("REST recap bounds three concurrent language calls before fetch and preserv
   assert.equal(fetchCalls, 2);
   for (const resolve of pendingResolvers) {
     resolve(fakeResponse({
-      json: { candidates: [{ content: { parts: [{ text: '{"summary":"safe","actions":[]}' }] } }] },
+      json: { candidates: [{ finishReason: "STOP", content: { parts: [{ text: '{"summary":"safe","actions":[]}' }] } }] },
     }));
   }
   await Promise.all([korean, english]);
@@ -239,8 +239,31 @@ test("REST recap enforces the global outstanding limit across sessions before fe
   assert.equal(fetchCalls, 2);
   for (const resolve of resolvers) {
     resolve(fakeResponse({
-      json: { candidates: [{ content: { parts: [{ text: '{"summary":"safe","actions":[]}' }] } }] },
+      json: { candidates: [{ finishReason: "STOP", content: { parts: [{ text: '{"summary":"safe","actions":[]}' }] } }] },
     }));
   }
   await Promise.all([first, second]);
+});
+
+const fixtureKey = ["server", "api", "key"].join("-");
+
+test("REST recap targets the requested catalog summary model and records that same model (3.6 → 3.6, 3.7 → 3.7); unlisted models are refused", async () => {
+  for (const model of ["gemini-3.6-flash", "gemini-3.7-flash"]) {
+    const calls = [], observations = [];
+    const generator = createGeminiRestRecapGenerator({
+      apiKey: fixtureKey, model, now: () => 0, observe(event) { observations.push(event); },
+      async fetchFn(url) {
+        calls.push(url);
+        return fakeResponse({ json: { candidates: [{ finishReason: "STOP", content: { parts: [{ text: '{"summary":"ok","actions":[]}' }] } }] } });
+      },
+    });
+    await generator.generateContent({ sessionId: `model-${model}`, prompt: "Summarize.", schema: recapSchema, maxOutputTokens: 512 });
+    assert.deepEqual(calls, [`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`]);
+    assert.equal(observations.length, 1);
+    assert.equal(observations[0].model, model, "the recorded model is the URL model");
+  }
+  assert.equal(createGeminiRestRecapGenerator({ apiKey: fixtureKey, async fetchFn() { throw new Error("unused"); } }) !== undefined, true, "no model → the recap default");
+  for (const model of ["gemini-3.5-flash", "gemini-3.5-flash-lite", "gemini-3.5-transcribe-live", "gemini-9-flash", "", null, 7]) {
+    assert.throws(() => createGeminiRestRecapGenerator({ apiKey: fixtureKey, model, async fetchFn() { throw new Error("unused"); } }), /INVALID_GEMINI_MODEL_SELECTION/u, String(model));
+  }
 });

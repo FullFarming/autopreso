@@ -1,4 +1,4 @@
-import { readLiveModelPreferences, type LiveModelPreferences } from "./model-preferences";
+import { fitEventMetadataToByteBudget, readLiveModelPreferences, type LiveModelPreferences } from "./model-preferences";
 import { hasValidTranslationCaptureProvenance, readTranslationCapture } from "./translation-capture";
 import type { LanguageObservation, CaptionEvent, LiveAgendaItem, LiveEventType, LiveSession, LiveSessionGlossaryPin, LiveSessionGlossaryPinSelection, LiveSessionGlossaryPins, LiveSessionSection, LiveSnapshot, LiveTopicSnapshot, SpeakerAssignment } from "../live-contract";
 import { BUILTIN_GLOSSARY_IDS } from "../glossary-presets/types";
@@ -149,8 +149,9 @@ export class MemoryLiveSessionStore implements LiveSessionStore {
   }
 
   async create(session: LiveSession): Promise<LiveSession> {
-    this.sessions.set(session.id, structuredClone(session));
-    return structuredClone(session);
+    const stored = withBudgetedPreferences(structuredClone(session));
+    this.sessions.set(session.id, stored);
+    return structuredClone(stored);
   }
 
   async get(sessionId: string, _options: { signal?: AbortSignal } = {}): Promise<LiveSession | null> {
@@ -182,7 +183,7 @@ export class MemoryLiveSessionStore implements LiveSessionStore {
       || current.version !== expectedVersion
       || current.status === "stopped"
       || Date.parse(current.expiresAt) <= this.now()) return null;
-    const updated = { ...current, ...structuredClone(patch), version: current.version + 1 };
+    const updated = withBudgetedPreferences({ ...current, ...structuredClone(patch), version: current.version + 1 });
     this.sessions.set(sessionId, updated);
     return structuredClone(updated);
   }
@@ -471,7 +472,7 @@ export class SupabaseLiveSessionStore implements LiveSessionStore {
         p_expires_at: session.expiresAt,
         p_event_company_name: session.companyName ?? null,
         p_event_reporting_period: session.fiscalPeriod ?? null,
-        p_event_metadata: eventMetadataBody(session),
+        p_event_metadata: fitEventMetadataToByteBudget(eventMetadataBody(session)),
       }),
     });
     if (!rows[0]) throw new LiveSessionError("세션을 만들지 못했습니다.", "SESSION_CREATE_FAILED", 502);
@@ -552,7 +553,8 @@ export class SupabaseLiveSessionStore implements LiveSessionStore {
         p_scheduled_at: patch.scheduledAt,
         p_event_company_name: patch.companyName ?? null,
         p_event_reporting_period: patch.fiscalPeriod ?? null,
-        p_event_metadata: { ...existingMetadata, ...eventMetadataBody({ ...patch, modelPreferences }) },
+        // Budgeted on the merged body — foreign keys already on the row count too.
+        p_event_metadata: fitEventMetadataToByteBudget({ ...existingMetadata, ...eventMetadataBody({ ...patch, modelPreferences }) }),
       }),
     });
     return rows[0] ? fromRow(rows[0]) : null;
@@ -730,7 +732,20 @@ export class SupabaseLiveSessionStore implements LiveSessionStore {
       limit: "101", offset: String(offset),
     });
     const rows = await this.request<SupabaseSessionRow[]>(`/rest/v1/live_sessions?${query}`, { method: "GET" });
-    return rows.map(fromRow);
+    // Recovery is a list: one row with unreadable stored state must not blank
+    // the host's whole list (Task 4 fix I3). Skip it and log code + id only;
+    // `get` / `getOwned` / `getSnapshot` still fail closed on the same row.
+    const sessions: LiveSession[] = [];
+    for (const row of rows) {
+      try {
+        sessions.push(fromRow(row));
+      } catch (error: unknown) {
+        if (!(error instanceof LiveSessionError) || error.code !== "INVALID_STORED_SESSION") throw error;
+        const rowId = typeof (row as { id?: unknown })?.id === "string" ? (row as { id: string }).id : "<unknown>";
+        console.error(`live session row skipped: ${error.code} id=${rowId}`);
+      }
+    }
+    return sessions;
   }
 
   async hasPreparingScheduledBetween(startAt: string, endAt: string): Promise<boolean> {
@@ -1214,6 +1229,12 @@ function topicMembershipFromRpc(value: unknown): Record<string, unknown> {
 function hasExactKeys(record: Record<string, unknown>, expected: ReadonlySet<string>): boolean {
   const keys = Object.keys(record);
   return keys.length === expected.size && keys.every((key) => expected.has(key));
+}
+
+/** Memory store mirror of the Supabase byte budget: the same body, the same trim, stored back on the session. */
+function withBudgetedPreferences(session: LiveSession): LiveSession {
+  const body = fitEventMetadataToByteBudget(eventMetadataBody(session));
+  return { ...session, modelPreferences: body.modelPreferences as LiveModelPreferences };
 }
 
 function eventMetadataBody(metadata: Pick<LiveSession, "ticker" | "eventType" | "agenda" | "modelPreferences">): Record<string, unknown> {

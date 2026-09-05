@@ -21,11 +21,15 @@ export function readGeminiSelectedModel(role, value) {
   if (typeof value === "string" && allowed(role).includes(value)) return value;
   throw new GeminiModelSelectionError();
 }
-/** Historical metadata is evidence of the old model, not a runtime override. */
+/** Historical metadata is evidence of the old model, not a runtime override.
+ *  Each role accepts only the ids that role ever stored: a flash id was never
+ *  a source (STT) model, so it is refused there instead of migrating silently. */
 export function readStoredGeminiModelSelection(role, value) {
-  if (role !== "source" && role !== "summary") throw new GeminiModelSelectionError();
-  if (role === "source" && ["gemini-3.5-transcribe-live", "gemini-3.5-live-translate-preview"].includes(value)) return value;
-  if (["gemini-3.7-flash", "gemini-3.6-flash", "gemini-3.5-flash"].includes(value)) return value;
+  if (role === "source") {
+    if (["gemini-3.5-transcribe-live", "gemini-3.5-live-translate-preview"].includes(value)) return value;
+    throw new GeminiModelSelectionError();
+  }
+  if (role === "summary" && ["gemini-3.7-flash", "gemini-3.6-flash", "gemini-3.5-flash"].includes(value)) return value;
   throw new GeminiModelSelectionError();
 }
 export function migrateLegacyGeminiModelSelection(role, value) {

@@ -498,7 +498,7 @@ test("the session engine's summary role selects the recap model and legacy pins 
     for (const [stored, expected] of [
       [{ engine: { ...DEFAULT_ENGINE_SELECTION, summary: { provider: "gemini", model: "gemini-3.6-flash" } } }, "gemini-3.6-flash"],
       [{ engine: { ...DEFAULT_ENGINE_SELECTION, summary: { provider: "gemini", model: "gemini-3.7-flash" } } }, "gemini-3.7-flash"],
-      [{ source: "gemini-3.7-flash", summary: "gemini-3.5-flash" }, "gemini-3.6-flash"],
+      [{ source: "gemini-3.5-live-translate-preview", summary: "gemini-3.5-flash" }, "gemini-3.6-flash"],
     ] as const) {
       const result = await generateMeetingSummary({ ...summaryInput, sessionContext: {
         title: "Pinned", companyName: null, ticker: null, fiscalPeriod: null, eventType: null, agenda: [],
@@ -519,7 +519,7 @@ test("the session engine's summary role selects the recap model and legacy pins 
 test("recap context reads the owned archived-time record and migrates its legacy model pin; failed reads never default", async () => {
   await withSupabaseTestEnvironment(async () => {
     const sessionId = crypto.randomUUID();
-    const modelPreferences = { source: "gemini-3.6-flash", summary: "gemini-3.5-flash" };
+    const modelPreferences = { source: "gemini-3.5-transcribe-live", summary: "gemini-3.5-flash" };
     const fetchFn: typeof fetch = async (input) => {
       const url = new URL(String(input));
       if (url.pathname.includes("/rpc/")) return Response.json([]);
