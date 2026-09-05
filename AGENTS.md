@@ -21,9 +21,9 @@ There is no npm workspace: the root, `media-gateway/`, and `webapp/` each have
 their own `package.json` and lockfile, so each needs its own `npm ci`.
 
 ```sh
-npm test                             # root: 1676 tests (1662 pass, 14 skip - PGlite SQL tests need NOVA_PGLITE_MODULE; local-term-retrieval's lookup-budget test flakes only when the three suites run concurrently)
-npm --prefix media-gateway test      # 591 tests (bare `node --test`)
-npm --prefix webapp run test:live    # 943 tests (Live Call surface; test:core adds 77)
+npm test                             # root: 1537 tests (1517 pass, 20 skip - PGlite SQL tests need NOVA_PGLITE_MODULE; local-term-retrieval's lookup-budget test flakes only when the three suites run concurrently)
+npm --prefix media-gateway test      # 644 tests (bare `node --test`)
+npm --prefix webapp run test:live    # 1043 tests (Live Call surface; test:core adds 79)
 npm --prefix webapp test             # test:live + test:core - what CI runs
 ```
 
@@ -81,6 +81,14 @@ socket (`onHostEvent`), because participant Speak audio is invisible to the
 desktop's own local engine; `electron/main.js` fans those to all renderers as
 `live-call:caption`.
 
+A session carries 1–3 unique canonical languages (`validateEngineForLanguages`
+in `packages/caption-core/caption-engine-catalog.js`). On Soniox, 1 language is
+a `one_way` stream and 2 is one `two_way` connection; 3 languages use
+`SonioxFanoutAdapter` (`media-gateway/src/engines/`): one Soniox connection per
+target language, finals aligned by time-range overlap plus normalized text,
+dead or recovering lanes skipped (fail-open to the source text), and lane
+rollovers staggered 60 s apart so no two connections renew in the same instant.
+
 - **Electron desktop host** (`electron/main.js`, `electron/preload.js`) owns the
   windows and the OS capture permissions. It boots the same `startServer` on
   `127.0.0.1:3210` (falling back to port 0 on `EADDRINUSE`) and loads its pages
@@ -132,18 +140,34 @@ desktop's own local engine; `electron/main.js` fans those to all renderers as
   (`webapp/app/console/layout.tsx`), not middleware, and every read/write goes
   through service-role RPCs (`set_profile_status_v1`, `set_profile_role_v1`,
   `list_sessions_admin_v1`, ...) - the browser never selects from `profiles`.
-  The global `engine_defaults.engine` is the **only** Live Call engine: hosts
-  see it read-only, and `POST/PATCH /api/live-sessions` replaces a non-admin
-  caller's `modelPreferences.engine` with it (server authority, not an error).
-  "배포" is `PUT /api/console/engine-defaults`: DB write, then per
-  `preparing|live` session `set_live_session_engine_admin_v1` (history <= 8
-  entries / 3800-byte `event_metadata` budget, `reason`) and gateway
+  **Engine assignment is per user (decision D1, 2026-09-05).** The default is
+  Soniox (recognition + its own translation); Gemini Transcribe Live → Flash is
+  the alternative. The assignment lives on `profiles.voice_provider` (+
+  `voice_provider_revision`) and only the operator changes it, in
+  `/console/users`: `PATCH /api/console/users { voiceProvider }` →
+  `set_profile_voice_provider_v2` → `engineSelectionForVoiceProvider` (the one
+  provider→engine mapping, shared with `resolveHostEngineAssignment`) → for
+  each of that host's `preparing|live` sessions
+  (`list_live_session_ids_for_host_admin_v1`)
+  `set_live_session_engine_admin_v2` (history <= 8 entries / 3800-byte
+  `event_metadata` budget, `reason`, plus the profile's revision pinned as
+  `modelPreferences.assignmentRevision`) and gateway
   `POST /internal/sessions/:id/engine` with a 60 s `ADMIN` gateway token; the
   gateway swaps the pipeline (contract C1 kept) and emits `engine-status` to
-  the host, and the response is a per-session `switched|queued|failed` table
-  (`queued` = cold session, applied on next activation). Each deploy leaves two
-  `profile_events.engine_defaults` rows (engine, then `kind: 'deploy'`
-  counters). `set_legacy_password_login_v1` turns the password login into
+  the host. So a change applies **immediately** to running sessions and
+  persists for future ones: `POST /api/live-sessions` pins the caller's current
+  assignment and `assignmentRevision` on the session, and both host readers
+  (`electron/main.js` `readLiveCallModelPreferences`,
+  `live-audio-client.ts` `readHostModelPreferences`) accept and drop that key.
+  Hosts cannot change the engine (server authority, not an error). The
+  response is a per-session `switched|queued|failed` table (`queued` = cold
+  session, applied on next activation); each change leaves a
+  `profile_events` `user_assignment` row plus a best-effort
+  `record_console_deploy_v1` row. The global `engine_defaults` deploy is
+  retired: `PUT /api/console/engine-defaults` answers 410
+  `ENGINE_DEFAULTS_RETIRED` (GET catalog kept), `/console/engine` is an info
+  card linking to `/console/users` plus the account section, where
+  `set_legacy_password_login_v1` turns the password login into
   `LEGACY_LOGIN_DISABLED` (403) at `/api/login`.
 
 ### Two supported HOST connection paths (do NOT tighten one to "fix" the other)

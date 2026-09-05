@@ -34,29 +34,66 @@ project. The core sequence is:
    identity fields through the v3 RPC overloads. Valid utterance start/end
    pairs also accumulate per-participant speaking seconds for recap analytics;
    negative or longer-than-one-hour segments are ignored.
-9. `202609020002_auth_profiles_desktop_codes.sql` makes Supabase Auth the host
-   identity provider: `profiles` (approval `status`, `role`, and the `host_id`
-   string the `rnw_session` cookie carries), append-only `profile_events`,
-   one-shot `desktop_login_codes`, RLS, and the service-role RPCs
-   `upsert_profile_on_login_v1`, `read_profile_by_host_id_v1`,
-   `issue_desktop_login_code_v1`, and `consume_desktop_login_code_v1`. See
-   "Authentication 설정" below.
-10. `202609020003_console_rpcs.sql` adds the admin console tables
-    `engine_defaults` and `console_settings` plus the admin-only RPCs for
-    signup approval, roles, session aggregates, global engine defaults, and
-    the legacy password-login switch (`set_legacy_password_login_v1`). It
-    depends on `profiles` from the previous migration.
-11. `202609020004_live_session_engine_admin.sql` adds
+9. `202609020001_live_summary_generic_failure_retry.sql` lets a generic
+   summary failure be retried, reports a session with no speech as `empty`,
+   and adds the host-only summary `reset` RPC (⑥).
+10. `202609020002_auth_profiles_desktop_codes.sql` makes Supabase Auth the host
+    identity provider: `profiles` (approval `status`, `role`, and the `host_id`
+    string the `rnw_session` cookie carries), append-only `profile_events`,
+    one-shot `desktop_login_codes`, RLS, and the service-role RPCs
+    `upsert_profile_on_login_v1`, `read_profile_by_host_id_v1`,
+    `issue_desktop_login_code_v1`, and `consume_desktop_login_code_v1`. See
+    "Authentication 설정" below.
+11. `202609020003_console_rpcs.sql` adds the admin console tables
+    `engine_defaults` (no longer decides anything since D1, kept for history)
+    and `console_settings` plus the admin-only RPCs for signup approval, roles,
+    session aggregates, and the legacy password-login switch
+    (`set_legacy_password_login_v1`). It depends on `profiles` from the
+    previous migration.
+12. `202609020004_live_session_engine_admin.sql` adds
     `set_live_session_engine_admin_v1` (replaces a `preparing`/`live`
     session's `event_metadata.modelPreferences.engine` and appends an
     `engineHistory` entry with `reason: 'admin'`; history is capped at 8
     entries and trimmed oldest-first while the metadata body exceeds 3800
     bytes) and `list_live_session_ids_admin_v1`. Neither writes
     `profile_events`.
-12. `202609020005_console_deploy_audit.sql` adds `record_console_deploy_v1`,
-    the per-deploy audit row (`profile_events.engine_defaults` with
-    `kind: 'deploy'` and `sessionsSwitched` / `sessionsQueued` /
-    `sessionsFailed` counters).
+13. `202609020005_console_deploy_audit.sql` adds `record_console_deploy_v1`,
+    the per-change audit row in `profile_events.engine_defaults` (now written
+    per user assignment change with the target profile and revision).
+14. `202609050001_user_engine_access_renewal.sql` adds
+    `profiles.voice_provider` (`soniox` | `gemini`, default `soniox`) and
+    `voice_provider_revision`, `set_profile_voice_provider_v1`,
+    `read_host_voice_assignment_v1`, `list_profiles_admin_v2`, and the
+    host/viewer access-renewal RPCs (`renew_live_session_access_v1`,
+    `renew_live_viewer_access_v1`). Existing profiles become Soniox revision 1;
+    running sessions are not rewritten. **Depends on `202609020002`–`0005`**
+    (`profiles`, `profile_events`, the console guard, the admin session RPC),
+    so those five must be applied first.
+15. `202609050002_managed_caption_sessions.sql` adds `managed_caption_sessions`
+    for the server-issued local-caption credentials (Soniox temporary keys /
+    Gemini short-lived tokens): register, renew (24 h grace past
+    `access_expires_at`, then `CAPTION_SESSION_EXPIRED`), stop. No transcript
+    text is stored.
+16. `202609050003_live_speaker_roster.sql` adds the host speaker roster:
+    `live_speaker_rosters`, immutable `live_speaker_profile_versions` and
+    `live_speaker_photos`, with revision-guarded replace/ack RPCs.
+17. `202609050004_speaker_profile_history.sql` adds nullable `speaker_profile` /
+    `speaker_attribution` to source and caption rows and the v4 source RPCs
+    that pin the identity captured at the audio boundary. Existing rows stay
+    NULL.
+18. `202609050005_regrant_session_engine_admin.sql` (decision D1) re-grants
+    `set_live_session_engine_admin_v1` to `service_role` (0001 had revoked it)
+    and adds `set_live_session_engine_admin_v2` (also pins
+    `modelPreferences.assignmentRevision`), `list_live_session_ids_for_host_admin_v1`,
+    and `set_profile_voice_provider_v2` (returns the profile identity, logs
+    `effective = 'immediate'`). Must follow `202609050001`.
+
+`202609050003` and `202609050004` are idempotent (`if not exists` /
+`create or replace` / do-block-guarded renames) and the PGlite tests apply each
+twice; `202609050005` is additive and re-runnable. Order is load-bearing:
+`202609020002`–`202609020005` before `202609050001`, and `202609050001` before
+`202609050005`. Never run `bootstrap-new-project.sql` against an existing
+production database.
 
 ## Deployment region policy and current audit
 
@@ -519,7 +556,8 @@ application callers first and retain the additive column and rows.
 ## Authentication 설정
 
 Migrations `202609020002` through `202609020005` make Supabase Auth the
-identity provider for hosts and add the admin console. The browser signs in with Google or email/password (PKCE)
+identity provider for hosts and add the admin console; `202609050001` and
+`202609050005` add the per-user engine assignment the console manages. The browser signs in with Google or email/password (PKCE)
 and posts the access token to `POST /api/auth/exchange`; the server verifies it
 against `GET /auth/v1/user`, upserts `profiles` through
 `upsert_profile_on_login_v1`, and issues the existing `rnw_session` cookie only
@@ -554,7 +592,10 @@ API keys, deep-link codes, or `state` values into chat, commits, or this file.
 4. Vercel: set `ADMIN_BOOTSTRAP_EMAILS` (comma-separated) for Production and
    any Preview environment that should accept those admins.
 
-Deploy order: apply `202609020002`–`202609020005` by hand in filename order → deploy the
+Deploy order: apply `202609020001`–`202609020005`, then
+`202609050001`–`202609050005`, by hand in filename order → deploy the media
+gateway first (it must accept 1–3-language Soniox sessions before the webapp
+creates them) → deploy the
 webapp with legacy login still enabled → confirm the first Google login of a
 bootstrap admin creates an approved `profiles` row → ship the desktop DMG that
 registers the `nova` scheme (`electron/main.js` registers it only when
@@ -569,40 +610,51 @@ leave the additive tables in place.
 `/console` (`/console/users`, `/console/sessions`, `/console/engine`) is
 reachable only by `role = 'admin'` profiles; the guard runs in the Next.js
 server layout (`requireAdminFromCookieValue`), and every read and write goes
-through the service-role RPCs from `202609020003`–`202609020005`. The console
-does three things: signup approval and roles (`set_profile_status_v1` /
-`set_profile_role_v1`; the last admin cannot be demoted or disabled and nobody
-can change their own row - both enforced in SQL), session aggregates
-(`list_sessions_admin_v1`), and the global Live Call engine.
+through service-role RPCs. The console does three things: signup approval and
+roles (`set_profile_status_v1` / `set_profile_role_v1`; the last admin cannot
+be demoted or disabled and nobody can change their own row - both enforced in
+SQL), session aggregates (`list_sessions_admin_v1`), and **per-user engine
+assignment** (decision D1, 2026-09-05).
 
-The global engine (`engine_defaults.engine`) is the only Live Call engine.
-Hosts see it read-only in the web dashboard and the desktop app, and the
-server replaces any non-admin `modelPreferences.engine` with it when a session
-is created or patched. "배포" (`PUT /api/console/engine-defaults`) is an
-**immediate switch**: it stores the new engine (`set_engine_defaults_v1`), then
-for every `preparing`/`live` session calls `set_live_session_engine_admin_v1`
-and pushes `POST /internal/sessions/:id/engine` to the media gateway with a
-60-second `ADMIN` gateway token. The gateway opens the new pipeline, closes the
-old one once it is ready (caption `seq` continues), and tells the host via
-`engine-status`. The response is a per-session table: `switched` (the gateway
-swapped it), `queued` (the gateway does not hold the session - cold - so the DB
-value applies on the next activation; expected, not an error), or `failed`
-with a code (the old pipeline keeps running). Each deploy leaves **two**
-`profile_events.engine_defaults` rows: the bare engine from
-`set_engine_defaults_v1`, then the `kind: 'deploy'` counters row from
-`record_console_deploy_v1`.
+The Live Call engine is assigned per user on `profiles.voice_provider`
+(`soniox` = Soniox recognition + its own translation, the default;
+`gemini` = Gemini Transcribe Live → Flash). Only the operator (a global admin)
+changes it, from the user row in `/console/users`; hosts see their engine
+read-only in the web dashboard and the desktop app, and the server pins the
+caller's current assignment (and its `voice_provider_revision` as
+`modelPreferences.assignmentRevision`) when a session is created. A change is
+an **immediate switch**: `PATCH /api/console/users { voiceProvider }` →
+`set_profile_voice_provider_v2` (bumps the revision only on a change, logs
+`effective = 'immediate'`) → for each of that host's `preparing`/`live`
+sessions (`list_live_session_ids_for_host_admin_v1`)
+`set_live_session_engine_admin_v2` with the new revision → gateway
+`POST /internal/sessions/:id/engine` with a 60-second `ADMIN` gateway token.
+The gateway opens the new pipeline, closes the old one once it is ready
+(caption `seq` continues), and tells the host via `engine-status`. The console
+shows a confirm dialog quoting how many running sessions will switch, then a
+per-session table: `switched` (the gateway swapped it), `queued` (cold session,
+the DB value applies on the next activation; expected, not an error), or
+`failed` with a code (the old pipeline keeps running). Each change leaves a
+`profile_events` `user_assignment` row from the RPC plus a best-effort
+`record_console_deploy_v1` row carrying the target profile, provider and
+revision.
+
+The global `engine_defaults` deploy is retired: `PUT /api/console/engine-defaults`
+answers 410 `ENGINE_DEFAULTS_RETIRED` (the GET catalog stays), and
+`/console/engine` is an information card that links to `/console/users`.
 
 Operator steps after the first admin login: open `/console/users` (the
-bootstrap admin row must be `approved` / `admin`) and `/console/engine` (the
-current engine and a "배포" that reports `queued` or `switched`, never 5xx).
-Turn off legacy password login (`set_legacy_password_login_v1`, the 계정
-section of `/console/engine`) only after Google login is confirmed; from then
-on `/api/login` answers `LEGACY_LOGIN_DISABLED` (403).
+bootstrap admin row must be `approved` / `admin`, and each row shows its
+engine), change one test user's engine and confirm the result table reports
+`queued` or `switched`, never 5xx. Turn off legacy password login
+(`set_legacy_password_login_v1`, the 계정 section of `/console/engine`) only
+after Google login is confirmed; from then on `/api/login` answers
+`LEGACY_LOGIN_DISABLED` (403).
 
 Local SQL verification without a linked project:
 
 ```sh
-NOVA_PGLITE_MODULE=/path/to/pglite/dist/index.js node --test test/auth-profiles-sql.test.js test/console-rpcs-sql.test.js test/live-session-engine-admin-sql.test.js test/console-deploy-audit-sql.test.js
+NOVA_PGLITE_MODULE=/path/to/pglite/dist/index.js node --test test/auth-profiles-sql.test.js test/console-rpcs-sql.test.js test/live-session-engine-admin-sql.test.js test/console-deploy-audit-sql.test.js test/regrant-session-engine-admin-sql.test.js
 ```
 
 ## 2026-09-05: 사용자별 엔진과 연속 세션 접근
@@ -610,7 +662,7 @@ NOVA_PGLITE_MODULE=/path/to/pglite/dist/index.js node --test test/auth-profiles-
 `202609050001_user_engine_access_renewal.sql`은 기존 마이그레이션 다음에 적용합니다. 운영 DB에는 자동 적용하지 않습니다. 신규 프로젝트 bootstrap에도 동일 SQL이 포함됩니다.
 
 - 기존 및 신규 `profiles`는 `voice_provider = soniox`, `voice_provider_revision = 1`로 초기화됩니다. 기존 세션의 엔진과 기록은 변경하지 않습니다.
-- 관리자는 `set_profile_voice_provider_v1`로 사용자 배정만 바꿉니다. 서버는 새 세션을 만들 때 `read_host_voice_assignment_v1` 결과를 세션에 고정하며, 재연결 시 이를 유지해야 합니다. `list_profiles_admin_v2`는 배정 정보를 함께 반환합니다.
+- 관리자는 사용자 배정을 바꿉니다(콘솔은 `202609050005`의 `set_profile_voice_provider_v2`를 호출하며, D1에 따라 그 사용자의 진행 중 세션에도 즉시 적용됩니다 — 이 파일의 "다음 세션부터" 회수는 `202609050005`가 되돌립니다). 서버는 새 세션을 만들 때 `read_host_voice_assignment_v1` 결과를 세션에 고정하며, 재연결 시 이를 유지해야 합니다. `list_profiles_admin_v2`는 배정 정보를 함께 반환합니다.
 - 라이브 상태에서 기존 접근 만료 시각과 일치하는 아직 열린 입장 창·미철회 초대만 접근 연장과 함께 연장합니다. 짧게 설정한 입장 창, 준비/일시정지 상태, 만료 또는 철회된 초대는 그대로 둡니다.
 - 호스트 인증 후 `renew_live_session_access_v1`을 호출하면 남은 접근 시간이 15분 이하일 때 6시간의 유한 접근 창을 갱신합니다. 종료/삭제된 세션, 다른 호스트, 비활성 프로필은 갱신되지 않습니다.
 - 서버에서 유효한 참가자 쿠키를 검증한 뒤 `renew_live_viewer_access_v1(session_id, grant_id, user_id)`로 해당 참가자의 유효한 접근만 갱신합니다. 반환값은 만료 시각이며 쿠키/미디어 토큰도 함께 재발급해야 합니다. 만료되거나 철회된 참가자 권한은 복구하지 않습니다.

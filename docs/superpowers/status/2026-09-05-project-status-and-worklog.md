@@ -1,6 +1,6 @@
 # NOVA (realtime-noel) — 프로젝트 정리와 작업 이력 (2026-09-05 기준)
 
-작성 시각: 2026-09-05 08:45 KST, 갱신 2026-09-05 14:30 KST(Plan B Task 7). 브랜치 `codex/google-live-latency-20260831`, HEAD `949b06f`; 남은 작업은 하드닝 브랜치 `codex/engine-hardening-20260905`(949b06f 기반 워크트리)에서 진행. 이 문서는 2026-09-02부터 이어진 작업의 맥락·결정·진행 상황을 한곳에 모은 것이다. 세부 근거는 각 스펙·계획·원장 파일에 있으며, 여기서는 경로만 가리킨다.
+작성 시각: 2026-09-05 08:45 KST, 갱신 14:30 KST(Plan B Task 7), 19:10 KST(§4.7 통합). 현재 브랜치 `codex/nova-integration-20260905`, HEAD `4c2cbbf`(949b06f + 하드닝 브랜치 + 두 번째 세션 체크포인트 + 통합 수정). §1~§4.6은 오전 기준 기록이며, 이후 상태는 §3 말미·§4.7·§5·§6에 있다. 이 문서는 2026-09-02부터 이어진 작업의 맥락·결정·진행 상황을 한곳에 모은 것이다. 세부 근거는 각 스펙·계획·원장 파일에 있으며, 여기서는 경로만 가리킨다.
 
 ---
 
@@ -44,9 +44,10 @@
 4. 가입: **공개 가입 + 관리자 승인**. 콘솔 범위: 가입 관리 · 세션 데이터 · 전역 엔진 기본값.
 5. 기록 원문 뷰: **화자가 바뀌지 않으면 한 문단**, 발언마다 시각 표시(⑤).
 6. 요약 생성: 로딩 스켈레톤, 첫 실패·반복 클릭 문제 해결(⑥).
-7. **2026-09-04 추가 결정**: Live Call 엔진은 **관리자가 콘솔에서 정한 전역 값 하나**, 호스트는 **바꿀 수 없음(잠금)**, 배포 시 **진행 중 세션도 즉시 전환**. 데스크톱 `subtitle.engine`은 로컬 자막 전용. (`2026-09-02-auth-approval-admin-console-design.md` §9)
-8. 기본 공급자: spike 결과에도 **Gemini Transcribe + Flash 유지**(합성 음성만으로 실제 마이크 정확도를 판정할 수 없고, 3개 언어 세션은 Gemini 번역이 필요하며, 배포된 게이트웨이에 Soniox 레인이 없기 때문). Soniox는 관리자가 선택 가능한 결합 엔진.
+7. ~~**2026-09-04 추가 결정**: Live Call 엔진은 **관리자가 콘솔에서 정한 전역 값 하나**, 호스트는 **바꿀 수 없음(잠금)**, 배포 시 **진행 중 세션도 즉시 전환**.~~ **→ D1(2026-09-05 오후)로 대체**: 엔진은 **사용자별**(`profiles.voice_provider`), **운영자(전역 관리자)만** `/console/users`에서 바꾸며, 변경은 그 사용자의 진행 중 세션에 **즉시** 적용되고 다음 세션에도 유지된다. "호스트 잠금"과 "즉시 전환"은 유지, "전역 하나"만 폐기. 데스크톱 `subtitle.engine`은 로컬 자막 전용 그대로. (스펙 §11)
+8. ~~기본 공급자: spike 결과에도 **Gemini Transcribe + Flash 유지**(합성 음성만으로 실제 마이크 정확도를 판정할 수 없고, 3개 언어 세션은 Gemini 번역이 필요하며, 배포된 게이트웨이에 Soniox 레인이 없기 때문). Soniox는 관리자가 선택 가능한 결합 엔진.~~ **→ D2(2026-09-05 오후)로 대체**: 기본 엔진은 **Soniox**(인식+자체 번역), Gemini Transcribe → Flash는 대안. 3개 언어는 Soniox 팬아웃(대상별 연결, 2408f0b가 결함 수정). 실음성 검증(P0)은 남은 조건.
 9. 보안 규칙: API 키는 채팅에 붙이지 않는다(사용자가 직접 `~/.config/realtime-noel/soniox.env`와 Secret Manager `realtime-noel-soniox-api-key`에 설치 완료). 테스트는 fixture 문자열만. `git add -A` 금지. 운영 변경(마이그레이션 적용·Vercel·Cloud Run·DMG)은 사용자 승인 후.
+10. **2026-09-05 오후 결정 D1~D5** (근거 `2026-09-05-cross-session-analysis-and-user-actions.md` §4, 기록 스펙 §11): D1 사용자별 즉시 전환(위 7 대체) · D2 Soniox 기본(위 8 대체) · D3 자동 모드 언어 힌트는 두 번째 세션 설계(입력 ≠ 출력, 비엄격) 유지, 실음성 P0 검증은 후속 · D4 수정+클린 게이트 뒤 전부 배포(Vercel 등록은 컨트롤러, 게이트웨이/Soniox 계정 단계는 사용자 안내) · D5 Vercel Root Directory는 리포 루트 유지.
 
 ---
 
@@ -101,7 +102,27 @@
 - Task 6 `4c28deb`(입력 소스 마이그레이션 `202609010001~0004` + bootstrap 미러), `461f026`(데스크톱 Live Call archive/drain 모듈 등 WT 커밋), `906fe46`(데스크톱이 게이트웨이 (재)시작 전 세션 레코드에서 엔진을 다시 핀 — Task 5 후속 I1), `5b5d964`(웹앱 소스 레저·스냅샷 동기화·자막 provenance·요약 원문), `949b06f`(엔진 카탈로그 핀 정합 + 게이트웨이 WT 커밋). 이 시점부터 **커밋된 브랜치가 자체 정합**이다(WT 진실 규칙 종료).
 - Task 7 1단계(클린 워크트리 게이트, 949b06f, node_modules 심링크): 루트 typecheck 클린, 1676 / 1662 pass / 0 fail / 14 skip; 게이트웨이 591/591; 웹앱 typecheck 클린, `test:live` 943/943 + `test:core` 77/77. 남은 것: 하드닝 라운드(Task 5 리뷰 M1~M5 + 게이트웨이 재접속 warm 판정) → 게이트 재실행 → 배포.
 
-### 4.7 리뷰에서 나온 결정 중 기억할 것
+### 4.7 통합(2026-09-05 오후) — 브랜치 `codex/nova-integration-20260905`
+
+두 번째 세션이 메인 워킹트리에 남긴 미커밋 작업(~380 파일: 제품 경계 NOVA 전용, Soniox 기본, 사용자별 엔진 배정, 관리형 자막 자격증명, 화자 명단, 접근 갱신, 요약 폴링)을 949b06f 위에 체크포인트로 커밋하고, 대조 분석(`2026-09-05-cross-session-analysis-and-user-actions.md`)에서 찾은 결함을 D1~D5에 맞춰 고친 뒤 하드닝 브랜치를 병합했다. 원장 `.superpowers/sdd/2026-09-05-nova-integration/progress.md`. 커밋(시간순):
+
+- `b8dcba0` wip(checkpoint): 두 번째 세션의 미커밋 NOVA 작업 스냅샷(`git add -A` 1회, 루트 `controller.js`/`live-interpreter.js` 제외; 이후 커밋은 파일 지정 스테이징만).
+- `5d4c271` fix(live): 두 호스트 리더(데스크톱 `readLiveCallModelPreferences`, 웹 `readHostModelPreferences`)가 서버가 고정한 `assignmentRevision`을 허용·폐기 — 이 키 때문에 새 Live Call이 시작되지 않던 치명 결함(C1) 수정, 생성→시작 왕복 계약 테스트 추가.
+- `d8a2b00` merge: `codex/engine-hardening-20260905`(ec128de warm reattach·엔진 전환 시도 정리·키 존재 플래그·413 hangup·레인 인식 ready 재공지 + 문서 3건) 병합.
+- `2408f0b` fix(gateway): Soniox 팬아웃 — 시간 범위 정렬(≥50% 겹침 + 정규화 텍스트), 죽은/복구 중 레인은 대기에서 제외(죽은 레인 1개당 최종 자막 3초 지연 → 0), 백프레셔는 비치명, 일시 오류는 상한 백오프로 레인 재개(3회 연속 실패 시 `SONIOX_TRANSLATION_UNAVAILABLE`), 레인별 롤오버 60초 어긋나기, 늦은 임시 자막 지연.
+- `6ef36b7` feat(supabase): `202609050005` — `set_live_session_engine_admin_v1` service_role 재부여(0001의 회수 되돌림) + `set_live_session_engine_admin_v2`(assignmentRevision 기록)·`list_live_session_ids_for_host_admin_v1`·`set_profile_voice_provider_v2`.
+- `069a73d` fix(auth): 승인 캐시가 저장소 장애 시 마지막 값을 TTL 지나 10분까지 유지(전원 잠금 방지); 레거시 `noel` 로그인은 `ADMIN_BOOTSTRAP_EMAILS` 미설정 로컬에서 기존 동작(break-glass).
+- `9061071` feat(console): 운영자의 사용자별 엔진 배정이 그 사용자의 진행 중 세션에 즉시 적용 — `PATCH /api/console/users { voiceProvider }` → `set_profile_voice_provider_v2` → `engineSelectionForVoiceProvider` → 세션별 `set_live_session_engine_admin_v2` + 게이트웨이 `POST /internal/sessions/:id/engine`(60초 ADMIN 토큰); `PUT /api/console/engine-defaults`는 410 `ENGINE_DEFAULTS_RETIRED`; `deployEngineToActiveSessions`·`gateway-engine-push.ts` 등 죽은 코드 삭제.
+- `19b7d9c` fix(console): 죽은 전역 엔진 패널을 안내 카드 + `/console/users` 링크로 교체; 사용자 행 엔진 셀렉트에 확인 다이얼로그(진행 중 세션 수) + 인라인 세션별 결과; 콘솔 문구 전부 `t()`(ko/en/ja), 사전 밖 한국어 리터럴을 거부하는 테스트.
+- `5e581bf` fix(supabase): `202609050003`/`0004` 멱등화(`if not exists`/`create or replace`/do-block 가드 rename; PGlite 테스트가 두 번 적용 + 금지 패턴 핀; bootstrap 미러 갱신) + 관리형 자막 갱신 24시간 유예(`CAPTION_SESSION_EXPIRED`, 브로커 410).
+- `74470c6` fix(live): 요약 폴링 벽시계 상한 30분(`SUMMARY_GENERATION_STALLED`), 읽기 실패 소진 `SUMMARY_READ_EXHAUSTED`, ko/en/ja 문구.
+- `5ea73b9` fix(desktop): 설정 로드가 `translateAllLanguages`로 `ja`를 조용히 추가하지 않음(언어 1개 = Soniox 연결 1개); 마이크/시스템 Soniox 롤오버 오프셋 +30초 어긋나기.
+- `43def59` fix(captions): Gemini 임시 토큰의 `languageCodes`가 티켓 언어의 부분집합이 아니면 400 `CAPTION_LANGUAGES_MISMATCH`.
+- `4c2cbbf` fix(stage): 스테이지의 `/host-screen` 링크가 `target=_blank rel=noopener` — Electron 스테이지 창은 열기 거부, 브라우저 프로젝터는 탭 유지.
+
+클린 게이트(4c2cbbf, 격리 워크트리 + node_modules 심링크): 루트 1537 / 1517 pass / 0 fail / 20 skip(PGlite 테스트는 `NOVA_PGLITE_MODULE` 필요), 게이트웨이 644/644, 웹앱 `test:live` 1043/1043 + `test:core` 79/79, 타입체크 2종 클린. 통합 중 Vercel 프로덕션 환경변수 `ADMIN_BOOTSTRAP_EMAILS`·`SONIOX_API_KEY` 등록 완료(다음 배포부터 유효). 게이트웨이 Cloud Run에는 `SONIOX_API_KEY` 시크릿이 아직 연결되지 않았고 `GEMINI_LIVE_MODEL`은 더 이상 읽지 않는다(배포 시 `--update-secrets` / `--remove-env-vars`). 남은 결함: 데스크톱 마이크+시스템 팬아웃의 프로세스 수준 stagger는 5ea73b9로 30초 오프셋만 적용.
+
+### 4.8 리뷰에서 나온 결정 중 기억할 것
 - 게이트웨이 Live Call 확정 자막에 LLM polish는 **넣지 않는다**(2026-08-31 지연 계약; 번역 호출이 최종 텍스트를 만들고 결정적 용어집 패스는 유지). 데스크톱 로컬 자막의 polish는 그대로.
 - 계약 C1(자막 seq는 확정에만 소비)은 게이트웨이·뷰어 양쪽에 `contract C1` 마커로 표시되어 있고 한쪽만 바꾸면 안 된다.
 - Node의 `--experimental-strip-types`는 TS 파라미터 프로퍼티·enum을 지원하지 않는다(명시적 필드 사용). 프리커밋 시크릿 스캐너는 `const x = "…token…"` 형태를 막으므로 fixture 리터럴은 호출부에 인라인한다.
@@ -111,25 +132,20 @@
 
 ## 5. 지금 워킹트리·커밋 상태
 
-- `codex/google-live-latency-20260831` HEAD `949b06f`(2026-09-02~05 커밋 65개). 배포된 서비스(Vercel 웹앱, Cloud Run 게이트웨이, 설치된 NOVA.app)는 **아직 아무것도 반영되지 않았다**.
-- 949b06f 클린 체크아웃 스위트: 루트 1676 / 1662 pass / 0 fail / 14 skip(PGlite 테스트는 `NOVA_PGLITE_MODULE` 필요; `local-term-retrieval` 조회 예산 테스트는 세 스위트를 동시에 돌릴 때만 흔들림), 게이트웨이 591/591, 웹앱 `test:live` 943/943 + `test:core` 77/77, 타입체크 2종 클린.
-- **메인 워킹트리 주의**: `/Users/kyeongmankim/Realtime/autopreso`의 미커밋 변경은 이 스트림과 무관한 "NOVA-only product boundary" 변경 세트(Canvas 분리, Moonshine 사이드카·`public/app.js` 삭제, README/AGENTS 재작성 등)다. 이 스트림의 남은 작업은 949b06f 기반 워크트리 브랜치 `codex/engine-hardening-20260905`에서만 진행하고, 메인 트리를 이 스트림의 커밋 기준으로 쓰지 않는다.
-- 미적용 마이그레이션(파일명 순으로 적용): `202609020001_live_summary_generic_failure_retry.sql`, `202609020002_auth_profiles_desktop_codes.sql`, `202609020003_console_rpcs.sql`, `202609020004_live_session_engine_admin.sql`, `202609020005_console_deploy_audit.sql`. `202609010001~0004`는 4c28deb에서 커밋됐고 배포 DB 적용 여부는 배포 전 `supabase migration list`로 확인; `202609010005`도 같은 확인 대상.
+- 브랜치 `codex/nova-integration-20260905` HEAD `4c2cbbf`(949b06f → 하드닝 ec128de·문서 → 체크포인트 b8dcba0 → 통합 수정 12커밋, §4.7). `codex/google-live-latency-20260831`은 949b06f에 머물러 있고, 하드닝 브랜치는 d8a2b00에서 병합됐다. 배포된 서비스(Vercel 웹앱, Cloud Run 게이트웨이 리비전 `live-input-20260901`, 설치된 NOVA.app)는 **아직 아무것도 반영되지 않았다**.
+- 4c2cbbf 클린 체크아웃 스위트: 루트 1537 / 1517 pass / 0 fail / 20 skip, 게이트웨이 644/644, 웹앱 `test:live` 1043 + `test:core` 79, 타입체크 2종 클린(§4.7).
+- 메인 워킹트리는 이제 통합 브랜치 그 자체다. 추적되지 않는 루트 `controller.js`·`live-interpreter.js`는 두 번째 세션의 잔여물로 커밋 대상이 아니다.
+- **미적용 마이그레이션(파일명 순으로 적용, 순서 준수)**: `202609020001_live_summary_generic_failure_retry.sql`, `202609020002_auth_profiles_desktop_codes.sql`, `202609020003_console_rpcs.sql`, `202609020004_live_session_engine_admin.sql`, `202609020005_console_deploy_audit.sql`, 그 뒤 `202609050001_user_engine_access_renewal.sql`, `202609050002_managed_caption_sessions.sql`, `202609050003_live_speaker_roster.sql`, `202609050004_speaker_profile_history.sql`, `202609050005_regrant_session_engine_admin.sql`. 202609050001은 202609020002~0005에 의존하고, 0005는 0001 뒤여야 한다. 0003/0004는 멱등(5e581bf). `202609010001~0005`의 배포 DB 적용 여부는 배포 전 `supabase migration list`로 확인.
 - 원장(`.superpowers/sdd/*/progress.md`)은 gitignore 대상이라 커밋에 없다. 모든 판정·편차가 거기에 있다.
-
----
 
 ## 6. 남은 작업 (순서)
 
-완료: Plan 2 Task 4 fix A(d9b9b8f, bbfc403) · Task 5(00556e5) · Task 6(4c28deb, 461f026, 906fe46, 5b5d964, 949b06f) · Plan B Task 6a/6b(f784cd9, 327a0c6) · Plan B Task 7 문서(하드닝 브랜치). 남은 순서:
+완료: Plan 1·Plan 2·Plan A·Plan B, 하드닝 라운드(ec128de, d8a2b00 병합), 두 번째 세션 체크포인트와 통합 수정(§4.7), 클린 게이트(4c2cbbf 녹색), 이 문서·AGENTS.md·`supabase/README.md`·스펙 §11 갱신. 남은 순서:
 
-1. **하드닝 라운드**(`codex/engine-hardening-20260905`): Task 5 리뷰 M1(`engineSwitchAttempts` 정리)·M2(키 존재 플래그만 전달)·M3(413 후 요청 파기)·M5(마지막 상태가 ready였던 레인만 재공지), 게이트웨이가 `captionConfig.engine` 키가 DB 엔진과 같은 재접속을 warm으로 판정(핑거프린트 재핀), 그 외 발견 사항.
-2. **클린 게이트 재실행**(Plan 2 Task 7): 하드닝 HEAD 기준 `npm ci` 3종 + 스위트 3종 + 타입체크 2종. 배포 전 저장된 `modelPreferences` 형태 스캔(flash 소스 핀·`null`은 fail-closed).
-3. **머지 백**: `codex/engine-hardening-20260905` → `codex/google-live-latency-20260831`(fast-forward), 이후 `main` PR.
-4. **배포(사용자 go 필요)**: 마이그레이션 `202609020001`~`0005` 적용(`202609010001~0005` 적용 여부 먼저 확인) → Vercel 프로덕션 → 부트스트랩 관리자 구글 첫 로그인으로 프로필 생성 확인 → `/console/users`·`/console/engine` 실제 화면 확인("배포"는 `queued`/`switched`만, 5xx 없음) → 게이트웨이 Cloud Run 새 리비전(`--update-secrets SONIOX_API_KEY=realtime-noel-soniox-api-key:latest`, 트래픽 전환은 별도 명령; 진행 중 세션 푸시는 데스크톱 재접속 수정 906fe46이 포함된 DMG 이후) → DMG 빌드·설치(`nova` 스킴) → 안정화 후 콘솔에서 레거시 비번 로그인 끄기. 새 게이트웨이 메트릭(엔진 전환 카운터)을 대시보드/알림에 추가.
-5. 후속: 비밀번호 재설정 화면, Soniox 실제 마이크 리허설 + mid-speech finalize 번역 검증 후 기본 공급자 재검토, XLSX 내보내기의 빈 레인 라벨.
-
----
+1. **T2b 코드 리뷰 판정 반영**(원장 18:58 dispatched): 콘솔 사용자별 즉시 전환(9061071, 19b7d9c)의 리뷰 결과에 따라 수정 라운드가 있으면 게이트 재실행.
+2. **배포(D4, 사용자 go 필요, 단계별 승인)**: 마이그레이션 10개 적용(§5 순서; `202609010001~0005` 적용 여부 먼저 확인; 배포 직전 읽기 전용 SQL 2건은 `2026-09-05-cross-session-analysis-and-user-actions.md` §6.3) → **게이트웨이 먼저** Cloud Run 새 리비전(`--update-secrets SONIOX_API_KEY=realtime-noel-soniox-api-key:latest`, `--remove-env-vars GEMINI_LIVE_MODEL`; 트래픽 없이 → health → 전환, 롤백 `live-input-20260901`) → Vercel 프로덕션(리포 루트, 환경변수는 등록 완료) → 부트스트랩 관리자 Google 첫 로그인 → `/console/users`에서 엔진 셀렉트 실제 확인(`queued|switched`, 5xx 없음) → DMG 빌드·설치(`nova` 스킴) → 종단 확인 → 안정화 후 레거시 비번 로그인 끄기. 상세 명령은 `2026-09-05-deploy-runbook.md`(전역 배포 단계는 사용자별 전환으로 읽을 것).
+3. **실음성 P0 검증**(D2·D3 조건): 한국어·영어·일본어 동일 녹음, 화자/언어 전환, 10분 이상 연속 — Soniox 기본·비엄격 힌트에서 타 스크립트 오인식 0건, 3개 언어 팬아웃의 언어별 누락률·지연 측정. Soniox 동시 연결 한도(기본 10, 3개 언어 운영에 20 이상) 확인.
+4. 후속: 비밀번호 재설정 화면, 데스크톱 마이크+시스템 팬아웃의 프로세스 수준 stagger, 결합 엔진(Soniox)에서 꺼지는 주제 추론·요약 부수 기능의 상태 표시, XLSX 내보내기의 빈 레인 라벨, 새 게이트웨이 메트릭(엔진 전환·팬아웃 레인) 대시보드.
 
 ## 7. 사용자가 직접 해야 하는 것 (비밀 값은 채팅에 올리지 않음)
 

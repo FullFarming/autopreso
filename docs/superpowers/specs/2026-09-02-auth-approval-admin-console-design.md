@@ -122,3 +122,16 @@ create table public.desktop_login_codes (
 - **레거시 로그인 스위치.** `set_legacy_password_login_v1`이 꺼지면 `/api/login`은 `LEGACY_LOGIN_DISABLED`(403)를 반환한다. 콘솔 `/console/engine` 계정 섹션에서 조작.
 - **마이그레이션.** 설계의 "1개"가 아니라 `202609020002`(profiles/desktop codes), `0003`(console RPCs), `0004`(session engine admin), `0005`(deploy audit) 네 개. 전부 미적용.
 - **미해결.** 비밀번호 재설정이 `/auth/callback`으로 와서 새 비밀번호 화면이 없음. 콘솔 화면의 실제 브라우저 확인은 승인된 관리자 프로필이 있어야 하므로 배포 후 부트스트랩 로그인 시점에 한다.
+
+## 11. 개정 2026-09-05 — 사용자별 즉시 전환 (사용자 결정 D1~D5)
+
+두 세션의 작업을 대조한 뒤(`docs/superpowers/status/2026-09-05-cross-session-analysis-and-user-actions.md` §4) 사용자가 2026-09-05 오후에 확정한 결정. §9의 "전역 하나·호스트 잠금·배포 즉시 전환" 중 **"전역 하나"만 폐기**하고 "호스트 잠금"과 "즉시 전환"은 유지한다. 통합 브랜치 `codex/nova-integration-20260905`, 원장 `.superpowers/sdd/2026-09-05-nova-integration/progress.md`.
+
+- **D1 사용자별 배정, 즉시 적용.** Live Call 엔진은 `profiles.voice_provider`(`soniox` | `gemini`, + `voice_provider_revision`)에 사용자별로 기록되며 **운영자(전역 관리자)만** `/console/users`에서 바꾼다. 호스트는 바꿀 수 없다(서버 권위, 오류 아님). 변경은 그 사용자의 `preparing|live` 세션에 **즉시** 적용되고 다음 세션에도 유지된다: `PATCH /api/console/users { voiceProvider }` → `set_profile_voice_provider_v2` → `engineSelectionForVoiceProvider`(공급자→엔진 매핑 하나, `resolveHostEngineAssignment`와 공유) → 호스트 범위 세션 목록 `list_live_session_ids_for_host_admin_v1` → 세션별 `set_live_session_engine_admin_v2`(engineHistory 규칙 §10 그대로 + `modelPreferences.assignmentRevision` 고정) → 게이트웨이 `POST /internal/sessions/:id/engine`(60초 ADMIN 토큰, 파이프라인 교체, 계약 C1 유지, `engine-status`). 응답은 §9와 같은 세션별 `switched | queued | failed` 표. 세션 생성 시 서버가 호출자의 현재 배정과 revision을 세션에 고정하고, 두 호스트 리더(데스크톱 `readLiveCallModelPreferences`, 웹 `readHostModelPreferences`)는 `assignmentRevision` 키를 허용·폐기한다(그 세션의 C1 치명 결함 수정, 5d4c271). 감사: RPC의 `profile_events` `user_assignment` 행 + best-effort `record_console_deploy_v1` 행(대상 프로필·공급자·revision).
+- **D2 기본 엔진 Soniox.** 인식+자체 번역 결합 엔진이 기본(`caption-engine-catalog.js` `DEFAULT_ENGINE_SELECTION`, `profiles.voice_provider` 기본값 `soniox`). Gemini Transcribe Live → Flash는 관리자가 선택하는 대안. §3 결정 8(Gemini 유지)은 이것으로 대체된다. 3개 언어 세션은 Soniox 팬아웃(대상별 연결)로 처리하며, 2408f0b가 정렬·죽은 레인·일시 오류·롤오버 결함을 고쳤다.
+- **D3 언어 힌트 비엄격 유지.** 자동 모드에서 `language_hints_strict`를 끄고 출력 언어를 힌트로만 보내는 그 세션의 설계(입력 ≠ 출력)를 유지한다. 2026-09-02의 strict 방어를 되돌린 것이므로 실음성 P0 검증(한국어 발화의 zh/vi 오인식 0건)이 남은 조건이다.
+- **D4 전부 배포.** 수정과 클린 게이트 뒤 웹앱·게이트웨이·DMG를 모두 배포한다. Vercel 등록·환경변수는 컨트롤러가, 게이트웨이/Soniox 계정 단계는 사용자에게 안내한다.
+- **D5 Vercel Root Directory 유지(리포 루트).**
+- **폐기.** `engine_defaults`는 아무 것도 결정하지 않는다(테이블·RPC는 이력용으로 보존). `PUT /api/console/engine-defaults`는 410 `ENGINE_DEFAULTS_RETIRED`(GET 카탈로그는 유지), `/console/engine`은 기본 엔진 안내 카드 + `/console/users` 링크 + 계정 섹션(레거시 로그인 스위치)만 남는다. §9의 "배포" 버튼·전역 확인 다이얼로그·`deployEngineToActiveSessions`·`gateway-engine-push.ts`는 삭제됐고, 확인 다이얼로그는 사용자 행의 엔진 셀렉트로 옮겨졌다("이 호스트의 진행 중 세션 n개가 즉시 전환됩니다"). 콘솔 문구는 전부 `t()`(ko/en/ja)를 거친다.
+- **마이그레이션.** `202609050001`(사용자 배정·접근 갱신)이 `set_live_session_engine_admin_v1`을 회수했던 것을 `202609050005`가 되돌린다(재부여 + `_v2` RPC 3개, 전부 additive·재실행 가능). 적용 순서: `202609020001`~`0005` → `202609050001`~`0005`. 전부 미적용.
+- **인증 부수 결정.** 승인 캐시는 저장소 장애 시 마지막 값을 TTL 지나 10분까지 유지(전원 잠금 방지, 069a73d); 유료 키 발급은 DB 권위 그대로. 레거시 `noel` 로그인은 `ADMIN_BOOTSTRAP_EMAILS`가 설정된 경우에만 Supabase Auth 사용자 연결을 요구하고, 미설정 로컬은 기존 동작(break-glass).
