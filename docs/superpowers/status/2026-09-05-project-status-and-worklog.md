@@ -1,6 +1,6 @@
 # NOVA (realtime-noel) — 프로젝트 정리와 작업 이력 (2026-09-05 기준)
 
-작성 시각: 2026-09-05 08:45 KST. 브랜치 `codex/google-live-latency-20260831`, HEAD `f784cd9`. 이 문서는 2026-09-02부터 이어진 작업의 맥락·결정·진행 상황을 한곳에 모은 것이다. 세부 근거는 각 스펙·계획·원장 파일에 있으며, 여기서는 경로만 가리킨다.
+작성 시각: 2026-09-05 08:45 KST, 갱신 2026-09-05 14:30 KST(Plan B Task 7). 브랜치 `codex/google-live-latency-20260831`, HEAD `949b06f`; 남은 작업은 하드닝 브랜치 `codex/engine-hardening-20260905`(949b06f 기반 워크트리)에서 진행. 이 문서는 2026-09-02부터 이어진 작업의 맥락·결정·진행 상황을 한곳에 모은 것이다. 세부 근거는 각 스펙·계획·원장 파일에 있으며, 여기서는 경로만 가리킨다.
 
 ---
 
@@ -77,25 +77,29 @@
 - `3b4dd05` 문서·env 예시; `bbe52d6` 루트 테스트 핀 갱신.
 - 미해결: 비밀번호 재설정 링크가 `/auth/callback`으로 와서 "새 비밀번호 설정" 화면이 없음(후속).
 
-### 4.5 Plan B — 관리자 콘솔 (거의 완료)
+### 4.5 Plan B — 관리자 콘솔 (완료: Task 1~6b + Task 7 문서)
 계획 `2026-09-02-auth-plan-b-admin-console.md`, 원장 `.superpowers/sdd/2026-09-02-auth-plan-b-admin-console/progress.md`.
 - `53d8ed8` 마이그레이션 `202609020003`: `engine_defaults`, `console_settings`(레거시 비번 로그인 스위치), RPC(`list_profiles_admin_v1`, `set_profile_status_v1`, `set_profile_role_v1`, `list_sessions_admin_v1`, `read_console_settings_v1`, `set_engine_defaults_v1`, `set_legacy_password_login_v1`). 마지막 관리자 보호·자기 변경 금지·상태 전이 규칙은 SQL에서 강제.
 - `a077878` 콘솔 스토어, `requireAdmin`, 엔진 기본값 정규화.
 - `4d1c39d` API 라우트(`/api/console/users|sessions|engine-defaults|settings`), `/api/login`에 `LEGACY_LOGIN_DISABLED`, `/api/live-config`에 `engineDefaults`.
 - `a04ee1d`+`00b4a23` 콘솔 UI(`/console/users|sessions|engine`), 대시보드 "콘솔" 링크(관리자만), §9 반영: 엔진 페이지의 주 액션은 **"배포"**, 확인 다이얼로그, 세션별 결과 표.
 - `852c486`+`1f8e1ed` 데스크톱 "콘솔" 버튼·창(관리자만), Live Call 생성은 항상 관리자 엔진 사용.
-- `f784cd9` Task 6a: `set_live_session_engine_admin_v1`(진행 중 세션의 `event_metadata.modelPreferences.engine` 교체 + `engineHistory`), `list_live_session_ids_admin_v1` (마이그레이션 `202609020004`, **미적용**).
-- **남은 일**: Task 6b(배포 PUT이 진행 중 세션마다 RPC + 게이트웨이 푸시 호출, 감사 페이로드), Task 7(문서). 콘솔 화면의 실제 브라우저 확인은 승인된 관리자 프로필이 필요해 배포 후 부트스트랩 로그인 시점으로 미룸.
+- `f784cd9` Task 6a: `set_live_session_engine_admin_v1`(진행 중 세션의 `event_metadata.modelPreferences.engine` 교체 + `engineHistory` ≤ 8개·3800바이트 예산·`reason`), `list_live_session_ids_admin_v1` (마이그레이션 `202609020004`, **미적용**). 레거시 `{ source, summary }`는 병합 대신 교체, 동일 엔진 재배포도 히스토리 추가.
+- `327a0c6` Task 6b: 콘솔 "배포" `PUT /api/console/engine-defaults` → `set_engine_defaults_v1` → `preparing|live` 세션마다 RPC + `pushEngineToGateway`(60 s ADMIN 토큰, 동시성 4) → `{ engine, results[{ sessionId, result: switched|queued|failed, code? }], summary }` → `record_console_deploy_v1`(마이그레이션 `202609020005`, **미적용**; 배포 1회 = `profile_events.engine_defaults` 행 2개).
+- Task 7(문서, 하드닝 브랜치): AGENTS.md "Admin console" 단락, `supabase/README.md` 마이그레이션 11·12 + "Admin console" 소절, 스펙 상태줄 + §10 구현 편차, 메모리 `live-call-host-auth-contract.md`, 이 문서.
+- 콘솔 화면의 실제 브라우저 확인은 승인된 관리자 프로필이 필요해 배포 후 부트스트랩 로그인 시점에 한다.
 
-### 4.6 Plan 2 — 게이트웨이·웹앱 엔진 전환 (진행 중)
+### 4.6 Plan 2 — 게이트웨이·웹앱 엔진 전환 (Task 1~6 완료, Task 7 게이트 1단계 통과)
 계획 `2026-09-02-caption-engine-plan-2-gateway-webapp.md`, 원장 `.superpowers/sdd/2026-09-02-caption-engine-plan-2-gateway-webapp/progress.md`.
 - Task 1 `30d5634`+`01fa7e3`: 게이트웨이 엔진 팩토리(`media-gateway/src/engines/create-engines.js`), 어댑터가 카탈로그 모델 사용, 번역 폴백 체인(모델당 1회, 시도 2.8 s/총 6 s, 세션 런타임을 통과해도 429/5xx가 폴백으로 이어지도록 오류 코드 매핑 수정), `translateWithProvenance`.
 - Task 2 `d234071`+`dd7943a`: Soniox 게이트웨이 어댑터(24 테스트; 키는 private 필드; 빈 텍스트 프레임 종료; finalize 스케줄러).
 - Task 3 `60e4b7d`+`b90fd9e`: 파이프라인 결합 공급자 경로(원문·번역 동시 확정, 부분 번역은 seq 소비 없이 게시 — 계약 C1), 엔진 기반 provenance, Live Translate 경로 삭제, `RollingSpeechSession`이 스트림별 rollover(Soniox 290분/Gemini 540 s), 결합 모드 누락 레인은 cooldown 없이 fail-open.
 - Task 4 `00f2ad4`: `modelPreferences = { engine, engineHistory }`, 서버 권위(비관리자 엔진은 전역값으로 대체), 게이트웨이 authorizer가 `engineSelectionKey` 비교, 데스크톱이 `{ engine }` 전송, Live Translate 모델 거부. 세 스위트 모두 녹색(웹앱 928, 게이트웨이 587).
   - **리뷰(REQUEST CHANGES)**: 클린 체크아웃에서 (C1) 요약 모델이 실제 호출 모델과 다르게 기록됨(의존 WT 파일 미커밋), (C2) 웹 호스트 대시보드가 `modelPreferences`를 보내지 않아 관리자가 비기본 엔진을 배포하면 authorizer가 거부, (I1) `engineHistory` 64개 캡이 `event_metadata` 4096바이트 제한을 초과. **판정**: 히스토리는 8개 이하 + 직렬화 본문 3800바이트 초과 시 오래된 것부터 삭제(웹앱과 Task 6a RPC 동일 규칙), 엔트리에 `reason` 추가.
-  - **진행 중**: fix round A(C1·I1·I2·I3·M1~M6, 클린 워크트리 게이트), Task 5(재시작: 게이트웨이 `POST /internal/sessions/:id/engine` + ADMIN 게이트웨이 토큰 + `engine-status` + 대시보드 `modelPreferences` 전달(C2) + 컨트롤러 엔진 pill).
-- 남은 Task 6(모든 핀 정합 + 게이트웨이/gemini-server WT 커밋 → 브랜치가 자체 정합), Task 7(클린 워크트리 검증 → 배포).
+  - fix round A `d9b9b8f` + `bbfc403`: 요약 모델이 클린 체크아웃에서도 세션 엔진을 따름(`summary-gemini-adapter.ts`, `rest-recap.js` 모델별 URL), `engineHistory` 8개/3800바이트 규칙(웹앱 store + Task 6a RPC 동일), `listOwnedActive` 행별 파싱 격리, 소스 모델은 Live 2종만 허용(flash 소스 핀은 fail-closed — 배포 전 저장 형태 스캔 필요).
+- Task 5 `00556e5`: 게이트웨이 `POST /internal/sessions/:id/engine`(60 s ADMIN 토큰, fail-closed 매트릭스, 콜드 세션 `queued`), 파이프라인 교체 시 seq 연속(C1), 호스트 `engine-status`(엔진 역할별, 시작 ACK 앞에도 전송), 뷰어 `preparing→ready`, 대시보드 `modelPreferences` 전달(C2), 컨트롤러 엔진 pill, `gateway-engine-push.ts`(웹앱이 게이트웨이의 `verifyAdminGatewayToken`으로 토큰을 검증하는 교차 계약 테스트).
+- Task 6 `4c28deb`(입력 소스 마이그레이션 `202609010001~0004` + bootstrap 미러), `461f026`(데스크톱 Live Call archive/drain 모듈 등 WT 커밋), `906fe46`(데스크톱이 게이트웨이 (재)시작 전 세션 레코드에서 엔진을 다시 핀 — Task 5 후속 I1), `5b5d964`(웹앱 소스 레저·스냅샷 동기화·자막 provenance·요약 원문), `949b06f`(엔진 카탈로그 핀 정합 + 게이트웨이 WT 커밋). 이 시점부터 **커밋된 브랜치가 자체 정합**이다(WT 진실 규칙 종료).
+- Task 7 1단계(클린 워크트리 게이트, 949b06f, node_modules 심링크): 루트 typecheck 클린, 1676 / 1662 pass / 0 fail / 14 skip; 게이트웨이 591/591; 웹앱 typecheck 클린, `test:live` 943/943 + `test:core` 77/77. 남은 것: 하드닝 라운드(Task 5 리뷰 M1~M5 + 게이트웨이 재접속 warm 판정) → 게이트 재실행 → 배포.
 
 ### 4.7 리뷰에서 나온 결정 중 기억할 것
 - 게이트웨이 Live Call 확정 자막에 LLM polish는 **넣지 않는다**(2026-08-31 지연 계약; 번역 호출이 최종 텍스트를 만들고 결정적 용어집 패스는 유지). 데스크톱 로컬 자막의 polish는 그대로.
@@ -107,22 +111,23 @@
 
 ## 5. 지금 워킹트리·커밋 상태
 
-- HEAD `f784cd9`. 이번 스트림 커밋 55개(2026-09-02~04). 배포된 서비스(Vercel 웹앱, Cloud Run 게이트웨이, 설치된 NOVA.app)는 **아직 아무것도 반영되지 않았다**.
-- 스위트(WT 기준, Task 4 직후): 웹앱 `test:live` 928/928 + `test:core` 77/77, 게이트웨이 587/587, 루트 1627(부하 시 흔들리는 성능 테스트 2개 제외 전부 통과), 타입체크 모두 깨끗. 클린 체크아웃은 fix round A와 Task 6 뒤에 녹색이 되어야 한다.
-- 미적용 마이그레이션(파일명 순으로 적용): `202609020001_live_summary_generic_failure_retry.sql`, `202609020002_auth_profiles_desktop_codes.sql`, `202609020003_console_rpcs.sql`, `202609020004_live_session_engine_admin.sql`. `202609010005`는 배포 DB에 이미 있는 것으로 보고 있으나 Task 7에서 확인.
+- `codex/google-live-latency-20260831` HEAD `949b06f`(2026-09-02~05 커밋 65개). 배포된 서비스(Vercel 웹앱, Cloud Run 게이트웨이, 설치된 NOVA.app)는 **아직 아무것도 반영되지 않았다**.
+- 949b06f 클린 체크아웃 스위트: 루트 1676 / 1662 pass / 0 fail / 14 skip(PGlite 테스트는 `NOVA_PGLITE_MODULE` 필요; `local-term-retrieval` 조회 예산 테스트는 세 스위트를 동시에 돌릴 때만 흔들림), 게이트웨이 591/591, 웹앱 `test:live` 943/943 + `test:core` 77/77, 타입체크 2종 클린.
+- **메인 워킹트리 주의**: `/Users/kyeongmankim/Realtime/autopreso`의 미커밋 변경은 이 스트림과 무관한 "NOVA-only product boundary" 변경 세트(Canvas 분리, Moonshine 사이드카·`public/app.js` 삭제, README/AGENTS 재작성 등)다. 이 스트림의 남은 작업은 949b06f 기반 워크트리 브랜치 `codex/engine-hardening-20260905`에서만 진행하고, 메인 트리를 이 스트림의 커밋 기준으로 쓰지 않는다.
+- 미적용 마이그레이션(파일명 순으로 적용): `202609020001_live_summary_generic_failure_retry.sql`, `202609020002_auth_profiles_desktop_codes.sql`, `202609020003_console_rpcs.sql`, `202609020004_live_session_engine_admin.sql`, `202609020005_console_deploy_audit.sql`. `202609010001~0004`는 4c28deb에서 커밋됐고 배포 DB 적용 여부는 배포 전 `supabase migration list`로 확인; `202609010005`도 같은 확인 대상.
 - 원장(`.superpowers/sdd/*/progress.md`)은 gitignore 대상이라 커밋에 없다. 모든 판정·편차가 거기에 있다.
 
 ---
 
 ## 6. 남은 작업 (순서)
 
-1. Plan 2 Task 4 fix round A → 클린 워크트리 게이트 통과.
-2. Plan 2 Task 5(진행 중 세션 엔진 전환 엔드포인트, `engine-status`, 대시보드 `modelPreferences` 전달).
-3. Plan B Task 6b: 콘솔 "배포" PUT → `set_engine_defaults_v1` → 진행 중 세션마다 `set_live_session_engine_admin_v1` + `pushEngineToGateway` → 결과 표 응답 → `profile_events.engine_defaults`에 `{ engine, sessionsSwitched, sessionsFailed }`.
-4. Plan 2 Task 6: 남은 핀 정합, 게이트웨이/gemini-server 워킹트리 커밋, bootstrap 미러 정리, `google-live-client.js` 잔여 정리, 삭제된 경로를 쓰는 루트 SQL 테스트 정리.
-5. Plan B Task 7 문서, Plan 2 Task 7 클린 워크트리 검증(`npm ci` 3종 + 스위트 3종 + 타입체크 2종).
-6. **배포(사용자 승인 필요)**: 마이그레이션 4개 적용 → Vercel 프로덕션 → 부트스트랩 관리자 구글 첫 로그인으로 프로필 생성 확인 → 콘솔 `/console/users`·`/console/engine` 실제 화면 확인 → 게이트웨이 Cloud Run 새 리비전(`--update-secrets SONIOX_API_KEY=realtime-noel-soniox-api-key:latest`, 트래픽 전환은 별도 명령) → DMG 빌드·설치(`nova` 스킴) → 안정화 후 콘솔에서 레거시 비번 로그인 끄기.
-7. 후속: 비밀번호 재설정 화면, Soniox 실제 마이크 리허설 + mid-speech finalize 번역 검증 후 기본 공급자 재검토, XLSX 내보내기의 빈 레인 라벨.
+완료: Plan 2 Task 4 fix A(d9b9b8f, bbfc403) · Task 5(00556e5) · Task 6(4c28deb, 461f026, 906fe46, 5b5d964, 949b06f) · Plan B Task 6a/6b(f784cd9, 327a0c6) · Plan B Task 7 문서(하드닝 브랜치). 남은 순서:
+
+1. **하드닝 라운드**(`codex/engine-hardening-20260905`): Task 5 리뷰 M1(`engineSwitchAttempts` 정리)·M2(키 존재 플래그만 전달)·M3(413 후 요청 파기)·M5(마지막 상태가 ready였던 레인만 재공지), 게이트웨이가 `captionConfig.engine` 키가 DB 엔진과 같은 재접속을 warm으로 판정(핑거프린트 재핀), 그 외 발견 사항.
+2. **클린 게이트 재실행**(Plan 2 Task 7): 하드닝 HEAD 기준 `npm ci` 3종 + 스위트 3종 + 타입체크 2종. 배포 전 저장된 `modelPreferences` 형태 스캔(flash 소스 핀·`null`은 fail-closed).
+3. **머지 백**: `codex/engine-hardening-20260905` → `codex/google-live-latency-20260831`(fast-forward), 이후 `main` PR.
+4. **배포(사용자 go 필요)**: 마이그레이션 `202609020001`~`0005` 적용(`202609010001~0005` 적용 여부 먼저 확인) → Vercel 프로덕션 → 부트스트랩 관리자 구글 첫 로그인으로 프로필 생성 확인 → `/console/users`·`/console/engine` 실제 화면 확인("배포"는 `queued`/`switched`만, 5xx 없음) → 게이트웨이 Cloud Run 새 리비전(`--update-secrets SONIOX_API_KEY=realtime-noel-soniox-api-key:latest`, 트래픽 전환은 별도 명령; 진행 중 세션 푸시는 데스크톱 재접속 수정 906fe46이 포함된 DMG 이후) → DMG 빌드·설치(`nova` 스킴) → 안정화 후 콘솔에서 레거시 비번 로그인 끄기. 새 게이트웨이 메트릭(엔진 전환 카운터)을 대시보드/알림에 추가.
+5. 후속: 비밀번호 재설정 화면, Soniox 실제 마이크 리허설 + mid-speech finalize 번역 검증 후 기본 공급자 재검토, XLSX 내보내기의 빈 레인 라벨.
 
 ---
 

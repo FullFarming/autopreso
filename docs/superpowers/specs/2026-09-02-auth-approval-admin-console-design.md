@@ -1,6 +1,6 @@
 # 회원가입·구글 로그인·가입 승인·관리자 콘솔 설계
 
-작성일: 2026-09-02 KST. 상태: 설계 승인(사용자, 섹션 1~8 확인) → 스펙 검토 → 구현 계획 작성 예정.
+작성일: 2026-09-02 KST. 상태: **구현 완료(Plan A 전체 + Plan B Task 1~6b, 2026-09-05)** — 브랜치 `codex/google-live-latency-20260831`(HEAD `949b06f`) + 하드닝 브랜치 `codex/engine-hardening-20260905`. **배포 대기**: 마이그레이션 `202609020001`~`0005` 미적용, Vercel·Cloud Run·DMG 미반영(사용자 승인 후). 설계 대비 편차는 문서 끝 "구현 편차" 참고.
 
 관련: [캡션 엔진 핫스왑 설계](2026-09-02-caption-engine-provider-hotswap-design.md)(전역 엔진 기본값은 그 카탈로그를 읽는다).
 
@@ -107,3 +107,18 @@ create table public.desktop_login_codes (
 - **Plan 2 Task 5 재정의.** "데스크톱 설정 변경 → Live Call 핫스왑" 경로는 만들지 않는다. 대신 게이트웨이 내부 엔진 갱신 엔드포인트 + `engine-status` 이벤트 + 웹/데스크톱 호스트 UI의 읽기 전용 엔진 상태 표시.
 - **Plan B 조정.** Task 3의 `PUT`은 DB 저장까지(진행 중). 새 Task 6 "배포 푸시"가 (2)(3)을 맡고 Plan 2 Task 5 이후에 실행한다. Task 4 UI: 버튼 라벨 "배포", 확인 다이얼로그("진행 중인 세션 n개가 즉시 전환됩니다"), 결과 표. Task 5 데스크톱: 시드 규칙 대신 항상 전역값 사용(진행 중인 구현은 완료 후 수정 라운드에서 단순화).
 - **감사.** 배포마다 `profile_events.engine_defaults` 페이로드에 `{ engine, sessionsSwitched, sessionsFailed }`를 남긴다.
+
+## 10. 구현 편차 (2026-09-05, Plan B 원장 기준)
+
+설계와 다르게 구현된 지점만 적는다. 근거는 `.superpowers/sdd/2026-09-02-auth-plan-b-admin-console/progress.md`.
+
+- **RPC 통합.** §1의 `approve_profile_v1` / `reject_profile_v1`는 하나의 `set_profile_status_v1(p_actor_id, p_target_id, p_status)`로 합쳤다. 마지막 관리자 보호·자기 변경 금지·상태 전이 규칙은 SQL(`assert_console_admin_v1`, `LAST_ADMIN_PROTECTED`, `SELF_CHANGE_FORBIDDEN`, `INVALID_TRANSITION`)에서 강제한다.
+- **콘솔 가드 위치.** `/console` 보호는 미들웨어가 아니라 서버 레이아웃(`webapp/app/console/layout.tsx` → `requireAdminFromCookieValue`)에서 한다. API 라우트는 각자 `requireAdmin`을 호출한다.
+- **`grant select on profiles to authenticated` 없음.** 브라우저는 `profiles`를 직접 읽지 않고(모두 service-role RPC), `profiles_self_select` 정책은 존재하지만 무력하다. 의도된 상태.
+- **§6 폐기 → §9 적용.** `engineDefaultsSeen`·호스트 선택·"새 세션에만 적용" 규칙은 모두 사라졌다. 전역 엔진이 유일한 Live Call 엔진이고 호스트 UI(웹·데스크톱)는 읽기 전용, 서버는 비관리자의 `modelPreferences.engine`을 전역값으로 덮어쓴다. 데스크톱 `subtitle.engine`은 로컬 자막 전용.
+- **배포 경로(§9 (2)(3)).** `PUT /api/console/engine-defaults` → `set_engine_defaults_v1` → `preparing|live` 세션마다 `set_live_session_engine_admin_v1`(마이그레이션 `202609020004`) → 게이트웨이 `POST /internal/sessions/:id/engine`을 **60초 ADMIN 게이트웨이 토큰**(세션별 발급, 로그·응답에 남기지 않음)으로 호출(동시성 4) → 세션별 `switched | queued | failed` 결과 표. `queued`는 콜드 세션(게이트웨이가 모르는 세션)으로 정상이며 다음 활성화 때 DB 값이 적용된다. 호스트에는 `engine-status` 이벤트(엔진 역할별 1건, 시작 ACK 앞에도 전송).
+- **engineHistory 규칙.** 항목 ≤ 8개, 직렬화된 `event_metadata` 본문이 3800바이트를 넘으면 오래된 것부터 삭제, 항목에 `reason: 'admin' | 'server-default'`. 웹앱 `applyEngineSelection`과 RPC가 동일 규칙. RPC는 동일 엔진 재배포에도 항목을 추가한다(감사 목적). 레거시 `{ source, summary }` 저장값은 병합하지 않고 교체한다(리더가 엄격).
+- **감사 행 2개.** `set_engine_defaults_v1`이 엔진 값을 자기 이벤트 페이로드로 남기므로 카운터를 넣을 자리가 없어, `record_console_deploy_v1`(마이그레이션 `202609020005`)이 `profile_events.engine_defaults`에 `{ kind: 'deploy', engine, sessionsSwitched, sessionsQueued, sessionsFailed }`를 추가로 남긴다. 배포 1회 = 행 2개.
+- **레거시 로그인 스위치.** `set_legacy_password_login_v1`이 꺼지면 `/api/login`은 `LEGACY_LOGIN_DISABLED`(403)를 반환한다. 콘솔 `/console/engine` 계정 섹션에서 조작.
+- **마이그레이션.** 설계의 "1개"가 아니라 `202609020002`(profiles/desktop codes), `0003`(console RPCs), `0004`(session engine admin), `0005`(deploy audit) 네 개. 전부 미적용.
+- **미해결.** 비밀번호 재설정이 `/auth/callback`으로 와서 새 비밀번호 화면이 없음. 콘솔 화면의 실제 브라우저 확인은 승인된 관리자 프로필이 있어야 하므로 배포 후 부트스트랩 로그인 시점에 한다.
