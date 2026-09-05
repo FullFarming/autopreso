@@ -23,9 +23,9 @@ There is no npm workspace: the root, `media-gateway/`, and `webapp/` each have
 their own `package.json` and lockfile, so each needs its own `npm ci`.
 
 ```sh
-npm test                             # root: 739 tests (738 pass, 1 skip)
-npm --prefix media-gateway test      # 250 tests (bare `node --test`)
-npm --prefix webapp run test:live    # 104 tests (Live Call surface)
+npm test                             # root: 1676 tests (1662 pass, 14 skip - PGlite SQL tests need NOVA_PGLITE_MODULE)
+npm --prefix media-gateway test      # 591 tests (bare `node --test`)
+npm --prefix webapp run test:live    # 943 tests (Live Call surface; test:core adds 77)
 npm --prefix webapp test             # test:live + test:core - what CI runs
 ```
 

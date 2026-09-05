@@ -1,6 +1,6 @@
 # 캡션 엔진 공급자 추상화·설정 선택·즉시 핫스왑 설계
 
-작성일: 2026-09-02 KST. 상태: 설계 승인 대기 → 구현 계획 작성 예정.
+작성일: 2026-09-02 KST. 상태: **Plan 1(로컬 엔진) 완료 · Plan 2(게이트웨이·웹앱) Task 6까지 구현 완료(2026-09-05) · 배포(Task 7) 대기.** 게이트웨이 엔진 팩토리·Soniox 어댑터·결합 공급자 파이프라인·`modelPreferences.engine`·관리자 트리거 엔진 전환(`POST /internal/sessions/:id/engine`)·`engine-status`가 브랜치 `codex/google-live-latency-20260831`에 커밋되어 있다. Cloud Run·Vercel·DMG 배포는 사용자 승인 후 진행한다. 계획: [Plan 2](../plans/2026-09-02-caption-engine-plan-2-gateway-webapp.md).
 
 선행 조사: [근본원인 보고](2026-09-02-live-translate-engine-root-cause-report.md), [공급자 비교](2026-09-02-caption-engine-model-survey.md), [Live API 문서 전수 조사](2026-09-02-gemini-live-api-docs-survey.md), [Soniox 적합성](2026-09-02-soniox-fit-analysis.md).
 

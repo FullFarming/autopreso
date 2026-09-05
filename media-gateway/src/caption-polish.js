@@ -1,11 +1,12 @@
 import {
+  captionPolishContract,
   preparePolishRequest,
   redactGeminiSensitiveText,
   GEMINI_WORKLOAD_MODEL_MATRIX,
   selectRelevantGlossary,
 } from "../../packages/caption-core/index.js";
 
-const DEFAULT_TIMEOUT_MS = 6_000;
+const DEFAULT_TIMEOUT_MS = captionPolishContract.timeoutMilliseconds;
 const SAFE_PROVIDER_ERROR_NAMES = new Set([
   "AbortError",
   "AggregateError",
@@ -44,7 +45,7 @@ export function safeProviderErrorIdentifier(error, fallbackCode = "PROVIDER_ERRO
  *   defaultDomain?: string,
  * }} [options]
  */
-export function createCaptionPolisher({ client, model = "gemini-3.7-flash", timeoutMs = DEFAULT_TIMEOUT_MS, defaultDomain = "" } = {}) {
+export function createCaptionPolisher({ client, model = GEMINI_WORKLOAD_MODEL_MATRIX.polish, timeoutMs = DEFAULT_TIMEOUT_MS, defaultDomain = "" } = {}) {
   if (model !== GEMINI_WORKLOAD_MODEL_MATRIX.polish) throw new Error("GEMINI_MODEL_OVERRIDE_FORBIDDEN");
   const fallbackDomain = String(defaultDomain ?? "").trim();
   /**
@@ -66,8 +67,8 @@ export function createCaptionPolisher({ client, model = "gemini-3.7-flash", time
     const abortController = new AbortController();
     try {
       const response = await Promise.race([
+        // 2026-08-31 fix: The session-bound runtime owns model selection; caller model fields reject dispatch.
         client.models.generateContent({
-          model,
           contents: [{ role: "user", parts: [{ text: redactGeminiSensitiveText(prepared.prompt) }] }],
           config: {
             abortSignal: abortController.signal,

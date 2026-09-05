@@ -219,6 +219,7 @@ test("source fanout reaches each authorized subscribed viewer once across langua
   for (const draft of [
     { type: "source-draft", sessionId: SESSION_ID, generation: fixtureUuid("draft"), revision: 1, text: "검토 중", sourceLanguage: "ko" },
     { type: "source-draft-clear", sessionId: SESSION_ID, generation: fixtureUuid("draft"), revision: 2 },
+    { type: "source-status", sessionId: SESSION_ID, status: "unavailable", code: "SOURCE_RECORDING_UNAVAILABLE" },
   ]) {
     await emitSource(draft);
     await waitForGatewayCondition(() => seen.get(viewers[1]).length === 1);
@@ -1985,6 +1986,111 @@ test("host handover with the SAME activation key reattaches warm; a different ke
   assert.equal((await reply).type, "started");
   assert.equal(pipelines.length, 2, "a mismatched key must build a fresh pipeline");
 });
+
+function independentCaptionFixture(seq = 1) {
+  return { type: "caption", sessionId: SESSION_ID, language: "en", seq, isFinal: true,
+    text: "Synthetic late final.", translationCapture: {
+      kind: "independent-live-translation", streamGeneration: fixtureUuid("stream"),
+      captureEpoch: fixtureUuid("capture"), captureStartedAt: null,
+      captureEndedAt: "2026-09-01T00:00:00.000Z", finalization: "application-sentence-boundary",
+    } };
+}
+
+test("late independent final rejects obsolete generations and old direct host callbacks", { timeout: 3_000 }, async (context) => {
+  const pipelines = [];
+  const gateway = createGatewayServer({ gatewaySecret: "gateway-secret", viewerSecret: "viewer-secret",
+    hostAuthorizer: { async authorize() { return true; } },
+    viewerAuthorizer: { async authorizeBatch(rows) { return new Map(rows.map(({ key }) => [key, true])); } },
+    async pipelineFactory(_settings, _previous, emit, options) {
+      const pipeline = { generation: options.pipelineGeneration, emit, isPaused: false,
+        async start() {}, async tick() {}, async close() {} };
+      pipelines.push(pipeline); return pipeline;
+    },
+  });
+  await new Promise((resolve) => gateway.server.listen(0, "127.0.0.1", resolve));
+  context.after(() => gateway.close());
+  const url = `ws://127.0.0.1:${gateway.server.address().port}/live`;
+  const host = await connectHost(url); context.after(() => host.terminate());
+  await startHostSocket(host, SESSION_ID, ["en"]);
+  const viewer = new WebSocket(url); context.after(() => viewer.terminate());
+  await once(viewer, "open");
+  let ack = nextJsonMatching(viewer, (message) => message.type === "authenticated");
+  viewer.send(JSON.stringify({ type: "authenticate", token: signViewerToken("viewer-secret", "late-independent") })); await ack;
+  ack = nextJsonMatching(viewer, (message) => message.type === "subscribed");
+  viewer.send(JSON.stringify({ type: "subscribe", sessionId: SESSION_ID, language: "en" })); await ack;
+  const seen = [], hostSeen = [];
+  viewer.on("message", (raw) => seen.push(JSON.parse(raw.toString())));
+  host.on("message", (raw) => hostSeen.push(JSON.parse(raw.toString())));
+  const caption = independentCaptionFixture();
+  for (const metadata of [{}, { pipelineGeneration: fixtureUuid("obsolete-pipeline"), mediaFence: null },
+    { pipelineGeneration: pipelines[0].generation, mediaFence: { epoch: 1, ownerId: fixtureUuid("wrong-owner") } }]) {
+    await gateway.broadcastEvent(SESSION_ID, "en", caption, metadata);
+  }
+  pipelines[0].isPaused = true;
+  await gateway.broadcastEvent(SESSION_ID, "en", caption, { pipelineGeneration: pipelines[0].generation });
+  pipelines[0].emit(caption);
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(seen.some((message) => message.payload?.type === "caption"), false);
+  assert.equal(hostSeen.some((message) => message.type === "caption"), false);
+  pipelines[0].isPaused = false;
+  await gateway.broadcastEvent(SESSION_ID, "en", caption, { pipelineGeneration: pipelines[0].generation });
+  await waitForGatewayCondition(() => seen.some((message) => message.payload?.isFinal));
+  ack = nextJsonMatching(host, (message) => message.type === "updated");
+  host.send(JSON.stringify({ type: "update", sessionId: SESSION_ID, version: 2,
+    sessionType: "meeting", outputMode: "captions", languages: ["en"] })); await ack;
+  assert.equal(pipelines.length, 2);
+  hostSeen.length = 0; seen.length = 0;
+  pipelines[0].emit(independentCaptionFixture(2));
+  await gateway.broadcastEvent(SESSION_ID, "en", independentCaptionFixture(2), { pipelineGeneration: pipelines[0].generation });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(seen.some((message) => message.payload?.type === "caption"), false);
+  assert.equal(hostSeen.some((message) => message.type === "caption"), false);
+  pipelines[1].emit(independentCaptionFixture(2));
+  await waitForGatewayCondition(() => hostSeen.some((message) => message.type === "caption"));
+});
+
+for (const pendingStage of ["authorization", "replay"]) {
+  test(`independent live events buffered during ${pendingStage} cannot escape after stop`, { timeout: 3_000 }, async (context) => {
+    let clock = Date.now(), generation, shouldBlock = false, entered = false, release, stopped = false;
+    const pending = new Promise((resolve) => { release = resolve; });
+    const gateway = createGatewayServer({ now: () => clock, gatewaySecret: "gateway-secret", viewerSecret: "viewer-secret",
+      hostAuthorizer: { async authorize() { return true; } },
+      viewerAuthorizer: { async authorizeBatch(rows) {
+        if (pendingStage === "authorization" && shouldBlock) { entered = true; await pending; }
+        return new Map(rows.map(({ key }) => [key, true]));
+      } },
+      async replayUtterances() { entered = true; await pending; return []; },
+      async pipelineFactory(_settings, _previous, _emit, options) {
+        generation = options.pipelineGeneration;
+        return { isPaused: false, isStopped: false, async start() {}, async tick() {},
+          async close() { this.isStopped = true; stopped = true; } };
+      },
+    });
+    await new Promise((resolve) => gateway.server.listen(0, "127.0.0.1", resolve));
+    context.after(() => { release(); return gateway.close(); });
+    const url = `ws://127.0.0.1:${gateway.server.address().port}/live`;
+    const host = await connectHost(url); context.after(() => host.terminate());
+    await startHostSocket(host, SESSION_ID, ["en"]);
+    const viewer = new WebSocket(url); context.after(() => viewer.terminate()); await once(viewer, "open");
+    let ack = nextJsonMatching(viewer, (message) => message.type === "authenticated");
+    viewer.send(JSON.stringify({ type: "authenticate", token: signViewerToken("viewer-secret", `pending-${pendingStage}`, { now: clock }) })); await ack;
+    ack = nextJsonMatching(viewer, (message) => message.type === "subscribed");
+    viewer.send(JSON.stringify({ type: "subscribe", sessionId: SESSION_ID, language: "en",
+      ...(pendingStage === "replay" ? { lastSeq: 0 } : {}) })); await ack;
+    const seen = []; viewer.on("message", (raw) => seen.push(JSON.parse(raw.toString())));
+    shouldBlock = true;
+    if (pendingStage === "authorization") clock += 6_000;
+    const delivery = gateway.broadcastEvent(SESSION_ID, "en", independentCaptionFixture(), { pipelineGeneration: generation });
+    await waitForGatewayCondition(() => entered);
+    if (pendingStage === "replay") await delivery;
+    ack = nextJsonMatching(host, (message) => message.type === "stopped");
+    host.send(JSON.stringify({ type: "stop" }));
+    await waitForGatewayCondition(() => stopped);
+    release(); await delivery; await ack;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(seen.some((message) => message.payload?.type === "caption"), false);
+  });
+}
 
 // ── Task 5: admin-triggered engine switch (POST /internal/sessions/:id/engine) + engine-status ──
 

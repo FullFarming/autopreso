@@ -49,7 +49,7 @@
 - Produces: `createSpeechToText({ engine, liveClient, sonioxApiKey, languageCodes, compiledGlossary, glossaryText, domainText })` → object with `open(...)` (STT provider contract); `createTextTranslate({ engine, geminiRuntime, sessionId })` → `{ translate }` or `null` when `isCombinedEngine(engine)`; `assertEngineKeys(engine, env)` throws `Error("ENGINE_KEY_MISSING")`.
 - Consumes: `normalizeEngineSelection`, `isCombinedEngine`, `findEngineEntry`, `engineRequiredApiKeys` from `packages/caption-core/caption-engine-catalog.js`.
 
-- [ ] **Step 1: Failing tests**
+- [x] **Step 1: Failing tests**
 
 ```js
 // media-gateway/test/create-engines.test.js
@@ -83,9 +83,9 @@ test("missing provider key is rejected before any adapter is built", () => {
 });
 ```
 
-- [ ] **Step 2: Run** `npm --prefix media-gateway test -- test/create-engines.test.js` → FAIL (module not found)
+- [x] **Step 2: Run** `npm --prefix media-gateway test -- test/create-engines.test.js` → FAIL (module not found)
 
-- [ ] **Step 3: Implement the factory**
+- [x] **Step 3: Implement the factory**
 
 ```js
 // media-gateway/src/engines/create-engines.js
@@ -133,7 +133,7 @@ export function createTextTranslate({ engine, geminiRuntime, sessionId }) {
 }
 ```
 
-- [ ] **Step 4: Adapter constructors accept catalog models**
+- [x] **Step 4: Adapter constructors accept catalog models**
 
 In `media-gateway/src/google-provider-adapters.js`: delete `LEGACY_TRANSCRIPTION_MODEL` / `LEGACY_TEXT_TRANSLATION_MODEL`; `GeminiLiveTranscriptionAdapter` validates `findEngineEntry("stt","gemini",model)` non-null else `GEMINI_MODEL_OVERRIDE_FORBIDDEN`; `GeminiTextTranslateAdapter` validates `findEngineEntry("translation","gemini",model)`, stores `this.model`, `this.fallbackModels`, `this.fallbackClients`, default `timeoutMilliseconds = captionPolishContract.timeoutMilliseconds` (6 000). In `translate()`, on a transient failure (`GEMINI_TRANSLATE_TIMEOUT`, HTTP 5xx/429 identifiers from `safeProviderErrorIdentifier`) try each fallback client once within the remaining deadline; never retry the same model. The session runtime rejects a `model` field in `generateContent` requests, so the model is bound at `createSessionClient` time (keep that).
 
@@ -141,9 +141,9 @@ In `packages/gemini-server/policy.js`: `GENERATE_WORKLOADS = new Set(["topic","t
 
 In `media-gateway/src/config.js`: add `sonioxApiKey: String(environment.SONIOX_API_KEY ?? "").trim()` to the returned config (optional), remove the `GEMINI_TEXT_MODEL` / `GEMINI_TRANSCRIBE_MODEL` fixed-matrix check (the catalog governs), keep `GEMINI_API_KEY` required. Update `media-gateway/.env.example` and README env list.
 
-- [ ] **Step 5: Run** `npm --prefix media-gateway test -- test/create-engines.test.js test/config.test.js test/provider-adapters.test.js` → PASS (update `config.test.js` fixtures that asserted the removed env check; keep every other assertion). Root: `node --test test/gemini-3-7-workload-contract.test.js` → update pins to the catalog contract (translation workload present, timeout `captionPolishContract.timeoutMilliseconds`, model check via catalog) — this is the reconciliation the Plan 1 hand-off promised.
+- [x] **Step 5: Run** `npm --prefix media-gateway test -- test/create-engines.test.js test/config.test.js test/provider-adapters.test.js` → PASS (update `config.test.js` fixtures that asserted the removed env check; keep every other assertion). Root: `node --test test/gemini-3-7-workload-contract.test.js` → update pins to the catalog contract (translation workload present, timeout `captionPolishContract.timeoutMilliseconds`, model check via catalog) — this is the reconciliation the Plan 1 hand-off promised.
 
-- [ ] **Step 6: Commit** `feat(gateway): engine factory from the shared catalog; adapters take catalog models; translation workload restored`
+- [x] **Step 6: Commit** `feat(gateway): engine factory from the shared catalog; adapters take catalog models; translation workload restored`
 
 ---
 
@@ -158,11 +158,11 @@ In `media-gateway/src/config.js`: add `sonioxApiKey: String(environment.SONIOX_A
 - Consumes: `buildSonioxConfig`, `createSonioxTokenReducer`, `createSonioxFinalizeScheduler`, `hasSonioxContentTokens`, `SONIOX_CONTROL`, `SONIOX_ENDPOINTS` (Plan 1).
 - Inherits two wire rules measured in the 2026-09-02 spike (see `docs/superpowers/specs/2026-09-02-soniox-fit-analysis.md` "Spike result"): (1) end of audio is an **empty TEXT frame** (`ws.send("")`) — an empty binary frame is ignored and `finished` never arrives; (2) continuous speech never yields `<end>`, so the adapter runs `createSonioxFinalizeScheduler` (1.2 s without new tokens while committed source text is pending, or a 15 s segment cap → send `SONIOX_CONTROL.finalize` as a text frame, at most once per segment) and commits the utterance on `<fin>` exactly as on `<end>`. The desktop transport (`src/caption-engine/soniox-transport.js`) is the reference wiring.
 
-- [ ] **Step 1: Failing tests** — fake `ws` (EventEmitter with `send/close/readyState`): (a) first frame after open is the JSON config with `language_hints_strict: true` and `two_way` when translation enabled; audio is sent as binary Buffers of 1,280 B unchanged (gateway PCM is already 16 kHz); (b) tokens `원문 final` + `translation final` + `<end>` → one `onFinalUtterance` with `translations.en.text === "Hello"`, `sourceStartOffsetMs`/`sourceEndOffsetMs` from `start_ms/end_ms`, and one prior `onPartialTranslation`; (c) 20 s without audio → a `keepalive` control message (use injected timers); (d) `error_type: "unauthenticated"` → `open()`/callbacks fail with `SONIOX_UNAUTHENTICATED` and no reconnect; (e) `gracefulDrain()` sends the empty **text** frame (`send("")`, never `Buffer.alloc(0)`) and resolves on `finished: true` (≤5 s); (f) `close()` resolves `{ transportClosed: true, inputAudioMilliseconds }`; (g) with injected timers, a final source token followed by 1.2 s without new tokens → exactly one `{"type":"finalize"}` text frame, no re-send until the `<fin>` arrives, and the `<fin>` frame → `onFinalUtterance` (same shape as `<end>`); tokens every 500 ms for 15 s → one finalize at the segment cap; a provisional-only stretch never finalizes; `close()`/`abort()` cancel the pending timer.
+- [x] **Step 1: Failing tests** — fake `ws` (EventEmitter with `send/close/readyState`): (a) first frame after open is the JSON config with `language_hints_strict: true` and `two_way` when translation enabled; audio is sent as binary Buffers of 1,280 B unchanged (gateway PCM is already 16 kHz); (b) tokens `원문 final` + `translation final` + `<end>` → one `onFinalUtterance` with `translations.en.text === "Hello"`, `sourceStartOffsetMs`/`sourceEndOffsetMs` from `start_ms/end_ms`, and one prior `onPartialTranslation`; (c) 20 s without audio → a `keepalive` control message (use injected timers); (d) `error_type: "unauthenticated"` → `open()`/callbacks fail with `SONIOX_UNAUTHENTICATED` and no reconnect; (e) `gracefulDrain()` sends the empty **text** frame (`send("")`, never `Buffer.alloc(0)`) and resolves on `finished: true` (≤5 s); (f) `close()` resolves `{ transportClosed: true, inputAudioMilliseconds }`; (g) with injected timers, a final source token followed by 1.2 s without new tokens → exactly one `{"type":"finalize"}` text frame, no re-send until the `<fin>` arrives, and the `<fin>` frame → `onFinalUtterance` (same shape as `<end>`); tokens every 500 ms for 15 s → one finalize at the segment cap; a provisional-only stretch never finalizes; `close()`/`abort()` cancel the pending timer.
 
-- [ ] **Step 2: Run** → FAIL (module not found)
+- [x] **Step 2: Run** → FAIL (module not found)
 
-- [ ] **Step 3: Implement** — structure mirrors `GeminiLiveTranscriptionAdapter.open()` (write tail, pending-frame backpressure 64, callback tail, terminal error, close promise). Core:
+- [x] **Step 3: Implement** — structure mirrors `GeminiLiveTranscriptionAdapter.open()` (write tail, pending-frame backpressure 64, callback tail, terminal error, close promise). Core:
 
 ```js
 const reducer = createSonioxTokenReducer({
@@ -181,7 +181,7 @@ const reducer = createSonioxTokenReducer({
 
 Reducer events are emitted per `apply(result)`; the reducer already emits source final → translation finals → boundary in that order, so buffering both until `onBoundary` yields one utterance per segment. Finalize: `const scheduler = createSonioxFinalizeScheduler({ now, setTimer, clearTimer, onFinalize: () => ws.send(SONIOX_CONTROL.finalize) })`; after every `reducer.apply(msg)` call `if (hasSonioxContentTokens(msg) && reducer.hasPendingFinalText()) scheduler.noteTokens({ hasPendingFinalText: true, atMs: now() })`; call `scheduler.noteBoundary()` inside the reducer's `onBoundary` and `scheduler.dispose()` on drain/close/abort. Keepalive: `setTimeout` chain every 5 s that sends `SONIOX_CONTROL.keepalive` if `now() - lastAudioAt > 8_000`. Rollover: none (300-minute stream cap; `maxConnectionMilliseconds = 17_400_000` then fail `SONIOX_MAX_DURATION` so `RollingSpeechSession` reopens). Error map as in the desktop transport (`SONIOX_*` codes).
 
-- [ ] **Step 4: Run** the adapter tests → PASS. **Step 5: Commit** `feat(gateway): soniox stt-rt-v5 adapter with segment translations`
+- [x] **Step 4: Run** the adapter tests → PASS. **Step 5: Commit** `feat(gateway): soniox stt-rt-v5 adapter with segment translations`
 
 ---
 
@@ -192,11 +192,11 @@ Reducer events are emitted per `apply(result)`; the reducer already emits source
 - Delete: files listed in File Structure
 - Tests: `media-gateway/test/captions-only-live-call.test.js` (+ combined-engine cases), `gemini-only-shared-engine.test.js` (rename expectations), `pipeline*.test.js`
 
-- [ ] **Step 1: Failing tests** in `captions-only-live-call.test.js`: (a) with a fake STT provider that emits a final with `translations: { en: { text: "Hello", sourceLanguage: "ko" } }` and a pipeline built with `textTranslate: null` and `engine` = soniox combined → the `en` lane publishes a final caption with `text: "Hello"`, `translationStatus: "translated"`, `translationModel: "stt-rt-v5"`, and `textTranslate` is never called; (b) a partial translation event → `en` lane `isFinal: false` caption with the same seq the coming final will take (`#peekCaptionSeq`), never consuming a seq; (c) provenance: `persistAuthoritativeSource` receives `sttProvider: "soniox"`, `sttModel: "stt-rt-v5"`; Gemini path receives `"gemini-transcribe-live"` / `"gemini-3.5-transcribe-live"` and `translationModel` = engine translation model.
+- [x] **Step 1: Failing tests** in `captions-only-live-call.test.js`: (a) with a fake STT provider that emits a final with `translations: { en: { text: "Hello", sourceLanguage: "ko" } }` and a pipeline built with `textTranslate: null` and `engine` = soniox combined → the `en` lane publishes a final caption with `text: "Hello"`, `translationStatus: "translated"`, `translationModel: "stt-rt-v5"`, and `textTranslate` is never called; (b) a partial translation event → `en` lane `isFinal: false` caption with the same seq the coming final will take (`#peekCaptionSeq`), never consuming a seq; (c) provenance: `persistAuthoritativeSource` receives `sttProvider: "soniox"`, `sttModel: "stt-rt-v5"`; Gemini path receives `"gemini-transcribe-live"` / `"gemini-3.5-transcribe-live"` and `translationModel` = engine translation model.
 
-- [ ] **Step 2: Run** → FAIL
+- [x] **Step 2: Run** → FAIL
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
   - Constructor: accept `engine` (from `captionConfig.engine`), store `this.engine`, `this.isCombined = isCombinedEngine(engine)`; `dependencies.textTranslate` may be `null` only when combined (else throw `TEXT_TRANSLATE_REQUIRED`).
   - `#openSpeechSession`: remove the direct branch; pass `onPartialTranslation: (event) => this.acceptPartialTranslation(event)` into `speechToText.open`.
   - `acceptPartialTranslation({ language, text, sourceLanguage })`: if `!this.languages.includes(language)` return; run `applyGlossaryCorrections` + `isOutputInTargetLanguage` gate; publish via the existing partial-lane publisher with `isFinal: false`, `seq: this.#peekCaptionSeq(language)`.
@@ -205,7 +205,7 @@ Reducer events are emitted per `apply(result)`; the reducer already emits source
   - `server.js` factory: `const engine = captionConfig.engine; assertEngineKeys(engine, process.env)` inside the start path (throw `ENGINE_KEY_MISSING` → gateway error message "선택한 엔진의 API 키가 서버에 없습니다."); `speechToText: createSpeechToText({...})`, `textTranslate: createTextTranslate({...})`, `captionPolish` unchanged.
   - Delete the direct files and their tests; delete `bindTopicModel` special-casing if it referenced `models.live`.
 
-- [ ] **Step 4: Run** `npm --prefix media-gateway test` → remaining failures must be only the authorizer/model pins handled in Task 4. **Step 5: Commit** `feat(gateway): combined-provider translations in the pipeline; engine-derived provenance; remove direct live-translate path`
+- [x] **Step 4: Run** `npm --prefix media-gateway test` → remaining failures must be only the authorizer/model pins handled in Task 4. **Step 5: Commit** `feat(gateway): combined-provider translations in the pipeline; engine-derived provenance; remove direct live-translate path`
 
 ---
 
@@ -215,11 +215,11 @@ Reducer events are emitted per `apply(result)`; the reducer already emits source
 - Modify: `webapp/lib/live/model-preferences.ts`, `webapp/lib/security/live-input-validation.ts`, `webapp/lib/live/store.ts` (eventMetadataBody, parseStoredEventMetadata, `engineHistory`), `webapp/lib/live/service.ts` (remove `SESSION_MODEL_PREFERENCES_PINNED`; append history), `webapp/lib/live-contract.ts`, `webapp/components/live/live-audio-client.ts` (`captionConfig.engine`), `webapp/components/live/LiveHostDashboard.tsx` (engine picker reads `/api/live-config.captionEngines`), `webapp/app/api/live-config/route.ts` (add `captionEngines` from `captionEngineCatalogForClient` with server key availability), `media-gateway/src/supabase-adapters.js` `SupabaseHostAuthorizer.authorize` (compare `engine`), `electron/main.js` (`pinLiveCallModelSettings` sends `engine`)
 - Tests: `webapp/lib/live/model-preferences.test.ts`, `live-service.test.ts`, `live-security.test.ts`, `components/live/host-manual-start.test.ts`, `media-gateway/test/host-model-authorization.test.js`, root `test/desktop-live-model-preferences.test.js`
 
-- [ ] **Step 1: Failing tests** — schema accepts `{ source, summary }` (legacy) AND `{ engine }`; stored legacy rows read back as `engine` via `migrateLegacyEngineSelection`; PATCH with a different `engine` on a `live` session succeeds and appends `engineHistory[{ engine, changedAt, byHostId }]` (max 64); gateway authorizer accepts when `captionConfig.engine` equals the DB `engine` (deep-equal after normalization) and rejects otherwise; `/api/live-config` returns `captionEngines` with `available` reflecting `GEMINI_API_KEY`/`SONIOX_API_KEY` presence on the webapp server (booleans only).
+- [x] **Step 1: Failing tests** — schema accepts `{ source, summary }` (legacy) AND `{ engine }`; stored legacy rows read back as `engine` via `migrateLegacyEngineSelection`; PATCH with a different `engine` on a `live` session succeeds and appends `engineHistory[{ engine, changedAt, byHostId }]` (max 64); gateway authorizer accepts when `captionConfig.engine` equals the DB `engine` (deep-equal after normalization) and rejects otherwise; `/api/live-config` returns `captionEngines` with `available` reflecting `GEMINI_API_KEY`/`SONIOX_API_KEY` presence on the webapp server (booleans only).
 
-- [ ] **Step 2: Run** → FAIL. **Step 3: Implement** (zod: `liveModelPreferencesSchema = z.union([legacyShape.transform(toEngine), z.object({ engine: engineSchema }).strict()])` where `engineSchema` validates via `normalizeEngineSelection`; store writes `{ engine, engineHistory }` inside `modelPreferences`). Desktop `pinLiveCallModelSettings` sends `modelPreferences: { engine }`. Gateway authorizer: `engineSelectionKey(config.engine) === engineSelectionKey(preferences.engine ?? migrateLegacy(preferences))`.
+- [x] **Step 2: Run** → FAIL. **Step 3: Implement** (zod: `liveModelPreferencesSchema = z.union([legacyShape.transform(toEngine), z.object({ engine: engineSchema }).strict()])` where `engineSchema` validates via `normalizeEngineSelection`; store writes `{ engine, engineHistory }` inside `modelPreferences`). Desktop `pinLiveCallModelSettings` sends `modelPreferences: { engine }`. Gateway authorizer: `engineSelectionKey(config.engine) === engineSelectionKey(preferences.engine ?? migrateLegacy(preferences))`.
 
-- [ ] **Step 4: Run** webapp test:live + test:core, gateway suite, root `test/desktop-live-model-preferences.test.js` → PASS. **Step 5: Commit** `feat(live): engine selection travels as modelPreferences.engine; PATCH allowed while live with engineHistory; gateway authorizer parity`
+- [x] **Step 4: Run** webapp test:live + test:core, gateway suite, root `test/desktop-live-model-preferences.test.js` → PASS. **Step 5: Commit** `feat(live): engine selection travels as modelPreferences.engine; PATCH allowed while live with engineHistory; gateway authorizer parity`
 
 ---
 
@@ -231,15 +231,17 @@ Reducer events are emitted per `apply(result)`; the reducer already emits source
 - Modify: `media-gateway/src/server.js` + `gateway-server.js` (HTTP `POST /internal/sessions/:sessionId/engine`; `engine-status` host event; reuse the `update` pipeline-replacement path), `webapp/lib/auth/live-auth.ts` (mint `role: "ADMIN"` gateway token: `{ role: "ADMIN", sub: <admin hostId>, sessionId, aud: "media-gateway", iat, exp ≤ 60 s }` signed with `LIVE_GATEWAY_TOKEN_SECRET`, verified on the gateway with the existing token verifier), `webapp/lib/live/gateway-engine-push.ts` (new: `pushEngineToGateway({ gatewayHttpUrl, sessionId, engine, token, fetchFn })` → `"switched" | "queued" | "failed"`), `webapp/components/live/LiveHostDashboard.tsx` + `public/subtitle-controller.js` (read-only engine status line/pill fed by `engine-status`), `webapp/components/live/live-audio-client.ts` (surface `engine-status`)
 - Tests: gateway `gateway-server.test.js` (internal endpoint: bad token 401, unknown session → `queued`, live session → new pipeline, old closed, seq continuity, viewers get `language-status preparing→ready`, host gets `engine-status connecting→ready`), webapp `gateway-engine-push.test.ts`, `live-audio-client.test.ts`, root `test/desktop-live-*.test.js` (controller pill)
 
-- [ ] **Step 1: Failing tests**; **Step 2: RED**; **Step 3: Implement**: the gateway HTTP server (where `/health` lives) gains `POST /internal/sessions/:sessionId/engine` with body `{ engine }` (normalized via `normalizeEngineSelection`, `assertEngineKeys`) and `Authorization: Bearer <ADMIN token>`; when the session has an active pipeline, run the same replacement the host `update` message performs (open new → ready → close old; `resolvePipelineInitialSequences` reseeds seq) and answer `{ result: "switched" }`; when the gateway holds no pipeline for that session answer `{ result: "queued" }` (the DB value applies at next activation). `engine-status` is sent from `gateway-server.js` where `language-status` is sent today (`connecting` on start, `ready` when `start()` resolves, `failed` with code from `failOwnedPipeline`). Host UIs render it read-only; the engine picker in the web host dashboard (Task 4) shows "관리자 지정" and is disabled for non-admin roles. **Step 4: GREEN**; **Step 5: Commit** `feat(live-call): admin-triggered engine switch for running sessions and engine-status events`
+- [x] **Step 1: Failing tests**; **Step 2: RED**; **Step 3: Implement**: the gateway HTTP server (where `/health` lives) gains `POST /internal/sessions/:sessionId/engine` with body `{ engine }` (normalized via `normalizeEngineSelection`, `assertEngineKeys`) and `Authorization: Bearer <ADMIN token>`; when the session has an active pipeline, run the same replacement the host `update` message performs (open new → ready → close old; `resolvePipelineInitialSequences` reseeds seq) and answer `{ result: "switched" }`; when the gateway holds no pipeline for that session answer `{ result: "queued" }` (the DB value applies at next activation). `engine-status` is sent from `gateway-server.js` where `language-status` is sent today (`connecting` on start, `ready` when `start()` resolves, `failed` with code from `failOwnedPipeline`). Host UIs render it read-only: the web host dashboard has no engine picker (Task 4 replaced it with the "자막 엔진 · 관리자 지정 · <label>" status line, which Task 5 extends with a `data-engine-runtime` pill), and the desktop controller reads the same status through the polled `live-call:get-state` projection. **Step 4: GREEN**; **Step 5: Commit** `feat(live-call): admin-triggered engine switch for running sessions and engine-status events`
 
 ---
 
 ### Task 6: Reconcile every remaining pin; commit the gateway/gemini-server working tree
 
+> Done 2026-09-05 (ledger `.superpowers/sdd/.../progress.md` → "Task 6"). Also absorbed here: the Task 5 follow-up (desktop re-pins the Live Call engine from `GET /api/live-sessions/:id` before every gateway (re)start), the stale root `live-input-source-security-sql` test (deleted — it drove the removed direct Live Translate path), migrations 202609010001–0004 + the bootstrap mirror, and the AGENTS.md test counts.
+
 **Files:** `media-gateway/test/*` (list from Plan 1 hand-off + Task 3 deletions), `packages/gemini-server/*.test.js`, root `test/gemini-3-7-workload-contract.test.js`, `webapp/lib/live/*.test.ts`
 
-- [ ] **Step 1:** run all three suites; list failing files. **Step 2:** for each: contract pin of the removed Live Translate default → update to the catalog default; import of a deleted module → delete the test (it tested the removed path); anything else → fix the code. **Step 3:** `git add` the gateway `src/` and `packages/gemini-server` files that were uncommitted WT (this is the moment the branch becomes self-consistent); `git status --short | wc -l` afterwards must not list any `media-gateway/src` or `packages/gemini-server` file. **Step 4:** all three suites + both typechecks green. **Step 5: Commit** `test(gateway,webapp): reconcile engine-catalog contract pins; commit gateway working tree`
+- [x] **Step 1:** run all three suites; list failing files. **Step 2:** for each: contract pin of the removed Live Translate default → update to the catalog default; import of a deleted module → delete the test (it tested the removed path); anything else → fix the code. **Step 3:** `git add` the gateway `src/` and `packages/gemini-server` files that were uncommitted WT (this is the moment the branch becomes self-consistent); `git status --short | wc -l` afterwards must not list any `media-gateway/src` or `packages/gemini-server` file. **Step 4:** all three suites + both typechecks green. **Step 5: Commit** `test(gateway,webapp): reconcile engine-catalog contract pins; commit gateway working tree`
 
 ---
 

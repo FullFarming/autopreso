@@ -31,7 +31,7 @@ function makeClient(responder) {
 
 test("polish rewrites finals with the desktop finalizer prompt (tone, glossary, domain)", async () => {
   const client = makeClient(() => ({ text: "실적이 예상을 상회했습니다." }));
-  const polisher = createCaptionPolisher({ client, model: "gemini-3.7-flash" });
+  const polisher = createCaptionPolisher({ client });
   const polished = await polisher.polish({
     translatedText: "실적이 예상보다 좋았어요",
     sourceText: "Hilton Garden Inn performed above expectations.",
@@ -48,7 +48,7 @@ test("polish rewrites finals with the desktop finalizer prompt (tone, glossary, 
   assert.match(system, /호텔 자산운용 미팅/);
   assert.equal(client.requests[0].config.maxOutputTokens, 1_024,
     "Live Call final polish must keep the captions-only output budget");
-  assert.equal(client.requests[0].model, "gemini-3.7-flash");
+  assert.equal(Object.hasOwn(client.requests[0], "model"), false, "the session-bound runtime owns model selection");
   assert.equal("thinkingConfig" in client.requests[0].config, false, "the server runtime owns fixed thinking policy");
   assert.equal("temperature" in client.requests[0].config, false);
   assert.equal("topP" in client.requests[0].config, false);
