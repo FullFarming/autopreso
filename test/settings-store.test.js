@@ -423,7 +423,7 @@ test("createSettingsStore.save persists subtitle settings", async () => {
   assert.equal(settings.subtitle.overlayEnabled, true);
 });
 
-test("createSettingsStore migrates old subtitle source display to translation only", async () => {
+test("createSettingsStore keeps the operator's translation_source display choice across loads", async () => {
   const filePath = await tempPath();
   await fs.writeFile(filePath, JSON.stringify({
     ...DEFAULT_SETTINGS,
@@ -435,7 +435,7 @@ test("createSettingsStore migrates old subtitle source display to translation on
 
   const store = createSettingsStore({ filePath, env: {} });
   const settings = await store.load();
-  assert.equal(settings.subtitle.displayMode, "translation_only");
+  assert.equal(settings.subtitle.displayMode, "translation_source");
 });
 
 test("migrateSettingsFile copies legacy settings only when the new file is missing", async () => {

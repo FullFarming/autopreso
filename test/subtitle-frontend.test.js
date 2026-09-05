@@ -676,6 +676,7 @@ test("desktop subtitle UI is captions-only and contains no translated-audio lane
     "selectedGlossaryPresetId",
     "selectedGlossaryPresetName",
     "selectedGlossaries",
+    "readDisplayModeFromForm",
     extractFunctionBody(js, "function readSettingsFromForm()"),
   );
   const settings = readSettingsFromForm(
@@ -702,8 +703,10 @@ test("desktop subtitle UI is captions-only and contains no translated-audio lane
     () => "gemini",
     () => "default-cre-ai-en-ko",
     () => [{ sourceKind: "builtin", sourceId: "common_business" }],
+    () => "translation_source",
   );
   assert.equal(settings.outputMode, "captions");
+  assert.equal(settings.displayMode, "translation_source", "the form's display-mode radio flows into the saved settings");
   assert.deepEqual(settings.engine, DEFAULT_SUBTITLE_SETTINGS.engine);
   assert.equal(Object.hasOwn(settings, "model"), false);
   assert.equal(Object.hasOwn(settings, "audioVolume"), false);
@@ -2437,4 +2440,23 @@ test("a start rejected for a missing host login shows the localized sign-in mess
   assert.ok(start > 0 && end > start);
   const requester = js.slice(start, end);
   assert.match(requester, /message\.message === "HOST_LOGIN_REQUIRED"[\s\S]*?t\("live\.hostLoginRequired"\)/u);
+});
+
+test("caption settings expose the display mode as a two-option radio and the dashboard round-trips it", () => {
+  const html = readFileSync(path.join(rootDir, "public", "subtitle.html"), "utf8");
+  const js = readFileSync(path.join(rootDir, "public", "subtitle-dashboard.js"), "utf8");
+  const i18n = readFileSync(path.join(rootDir, "public", "subtitle-i18n.js"), "utf8");
+  assert.doesNotMatch(html, /name="displayMode" type="hidden"/u, "the hidden displayMode input is replaced by visible controls");
+  assert.match(html, /<input type="radio" name="displayMode" value="translation_only"[^>]*>/u);
+  assert.match(html, /<input type="radio" name="displayMode" value="translation_source"[^>]*>/u);
+  for (const key of ["cfg.displayMode", "displayMode.translationOnly", "displayMode.translationSource", "displayMode.hint"]) {
+    assert.match(html, new RegExp(`data-i18n="${key.replace(".", "\\.")}"`, "u"), `${key} bound in the form`);
+    assert.ok((i18n.match(new RegExp(`"${key.replace(".", "\\.")}":`, "gu")) ?? []).length >= 2, `${key} translated in EN and KO`);
+  }
+  assert.match(js, /displayMode: readDisplayModeFromForm\(\)/u, "readSettingsFromForm reads the radio instead of hardcoding translation_only");
+  const overlay = readFileSync(path.join(rootDir, "public", "subtitle-overlay.js"), "utf8");
+  assert.match(overlay, /function isHiddenSourceCaption\(message\)[\s\S]*?message\.source !== "live-call"[\s\S]*?settings\.displayMode !== "translation_source"/u, "Live Call mirror lines are exempt from the caption display mode");
+  assert.match(js, /function readDisplayModeFromForm\(\)[\s\S]*?"translation_source"[\s\S]*?"translation_only"/u);
+  assert.match(js, /function writeDisplayModeToForm\(/u);
+  assert.doesNotMatch(js, /form\.elements\.displayMode\.value = "translation_only";/u);
 });

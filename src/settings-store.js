@@ -419,9 +419,8 @@ function migrateSettings(settings, { strictEngine = false } = {}) {
   if (settings.subtitle?.tonePolishModel === "gpt-4o-mini") {
     settings.subtitle.tonePolishModel = DEFAULT_SUBTITLE_SETTINGS.tonePolishModel;
   }
-  if (settings.subtitle?.displayMode === "translation_source") {
-    settings.subtitle.displayMode = DEFAULT_SUBTITLE_SETTINGS.displayMode;
-  }
+  // 2026-09-06: displayMode is an operator choice again (captions default to translation
+  // only; "translation_source" shows the spoken original beside every selected language).
   // A saved language list is the user's choice: loading never adds a language.
   // (An earlier migration expanded ["en","ko"] to ["en","ko","ja"] when
   // translateAllLanguages was on - a silent third Soniox connection.)

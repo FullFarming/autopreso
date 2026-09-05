@@ -2610,6 +2610,7 @@ function connectWebSocket() {
     }
     if (message.type === "subtitle:partial") {
       if (shouldSuppressLocalLiveCallOutput(message)) return;
+      if (isHiddenSourceCaptionForPreview(message)) return;
       if (activeCaptionSessionOwner === "live-call" && String(message.translatedText ?? "").trim()) {
         liveTranslationStallMonitor.noteOutput(performance.now());
       }
@@ -2618,6 +2619,7 @@ function connectWebSocket() {
     }
     if (message.type === "subtitle:committed") {
       if (shouldSuppressLocalLiveCallOutput(message)) return;
+      if (isHiddenSourceCaptionForPreview(message)) return;
       if (activeCaptionSessionOwner === "live-call" && String(message.translatedText ?? "").trim()) {
         liveTranslationStallMonitor.noteOutput(performance.now());
       }
@@ -3559,6 +3561,23 @@ async function saveSettings(patch) {
   return body;
 }
 
+// 2026-09-06: caption display mode. "translation_only" (default) shows only the translated
+// lane; "translation_source" shows the spoken original beside every selected language.
+function isHiddenSourceCaptionForPreview(message) {
+  return message.isSourceCaption === true && message.source !== "live-call"
+    && (state.settings?.displayMode ?? "translation_only") !== "translation_source";
+}
+
+function readDisplayModeFromForm() {
+  const value = form.elements.displayMode?.value;
+  return value === "translation_source" ? "translation_source" : "translation_only";
+}
+
+function writeDisplayModeToForm(displayMode) {
+  const value = displayMode === "translation_source" ? "translation_source" : "translation_only";
+  for (const input of form.querySelectorAll('input[name="displayMode"]')) input.checked = input.value === value;
+}
+
 function readSettingsFromForm() {
   const translationFontSize = readNumber(form.elements.translationFontSize.value, DEFAULT_SUBTITLE.translationFontSize);
   const sourceFontSize = readNumber(form.elements.sourceFontSize.value, Math.max(14, translationFontSize - 2));
@@ -3577,8 +3596,8 @@ function readSettingsFromForm() {
     translationLanguages,
     liveCallTranslationLanguages: readLiveCallLanguagesFromForm(),
     outputMode: "captions",
-    displayMode: "translation_only",
-    // Source ("원문") display removed — subtitles are always translation-only.
+    displayMode: readDisplayModeFromForm(),
+    // The legacy per-line source toggle stays off; displayMode owns the source lane now.
     showSourceText: false,
     translateAllLanguages: translationLanguages.length >= 3,
     fontFamily: form.elements.fontFamily.value || DEFAULT_SUBTITLE.fontFamily,
@@ -3610,7 +3629,7 @@ function writeSettingsToForm(settings) {
   writeTranslationLanguageCheckboxes(settings.translationLanguages ?? [settings.languagePair?.a ?? "en", settings.languagePair?.b ?? "ko"]);
   writeLiveCallLanguageCheckboxes(settings.liveCallTranslationLanguages ?? []);
   renderGlossarySelections(settings);
-  form.elements.displayMode.value = "translation_only";
+  writeDisplayModeToForm(settings.displayMode);
   if (form.elements.translateAllLanguages) form.elements.translateAllLanguages.checked = readTranslationLanguagesFromForm().length >= 3;
   form.elements.recordProvider.value = settings.recordProvider ?? DEFAULT_SUBTITLE.recordProvider;
   if (form.elements.tone) form.elements.tone.value = settings.tone ?? DEFAULT_SUBTITLE.tone;

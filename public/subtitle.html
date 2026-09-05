@@ -107,6 +107,15 @@
                 </div>
               </section>
 
+              <section class="cfg-section" aria-labelledby="caption-display-mode-title">
+                <div class="cfg-heading"><h2 id="caption-display-mode-title" data-i18n="cfg.displayMode">표시 방식</h2></div>
+                <div class="seg-toggle" role="radiogroup" aria-labelledby="caption-display-mode-title">
+                  <label class="seg-option"><input type="radio" name="displayMode" value="translation_only" checked /><span data-i18n="displayMode.translationOnly">번역만 표시</span></label>
+                  <label class="seg-option"><input type="radio" name="displayMode" value="translation_source" /><span data-i18n="displayMode.translationSource">원문과 선택한 모든 언어 동시 표시</span></label>
+                </div>
+                <p class="cfg-hint" data-i18n="displayMode.hint">기본은 인입 언어의 반대편 번역만 보여줍니다. 한국어로 말하면 영어만, 영어로 말하면 한국어만 나옵니다.</p>
+              </section>
+
               <section class="cfg-section" aria-labelledby="caption-display-title">
                 <div class="cfg-heading"><h2 id="caption-display-title">표시 화면</h2></div>
                 <button type="button" id="caption-display-trigger" aria-haspopup="dialog" aria-expanded="false" aria-controls="caption-display-panel">화면 선택</button>
@@ -641,7 +650,6 @@
                       </select>
                     </label>
 
-                    <input name="displayMode" type="hidden" value="translation_only" />
                     <input name="position" type="hidden" value="bottom-center" />
 
                     <div class="font-size-grid">

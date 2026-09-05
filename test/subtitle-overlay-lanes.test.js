@@ -1531,14 +1531,44 @@ test("legacy audio-only settings cannot suppress the captions-only overlay", asy
 });
 
 
-test("a trusted source caption remains visible beside its translated lane", async () => {
+test("a trusted source caption remains visible beside its translated lane when the operator opts into translation_source", async () => {
   const dom = installDom();
   await loadOverlay("source-with-translations");
-  const ws = dom.getWs(); ws.open(); ws.recv(SETTINGS);
+  const ws = dom.getWs(); ws.open();
+  ws.recv({ ...SETTINGS, settings: { ...SETTINGS.settings, subtitle: { ...SETTINGS.settings.subtitle, displayMode: "translation_source" } } });
   ws.recv({ type: "subtitle:committed", targetLanguage: "ko", sourceLanguage: "ko", isSourceCaption: true,
     translationProvider: "soniox", translatedText: "이번 분기 실적입니다." });
   ws.recv({ type: "subtitle:committed", targetLanguage: "en", sourceLanguage: "ko", translationProvider: "soniox",
     translatedText: "These are our quarterly results." });
   assert.match(dom.zoneText("top-center"), /분기 실적/);
   assert.match(dom.zoneText("bottom-center"), /quarterly results/);
+});
+
+// 2026-09-06 decision: Captions are an offline-event surface. By default only the
+// TRANSLATED lane shows (한국어 인입 → 영어만, 영어 인입 → 한국어만); the lane that echoes
+// the spoken original (`isSourceCaption`) is hidden unless the operator picks
+// "원문과 선택한 모든 언어 동시 표시" (displayMode "translation_source"). Live Call mirror
+// lines keep their own contract and are never filtered here.
+test("translation-only display hides the spoken-original lane and keeps the translated lane", async () => {
+  const dom = installDom();
+  await loadOverlay("display-mode-default");
+  const ws = dom.getWs();
+  ws.open();
+  ws.recv(SETTINGS);
+  ws.recv({ type: "subtitle:committed", targetLanguage: "ko", sourceLanguage: "ko", translationProvider: "soniox", isSourceCaption: true, translatedText: "지금 얘기하는 게 잘 들리나요?", sourceText: "지금 얘기하는 게 잘 들리나요?" });
+  ws.recv({ type: "subtitle:committed", targetLanguage: "en", sourceLanguage: "ko", translationProvider: "soniox", translatedText: "Can you hear what I am saying?", sourceText: "지금 얘기하는 게 잘 들리나요?" });
+  assert.equal(dom.zoneText("top-center"), "", "the Korean original must not render in translation-only mode");
+  assert.match(dom.zoneText("bottom-center"), /Can you hear/u, "the English translation still renders");
+});
+
+test("translation_source display shows the spoken-original lane alongside the translation", async () => {
+  const dom = installDom();
+  await loadOverlay("display-mode-source");
+  const ws = dom.getWs();
+  ws.open();
+  ws.recv({ ...SETTINGS, settings: { ...SETTINGS.settings, subtitle: { ...SETTINGS.settings.subtitle, displayMode: "translation_source" } } });
+  ws.recv({ type: "subtitle:committed", targetLanguage: "ko", sourceLanguage: "ko", translationProvider: "soniox", isSourceCaption: true, translatedText: "지금 얘기하는 게 잘 들리나요?", sourceText: "지금 얘기하는 게 잘 들리나요?" });
+  ws.recv({ type: "subtitle:committed", targetLanguage: "en", sourceLanguage: "ko", translationProvider: "soniox", translatedText: "Can you hear what I am saying?", sourceText: "지금 얘기하는 게 잘 들리나요?" });
+  assert.match(dom.zoneText("top-center"), /잘 들리나요/u);
+  assert.match(dom.zoneText("bottom-center"), /Can you hear/u);
 });

@@ -751,7 +751,24 @@ function updateLiveCallSpeaker(message, lane) {
   lane.speakerLabel.hidden = false;
 }
 
+// 2026-09-06 decision: Captions are an offline-event surface, so by default only the
+// translated lane shows (한국어 인입 → 영어만, 영어 인입 → 한국어만). The lane that echoes the
+// spoken original (`isSourceCaption`) renders only under displayMode "translation_source"
+// (원문과 선택한 모든 언어 동시 표시). Live Call mirror lines have their own contract and are
+// never filtered here. Records still receive every line: this is display-only.
+function isHiddenSourceCaption(message) {
+  return message.isSourceCaption === true
+    && message.source !== "live-call"
+    && settings.displayMode !== "translation_source";
+}
+
 function renderCommittedSubtitle(message, fromSnapshot = false) {
+  if (isHiddenSourceCaption(message)) {
+    // The speaker is now talking this lane's language, so any translation it still
+    // shows belongs to the previous direction.
+    if (lanes.has(laneKey(message.targetLanguage))) clearSubtitleLane(message.targetLanguage);
+    return;
+  }
   const lane = ensureLane(message.targetLanguage);
   if (!acceptLaneEvent(lane, message, fromSnapshot)) return;
   if (!acceptDirection(message)) return;
@@ -794,6 +811,10 @@ function renderCommittedSubtitle(message, fromSnapshot = false) {
 }
 
 function renderPredictedSubtitle(message, fromSnapshot = false) {
+  if (isHiddenSourceCaption(message)) {
+    if (lanes.has(laneKey(message.targetLanguage))) clearSubtitleLane(message.targetLanguage);
+    return;
+  }
   if (!shouldRenderPredictedSubtitle(message)) return;
   const lane = ensureLane(message.targetLanguage);
   if (!acceptLaneEvent(lane, message, fromSnapshot)) return;
