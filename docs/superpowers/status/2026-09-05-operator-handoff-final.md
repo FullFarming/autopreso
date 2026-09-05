@@ -69,7 +69,10 @@ NOVA 종료 → `/Applications/NOVA.app` 백업 → `dist/NOVA-0.2.3-arm64.dmg`�
 | 마이그레이션 | Supabase 커넥터 재연결 후 프로젝트 `qahzljufcqbzwkdweeji`(서울) 확인. `202609010001`~`202609050005`는 이미 적용되어 있었고, `202609050006`만 `apply_migration`으로 적용. 콘솔 RPC 12개 모두 `service_role` EXECUTE 확인 |
 | Vercel 프로덕션 | 배포 `dpl_6QRFkajqpQkfdcTvsF2uwYypJ1Yg` READY, `https://realtime-noel-web.vercel.app` 별칭 완료. `/login` 200(Google·회원가입 렌더), `/api/live-config` 익명 401(호스트 전용, 정상) |
 | Cloud Run | 트래픽 `realtime-noel-media-gateway-nova-20260905=100`, `/health` 200 |
-| 남은 사용자 단계 | §3-2 Google/Supabase 인증 설정(가이드 문서), §3-3 Soniox 한도, §3-4 DMG 설치, §6 실음성 검증 |
+| Google/Supabase 인증 | 사용자가 완료(2026-09-05). 운영자 계정 `kyeokim1234@gmail.com`은 프로필을 `approved/admin`으로 승격 + Vercel `ADMIN_BOOTSTRAP_EMAILS`에 추가 후 재배포 |
+| 데스크톱 설치 | `dist/NOVA-0.2.3-arm64.dmg` → `/Applications/NOVA.app` 교체 완료(2026-09-06). 이전 앱은 `/Applications/NOVA.app.bak-20260906`로 백업, quarantine 속성 제거, 실행 확인(메인+헬퍼 3개 상주). ad-hoc 서명이라 `spctl`은 reject로 보고되지만 로컬 설치라 실행에 영향 없음 |
+| PR | [FullFarming/autopreso#2](https://github.com/FullFarming/autopreso/pull/2) 열림. 세 스위트 CI 통과, `no-mistakes` 정책 체크만 실패(우회하지 않음) |
+| 남은 사용자 단계 | §3-3 Soniox 동시 연결 한도, §6 실음성 검증, PR 병합 방식 결정 |
 
 원래 계획(참고):
 
