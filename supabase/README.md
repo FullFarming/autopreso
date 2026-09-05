@@ -46,6 +46,17 @@ project. The core sequence is:
     signup approval, roles, session aggregates, global engine defaults, and
     the legacy password-login switch (`set_legacy_password_login_v1`). It
     depends on `profiles` from the previous migration.
+11. `202609020004_live_session_engine_admin.sql` adds
+    `set_live_session_engine_admin_v1` (replaces a `preparing`/`live`
+    session's `event_metadata.modelPreferences.engine` and appends an
+    `engineHistory` entry with `reason: 'admin'`; history is capped at 8
+    entries and trimmed oldest-first while the metadata body exceeds 3800
+    bytes) and `list_live_session_ids_admin_v1`. Neither writes
+    `profile_events`.
+12. `202609020005_console_deploy_audit.sql` adds `record_console_deploy_v1`,
+    the per-deploy audit row (`profile_events.engine_defaults` with
+    `kind: 'deploy'` and `sessionsSwitched` / `sessionsQueued` /
+    `sessionsFailed` counters).
 
 ## Deployment region policy and current audit
 
@@ -507,8 +518,8 @@ application callers first and retain the additive column and rows.
 
 ## Authentication 설정
 
-Migrations `202609020002` and `202609020003` make Supabase Auth the identity
-provider for hosts. The browser signs in with Google or email/password (PKCE)
+Migrations `202609020002` through `202609020005` make Supabase Auth the
+identity provider for hosts and add the admin console. The browser signs in with Google or email/password (PKCE)
 and posts the access token to `POST /api/auth/exchange`; the server verifies it
 against `GET /auth/v1/user`, upserts `profiles` through
 `upsert_profile_on_login_v1`, and issues the existing `rnw_session` cookie only
@@ -543,7 +554,7 @@ API keys, deep-link codes, or `state` values into chat, commits, or this file.
 4. Vercel: set `ADMIN_BOOTSTRAP_EMAILS` (comma-separated) for Production and
    any Preview environment that should accept those admins.
 
-Deploy order: apply both migrations by hand in filename order → deploy the
+Deploy order: apply `202609020002`–`202609020005` by hand in filename order → deploy the
 webapp with legacy login still enabled → confirm the first Google login of a
 bootstrap admin creates an approved `profiles` row → ship the desktop DMG that
 registers the `nova` scheme (`electron/main.js` registers it only when
@@ -553,10 +564,45 @@ exchanges the recovery session like a login; there is no "set a new password"
 screen yet. Rollback is application-first: redeploy the previous webapp and
 leave the additive tables in place.
 
+### Admin console
+
+`/console` (`/console/users`, `/console/sessions`, `/console/engine`) is
+reachable only by `role = 'admin'` profiles; the guard runs in the Next.js
+server layout (`requireAdminFromCookieValue`), and every read and write goes
+through the service-role RPCs from `202609020003`–`202609020005`. The console
+does three things: signup approval and roles (`set_profile_status_v1` /
+`set_profile_role_v1`; the last admin cannot be demoted or disabled and nobody
+can change their own row - both enforced in SQL), session aggregates
+(`list_sessions_admin_v1`), and the global Live Call engine.
+
+The global engine (`engine_defaults.engine`) is the only Live Call engine.
+Hosts see it read-only in the web dashboard and the desktop app, and the
+server replaces any non-admin `modelPreferences.engine` with it when a session
+is created or patched. "배포" (`PUT /api/console/engine-defaults`) is an
+**immediate switch**: it stores the new engine (`set_engine_defaults_v1`), then
+for every `preparing`/`live` session calls `set_live_session_engine_admin_v1`
+and pushes `POST /internal/sessions/:id/engine` to the media gateway with a
+60-second `ADMIN` gateway token. The gateway opens the new pipeline, closes the
+old one once it is ready (caption `seq` continues), and tells the host via
+`engine-status`. The response is a per-session table: `switched` (the gateway
+swapped it), `queued` (the gateway does not hold the session - cold - so the DB
+value applies on the next activation; expected, not an error), or `failed`
+with a code (the old pipeline keeps running). Each deploy leaves **two**
+`profile_events.engine_defaults` rows: the bare engine from
+`set_engine_defaults_v1`, then the `kind: 'deploy'` counters row from
+`record_console_deploy_v1`.
+
+Operator steps after the first admin login: open `/console/users` (the
+bootstrap admin row must be `approved` / `admin`) and `/console/engine` (the
+current engine and a "배포" that reports `queued` or `switched`, never 5xx).
+Turn off legacy password login (`set_legacy_password_login_v1`, the 계정
+section of `/console/engine`) only after Google login is confirmed; from then
+on `/api/login` answers `LEGACY_LOGIN_DISABLED` (403).
+
 Local SQL verification without a linked project:
 
 ```sh
-NOVA_PGLITE_MODULE=/path/to/pglite/dist/index.js node --test test/auth-profiles-sql.test.js
+NOVA_PGLITE_MODULE=/path/to/pglite/dist/index.js node --test test/auth-profiles-sql.test.js test/console-rpcs-sql.test.js test/live-session-engine-admin-sql.test.js test/console-deploy-audit-sql.test.js
 ```
 
 ## 2026-09-05: 사용자별 엔진과 연속 세션 접근

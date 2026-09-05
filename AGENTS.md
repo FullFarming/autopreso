@@ -21,7 +21,7 @@ There is no npm workspace: the root, `media-gateway/`, and `webapp/` each have
 their own `package.json` and lockfile, so each needs its own `npm ci`.
 
 ```sh
-npm test                             # root: 1676 tests (1662 pass, 14 skip - PGlite SQL tests need NOVA_PGLITE_MODULE)
+npm test                             # root: 1676 tests (1662 pass, 14 skip - PGlite SQL tests need NOVA_PGLITE_MODULE; local-term-retrieval's lookup-budget test flakes only when the three suites run concurrently)
 npm --prefix media-gateway test      # 591 tests (bare `node --test`)
 npm --prefix webapp run test:live    # 943 tests (Live Call surface; test:core adds 77)
 npm --prefix webapp test             # test:live + test:core - what CI runs
@@ -127,6 +127,24 @@ desktop's own local engine; `electron/main.js` fans those to all renderers as
   browser and returns via `nova://auth/callback?code&state`, which
   `electron/main.js` trades for the cookie at `POST /api/auth/desktop-exchange`
   (the scheme is registered only when packaged or `NOVA_DEV_DEEP_LINK=1`).
+- **Admin console.** `/console` (`users`, `sessions`, `engine`) is admin-only:
+  the guard is `requireAdminFromCookieValue` in the server layout
+  (`webapp/app/console/layout.tsx`), not middleware, and every read/write goes
+  through service-role RPCs (`set_profile_status_v1`, `set_profile_role_v1`,
+  `list_sessions_admin_v1`, ...) - the browser never selects from `profiles`.
+  The global `engine_defaults.engine` is the **only** Live Call engine: hosts
+  see it read-only, and `POST/PATCH /api/live-sessions` replaces a non-admin
+  caller's `modelPreferences.engine` with it (server authority, not an error).
+  "배포" is `PUT /api/console/engine-defaults`: DB write, then per
+  `preparing|live` session `set_live_session_engine_admin_v1` (history <= 8
+  entries / 3800-byte `event_metadata` budget, `reason`) and gateway
+  `POST /internal/sessions/:id/engine` with a 60 s `ADMIN` gateway token; the
+  gateway swaps the pipeline (contract C1 kept) and emits `engine-status` to
+  the host, and the response is a per-session `switched|queued|failed` table
+  (`queued` = cold session, applied on next activation). Each deploy leaves two
+  `profile_events.engine_defaults` rows (engine, then `kind: 'deploy'`
+  counters). `set_legacy_password_login_v1` turns the password login into
+  `LEGACY_LOGIN_DISABLED` (403) at `/api/login`.
 
 ### Two supported HOST connection paths (do NOT tighten one to "fix" the other)
 

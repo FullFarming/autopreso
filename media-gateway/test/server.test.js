@@ -423,3 +423,20 @@ test('Soniox with no Gemini key opens its native socket and sends PCM without st
   assert.equal(frames.filter(frame => Buffer.isBuffer(frame)).length, 1);
   assert.equal(imports, 0);
 });
+
+test("the admin engine endpoint receives provider-key PRESENCE flags, never the key strings", async () => {
+  const source = await readFile(new URL("../src/server.js", import.meta.url), "utf8");
+  const match = /engineKeyEnvironment:\s*(\{[^}]*\})/u.exec(source);
+  assert.ok(match, "createGatewayServer must be handed an engineKeyEnvironment");
+  assert.equal(
+    match[1].replace(/\s+/gu, " "),
+    '{ GEMINI_API_KEY: config.geminiApiKey ? "1" : "", SONIOX_API_KEY: config.sonioxApiKey ? "1" : "" }',
+    "the handler closure must hold only presence flags",
+  );
+  // Behavioural half: presence flags are all assertEngineKeys needs, and an
+  // empty flag still fails closed.
+  const { assertEngineKeys } = await import("../src/engines/create-engines.js");
+  const soniox = { stt: { provider: "soniox", model: "stt-rt-v5", languageMode: "auto" }, translation: { provider: "soniox", model: "stt-rt-v5" }, summary: { provider: "gemini", model: "gemini-3.6-flash" } };
+  assert.doesNotThrow(() => assertEngineKeys(soniox, { GEMINI_API_KEY: "1", SONIOX_API_KEY: "1" }));
+  assert.throws(() => assertEngineKeys(soniox, { GEMINI_API_KEY: "1", SONIOX_API_KEY: "" }), /ENGINE_KEY_MISSING/u);
+});

@@ -264,9 +264,11 @@ export async function startMediaGateway(config = readGatewayEnvironment(), {
     mediaDemandStore: config.participantDemandEnabled ? new SupabaseMediaDemandStore(config) : null,
     fetchFloorParticipant: (sessionId, participantId) => floorController.getParticipant(sessionId, participantId),
     replayUtterances: (sessionId, language, afterSeq, limit, options) => publisher.fetchUtterancesAfter(sessionId, language, afterSeq, limit, options),
-    // Presence-only view of the provider keys for the admin engine endpoint;
-    // the factory below re-checks the same env before any pipeline exists.
-    engineKeyEnvironment: { GEMINI_API_KEY: config.geminiApiKey, SONIOX_API_KEY: config.sonioxApiKey },
+    // The admin engine endpoint only ever asks "is this provider's key
+    // configured?", so its closure is handed presence flags, not the key
+    // strings; the factory below re-checks the real env before any pipeline
+    // exists. Key values are never copied into request handlers or logs.
+    engineKeyEnvironment: { GEMINI_API_KEY: config.geminiApiKey ? "1" : "", SONIOX_API_KEY: config.sonioxApiKey ? "1" : "" },
     async pipelineFactory(message, previousPipeline, onHostEvent, options = {}) {
       const captionPolishPolicy = resolveCaptionPolishPolicy(message.sessionId);
       const captionConfig = createGeminiCaptionConfig({
