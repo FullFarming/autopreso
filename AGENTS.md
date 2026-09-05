@@ -242,6 +242,19 @@ take **without** consuming it. Both halves of that asymmetry are load-bearing:
 Change one side and you must change the other. `contract C1` is the searchable
 marker on both.
 
+## Caption display mode (2026-09-06)
+
+Local captions keep one lane per selected language, and each lane also echoes the
+original spoken in its own language (`acceptSource` in `src/subtitle-realtime.js`,
+`isSourceCaption: true`). Whether that lane is SHOWN is `subtitle.displayMode`:
+`translation_only` (default; Korean in → English only, English in → Korean only,
+three languages → two translations) or `translation_source` (the original beside
+every selected language). The filter is display-only — `isHiddenSourceCaption` in
+`public/subtitle-overlay.js` and the dashboard preview — so server broadcasts and
+Records are unchanged, and Live Call mirror lines (`source: "live-call"`) are exempt.
+The radio lives in the caption settings (`name="displayMode"`); the old load-time
+migration that discarded `translation_source` is gone, so the choice persists.
+
 ## The root-vs-`public/` frontend duplication trap
 
 `public/` is the only copy that matters, and now the only copy there is.
