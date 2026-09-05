@@ -189,3 +189,34 @@ test("desktop session assignment lookup fails closed and never buys the default 
   const seed=vm.runInNewContext(`${helpers}\n${seedSource}\nseedLiveCallEngineDefaults`, context({liveCallApi:async()=>({ok:true,data:{engineDefaults:gemini37}})}));
   sameEngine((await seed('https://example.test')).engine,gemini37);
 });
+
+// T1 (2026-09-05): `webapp/lib/live/service.ts` stores
+// `{ engine, engineHistory: [], assignmentRevision }` on create (the operator's
+// per-user engine assignment revision). The desktop reader must accept that key
+// and DROP it - it keeps only the engine - while still rejecting unknown keys and
+// a malformed revision. Without this every new Live Call failed re-pin (906fe46).
+const serviceSource = readFileSync(new URL("../webapp/lib/live/service.ts", import.meta.url), "utf8");
+const readPreferences = vm.runInNewContext(`${helpers}\n(value) => readLiveCallModelPreferences(value)`, context());
+
+test("the desktop reader accepts the server-pinned assignmentRevision, drops it, and keeps every other rejection", () => {
+  assert.match(serviceSource, /modelPreferences: LiveModelPreferences = \{ engine, engineHistory: \[\], \.\.\.\(options\.assignmentRevision/u,
+    "service.ts must still write the shape this test feeds to the desktop reader");
+  const stored = { engine: plain(gemini37), engineHistory: [], assignmentRevision: "2" };
+  assert.deepEqual(plain(readPreferences(stored)), { engine: plain(gemini37) }, "yields exactly { engine }");
+  assert.deepEqual(plain(readPreferences({ engine: plain(gemini37), engineHistory: history, assignmentRevision: "a".repeat(64) })), { engine: plain(gemini37) });
+  assert.throws(() => readPreferences({ ...stored, foo: "bar" }), { code: "ENGINE_SELECTION_INVALID" }, "unknown keys still fail closed");
+  for (const revision of [2, null, "", "a".repeat(65), {}, []]) {
+    assert.throws(() => readPreferences({ ...stored, assignmentRevision: revision }), { code: "ENGINE_SELECTION_INVALID" }, `assignmentRevision ${JSON.stringify(revision)}`);
+  }
+  assert.throws(() => readPreferences({ engine: "gemini", assignmentRevision: "2" }), { code: "ENGINE_SELECTION_INVALID" }, "a malformed engine is still rejected");
+});
+
+test("a session record carrying assignmentRevision re-pins the engine on start and arms without error", async () => {
+  const h = startHarness({ ...dbPreferences, assignmentRevision: "2" });
+  assert.equal((await h.start(h.session)).ok, true);
+  assertEngine(h.session.gatewaySettings.captionConfig, gemini37);
+  const armed = armHarness();
+  assert.equal((await armed.arm({ id: "call", status: "preparing", modelPreferences: { engine: soniox, engineHistory: [], assignmentRevision: "7" } }, { languages: ["ko", "en"] })).ok, true);
+  assertEngine(armed.scope.liveCallSession.gatewaySettings.captionConfig, soniox);
+  assert.equal(armed.scope.liveCallSession.modelPreferences.assignmentRevision, undefined, "the desktop never carries the revision");
+});

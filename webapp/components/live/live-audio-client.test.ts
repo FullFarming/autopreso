@@ -2068,3 +2068,19 @@ test("host dashboard hands the session's modelPreferences to every gateway start
   assert.doesNotMatch(source, /pushEngineToGateway|\/internal\/sessions/u, "hosts never trigger an engine switch themselves");
   for (const key of ["엔진 연결 중", "엔진 준비됨", "엔진 오류"]) assert.ok(source.includes(`"${key}"`), key);
 });
+
+import { readHostModelPreferences } from "./live-audio-client";
+
+// T1 (2026-09-05): the server stores `{ engine, engineHistory, assignmentRevision }`
+// (lib/live/service.ts create). The web host reader accepts and DROPS the revision;
+// unknown keys and a malformed revision still fail closed.
+test("web host reader accepts the server-pinned assignmentRevision, drops it, and keeps every other rejection", () => {
+  const stored = { engine: DEFAULT_ENGINE_SELECTION, engineHistory: [], assignmentRevision: "2" };
+  assert.deepEqual(readHostModelPreferences(stored), { engine: DEFAULT_ENGINE_SELECTION, engineHistory: [] });
+  assert.deepEqual(readHostModelPreferences({ ...stored, assignmentRevision: "a".repeat(64) }).engine, DEFAULT_ENGINE_SELECTION);
+  assert.throws(() => readHostModelPreferences({ ...stored, foo: "bar" }), /올바르지/u, "unknown keys still fail closed");
+  for (const assignmentRevision of [2, null, "", "a".repeat(65), {}, []]) {
+    assert.throws(() => readHostModelPreferences({ ...stored, assignmentRevision }), /올바르지/u, `assignmentRevision ${JSON.stringify(assignmentRevision)}`);
+  }
+  assert.throws(() => readHostModelPreferences({ engine: "gemini", assignmentRevision: "2" }), /올바르지|지원하지/u, "a malformed engine is still rejected");
+});

@@ -1193,15 +1193,24 @@ async function liveCallApiWithHostSession(baseUrl, pathname, options) {
   return liveCallApi(baseUrl, pathname, options);
 }
 
-// Plan 2 Task 4: a Live Call's `modelPreferences` is `{ engine, engineHistory }`
-// (webapp/lib/live/model-preferences.ts). The desktop keeps only the engine -
-// history is server-owned and never sent back - and validates it against the
-// shared catalog; an absent value is the catalog default.
+// Plan 2 Task 4: a Live Call's `modelPreferences` is
+// `{ engine, engineHistory, assignmentRevision? }` (webapp/lib/live/model-preferences.ts;
+// service.ts pins the operator's per-user assignment revision on create). The
+// desktop keeps only the engine - history and revision are server-owned and never
+// sent back - and validates it against the shared catalog; an absent value is the
+// catalog default. Any other key, or a malformed revision, fails closed.
 function readLiveCallModelPreferences(value) {
+  // Declared inside so the vm-sliced desktop tests carry the constants along.
+  const allowedKeys = ["engine", "engineHistory", "assignmentRevision"];
+  const maxAssignmentRevisionCharacters = 64;
   if (value === undefined) return Object.freeze({ engine: DEFAULT_ENGINE_SELECTION });
   if (!value || typeof value !== "object" || Array.isArray(value)
     || !value.engine || typeof value.engine !== "object" || Array.isArray(value.engine)
-    || Object.keys(value).some((key) => key !== "engine" && key !== "engineHistory")) {
+    || Object.keys(value).some((key) => !allowedKeys.includes(key))) {
+    throw new EngineSelectionError();
+  }
+  const revision = value.assignmentRevision;
+  if (revision !== undefined && (typeof revision !== "string" || revision.length < 1 || revision.length > maxAssignmentRevisionCharacters)) {
     throw new EngineSelectionError();
   }
   return Object.freeze({ engine: normalizeEngineSelection(value.engine) });

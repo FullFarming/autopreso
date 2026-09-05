@@ -2071,3 +2071,17 @@ test("Supabase rows expose the server-owned gateway activation key to the host p
   );
   assert.equal((await withBadKey.get(baseRow.id))?.activationKey, null);
 });
+
+import { readHostModelPreferences } from "../../components/live/live-audio-client";
+
+// T1 (2026-09-05) contract: what `create` stores under `modelPreferences` (with the
+// operator's `assignmentRevision`) must be accepted by the web host reader that
+// starts the gateway pipeline. Both halves are imported here so they cannot drift.
+test("the modelPreferences `create` stores with an assignmentRevision is accepted by the web host reader", async () => {
+  const service = new LiveSessionService(new MemoryLiveSessionStore());
+  const engineDefaults = readStoredEngineDefaults({ stt: { provider: "soniox", model: "stt-rt-v5", languageMode: "ko" }, translation: { provider: "soniox", model: "stt-rt-v5" }, summary: { provider: "gemini", model: "gemini-3.7-flash" } });
+  const session = await service.create("host-1", { sessionType: "meeting", languages: ["ko"] }, { engineDefaults, assignmentRevision: "2" });
+  assert.equal(session.modelPreferences?.assignmentRevision, "2", "the server pins the assignment revision on the record");
+  assert.deepEqual(readHostModelPreferences(session.modelPreferences), { engine: engineDefaults, engineHistory: [] });
+  assert.deepEqual(readHostModelPreferences(readLiveModelPreferences(JSON.parse(JSON.stringify(session.modelPreferences)))).engine, engineDefaults, "the store round-trip shape is accepted too");
+});

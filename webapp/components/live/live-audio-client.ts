@@ -106,15 +106,21 @@ export interface LiveAudioSettings {
 
 const INVALID_ENGINE_MESSAGE = "자막 엔진 선택이 올바르지 않습니다.";
 
-// The server always returns the normalized `{ engine, engineHistory }` shape
-// (lib/live/model-preferences.ts); the client re-validates the engine against
-// the catalog and carries nothing else - history is server-owned.
-function readHostModelPreferences(value: unknown): LiveModelPreferences {
+// The server always returns the normalized `{ engine, engineHistory, assignmentRevision? }`
+// shape (lib/live/model-preferences.ts; service.ts pins the operator's per-user
+// assignment revision on create); the client re-validates the engine against the
+// catalog and carries nothing else - history and revision are server-owned. Any
+// other key, or a malformed revision, fails closed.
+const HOST_MODEL_PREFERENCE_KEYS = new Set(["engine", "engineHistory", "assignmentRevision"]);
+const MAX_ASSIGNMENT_REVISION_CHARACTERS = 64;
+export function readHostModelPreferences(value: unknown): LiveModelPreferences {
   if (value === undefined) return { engine: normalizeEngineSelection(undefined) as EngineSelection, engineHistory: [] };
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(INVALID_ENGINE_MESSAGE);
   const preferences = value as Record<string, unknown>;
-  if (Object.keys(preferences).some((key) => key !== "engine" && key !== "engineHistory")
+  if (Object.keys(preferences).some((key) => !HOST_MODEL_PREFERENCE_KEYS.has(key))
     || !preferences.engine || typeof preferences.engine !== "object" || Array.isArray(preferences.engine)) throw new Error(INVALID_ENGINE_MESSAGE);
+  const revision = preferences.assignmentRevision;
+  if (revision !== undefined && (typeof revision !== "string" || revision.length < 1 || revision.length > MAX_ASSIGNMENT_REVISION_CHARACTERS)) throw new Error(INVALID_ENGINE_MESSAGE);
   try {
     return { engine: normalizeEngineSelection(preferences.engine) as EngineSelection, engineHistory: [] };
   } catch {
