@@ -1,3 +1,4 @@
+import { hasValidTranslationCaptureProvenance, type TranslationCapture } from "../../../lib/live/translation-capture";
 import type { CaptionTranslationStatus } from "@/lib/live-contract";
 import type { LanguageObservation } from "../../../lib/live/source-contract";
 import type { CaptionDisplayMode } from "./CaptionEntry";
@@ -26,6 +27,7 @@ export interface TopicCaptionPresentation {
 }
 
 export interface CaptionLaneInput extends TopicCaptionPresentation {
+  translationCapture?: TranslationCapture;
   language: string;
   sourceLanguage?: string | null;
   origin?: "source";
@@ -111,6 +113,7 @@ export function projectCaptionLane(
   const projected = new Map<string, TopicCaptionPresentation>();
   const sourcePriority = new Map<string, number>();
   for (const caption of captions) {
+    if (!hasValidTranslationCaptureProvenance(caption)) continue;
     let text: string | null = null;
     let priority = 0;
     if (lane.kind === "source") {
@@ -123,7 +126,7 @@ export function projectCaptionLane(
       }
     } else if (caption.language === lane.language) {
       const isVerifiedTranslation = caption.translationStatus === "translated"
-        && caption.origin !== "source" && Boolean(caption.sourceText?.trim());
+        && caption.origin !== "source" && (Boolean(caption.sourceText?.trim()) || caption.translationCapture !== undefined);
       const isVerifiedNative = caption.translationStatus === "verbatim"
         && caption.sourceLanguage === lane.language;
       const isVerifiedNeutral = caption.translationStatus === "verbatim" && caption.sourceLanguage === "und"

@@ -246,6 +246,7 @@ function captionLaneInput(caption: CaptionEvent, index: number, total: number): 
     utteranceKey: caption.utteranceKey,
     language: caption.language,
     sourceLanguage: caption.sourceLanguage,
+    translationCapture: caption.translationCapture,
     languageObservation: caption.languageObservation,
     origin: caption.origin,
     text: caption.text,
@@ -333,6 +334,7 @@ export default function LiveViewer({ compact = false }: { compact?: boolean }) {
   const sourceSnapshotAbortRef = useRef<AbortController | null>(null);
   const isSourceHydratedRef = useRef(false);
   const [sourceError, setSourceError] = useState("");
+  const [hasSourceRecordingFailure, setHasSourceRecordingFailure] = useState(false);
   const [isSourceLoading, setIsSourceLoading] = useState(false);
   const captionsByLanguageRef = useRef<Record<string, CaptionEvent[]>>({});
   const [captionsByLanguage, setCaptionsByLanguage] = useState(captionsByLanguageRef.current);
@@ -437,6 +439,7 @@ export default function LiveViewer({ compact = false }: { compact?: boolean }) {
     setSourceLedger([]);
     setSourceDraftState(createViewerSourceDraftState());
     setSourceError("");
+    setHasSourceRecordingFailure(false);
     setIsSourceLoading(false);
     setIncompleteLanguages([]);
     isSourceHydratedRef.current = false;
@@ -539,14 +542,16 @@ export default function LiveViewer({ compact = false }: { compact?: boolean }) {
     sourceSnapshotAbortRef.current = controller;
     setIsSourceLoading(true);
     try {
-      const events = await withAbortTimeout(async (timeoutSignal) => {
+      const snapshot = await withAbortTimeout(async (timeoutSignal) => {
         const cancel = () => controller.abort(timeoutSignal.reason);
         timeoutSignal.addEventListener("abort", cancel, { once: true });
         try { return await loadViewerSourceSnapshot(sessionId, afterSourceSeq, controller.signal); }
         finally { timeoutSignal.removeEventListener("abort", cancel); }
       });
       if (controller.signal.aborted || sessionId !== viewerSessionIdRef.current) return;
-      mergeSourceEvents(events);
+      mergeSourceEvents(snapshot.sources);
+      setRecordingGaps((previous) => [...new Map([...previous, ...snapshot.recordingGaps].map((gap) => [gap.id, gap])).values()]);
+      if (snapshot.recordingGaps.some((gap) => gap.reason === "source_recording_failed")) setHasSourceRecordingFailure(true);
       isSourceHydratedRef.current = true;
       setSourceError("");
     } catch {
@@ -1223,6 +1228,10 @@ export default function LiveViewer({ compact = false }: { compact?: boolean }) {
       replaceCaptionCache(nextCache);
       return;
     }
+    if (event.type === "source-status") {
+      setHasSourceRecordingFailure(true);
+      return;
+    }
     if (event.type === "recording-status") {
       if (event.language === languageRef.current) {
         setError("실시간 자막 연결을 확인하고 있습니다. 원문 자막은 계속 유지됩니다.");
@@ -1322,6 +1331,8 @@ export default function LiveViewer({ compact = false }: { compact?: boolean }) {
       setSourceLedger([]);
       isSourceHydratedRef.current = false;
       setSourceError("");
+      setHasSourceRecordingFailure(false);
+      setRecordingGaps([]);
       setIncompleteLanguages([]);
       lastSeqByLanguageRef.current = {};
       snapshotRegistryRef.current.reset(currentViewer.session.id);
@@ -2094,6 +2105,7 @@ export default function LiveViewer({ compact = false }: { compact?: boolean }) {
         </div>
       )}
       {error && <div className="live-error" role="alert">{t(error)}</div>}
+      {!isSessionEnded && hasSourceRecordingFailure && <div className="live-error" role="status">{t("원문 기록을 완료하지 못했습니다. 번역 자막은 계속 표시됩니다.")}</div>}
       <header className="viewer-meeting-heading">
         <h1>{viewer.session.title}</h1>
         {viewer.session.companyName && <p>{viewer.session.companyName}</p>}
@@ -2162,11 +2174,11 @@ export default function LiveViewer({ compact = false }: { compact?: boolean }) {
               selectedLaneId={selectedLaneId} onSelectLane={selectTranslationLane}
               renderPanel={renderTopicLane} />
           </div>
-          <div className="viewer-microphone-slot">
-            {canUseSpeakingFloor && <ParticipantSpeakButton state={speakState}
+          {canUseSpeakingFloor && <div className="viewer-microphone-slot">
+            <ParticipantSpeakButton state={speakState}
               disabled={speakState === "idle" && gatewayConnectionState !== "connected"}
-              onClick={() => void toggleSpeak()} />}
-          </div>
+              onClick={() => void toggleSpeak()} />
+          </div>}
         </>
       )}
       </div>

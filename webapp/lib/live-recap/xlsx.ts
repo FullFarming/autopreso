@@ -101,6 +101,7 @@ export async function buildLiveRecordWorkbook(snapshot: RecordExportSnapshot): P
 function gapReason(gap: RecordingGap): string {
   const labels: Record<RecordingGap["reason"], string> = {
     no_viewers: "참여자 없음", host_unavailable: "진행자 음성 연결 없음", media_failed: "음성 처리 연결 중단",
+    source_recording_failed: "원문 기록 중단",
   };
   return `${labels[gap.reason]} (${gap.reason})`;
 }

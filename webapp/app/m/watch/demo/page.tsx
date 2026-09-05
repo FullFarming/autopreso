@@ -128,10 +128,10 @@ export default function MobileWatchDemoPage() {
           {previewState === "degraded" && <p role="status">{t("번역이 지연되고 있어요. 이전 문장은 계속 읽을 수 있어요.")}</p>}
           <div className="live-viewer-caption-region"><TranslationLaneTabs participantControls lanes={LANES} selectedLaneId={selectedLaneId} onChange={(lane) => setSelectedLaneId(lane.id)} ariaLabel={t("자막 언어")}
             renderPanel={() => <ViewerReadingFeed key={selectedLane.id} captions={captions} language={selectedLane.language} kind={selectedLane.kind} />} /></div>
-          <div className="viewer-microphone-slot">{previewState !== "denied" && <ParticipantSpeakButton state={isSpeaking ? "speaking" : "idle"}
+          {previewState !== "denied" && <div className="viewer-microphone-slot"><ParticipantSpeakButton state={isSpeaking ? "speaking" : "idle"}
             disabled={previewState === "disconnected" && !isSpeaking}
-            onClick={() => setIsSpeaking((current) => !current)} />}
-            {isSpeaking && <p role="status">{t("발언 상태 미리보기 · 실제 마이크는 사용하지 않아요.")}</p>}</div>
+            onClick={() => setIsSpeaking((current) => !current)} />
+            {isSpeaking && <p role="status">{t("발언 상태 미리보기 · 실제 마이크는 사용하지 않아요.")}</p>}</div>}
         </>}
     </div>
   </main>;

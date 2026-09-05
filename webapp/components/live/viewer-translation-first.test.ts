@@ -171,7 +171,8 @@ test("participant notebook keeps live reading continuous and microphone permissi
   assert.match(policy, /!isSessionEnded && sessionStatus === "live"/u);
   assert.doesNotMatch(policy, /activeSection|qa/u);
   const capsule = viewer.slice(viewer.indexOf('className="viewer-microphone-slot"'));
-  assert.match(capsule, /canUseSpeakingFloor && <ParticipantSpeakButton/u);
+  assert.match(viewer, /\{canUseSpeakingFloor && <div className="viewer-microphone-slot">/u);
+  assert.match(capsule, /<ParticipantSpeakButton/u);
   const speakButton = readFileSync(resolve(process.cwd(), "components/live/ParticipantSpeakButton.tsx"), "utf8");
   assert.match(speakButton, /aria-label=/u);
   assert.match(speakButton, /CircleNotch, Record, Stop/u);
@@ -182,6 +183,16 @@ test("participant notebook keeps live reading continuous and microphone permissi
   assert.doesNotMatch(feed, /Avatar|CompletedTopicAccordion|CurrentTopicPanel/u);
   assert.match(styles, /\.viewer-notebook \.viewer-microphone-capsule,\s*\.viewer-notebook \.viewer-recap-cta[^}]*width: 100%/u);
   assert.match(styles, /\.viewer-notebook \.viewer-microphone-capsule[^}]*border-radius: var\(--nova-radius-pill\)/u);
+});
+
+test("participants without a speaking action reserve no footer space in production or demo", () => {
+  const demo = readFileSync(resolve(process.cwd(), "app/m/watch/demo/page.tsx"), "utf8");
+  assert.match(demo, /\{previewState !== "denied" && <div className="viewer-microphone-slot">/u);
+  const noAction = '.live-viewer-shell[data-reading-state="live"] .viewer-notebook:not(:has(> .viewer-microphone-slot))';
+  assert.equal(readCssDeclaration(styles, noAction, "padding-bottom"), "0");
+  assert.equal(readCssDeclaration(styles, `${noAction} .viewer-reading-scroll`, "padding-bottom"), "env(safe-area-inset-bottom, 0px)");
+  assert.equal(readCssDeclaration(styles, `${noAction} .viewer-reading-scroll > :last-child`, "margin-bottom"), "0");
+  assert.match(viewer, /!isSessionEnded && hasSourceRecordingFailure/u, "a missing original must retain its visible failure notice");
 });
 
 

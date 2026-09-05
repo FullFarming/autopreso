@@ -1,13 +1,56 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { readFile } from 'node:fs/promises';
 import { createViewerGrantToken, createRecapGrantToken, VIEWER_GRANT_COOKIE, RECAP_GRANT_COOKIE, AuthorizationError } from '../auth/live-auth';
-import { authenticateSourceSnapshotRequest, SupabaseSourceSnapshotStore, parseSourceSnapshotQuery } from './source-snapshot';
+import { authenticateSourceSnapshotRequest, authenticateSourceSnapshotAudience, SupabaseSourceSnapshotStore, parseSourceSnapshotQuery } from './source-snapshot';
+import { createSessionToken, SESSION_COOKIE } from '../session';
 import { LiveAdmissionError } from '../security/live-admission-store';
 import { isViewerSnapshotPath } from '../security/csrf';
 const sessionId='00000000-0000-4000-8000-000000000001';
 const userId='00000000-0000-4000-8000-000000000002';
 const grantId='00000000-0000-4000-8000-000000000003';
 const cookies=(values:Record<string,string>)=>({cookies:{get:(key:string)=>values[key]?{value:values[key]}:undefined}});
+
+test('host source audience requires the host cookie without changing participant authorization',async()=>{
+  const oldUsers=process.env.ADMIN_USER_IDS;process.env.ADMIN_USER_IDS='source-host';
+  try {
+    const host=await createSessionToken('source-host');
+    const {token:viewer}=await createViewerGrantToken({sessionId,userId,grantId});
+    const mixed=cookies({[SESSION_COOKIE]:host,[VIEWER_GRANT_COOKIE]:viewer});
+    assert.deepEqual(await authenticateSourceSnapshotAudience(mixed,sessionId,'host'),{role:'host',hostId:'source-host'});
+    assert.deepEqual(await authenticateSourceSnapshotAudience(mixed,sessionId,null),{role:'participant',userId,grantId});
+    await assert.rejects(authenticateSourceSnapshotAudience(cookies({[VIEWER_GRANT_COOKIE]:viewer}),sessionId,'host'));
+    await assert.rejects(authenticateSourceSnapshotAudience(mixed,sessionId,'admin'),LiveAdmissionError);
+    await assert.rejects(authenticateSourceSnapshotAudience(cookies({[SESSION_COOKIE]:`${host}tampered`}),sessionId,'host'));
+  }finally {if(oldUsers===undefined)delete process.env.ADMIN_USER_IDS;else process.env.ADMIN_USER_IDS=oldUsers;}
+});
+
+test('host source store uses the private owner RPC, carries known gaps, and rejects cross-session pages',async()=>{
+  const gap={id:grantId,startedAt:'2026-09-01T00:00:00.000Z',endedAt:null,reason:'no_viewers'};
+  const page={sessionId,sources:[],lastSourceSeq:0,hasNextPage:false,nextAfterSourceSeq:null,recordsExpiresAt:null,recordingGaps:[gap]};
+  const make=(payload:unknown,status=200)=>new SupabaseSourceSnapshotStore({
+    getServerAccess:()=>({url:'https://test-ref.supabase.co',credential:{kind:'secret',key:'sb_secret_test-only-value'}}),
+    fetchFn:async(url,init)=>{assert.match(String(url),/read_owned_live_source_snapshot_v1$/u);
+      assert.deepEqual(JSON.parse(String(init?.body)),{p_session_id:sessionId,p_host_id:'source-host',p_after_source_seq:0,p_limit:500});
+      return Response.json(payload,{status});},
+  });
+  const input={hostId:'source-host',afterSourceSeq:0,pageSize:500};
+  assert.deepEqual(await make(page).readHost(sessionId,input),page);
+  await assert.rejects(make({...page,sessionId:grantId}).readHost(sessionId,input),/응답/u);
+  await assert.rejects(make({...page,recordingGaps:[{...gap,reason:'inferred'}]}).readHost(sessionId,input),/응답/u);
+  await assert.rejects(make({message:'SOURCE_FORBIDDEN'},403).readHost(sessionId,input),(error:unknown)=>error instanceof LiveAdmissionError&&error.status===403);
+  await assert.rejects(make({message:'EXPORT_TOO_LARGE'},400).readHost(sessionId,input),(error:unknown)=>error instanceof LiveAdmissionError&&error.status===413);
+});
+
+test('source route authenticates the selected audience before its own read rate limit and private store',async()=>{
+  const route=await readFile(new URL('../../app/api/live-sessions/[id]/source-snapshot/route.ts',import.meta.url),'utf8');
+  assert.ok(route.indexOf('authenticateSourceSnapshotAudience(request, sessionId, audience)')<route.indexOf('store.readHost'));
+  assert.ok(route.indexOf('enforceAuthoritativeTranscriptReadRateLimit(identity.hostId')<route.indexOf('store.readHost'));
+  assert.match(route,/store\.readHost\(sessionId, \{ hostId: identity\.hostId, \.\.\.page \}\)/u);
+  assert.match(route,/enforceParticipantRecordReadRateLimit\(identity\.userId/u);
+  assert.doesNotMatch(route,/searchParams\.get\(["']hostId/u);
+  assert.match(route,/privateNoStoreHeaders\(\)/u);
+});
 
 test('source auth binds signed viewer/recap identity without exposing the host audit API',async()=>{
   const {token}=await createViewerGrantToken({sessionId,userId,grantId});

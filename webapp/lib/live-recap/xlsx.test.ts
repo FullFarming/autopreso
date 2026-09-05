@@ -108,3 +108,17 @@ test("recording gaps retain server times and reasons without fabricating missing
   assert.ok(values.includes("종료 시각 미확인"));
   assert.ok(values.includes("미수집 구간 수"));
 });
+
+test("source recorder failure exports a truthful separate gap while retaining translated/original records", async () => {
+  const snapshot = snapshotFixture();
+  const gap = { id: "88888888-8888-4888-8888-888888888888", startedAt: "2026-08-30T23:10:00Z", endedAt: "2026-08-30T23:10:15Z", reason: "source_recording_failed" as const };
+  const workbook = new ExcelJS.Workbook();
+  await workbook.xlsx.load(Uint8Array.from(await buildLiveRecordWorkbook({ ...snapshot, recordingGaps: [gap] })).buffer);
+  const original = workbook.getWorksheet("원문");
+  assert.ok(original);
+  assert.equal(original.getCell("A2").value, gap.id);
+  assert.equal(original.getCell("E2").value, gap.startedAt);
+  assert.equal(original.getCell("F2").value, gap.endedAt);
+  assert.equal(original.getCell("G2").value, "원문 기록 중단 (source_recording_failed)");
+  assert.equal(original.rowCount, 77);
+});

@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { recordingGapSchema } from "../live-recap/contract";
 
 const language = z.string().regex(/^[a-z]{2,3}(?:-[A-Za-z]{4})?$/u).max(16);
 const instant = z.iso.datetime({ offset: true });
@@ -30,6 +31,7 @@ export const sourceSnapshotSchema = z.object({
   sessionId: z.uuid(), sources: z.array(sourceEventSchema).max(500),
   lastSourceSeq: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER), hasNextPage: z.boolean(),
   nextAfterSourceSeq: sequence.nullable(), recordsExpiresAt: instant.nullable(),
+  recordingGaps: z.array(recordingGapSchema).max(12_000).optional(),
 }).strict().refine((value) => value.sources.every((source, index) => source.sessionId === value.sessionId
   && source.sourceSeq > (value.sources[index - 1]?.sourceSeq ?? 0) && source.sourceSeq <= value.lastSourceSeq)
   && (value.hasNextPage ? value.nextAfterSourceSeq === value.sources.at(-1)?.sourceSeq

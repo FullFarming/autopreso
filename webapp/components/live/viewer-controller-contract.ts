@@ -1,3 +1,4 @@
+import { hasValidTranslationCaptureProvenance } from "../../lib/live/translation-capture";
 import type {
   ApiResponse,
   CaptionEvent,
@@ -91,6 +92,7 @@ function isCaptionEvent(value: unknown): value is CaptionEvent {
     && typeof value.text === "string"
     && typeof value.isFinal === "boolean"
     && (value.sourceText === undefined || value.sourceText === null || typeof value.sourceText === "string")
+    && hasValidTranslationCaptureProvenance(value)
     && (value.sourceLanguage === undefined || value.sourceLanguage === null || typeof value.sourceLanguage === "string")
     && (value.languageObservation === undefined || languageObservationSchema.safeParse(value.languageObservation).success)
     && (value.translationStatus === undefined || value.translationStatus === "verbatim"
@@ -151,6 +153,10 @@ export function parseBroadcastEvent(value: unknown): LiveBroadcastEvent | null {
     const parsed = value.type === "source-draft" ? sourceDraftEventSchema.safeParse(value) : sourceDraftClearEventSchema.safeParse(value);
     return parsed.success ? parsed.data : null;
   }
+  if (isRecord(value) && value.type === "source-status" && typeof value.sessionId === "string"
+    && value.status === "unavailable" && value.code === "SOURCE_RECORDING_UNAVAILABLE") return {
+      type: "source-status", sessionId: value.sessionId, status: "unavailable", code: "SOURCE_RECORDING_UNAVAILABLE",
+    };
   if (isCaptionEvent(value)) return value;
   if (isRecordingStatus(value)) return value;
   return isControlEvent(value) ? value : null;

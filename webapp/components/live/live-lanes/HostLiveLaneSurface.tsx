@@ -6,7 +6,8 @@ import { hostMessages } from "@/lib/system-language/host-messages";
 
 import type { ReactNode } from "react";
 
-import type { CaptionEvent, LiveSessionStatus, LiveSpeechActivity } from "@/lib/live-contract";
+import type { CaptionEvent, LiveSessionStatus } from "@/lib/live-contract";
+import type { SourceEvent } from "@/lib/live/source-contract";
 import { LANGUAGE_LABELS } from "@/lib/languageDetect";
 import { GatewayConnectionStatus, type GatewayConnectionState } from "../status";
 import {
@@ -27,7 +28,8 @@ interface HostLiveLaneSurfaceProps {
   gatewayStatus: string;
   languages: readonly string[];
   captions: readonly CaptionEvent[];
-  recentSpeeches: readonly LiveSpeechActivity[];
+  sources: readonly SourceEvent[];
+  sourceStatusMessage: string;
   selectedLaneId: string;
   aiHealthRows: HostAiHealthRows;
   inspectorChildren: ReactNode;
@@ -55,6 +57,7 @@ export function HostLiveLaneSurface(props: HostLiveLaneSurfaceProps) {
     utteranceKey: caption.utteranceKey,
     language: caption.language,
     sourceLanguage: caption.sourceLanguage,
+    translationCapture: caption.translationCapture,
     languageObservation: caption.languageObservation,
     origin: caption.origin,
     text: caption.text,
@@ -65,18 +68,19 @@ export function HostLiveLaneSurface(props: HostLiveLaneSurfaceProps) {
     translationStatus: caption.translationStatus,
     isActive: index === props.captions.length - 1,
   }));
+  const sourceInputs = props.sources.map((source) => ({
+    id: source.sourceUtteranceId, text: source.text, isFinal: true,
+    speakerLabel: source.speaker.label, timestamp: props.formatTime(source.sourceEndedAt),
+  }));
   const renderLane = (lane: TranslationLanePresentation) => {
-    const projected = projectCaptionLane(captionInputs, lane);
-    const sourceFallback = lane.kind === "source" && projected.length === 0 ? props.recentSpeeches : [];
+    const projected = lane.kind === "source" ? sourceInputs : projectCaptionLane(captionInputs, lane);
     return (
       <TranslationViewport state={props.sessionStatus === "paused" ? "paused" : props.isBroadcasting ? "live" : "disconnected"}
-        statusLabel={props.isBroadcasting ? undefined : t(props.gatewayStatus)}
-        finalAnnouncement={projected.at(-1)?.text ?? sourceFallback.at(-1)?.text}
-        emptyLabel={t("이 언어의 자막이 아직 없습니다.")} isEmpty={projected.length === 0 && sourceFallback.length === 0}
+        statusLabel={lane.kind === "source" && props.sourceStatusMessage ? t(props.sourceStatusMessage) : props.isBroadcasting ? undefined : t(props.gatewayStatus)}
+        finalAnnouncement={projected.at(-1)?.text}
+        emptyLabel={t(lane.kind === "source" ? "저장된 원문이 아직 없습니다." : "이 언어의 자막이 아직 없습니다.")} isEmpty={projected.length === 0}
         ariaLabel={t("{language} 자막", { language: lane.label })}>
         {projected.map((caption) => <CaptionEntry key={caption.id} {...caption} />)}
-        {sourceFallback.map((speech) => <CaptionEntry key={`${speech.participantId}-${speech.seq}`}
-          text={speech.text} speakerLabel={speech.displayName} timestamp={props.formatTime(speech.endedAt)} isFinal />)}
       </TranslationViewport>
     );
   };

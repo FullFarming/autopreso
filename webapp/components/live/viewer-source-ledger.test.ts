@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { readFileSync } from "node:fs";
+import ts from "typescript";
 import { mergeViewerSourceLedger, loadViewerSourceSnapshot, createViewerSourceDraftState, reduceViewerSourceDraft } from "./viewer-source-ledger";
 import type { SourceEvent, SourceDraftEvent } from "../../lib/live/source-contract";
 
@@ -50,7 +52,65 @@ test("source snapshot pagination merges with concurrent websocket finals without
   const snapshot = await loadViewerSourceSnapshot(sessionId, 0, new AbortController().signal, fetcher);
   assert.equal(requests.length, 2);
   assert.match(requests[1], /afterSourceSeq=1&pageSize=500/u);
-  assert.deepEqual(mergeViewerSourceLedger([source(3)], snapshot).map((event) => event.sourceSeq), [1, 2, 3]);
+  assert.deepEqual(mergeViewerSourceLedger([source(3)], snapshot.sources).map((event) => event.sourceSeq), [1, 2, 3]);
+});
+
+const gap = { id: "0192d0f4-9f72-7a36-91f5-6a76ef736f45", startedAt: "2026-09-01T00:00:00.000Z",
+  endedAt: "2026-09-01T00:00:02.000Z", reason: "source_recording_failed" as const };
+
+test("source snapshot retains durable recording failures with zero originals and across pages", async () => {
+  const empty: typeof fetch = async () => Response.json({ ok: true, data: {
+    sessionId, sources: [], lastSourceSeq: 0, hasNextPage: false, nextAfterSourceSeq: null,
+    recordsExpiresAt: null, recordingGaps: [gap],
+  } });
+  const restored = await loadViewerSourceSnapshot(sessionId, 0, new AbortController().signal, empty);
+  assert.deepEqual(restored, { sources: [], recordingGaps: [gap] });
+  let calls = 0;
+  const pages: typeof fetch = async () => {
+    const first = ++calls === 1;
+    return Response.json({ ok: true, data: { sessionId, sources: [source(calls)], lastSourceSeq: 2,
+      hasNextPage: first, nextAfterSourceSeq: first ? 1 : null, recordsExpiresAt: null,
+      recordingGaps: first ? [{ ...gap, endedAt: null }] : [gap] } });
+  };
+  const paged = await loadViewerSourceSnapshot(sessionId, 0, new AbortController().signal, pages);
+  assert.deepEqual(paged.recordingGaps, [gap], "a later closed interval replaces the open copy without duplication");
+  assert.deepEqual(paged.sources.map((event) => event.sourceSeq), [1, 2]);
+});
+
+test("actual viewer refresh restores a sticky source failure without discarding valid source captions", async () => {
+  const viewer = readFileSync(new URL("./LiveViewer.tsx", import.meta.url), "utf8");
+  const declaration = viewer.slice(viewer.indexOf("const synchronizeSourceLedger ="), viewer.indexOf("const loadMinutes ="));
+  const code = ts.transpileModule(`${declaration}\nreturn synchronizeSourceLedger;`, {
+    compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None },
+  }).outputText;
+  let hasFailure = false;
+  let gaps: unknown[] = [];
+  let currentSession = sessionId;
+  let sources: SourceEvent[] = [];
+  const snapshots: Awaited<ReturnType<typeof loadViewerSourceSnapshot>>[] = [
+    { sources: [], recordingGaps: [gap] }, { sources: [source(1)], recordingGaps: [] },
+  ];
+  const dependencies = {
+    useCallback: (callback: unknown) => callback, sourceSnapshotAbortRef: { current: null },
+    setIsSourceLoading() {}, withAbortTimeout: (callback: (signal: AbortSignal) => unknown) => callback(new AbortController().signal),
+    loadViewerSourceSnapshot: async () => snapshots.shift(),
+    viewerSessionIdRef: { get current() { return currentSession; } },
+    mergeSourceEvents: (events: SourceEvent[]) => { sources = mergeViewerSourceLedger(sources, events); },
+    isSourceHydratedRef: { current: false }, setSourceError() {},
+    setRecordingGaps: (value: unknown[] | ((previous: unknown[]) => unknown[])) => { gaps = typeof value === "function" ? value(gaps) : value; },
+    setHasSourceRecordingFailure: (value: boolean) => { hasFailure = value; },
+  };
+  const synchronize = new Function(...Object.keys(dependencies), code)(...Object.values(dependencies)) as (id: string, after: number) => Promise<void>;
+  await synchronize(sessionId, 0);
+  assert.equal(hasFailure, true, "refresh must restore failure even when no source row was saved");
+  assert.deepEqual(gaps, [gap]);
+  await synchronize(sessionId, 0);
+  assert.equal(hasFailure, true, "later successful source snapshots cannot erase an earlier missing interval");
+  assert.deepEqual(sources, [source(1)]);
+  currentSession = "0192d0f4-9f72-7a36-91f5-6a76ef736f46";
+  snapshots.push({ sources: [source(2)], recordingGaps: [gap] });
+  await synchronize(sessionId, 0);
+  assert.deepEqual(sources, [source(1)], "old-session reads must not update the new session");
 });
 
 test("invalid session, repeated page cursor, auth failure and abort stop source snapshot reads", async () => {

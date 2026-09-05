@@ -46,11 +46,11 @@ export function ParticipantMeetingMinutes({ sessionId, email, summary, transcrip
         onClick={() => setTab(value)} onKeyDown={selectKey}>{value === "source" ? t("원문") : t("AI 요약")}</button>)}
     </div>
     {recordingGaps.length > 0 && <aside className="viewer-recording-gaps" aria-label={t("기록되지 않은 구간")}>
-      <h3>{t("기록되지 않은 구간")}</h3><p>{t("아래 구간의 음성과 발언 원문은 수집되지 않았어요.")}</p>
+      <h3>{t("기록되지 않은 구간")}</h3><p>{t("아래 구간의 발언 원문은 기록되지 않았어요.")}</p>
       <ul>{recordingGaps.map((gap) => <li key={gap.id}>
         <time dateTime={gap.startedAt}>{new Date(gap.startedAt).toLocaleString(SYSTEM_LOCALES[systemLanguage], { month: "long", day: "numeric", hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false })}</time>
         {" – "}{gap.endedAt ? <time dateTime={gap.endedAt}>{new Date(gap.endedAt).toLocaleString(SYSTEM_LOCALES[systemLanguage], { month: "long", day: "numeric", hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false })}</time> : t("종료 시각 미확인")}
-        <span>{gap.reason === "no_viewers" ? t("참여자 대기") : gap.reason === "host_unavailable" ? t("호스트 연결 대기") : t("미디어 연결 중단")}</span>
+        <span>{gap.reason === "no_viewers" ? t("참여자 대기") : gap.reason === "host_unavailable" ? t("호스트 연결 대기") : gap.reason === "source_recording_failed" ? t("원문 기록 중단") : t("미디어 연결 중단")}</span>
       </li>)}</ul>
     </aside>}
     <div role="tabpanel" id={`${id}-${tab}-panel`} aria-labelledby={`${id}-${tab}`}>

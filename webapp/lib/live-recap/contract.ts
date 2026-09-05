@@ -9,7 +9,7 @@ const nullableText = z.string().nullable();
 
 export const recordingGapSchema = z.object({
   id: z.uuid(), startedAt: timestamp, endedAt: timestamp.nullable(),
-  reason: z.enum(["no_viewers", "host_unavailable", "media_failed"]),
+  reason: z.enum(["no_viewers", "host_unavailable", "media_failed", "source_recording_failed"]),
 }).strict().refine((gap) => gap.endedAt === null || Date.parse(gap.endedAt) >= Date.parse(gap.startedAt), "Invalid gap interval");
 export const recordingGapsSchema = z.object({
   recordingGaps: z.array(recordingGapSchema).max(EXPORT_LIMITS.recordingGaps),

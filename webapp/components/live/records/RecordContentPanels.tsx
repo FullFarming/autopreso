@@ -74,7 +74,7 @@ export function RecordOriginalPanel({ sessionId, loadOriginals = fetchLiveRecord
     {recordingGaps.length > 0 && <section className={styles.recordingGaps} aria-label={t("기록되지 않은 구간")}>
       <h3>{t("기록되지 않은 구간이 있어요")}</h3><p>{t("이 구간의 발언은 원문과 요약에 포함되지 않아요.")}</p>
       <ul>{recordingGaps.map((gap) => <li key={gap.id}>
-        <span>{t(gap.reason === "no_viewers" ? "참여자 없음" : gap.reason === "host_unavailable" ? "진행자 연결 없음" : "오디오 처리 중단")}</span>
+        <span>{t(gap.reason === "no_viewers" ? "참여자 없음" : gap.reason === "host_unavailable" ? "진행자 연결 없음" : gap.reason === "source_recording_failed" ? "원문 기록 중단" : "오디오 처리 중단")}</span>
         <span><time dateTime={gap.startedAt}>{formatSystemRecordDate(gap.startedAt, language)}</time> – {gap.endedAt
           ? <time dateTime={gap.endedAt}>{formatSystemRecordDate(gap.endedAt, language)}</time> : t("종료 시각 확인 중")}</span>
       </li>)}</ul>

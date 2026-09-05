@@ -77,6 +77,7 @@ const rows = [
   ["참여자 없음", "No participants", "参加者なし"],
   ["진행자 연결 없음", "Host disconnected", "ホストの接続なし"],
   ["오디오 처리 중단", "Audio processing interrupted", "音声処理の中断"],
+  ["원문 기록 중단", "Source recording interrupted", "原文の記録が中断されました。"],
   ["종료 시각 확인 중", "End time pending", "終了時刻を確認中"],
   ["저장된 원문이 없습니다.", "No original transcript has been saved.", "保存された原文はありません。"],
   ["교정본", "Corrected", "修正版"],

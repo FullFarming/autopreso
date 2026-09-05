@@ -28,6 +28,7 @@ import { LIVE_CALL_ENABLED } from "@/lib/live/feature-flag";
 import { formatEngineLabel } from "@/lib/live/engine-label";
 import { mergeLanguageCaptionCache } from "@/lib/live/caption-feed";
 import { createHostDemandControl } from "./host-demand-control";
+import { createHostSourceLedger, loadHostSourceSnapshot, markHostSourceUnavailable, mergeHostSourceLedger } from "./host-source-ledger";
 import {
   LiveAudioRecoveryError,
   startLiveAudioClient,
@@ -286,7 +287,8 @@ export default function LiveHostDashboard() {
   const [isInviteQrOpen, setIsInviteQrOpen] = useState(false);
   const inviteSharePendingRef = useRef(false);
   const [participants, setParticipants] = useState<LiveHostParticipantActivity[]>([]);
-  const [recentSpeeches, setRecentSpeeches] = useState<LiveSpeechActivity[]>([]);
+  const [hostSourceLedger, setHostSourceLedger] = useState(() => createHostSourceLedger(""));
+  const [hasSourceHistoryError, setHasSourceHistoryError] = useState(false);
   const [hostCaptionsByLanguage, setHostCaptionsByLanguage] = useState<Record<string, CaptionEvent[]>>({});
   const [selectedHostLaneId, setSelectedHostLaneId] = useState("source");
   const [isBusy, setIsBusy] = useState(false);
@@ -419,6 +421,8 @@ export default function LiveHostDashboard() {
 
   useEffect(() => {
     setHostCaptionsByLanguage({});
+    setHostSourceLedger((current) => current.sessionId === (sessionId ?? "") ? current : createHostSourceLedger(sessionId ?? ""));
+    setHasSourceHistoryError(false);
     setSelectedHostLaneId("source");
     setIsInviteQrOpen(false);
   }, [sessionId]);
@@ -908,6 +912,19 @@ export default function LiveHostDashboard() {
       onSpeakers: setSpeakers,
       onCaption: (caption) => setHostCaptionsByLanguage((current) =>
         mergeLanguageCaptionCache(current, caption.language, [caption])),
+      onSource: (source) => {
+        if (!isPageActiveRef.current || currentSessionIdRef.current !== activeSession.id) return;
+        setHostSourceLedger((current) => {
+          const scoped = current.sessionId === activeSession.id ? current : createHostSourceLedger(activeSession.id);
+          try { return mergeHostSourceLedger(scoped, activeSession.id, [source]); }
+          catch { return markHostSourceUnavailable(scoped, activeSession.id); }
+        });
+      },
+      onSourceStatus: () => {
+        if (!isPageActiveRef.current || currentSessionIdRef.current !== activeSession.id) return;
+        setHostSourceLedger((current) => markHostSourceUnavailable(
+          current.sessionId === activeSession.id ? current : createHostSourceLedger(activeSession.id), activeSession.id));
+      },
       onLanguageStatus: (language, status) => {
         setLanguageStatuses((current) => ({ ...current, [language]: status }));
       },
@@ -1268,7 +1285,7 @@ export default function LiveHostDashboard() {
       setInvite(null);
       setSpeakers([]);
       setParticipants([]);
-      setRecentSpeeches([]);
+      setHostSourceLedger(createHostSourceLedger(""));
     } catch (requestError) {
       setError(requestError instanceof Error ? requestError.message : "Unable to end the live session.");
     } finally {
@@ -1380,7 +1397,6 @@ export default function LiveHostDashboard() {
         if (isDisposed) return;
         setSession((current) => mergePolledHostSession(current, latest));
         setParticipants(activity.participants);
-        setRecentSpeeches(activity.recentSpeeches);
         setSessionSyncStatus("자동 동기화됨");
       } catch (requestError) {
         if (!isDisposed && (!(requestError instanceof DOMException) || requestError.name !== "AbortError")) {
@@ -1398,6 +1414,42 @@ export default function LiveHostDashboard() {
       window.clearInterval(timer);
       requestController?.abort();
     };
+  }, [sessionId, polledSessionStatus]);
+
+  useEffect(() => {
+    if (!sessionId) return;
+    let isDisposed = false;
+    let isPending = false;
+    let afterSourceSeq = 0;
+    let controller: AbortController | null = null;
+    const synchronizeOriginals = async () => {
+      if (isDisposed || isPending || document.visibilityState === "hidden") return;
+      isPending = true;
+      const requestController = new AbortController();
+      controller = requestController;
+      const timeout = window.setTimeout(() => requestController.abort(), 10_000);
+      try {
+        const snapshot = await loadHostSourceSnapshot(sessionId, afterSourceSeq, requestController.signal);
+        if (isDisposed || currentSessionIdRef.current !== sessionId) return;
+        setHostSourceLedger((current) => {
+          try {
+            const merged = mergeHostSourceLedger(current, sessionId, snapshot.sources);
+            return snapshot.hasRecordingGaps ? markHostSourceUnavailable(merged, sessionId) : merged;
+          } catch { return markHostSourceUnavailable(current, sessionId); }
+        });
+        afterSourceSeq = snapshot.sources.at(-1)?.sourceSeq ?? afterSourceSeq;
+        setHasSourceHistoryError(false);
+      } catch {
+        if (!isDisposed && currentSessionIdRef.current === sessionId) setHasSourceHistoryError(true);
+      } finally {
+        window.clearTimeout(timeout);
+        isPending = false;
+      }
+    };
+    void synchronizeOriginals();
+    const timer = polledSessionStatus === "stopped" || polledSessionStatus === "failed" ? null
+      : window.setInterval(() => { void synchronizeOriginals(); }, 10_000);
+    return () => { isDisposed = true; if (timer !== null) window.clearInterval(timer); controller?.abort(); };
   }, [sessionId, polledSessionStatus]);
 
   const getScheduledStartRuntime = useCallback((activeSessionId: string): ScheduledStartRuntime => {
@@ -1707,10 +1759,15 @@ export default function LiveHostDashboard() {
         ? "다른 기기에서 호스트로 접속해 이 기기의 송출이 중지되었습니다. 여기서 다시 호스트하려면 자막 다시 연결을 누르세요."
         : "";
   const hasUnavailableTranslation = Object.values(languageStatuses).includes("unavailable");
+  const hostSources = hostSourceLedger.sessionId === sessionId ? hostSourceLedger.sources : [];
+  const hasSourceFailure = hostSourceLedger.sessionId === sessionId && hostSourceLedger.isUnavailable;
+  const sourceStatusMessage = hasSourceFailure ? "원문 기록에 누락이 있습니다. 저장된 원문만 표시합니다."
+    : hasSourceHistoryError ? "원문 기록을 불러오지 못했어요. 기존 원문은 유지됩니다."
+      : hostSources.length === 0 ? "저장된 원문을 기다리고 있습니다." : "";
   const aiHealthRows: HostAiHealthRows = [
     {
-      id: "source", label: "원문 자막", state: isBroadcasting ? "healthy" : "degraded",
-      stateLabel: isBroadcasting ? "정상" : "연결 필요",
+      id: "source", label: "원문 자막", state: hasSourceFailure || hasSourceHistoryError ? "degraded" : hostSources.length > 0 && isBroadcasting ? "healthy" : "working",
+      stateLabel: hasSourceFailure ? "일부 원문 누락" : hasSourceHistoryError ? "동기화 지연" : hostSources.length > 0 && isBroadcasting ? "정상" : "자막 대기",
       actionLabel: !isBroadcasting ? "자막 다시 연결" : undefined,
       onAction: !isBroadcasting ? () => { void startBroadcast(true); } : undefined,
     },
@@ -1720,7 +1777,7 @@ export default function LiveHostDashboard() {
       actionLabel: hasUnavailableTranslation && isBroadcasting ? "번역 다시 시작" : undefined,
       onAction: hasUnavailableTranslation && isBroadcasting ? () => { void restartBroadcast(); } : undefined,
     },
-    { id: "topic", label: "주제 분류", state: recentSpeeches.length ? "working" : "unavailable", stateLabel: recentSpeeches.length ? "진행 중" : "자막 대기" },
+    { id: "topic", label: "주제 분류", state: hostSources.length ? "working" : "unavailable", stateLabel: hostSources.length ? "진행 중" : "자막 대기" },
     { id: "recap", label: "회의 요약", state: "working", stateLabel: "종료 후 생성" },
   ];
   const hostConnectionState: GatewayConnectionState = session?.status === "failed" ? "failed"
@@ -1754,6 +1811,7 @@ export default function LiveHostDashboard() {
     if (roles.some((role) => role.status === "connecting")) return { key: "엔진 연결 중", code: null, state: "connecting" as const };
     return { key: "엔진 준비됨", code: null, state: "ready" as const };
   })();
+
   // Task 4 (admin console): the rail offers /console only to admins. One GET on mount; the
   // response's `role` is the only signal, so a failed or non-admin answer simply shows no link.
   const [isConsoleAdmin, setIsConsoleAdmin] = useState(false);
@@ -2187,7 +2245,7 @@ export default function LiveHostDashboard() {
           selectedLaneId={selectedHostLaneId}
           onSelectLane={(lane: TranslationLanePresentation) => setSelectedHostLaneId(lane.id)}
           isBroadcasting={isBroadcasting} isBusy={isBusy} audioRecoveryMessage={audioRecoveryMessage}
-          isEndConfirmVisible={isEndConfirmVisible} recentSpeeches={recentSpeeches}
+          isEndConfirmVisible={isEndConfirmVisible} sources={hostSources} sourceStatusMessage={sourceStatusMessage}
           aiHealthRows={aiHealthRows} formatTime={formatTime}
           onStart={() => { void startBroadcast(true); }} onPause={() => { void pauseSession(); }}
           onResume={() => { void resumeSession(); }} onRequestEnd={() => setIsEndConfirmVisible(true)}

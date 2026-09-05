@@ -1,3 +1,4 @@
+import { hasValidTranslationCaptureProvenance, type CaptionTranslationCaptureInput } from "./translation-capture";
 /** Newest-first caption feed ordering: the live edge is the TOP of the feed
  *  and older captions push downward, so a phone held one-handed keeps the
  *  reader's eyes on a fixed position at the top of the screen. */
@@ -80,14 +81,19 @@ export function isPinnedToLatest(scrollTop: number, thresholdPx: number = PIN_TH
  * cross-language provenance; failed, echoed, and uncorrelated provider output
  * stays out of the user-facing record. */
 export function isDisplayableCaption(
-  caption: {
+  caption: CaptionTranslationCaptureInput & {
     language?: string | null;
     sourceLanguage?: string | null;
+    translationCapture?: unknown;
     origin?: string | null;
     translationStatus?: string | null;
   },
 ): boolean {
-  if (caption.translationStatus === "failed") return false;
+  if (!hasValidTranslationCaptureProvenance(caption) || caption.translationStatus === "failed") return false;
+  if (caption.translationCapture !== undefined) {
+    return caption.translationStatus === "translated" && caption.origin !== "source"
+      && (caption.language === "en" || caption.language === "ko");
+  }
   const hasCanonicalLanguages = (caption.language === "en" || caption.language === "ko")
     && (caption.sourceLanguage === "en" || caption.sourceLanguage === "ko");
   if (!hasCanonicalLanguages) return false;

@@ -67,6 +67,14 @@ test("actual participant reading controls render in three locales while speech a
   assert.equal(typeof feed.ViewerReadingFeed, "object");
   const Provider = provider.SystemLanguageProvider as React.ComponentType<{ initialLanguage: systemLanguage.SystemLanguage; children: React.ReactNode }>;
   const Feed = feed.ViewerReadingFeed as React.ComponentType<Record<string, unknown>>;
+  const minutes = loadModule("../../components/live/ParticipantMeetingMinutes.tsx", {
+    "@/components/system-language/SystemLanguageProvider": provider,
+    "@/lib/system-language/viewer-messages": { viewerMessages },
+    "@/lib/system-language": systemLanguage,
+    "./meeting-minutes-model": { formatMinuteTime: (instant: string) => instant },
+    "./ViewerRecapRequest": { ViewerRecapRequest: () => null },
+  });
+  const Minutes = minutes.ParticipantMeetingMinutes as React.ComponentType<Record<string, unknown>>;
   for (const locale of ["ko", "en", "ja"] as const) {
     const content = React.createElement(Feed, { language: "ko", kind: "source", captions: [{
       id: "source-1", text: "라이브 참여", language: "ko", speakerLabel: "참여자", isFinal: false,
@@ -76,5 +84,16 @@ test("actual participant reading controls render in three locales while speech a
     assert.ok(html.includes(viewerMessages[locale]["작성 중"]));
     assert.ok(html.includes(viewerMessages[locale]["참여자"]));
     assert.match(html, /lang="ko" class="viewer-caption-text">라이브 참여</u);
+    const records = React.createElement(Minutes, {
+      sessionId: "session-1", email: "test@example.com", summary: null, transcript: [], topics: [],
+      isTranscriptLoaded: true, summaryError: "", transcriptError: "", isLoading: false, isExpired: false, onRetry() {},
+      recordingGaps: [{ id: "gap-1", startedAt: "2026-09-01T00:00:00.000Z", endedAt: null, reason: "source_recording_failed" }],
+    });
+    const recordsHtml = renderToStaticMarkup(React.createElement(Provider, { initialLanguage: locale, children: records }));
+    assert.ok(recordsHtml.includes(viewerMessages[locale]["원문 기록 중단"]));
+    assert.ok(recordsHtml.includes(viewerMessages[locale]["종료 시각 미확인"]));
+    assert.ok(recordsHtml.includes(viewerMessages[locale]["아래 구간의 발언 원문은 기록되지 않았어요."]));
+    assert.ok(!recordsHtml.includes(viewerMessages[locale]["미디어 연결 중단"]), "source-only recording failure must not claim media failure");
+    assert.match(recordsHtml, /dateTime="2026-09-01T00:00:00.000Z"/iu);
   }
 });

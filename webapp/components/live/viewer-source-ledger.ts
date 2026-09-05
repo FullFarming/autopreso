@@ -2,6 +2,7 @@ import { sourceSnapshotSchema, type SourceEvent, type SourceDraftEvent, type Sou
 import { readApi } from "./viewer-controller-contract";
 import { formatMinuteTime } from "./meeting-minutes-model";
 import type { TopicCaptionPresentation } from "./translation/topic-presentation";
+import type { RecordingGap } from "../../lib/live-recap/contract";
 
 export const VIEWER_SOURCE_HISTORY_LIMIT = 12_000;
 
@@ -57,9 +58,10 @@ export async function loadViewerSourceSnapshot(
   afterSourceSeq: number,
   signal: AbortSignal,
   fetcher: typeof fetch = fetch,
-): Promise<SourceEvent[]> {
+): Promise<{ sources: SourceEvent[]; recordingGaps: RecordingGap[] }> {
   let cursor = afterSourceSeq;
   let sources: SourceEvent[] = [];
+  const gapsById = new Map<string, RecordingGap>();
   // 2026-08-31 fix: malformed pagination must not create an unbounded database request loop.
   for (let pageCount = 0; pageCount < 128; pageCount += 1) {
     signal.throwIfAborted();
@@ -71,7 +73,8 @@ export async function loadViewerSourceSnapshot(
       throw new Error("원문 기록의 회의 또는 순서가 일치하지 않습니다.");
     }
     sources = mergeViewerSourceLedger(sources, page.sources);
-    if (!page.hasNextPage) return sources;
+    for (const gap of page.recordingGaps ?? []) gapsById.set(gap.id, gap);
+    if (!page.hasNextPage) return { sources, recordingGaps: [...gapsById.values()] };
     if (page.nextAfterSourceSeq === null || page.nextAfterSourceSeq <= cursor) throw new Error("원문 페이지 순서를 확인할 수 없습니다.");
     cursor = page.nextAfterSourceSeq;
   }

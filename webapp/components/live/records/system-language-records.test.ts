@@ -119,6 +119,23 @@ test("actual list and summary renders translate controls while preserving meetin
   }
 });
 
+test("host original panel labels source-only gaps distinctly in all languages even with no transcript", () => {
+  const react = require("react") as typeof import("react");
+  const gap = { id: "gap-1", startedAt: "2026-09-01T00:00:00.000Z", endedAt: null, reason: "source_recording_failed" };
+  for (const language of ["ko", "en", "ja"] as const) {
+    let stateIndex = 0;
+    const { RecordOriginalPanel } = loadComponent("./RecordContentPanels.tsx", language, {
+      react: { ...react, useState: (initial: unknown) => react.useState(++stateIndex === 2 ? [gap] : initial) },
+      "../transcript-reading-model": { groupTranscriptReading: () => [] }, "./records-client": {},
+    });
+    const html = renderToStaticMarkup(createElement(RecordOriginalPanel, { sessionId: "record-1" }));
+    assert.ok(html.includes(recordsMessages[language]["원문 기록 중단"]));
+    assert.ok(html.includes(recordsMessages[language]["종료 시각 확인 중"]));
+    assert.ok(!html.includes(recordsMessages[language]["오디오 처리 중단"]));
+    assert.match(html, /dateTime="2026-09-01T00:00:00.000Z"/iu);
+  }
+});
+
 test("actual login labels and topbar status translate without changing endpoint or credentials", () => {
   for (const language of ["ko", "en", "ja"] as const) {
     const formControls = {
