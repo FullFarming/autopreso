@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { estimateAcousticRange } from "../src/acoustic-range.js";
-import { RollingSpeechSession } from "../src/rolling-speech-session.js";
+import { RollingSpeechSession, resolveRolloverMilliseconds } from "../src/rolling-speech-session.js";
 
 test("close keeps caller cancellation connected while an accepted provider write is stalled", async () => {
   let aborts = 0;
@@ -664,4 +664,44 @@ test("a remapped previous stream stops emitting partials before its close resolv
   assert.deepEqual(translations, []);
   streams[1].releaseClose();
   await session.close();
+});
+
+test("T4: rolloverOffsetMilliseconds pulls the first roll earlier; the replacement keeps the full provider period", async () => {
+  let now = 0;
+  const delays = [];
+  const session = new RollingSpeechSession({ now: () => now, onFinalUtterance() {}, onRemap() {},
+    rolloverOffsetMilliseconds: 120_000,
+    setTimer: (fn, ms) => { delays.push(ms); return setTimeout(fn, 1_000_000); }, clearTimer: clearTimeout,
+    provider: { async open() { return {
+      supportsRolloverRemap: false, maxConnectionMilliseconds: 17_400_000, async sendAudio() {}, async close() {},
+    }; } } });
+  await session.start();
+  assert.deepEqual(delays, [17_250_000]);
+  now = 17_250_000 - 1;
+  await session.sendAudio(new Uint8Array(1_280));
+  assert.equal(delays.length, 1);
+  now = 17_250_000;
+  await session.sendAudio(new Uint8Array(1_280));
+  assert.deepEqual(delays, [17_250_000, 17_370_000], "the stagger applies once; later generations roll on the provider period");
+  await session.close();
+});
+
+test("T4: a stagger can never push a roll below the sixty second floor", () => {
+  assert.equal(resolveRolloverMilliseconds({ maxConnectionMilliseconds: 100_000 }, 200_000), 60_000);
+  assert.equal(resolveRolloverMilliseconds({ maxConnectionMilliseconds: 17_400_000 }, 60_000), 17_310_000);
+  assert.equal(resolveRolloverMilliseconds({}, 60_000), 480_000);
+});
+
+test("T4: a provider STT_AUDIO_BACKPRESSURE rejection drops that frame without ending the session", async () => {
+  let writes = 0;
+  const session = new RollingSpeechSession({ now: () => 0, onFinalUtterance() {}, onRemap() {},
+    provider: { async open() { return { supportsRolloverRemap: false,
+      async sendAudio() { writes += 1; if (writes === 2) throw new Error("STT_AUDIO_BACKPRESSURE"); }, async close() {} }; } } });
+  await session.start();
+  await session.sendAudio(new Uint8Array(1_280));
+  await assert.rejects(session.sendAudio(new Uint8Array(1_280)), /STT_AUDIO_BACKPRESSURE/u);
+  await session.sendAudio(new Uint8Array(1_280));
+  assert.equal(writes, 3, "the stream stays writable: backpressure is a dropped frame, not a failure");
+  await session.close();
+  assert.doesNotThrow(() => session.gracefulDrain().catch(error => { throw error; }));
 });

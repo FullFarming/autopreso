@@ -16,11 +16,12 @@ const MINIMUM_ROLLOVER_MILLISECONDS = 60_000;
 /** Rollover clock for one open stream. Gemini streams advertise no limit and
  *  keep the 540 s `STT_CONFIG.rolloverMilliseconds`; Soniox advertises
  *  `maxConnectionMilliseconds` (290 min) and rolls shortly before it. */
-export function resolveRolloverMilliseconds(stream) {
+export function resolveRolloverMilliseconds(stream, offsetMilliseconds = 0) {
   if (stream?.managesOwnRollover === true) return Infinity;
   const limit = stream?.maxConnectionMilliseconds;
-  if (!Number.isFinite(limit) || limit <= 0) return STT_CONFIG.rolloverMilliseconds;
-  return Math.max(MINIMUM_ROLLOVER_MILLISECONDS, limit - ROLLOVER_LEAD_MILLISECONDS);
+  const offset = Number.isFinite(offsetMilliseconds) && offsetMilliseconds > 0 ? offsetMilliseconds : 0;
+  const base = !Number.isFinite(limit) || limit <= 0 ? STT_CONFIG.rolloverMilliseconds : limit - ROLLOVER_LEAD_MILLISECONDS;
+  return Math.max(MINIMUM_ROLLOVER_MILLISECONDS, base - offset);
 }
 
 export class RollingSpeechSession {
@@ -56,6 +57,7 @@ export class RollingSpeechSession {
     onConnectionState = (_state) => {},
     maxPendingUtterances = 64,
     setTimer = setTimeout, clearTimer = clearTimeout,
+    rolloverOffsetMilliseconds = 0,
   }) {
     this.setTimer = setTimer;
     this.clearTimer = clearTimer;
@@ -71,6 +73,10 @@ export class RollingSpeechSession {
       throw new Error("STT_UTTERANCE_BACKPRESSURE_LIMIT_INVALID");
     }
     this.maxPendingUtterances = maxPendingUtterances;
+    // T4 (2026-09-05): a fan-out owner staggers its lanes by pulling the FIRST
+    // roll of each lane earlier; replacements roll on the provider period, so
+    // the lanes stay that far apart for the life of the session.
+    this.rolloverOffsetMilliseconds = rolloverOffsetMilliseconds;
   }
 
   start({ signal } = {}) {
@@ -92,7 +98,7 @@ export class RollingSpeechSession {
       this.#pcmRing = pcmRing;
       this.#streamAudioOffsetMs = 0;
       this.#startedAt = this.now();
-      this.#rolloverMilliseconds = resolveRolloverMilliseconds(this.#stream);
+      this.#rolloverMilliseconds = resolveRolloverMilliseconds(this.#stream, this.rolloverOffsetMilliseconds);
       this.#armRollover();
     })().catch((error) => { this.#terminalError = error; throw error; });
     return this.#startPromise;
@@ -177,6 +183,10 @@ export class RollingSpeechSession {
       const maxFrames = STT_CONFIG.overlapMilliseconds / AUDIO_CONFIG.chunkMilliseconds;
       if (this.#overlapFrames.length > maxFrames) this.#overlapFrames.shift()?.fill(0);
     }).catch((error) => {
+      // T4 (2026-09-05): both provider adapters refuse a frame with
+      // STT_AUDIO_BACKPRESSURE "without failing the stream"; the frame is
+      // dropped and the caller sees the rejection, but the session lives on.
+      if (error?.message === "STT_AUDIO_BACKPRESSURE" && !this.#terminalError) throw error;
       this.#terminalError ??= error instanceof Error ? error : new Error("STT_STREAM_SEND_FAILED");
       this.#stream?.abort?.();
       throw this.#terminalError;
