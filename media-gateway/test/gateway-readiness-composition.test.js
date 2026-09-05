@@ -17,12 +17,18 @@ function token() {
   return `${claims}.${createHmac("sha256", "fixture-secret").update(claims).digest("hex")}`;
 }
 
-async function nextMessage(socket, types) {
-  while (socket.readyState === WebSocket.OPEN) {
-    const [data] = await once(socket, "message");
-    const message = JSON.parse(data.toString("utf8"));
-    if (types.includes(message.type)) return message;
-  }
+function nextMessage(socket, types) {
+  // A persistent listener: the gateway sends engine-status frames in the same
+  // tick as the ACK, and a re-armed once() would miss the frame that follows.
+  return new Promise((resolve) => {
+    const onMessage = (data) => {
+      const message = JSON.parse(data.toString("utf8"));
+      if (!types.includes(message.type)) return;
+      socket.off("message", onMessage);
+      resolve(message);
+    };
+    socket.on("message", onMessage);
+  });
 }
 
 for (const sessionType of ["meeting", "presentation"]) {

@@ -34,6 +34,17 @@ export interface GatewayClaims {
   exp: number;
 }
 
+/** Short-lived credential for the gateway's internal engine endpoint (auth
+ *  console spec §9). Session-bound and never accepted on a WebSocket lane. */
+export interface AdminGatewayClaims {
+  role: "ADMIN";
+  sub: string;
+  sessionId: string;
+  aud: "media-gateway";
+  iat: number;
+  exp: number;
+}
+
 export interface ViewerGatewayTicketClaims {
   role: "VIEWER";
   sub: string;
@@ -262,6 +273,29 @@ export async function createGatewayToken(
     aud: "media-gateway",
     iat: Math.floor(now / 1000),
     exp: Math.floor((now + GATEWAY_TOKEN_TTL_MS) / 1000),
+  };
+  return { token: await signClaims(LIVE_GATEWAY_TOKEN_SECRET, claims), claims };
+}
+
+export const ADMIN_GATEWAY_TOKEN_TTL_MS = 60_000;
+
+/** Mints the ADMIN token `pushEngineToGateway` sends. Signed with the same
+ *  gateway secret as HOST tokens; the gateway verifies role, audience, the
+ *  60 s lifetime, and that `sessionId` matches the path. */
+export async function createAdminGatewayToken({ hostId, sessionId, now = Date.now() }: {
+  hostId: string;
+  sessionId: string;
+  now?: number;
+}): Promise<{ token: string; claims: AdminGatewayClaims }> {
+  if (!hostId || !sessionId) throw new AuthorizationError("관리자 게이트웨이 토큰 입력이 올바르지 않습니다.");
+  const iat = Math.floor(now / 1000);
+  const claims: AdminGatewayClaims = {
+    role: "ADMIN",
+    sub: hostId,
+    sessionId,
+    aud: "media-gateway",
+    iat,
+    exp: iat + ADMIN_GATEWAY_TOKEN_TTL_MS / 1000,
   };
   return { token: await signClaims(LIVE_GATEWAY_TOKEN_SECRET, claims), claims };
 }

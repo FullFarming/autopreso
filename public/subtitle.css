@@ -1186,6 +1186,24 @@ button:disabled {
 
 .mp-live-call[hidden] { display: none; }
 
+/* Read-only engine pill: which admin-deployed engine is serving, and whether it is up. */
+.mp-engine {
+  border: 1px solid rgba(255, 255, 255, 0.28);
+  border-radius: 999px;
+  color: rgba(255, 255, 255, 0.8);
+  flex: none;
+  font-size: 11px;
+  line-height: 1;
+  max-width: 180px;
+  overflow: hidden;
+  padding: 5px 9px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.mp-engine[hidden] { display: none; }
+.mp-engine[data-state="ready"] { border-color: rgba(48, 209, 88, 0.55); color: #30d158; }
+.mp-engine[data-state="failed"] { border-color: rgba(255, 69, 58, 0.6); color: #ff453a; }
+
 /* The big central Go-Live: the play button of the console. */
 .subtitle-controller-body .controller-go-live {
   border-radius: 999px;

@@ -437,6 +437,27 @@ const liveCallGroup = document.getElementById("controller-live-call");
 const goLiveButton = document.getElementById("controller-go-live");
 const hostSpeakButton = document.getElementById("controller-host-speak");
 const endLiveCallButton = document.getElementById("controller-end-live-call");
+const enginePill = document.getElementById("controller-engine");
+// Read-only pill for the admin-deployed Live Call engine. Fed by the bounded
+// `bridge.engine` projection of live-call:get-state; text only, never markup.
+function renderEnginePill(engine) {
+  if (!enginePill) return;
+  const state = ["connecting", "ready", "failed"].includes(engine?.state) ? engine.state : "";
+  if (!state) {
+    enginePill.hidden = true;
+    enginePill.textContent = "";
+    delete enginePill.dataset.state;
+    return;
+  }
+  const key = state === "ready" ? "controller.engineReady" : state === "failed" ? "controller.engineFailed" : "controller.engineConnecting";
+  const roles = Array.isArray(engine.roles) ? engine.roles : [];
+  const detail = roles.map((row) => `${row.role}: ${row.model}`).join(" · ");
+  enginePill.dataset.state = state;
+  enginePill.dataset.i18n = key;
+  enginePill.textContent = state === "failed" && typeof engine.code === "string" ? `${t(key)} (${engine.code})` : t(key);
+  enginePill.title = detail;
+  enginePill.hidden = false;
+}
 if (window.realtimeNoelDesktop?.getLiveCallState && liveCallGroup && goLiveButton && endLiveCallButton && liveCallStatus) {
   let isEndingLiveCall = false;
   // Elapsed "now playing" timer: ticks only while live, renders next to End.
@@ -476,6 +497,7 @@ if (window.realtimeNoelDesktop?.getLiveCallState && liveCallGroup && goLiveButto
         // Host Speak only matters once the call is live and a guest may be
         // holding the speaking floor.
         if (hostSpeakButton) hostSpeakButton.hidden = !state.live;
+        renderEnginePill(state.bridge?.engine ?? null);
         endLiveCallButton.disabled = isEndingLiveCall;
         if (state.live && state.liveStartedAt) setLiveElapsed(state.liveStartedAt);
         if (!state.live) stopLiveElapsed();
@@ -484,6 +506,7 @@ if (window.realtimeNoelDesktop?.getLiveCallState && liveCallGroup && goLiveButto
         translationHealth.isLive = false;
         translationHealth.bridgeState = "idle";
         if (hostSpeakButton) hostSpeakButton.hidden = true;
+        renderEnginePill(null);
         stopLiveElapsed();
         setControllerStatus("controller.captionsReady");
       }

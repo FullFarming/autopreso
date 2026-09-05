@@ -260,6 +260,9 @@ export async function startMediaGateway(config = readGatewayEnvironment(), {
     mediaDemandStore: config.participantDemandEnabled ? new SupabaseMediaDemandStore(config) : null,
     fetchFloorParticipant: (sessionId, participantId) => floorController.getParticipant(sessionId, participantId),
     replayUtterances: (sessionId, language, afterSeq, limit, options) => publisher.fetchUtterancesAfter(sessionId, language, afterSeq, limit, options),
+    // Presence-only view of the provider keys for the admin engine endpoint;
+    // the factory below re-checks the same env before any pipeline exists.
+    engineKeyEnvironment: { GEMINI_API_KEY: config.geminiApiKey, SONIOX_API_KEY: config.sonioxApiKey },
     async pipelineFactory(message, previousPipeline, onHostEvent, options = {}) {
       // Per-language caption seq survives host reconnects and process
       // restarts. Durable-failure recovery is stricter: the failed final has

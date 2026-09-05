@@ -63,8 +63,9 @@ function signViewerToken(secret, grantId, { now = Date.now(), expiresInMilliseco
 }
 
 async function nextJson(webSocket) {
-  const [data] = await once(webSocket, "message");
-  return JSON.parse(data.toString("utf8"));
+  // `engine-status` rides alongside every start/update ACK; callers of this
+  // helper want the ACK itself. Tests that pin engine-status filter for it.
+  return nextJsonMatching(webSocket, (message) => message.type !== "engine-status");
 }
 
 function nextJsonMatching(webSocket, predicate) {
@@ -1983,4 +1984,285 @@ test("host handover with the SAME activation key reattaches warm; a different ke
   }));
   assert.equal((await reply).type, "started");
   assert.equal(pipelines.length, 2, "a mismatched key must build a fresh pipeline");
+});
+
+// ── Task 5: admin-triggered engine switch (POST /internal/sessions/:id/engine) + engine-status ──
+
+const ENGINE_FIXTURE_KEYS = { GEMINI_API_KEY: "fixture-key" };
+const FLASH_37_ENGINE = {
+  stt: { provider: "gemini", model: "gemini-3.5-transcribe-live", languageMode: "auto" },
+  translation: { provider: "gemini", model: "gemini-3.7-flash" },
+  summary: { provider: "gemini", model: "gemini-3.6-flash" },
+};
+
+function signAdminToken(secret, { now = Date.now(), expiresInSeconds = 60, sessionId = SESSION_ID, sub = "admin-1", role = "ADMIN" } = {}) {
+  const nowSeconds = Math.floor(now / 1_000);
+  const claims = { role, sub, sessionId, aud: "media-gateway", iat: nowSeconds, exp: nowSeconds + expiresInSeconds };
+  const encoded = Buffer.from(JSON.stringify(claims)).toString("base64url");
+  return `${encoded}.${createHmac("sha256", secret).update(encoded).digest("hex")}`;
+}
+
+async function postEngine(port, sessionId, token, body, { method = "POST", headers = {} } = {}) {
+  const response = await fetch(`http://127.0.0.1:${port}/internal/sessions/${sessionId}/engine`, {
+    method,
+    headers: {
+      "content-type": "application/json",
+      ...(token === null ? {} : { authorization: `Bearer ${token}` }),
+      ...headers,
+    },
+    body: method === "GET" ? undefined : (typeof body === "string" ? body : JSON.stringify(body)),
+  });
+  const text = await response.text();
+  return { status: response.status, cacheControl: response.headers.get("cache-control"), json: text ? JSON.parse(text) : null };
+}
+
+function createEngineSwitchGateway({ pipelines, startBehaviour = () => undefined, now, factoryFailure = null } = {}) {
+  let gateway;
+  gateway = createGatewayServer({
+    gatewaySecret: "gateway-secret",
+    viewerSecret: "viewer-secret",
+    ...(now ? { now } : {}),
+    engineKeyEnvironment: ENGINE_FIXTURE_KEYS,
+    viewerAuthorizer: {
+      async authorize() { return true; },
+      async authorizeBatch(requests) { return new Map(requests.map(({ key }) => [key, true])); },
+      async authorizeSpeaking() { return true; },
+    },
+    hostAuthorizer: { async authorize() { return true; } },
+    floorController: { async take() { return { ok: true, displayName: "Guest" }; }, async release() { return true; } },
+    async pipelineFactory(settings, previous, onHostEvent) {
+      if (factoryFailure && pipelines.length >= 1) throw factoryFailure();
+      const pipeline = {
+        settings,
+        previous,
+        onHostEvent,
+        lastSequences: { ko: 40 + pipelines.length, en: 41 + pipelines.length },
+        closed: 0,
+        floorSpeaker: undefined,
+        async start() {
+          await startBehaviour(pipeline, pipelines.length);
+          // Production LiveMediaPipeline.start() publishes `ready` per lane
+          // through the publisher fanout; the fake mirrors that contract.
+          for (const language of settings.languages) {
+            await gateway.broadcastEvent(settings.sessionId, language, { type: "language-status", sessionId: settings.sessionId, language, status: "ready" });
+          }
+        },
+        async tick() {},
+        async acceptAudio() {},
+        setFloorSpeaker(speaker) { this.floorSpeaker = speaker; },
+        async close() { this.closed += 1; },
+      };
+      pipelines.push(pipeline);
+      return pipeline;
+    },
+  });
+  return gateway;
+}
+
+async function subscribeViewer(url, language, seed) {
+  const viewer = new WebSocket(url);
+  await once(viewer, "open");
+  let received = nextJson(viewer);
+  viewer.send(JSON.stringify({ type: "authenticate", token: signViewerToken("viewer-secret", seed) }));
+  assert.equal((await received).type, "authenticated");
+  received = nextJson(viewer);
+  viewer.send(JSON.stringify({ type: "subscribe", sessionId: SESSION_ID, language }));
+  assert.equal((await received).type, "subscribed");
+  const events = [];
+  viewer.on("message", (data) => { events.push(JSON.parse(data.toString("utf8")).payload); });
+  return { viewer, events };
+}
+
+test("internal engine endpoint fails closed on token, method, size, body, and engine validation before touching any pipeline", async (context) => {
+  const pipelines = [];
+  const gateway = createEngineSwitchGateway({ pipelines });
+  await new Promise((resolve) => gateway.server.listen(0, "127.0.0.1", resolve));
+  context.after(async () => gateway.close());
+  const { port } = gateway.server.address();
+  const now = Date.now();
+
+  const unauthorized = [
+    ["missing bearer", null],
+    ["HOST-signed token", signHostToken("gateway-secret")],
+    ["HOST role claim signed as admin", signAdminToken("gateway-secret", { role: "HOST" })],
+    ["viewer-secret signature", signAdminToken("viewer-secret")],
+    ["expired", signAdminToken("gateway-secret", { now: now - 120_000 })],
+    ["over-long lifetime", signAdminToken("gateway-secret", { expiresInSeconds: 61 })],
+    ["cross-session", signAdminToken("gateway-secret", { sessionId: SESSION_TWO_ID })],
+  ];
+  for (const [label, token] of unauthorized) {
+    const response = await postEngine(port, SESSION_ID, token, { engine: FLASH_37_ENGINE });
+    assert.equal(response.status, 401, `${label} must be refused`);
+    assert.deepEqual(response.json, { result: "failed", code: "ADMIN_TOKEN_INVALID" }, label);
+    assert.equal(response.cacheControl, "no-store");
+  }
+  const notUuid = await postEngine(port, "not-a-session", signAdminToken("gateway-secret"), { engine: FLASH_37_ENGINE });
+  assert.equal(notUuid.status, 404);
+  for (const method of ["GET", "PUT", "PATCH", "DELETE"]) {
+    const response = await postEngine(port, SESSION_ID, signAdminToken("gateway-secret"), { engine: FLASH_37_ENGINE }, { method });
+    assert.equal(response.status, 405, `${method} must not switch engines`);
+  }
+  const oversized = await postEngine(port, SESSION_ID, signAdminToken("gateway-secret"), JSON.stringify({ engine: FLASH_37_ENGINE, pad: "x".repeat(17 * 1_024) }));
+  assert.equal(oversized.status, 413);
+  assert.deepEqual(oversized.json, { result: "failed", code: "PAYLOAD_TOO_LARGE" });
+  const malformed = await postEngine(port, SESSION_ID, signAdminToken("gateway-secret"), "{not json");
+  assert.equal(malformed.status, 400);
+  assert.deepEqual(malformed.json, { result: "failed", code: "INVALID_ENGINE_BODY" });
+  const forged = await postEngine(port, SESSION_ID, signAdminToken("gateway-secret"), { engine: { ...FLASH_37_ENGINE, stt: { provider: "gemini", model: "gemini-3.5-live-translate-preview" } } });
+  assert.equal(forged.status, 400);
+  assert.deepEqual(forged.json, { result: "failed", code: "ENGINE_SELECTION_INVALID" });
+  const soniox = { stt: { provider: "soniox", model: "stt-rt-v5", languageMode: "auto" }, translation: { provider: "soniox", model: "stt-rt-v5" }, summary: { provider: "gemini", model: "gemini-3.6-flash" } };
+  const keyless = await postEngine(port, SESSION_ID, signAdminToken("gateway-secret"), { engine: soniox });
+  assert.equal(keyless.status, 400);
+  assert.deepEqual(keyless.json, { result: "failed", code: "ENGINE_KEY_MISSING" });
+  assert.equal(pipelines.length, 0, "validation failures never reach the pipeline factory");
+
+  // A session this gateway does not hold: the DB value applies at next activation.
+  const cold = await postEngine(port, SESSION_ID, signAdminToken("gateway-secret"), { engine: FLASH_37_ENGINE });
+  assert.equal(cold.status, 200);
+  assert.deepEqual(cold.json, { result: "queued" });
+  assert.equal(pipelines.length, 0);
+});
+
+test("admin engine switch on a live session replaces the pipeline with seq continuity and notifies host and viewers", async (context) => {
+  const pipelines = [];
+  let clock = Date.now();
+  const gateway = createEngineSwitchGateway({ pipelines, now: () => clock });
+  await new Promise((resolve) => gateway.server.listen(0, "127.0.0.1", resolve));
+  context.after(async () => gateway.close());
+  const { port } = gateway.server.address();
+  const url = `ws://127.0.0.1:${port}/live`;
+
+  const host = await connectHost(url);
+  context.after(() => host.terminate());
+  const hostMessages = [];
+  host.on("message", (data) => { hostMessages.push(JSON.parse(data.toString("utf8"))); });
+  await startHostSocket(host, SESSION_ID, ["ko", "en"]);
+  const startStatuses = hostMessages.filter((message) => message.type === "engine-status");
+  assert.deepEqual(startStatuses.map(({ role, provider, model, status }) => ({ role, provider, model, status })), [
+    { role: "stt", provider: "gemini", model: "gemini-3.5-transcribe-live", status: "connecting" },
+    { role: "translation", provider: "gemini", model: "gemini-3.6-flash", status: "connecting" },
+    { role: "stt", provider: "gemini", model: "gemini-3.5-transcribe-live", status: "ready" },
+    { role: "translation", provider: "gemini", model: "gemini-3.6-flash", status: "ready" },
+  ], "normal start reports connecting then ready for both roles");
+  assert.ok(startStatuses.every((message) => message.sessionId === SESSION_ID && message.code === undefined));
+  assert.ok(hostMessages.findIndex((message) => message.type === "started") > hostMessages.findIndex((message) => message.status === "ready"),
+    "ready precedes the started ACK because start() has resolved by then");
+  hostMessages.length = 0;
+
+  const { viewer, events } = await subscribeViewer(url, "en", "engine-viewer");
+  context.after(() => viewer.terminate());
+
+  const switched = await postEngine(port, SESSION_ID, signAdminToken("gateway-secret", { now: clock }), { engine: FLASH_37_ENGINE });
+  assert.equal(switched.status, 200);
+  assert.deepEqual(switched.json, { result: "switched" });
+  assert.equal(pipelines.length, 2);
+  assert.equal(pipelines[0].closed, 1, "the old pipeline is closed after the new one is ready");
+  assert.equal(pipelines[1].closed, 0);
+  assert.equal(pipelines[1].previous, pipelines[0], "the factory receives the retiring pipeline so lastSequences reseed the counter (contract C1)");
+  assert.equal(pipelines[1].settings.captionConfig.engine.translation.model, "gemini-3.7-flash");
+  assert.deepEqual(pipelines[1].settings.languages, ["ko", "en"]);
+  assert.equal(pipelines[1].settings.sessionId, SESSION_ID);
+  assert.notEqual(pipelines[1].settings.captionConfigFingerprint, pipelines[0].settings.captionConfigFingerprint);
+
+  const switchStatuses = hostMessages.filter((message) => message.type === "engine-status");
+  assert.deepEqual(switchStatuses.map(({ role, model, status }) => ({ role, model, status })), [
+    { role: "stt", model: "gemini-3.5-transcribe-live", status: "connecting" },
+    { role: "translation", model: "gemini-3.7-flash", status: "connecting" },
+    { role: "stt", model: "gemini-3.5-transcribe-live", status: "ready" },
+    { role: "translation", model: "gemini-3.7-flash", status: "ready" },
+  ]);
+  await waitForGatewayCondition(() => events.filter((event) => event.type === "language-status").length >= 2);
+  assert.deepEqual(events.filter((event) => event.type === "language-status").map(({ language, status }) => ({ language, status })), [
+    { language: "en", status: "preparing" },
+    { language: "en", status: "ready" },
+  ], "viewers see preparing while the new engine opens, then ready from the new pipeline");
+  assert.match(gateway.metrics.render(), /realtime_noel_host_sessions 1/u);
+  assert.match(gateway.metrics.render(), /realtime_noel_engine_switches_total 1/u);
+  assert.equal(host.readyState, WebSocket.OPEN, "the host socket survives an admin switch");
+
+  const limited = await postEngine(port, SESSION_ID, signAdminToken("gateway-secret", { now: clock }), { engine: FLASH_37_ENGINE });
+  assert.equal(limited.status, 429);
+  assert.deepEqual(limited.json, { result: "failed", code: "ENGINE_SWITCH_RATE_LIMITED" });
+  clock += 2_000;
+  const unchanged = await postEngine(port, SESSION_ID, signAdminToken("gateway-secret", { now: clock }), { engine: FLASH_37_ENGINE });
+  assert.equal(unchanged.status, 200);
+  assert.deepEqual(unchanged.json, { result: "switched" });
+  assert.equal(pipelines.length, 2, "re-deploying the running engine is idempotent and builds no pipeline");
+
+  // Host audio after the switch reaches the NEW pipeline only.
+  let accepted = 0;
+  pipelines[1].acceptAudio = async () => { accepted += 1; };
+  pipelines[0].acceptAudio = async () => { throw new Error("old pipeline must not receive audio"); };
+  host.send(Buffer.alloc(1_280));
+  await waitForGatewayCondition(() => accepted === 1);
+});
+
+test("a failed admin engine switch keeps the old pipeline serving, reports engine-status failed, and re-announces viewers ready", async (context) => {
+  const pipelines = [];
+  const gateway = createEngineSwitchGateway({ pipelines, factoryFailure: () => new Error("STT_PROVIDER_UNAVAILABLE") });
+  await new Promise((resolve) => gateway.server.listen(0, "127.0.0.1", resolve));
+  context.after(async () => gateway.close());
+  const { port } = gateway.server.address();
+  const url = `ws://127.0.0.1:${port}/live`;
+  const host = await connectHost(url);
+  context.after(() => host.terminate());
+  await startHostSocket(host, SESSION_ID, ["ko", "en"]);
+  const hostMessages = [];
+  host.on("message", (data) => { hostMessages.push(JSON.parse(data.toString("utf8"))); });
+  const { viewer, events } = await subscribeViewer(url, "ko", "engine-viewer-fail");
+  context.after(() => viewer.terminate());
+
+  const failed = await postEngine(port, SESSION_ID, signAdminToken("gateway-secret"), { engine: FLASH_37_ENGINE });
+  assert.equal(failed.status, 409);
+  assert.deepEqual(failed.json, { result: "failed", code: "STT_PROVIDER_UNAVAILABLE" });
+  assert.equal(pipelines.length, 1);
+  assert.equal(pipelines[0].closed, 0, "the running pipeline is untouched when the replacement cannot open");
+  const statuses = hostMessages.filter((message) => message.type === "engine-status");
+  assert.deepEqual(statuses.map(({ role, status, code }) => ({ role, status, code })), [
+    { role: "stt", status: "connecting", code: undefined },
+    { role: "translation", status: "connecting", code: undefined },
+    { role: "stt", status: "failed", code: "STT_PROVIDER_UNAVAILABLE" },
+    { role: "translation", status: "failed", code: "STT_PROVIDER_UNAVAILABLE" },
+  ]);
+  await waitForGatewayCondition(() => events.filter((event) => event.type === "language-status").length >= 2);
+  assert.deepEqual(events.filter((event) => event.type === "language-status").map(({ status }) => status), ["preparing", "ready"]);
+  assert.equal(host.readyState, WebSocket.OPEN);
+  assert.match(gateway.metrics.render(), /realtime_noel_host_sessions 1/u);
+  assert.match(gateway.metrics.render(), /realtime_noel_engine_switch_failures_total 1/u);
+
+  // Host audio still flows to the surviving pipeline.
+  let accepted = 0;
+  pipelines[0].acceptAudio = async () => { accepted += 1; };
+  host.send(Buffer.alloc(1_280));
+  await waitForGatewayCondition(() => accepted === 1);
+});
+
+test("admin engine switch preserves the participant floor on the replacement pipeline", async (context) => {
+  const pipelines = [];
+  const gateway = createEngineSwitchGateway({ pipelines });
+  await new Promise((resolve) => gateway.server.listen(0, "127.0.0.1", resolve));
+  context.after(async () => gateway.close());
+  const { port } = gateway.server.address();
+  const url = `ws://127.0.0.1:${port}/live`;
+  const host = await connectHost(url);
+  context.after(() => host.terminate());
+  await startHostSocket(host, SESSION_ID, ["ko", "en"]);
+  const speaker = new WebSocket(url);
+  context.after(() => speaker.terminate());
+  await once(speaker, "open");
+  let received = nextJson(speaker);
+  speaker.send(JSON.stringify({ type: "authenticate", token: signViewerToken("viewer-secret", "floor-holder") }));
+  assert.equal((await received).type, "authenticated");
+  received = nextJson(speaker);
+  speaker.send(JSON.stringify({ type: "subscribe", sessionId: SESSION_ID, language: "en" }));
+  assert.equal((await received).type, "subscribed");
+  const speakStarted = nextJsonMatching(speaker, (message) => message.type === "speak-started");
+  speaker.send(JSON.stringify({ type: "speak-start", sessionId: SESSION_ID, displayName: "Guest" }));
+  await speakStarted;
+
+  const switched = await postEngine(port, SESSION_ID, signAdminToken("gateway-secret"), { engine: FLASH_37_ENGINE });
+  assert.deepEqual(switched.json, { result: "switched" });
+  assert.equal(pipelines[1].floorSpeaker?.displayName, "Guest", "the floor holder is re-attributed on the new pipeline");
+  assert.equal(speaker.readyState, WebSocket.OPEN, "an engine switch does not end the participant's turn");
 });

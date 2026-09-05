@@ -2013,3 +2013,58 @@ test("drain ignores another meeting ACK and fails within its bounded deadline", 
     assert.equal(socket.messages.some((message) => message.type === "stop"), false);
   } finally { FakeWebSocket.ignoredReplyTypes.clear(); await client?.stop(); harness.restore(); }
 });
+
+test("engine-status reaches the host callback only for this session with a validated shape, and stops after stop()", async () => {
+  FakeWebSocket.instances = []; FakeWebSocket.shouldOpen = true;
+  const restore = [replaceGlobal("window", globalThis), replaceGlobal("WebSocket", FakeWebSocket),
+    replaceGlobal("AudioContext", FakeAudioContext), replaceGlobal("AudioWorkletNode", FakeAudioWorkletNode),
+    replaceGlobal("fetch", async () => new Response(null, { status: 204 })),
+    replaceGlobal("navigator", { mediaDevices: { async getUserMedia() { return { getTracks: () => [{ stop() {} }] }; } } })];
+  const sessionId = "0192d0f4-9f72-7a36-91f5-6a76ef736f41";
+  const credentials = { token: "host-token", gatewayUrl: "wss://gateway.example.test/live", expiresAt: new Date(Date.now() + 900000).toISOString() };
+  const statuses: unknown[] = [];
+  const errors: string[] = [];
+  let client: LiveAudioClient | null = null;
+  try {
+    client = await startLiveAudioClient({ sessionId, version: 1, sessionType: "presentation", languages: ["ko", "en"],
+      inputSource: "mic", outputMode: "captions", voiceProvider: "gemini", maxViewers: 50, glossaryPack: "general_cre", credentials,
+      async refreshCredentials() { return credentials; }, onCaption() {}, onStatus() {}, onError(message) { errors.push(message); }, onSpeakers() {}, onLanguageStatus() {},
+      onEngineStatus: (status) => statuses.push(status) });
+    const socket = FakeWebSocket.instances[0]; assert.ok(socket);
+    const send = (event: object) => socket.dispatchEvent(new MessageEvent("message", { data: JSON.stringify(event) }));
+    const ready = { type: "engine-status", sessionId, role: "stt", provider: "gemini", model: "gemini-3.5-transcribe-live", status: "ready" };
+    send({ ...ready, sessionId: "0192d0f4-9f72-7a36-91f5-6a76ef736f42" });
+    send({ ...ready, role: "summary" });
+    send({ ...ready, status: "exploded" });
+    send({ ...ready, code: "not a code" });
+    send({ ...ready, model: "<script>alert(1)</script>" });
+    assert.deepEqual(statuses, []);
+    send({ ...ready, status: "connecting" });
+    send(ready);
+    send({ ...ready, role: "translation", model: "gemini-3.7-flash", status: "failed", code: "STT_PROVIDER_UNAVAILABLE" });
+    assert.deepEqual(statuses, [
+      { role: "stt", provider: "gemini", model: "gemini-3.5-transcribe-live", status: "connecting" },
+      { role: "stt", provider: "gemini", model: "gemini-3.5-transcribe-live", status: "ready" },
+      { role: "translation", provider: "gemini", model: "gemini-3.7-flash", status: "failed", code: "STT_PROVIDER_UNAVAILABLE" },
+    ]);
+    assert.deepEqual(errors, []);
+    await client.stop();
+    send(ready);
+    assert.equal(statuses.length, 3);
+  } finally { await client?.stop(); for (const reset of restore.reverse()) reset(); }
+});
+
+test("host dashboard hands the session's modelPreferences to every gateway start/update and renders read-only engine-status", async () => {
+  const { readFile } = await import("node:fs/promises");
+  const source = await readFile(new URL("./LiveHostDashboard.tsx", import.meta.url), "utf8");
+  // Task 4 review C2: without these the gateway authorizer rejects any non-default admin engine.
+  const startCall = source.slice(source.indexOf("const client = await startLiveAudioClient({"), source.indexOf("if (!isPageActiveRef.current || currentSessionIdRef.current !== activeSession.id) {\n      await client.disconnect();"));
+  assert.match(startCall, /modelPreferences: activeSession\.modelPreferences,/u);
+  assert.match(startCall, /modelPreferences: fresh\.modelPreferences \};/u, "refreshSettings must reload the stored engine so a reconnect never re-sends a stale one");
+  assert.equal(source.match(/audioClientRef\.current\.update\(\{[\s\S]*?modelPreferences: (?:next|restoredSession)\.modelPreferences,[\s\S]*?\}\)/gu)?.length, 2, "both update() calls (apply and rollback) carry the PATCHed engine");
+  // Read-only runtime: the dashboard subscribes to engine-status and only renders it.
+  assert.match(startCall, /onEngineStatus: \(status\) => \{/u);
+  assert.match(source, /data-engine-runtime=\{engineRuntime\.state\}/u);
+  assert.doesNotMatch(source, /pushEngineToGateway|\/internal\/sessions/u, "hosts never trigger an engine switch themselves");
+  for (const key of ["엔진 연결 중", "엔진 준비됨", "엔진 오류"]) assert.ok(source.includes(`"${key}"`), key);
+});

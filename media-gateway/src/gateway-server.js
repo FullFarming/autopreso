@@ -12,10 +12,17 @@ import {
   readGatewaySecurityPolicy,
 } from "./gateway-security.js";
 import { GatewayMetrics } from "./metrics.js";
-import { verifyLiveToken } from "./token-verifier.js";
+import { verifyAdminGatewayToken, verifyLiveToken } from "./token-verifier.js";
 import { ViewerTicketReplayGuard } from "./viewer-ticket-replay-guard.js";
 import { ViewerAuthorizationBatcher } from "./viewer-authorization-batcher.js";
 import { MediaDemandCoordinator } from "./media-demand-coordinator.js";
+import { assertEngineForLanguages, assertEngineKeys } from "./engines/create-engines.js";
+import {
+  createGeminiCaptionConfig,
+  DEFAULT_ENGINE_SELECTION,
+  engineSelectionKey,
+  geminiCaptionConfigFingerprint,
+} from "../../packages/caption-core/index.js";
 
 const AUTH_TIMEOUT_MILLISECONDS = 5_000;
 const AUTHORIZATION_CADENCE_MILLISECONDS = 2_500;
@@ -328,6 +335,10 @@ export function createGatewayServer({
   maxBufferedHostCaptions = DEFAULT_MAX_BUFFERED_HOST_CAPTIONS,
   mediaDemandStore = null,
   mediaDemandPollMilliseconds = 5_000,
+  /** Key PRESENCE only, consulted before an admin engine switch builds anything.
+   *  Production passes the validated gateway config; tests pass fixtures. */
+  engineKeyEnvironment = process.env,
+  engineSwitchCooldownMilliseconds = 2_000,
 }) {
   if (!Number.isFinite(heartbeatIntervalMilliseconds) || heartbeatIntervalMilliseconds <= 0) throw new Error("INVALID_HEARTBEAT_INTERVAL");
   if (typeof viewerTicketReplayGuard?.consume !== "function") throw new Error("INVALID_VIEWER_TICKET_REPLAY_GUARD");
@@ -377,6 +388,9 @@ export function createGatewayServer({
     ?? Math.min(DEFAULT_FLOOR_RESUME_COOLDOWN_MILLISECONDS, floorTakeCooldownMilliseconds);
   if (!Number.isFinite(hostReconnectGraceMilliseconds) || hostReconnectGraceMilliseconds < 0) {
     throw new Error("INVALID_HOST_RECONNECT_GRACE");
+  }
+  if (!Number.isFinite(engineSwitchCooldownMilliseconds) || engineSwitchCooldownMilliseconds < 0) {
+    throw new Error("INVALID_ENGINE_SWITCH_COOLDOWN");
   }
   const hostSessions = new Map();
   const failedHostSessions = new Map();
@@ -484,6 +498,21 @@ export function createGatewayServer({
     finalSeqByLanguage: new Map(),
     nextBufferedOrder: 0,
   });
+  /** `engine-status` (spec §4/§9): one event per engine role, straight to the
+   *  host socket. Read-only on every host UI; never carries key material. */
+  const sendEngineStatus = (webSocket, sessionId, engine, status, code) => {
+    for (const role of ["stt", "translation"]) {
+      sendJson(webSocket, {
+        type: "engine-status",
+        sessionId,
+        role,
+        provider: engine[role].provider,
+        model: engine[role].model,
+        status,
+        ...(code ? { code } : {}),
+      });
+    }
+  };
   const hostCaptionIdentity = (event) => {
     const sessionId = typeof event.sessionId === "string" ? event.sessionId : "";
     const language = typeof event.language === "string" ? event.language : "";
@@ -1045,7 +1074,235 @@ export function createGatewayServer({
     metrics.set("host_sessions", hostSessions.size);
     return true;
   }, { bypassQueueLimit: true });
+  // ── Admin-triggered engine switch (auth console spec §9) ──────────────────
+  // POST /internal/sessions/:sessionId/engine with a short-lived ADMIN token.
+  // A live session gets the same replacement the host `update` performs (open
+  // the new pipeline → ready → close the old one; seq reseeds from the retiring
+  // pipeline, contract C1). A session this gateway does not hold is "queued":
+  // the DB value applies at the next activation.
+  const ENGINE_ROUTE_PATTERN = /^\/internal\/sessions\/([^/?#]+)\/engine$/u;
+  const MAX_ENGINE_BODY_BYTES = 16 * 1_024;
+  const engineSwitchAttempts = new Map();
+  const jsonResponse = (response, statusCode, body, headers = {}) => {
+    response.writeHead(statusCode, { "Content-Type": "application/json", "Cache-Control": "no-store", ...headers });
+    response.end(JSON.stringify(body));
+  };
+  const readBoundedBody = (request) => new Promise((resolve, reject) => {
+    const declared = Number(request.headers["content-length"]);
+    if (Number.isFinite(declared) && declared > MAX_ENGINE_BODY_BYTES) {
+      request.resume();
+      reject(new Error("PAYLOAD_TOO_LARGE"));
+      return;
+    }
+    const chunks = [];
+    let total = 0;
+    let isOverflowing = false;
+    request.on("data", (chunk) => {
+      if (isOverflowing) return;
+      total += chunk.length;
+      if (total > MAX_ENGINE_BODY_BYTES) {
+        isOverflowing = true;
+        chunks.length = 0;
+        reject(new Error("PAYLOAD_TOO_LARGE"));
+        return;
+      }
+      chunks.push(chunk);
+    });
+    request.on("end", () => { if (!isOverflowing) resolve(Buffer.concat(chunks).toString("utf8")); });
+    request.on("error", () => reject(new Error("INVALID_ENGINE_BODY")));
+  });
+  const switchSessionEngine = (sessionId, engine) => withHostSessionLock(sessionId, async () => {
+    if (isShuttingDown) return { statusCode: 503, body: { result: "failed", code: "GATEWAY_SHUTTING_DOWN" } };
+    const attemptAt = now();
+    const lastAttemptAt = engineSwitchAttempts.get(sessionId);
+    if (lastAttemptAt !== undefined && attemptAt - lastAttemptAt < engineSwitchCooldownMilliseconds) {
+      metrics.increment("engine_switch_rate_limited_total");
+      return { statusCode: 429, body: { result: "failed", code: "ENGINE_SWITCH_RATE_LIMITED" } };
+    }
+    engineSwitchAttempts.set(sessionId, attemptAt);
+    const state = hostSessions.get(sessionId);
+    if (!state || state.isDetaching) return { statusCode: 200, body: { result: "queued" } };
+    if (state.isDraining) return { statusCode: 409, body: { result: "failed", code: "MEDIA_DRAINING" } };
+    try {
+      assertEngineForLanguages(engine, state.settings.languages);
+    } catch (error) {
+      return { statusCode: 400, body: { result: "failed", code: error?.code === "ENGINE_SELECTION_INVALID" ? "ENGINE_SELECTION_INVALID" : engineFailureCode(error) } };
+    }
+    // The canonical caption config round-trips through the builder; only the
+    // engine changes, so glossary/domain/tone/languages stay exactly as pinned.
+    const { models: _previousModels, ...previousCaptionInput } = state.settings.captionConfig ?? {
+      languages: state.settings.languages,
+      outputMode: state.settings.outputMode,
+      glossaryText: state.settings.glossaryText,
+      glossaryPack: state.settings.glossaryPack,
+      domainText: state.settings.domainText,
+      translationTone: state.settings.translationTone,
+    };
+    let nextCaptionConfig;
+    try {
+      nextCaptionConfig = createGeminiCaptionConfig({ ...previousCaptionInput, engine });
+    } catch {
+      return { statusCode: 400, body: { result: "failed", code: "ENGINE_SELECTION_INVALID" } };
+    }
+    const currentEngine = state.settings.captionConfig?.engine ?? DEFAULT_ENGINE_SELECTION;
+    if (engineSelectionKey(currentEngine) === engineSelectionKey(nextCaptionConfig.engine)) {
+      // Re-deploying the running engine is idempotent: no pipeline, no viewer churn.
+      return { statusCode: 200, body: { result: "switched" } };
+    }
+    const captionConfigFingerprint = geminiCaptionConfigFingerprint(nextCaptionConfig);
+    const hostMessage = {
+      ...state.settings,
+      captionConfig: nextCaptionConfig,
+      captionConfigFingerprint,
+      languages: [...state.settings.languages],
+    };
+    const previousPipeline = state.pipeline;
+    const pipelineGeneration = randomUUID();
+    const mediaFence = state.demandEpoch === null ? null : { epoch: state.demandEpoch, ownerId: demand.ownerId };
+    const announceLanguages = (status) => Promise.all(hostMessage.languages.map((language) => {
+      const event = { type: "language-status", sessionId, language, status };
+      sendHostEvent(state.hostOutput, event);
+      return deliverEvent(sessionId, language, event);
+    }));
+    sendEngineStatus(state.webSocket, sessionId, nextCaptionConfig.engine, "connecting");
+    await announceLanguages("preparing");
+    const operationAbortController = new AbortController();
+    const abortForShutdown = () => operationAbortController.abort(
+      shutdownAbortController.signal.reason ?? new Error("GATEWAY_SHUTTING_DOWN"),
+    );
+    shutdownAbortController.signal.addEventListener("abort", abortForShutdown, { once: true });
+    const startTimer = setTimeoutFn(
+      () => operationAbortController.abort(new Error("HOST_START_TIMEOUT")),
+      hostStartTimeoutMilliseconds,
+    );
+    let candidate = null;
+    try {
+      const factoryPromise = Promise.resolve().then(() => pipelineFactory(
+        hostMessage,
+        previousPipeline,
+        (event) => {
+          if (event?.translationCapture != null
+            && !createMediaEventGuard(sessionId, { pipelineGeneration, mediaFence })()) return;
+          sendHostEvent(state.hostOutput, event);
+        },
+        {
+          signal: operationAbortController.signal,
+          pipelineGeneration,
+          requireDurableSeed: state.demandEpoch !== null,
+          mediaFence,
+          onFatalError: () => failOwnedPipeline(sessionId, candidate),
+        },
+      ));
+      void factoryPromise.then((lateCandidate) => {
+        pipelineSessionIds.set(lateCandidate, sessionId);
+        if (operationAbortController.signal.aborted) return closePipelineOnce(lateCandidate).catch(() => undefined);
+        return undefined;
+      }, () => undefined);
+      candidate = await waitForAbort(factoryPromise, operationAbortController.signal);
+      await waitForAbort(
+        Promise.resolve().then(() => candidate.start({ signal: operationAbortController.signal })),
+        operationAbortController.signal,
+      );
+      if (isShuttingDown) throw new Error("GATEWAY_SHUTTING_DOWN");
+      if (hostSessions.get(sessionId) !== state || state.isDetaching || state.isDraining) throw new Error("SESSION_NOT_STARTED");
+    } catch (error) {
+      // The replacement never took ownership: the old pipeline keeps serving,
+      // so viewers are told the lanes are ready again.
+      const code = engineFailureCode(error);
+      try { await closePipelineOnce(candidate); } catch { metrics.increment("pipeline_close_failures_total"); }
+      metrics.increment("engine_switch_failures_total");
+      sendEngineStatus(state.webSocket, sessionId, nextCaptionConfig.engine, "failed", code);
+      if (hostSessions.get(sessionId) === state && !state.isDetaching) await announceLanguages("ready");
+      return { statusCode: 409, body: { result: "failed", code } };
+    } finally {
+      clearTimeoutFn(startTimer);
+      shutdownAbortController.signal.removeEventListener("abort", abortForShutdown);
+    }
+    state.pipeline = candidate;
+    state.pipelineGeneration = pipelineGeneration;
+    state.settings = { ...state.settings, captionConfig: nextCaptionConfig, captionConfigFingerprint };
+    pipelineSessionIds.set(candidate, sessionId);
+    try {
+      await closePipelineOnce(previousPipeline);
+    } catch {
+      // Same contract as the host `update`: two paid provider pipelines must
+      // never overlap, so a retiring pipeline that will not close ends the session.
+      state.isDetaching = true;
+      stopHostLease(state);
+      try { candidate.abortMedia?.(); } catch { /* close remains required */ }
+      await closePipelineOnce(candidate).catch(() => undefined);
+      if (hostSessions.get(sessionId) === state) hostSessions.delete(sessionId);
+      metrics.set("host_sessions", hostSessions.size);
+      metrics.increment("engine_switch_failures_total");
+      sendEngineStatus(state.webSocket, sessionId, nextCaptionConfig.engine, "failed", "PIPELINE_CLEANUP_FAILED");
+      closePipelineSocket(state.webSocket, new Error("PIPELINE_CLEANUP_FAILED"));
+      return { statusCode: 409, body: { result: "failed", code: "PIPELINE_CLEANUP_FAILED" } };
+    }
+    const holder = floorHolders.get(sessionId);
+    if (holder) {
+      try {
+        candidate.setFloorSpeaker?.({
+          participantId: holder.participantId,
+          displayName: holder.displayName,
+          department: holder.department,
+          jobTitle: holder.jobTitle,
+        });
+      } catch {
+        // An engine switch must not revoke the floor.
+      }
+    }
+    metrics.increment("engine_switches_total");
+    sendEngineStatus(state.webSocket, sessionId, nextCaptionConfig.engine, "ready");
+    return { statusCode: 200, body: { result: "switched" } };
+  }, { bypassQueueLimit: true });
+  const handleEngineRequest = async (request, response, sessionId) => {
+    const refuse = (statusCode, code, headers) => {
+      request.resume();
+      jsonResponse(response, statusCode, { result: "failed", code }, headers);
+    };
+    if (!UUID_PATTERN.test(sessionId)) return refuse(404, "SESSION_NOT_FOUND");
+    if (request.method !== "POST") return refuse(405, "METHOD_NOT_ALLOWED", { Allow: "POST" });
+    const authorization = request.headers.authorization;
+    const bearer = typeof authorization === "string" ? /^Bearer\s+(\S+)$/u.exec(authorization) : null;
+    try {
+      verifyAdminGatewayToken(bearer?.[1], { gatewaySecret, now, sessionId });
+    } catch {
+      metrics.increment("engine_switch_unauthorized_total");
+      return refuse(401, "ADMIN_TOKEN_INVALID");
+    }
+    let text;
+    try {
+      text = await readBoundedBody(request);
+    } catch (error) {
+      return error?.message === "PAYLOAD_TOO_LARGE" ? refuse(413, "PAYLOAD_TOO_LARGE") : refuse(400, "INVALID_ENGINE_BODY");
+    }
+    let body;
+    try {
+      body = JSON.parse(text);
+    } catch {
+      return refuse(400, "INVALID_ENGINE_BODY");
+    }
+    if (!body || typeof body !== "object" || Array.isArray(body) || Object.keys(body).some((key) => key !== "engine")) {
+      return refuse(400, "INVALID_ENGINE_BODY");
+    }
+    let engine;
+    try {
+      engine = assertEngineKeys(body.engine, engineKeyEnvironment);
+    } catch (error) {
+      return refuse(400, error?.code === "ENGINE_KEY_MISSING" ? "ENGINE_KEY_MISSING" : "ENGINE_SELECTION_INVALID");
+    }
+    const outcome = await switchSessionEngine(sessionId, engine);
+    return jsonResponse(response, outcome.statusCode, outcome.body);
+  };
   const server = createServer((request, response) => {
+    const engineRoute = ENGINE_ROUTE_PATTERN.exec(request.url ?? "");
+    if (engineRoute) {
+      handleEngineRequest(request, response, engineRoute[1]).catch(() => {
+        if (!response.headersSent) jsonResponse(response, 500, { result: "failed", code: "ENGINE_SWITCH_FAILED" });
+        else response.end();
+      });
+      return;
+    }
     if (request.method === "GET" && (request.url === "/health" || request.url === "/healthz")) {
       response.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
       response.end(JSON.stringify({ ok: true }));
@@ -1548,6 +1805,7 @@ export function createGatewayServer({
                   throw new Error("SESSION_REVOKED");
                 }
                 factoryAttempted = true;
+                sendEngineStatus(webSocket, claims.sessionId, hostMessage.captionConfig.engine, "connecting");
                 const factoryPromise = Promise.resolve().then(() => pipelineFactory(
                   hostMessage,
                   previous?.pipeline ?? null,
@@ -1588,6 +1846,7 @@ export function createGatewayServer({
                   Promise.resolve().then(() => candidate.start({ signal: operationAbortController.signal })),
                   operationAbortController.signal,
                 );
+                sendEngineStatus(webSocket, claims.sessionId, hostMessage.captionConfig.engine, "ready");
                 let authoritativeVersion = hostMessage.version;
                 if (usesReadinessActivation && readinessMode === "activate") {
                   const readinessSettings = {
@@ -1631,6 +1890,9 @@ export function createGatewayServer({
                 assertHostSocketActive(operationAbortController.signal);
                 hostMessage.authoritativeVersion = authoritativeVersion;
               } catch (error) {
+                if (factoryAttempted) {
+                  sendEngineStatus(webSocket, claims.sessionId, hostMessage.captionConfig.engine, "failed", engineFailureCode(error));
+                }
                 let cleanupComplete = false;
                 try {
                   await closePipelineOnce(candidate);
@@ -2268,6 +2530,12 @@ export function createGatewayServer({
       if (viewer.readyState === WebSocket.OPEN) deliver(viewer);
     }));
   }
+}
+
+/** Machine token for engine-status/HTTP bodies: never provider prose. */
+function engineFailureCode(error) {
+  const code = typeof error?.code === "string" ? error.code : error?.message;
+  return typeof code === "string" && /^[A-Z0-9_]{1,80}$/u.test(code) ? code : "ENGINE_SWITCH_FAILED";
 }
 
 function parseJson(data) {

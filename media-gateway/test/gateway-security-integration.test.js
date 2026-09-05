@@ -267,9 +267,15 @@ test("desktop-main keeps its trusted no-Origin HOST-token path", async (context)
   });
   context.after(() => socket.terminate());
   assert.equal(authenticated.role, "HOST");
-  const reply = once(socket, "message");
+  const seen = [];
+  const reply = new Promise((resolve) => socket.on("message", (data) => {
+    const message = JSON.parse(data.toString());
+    seen.push(message.type);
+    if (message.type !== "engine-status") resolve(message);
+  }));
   socket.send(JSON.stringify(START_MESSAGE));
-  assert.equal(JSON.parse((await reply)[0].toString()).type, "started");
+  assert.equal((await reply).type, "started");
+  assert.deepEqual(seen.filter((type) => type === "engine-status").length, 4, "the trusted desktop lane receives engine-status like a browser host");
 });
 
 test("WebSocket upgrade rejects a non-allowlisted Origin before authentication", async (context) => {

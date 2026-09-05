@@ -46,3 +46,48 @@ export function verifyLiveToken(token, { gatewaySecret, viewerSecret, now = Date
     || claims.exp - claims.iat > VIEWER_TICKET_MAX_SECONDS) throw new Error("UNAUTHORIZED");
   return { ...claims, userId: claims.sub };
 }
+
+const ADMIN_CLAIM_KEYS = ["aud", "exp", "iat", "role", "sessionId", "sub"];
+const ADMIN_TOKEN_MAX_SECONDS = 60;
+
+/**
+ * Verifies the short-lived ADMIN token the webapp mints for the internal engine
+ * endpoint. Deliberately separate from `verifyLiveToken`: an ADMIN token must
+ * never authenticate a WebSocket lane, and a HOST or VIEWER token must never
+ * switch engines. Signed with the gateway (HOST) secret; bound to one session;
+ * lifetime capped at 60 s. Throws `ADMIN_TOKEN_INVALID` on any mismatch.
+ */
+export function verifyAdminGatewayToken(token, { gatewaySecret, now = Date.now, sessionId }) {
+  const fail = () => new Error("ADMIN_TOKEN_INVALID");
+  if (typeof token !== "string" || !gatewaySecret) throw fail();
+  const separator = token.lastIndexOf(".");
+  if (separator <= 0) throw fail();
+  const encoded = token.slice(0, separator);
+  const signature = token.slice(separator + 1);
+  const expected = createHmac("sha256", gatewaySecret).update(encoded).digest("hex");
+  const actualBytes = Buffer.from(signature, "utf8");
+  const expectedBytes = Buffer.from(expected, "utf8");
+  if (actualBytes.length !== expectedBytes.length || !timingSafeEqual(actualBytes, expectedBytes)) throw fail();
+  let claims;
+  try {
+    claims = JSON.parse(Buffer.from(encoded, "base64url").toString("utf8"));
+  } catch {
+    throw fail();
+  }
+  if (!claims || typeof claims !== "object" || Array.isArray(claims)) throw fail();
+  const keys = Object.keys(claims).sort();
+  const nowSeconds = Math.floor(now() / 1_000);
+  if (keys.length !== ADMIN_CLAIM_KEYS.length
+    || keys.some((key, index) => key !== ADMIN_CLAIM_KEYS[index])
+    || claims.role !== "ADMIN"
+    || claims.aud !== "media-gateway"
+    || typeof claims.sub !== "string" || claims.sub.length === 0 || claims.sub.length > 128
+    || typeof claims.sessionId !== "string" || claims.sessionId !== sessionId
+    || !Number.isSafeInteger(claims.iat)
+    || !Number.isSafeInteger(claims.exp)
+    || claims.exp <= nowSeconds
+    || claims.iat > nowSeconds + 30
+    || claims.exp <= claims.iat
+    || claims.exp - claims.iat > ADMIN_TOKEN_MAX_SECONDS) throw fail();
+  return claims;
+}

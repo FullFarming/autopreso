@@ -31,6 +31,7 @@ import { createHostDemandControl } from "./host-demand-control";
 import {
   LiveAudioRecoveryError,
   startLiveAudioClient,
+  type EngineStatusEvent,
   type LiveAudioClient,
   type LiveAudioRecoveryStatus,
   type LiveInputSource,
@@ -293,6 +294,8 @@ export default function LiveHostDashboard() {
   const [gatewayStatus, setGatewayStatus] = useState("준비됨");
   const [sessionSyncStatus, setSessionSyncStatus] = useState("동기화 대기 중");
   const [languageStatuses, setLanguageStatuses] = useState<Record<string, LanguageStatus>>({});
+  // Read-only engine runtime (`engine-status` from the gateway); the admin console owns the engine.
+  const [engineStatuses, setEngineStatuses] = useState<Partial<Record<EngineStatusEvent["role"], EngineStatusEvent>>>({});
   const [error, setError] = useState("");
   const [recoverableSessions, setRecoverableSessions] = useState<RecoverableSession[]>([]);
   const [isRecoveryDismissed, setIsRecoveryDismissed] = useState(false);
@@ -513,6 +516,7 @@ export default function LiveHostDashboard() {
     if (client) await client.disconnect();
     setIsBroadcasting(false);
     setAudioRecoveryStatus(null);
+    setEngineStatuses({});
     setGatewayStatus("준비됨");
   }, []);
 
@@ -582,6 +586,7 @@ export default function LiveHostDashboard() {
             maxViewers,
             glossaryPack,
             domainText: buildLiveSessionDomainText(next),
+            modelPreferences: next.modelPreferences,
           });
         } catch (gatewayError) {
           let restoredSession: LiveSession | null = null;
@@ -616,6 +621,7 @@ export default function LiveHostDashboard() {
               maxViewers: previousSession.maxViewers,
               glossaryPack: previousSession.glossaryPack,
               domainText: buildLiveSessionDomainText(previousSession),
+              modelPreferences: restoredSession.modelPreferences,
             });
             setSession(restoredSession);
             restoreSessionIdentity(restoredSession);
@@ -856,6 +862,7 @@ export default function LiveHostDashboard() {
       maxViewers: activeSession.maxViewers,
       glossaryPack: activeSession.glossaryPack,
       domainText: buildLiveSessionDomainText(activeSession),
+      modelPreferences: activeSession.modelPreferences,
       activationKey: activation?.activationKey,
       initialControl,
       sessionStatus: activeSession.status,
@@ -876,7 +883,7 @@ export default function LiveHostDashboard() {
         }
         return { version: fresh.version, sessionStatus: fresh.status, sessionType: fresh.sessionType, languages: fresh.languages,
           outputMode: fresh.outputMode, voiceProvider: GEMINI_VOICE_PROVIDER, maxViewers: fresh.maxViewers,
-          glossaryPack: fresh.glossaryPack, domainText: buildLiveSessionDomainText(fresh) };
+          glossaryPack: fresh.glossaryPack, domainText: buildLiveSessionDomainText(fresh), modelPreferences: fresh.modelPreferences };
       },
       demandControl: createHostDemandControl(activeSession.id),
       onStatus: (status) => {
@@ -903,6 +910,10 @@ export default function LiveHostDashboard() {
         mergeLanguageCaptionCache(current, caption.language, [caption])),
       onLanguageStatus: (language, status) => {
         setLanguageStatuses((current) => ({ ...current, [language]: status }));
+      },
+      onEngineStatus: (status) => {
+        if (!isPageActiveRef.current || currentSessionIdRef.current !== activeSession.id) return;
+        setEngineStatuses((current) => ({ ...current, [status.role]: status }));
       },
     });
     if (!isPageActiveRef.current || currentSessionIdRef.current !== activeSession.id) {
@@ -1229,10 +1240,25 @@ export default function LiveHostDashboard() {
     setError("");
     try {
       const client = audioClientRef.current;
+      if (client) await client.drain();
+      else {
+        const current = await readResponse<LiveSession>(await fetch(`/api/live-sessions/${session.id}`, {
+          method: "GET", cache: "no-store", signal: AbortSignal.timeout(10_000),
+        }));
+        if (current.id !== session.id) throw new Error("회의 상태를 확인하지 못했습니다.");
+        const terminalOrPreparing = ["preparing", "stopped", "failed"].includes(current.status);
+        if (!terminalOrPreparing) {
+          if (current.status !== "live" && current.status !== "paused") throw new Error("회의 상태를 확인하지 못했습니다.");
+          const runtime = await createHostDemandControl(session.id).read();
+          if (!runtime.enabled || runtime.state !== "sleeping") {
+            throw new Error("원문 저장을 확인하려면 라이브 연결을 복구한 후 종료해 주세요. (MEDIA_DRAIN_CONNECTION_REQUIRED)");
+          }
+        }
+      }
+      await readResponse<unknown>(await fetch(`/api/live-sessions/${session.id}`, { method: "DELETE" }));
       audioClientRef.current = null;
       if (client) await client.stop();
       await stopBroadcast();
-      await readResponse<unknown>(await fetch(`/api/live-sessions/${session.id}`, { method: "DELETE" }));
       setIsEndConfirmVisible(false);
       resetHostSummaryLifecycle();
       setEndedSession({ id: session.id, languages: [...session.languages] });
@@ -1719,7 +1745,15 @@ export default function LiveHostDashboard() {
     return () => controller.abort();
   }, []);
   const engineStatusLabel = formatEngineLabel(session?.modelPreferences?.engine ?? engineDefaults);
-
+  // Live runtime verdict across both roles: any failure wins, then connecting, then ready.
+  const engineRuntime = (() => {
+    const roles = Object.values(engineStatuses);
+    if (!isBroadcasting || roles.length === 0) return null;
+    const failed = roles.find((role) => role.status === "failed");
+    if (failed) return { key: "엔진 오류", code: failed.code ?? null, state: "failed" as const };
+    if (roles.some((role) => role.status === "connecting")) return { key: "엔진 연결 중", code: null, state: "connecting" as const };
+    return { key: "엔진 준비됨", code: null, state: "ready" as const };
+  })();
   // Task 4 (admin console): the rail offers /console only to admins. One GET on mount; the
   // response's `role` is the only signal, so a failed or non-admin answer simply shows no link.
   const [isConsoleAdmin, setIsConsoleAdmin] = useState(false);
@@ -1882,6 +1916,11 @@ export default function LiveHostDashboard() {
             <p className="live-engine-status" data-engine-status aria-live="polite">
               <span>{t("자막 엔진")}</span>
               <strong title={engineStatusLabel}>{t("관리자 지정")} · {engineStatusLabel}</strong>
+              {engineRuntime && (
+                <em data-engine-runtime={engineRuntime.state} title={engineRuntime.code ?? undefined}>
+                  {t(engineRuntime.key)}{engineRuntime.code ? ` (${engineRuntime.code})` : ""}
+                </em>
+              )}
             </p>
             <section className="live-context-panel" aria-labelledby="live-context-heading">
               <div className="live-field-label">

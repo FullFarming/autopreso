@@ -1851,10 +1851,33 @@ function applyAuthoritativeLiveCallFloorSnapshot(snapshot) {
   }
 }
 
+// One bounded engine-status row for the polled controller: role/status from
+// closed sets, provider/model/code as short tokens. Anything else is dropped.
+const LIVE_ENGINE_STATUS_ROLES = new Set(["stt", "translation"]);
+const LIVE_ENGINE_STATUS_VALUES = new Set(["connecting", "ready", "failed"]);
+function projectLiveEngineStatus(message) {
+  if (!message || typeof message !== "object") return null;
+  const { role, provider, model, status, code } = message;
+  if (!LIVE_ENGINE_STATUS_ROLES.has(role) || !LIVE_ENGINE_STATUS_VALUES.has(status)) return null;
+  if (typeof provider !== "string" || !/^[A-Za-z0-9._-]{1,80}$/u.test(provider)) return null;
+  if (typeof model !== "string" || !/^[A-Za-z0-9._-]{1,80}$/u.test(model)) return null;
+  const safeCode = typeof code === "string" && /^[A-Z0-9_]{1,80}$/u.test(code) ? code : null;
+  return { role, provider, model, status, ...(status === "failed" && safeCode ? { code: safeCode } : {}) };
+}
+
+function projectLiveEngineStatuses(engineStatuses) {
+  const rows = [...(engineStatuses?.values?.() ?? [])].map(projectLiveEngineStatus).filter(Boolean);
+  if (rows.length === 0) return null;
+  const failed = rows.find((row) => row.status === "failed");
+  const state = failed ? "failed" : rows.some((row) => row.status === "connecting") ? "connecting" : "ready";
+  return { state, ...(failed?.code ? { code: failed.code } : {}), roles: rows };
+}
+
 function liveBridgeStatus() {
   const floorState = {
     floorKnown: liveGatewayBridge?.floorKnown === true,
     hostAudioBlocked: liveGatewayBridge?.isHostAudioBlocked !== false,
+    engine: projectLiveEngineStatuses(liveGatewayBridge?.engineStatuses),
   };
   if (liveBridgeAlert) {
     const state = ["connecting", "reconnecting", "failed"].includes(liveBridgeAlert.state)
@@ -2363,6 +2386,7 @@ async function ensureLiveGatewayBridgeOnce({ allowPreparing = false, deadlineAt 
     isHostAudioBlocked: true,
     lastFloorMessage: null,
     languageStatuses: new Map(),
+    engineStatuses: new Map(),
   };
   bridge.captionRelay = createLiveCaptionIpcRelay({
     lastFinalSeqByLanguage: captionRelayState.lastFinalSeqByLanguage,
@@ -2436,6 +2460,13 @@ async function ensureLiveGatewayBridgeOnce({ allowPreparing = false, deadlineAt 
           try { socket.close(4000, "readiness confirmation failed"); } catch { /* closed */ }
         }
       })();
+    } else if (message.type === "engine-status") {
+      // Read-only runtime status of the admin-deployed engine. It arrives before
+      // `started` (connecting) and again on an admin switch; only bounded
+      // fields are kept, and the controller reads them from live-call:get-state.
+      if (message.sessionId !== armedSession.sessionId) return;
+      const projected = projectLiveEngineStatus(message);
+      if (projected) bridge.engineStatuses.set(projected.role, projected);
     } else if (message.type === "language-status") {
       if (!bridge.ready || message.sessionId !== armedSession.sessionId) return;
       if (typeof message.language !== "string" || !["en", "ko"].includes(message.language)) return;

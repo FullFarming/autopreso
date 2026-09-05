@@ -24,6 +24,30 @@ const ACTIVATION_KEY_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab]
 
 export type LiveInputSource = "mic" | "system" | "both";
 
+/** Read-only engine runtime status the gateway sends the host (`engine-status`):
+ *  one event per engine role on start, on an admin engine switch, and on failure. */
+export interface EngineStatusEvent {
+  role: "stt" | "translation";
+  provider: string;
+  model: string;
+  status: "connecting" | "ready" | "failed";
+  code?: string;
+}
+const ENGINE_STATUS_ROLES = new Set(["stt", "translation"]);
+const ENGINE_STATUS_VALUES = new Set(["connecting", "ready", "failed"]);
+const ENGINE_STATUS_TOKEN = /^[A-Za-z0-9._-]{1,80}$/u;
+function readEngineStatusEvent(message: Record<string, unknown>, sessionId: string): EngineStatusEvent | null {
+  if (message.type !== "engine-status" || message.sessionId !== sessionId) return null;
+  const { role, provider, model, status, code } = message;
+  if (typeof role !== "string" || !ENGINE_STATUS_ROLES.has(role)) return null;
+  if (typeof status !== "string" || !ENGINE_STATUS_VALUES.has(status)) return null;
+  if (typeof provider !== "string" || !ENGINE_STATUS_TOKEN.test(provider)) return null;
+  if (typeof model !== "string" || !ENGINE_STATUS_TOKEN.test(model)) return null;
+  if (code !== undefined && (typeof code !== "string" || !/^[A-Z0-9_]{1,80}$/u.test(code))) return null;
+  const event: EngineStatusEvent = { role: role as EngineStatusEvent["role"], provider, model, status: status as EngineStatusEvent["status"] };
+  return code === undefined ? event : { ...event, code };
+}
+
 interface GatewayCredentials {
   token: string;
   gatewayUrl: string;
@@ -59,6 +83,8 @@ interface AudioClientOptions {
   onManualRestartRequired?: () => void;
   onSpeakers: (speakers: SpeakerAssignment[]) => void;
   onLanguageStatus: (language: string, status: "preparing" | "ready" | "unavailable") => void;
+  /** Read-only engine runtime status; the admin console owns the engine itself. */
+  onEngineStatus?: (status: EngineStatusEvent) => void;
   /** Another client took this session's HOST slot (gateway close 4410). The
    *  client has already stopped itself; reconnecting would seize the session
    *  back and ping-pong the socket, so the UI offers a manual restart instead. */
@@ -736,6 +762,11 @@ export async function startLiveAudioClient(options: AudioClientOptions): Promise
         }
         if (message.type === "speaker-legend" && Array.isArray(message.speakers) && message.speakers.every(isSpeakerAssignment)) {
           options.onSpeakers(message.speakers);
+        }
+        if (message.type === "engine-status") {
+          const engineStatus = readEngineStatusEvent(message, options.sessionId);
+          if (engineStatus && !isStopped) options.onEngineStatus?.(engineStatus);
+          return;
         }
         if (message.type === "language-status"
           && message.sessionId === options.sessionId

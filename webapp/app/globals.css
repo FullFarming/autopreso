@@ -424,6 +424,9 @@ input:focus-visible {
 .live-engine-status { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 8px 0 0; padding: 10px 12px; border: 1px solid var(--hairline); border-radius: 12px; background: var(--nova-web-background); font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
 .live-engine-status span { flex: none; color: var(--muted); }
 .live-engine-status strong { min-width: 0; overflow: hidden; color: var(--ink); text-overflow: ellipsis; white-space: nowrap; font-weight: 600; }
+.live-engine-status em { flex: none; font-style: normal; font-size: 12px; color: var(--muted); }
+.live-engine-status em[data-engine-runtime="ready"] { color: var(--ok, #1a7f37); }
+.live-engine-status em[data-engine-runtime="failed"] { color: var(--danger, #b42318); }
 .live-session-panel { margin-top: 16px; }
 .live-language-panel,
 .live-session-panel { min-height: 280px; }

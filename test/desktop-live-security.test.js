@@ -556,8 +556,9 @@ test("controller bridge health projects an explicit metadata allowlist", () => {
   const status = bridge.liveBridgeStatus();
   assert.deepEqual(
     [...Object.keys(status)].sort(),
-    ["attempts", "code", "floorKnown", "hostAudioBlocked", "state"].sort(),
+    ["attempts", "code", "engine", "floorKnown", "hostAudioBlocked", "state"].sort(),
   );
+  assert.equal(status.engine, null, "no engine-status yet projects as null, not as an empty object");
   assert.equal(status.state, "reconnecting");
   assert.equal(status.code, "TRANSLATION_RECONNECTING");
   assert.equal(status.attempts, 4);
@@ -572,6 +573,19 @@ test("controller bridge health projects an explicit metadata allowlist", () => {
   assert.equal(bridge.liveBridgeStatus().code, "TRANSLATION_RECOVERING");
   bridge.context.liveGatewayBridge.languageStatuses.set("ko", "ready");
   assert.equal(bridge.liveBridgeStatus().state, "connected");
+
+  // engine-status rows are re-projected on every poll: only role/provider/model/
+  // status and a machine-token failure code survive, never provider prose.
+  bridge.context.liveGatewayBridge.engineStatuses = new Map([
+    ["stt", { role: "stt", provider: "gemini", model: "gemini-3.5-transcribe-live", status: "ready", message: "sk-secret", gatewayUrl: "wss://provider.example" }],
+    ["translation", { role: "translation", provider: "gemini", model: "gemini-3.7-flash", status: "failed", code: "STT_PROVIDER_UNAVAILABLE", detail: "Cushman & Wakefield" }],
+  ]);
+  const engine = JSON.parse(JSON.stringify(bridge.liveBridgeStatus().engine));
+  assert.equal(engine.state, "failed");
+  assert.equal(engine.code, "STT_PROVIDER_UNAVAILABLE");
+  assert.deepEqual(Object.keys(engine).sort(), ["code", "roles", "state"]);
+  assert.deepEqual(engine.roles.map((row) => Object.keys(row).sort()), [["model", "provider", "role", "status"], ["code", "model", "provider", "role", "status"]]);
+  assert.doesNotMatch(JSON.stringify(engine), /secret|provider.example|Cushman|gatewayUrl/u);
 
   const healthProjection = sourceBetween("function liveBridgeStatus", "function shouldBlockLiveHostAudioForFloor");
   assert.doesNotMatch(healthProjection, /\.\.\.liveBridgeAlert/u);

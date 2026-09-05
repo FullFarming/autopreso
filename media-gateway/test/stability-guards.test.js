@@ -24,9 +24,18 @@ function hostToken(secret, sessionId = SESSION_ID) {
   });
 }
 
-async function nextJson(webSocket) {
-  const [data] = await once(webSocket, "message");
-  return JSON.parse(data.toString("utf8"));
+function nextJson(webSocket) {
+  // Skips the engine-status frames that accompany every start ACK; a re-armed
+  // once() would miss the ACK delivered in the same tick.
+  return new Promise((resolve) => {
+    const onMessage = (data) => {
+      const message = JSON.parse(data.toString("utf8"));
+      if (message.type === "engine-status") return;
+      webSocket.off("message", onMessage);
+      resolve(message);
+    };
+    webSocket.on("message", onMessage);
+  });
 }
 
 async function waitFor(predicate) {
