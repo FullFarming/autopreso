@@ -226,9 +226,11 @@ async function createApp() {
   preferredOverlayDisplayId = settings.subtitle?.overlayDisplayId ?? "";
   overlayAllDisplays = settings.subtitle?.overlayAllDisplays !== false;
   selectedOverlayDisplayIds = Array.isArray(settings.subtitle?.overlayDisplayIds) ? settings.subtitle.overlayDisplayIds : null;
-  server = await startDesktopServer(settingsStore);
-  const liveCallEnabled = isLiveCallEnabled();
+  // 2026-09-06 fix: the managed-caption callbacks the local server captures need this URL,
+  // so it is resolved BEFORE startDesktopServer(); module-level code must never reach for it.
   const liveWorkspaceUrl = resolveLiveWorkspaceUrl();
+  server = await startDesktopServer(settingsStore, liveWorkspaceUrl);
+  const liveCallEnabled = isLiveCallEnabled();
   const localAppOrigin = new URL(server.url).origin;
   // Media capture is LOCAL-ONLY on purpose. The host mic and system-audio
   // loopback are captured by the dashboard renderer (see the backgroundThrottling
@@ -414,15 +416,19 @@ function attachRendererRecovery(window, { label, reload, onFailure }) {
   return { cancel: clearReloadTimer };
 }
 
-async function managedCaptionRequest(pathname, body, baseUrl = liveWorkspaceUrl) {
+async function managedCaptionRequest(pathname, body, baseUrl) {
+  if (typeof baseUrl !== "string" || baseUrl.length === 0) throw new Error("관리자 배정 자막 연결을 준비하지 못했습니다. 작업공간 주소가 없습니다.");
   const result = await liveCallApi(baseUrl, pathname, { method: "POST", body });
   if (!result.ok || !result.data) throw new Error("관리자 배정 자막 연결을 준비하지 못했습니다. 로그인과 연결 상태를 확인해 주세요.");
   return result.data;
 }
 
-const managedCaptionCallbacks = {
+// The desktop's workspace URL is a local of the app-ready handler, so the callbacks are
+// built from an explicit argument rather than closing over a name that is not in scope here.
+function createManagedCaptionCallbacks(workspaceUrl) {
+  return {
   startCaptionSession: async (languages) => {
-    const workspaceBaseUrl = liveWorkspaceUrl;
+    const workspaceBaseUrl = workspaceUrl;
     return { ...await managedCaptionRequest("/api/captions/session", { languages }, workspaceBaseUrl), workspaceBaseUrl };
   },
   stopCaptionSession: (managedSession) => managedCaptionRequest("/api/captions/stop", { ticket: managedSession.ticket }, managedSession.workspaceBaseUrl),
@@ -448,9 +454,10 @@ const managedCaptionCallbacks = {
     if (typeof result.text !== "string") throw new Error("자막 번역 응답을 확인할 수 없습니다.");
     return result.text;
   },
-};
+  };
+}
 
-async function startDesktopServer(settingsStore) {
+async function startDesktopServer(settingsStore, liveWorkspaceUrl) {
   const transcriptsDir = path.join(path.dirname(SETTINGS_PATH), "transcripts");
   try {
     return await startServer({
@@ -459,7 +466,7 @@ async function startDesktopServer(settingsStore) {
       settingsStore,
       transcriptsDir,
       liveCallProducerCapability,
-      ...managedCaptionCallbacks,
+      ...createManagedCaptionCallbacks(liveWorkspaceUrl),
       resolveCaptionEngine: async () => (await seedLiveCallEngineDefaults(liveWorkspaceUrl)).engine,
       canStartSubtitleSession: () => isDesktopAuthenticated && !isHostLogoutPending && !isHostLoginPending,
     });
@@ -472,7 +479,7 @@ async function startDesktopServer(settingsStore) {
     settingsStore,
     transcriptsDir,
     liveCallProducerCapability,
-    ...managedCaptionCallbacks,
+    ...createManagedCaptionCallbacks(liveWorkspaceUrl),
     resolveCaptionEngine: async () => (await seedLiveCallEngineDefaults(liveWorkspaceUrl)).engine,
     canStartSubtitleSession: () => isDesktopAuthenticated && !isHostLogoutPending && !isHostLoginPending,
   });

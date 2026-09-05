@@ -103,7 +103,7 @@ test("boot cannot prompt for microphone, start local services, or show local win
   const boot = source("async function createApp()", "function syncOverlayBoundsAndTop");
   const verified = boot.indexOf("if (!authenticated.ok || isQuitting)");
   assert.ok(verified > boot.indexOf("desktopHostSession.ensureSession()"));
-  for (const operation of ["loadSettingsStoreResiliently()", "startDesktopServer(settingsStore)", "ensureMicrophoneAccess()", "createDashboardWindow(", "createOverlayWindow(", "registerOverlayIpc("]) {
+  for (const operation of ["loadSettingsStoreResiliently()", "startDesktopServer(settingsStore, liveWorkspaceUrl)", "ensureMicrophoneAccess()", "createDashboardWindow(", "createOverlayWindow(", "registerOverlayIpc("]) {
     assert.ok(boot.indexOf(operation) > verified, operation);
   }
 });
