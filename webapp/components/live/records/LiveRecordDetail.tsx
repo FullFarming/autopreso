@@ -13,6 +13,7 @@ import { fetchLiveRecordExport, fetchLiveRecordOriginals, fetchLiveRecordRecipie
 import { RecordOriginalPanel } from "./RecordContentPanels";
 import { RecordPeopleTable } from "./RecordPeopleTable";
 import styles from "./live-records.module.css";
+import { ActionWithHelp } from "../../ui/ActionWithHelp";
 
 interface LiveRecordDetailProps {
   record: LiveRecordDetailPresentation;
@@ -117,8 +118,8 @@ export function LiveRecordDetail({ record, participants, panels, selectedLaneId,
       <div className={styles.recordTitle}><h1 id="live-record-detail-heading">{record.title}</h1>
         <p>{formatSystemRecordDate(record.scheduledAt, language)}<span aria-hidden="true"> · </span>{t(record.status.label === "종료" ? "회의 종료" : record.status.label)}</p>
       </div>
-      <div className={styles.exportArea}><button className={styles.exportButton} type="button" disabled={isExporting} onClick={() => { void exportWorkbook(); }}>
-        <DownloadSimple size={22} aria-hidden="true" />{t(isExporting ? "Excel 준비 중" : "전체 Excel 내보내기")}</button><span>{t("이 회의의 전체 기록")}</span></div>
+      <div className={styles.exportArea}><ActionWithHelp label={t("내보내기 도움말")} help={t("이 회의의 전체 기록")}><button className={styles.exportButton} type="button" disabled={isExporting} onClick={() => { void exportWorkbook(); }}>
+        <DownloadSimple size={22} aria-hidden="true" />{t(isExporting ? "준비 중" : "Excel 저장")}</button></ActionWithHelp></div>
     </header>
     {(error || exportError) && <p className={styles.inlineError} role="alert">{t(exportError || error)}</p>}
     {exportStatus && <p className={styles.exportStatus} role="status">{t(exportStatus)}</p>}
@@ -137,7 +138,7 @@ export function LiveRecordDetail({ record, participants, panels, selectedLaneId,
       </section>}
       {selectedTab === 3 && <>
         {isRecipientsLoading && <p className={styles.empty} role="status">{t("수신 신청자를 불러오는 중입니다.")}</p>}
-        {recipientError && <div className={styles.statePanel}><p role="alert">{t(recipientError)}</p><button type="button" onClick={() => setRecipientVersion((version) => version + 1)}>{t("명단 다시 불러오기")}</button></div>}
+        {recipientError && <div className={styles.statePanel}><p role="alert">{t(recipientError)}</p><button type="button" onClick={() => setRecipientVersion((version) => version + 1)}>{t("다시 시도")}</button></div>}
         {!isRecipientsLoading && !recipientError && recipients && <RecordPeopleTable key="recipients" participants={[]} recipients={recipients} mode="recipients" />}
       </>}
     </div>
@@ -145,10 +146,11 @@ export function LiveRecordDetail({ record, participants, panels, selectedLaneId,
     <details className={styles.operationsDisclosure}><summary>{t("기록 관리")}</summary>
       <section className={styles.operations} aria-label={t("기록 관리")}>
         <div className={styles.sectionHeading}><h2>{t("운영 상태")}</h2><span>{t(record.syncMessage)}</span></div>
-        {record.syncState === "failed" && <button className={styles.secondaryButton} type="button" disabled={isRetryingSync} onClick={onRetrySync}>{t("동기화 다시 시도")}</button>}
+        {record.syncState === "failed" && <button className={styles.secondaryButton} type="button" disabled={isRetryingSync} onClick={onRetrySync}>{t("동기화")}</button>}
         <label htmlFor="record-delete-confirmation">{t("삭제하려면 기록 제목 “{title}”을 입력하세요.", { title: record.title })}</label>
         <input id="record-delete-confirmation" name="deleteConfirmation" value={deleteConfirmation} onChange={(event) => setDeleteConfirmation(event.currentTarget.value)} placeholder={record.title} />
-        <button className={styles.dangerButton} type="button" disabled={isDeleting || deleteConfirmation !== record.title} onClick={onDelete}>{t("복구 가능 상태로 삭제")}</button>
+        <p>{t("복구 가능 상태로 삭제")}</p>
+        <button className={styles.dangerButton} type="button" disabled={isDeleting || deleteConfirmation !== record.title} onClick={onDelete}>{t("삭제")}</button>
       </section>
     </details>
   </article>;

@@ -1,3 +1,6 @@
+import { readBootstrapAdminConfig } from "@/lib/auth/bootstrap-admins";
+import { SupabaseProfileStore, ProfileStoreError } from "@/lib/auth/profile-store";
+import { profileStatusCache } from "@/lib/auth/profile-status-cache";
 import { NextRequest } from "next/server";
 
 import { SESSION_COOKIE, SESSION_TTL_SECONDS, createSessionToken } from "@/lib/session";
@@ -114,9 +117,21 @@ export async function POST(request: NextRequest) {
     return apiError("아이디 또는 비밀번호가 올바르지 않습니다.", "INVALID_CREDENTIALS", 401);
   }
 
+  if (process.env.LIVE_ALLOW_WEAK_TEST_LOGIN !== "true") {
+    try {
+      const bootstrap = readBootstrapAdminConfig();
+      if (bootstrap.legacyHostId !== id) return apiError("관리자 로그인 아이디 설정을 확인해 주세요.", "ADMIN_BOOTSTRAP_CONFIG_REQUIRED", 503);
+      await new SupabaseProfileStore().ensureLegacyAdmin({ hostId: id, bootstrapEmail: [...bootstrap.emails][0] ?? "" });
+      profileStatusCache.invalidate(id);
+    } catch (error: unknown) {
+      if (error instanceof ProfileStoreError) return apiError(error.message, error.code, error.status);
+      return apiError("관리자 계정 설정을 확인해 주세요.", "ADMIN_BOOTSTRAP_UNAVAILABLE", 503);
+    }
+  }
+
   loginRateLimiter.clear(request.headers);
   const token = await createSessionToken(id);
-  const response = apiSuccess({ userId: id }, { headers: { "cache-control": "private, no-store" } });
+  const response = apiSuccess({ userId: id, role: "admin", next: "/admin" }, { headers: { "cache-control": "private, no-store" } });
   response.cookies.set("rnw_name", name, {
     sameSite: "lax", secure: process.env.NODE_ENV === "production", path: "/", maxAge: SESSION_TTL_SECONDS,
   });

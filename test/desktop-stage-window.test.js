@@ -255,7 +255,7 @@ function buildApplicationMenu(language) {
   return { template, calls };
 }
 
-test("the application menu reaches every surface including Meeting Prep and ends nothing", () => {
+test("the application menu exposes only NOVA caption surfaces and ends nothing", () => {
   const { template, calls } = buildApplicationMenu("en");
   assert.ok(template, "an application menu must be built");
 
@@ -263,7 +263,8 @@ test("the application menu reaches every surface including Meeting Prep and ends
   const byLabel = new Map(items.map((item) => [item.label, item]));
   // One place that can reach every surface, whatever state the others are in.
   assert.equal(byLabel.get("Show Main Window")?.accelerator, "CommandOrControl+Shift+M");
-  assert.equal(byLabel.get("Meeting Prep")?.accelerator, "CommandOrControl+Shift+P");
+  assert.equal(byLabel.has("Meeting Prep"), false);
+  assert.equal(byLabel.has("Live Interpreter"), false);
   assert.equal(byLabel.get("Show Caption Controller")?.accelerator, "CommandOrControl+Shift+C");
   assert.equal(byLabel.get("Show Subtitle Overlays")?.accelerator, "CommandOrControl+Shift+O");
   assert.ok(byLabel.has("Hide Caption Controller"));
@@ -272,7 +273,7 @@ test("the application menu reaches every surface including Meeting Prep and ends
 
   calls.length = 0;
   for (const item of byLabel.values()) item.click();
-  assert.deepEqual(calls, ["show-dashboard", "show-meeting-prep", "show-controller", "hide-controller", "show-overlays"]);
+  assert.deepEqual(calls, ["show-dashboard", "show-controller", "hide-controller", "show-overlays"]);
   assert.equal(calls.includes("QUIT"), false, "no menu item may reach the quit path that ends the Live Call");
 });
 

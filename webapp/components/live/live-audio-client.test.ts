@@ -3,7 +3,7 @@ import test from "node:test";
 import type { HostDemandControl, HostMediaRuntime } from "./host-demand-control";
 import type { SourceEvent } from "../../lib/live/source-contract";
 import { createGeminiCaptionConfig } from "../../../packages/caption-core/gemini-caption-contract.js";
-import { DEFAULT_ENGINE_SELECTION } from "../../../packages/caption-core/caption-engine-catalog.js";
+import { DEFAULT_ENGINE_SELECTION, GEMINI_ENGINE_SELECTION } from "../../../packages/caption-core/caption-engine-catalog.js";
 
 test("host original callbacks accept only canonical same-meeting sources and fixed failure status", async () => {
   FakeWebSocket.instances = [];
@@ -72,7 +72,7 @@ test("web host start, update, reconnect and manual restart carry the session eng
     replaceGlobal("navigator", { mediaDevices: { async getUserMedia() { return { getTracks: () => [{ stop() {} }] }; } } })];
   // The server hands the host the normalized `{ engine, engineHistory }`; the translation role
   // differs from the default so the test proves the whole engine travels, not just the model ids.
-  const engine = { ...DEFAULT_ENGINE_SELECTION, translation: { provider: "gemini", model: "gemini-3.7-flash" } };
+  const engine = { ...GEMINI_ENGINE_SELECTION, translation: { provider: "gemini", model: "gemini-3.7-flash" } };
   const preferences = { engine, engineHistory: [] };
   const credentials = { token: "host-token", gatewayUrl: "wss://gateway.example.test/live", expiresAt: new Date(Date.now() + 900000).toISOString() };
   const settings = { version: 2, sessionStatus: "live" as const, sessionType: "presentation" as const, languages: ["ko", "en"],

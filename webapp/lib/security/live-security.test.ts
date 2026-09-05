@@ -3,6 +3,7 @@ import { Buffer } from "node:buffer";
 import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync, readdirSync } from "node:fs";
 import test from "node:test";
+import ts from "typescript";
 
 import {
   createGatewayToken,
@@ -2180,7 +2181,6 @@ test("production rejects known example placeholders regardless of their length",
       }),
   );
   for (const name of [
-    "ADMIN_PASSWORD",
     "SESSION_SECRET",
     "PAIR_SECRET",
     "LIVE_ADMISSION_PEPPER",
@@ -2189,6 +2189,7 @@ test("production rejects known example placeholders regardless of their length",
   ]) {
     assert.equal(isKnownInsecureSecret(example[name] ?? ""), true, `${name} must remain an intentionally invalid example`);
   }
+  assert.throws(() => readHostLoginConfig({ ...example, NODE_ENV: "production" }), "example configuration must never authenticate an administrator");
 });
 
 test("ADMIN_PASSWORD follows the non-MFA 10+ char owner baseline, not the 32-char HMAC secret gate", () => {
@@ -2618,10 +2619,10 @@ test("engine-catalog governed Gemini workloads are allowlisted, deterministic, r
 
   // Plan 2: every runtime model id comes from the engine catalog; the caption contract only derives.
   assert.match(captionPolicy, /transcription: DEFAULT_TRANSCRIPTION_MODEL/u);
-  assert.match(captionPolicy, /DEFAULT_TRANSCRIPTION_MODEL = DEFAULT_ENGINE_SELECTION\.stt\.model/u);
+  assert.match(captionPolicy, /DEFAULT_TRANSCRIPTION_MODEL = GEMINI_ENGINE_SELECTION\.stt\.model/u);
   assert.match(captionPolicy, /DEFAULT_POLISH_MODEL = "gemini-3\.7-flash"/u);
-  assert.match(captionPolicy, /DEFAULT_ANALYSIS_MODEL = DEFAULT_ENGINE_SELECTION\.summary\.model/u);
-  assert.match(captionPolicy, /translation: DEFAULT_ENGINE_SELECTION\.translation\.model/u);
+  assert.match(captionPolicy, /DEFAULT_ANALYSIS_MODEL = GEMINI_ENGINE_SELECTION\.summary\.model/u);
+  assert.match(captionPolicy, /translation: GEMINI_ENGINE_SELECTION\.translation\.model/u);
   assert.match(captionPolicy, /polish: DEFAULT_POLISH_MODEL/u);
   assert.match(captionPolicy, /glossaryExtraction: DEFAULT_POLISH_MODEL/u);
   for (const workload of ["topic", "recap"]) assert.match(captionPolicy, new RegExp(`${workload}: DEFAULT_ANALYSIS_MODEL`, "u"));
@@ -2684,6 +2685,8 @@ test("browser source cannot bundle a direct Gemini transport while compatibility
   const webappRoot = new URL("../../", import.meta.url);
   const productionSources: string[] = [];
   const clientReachableSources: string[] = [];
+  const sourceByPath = new Map<string, string>();
+  const clientRoots: string[] = [];
   const visit = (directory: URL) => {
     for (const entry of readdirSync(directory, { withFileTypes: true })) {
       const child = new URL(`${entry.name}${entry.isDirectory() ? "/" : ""}`, directory);
@@ -2692,8 +2695,10 @@ test("browser source cannot bundle a direct Gemini transport while compatibility
       } else if (/\.(?:ts|tsx|js|jsx)$/u.test(entry.name) && !/\.test\.[^.]+$/u.test(entry.name)) {
         const source = readFileSync(child, "utf8");
         productionSources.push(source);
+        sourceByPath.set(child.pathname, source);
         if (child.pathname.includes("/components/") || /^["']use client["']/u.test(source.trimStart())) {
           clientReachableSources.push(source);
+          clientRoots.push(child.pathname);
         }
       }
     }
@@ -2706,7 +2711,26 @@ test("browser source cannot bundle a direct Gemini transport while compatibility
   assert.match(serverGeminiPackage, /const selectedModel = resolveGeminiWorkloadModel\("recap", model\)/u);
   assert.match(serverGeminiPackage, /const url = `https:\/\/generativelanguage\.googleapis\.com\/v1beta\/models\/\$\{selectedModel\}:generateContent`/u);
   assert.doesNotMatch(browserSource, /@google\/genai/u);
-  assert.doesNotMatch(browserSource, /generativelanguage\.googleapis\.com/u);
+  for (const [path, source] of sourceByPath) {
+    if (/generativelanguage\.googleapis\.com/u.test(source)) assert.ok(path.endsWith("/lib/captions/broker.ts"), path);
+  }
+  const visited = new Set<string>();
+  const inspectClientImports = (path: string): void => {
+    if (visited.has(path)) return;
+    visited.add(path);
+    const source = sourceByPath.get(path) ?? "";
+    assert.doesNotMatch(path, /\/lib\/captions\/(?:broker|runtime|store|route)\.ts$/u, "server credential broker must not be client reachable");
+    assert.doesNotMatch(source, /generativelanguage\.googleapis\.com|node:crypto/u, path);
+    const runtimeSource = ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022, jsx: ts.JsxEmit.Preserve } }).outputText;
+    for (const match of runtimeSource.matchAll(/(?:from\s*|import\s*\(\s*)["']([^"']+)["']/gu)) {
+      const specifier = match[1];
+      if (!specifier.startsWith(".") && !specifier.startsWith("@/")) continue;
+      const base = specifier.startsWith("@/") ? new URL(specifier.slice(2), webappRoot).pathname : new URL(specifier, `file://${path}`).pathname;
+      const resolved = [base, ...[".ts", ".tsx", ".js", ".jsx", "/index.ts", "/index.tsx"].map((suffix) => base + suffix)].find((candidate) => sourceByPath.has(candidate));
+      if (resolved) inspectClientImports(resolved);
+    }
+  };
+  for (const root of clientRoots) inspectClientImports(root);
   assert.doesNotMatch(clientReachableSource, /summary-gemini-adapter|gemini-server|@google\/genai|generativelanguage\.googleapis\.com/u);
   assert.doesNotMatch(browserSource, /fetch\(\s*["']\/api\/gemini-token["']/u);
   assert.doesNotMatch(browserSource, /\bdata\??\.key\b/u);
@@ -2849,4 +2873,12 @@ test("legacy pairing query parameters are discarded without an authentication re
     assert.match(source, new RegExp(`searchParams\\.delete\\("${parameter}"\\)`, "u"));
   }
   assert.match(source, /window\.history\.replaceState/u);
+});
+
+test("renewed viewer tokens cannot exceed the database lease or token maximum", async () => {
+  const now = Date.now();
+  const input = {grantId:"grant-1",sessionId:"session-1",userId:"user-1"};
+  const renewed = await createViewerGrantToken(input, now, now + 60_000);
+  assert.equal(renewed.claims.expiresAt,now+60_000);
+  for (const expiry of [now,now-1,now+6*60*60*1000+1,Number.NaN]) await assert.rejects(createViewerGrantToken(input,now,expiry));
 });

@@ -1,3 +1,4 @@
+import { normalizeSpeakerProfile } from "../packages/caption-core/speaker-profile.js";
 const MAX_PAGES = 400;
 const MAX_LINES = 20_000;
 const MAX_BYTES = 20 * 1024 * 1024;
@@ -106,6 +107,8 @@ export function createLiveCallArchive({ requestRemote, importLocal, now = Date.n
           sourceUtteranceId: text(item.sourceUtteranceId, 128, false),
           sourceLanguage: text(item.sourceLanguage, 16, false),
           speaker: text(item.speakerName ?? item.speakerLabel ?? "", 80),
+          ...(item.speakerProfile ? { speakerProfile: normalizeSpeakerProfile(item.speakerProfile) } : {}),
+          ...(item.speakerAttribution === "unresolved" ? { speakerAttribution: "unresolved" } : {}),
           translatedText: "", targetLanguage: "",
         });
         sourceCount += 1;
@@ -125,7 +128,10 @@ export function createLiveCallArchive({ requestRemote, importLocal, now = Date.n
         if (utterance.origin === "source" || utterance.translationStatus === "failed") continue;
         if (typeof utterance.seq !== "number" || !Number.isSafeInteger(utterance.seq) || utterance.seq <= sequence) throw new LiveCallArchiveError();
         sequence = utterance.seq;
-        append({ at: timestamp(utterance.emittedAt), sourceText: "", sourceLanguage: "", translatedText: text(utterance.text, 8_000, false), targetLanguage: language, translationSeq: sequence, speaker: text(utterance.speaker ?? "", 80) });
+        append({ at: timestamp(utterance.emittedAt), sourceText: "", sourceLanguage: "", translatedText: text(utterance.text, 8_000, false), targetLanguage: language, translationSeq: sequence, speaker: text(utterance.speaker ?? "", 80),
+          ...(utterance.speakerProfile ? { speakerProfile: normalizeSpeakerProfile(utterance.speakerProfile) } : {}),
+          ...(utterance.speakerAttribution === "unresolved" ? { speakerAttribution: "unresolved" } : {}),
+        });
         translationCount += 1;
       }
     }

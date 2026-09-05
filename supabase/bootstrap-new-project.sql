@@ -19572,3 +19572,874 @@ begin
 end; $$;
 revoke all on function public.record_console_deploy_v1(uuid,jsonb) from public, anon, authenticated, service_role;
 grant execute on function public.record_console_deploy_v1(uuid,jsonb) to service_role;
+
+-- supabase/migrations/202609050001_user_engine_access_renewal.sql
+
+-- 2026-09-05 feat: Assign the next session's provider without rewriting an active session.
+-- Existing profiles receive Soniox revision 1. Existing session engine snapshots remain unchanged.
+alter table public.profiles
+  add column if not exists voice_provider text not null default 'soniox'
+    check (voice_provider in ('soniox', 'gemini')),
+  add column if not exists voice_provider_revision bigint not null default 1
+    check (voice_provider_revision > 0);
+
+create or replace function public.read_host_voice_assignment_v1(p_host_id text)
+returns table (provider text, revision bigint)
+language sql stable security definer set search_path = '' as $$
+  select p.voice_provider, p.voice_provider_revision from public.profiles p
+  where p.host_id = p_host_id and p.status = 'approved';
+$$;
+revoke all on function public.read_host_voice_assignment_v1(text) from public, anon, authenticated, service_role;
+grant execute on function public.read_host_voice_assignment_v1(text) to service_role;
+
+create or replace function public.set_profile_voice_provider_v1(p_actor_id uuid, p_profile_id uuid, p_provider text)
+returns table (provider text, revision bigint)
+language plpgsql security definer set search_path = '' as $$
+declare target public.profiles%rowtype;
+begin
+  perform public.assert_console_admin_v1(p_actor_id);
+  if p_provider is null or p_provider not in ('soniox', 'gemini') then
+    raise exception 'VOICE_PROVIDER_INVALID' using errcode = '22023';
+  end if;
+  select p.* into target from public.profiles p where p.id = p_profile_id for update;
+  if not found then raise exception 'PROFILE_NOT_FOUND' using errcode = 'P0001'; end if;
+  if target.voice_provider is distinct from p_provider then
+    update public.profiles p set voice_provider = p_provider,
+      voice_provider_revision = p.voice_provider_revision + 1, updated_at = statement_timestamp()
+    where p.id = p_profile_id;
+    insert into public.profile_events(profile_id, actor_id, action, payload)
+      values(p_profile_id, p_actor_id, 'engine_defaults', jsonb_build_object(
+        'kind', 'user_assignment', 'provider', p_provider,
+        'revision', target.voice_provider_revision + 1, 'effective', 'next_session'));
+  end if;
+  return query select p.voice_provider, p.voice_provider_revision from public.profiles p where p.id = p_profile_id;
+end;
+$$;
+revoke all on function public.set_profile_voice_provider_v1(uuid,uuid,text) from public, anon, authenticated, service_role;
+grant execute on function public.set_profile_voice_provider_v1(uuid,uuid,text) to service_role;
+
+create or replace function public.list_profiles_admin_v2(p_status text, p_limit integer, p_before timestamptz)
+returns table (id uuid, email text, display_name text, status text, role text, host_id text, created_at timestamptz, last_login_at timestamptz, approved_at timestamptz, voice_provider text, voice_provider_revision bigint)
+language sql stable security definer set search_path = '' as $$
+  select p.id, p.email, p.display_name, p.status, p.role, p.host_id, p.created_at,
+    p.last_login_at, p.approved_at, p.voice_provider, p.voice_provider_revision
+  from public.profiles p
+  where (p_status is null or p.status = p_status) and (p_before is null or p.created_at < p_before)
+  order by p.created_at desc, p.id
+  limit least(greatest(coalesce(p_limit, 50), 1), 200);
+$$;
+revoke all on function public.list_profiles_admin_v2(text,integer,timestamptz) from public, anon, authenticated, service_role;
+grant execute on function public.list_profiles_admin_v2(text,integer,timestamptz) to service_role;
+
+-- 2026-09-05 fix: Renew before the six-hour boundary, while authorization remains live.
+-- A service caller must first verify the host identity; an untrusted host_id is not authentication.
+create or replace function public.renew_live_session_access_v1(
+  p_session_id uuid, p_host_id text, p_expected_version integer
+)
+returns integer language plpgsql security definer set search_path = '' as $$
+declare session_row public.live_sessions%rowtype; next_version integer; next_deadline timestamptz; extend_admission boolean;
+begin
+  if p_session_id is null or p_host_id is null or char_length(p_host_id) not between 1 and 256
+    or p_host_id <> btrim(p_host_id) or p_host_id ~ '[[:cntrl:]]'
+    or p_expected_version is null or p_expected_version < 1 or p_expected_version >= 2147483647 then
+    raise exception 'INVALID_LIVE_SESSION_RENEWAL_INPUT' using errcode = '22023';
+  end if;
+  if exists(select 1 from public.profiles p where p.host_id = p_host_id and p.status <> 'approved') then
+    raise exception 'VERSION_CONFLICT_OR_FORBIDDEN' using errcode = '42501';
+  end if;
+  select s.* into session_row from public.live_sessions s
+  where s.id = p_session_id and s.host_id = p_host_id and s.version = p_expected_version
+    and s.status in ('preparing','live','paused') and s.archive_deleted_at is null for update;
+  if not found then raise exception 'VERSION_CONFLICT_OR_FORBIDDEN' using errcode = 'P0001'; end if;
+  if session_row.expires_at > statement_timestamp() + interval '15 minutes' then return session_row.version; end if;
+  next_deadline := greatest(statement_timestamp(), coalesce(session_row.scheduled_at, statement_timestamp())) + interval '6 hours';
+  -- Keep an explicitly shorter/closed invitation unchanged; only a live, open window
+  -- that followed the old access boundary is carried forward by authenticated activity.
+  extend_admission := session_row.status = 'live' and session_row.admission_state = 'open'
+    and session_row.admission_open_until = session_row.expires_at
+    and session_row.admission_open_until > statement_timestamp();
+  update public.live_sessions s set access_window_started_at = statement_timestamp(),
+    expires_at = next_deadline,
+    admission_open_until = case when extend_admission then next_deadline else s.admission_open_until end,
+    version = s.version + 1, updated_at = statement_timestamp()
+  where s.id = session_row.id and s.host_id = p_host_id and s.version = p_expected_version
+    and s.status in ('preparing','live','paused') and s.archive_deleted_at is null
+  returning s.version into next_version;
+  if next_version is null then raise exception 'VERSION_CONFLICT_OR_FORBIDDEN' using errcode = 'P0001'; end if;
+  if extend_admission then
+    update public.live_session_invites invite_row set expires_at = next_deadline
+    where invite_row.session_id = p_session_id and invite_row.revoked_at is null
+      and invite_row.expires_at = session_row.expires_at
+      and invite_row.expires_at > statement_timestamp();
+  end if;
+  return next_version;
+end;
+$$;
+revoke all on function public.renew_live_session_access_v1(uuid,text,integer) from public, anon, authenticated, service_role;
+grant execute on function public.renew_live_session_access_v1(uuid,text,integer) to service_role;
+
+-- 2026-09-05 fix: Renew only the authenticated, still-valid viewer grant.
+-- Expired or revoked credentials must re-enter admission; host renewal never revives them.
+create or replace function public.renew_live_viewer_access_v1(
+  p_session_id uuid, p_grant_id uuid, p_user_id text
+)
+returns timestamptz language plpgsql security definer set search_path = '' as $$
+declare deadline timestamptz; renewed_until timestamptz;
+begin
+  select s.expires_at into deadline from public.live_sessions s
+  where s.id = p_session_id and s.status in ('preparing','live','paused')
+    and s.archive_deleted_at is null and s.expires_at > statement_timestamp() for update;
+  if not found then raise exception 'VIEWER_RENEWAL_FORBIDDEN' using errcode = '42501'; end if;
+  update public.viewer_grants grant_row
+  set expires_at = least(deadline, statement_timestamp() + interval '6 hours')
+  where grant_row.id = p_grant_id and grant_row.session_id = p_session_id
+    and grant_row.user_id = p_user_id
+    and grant_row.revoked_at is null and grant_row.expires_at > statement_timestamp()
+  returning grant_row.expires_at into renewed_until;
+  if renewed_until is null then raise exception 'VIEWER_RENEWAL_FORBIDDEN' using errcode = '42501'; end if;
+  return renewed_until;
+end;
+$$;
+revoke all on function public.renew_live_viewer_access_v1(uuid,uuid,text) from public, anon, authenticated, service_role;
+grant execute on function public.renew_live_viewer_access_v1(uuid,uuid,text) to service_role;
+
+-- 2026-09-05 chore: Deprecated immediate-switch RPC remains for audit/rollback only.
+-- Application server callers must use profile assignments for the next session.
+revoke all on function public.set_live_session_engine_admin_v1(uuid,uuid,jsonb) from public, anon, authenticated, service_role;
+
+-- supabase/migrations/202609050002_managed_caption_sessions.sql
+
+-- 2026-09-05 feat: A signed caption ticket cannot revive a host-ended session.
+-- Existing profiles/sessions are preserved; only new managed caption sessions create rows.
+create table if not exists public.managed_caption_sessions (
+  id uuid primary key,
+  host_id text not null,
+  engine jsonb not null check(jsonb_typeof(engine) = 'object' and octet_length(engine::text) <= 4096),
+  assignment_revision text not null check(assignment_revision ~ '^[1-9][0-9]{0,18}$'),
+  languages text[] not null check(cardinality(languages) between 1 and 3),
+  status text not null default 'active' check(status in ('active','stopped')),
+  created_at timestamptz not null default statement_timestamp(),
+  access_renewed_at timestamptz not null default statement_timestamp(),
+  access_expires_at timestamptz not null,
+  stopped_at timestamptz,
+  check((status = 'stopped') = (stopped_at is not null)),
+  check(access_expires_at <= access_renewed_at + interval '6 hours')
+);
+create index if not exists managed_caption_sessions_host_idx on public.managed_caption_sessions(host_id, created_at desc);
+alter table public.managed_caption_sessions enable row level security;
+revoke all on table public.managed_caption_sessions from public, anon, authenticated, service_role;
+
+create or replace function public.create_managed_caption_session_v1(
+  p_session_id uuid, p_host_id text, p_engine jsonb, p_assignment_revision text, p_languages text[]
+)
+returns timestamptz language plpgsql security definer set search_path = '' as $$
+declare provider text; revision bigint; deadline timestamptz := statement_timestamp() + interval '6 hours';
+begin
+  if p_session_id is null or p_host_id is null or char_length(p_host_id) not between 1 and 128
+    or p_engine is null or jsonb_typeof(p_engine) <> 'object' or octet_length(p_engine::text) > 4096
+    or p_assignment_revision is null or p_assignment_revision !~ '^[1-9][0-9]{0,18}$'
+    or p_languages is null or cardinality(p_languages) not between 1 and 3
+    or array_position(p_languages, null) is not null
+    or cardinality(p_languages) <> (select count(distinct language) from unnest(p_languages) language)
+    or exists(select 1 from unnest(p_languages) language where language <> all(array['en','ko','ja','zh-Hans','zh-Hant','es','pt','fr','de','ru','hi','id','vi','it'])) then
+    raise exception 'CAPTION_SESSION_INPUT_INVALID' using errcode = '22023';
+  end if;
+  select p.voice_provider, p.voice_provider_revision into provider, revision from public.profiles p
+    where p.host_id = p_host_id and p.status = 'approved' for update;
+  if not found or revision::text <> p_assignment_revision
+    or (p_engine -> 'stt' ->> 'provider') is distinct from provider
+    or (p_engine -> 'translation' ->> 'provider') is distinct from provider then
+    raise exception 'CAPTION_ASSIGNMENT_CONFLICT' using errcode = '42501';
+  end if;
+  insert into public.managed_caption_sessions(id,host_id,engine,assignment_revision,languages,access_expires_at)
+    values(p_session_id,p_host_id,p_engine,p_assignment_revision,p_languages,deadline);
+  return deadline;
+end;
+$$;
+revoke all on function public.create_managed_caption_session_v1(uuid,text,jsonb,text,text[]) from public, anon, authenticated, service_role;
+grant execute on function public.create_managed_caption_session_v1(uuid,text,jsonb,text,text[]) to service_role;
+
+create or replace function public.read_managed_caption_session_v1(p_session_id uuid, p_host_id text)
+returns table(engine jsonb, assignment_revision text, languages text[], expires_at timestamptz)
+language sql stable security definer set search_path = '' as $$
+  select s.engine,s.assignment_revision,s.languages,s.access_expires_at from public.managed_caption_sessions s
+  where s.id=p_session_id and s.host_id=p_host_id and s.status='active'
+    and s.access_expires_at > statement_timestamp()
+    and exists(select 1 from public.profiles p where p.host_id=s.host_id and p.status='approved');
+$$;
+revoke all on function public.read_managed_caption_session_v1(uuid,text) from public, anon, authenticated, service_role;
+grant execute on function public.read_managed_caption_session_v1(uuid,text) to service_role;
+
+create or replace function public.renew_managed_caption_session_v1(p_session_id uuid, p_host_id text)
+returns timestamptz language plpgsql security definer set search_path = '' as $$
+declare deadline timestamptz;
+begin
+  -- Fresh host authentication can restore a finite access window after sleep.
+  -- Expired provider credentials stay invalid; the durable active state is authoritative.
+  update public.managed_caption_sessions s
+  set access_renewed_at=statement_timestamp(),access_expires_at=statement_timestamp()+interval '6 hours'
+  where s.id=p_session_id and s.host_id=p_host_id and s.status='active'
+    and exists(select 1 from public.profiles p where p.host_id=s.host_id and p.status='approved')
+  returning s.access_expires_at into deadline;
+  if deadline is null then raise exception 'CAPTION_SESSION_FORBIDDEN' using errcode = '42501'; end if;
+  return deadline;
+end;
+$$;
+revoke all on function public.renew_managed_caption_session_v1(uuid,text) from public, anon, authenticated, service_role;
+grant execute on function public.renew_managed_caption_session_v1(uuid,text) to service_role;
+
+create or replace function public.stop_managed_caption_session_v1(p_session_id uuid, p_host_id text)
+returns boolean language plpgsql security definer set search_path = '' as $$
+begin
+  -- Repeated stop remains successful; even an expired session can still be ended by its owner.
+  update public.managed_caption_sessions s
+    set status='stopped',stopped_at=coalesce(s.stopped_at,statement_timestamp())
+    where s.id=p_session_id and s.host_id=p_host_id;
+  return found;
+end;
+$$;
+revoke all on function public.stop_managed_caption_session_v1(uuid,text) from public, anon, authenticated, service_role;
+grant execute on function public.stop_managed_caption_session_v1(uuid,text) to service_role;
+
+
+-- Speaker feature migration: 202609050003_live_speaker_roster.sql
+-- 2026-09-05 feat: Preserve each speaker identity version independently of the current roster.
+create table public.live_speaker_rosters (
+ session_id uuid primary key references public.live_sessions(id) on delete cascade,
+ revision integer not null default 0 check(revision >= 0),
+ applied_revision integer not null default 0 check(applied_revision between 0 and revision),
+ active_onsite_speaker_id uuid,
+ speakers jsonb not null default '[]'::jsonb check(jsonb_typeof(speakers)='array' and jsonb_array_length(speakers)<=30)
+);
+create table public.live_speaker_photos (
+ id uuid primary key,
+ session_id uuid not null references public.live_sessions(id) on delete cascade,
+ content_type text not null check(content_type in ('image/jpeg','image/png','image/webp')),
+ image_base64 text not null,
+ size_bytes integer not null check(size_bytes between 1 and 262144),
+ check(octet_length(decode(image_base64,'base64'))=size_bytes)
+);
+create table public.live_speaker_profile_versions (
+ session_id uuid not null references public.live_sessions(id) on delete cascade, speaker_id uuid not null,
+ version integer not null check(version>0), profile jsonb not null,
+ primary key(session_id,speaker_id,version)
+);
+alter table public.live_speaker_rosters enable row level security;
+alter table public.live_speaker_photos enable row level security;
+alter table public.live_speaker_profile_versions enable row level security;
+revoke all on public.live_speaker_rosters, public.live_speaker_photos, public.live_speaker_profile_versions from public, anon, authenticated, service_role;
+
+create function public.get_live_speaker_roster_gateway_v1(p_session_id uuid)
+returns jsonb language plpgsql stable security definer set search_path='' as $$
+declare r public.live_speaker_rosters%rowtype;
+begin
+ if not exists(select 1 from public.live_sessions where id=p_session_id) then raise exception 'SPEAKER_ROSTER_FORBIDDEN'; end if;
+ select * into r from public.live_speaker_rosters where session_id=p_session_id;
+ return jsonb_build_object('sessionId',p_session_id,'revision',coalesce(r.revision,0),'appliedRevision',coalesce(r.applied_revision,0),'activeOnsiteSpeakerId',r.active_onsite_speaker_id,'speakers',coalesce(r.speakers,'[]'::jsonb));
+end $$;
+create function public.get_live_speaker_roster_v1(p_session_id uuid,p_host_id text)
+returns jsonb language plpgsql stable security definer set search_path='' as $$
+begin
+ if not exists(select 1 from public.live_sessions where id=p_session_id and host_id=p_host_id) then raise exception 'SPEAKER_ROSTER_FORBIDDEN'; end if;
+ return public.get_live_speaker_roster_gateway_v1(p_session_id);
+end $$;
+
+create function public.replace_live_speaker_roster_v1(p_session_id uuid,p_host_id text,p_expected_revision integer,p_speakers jsonb,p_active_onsite_speaker_id uuid)
+returns jsonb language plpgsql security definer set search_path='' as $$
+declare current_status text; r public.live_speaker_rosters%rowtype; s jsonb; previous jsonb; normalized jsonb; result jsonb:='[]'; selected_speaker_id uuid; participant_id uuid; photo_id uuid; next_version integer;
+begin
+ select status::text into current_status from public.live_sessions where id=p_session_id and host_id=p_host_id for update;
+ if not found then raise exception 'SPEAKER_ROSTER_FORBIDDEN'; end if;
+ if current_status in ('stopped','failed') then raise exception 'SPEAKER_ROSTER_TERMINAL'; end if;
+ if p_expected_revision is null or p_expected_revision<0 or p_speakers is null or jsonb_typeof(p_speakers)<>'array' then raise exception 'SPEAKER_ROSTER_INVALID'; end if;
+ if jsonb_array_length(p_speakers)>30 then raise exception 'SPEAKER_ROSTER_INVALID'; end if;
+ insert into public.live_speaker_rosters(session_id) values(p_session_id) on conflict do nothing;
+ select * into r from public.live_speaker_rosters where session_id=p_session_id for update;
+ if r.revision<>p_expected_revision then raise exception 'SPEAKER_ROSTER_CONFLICT' using errcode='40001'; end if;
+ for s in select value from jsonb_array_elements(p_speakers) loop
+  if jsonb_typeof(s)<>'object' or jsonb_typeof(s->'displayName') is distinct from 'string' or length(btrim(s->>'displayName')) not between 1 and 40
+   or jsonb_typeof(s->'company') is distinct from 'string' or length(s->>'company')>80
+   or jsonb_typeof(s->'department') is distinct from 'string' or length(s->>'department')>80
+   or (s->>'displayName') ~ '[[:cntrl:]<>]' or (s->>'company') ~ '[[:cntrl:]<>]' or (s->>'department') ~ '[[:cntrl:]<>]' then raise exception 'SPEAKER_ROSTER_INVALID'; end if;
+  begin selected_speaker_id:=(s->>'id')::uuid;participant_id:=(s->>'participantId')::uuid;photo_id:=(s->>'photoAssetId')::uuid;
+  exception when invalid_text_representation then raise exception 'SPEAKER_ROSTER_INVALID'; end;
+  if selected_speaker_id is null then raise exception 'SPEAKER_ROSTER_INVALID'; end if;
+  if exists(select 1 from jsonb_array_elements(result) x where x->>'id'=selected_speaker_id::text or (participant_id is not null and x->>'participantId'=participant_id::text)) then raise exception 'SPEAKER_ROSTER_DUPLICATE'; end if;
+  if participant_id is not null and not exists(select 1 from public.live_participants p where p.id=participant_id and p.session_id=p_session_id) then raise exception 'SPEAKER_ROSTER_PARTICIPANT'; end if;
+  if photo_id is not null and not exists(select 1 from public.live_speaker_photos p where p.id=photo_id and p.session_id=p_session_id) then raise exception 'SPEAKER_ROSTER_PHOTO'; end if;
+  normalized:=jsonb_build_object('id',selected_speaker_id,'displayName',btrim(s->>'displayName'),'company',s->>'company','department',s->>'department','photoAssetId',photo_id,'participantId',participant_id);
+  select v.profile into previous from public.live_speaker_profile_versions v where v.session_id=p_session_id and v.speaker_id=selected_speaker_id order by v.version desc limit 1;
+  if previous is null then next_version:=1;
+  elsif (previous-'version')=normalized then next_version:=(previous->>'version')::integer;
+  else next_version:=(previous->>'version')::integer+1; end if;
+  normalized:=normalized||jsonb_build_object('version',next_version);
+  insert into public.live_speaker_profile_versions(session_id,speaker_id,version,profile) values(p_session_id,selected_speaker_id,next_version,normalized) on conflict do nothing;
+  result:=result||jsonb_build_array(normalized);
+ end loop;
+ if p_active_onsite_speaker_id is not null and not exists(select 1 from jsonb_array_elements(result) x where x->>'id'=p_active_onsite_speaker_id::text) then raise exception 'SPEAKER_ROSTER_ACTIVE'; end if;
+ update public.live_speaker_rosters set revision=r.revision+1,applied_revision=case when current_status='preparing' then r.revision+1 else r.applied_revision end,speakers=result,active_onsite_speaker_id=p_active_onsite_speaker_id where session_id=p_session_id;
+ return public.get_live_speaker_roster_gateway_v1(p_session_id);
+end $$;
+
+create function public.ack_live_speaker_roster_v1(p_session_id uuid,p_revision integer)
+returns jsonb language plpgsql security definer set search_path='' as $$
+declare r public.live_speaker_rosters%rowtype;
+begin
+ select * into r from public.live_speaker_rosters where session_id=p_session_id for update;
+ if not found then
+  if p_revision=0 then return public.get_live_speaker_roster_gateway_v1(p_session_id); end if;
+  raise exception 'SPEAKER_ROSTER_REVISION';
+ end if;
+ if p_revision is null or p_revision<0 or p_revision>r.revision then raise exception 'SPEAKER_ROSTER_REVISION'; end if;
+ update public.live_speaker_rosters set applied_revision=greatest(applied_revision,p_revision) where session_id=p_session_id;
+ return public.get_live_speaker_roster_gateway_v1(p_session_id);
+end $$;
+
+create function public.create_live_speaker_photo_v1(p_session_id uuid,p_host_id text,p_photo_id uuid,p_content_type text,p_bytes_base64 text)
+returns jsonb language plpgsql security definer set search_path='' as $$
+declare current_status text; bytes bytea;
+begin
+ select status::text into current_status from public.live_sessions where id=p_session_id and host_id=p_host_id for update;
+ if not found then raise exception 'SPEAKER_ROSTER_FORBIDDEN'; end if;
+ if current_status in ('stopped','failed') then raise exception 'SPEAKER_ROSTER_TERMINAL'; end if;
+ if p_photo_id is null or p_content_type is null or p_content_type not in ('image/jpeg','image/png','image/webp') or p_bytes_base64 is null or length(p_bytes_base64)>349528 then raise exception 'SPEAKER_ROSTER_PHOTO'; end if;
+ begin bytes:=decode(p_bytes_base64,'base64');exception when others then raise exception 'SPEAKER_ROSTER_PHOTO';end;
+ if octet_length(bytes) not between 1 and 262144 then raise exception 'SPEAKER_ROSTER_PHOTO'; end if;
+ insert into public.live_speaker_photos(id,session_id,content_type,image_base64,size_bytes) values(p_photo_id,p_session_id,p_content_type,p_bytes_base64,octet_length(bytes));
+ return jsonb_build_object('photoAssetId',p_photo_id);
+end $$;
+create function public.get_live_speaker_photo_v1(p_session_id uuid,p_photo_id uuid)
+returns jsonb language sql stable security definer set search_path='' as $$
+ select jsonb_build_object('contentType',content_type,'bytesBase64',image_base64) from public.live_speaker_photos where session_id=p_session_id and id=p_photo_id;
+$$;
+revoke all on function public.get_live_speaker_roster_gateway_v1(uuid),public.get_live_speaker_roster_v1(uuid,text),public.replace_live_speaker_roster_v1(uuid,text,integer,jsonb,uuid),public.ack_live_speaker_roster_v1(uuid,integer),public.create_live_speaker_photo_v1(uuid,text,uuid,text,text),public.get_live_speaker_photo_v1(uuid,uuid) from public,anon,authenticated,service_role;
+grant execute on function public.get_live_speaker_roster_gateway_v1(uuid),public.get_live_speaker_roster_v1(uuid,text),public.replace_live_speaker_roster_v1(uuid,text,integer,jsonb,uuid),public.ack_live_speaker_roster_v1(uuid,integer),public.create_live_speaker_photo_v1(uuid,text,uuid,text,text),public.get_live_speaker_photo_v1(uuid,uuid) to service_role;
+
+
+-- Speaker feature migration: 202609050004_speaker_profile_history.sql
+-- 2026-09-05 feat: Persist the identity selected at the audio boundary, never the latest profile.
+alter table public.live_source_utterances add column speaker_profile jsonb, add column speaker_attribution text check(speaker_attribution is null or speaker_attribution='unresolved');
+alter table public.live_utterances add column speaker_profile jsonb, add column speaker_attribution text check(speaker_attribution is null or speaker_attribution='unresolved');
+create function public.assert_live_speaker_profile_v1(p_session_id uuid,p_profile jsonb,p_attribution text)
+returns void language plpgsql stable security definer set search_path='' as $$
+begin
+ if p_attribution is not null and p_attribution<>'unresolved' then raise exception 'SPEAKER_PROFILE_INVALID'; end if;
+ if p_profile is null then return; end if;
+ if p_attribution is not null or not exists(select 1 from public.live_speaker_profile_versions v where v.session_id=p_session_id and (v.profile-'participantId')=p_profile) then raise exception 'SPEAKER_PROFILE_INVALID'; end if;
+end $$;
+revoke all on function public.assert_live_speaker_profile_v1(uuid,jsonb,text) from public,anon,authenticated,service_role;
+create or replace function public.persist_authoritative_live_source_utterance_v4(
+  p_session_id uuid,
+  p_utterance_key text,
+  p_raw_text text,
+  p_normalized_text text,
+  p_source_language text,
+  p_speaker_role text,
+  p_speaker_label text,
+  p_speaker_name text,
+  p_speaker_department text,
+  p_speaker_job_title text,
+  p_participant_id uuid,
+  p_source_started_at timestamptz,
+  p_source_ended_at timestamptz,
+  p_provider_committed_at timestamptz,
+  p_stt_provider text,
+  p_stt_model text,
+  p_translation_model text,
+  p_pipeline_config_fingerprint text,
+  p_language_observation jsonb,
+  p_speaker_profile jsonb,
+  p_speaker_attribution text,
+  p_source_provenance jsonb default null
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+  locked_session public.live_sessions%rowtype;
+  matched_participant public.live_participants%rowtype;
+  existing_source public.live_source_utterances%rowtype;
+  inserted_source public.live_source_utterances%rowtype;
+  next_source_seq bigint;
+  clean_key text;
+  clean_normalized_text text;
+  clean_source_language text;
+  clean_speaker_label text;
+  clean_speaker_name text;
+  clean_speaker_department text;
+  clean_speaker_job_title text;
+  clean_stt_model text;
+  clean_translation_model text;
+begin
+  perform public.assert_live_speaker_profile_v1(p_session_id,p_speaker_profile,p_speaker_attribution);
+  if p_speaker_role is null or (p_speaker_attribution='unresolved' and (p_speaker_role<>'unknown' or p_participant_id is not null)) or (p_speaker_profile is not null and p_speaker_role not in ('host','participant')) then raise exception 'SPEAKER_PROFILE_INVALID'; end if;
+  if p_source_provenance is not null and (not public.live_input_source_provenance_valid_v1(p_source_provenance) or p_stt_provider is distinct from 'gemini-live-input-transcription' or p_stt_model is distinct from 'gemini-3.5-live-translate-preview' or p_source_started_at is not null) then raise exception 'INVALID_LIVE_SOURCE_PROVENANCE'; end if;
+  if public.live_source_observation_valid_v1(p_language_observation, p_source_language) is not true then
+    raise exception using errcode = '22023', message = 'INVALID_SOURCE_LANGUAGE_OBSERVATION';
+  end if;
+  clean_key := nullif(btrim(coalesce(p_utterance_key, '')), '');
+  clean_normalized_text := nullif(normalize(btrim(coalesce(p_normalized_text, '')), NFC), '');
+  clean_source_language := nullif(btrim(coalesce(p_source_language, '')), '');
+  clean_speaker_label := nullif(normalize(btrim(coalesce(p_speaker_label, '')), NFC), '');
+  clean_speaker_name := nullif(normalize(btrim(coalesce(p_speaker_name, '')), NFC), '');
+  clean_speaker_department := nullif(normalize(btrim(coalesce(p_speaker_department, '')), NFC), '');
+  clean_speaker_job_title := nullif(normalize(btrim(coalesce(p_speaker_job_title, '')), NFC), '');
+  clean_stt_model := nullif(btrim(coalesce(p_stt_model, '')), '');
+  clean_translation_model := nullif(btrim(coalesce(p_translation_model, '')), '');
+
+  if p_session_id is null
+    or clean_key is null
+    or char_length(clean_key) > 200
+    or octet_length(clean_key) > 600
+    or clean_key ~ '[[:cntrl:]<>]'
+    or p_raw_text is null
+    or char_length(btrim(p_raw_text)) not between 1 and 8000
+    or octet_length(p_raw_text) > 24000
+    or clean_normalized_text is null
+    or char_length(clean_normalized_text) > 8000
+    or octet_length(clean_normalized_text) > 24000
+    or clean_source_language is null
+    or clean_source_language !~ '^[A-Za-z]{2,3}(-[A-Za-z0-9]{2,8})*$'
+    or p_speaker_role not in ('host', 'participant', 'unknown')
+    or (p_speaker_role = 'participant') <> (p_participant_id is not null)
+    or (clean_speaker_label is not null and (
+      char_length(clean_speaker_label) > 80 or clean_speaker_label ~ '[[:cntrl:]<>]'
+    ))
+    or (clean_speaker_name is not null and (
+      char_length(clean_speaker_name) > 40 or clean_speaker_name ~ '[[:cntrl:]<>]'
+    ))
+    or (clean_speaker_department is not null and (
+      char_length(clean_speaker_department) > 80 or clean_speaker_department ~ '[[:cntrl:]<>]'
+    ))
+    or (clean_speaker_job_title is not null and (
+      char_length(clean_speaker_job_title) > 100 or clean_speaker_job_title ~ '[[:cntrl:]<>]'
+    ))
+    or p_source_ended_at is null
+    or p_provider_committed_at is null
+    or p_provider_committed_at < p_source_ended_at
+    or (p_source_started_at is not null and (
+      p_source_started_at > p_source_ended_at
+      or p_source_ended_at - p_source_started_at > interval '1 hour'
+    ))
+    or p_stt_provider is null
+    or p_stt_provider !~ '^[a-z0-9][a-z0-9._-]{0,63}$'
+    or (clean_stt_model is not null and (
+      char_length(clean_stt_model) > 120 or clean_stt_model ~ '[[:cntrl:]<>]'
+    ))
+    or (clean_translation_model is not null and (
+      char_length(clean_translation_model) > 120 or clean_translation_model ~ '[[:cntrl:]<>]'
+    ))
+    or (p_pipeline_config_fingerprint is not null
+      and p_pipeline_config_fingerprint !~ '^sha256:[0-9a-f]{64}$')
+  then
+    raise exception using errcode = '22023', message = 'INVALID_AUTHORITATIVE_SOURCE_INPUT';
+  end if;
+
+  select * into locked_session
+  from public.live_sessions session_row
+  where session_row.id = p_session_id
+    and session_row.status = 'live'
+    and session_row.expires_at > statement_timestamp()
+    and session_row.archive_deleted_at is null
+  for update;
+  if not found then
+    raise exception using errcode = 'P0001', message = 'SESSION_NOT_LIVE';
+  end if;
+
+  if p_participant_id is not null then
+    select * into matched_participant
+    from public.live_participants participant_row
+    where participant_row.id = p_participant_id
+      and participant_row.session_id = p_session_id;
+    if not found then
+      raise exception using errcode = '42501', message = 'PARTICIPANT_SESSION_MISMATCH';
+    end if;
+    if p_speaker_profile is null then
+    clean_speaker_name := matched_participant.display_name;
+    clean_speaker_department := matched_participant.department;
+    clean_speaker_job_title := matched_participant.job_title;
+    end if;
+  end if;
+
+  if p_speaker_profile is not null then
+    clean_speaker_name := p_speaker_profile->>'displayName';
+    clean_speaker_label := clean_speaker_name;
+    clean_speaker_department := p_speaker_profile->>'department';
+  end if;
+
+  select * into existing_source
+  from public.live_source_utterances source_row
+  where source_row.session_id = p_session_id
+    and source_row.utterance_key = clean_key;
+  if found then
+    if existing_source.speaker_profile is distinct from p_speaker_profile
+      or existing_source.speaker_attribution is distinct from p_speaker_attribution
+      or existing_source.source_provenance is distinct from p_source_provenance
+      or existing_source.language_observation is distinct from p_language_observation
+      or existing_source.raw_text is distinct from p_raw_text
+      or existing_source.normalized_text is distinct from clean_normalized_text
+      or existing_source.source_language is distinct from clean_source_language
+      or existing_source.speaker_role is distinct from p_speaker_role
+      or existing_source.speaker_label is distinct from clean_speaker_label
+      or existing_source.speaker_name is distinct from clean_speaker_name
+      or existing_source.speaker_department is distinct from clean_speaker_department
+      or existing_source.speaker_job_title is distinct from clean_speaker_job_title
+      or existing_source.participant_id is distinct from p_participant_id
+      or existing_source.source_started_at is distinct from p_source_started_at
+      or existing_source.source_ended_at is distinct from p_source_ended_at
+      or existing_source.provider_committed_at is distinct from p_provider_committed_at
+      or existing_source.stt_provider is distinct from p_stt_provider
+      or existing_source.stt_model is distinct from clean_stt_model
+      or existing_source.translation_model is distinct from clean_translation_model
+      or existing_source.pipeline_config_fingerprint is distinct from p_pipeline_config_fingerprint
+      or existing_source.glossary_fingerprint is distinct from locked_session.pinned_glossary_fingerprint
+    then
+      raise exception using errcode = 'P0001', message = 'SOURCE_UTTERANCE_IDEMPOTENCY_CONFLICT';
+    end if;
+    return jsonb_build_object(
+      'ok', true,
+      'sourceUtteranceId', existing_source.id,
+      'sourceSeq', existing_source.source_seq,
+      'idempotent', true
+    );
+  end if;
+
+  select coalesce(max(source_row.source_seq), 0) + 1
+  into next_source_seq
+  from public.live_source_utterances source_row
+  where source_row.session_id = p_session_id;
+
+  insert into public.live_source_utterances (
+    speaker_profile,speaker_attribution,source_provenance,language_observation, session_id, source_seq, utterance_key, raw_text, normalized_text,
+    source_language, speaker_role, speaker_label, speaker_name,
+    speaker_department, speaker_job_title, participant_id,
+    source_started_at, source_ended_at, provider_committed_at,
+    stt_provider, stt_model, translation_model, pipeline_config_fingerprint,
+    glossary_fingerprint, created_at
+  ) values (
+    p_speaker_profile,p_speaker_attribution,p_source_provenance,p_language_observation, p_session_id, next_source_seq, clean_key, p_raw_text, clean_normalized_text,
+    clean_source_language, p_speaker_role, clean_speaker_label, clean_speaker_name,
+    clean_speaker_department, clean_speaker_job_title, p_participant_id,
+    p_source_started_at, p_source_ended_at, p_provider_committed_at,
+    p_stt_provider, clean_stt_model, clean_translation_model,
+    p_pipeline_config_fingerprint, locked_session.pinned_glossary_fingerprint,
+    statement_timestamp()
+  ) returning * into inserted_source;
+
+  return jsonb_build_object(
+    'ok', true,
+    'sourceUtteranceId', inserted_source.id,
+    'sourceSeq', inserted_source.source_seq,
+    'idempotent', false
+  );
+exception
+  when unique_violation then
+    raise exception using errcode = '23505', message = 'SOURCE_UTTERANCE_IDEMPOTENCY_CONFLICT';
+end;
+$$;
+
+revoke all on function public.persist_authoritative_live_source_utterance_v4(uuid, text, text, text, text, text, text, text, text, text, uuid, timestamptz, timestamptz, timestamptz, text, text, text, text, jsonb, jsonb, text, jsonb) from public,anon,authenticated,service_role;
+grant execute on function public.persist_authoritative_live_source_utterance_v4(uuid, text, text, text, text, text, text, text, text, text, uuid, timestamptz, timestamptz, timestamptz, text, text, text, text, jsonb, jsonb, text, jsonb) to service_role;
+
+create function public.persist_authoritative_live_source_utterance_v4_fenced_v1(p_epoch integer,p_owner_id uuid,
+  p_session_id uuid,
+  p_utterance_key text,
+  p_raw_text text,
+  p_normalized_text text,
+  p_source_language text,
+  p_speaker_role text,
+  p_speaker_label text,
+  p_speaker_name text,
+  p_speaker_department text,
+  p_speaker_job_title text,
+  p_participant_id uuid,
+  p_source_started_at timestamptz,
+  p_source_ended_at timestamptz,
+  p_provider_committed_at timestamptz,
+  p_stt_provider text,
+  p_stt_model text,
+  p_translation_model text,
+  p_pipeline_config_fingerprint text,
+  p_language_observation jsonb,
+  p_speaker_profile jsonb,
+  p_speaker_attribution text,
+  p_source_provenance jsonb default null)
+returns jsonb language plpgsql security definer set search_path='' as $$ begin
+ perform public.assert_live_media_write_epoch_v1(p_session_id,p_epoch,p_owner_id);
+ return public.persist_authoritative_live_source_utterance_v4(p_session_id, p_utterance_key, p_raw_text, p_normalized_text, p_source_language, p_speaker_role, p_speaker_label, p_speaker_name, p_speaker_department, p_speaker_job_title, p_participant_id, p_source_started_at, p_source_ended_at, p_provider_committed_at, p_stt_provider, p_stt_model, p_translation_model, p_pipeline_config_fingerprint, p_language_observation, p_speaker_profile, p_speaker_attribution, p_source_provenance);
+end $$;
+revoke all on function public.persist_authoritative_live_source_utterance_v4_fenced_v1(integer,uuid,uuid, text, text, text, text, text, text, text, text, text, uuid, timestamptz, timestamptz, timestamptz, text, text, text, text, jsonb, jsonb, text, jsonb) from public,anon,authenticated,service_role;
+grant execute on function public.persist_authoritative_live_source_utterance_v4_fenced_v1(integer,uuid,uuid, text, text, text, text, text, text, text, text, text, uuid, timestamptz, timestamptz, timestamptz, text, text, text, text, jsonb, jsonb, text, jsonb) to service_role;
+
+create or replace function public.read_owned_live_source_snapshot_v1(
+  p_session_id uuid, p_host_id text,
+  p_after_source_seq bigint default 0, p_limit integer default 200
+)
+returns jsonb language plpgsql stable security definer set search_path = ''
+as $$
+declare
+  recording_gaps jsonb;
+  source_rows jsonb;
+  last_source_seq bigint;
+  next_source_seq bigint;
+  has_next boolean;
+  estimated_bytes bigint;
+begin
+  if p_after_source_seq is null or p_after_source_seq < 0 or p_after_source_seq > 9007199254740991
+    or p_limit is null or p_limit < 1 or p_limit > 500 then
+    raise exception using errcode = '22023', message = 'INVALID_SOURCE_SNAPSHOT_INPUT';
+  end if;
+  if p_host_id is null or char_length(p_host_id) not between 1 and 256 then
+    raise exception using errcode='42501',message='SOURCE_FORBIDDEN';
+  end if;
+  perform 1 from public.live_sessions target where target.id=p_session_id
+    and target.host_id=p_host_id and target.archive_deleted_at is null;
+  if not found then
+    raise exception using errcode='42501',message='SOURCE_FORBIDDEN';
+  end if;
+  -- The owner can inspect captured originals during a call and afterwards.
+  -- Participant grant, revocation and six-hour checks remain in their own RPC.
+  recording_gaps := public.read_owned_live_recording_gaps_v1(p_session_id,p_host_id) -> 'recordingGaps';
+
+  select coalesce(max(source.source_seq),0) into last_source_seq
+    from public.live_source_utterances source where source.session_id=p_session_id;
+  if last_source_seq > 9007199254740991 then
+    raise exception using errcode='P0001',message='SOURCE_SNAPSHOT_TOO_LARGE';
+  end if;
+  select coalesce(sum(octet_length(to_jsonb(coalesce(correction.corrected_text,source.normalized_text))::text)+2048),0)
+    into estimated_bytes from (select * from public.live_source_utterances target
+      where target.session_id=p_session_id and target.source_seq>p_after_source_seq
+      order by target.source_seq limit p_limit) source
+    left join lateral (select row.corrected_text from public.live_source_utterance_corrections row
+      where row.source_utterance_id=source.id and row.session_id=p_session_id order by row.revision desc limit 1) correction on true;
+  if estimated_bytes + octet_length(recording_gaps::text) > 12*1024*1024 then
+    raise exception using errcode='P0001',message='SOURCE_SNAPSHOT_TOO_LARGE';
+  end if;
+
+  select coalesce(jsonb_agg(jsonb_build_object(
+    'type','source','sessionId',source.session_id,'sourceUtteranceId',source.id,'sourceSeq',source.source_seq,
+    'utteranceKey',source.utterance_key,'text',coalesce(correction.corrected_text,source.normalized_text),
+    'sourceLanguage',source.source_language,'languageObservation',source.language_observation,
+    'speaker',jsonb_build_object('role',source.speaker_role,'label',case source.speaker_role
+      when 'host' then '발표자' when 'participant' then '참여자' else '화자 미상' end),
+    'isFinal',true,'sourceStartedAt',source.source_started_at,'sourceEndedAt',source.source_ended_at,
+    'emittedAt',source.provider_committed_at
+  ) || case when source.speaker_profile is not null then jsonb_build_object('speakerProfile',source.speaker_profile) else '{}'::jsonb end || case when source.speaker_attribution is not null then jsonb_build_object('speakerAttribution',source.speaker_attribution) else '{}'::jsonb end order by source.source_seq),'[]'::jsonb),max(source.source_seq) into source_rows,next_source_seq
+    from (select * from public.live_source_utterances target
+      where target.session_id=p_session_id and target.source_seq>p_after_source_seq
+      order by target.source_seq limit p_limit) source
+    left join lateral (select row.corrected_text from public.live_source_utterance_corrections row
+      where row.source_utterance_id=source.id and row.session_id=p_session_id order by row.revision desc limit 1) correction on true;
+  has_next := next_source_seq is not null and next_source_seq < last_source_seq;
+  return jsonb_build_object('sessionId',p_session_id,'sources',source_rows,'lastSourceSeq',last_source_seq,
+    'hasNextPage',has_next,'nextAfterSourceSeq',case when has_next then next_source_seq else null end,
+    'recordsExpiresAt',null,'recordingGaps',recording_gaps);
+end;
+$$;
+revoke all on function public.read_owned_live_source_snapshot_v1(uuid,text,bigint,integer)
+  from public,anon,authenticated,service_role;
+grant execute on function public.read_owned_live_source_snapshot_v1(uuid,text,bigint,integer) to service_role;
+
+create or replace function public.read_participant_live_source_snapshot_v1(
+  p_session_id uuid, p_user_id text, p_grant_id uuid default null,
+  p_after_source_seq bigint default 0, p_limit integer default 200
+)
+returns jsonb language plpgsql stable security definer set search_path = ''
+as $$
+declare
+  session_row public.live_sessions%rowtype;
+  records_expire_at timestamptz;
+  source_rows jsonb;
+  recording_gaps jsonb;
+  last_source_seq bigint;
+  next_source_seq bigint;
+  has_next boolean;
+  estimated_bytes bigint;
+begin
+  if p_after_source_seq is null or p_after_source_seq < 0 or p_after_source_seq > 9007199254740991
+    or p_limit is null or p_limit < 1 or p_limit > 500 then
+    raise exception using errcode = '22023', message = 'INVALID_SOURCE_SNAPSHOT_INPUT';
+  end if;
+  select * into session_row from public.live_sessions target
+    where target.id=p_session_id and target.archive_deleted_at is null;
+  if not found or not exists(select 1 from public.live_participants member
+    where member.session_id=p_session_id and member.user_id=p_user_id and member.records_revoked_at is null) then
+    raise exception using errcode='42501',message='SOURCE_FORBIDDEN';
+  end if;
+  if session_row.status in ('stopped','failed') then
+    if session_row.ended_at is null then
+      raise exception using errcode='P0001',message='RECAP_NOT_READY';
+    end if;
+    records_expire_at := session_row.ended_at + interval '6 hours';
+    if records_expire_at <= statement_timestamp() then
+      raise exception using errcode='P0001',message='RECAP_EXPIRED';
+    end if;
+  elsif session_row.status in ('preparing','live','paused') and session_row.expires_at > statement_timestamp() then
+    if not exists(select 1 from public.viewer_grants grant_row where grant_row.id=p_grant_id
+      and grant_row.session_id=p_session_id and grant_row.user_id=p_user_id
+      and grant_row.revoked_at is null and grant_row.expires_at > statement_timestamp()) then
+      raise exception using errcode='42501',message='SOURCE_FORBIDDEN';
+    end if;
+  else
+    raise exception using errcode='42501',message='SOURCE_FORBIDDEN';
+  end if;
+
+  if (select count(*) from public.live_media_recording_gaps target where target.session_id=p_session_id) > 12000 then
+    raise exception using errcode='P0001',message='SOURCE_SNAPSHOT_TOO_LARGE';
+  end if;
+  select coalesce(jsonb_agg(jsonb_build_object('id',target.id,'startedAt',target.started_at,
+    'endedAt',target.ended_at,'reason',target.reason) order by target.started_at,target.id),'[]'::jsonb)
+    into recording_gaps from public.live_media_recording_gaps target where target.session_id=p_session_id;
+
+  select coalesce(max(source.source_seq),0) into last_source_seq
+    from public.live_source_utterances source where source.session_id=p_session_id;
+  if last_source_seq > 9007199254740991 then
+    raise exception using errcode='P0001',message='SOURCE_SNAPSHOT_TOO_LARGE';
+  end if;
+  select coalesce(sum(octet_length(to_jsonb(coalesce(correction.corrected_text,source.normalized_text))::text)+2048),0)
+    into estimated_bytes from (select * from public.live_source_utterances target
+      where target.session_id=p_session_id and target.source_seq>p_after_source_seq
+      order by target.source_seq limit p_limit) source
+    left join lateral (select row.corrected_text from public.live_source_utterance_corrections row
+      where row.source_utterance_id=source.id and row.session_id=p_session_id order by row.revision desc limit 1) correction on true;
+  if estimated_bytes > 12*1024*1024 then
+    raise exception using errcode='P0001',message='SOURCE_SNAPSHOT_TOO_LARGE';
+  end if;
+
+  select coalesce(jsonb_agg(jsonb_build_object(
+    'type','source','sessionId',source.session_id,'sourceUtteranceId',source.id,'sourceSeq',source.source_seq,
+    'utteranceKey',source.utterance_key,'text',coalesce(correction.corrected_text,source.normalized_text),
+    'sourceLanguage',source.source_language,'languageObservation',source.language_observation,
+    'speaker',jsonb_build_object('role',source.speaker_role,'label',case source.speaker_role
+      when 'host' then '발표자' when 'participant' then '참여자' else '화자 미상' end),
+    'isFinal',true,'sourceStartedAt',source.source_started_at,'sourceEndedAt',source.source_ended_at,
+    'emittedAt',source.provider_committed_at
+  ) || case when source.speaker_profile is not null then jsonb_build_object('speakerProfile',source.speaker_profile) else '{}'::jsonb end || case when source.speaker_attribution is not null then jsonb_build_object('speakerAttribution',source.speaker_attribution) else '{}'::jsonb end order by source.source_seq),'[]'::jsonb),max(source.source_seq) into source_rows,next_source_seq
+    from (select * from public.live_source_utterances target
+      where target.session_id=p_session_id and target.source_seq>p_after_source_seq
+      order by target.source_seq limit p_limit) source
+    left join lateral (select row.corrected_text from public.live_source_utterance_corrections row
+      where row.source_utterance_id=source.id and row.session_id=p_session_id order by row.revision desc limit 1) correction on true;
+  has_next := next_source_seq is not null and next_source_seq < last_source_seq;
+  return jsonb_build_object('sessionId',p_session_id,'sources',source_rows,'lastSourceSeq',last_source_seq,
+    'hasNextPage',has_next,'nextAfterSourceSeq',case when has_next then next_source_seq else null end,
+    'recordsExpiresAt',records_expire_at,'recordingGaps',recording_gaps);
+end;
+$$;
+revoke all on function public.read_participant_live_source_snapshot_v1(uuid,text,uuid,bigint,integer)
+  from public,anon,authenticated,service_role;
+grant execute on function public.read_participant_live_source_snapshot_v1(uuid,text,uuid,bigint,integer) to service_role;
+
+-- 2026-09-05 fix: Authorize custom identity before delegating to the existing caption sanitizer.
+alter function public.persist_live_snapshot_if_active(uuid,text,jsonb) rename to persist_live_snapshot_if_active_before_speaker_profile;
+revoke all on function public.persist_live_snapshot_if_active_before_speaker_profile(uuid,text,jsonb) from public,anon,authenticated,service_role;
+create function public.persist_live_snapshot_if_active(p_session_id uuid,p_language text,p_event jsonb)
+returns boolean language plpgsql security definer set search_path='' as $$
+declare stored boolean; clean_event jsonb; existing jsonb; additions jsonb;
+begin
+ if not(p_event ? 'speakerProfile' or p_event ? 'speakerAttribution') then return public.persist_live_snapshot_if_active_before_speaker_profile(p_session_id,p_language,p_event); end if;
+ perform public.assert_live_speaker_profile_v1(p_session_id,p_event->'speakerProfile',p_event->>'speakerAttribution');
+ if p_event ? 'speakerProfile' and (coalesce(p_event->>'speakerRole','') not in ('host','participant') or p_event->>'speakerName' is distinct from p_event->'speakerProfile'->>'displayName' or p_event->>'speakerDepartment' is distinct from p_event->'speakerProfile'->>'department') then raise exception 'SPEAKER_PROFILE_INVALID'; end if;
+ if p_event->>'speakerAttribution'='unresolved' and p_event->>'speakerRole' is distinct from 'unknown' then raise exception 'SPEAKER_PROFILE_INVALID'; end if;
+ additions:=jsonb_build_object('speakerAttribution',p_event->'speakerAttribution','speakerProfile',p_event->'speakerProfile');
+ if p_event ? 'speakerProfile' then additions:=additions||jsonb_build_object('speakerRole',p_event->'speakerRole','speakerName',p_event->'speakerProfile'->>'displayName','speakerDepartment',p_event->'speakerProfile'->>'department','speakerJobTitle',''); end if;
+ select coalesce(jsonb_object_agg(key,value),'{}'::jsonb) into additions from jsonb_each(additions) where value<>'null'::jsonb;
+ clean_event:=p_event-array['speakerProfile','speakerAttribution','speakerRole','speakerName','speakerDepartment','speakerJobTitle'];
+ select captions->0 into existing from public.live_snapshots where session_id=p_session_id and language=p_language and last_seq=(p_event->>'seq')::bigint;
+ if existing is not null and (existing->'speakerProfile' is distinct from p_event->'speakerProfile' or existing->>'speakerAttribution' is distinct from p_event->>'speakerAttribution') then raise exception 'SPEAKER_PROFILE_IDEMPOTENCY_CONFLICT'; end if;
+ stored:=public.persist_live_snapshot_if_active_before_speaker_profile(p_session_id,p_language,clean_event);
+ if stored then update public.live_snapshots set captions=jsonb_build_array((captions->0)||additions) where session_id=p_session_id and language=p_language and last_seq=(p_event->>'seq')::bigint; end if;
+ return stored;
+end $$;
+revoke all on function public.persist_live_snapshot_if_active(uuid,text,jsonb) from public,anon,authenticated,service_role;
+grant execute on function public.persist_live_snapshot_if_active(uuid,text,jsonb) to service_role;
+alter function public.persist_live_final_caption_if_active(uuid, text, jsonb, bigint, text, text, text, timestamptz, timestamptz, timestamptz, uuid, text, text, text, text, text) rename to persist_live_final_caption_before_speaker_profile;
+revoke all on function public.persist_live_final_caption_before_speaker_profile(uuid, text, jsonb, bigint, text, text, text, timestamptz, timestamptz, timestamptz, uuid, text, text, text, text, text) from public,anon,authenticated,service_role;
+create function public.persist_live_final_caption_if_active(
+  p_session_id uuid,
+  p_language text,
+  p_event jsonb,
+  p_seq bigint,
+  p_text text,
+  p_speaker_label text,
+  p_speaker_name text,
+  p_source_started_at timestamptz,
+  p_source_ended_at timestamptz,
+  p_emitted_at timestamptz,
+  p_participant_id uuid,
+  p_source_text text,
+  p_source_language text,
+  p_origin text,
+  p_utterance_key text,
+  p_translation_status text) returns boolean language plpgsql security definer set search_path='' as $$
+declare stored boolean; previous public.live_utterances%rowtype; existed boolean;
+begin
+ perform public.assert_live_speaker_profile_v1(p_session_id,p_event->'speakerProfile',p_event->>'speakerAttribution');
+ if p_event ? 'speakerProfile' and (coalesce(p_event->>'speakerRole','') not in ('host','participant') or p_event->>'speakerName' is distinct from p_event->'speakerProfile'->>'displayName' or p_event->>'speakerDepartment' is distinct from p_event->'speakerProfile'->>'department') then raise exception 'SPEAKER_PROFILE_INVALID'; end if;
+ if p_event->>'speakerAttribution'='unresolved' and p_event->>'speakerRole' is distinct from 'unknown' then raise exception 'SPEAKER_PROFILE_INVALID'; end if;
+ select * into previous from public.live_utterances where session_id=p_session_id and language=p_language and seq=p_seq;
+ existed:=found;
+ if existed and (previous.speaker_profile is distinct from p_event->'speakerProfile' or previous.speaker_attribution is distinct from p_event->>'speakerAttribution') then raise exception 'SPEAKER_PROFILE_IDEMPOTENCY_CONFLICT'; end if;
+ stored:=public.persist_live_final_caption_before_speaker_profile(p_session_id, p_language, p_event, p_seq, p_text, p_speaker_label, p_speaker_name, p_source_started_at, p_source_ended_at, p_emitted_at, p_participant_id, p_source_text, p_source_language, p_origin, p_utterance_key, p_translation_status);
+ if stored and not existed then update public.live_utterances set speaker_profile=p_event->'speakerProfile',speaker_attribution=p_event->>'speakerAttribution' where session_id=p_session_id and language=p_language and seq=p_seq; end if;
+ return stored;
+end $$;
+revoke all on function public.persist_live_final_caption_if_active(uuid, text, jsonb, bigint, text, text, text, timestamptz, timestamptz, timestamptz, uuid, text, text, text, text, text) from public,anon,authenticated,service_role;
+grant execute on function public.persist_live_final_caption_if_active(uuid, text, jsonb, bigint, text, text, text, timestamptz, timestamptz, timestamptz, uuid, text, text, text, text, text) to service_role;
+
+alter function public.read_owned_authoritative_live_transcript_v1(text, uuid, bigint, integer) rename to read_owned_authoritative_live_transcript_v1_before_profile;
+revoke all on function public.read_owned_authoritative_live_transcript_v1_before_profile(text, uuid, bigint, integer) from public,anon,authenticated,service_role;
+create function public.read_owned_authoritative_live_transcript_v1(
+  p_host_id text,
+  p_session_id uuid,
+  p_after_source_seq bigint default 0,
+  p_limit integer default 200
+) returns table(
+  source_utterance_id uuid,
+  source_seq bigint,
+  utterance_key text,
+  raw_text text,
+  normalized_text text,
+  effective_text text,
+  source_language text,
+  speaker_role text,
+  speaker_label text,
+  speaker_name text,
+  speaker_department text,
+  speaker_job_title text,
+  participant_id uuid,
+  source_started_at timestamptz,
+  source_ended_at timestamptz,
+  provider_committed_at timestamptz,
+  stt_provider text,
+  stt_model text,
+  translation_model text,
+  pipeline_config_fingerprint text,
+  glossary_fingerprint text,
+  correction_revision integer,
+  corrected_at timestamptz,
+  translations jsonb
+,speaker_profile jsonb,speaker_attribution text)
+language sql stable security definer set search_path='' as $$
+ select original.*,source.speaker_profile,source.speaker_attribution from public.read_owned_authoritative_live_transcript_v1_before_profile(p_host_id, p_session_id, p_after_source_seq, p_limit) original join public.live_source_utterances source on source.id=original.source_utterance_id and source.session_id=p_session_id;
+$$;
+revoke all on function public.read_owned_authoritative_live_transcript_v1(text, uuid, bigint, integer) from public,anon,authenticated,service_role;
+grant execute on function public.read_owned_authoritative_live_transcript_v1(text, uuid, bigint, integer) to service_role;
+
+alter function public.read_participant_live_source_transcript_v1(uuid, text, bigint, integer) rename to read_participant_live_source_transcript_v1_before_profile;
+revoke all on function public.read_participant_live_source_transcript_v1_before_profile(uuid, text, bigint, integer) from public,anon,authenticated,service_role;
+create function public.read_participant_live_source_transcript_v1(
+  p_session_id uuid, p_user_id text,
+  p_after_source_seq bigint default 0, p_limit integer default 200
+) returns table(
+  source_utterance_id uuid, source_seq bigint, effective_text text,
+  source_language text, speaker_label text, source_started_at timestamptz,
+  source_ended_at timestamptz
+,speaker_profile jsonb,speaker_attribution text)
+language sql stable security definer set search_path='' as $$
+ select original.*,source.speaker_profile,source.speaker_attribution from public.read_participant_live_source_transcript_v1_before_profile(p_session_id, p_user_id, p_after_source_seq, p_limit) original join public.live_source_utterances source on source.id=original.source_utterance_id and source.session_id=p_session_id;
+$$;
+revoke all on function public.read_participant_live_source_transcript_v1(uuid, text, bigint, integer) from public,anon,authenticated,service_role;
+grant execute on function public.read_participant_live_source_transcript_v1(uuid, text, bigint, integer) to service_role;

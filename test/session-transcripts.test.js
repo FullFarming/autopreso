@@ -1,3 +1,4 @@
+import { GEMINI_ENGINE_SELECTION } from "../packages/caption-core/caption-engine-catalog.js";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import fs from "node:fs/promises";
@@ -12,6 +13,21 @@ import { buildTranscriptSummaryPrompt, createSessionTranscripts, parseSummaryTex
 async function makeStorageDir() {
   return fs.mkdtemp(path.join(os.tmpdir(), "rn-transcripts-"));
 }
+
+test("speaker profile snapshots survive local recording and archive import", async () => {
+  const storageDir = await makeStorageDir();
+  const store = createSessionTranscripts({ storageDir, persistDelayMs: 0 });
+  const profile = { id: "00000000-0000-4000-8000-000000000001", version: 1, displayName: "김민지", company: "NOVA", department: "제품팀", photoAssetId: null };
+  await store.begin({ sessionId: "speaker-snapshots" });
+  await store.recordLine({ translatedText: "Hello", speaker: profile.displayName, speakerProfile: profile });
+  profile.displayName = "변경된 이름";
+  await store.end();
+  assert.equal((await store.get("speaker-snapshots")).lines[0].speakerProfile.displayName, "김민지");
+  await store.importSession({ id: "live-speaker-import", lines: [{ sourceText: "원문", speakerProfile: profile }] });
+  const line = (await store.get("live-speaker-import")).lines[0];
+  assert.equal(line.speakerProfile.company, "NOVA");
+  assert.equal(line.speakerProfile.department, "제품팀");
+});
 
 function sameOriginHeaders(url, headers = {}) {
   return { origin: new URL(url).origin, ...headers };
@@ -236,6 +252,7 @@ test("caption sessions record committed lines start-to-stop and auto-summarize o
   const transcriptsDir = await makeStorageDir();
   const summaryRequests = [];
   const { httpServer, url } = await startServer({
+    resolveCaptionEngine: async () => GEMINI_ENGINE_SELECTION,
     host: "127.0.0.1",
     port: 0,
     moonshineModel: "medium",
@@ -319,6 +336,7 @@ test("transcript summary is unavailable without Gemini and never falls back to O
 
   let providerDispatchCount = 0;
   const { httpServer, url } = await startServer({
+    resolveCaptionEngine: async () => GEMINI_ENGINE_SELECTION,
     host: "127.0.0.1",
     port: 0,
     moonshineModel: "medium",
@@ -606,6 +624,7 @@ test("list filters by kind and by an inclusive time range", async () => {
 test("subtitle:start carries optional meeting identity into the record", async () => {
   const transcriptsDir = await makeStorageDir();
   const { httpServer, url } = await startServer({
+    resolveCaptionEngine: async () => GEMINI_ENGINE_SELECTION,
     host: "127.0.0.1",
     port: 0,
     moonshineModel: "medium",
@@ -666,6 +685,7 @@ test("subtitle:start carries optional meeting identity into the record", async (
 test("a participant's mirrored caption is recorded on the host with attribution", async () => {
   const transcriptsDir = await makeStorageDir();
   const { httpServer, url } = await startServer({
+    resolveCaptionEngine: async () => GEMINI_ENGINE_SELECTION,
     host: "127.0.0.1",
     port: 0,
     moonshineModel: "medium",
@@ -753,6 +773,7 @@ test("a gateway-canonical Live Call records captions without opening the local t
   const transcriptsDir = await makeStorageDir();
   let localSocketCount = 0;
   const { httpServer, url } = await startServer({
+    resolveCaptionEngine: async () => GEMINI_ENGINE_SELECTION,
     host: "127.0.0.1",
     port: 0,
     env: {},
@@ -909,6 +930,7 @@ test("a transcript begin failure compensates the already-opened local providers"
   await fs.writeFile(unusableStoragePath, "occupied");
   const providerSockets = [];
   const { httpServer, url } = await startServer({
+    resolveCaptionEngine: async () => GEMINI_ENGINE_SELECTION,
     host: "127.0.0.1",
     port: 0,
     env: { GEMINI_API_KEY: "AIza-test" },
@@ -1008,7 +1030,8 @@ test("Live Call reimport preserves completed summary, call identity and source-o
 
 test("Live Call import never starts a second local paid summary while remote recap is pending", async () => {
   let calls = 0;
-  const { httpServer, url } = await startServer({ host: "127.0.0.1", port: 0,
+  const { httpServer, url } = await startServer({
+    resolveCaptionEngine: async () => GEMINI_ENGINE_SELECTION, host: "127.0.0.1", port: 0,
     transcriptsDir: await makeStorageDir(), env: { GEMINI_API_KEY: "synthetic" },
     subtitleSummaryGenerateText: async () => { calls += 1; return { text: '{"title":"Unexpected"}' }; } });
   try {

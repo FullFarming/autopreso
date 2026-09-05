@@ -87,7 +87,7 @@ export const createLiveSessionInputSchema = z
     // pinned glossaries). Optional so new clients can stop sending it; the
     // service still defaults it to "general_cre" for the DB column.
     glossaryPack: glossaryPackInputSchema.optional(),
-    languages: languagesInputSchema,
+    languages: languagesInputSchema.default(["ko", "en"]),
     maxViewers: z.number().int().min(1).max(200).default(200),
     participantSpeakingEnabled: z.boolean().default(false),
     companyName: publicMetadataSchema(160),

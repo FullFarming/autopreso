@@ -287,7 +287,7 @@ test("a one-character Custom glossary remains the source of truth", async () => 
     },
   };
   await fs.writeFile(filePath, JSON.stringify(settings));
-  const loaded = await createSettingsStore({ filePath, env: {}, readCodexAuth: () => null }).load();
+  const loaded = await createSettingsStore({ filePath, env: {} }).load();
   assert.equal(loaded.subtitle.glossaryPresetId, "");
   assert.equal(loaded.subtitle.glossary, customGlossary);
 });
@@ -338,7 +338,7 @@ test("the legacy full CRE preset is preserved locally and never auto-compacted o
   };
   await fs.writeFile(filePath, JSON.stringify(settings));
 
-  const loaded = await createSettingsStore({ filePath, env: {}, readCodexAuth: () => null }).load();
+  const loaded = await createSettingsStore({ filePath, env: {} }).load();
   assert.ok(loaded.subtitle.glossary.length >= fullCorpus.length);
   assert.ok(Buffer.byteLength(loaded.subtitle.glossary, "utf8") > 25_000);
   assert.match(loaded.subtitle.glossary, /\[AI·AX/u);

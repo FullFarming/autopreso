@@ -2,7 +2,6 @@ import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 
-import { readCodexCliAuthSync } from "./codex-auth.js";
 import { DEFAULT_GLOSSARY_PRESET_ID, GLOSSARY_PRESETS } from "./glossary-presets.js";
 import { MAX_TRANSLATION_LANGUAGES, isSupportedSubtitleLanguage } from "./subtitle-languages.js";
 import {
@@ -14,7 +13,6 @@ import {
   validateEngineForLanguages,
 } from "../packages/caption-core/caption-engine-catalog.js";
 
-export const MAX_AGENT_INSTRUCTIONS_CHARS = 100_000;
 
 const DEFAULT_GLOSSARY_PRESET = GLOSSARY_PRESETS.find((preset) => preset.id === DEFAULT_GLOSSARY_PRESET_ID);
 if (!DEFAULT_GLOSSARY_PRESET) throw new Error("Default glossary preset is missing.");
@@ -93,7 +91,8 @@ export const DEFAULT_SUBTITLE_SETTINGS = Object.freeze({
   maxSubtitleLines: 2,
   overlayEnabled: true,
   overlayDisplayId: "",
-  overlayAllDisplays: false,
+  overlayAllDisplays: true,
+  overlayDisplayIds: null,
   recordProvider: "ollama",
   ollamaBaseURL: "http://127.0.0.1:11434",
   ollamaModel: "gemma3n:e2b",
@@ -123,17 +122,6 @@ export const MAX_API_KEY_CHARS = 500;
 export const API_KEY_NAMES = Object.freeze(["openai", "gemini", "geminiSecondary", "soniox"]);
 
 export const DEFAULT_SETTINGS = Object.freeze({
-  agent: {
-    provider: "openai",
-    openai: { model: "gpt-5.5", reasoningEffort: "low", baseURL: "https://api.openai.com/v1" },
-    codex: { model: "gpt-5.5-fast", baseURL: "https://chatgpt.com/backend-api/codex" },
-    ollama: { model: "", baseURL: "http://localhost:11434/v1" },
-  },
-  transcription: {
-    provider: "moonshine",
-    moonshine: { model: "medium" },
-    openai: { model: "gpt-realtime-whisper" },
-  },
   apiKeys: {
     openai: "",
     gemini: "",
@@ -143,10 +131,9 @@ export const DEFAULT_SETTINGS = Object.freeze({
   subtitleHistory: {
     records: [],
   },
-  agentInstructions: "",
 });
 
-export function createSettingsStore({ filePath, env = process.env, readCodexAuth = readCodexCliAuthSync }) {
+export function createSettingsStore({ filePath, env = process.env }) {
   let cached = null;
   let loadPromise = null;
 
@@ -162,6 +149,9 @@ export function createSettingsStore({ filePath, env = process.env, readCodexAuth
       // set it; otherwise let the legacy fields (or the true default) decide.
       if (isPlainObject(merged.subtitle) && !Object.hasOwn(parsed?.subtitle ?? {}, "engine")) {
         delete merged.subtitle.engine;
+      }
+      if (isPlainObject(merged.subtitle) && !Object.hasOwn(parsed?.subtitle ?? {}, "overlayAllDisplays") && parsed?.subtitle?.overlayDisplayId) {
+        merged.subtitle.overlayAllDisplays = false;
       }
       const migrated = migrateSettings(merged);
       const legacyPresent = ["geminiTranscribeModel", "geminiSummaryModel", "geminiPolishModel", "geminiModel"].some((key) => Object.hasOwn(parsed?.subtitle ?? {}, key));
@@ -217,7 +207,7 @@ export function createSettingsStore({ filePath, env = process.env, readCodexAuth
         cached = fromDisk;
         return cached;
       }
-      const seeded = seedFromEnv(cloneDefaults(), env, readCodexAuth);
+      const seeded = seedFromEnv(cloneDefaults(), env);
       await writeToDisk(seeded);
       cached = seeded;
       return cached;
@@ -229,7 +219,9 @@ export function createSettingsStore({ filePath, env = process.env, readCodexAuth
 
   async function save(partial) {
     if (!cached) await load();
-    validateAgentInstructions(partial?.agentInstructions);
+    if (!isPlainObject(partial) || Object.keys(partial).some((key) => !["apiKeys", "subtitle", "subtitleHistory"].includes(key))) {
+      throw new Error("NOVA 설정 항목만 저장할 수 있습니다.");
+    }
     // Shape-check the patch BEFORE merging. `"subtitle": []` used to slip
     // through here (an array is truthy, every field reads undefined so the
     // field validators all passed) and deepMerge preserved the array shape —
@@ -370,6 +362,12 @@ function mergeEnginePatch(savedEngine, patchEngine) {
 }
 
 function migrateSettings(settings, { strictEngine = false } = {}) {
+  // 2026-09-05 fix: Imported settings must not carry the separate canvas agent's context.
+  settings = {
+    apiKeys: settings.apiKeys,
+    subtitle: settings.subtitle,
+    subtitleHistory: settings.subtitleHistory,
+  };
   // A hand-edited, truncated, or half-written settings.json can hold
   // `"subtitle": null`, `"subtitle": []`, `"subtitle": "boom"`, or a number.
   // Every migration below assumed a plain object, so the very first assignment
@@ -442,7 +440,7 @@ function migrateSettings(settings, { strictEngine = false } = {}) {
     settings.subtitle.overlayDisplayId = "";
   }
   if (typeof settings.subtitle.overlayAllDisplays !== "boolean") {
-    settings.subtitle.overlayAllDisplays = false;
+    settings.subtitle.overlayAllDisplays = !settings.subtitle.overlayDisplayId;
   }
   // A stored combination can be individually valid yet unusable together: a
   // file written before the caption-language rule existed can hold Soniox's
@@ -530,7 +528,7 @@ function hasSameLanguagePair(left, right) {
     && [left.a, left.b].every((language) => new Set([right.a, right.b]).has(language));
 }
 
-function seedFromEnv(settings, env, readCodexAuth) {
+function seedFromEnv(settings, env) {
   const next = settings;
   const openaiKey = trimOrEmpty(env.OPENAI_API_KEY);
   if (openaiKey) next.apiKeys.openai = openaiKey;
@@ -541,54 +539,12 @@ function seedFromEnv(settings, env, readCodexAuth) {
   const sonioxKey = trimOrEmpty(env.SONIOX_API_KEY);
   if (sonioxKey) next.apiKeys.soniox = sonioxKey;
 
-  const openaiModel = trimOrEmpty(env.OPENAI_MODEL);
-  if (openaiModel) next.agent.openai.model = openaiModel;
-
-  const openaiBaseURL = trimOrEmpty(env.OPENAI_BASE_URL);
-  if (openaiBaseURL) next.agent.openai.baseURL = openaiBaseURL;
-
-  const reasoningEffort = trimOrEmpty(env.OPENAI_REASONING_EFFORT);
-  if (reasoningEffort) next.agent.openai.reasoningEffort = reasoningEffort;
-
-  const codexModel = trimOrEmpty(env.CODEX_MODEL);
-  if (codexModel) next.agent.codex.model = codexModel;
-
-  const codexBaseURL = trimOrEmpty(env.CODEX_BASE_URL);
-  if (codexBaseURL) next.agent.codex.baseURL = codexBaseURL;
-
-  const ollamaModel = trimOrEmpty(env.OLLAMA_MODEL);
-  if (ollamaModel) next.agent.ollama.model = ollamaModel;
-
-  const ollamaBaseURL = trimOrEmpty(env.OLLAMA_BASE_URL);
-  if (ollamaBaseURL) next.agent.ollama.baseURL = ollamaBaseURL;
-
-  const codexAuth = safeReadCodexAuth(readCodexAuth, env);
-  if (codexAuth) next.agent.provider = "codex";
-  else if (ollamaModel) next.agent.provider = "ollama";
-  else next.agent.provider = "openai";
-
-  if (openaiKey) next.transcription.provider = "openai";
-
   return next;
-}
-
-function safeReadCodexAuth(readCodexAuth, env) {
-  try {
-    return readCodexAuth(env);
-  } catch {
-    return null;
-  }
 }
 
 function trimOrEmpty(value) {
   if (typeof value !== "string") return "";
   return value.trim();
-}
-
-export function validateAgentInstructions(value) {
-  if (typeof value === "string" && value.length > MAX_AGENT_INSTRUCTIONS_CHARS) {
-    throw new Error(`Agent instructions must be ${MAX_AGENT_INSTRUCTIONS_CHARS} characters or fewer.`);
-  }
 }
 
 // API keys were persisted with no validation at all: `{ openai: { evil: 1 } }`
@@ -728,6 +684,12 @@ export function validateSubtitleSettings(value) {
   if (value.overlayEnabled !== undefined && typeof value.overlayEnabled !== "boolean") {
     throw new Error("Subtitle overlayEnabled must be a boolean.");
   }
+  if (value.overlayDisplayIds !== undefined && value.overlayDisplayIds !== null
+    && (!Array.isArray(value.overlayDisplayIds) || value.overlayDisplayIds.length > 16
+      || new Set(value.overlayDisplayIds).size !== value.overlayDisplayIds.length
+      || value.overlayDisplayIds.some((id) => typeof id !== "string" || !id || id.length > 64 || /[\u0000-\u001f\u007f]/u.test(id)))) {
+    throw new Error("Subtitle overlayDisplayIds must contain unique display IDs.");
+  }
   if (value.overlayAllDisplays !== undefined && typeof value.overlayAllDisplays !== "boolean") {
     throw new Error("Subtitle overlayAllDisplays must be a boolean.");
   }
@@ -750,8 +712,8 @@ export function validateSubtitleSettings(value) {
   }
   if (value.opacity !== undefined) {
     const opacity = Number(value.opacity);
-    if (!Number.isFinite(opacity) || opacity < 0.2 || opacity > 1) {
-      throw new Error("Subtitle opacity must be between 0.2 and 1.");
+    if (!Number.isFinite(opacity) || opacity < 0 || opacity > 1) {
+      throw new Error("Subtitle opacity must be between 0 and 1.");
     }
   }
 }
@@ -794,9 +756,9 @@ function validateLanguagePair(value) {
 function validateTranslationLanguages(value) {
   if (!Array.isArray(value)) throw new Error("Subtitle translationLanguages must be an array.");
   const unique = new Set(value);
-  if (value.length < 2 || value.length > MAX_TRANSLATION_LANGUAGES || unique.size !== value.length
+  if (value.length < 1 || value.length > MAX_TRANSLATION_LANGUAGES || unique.size !== value.length
     || value.some((language) => !isSupportedSubtitleLanguage(language))) {
-    throw new Error(`Subtitle translationLanguages must include 2-${MAX_TRANSLATION_LANGUAGES} different supported language codes.`);
+    throw new Error(`Subtitle translationLanguages must include 1-${MAX_TRANSLATION_LANGUAGES} different supported language codes.`);
   }
 }
 

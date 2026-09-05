@@ -13,7 +13,7 @@ import { useConsolePending } from "./ConsoleShell";
 import { buildRejectReason, emptyStateKey, formatConsoleDate, REJECT_REASON_LABEL_KEYS, rejectReasons, statusLabelKey, type ProfileFilter, type RejectReason } from "./console-model";
 
 interface UsersResponse { profiles: ConsoleProfileRow[]; pendingCount: number }
-type PatchBody = { profileId: string; status: "approved" | "rejected" | "disabled"; reason?: string } | { profileId: string; role: "host" | "admin" };
+type PatchBody = { profileId: string; status: "approved" | "rejected" | "disabled"; reason?: string } | { profileId: string; role: "host" | "admin" } | { profileId: string; voiceProvider: "soniox" | "gemini" };
 
 const FILTERS: readonly ProfileFilter[] = ["pending", "approved", "rejected", "disabled"];
 const FILTER_LABEL_KEYS: Record<ProfileFilter, string> = { pending: "대기", approved: "승인", rejected: "반려", disabled: "비활성" };
@@ -156,16 +156,17 @@ export function UsersPanel() {
               <th scope="col" role="columnheader">{t("가입일")}</th>
               <th scope="col" role="columnheader">{t("상태")}</th>
               <th scope="col" role="columnheader">{t("역할")}</th>
+              <th scope="col" role="columnheader">다음 세션 엔진</th>
               <th scope="col" role="columnheader">{t("마지막 로그인")}</th>
               <th scope="col" role="columnheader">{t("작업")}</th>
             </tr>
           </thead>
           <tbody>
             {!isLoading && !listError && profiles.length === 0 && (
-              <tr role="row"><td role="cell" colSpan={7} className="console-empty">{t(emptyStateKey(filter))}</td></tr>
+              <tr role="row"><td role="cell" colSpan={8} className="console-empty">{t(emptyStateKey(filter))}</td></tr>
             )}
             {isLoading && profiles.length === 0 && (
-              <tr role="row"><td colSpan={7} className="console-empty" role="status">{t("불러오는 중…")}</td></tr>
+              <tr role="row"><td colSpan={8} className="console-empty" role="status">{t("불러오는 중…")}</td></tr>
             )}
             {profiles.map((row) => (
               <tr key={row.id} role="row" aria-busy={busyId === row.id}>
@@ -174,6 +175,19 @@ export function UsersPanel() {
                 <td role="cell" data-label={t("가입일")} className="console-num">{formatConsoleDate(row.createdAt, locale)}</td>
                 <td role="cell" data-label={t("상태")}><span className={`console-status console-status-${row.status}`}>{t(statusLabelKey(row.status))}</span></td>
                 <td role="cell" data-label={t("역할")}>{row.role === "admin" ? t("관리자") : t("호스트")}</td>
+                <td role="cell" data-label="다음 세션 엔진">
+                  <label className="console-inline-field">
+                    <span className="sr-only">{row.email} 다음 세션 엔진</span>
+                    <select aria-label={`${row.email} 다음 세션 엔진`} value={row.voiceProvider ?? "soniox"} disabled={busyId === row.id}
+                      onChange={(event) => {
+                        const voiceProvider = event.currentTarget.value;
+                        if (voiceProvider === "soniox" || voiceProvider === "gemini") void patchProfile({ profileId: row.id, voiceProvider });
+                      }}>
+                      <option value="soniox">Soniox</option>
+                      <option value="gemini">Gemini</option>
+                    </select>
+                  </label>
+                </td>
                 <td role="cell" data-label={t("마지막 로그인")} className="console-num">{formatConsoleDate(row.lastLoginAt, locale) || t("없음")}</td>
                 <td role="cell" data-label={t("작업")}>
                   {renderActions(row)}
@@ -185,13 +199,14 @@ export function UsersPanel() {
         </table>
       </div>
       <ConfirmDialog
+        variant="destructive"
         open={disableTarget !== null}
         title={t("{email} 계정을 비활성화할까요?", { email: disableTarget?.email ?? "" })}
         body={<p>{t("비활성화된 사용자는 즉시 로그인할 수 없고 진행 중인 라이브 콜 호스트 권한도 잃습니다. 나중에 재활성화할 수 있습니다.")}</p>}
         confirmLabel={t("비활성화")}
         busy={disableTarget !== null && busyId === disableTarget.id}
         onCancel={() => setDisableTarget(null)}
-        onConfirm={() => { if (disableTarget) void patchProfile({ profileId: disableTarget.id, status: "disabled" }); }}
+        onConfirm={() => { if (disableTarget) return patchProfile({ profileId: disableTarget.id, status: "disabled" }); }}
       />
     </section>
   );

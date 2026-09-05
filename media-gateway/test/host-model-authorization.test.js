@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { createGeminiCaptionConfig } from "../../packages/caption-core/gemini-caption-contract.js";
-import { DEFAULT_ENGINE_SELECTION } from "../../packages/caption-core/caption-engine-catalog.js";
+import { GEMINI_ENGINE_SELECTION as DEFAULT_ENGINE_SELECTION, DEFAULT_ENGINE_SELECTION as NEW_USER_ENGINE } from "../../packages/caption-core/caption-engine-catalog.js";
 import { SupabaseHostAuthorizer } from "../src/supabase-adapters.js";
 
 const claims = { role: "HOST", sub: "host-1", sessionId: "session-1" };
@@ -89,19 +89,24 @@ test("forged model overrides beside the engine are denied for preparation, first
     }
   }
   const { authorizer } = harness({ ...baseRow, status: "preparing", event_metadata: { modelPreferences: { source: legacySources[1], summary: legacyModels[2] } } });
-  assert.deepEqual(await authorizer.authorize(claims, settings, { readinessStart: true }), {
+  assert.deepEqual(await authorizer.authorize(claims, { ...settings, captionConfig: captionConfig() }, { readinessStart: true }), {
     pinnedGlossaryFingerprint: null, readinessMode: "activate", sessionStatus: "preparing",
-  }, "a prepared call whose legacy pin migrates to the catalog default can start without a captionConfig");
+  }, "a prepared legacy Gemini call starts with its explicit preserved Gemini pin");
 });
 
 test("absent preferences mean the catalog default; malformed, unknown, or partially-legacy shapes fail closed", async () => {
   for (const metadata of [undefined, null, {}, { agenda: [] },
+    { modelPreferences: { engine: NEW_USER_ENGINE } },
+    { modelPreferences: { engine: NEW_USER_ENGINE, engineHistory: [] } }]) {
+    assert.equal(await authorize({ ...baseRow, event_metadata: metadata }), true, JSON.stringify(metadata));
+  }
+  for (const metadata of [
     { modelPreferences: { engine: DEFAULT_ENGINE_SELECTION } },
     { modelPreferences: { engine: DEFAULT_ENGINE_SELECTION, engineHistory: [] } },
-    { modelPreferences: { engine: { translation: { provider: "gemini", model: "gemini-3.6-flash" } } } },
     { modelPreferences: { source: "gemini-3.5-live-translate-preview", summary: "gemini-3.6-flash" } },
     { modelPreferences: { source: "gemini-3.5-transcribe-live", summary: "gemini-3.5-flash" } }]) {
-    assert.equal(await authorize({ ...baseRow, event_metadata: metadata }), true, JSON.stringify(metadata));
+    assert.equal(await authorize({ ...baseRow, event_metadata: metadata }, captionConfig()), true, JSON.stringify(metadata));
+    assert.equal(await authorize({ ...baseRow, event_metadata: metadata }), false, 'implicit Soniox cannot replace existing Gemini');
   }
   for (const metadata of [[], "invalid", { modelPreferences: null }, { modelPreferences: {} }, { modelPreferences: [] },
     { modelPreferences: { source: legacyModels[0] } }, { modelPreferences: { source: legacyModels[0], summary: "https://169.254.169.254/model" } },
@@ -130,4 +135,15 @@ test("matching engines never bypass role, owner, session status or version check
     assert.equal(await harness({ ...row, ...patch }).authorizer.authorize(claims, pinned, { requireLive: true }), false, JSON.stringify(patch));
   }
   assert.equal(await harness(row).authorizer.authorize({ ...claims, role: "VIEWER" }, pinned, { requireLive: true }), false);
+});
+
+test('session assignment revision validates without rereading user assignment during reconnection', async () => {
+  const row = { ...baseRow, event_metadata: { modelPreferences: { engine: soniox, engineHistory: [], assignmentRevision: '12' } } };
+  const { authorizer, queries } = harness(row);
+  assert.equal(await authorizer.authorize(claims, { ...settings, captionConfig: captionConfig(soniox) }, { requireLive: true, compareVersion: false }), true);
+  assert.equal(queries.length, 1);
+  assert.ok(queries.every(url => url.pathname.endsWith('/live_sessions')));
+  for (const assignmentRevision of ['0', '-1', '1.5', '999999999999999999999999', 1, null]) {
+    assert.equal(await authorize({ ...row, event_metadata: { modelPreferences: { ...row.event_metadata.modelPreferences, assignmentRevision } } }, captionConfig(soniox)), false);
+  }
 });

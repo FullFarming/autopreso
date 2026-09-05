@@ -175,6 +175,8 @@ function loadRoute(name: "auth/session" | "logout" | "login", overrides: Record<
   const source = readFileSync(new URL(`../../app/api/${name}/route.ts`, import.meta.url), "utf8");
   const output = ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }).outputText;
   const modules: Record<string, unknown> = {
+    "@/lib/auth/bootstrap-admins": {},
+    "@/lib/auth/profile-store": {},
     "@/lib/session": sessions,
     "@/lib/security/csrf": { assertStrictOrigin },
     "@/lib/security/host-login-config": { readHostLoginConfig },

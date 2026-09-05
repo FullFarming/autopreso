@@ -174,8 +174,10 @@ test("participant notebook keeps live reading continuous and microphone permissi
   assert.match(viewer, /\{canUseSpeakingFloor && <div className="viewer-microphone-slot">/u);
   assert.match(capsule, /<ParticipantSpeakButton/u);
   const speakButton = readFileSync(resolve(process.cwd(), "components/live/ParticipantSpeakButton.tsx"), "utf8");
-  assert.match(speakButton, /aria-label=/u);
-  assert.match(speakButton, /CircleNotch, Record, Stop/u);
+  assert.match(speakButton, /aria-label=\{actionLabel\}/u);
+  assert.match(speakButton, /<span>\{actionLabel\}<\/span>/u);
+  assert.match(speakButton, /CircleNotch, Microphone, Stop/u);
+  assert.match(speakButton, /state === "speaking" \? Stop : state === "starting" \? CircleNotch : Microphone/u);
   assert.match(capsule, /state=\{speakState\}/u);
   assert.doesNotMatch(capsule, /발언하기|최신 자막을 보고 있어요|요약받기/u);
   assert.match(feed, /data-caption-state=/u);

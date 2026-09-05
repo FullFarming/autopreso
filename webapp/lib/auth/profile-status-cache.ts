@@ -22,8 +22,7 @@ export function createProfileStatusCache(opts: { read: Reader; ttlMs?: number; n
         if (entries.size > 5_000) entries.delete(entries.keys().next().value as string);
         return value;
       } catch {
-        // Store outage: keep serving the last known answer instead of locking every host out.
-        if (hit) return hit.value;
+        // 2026-09-05 fix: 만료된 승인 캐시는 유료 자막 키 발급 권한을 연장할 수 없다.
         throw new AuthenticationError("호스트 상태를 확인할 수 없습니다.");
       }
     },

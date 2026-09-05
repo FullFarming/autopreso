@@ -291,50 +291,10 @@ test("online BlackHole failure stays closed with setup guidance while face-to-fa
   assert.match(script, /mode === "IN_PERSON" && state\.recovery\.kind === "blackhole"[\s\S]*?clearRecovery\(\)/u);
 });
 
-test("dashboard reveals a keyboard launch entry only after the desktop feature gate passes", async () => {
-  const [html, dashboard, css] = await Promise.all([
-    read("public/subtitle.html"),
-    read("public/subtitle-dashboard.js"),
-    read("public/subtitle.css"),
-  ]);
-  assert.match(html, /<button id="open-live-interpreter"[^>]*type="button"[^>]*hidden/u);
-  assert.match(html, /<span data-i18n="nav\.liveInterpreter">라이브 통역<\/span>/u);
-  assert.doesNotMatch(html, /data-workspace-page="live-interpreter"|href="#live-interpreter/u);
-  assert.match(css, /\.subtitle-app-rail nav button\s*\{[\s\S]*?min-height:\s*44px/u);
-
-  const start = dashboard.indexOf("async function initializeDesktopLaunch");
-  const end = dashboard.indexOf("// Live Call feature flag", start);
-  assert.ok(start >= 0 && end > start);
-  const button = {
-    disabled: false,
-    hidden: true,
-    listeners: new Map(),
-    addEventListener(type, listener) { this.listeners.set(type, listener); },
-    setAttribute() {},
-    removeAttribute() {},
-  };
-  let opens = 0;
-  const sandbox = {
-    document: { getElementById: () => button },
-    window: {
-      realtimeNoelDesktop: {
-        getLiveInterpreterEnabled: async () => ({ ok: true, data: true }),
-        openLiveInterpreter: async () => { opens += 1; return { ok: true }; },
-      },
-    },
-  };
-  const initialize = vm.runInNewContext(`${dashboard.slice(start, end)}; initializeLiveInterpreterLaunch`, sandbox);
-  await initialize();
-  assert.equal(button.hidden, false);
-  await button.listeners.get("click")();
-  assert.equal(opens, 1);
-
-  const disabledButton = { ...button, hidden: true, listeners: new Map() };
-  sandbox.document.getElementById = () => disabledButton;
-  sandbox.window.realtimeNoelDesktop.getLiveInterpreterEnabled = async () => ({ ok: true, data: false });
-  await initialize();
-  assert.equal(disabledButton.hidden, true);
-  assert.equal(disabledButton.listeners.size, 0);
+test("retired interpreter cannot be launched from the caption dashboard", async () => {
+  const [html, dashboard] = await Promise.all([read("public/subtitle.html"), read("public/subtitle-dashboard.js")]);
+  assert.doesNotMatch(html, /id="open-live-interpreter"/u);
+  assert.doesNotMatch(dashboard, /initializeLiveInterpreterLaunch|methodName: "openLiveInterpreter"/u);
 });
 
 test("compact desktop layout keeps both language selects readable at 880px", async () => {

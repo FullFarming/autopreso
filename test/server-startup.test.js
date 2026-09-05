@@ -8,86 +8,13 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
-import { DEFAULT_AGENT_TIMEOUT_MS, runWhiteboardAgent, selectSubtitlePolishOptions, startServer, whiteboardSystemPrompt } from "../src/server.js";
+import { selectSubtitlePolishOptions, startServer } from "../src/server.js";
 import { createSettingsStore, MAX_SUBTITLE_GLOSSARY_CHARS } from "../src/settings-store.js";
+import { DEFAULT_ENGINE_SELECTION, GEMINI_ENGINE_SELECTION } from "../packages/caption-core/caption-engine-catalog.js";
 
 function sameOriginHeaders(url, headers = {}) {
   return { origin: new URL(url).origin, ...headers };
 }
-
-test("default whiteboard agent timeout is 90 seconds", () => {
-  assert.equal(DEFAULT_AGENT_TIMEOUT_MS, 90_000);
-});
-
-test("startServer waits for Moonshine readiness before listening", async () => {
-  let resolveReady;
-  let closed = false;
-  const progressMessages = [];
-  const readyPromise = new Promise((resolve) => {
-    resolveReady = resolve;
-  });
-
-  const serverPromise = startServer({
-    host: "127.0.0.1",
-    port: 0,
-    moonshineModel: "medium",
-    openaiApiKey: "test",
-    onStatus: (message) => progressMessages.push(message),
-    createTranscription: () => ({
-      ready: () => readyPromise,
-      sendAudio: () => {},
-      stop: () => {},
-      close: () => {
-        closed = true;
-      },
-    }),
-  });
-
-  let started = false;
-  serverPromise.then(() => {
-    started = true;
-  });
-  await Promise.resolve();
-  assert.equal(started, false);
-  assert.deepEqual(progressMessages, ["Preparing Moonshine medium transcription model..."]);
-
-  resolveReady();
-  const { httpServer } = await serverPromise;
-  assert.equal(started, true);
-  assert.deepEqual(progressMessages, [
-    "Preparing Moonshine medium transcription model...",
-    "Moonshine medium transcription model ready.",
-  ]);
-
-  await new Promise((resolve) => httpServer.close(resolve));
-  assert.equal(closed, true);
-});
-
-test("server still starts when the transcription model fails to load (missing sidecar)", async () => {
-  // A missing local Moonshine sidecar must not crash boot — the subtitle feature
-  // (Gemini/OpenAI Realtime) is independent of it. startServer must resolve and
-  // listen even though ready() rejects.
-  const { httpServer, url } = await startServer({
-    host: "127.0.0.1",
-    port: 0,
-    moonshineModel: "medium",
-    openaiApiKey: "test",
-    createTranscription: () => ({
-      ready: async () => { throw new Error("Cannot find Moonshine sidecar package for darwin/arm64."); },
-      sendAudio: () => {},
-      stop: () => {},
-      close: () => {},
-    }),
-  });
-
-  try {
-    assert.ok(url, "server should still come up and listen");
-    const messages = await collectWebSocketMessages(url.replace("http:", "ws:") + "/ws", 1);
-    assert.equal(messages[0].type, "config", "server serves clients despite the transcription model being unavailable");
-  } finally {
-    await new Promise((resolve) => httpServer.close(resolve));
-  }
-});
 
 test("desktop subtitle static assets are always revalidated instead of surviving an app update cache", async () => {
   const { httpServer, url } = await startServer({
@@ -120,39 +47,7 @@ test("desktop subtitle static assets are always revalidated instead of surviving
       assert.equal(response.headers.get("surrogate-control"), "no-store", asset);
     }
     const unrelated = await fetch(`${url}/app.js`);
-    assert.equal(unrelated.status, 200);
-    assert.equal(unrelated.headers.get("cache-control")?.includes("no-store"), false, "the emergency policy must stay scoped to subtitle assets");
-  } finally {
-    await new Promise((resolve) => httpServer.close(resolve));
-  }
-});
-
-test("websocket clients receive the current agent status on connect", async () => {
-  const { httpServer, url } = await startServer({
-    host: "127.0.0.1",
-    port: 0,
-    moonshineModel: "medium",
-    openaiApiKey: "test",
-    createTranscription: () => ({
-      ready: async () => {},
-      sendAudio: () => {},
-      stop: () => {},
-      close: () => {},
-    }),
-  });
-
-  try {
-    const messages = await collectWebSocketMessages(url.replace("http:", "ws:") + "/ws", 7);
-    assert.deepEqual(
-      messages.map((message) => message.type),
-      ["config", "agent:status", "mode", "warmup", "cost", "subtitle:history", "subtitle:snapshot"],
-    );
-    assert.equal(messages[1].status, "idle");
-    assert.equal(messages[2].mode, "staging");
-    assert.equal(messages[3].state, "idle");
-    assert.equal(messages[4].agent.cost, 0);
-    assert.equal(messages[4].transcription.cost, 0);
-    assert.deepEqual(messages[5].records, []);
+    assert.equal(unrelated.status, 404, "the canvas application is served only by its independent project");
   } finally {
     await new Promise((resolve) => httpServer.close(resolve));
   }
@@ -225,7 +120,7 @@ test("settings export downloads subtitle settings as a portable JSON file", asyn
     openaiApiKey: "test",
     settingsStore: await (async () => {
       const dir = await fs.mkdtemp(path.join(os.tmpdir(), "rn-export-"));
-      const store = createSettingsStore({ filePath: path.join(dir, "settings.json"), env: {}, readCodexAuth: () => null });
+      const store = createSettingsStore({ filePath: path.join(dir, "settings.json"), env: {} });
       await store.load();
       await store.save({
         apiKeys: { openai: "sk-test" },
@@ -274,7 +169,7 @@ test("settings export downloads subtitle settings as a portable JSON file", asyn
 });
 
 test("text adapter accepts one-character speech without optional polish settings", () => {
-  const saved = { apiKeys: { gemini: "test-caption-key" } };
+  const saved = { apiKeys: { gemini: "test-caption-key" }, subtitle: { engine: GEMINI_ENGINE_SELECTION } };
   assert.deepEqual(selectSubtitlePolishOptions({
     args: { translatedText: "…", sourceText: "네", tone: "natural" }, saved, env: {},
   }), { provider: "gemini", apiKey: saved.apiKeys.gemini, modelId: "gemini-3.6-flash", fallbackModels: ["gemini-3.5-flash-lite"] });
@@ -290,6 +185,7 @@ test("text adapter outages walk the engine fallback chain once per model", async
   const calls = [];
   const { httpServer } = await startServer({
     host: "127.0.0.1", port: 0, env: { GEMINI_API_KEY: "test-caption-key" },
+    settingsStore: { load: async () => ({ transcription: { provider: "moonshine", moonshine: { model: "medium" }, openai: { model: "gpt-4o-transcribe" } }, subtitle: { engine: GEMINI_ENGINE_SELECTION } }), getSanitized: async () => ({ subtitle: { engine: GEMINI_ENGINE_SELECTION } }) },
     createTranscription: () => ({ ready: async () => {}, sendAudio() {}, stop() {}, close() {} }),
     createSubtitleRealtimeManager: (options) => { polish = options.polish; return { close() {} }; },
     fetchImpl: async (url) => { calls.push(url); return new Response("", { status: 503 }); },
@@ -340,7 +236,7 @@ test("subtitle second-pass polish uses separated provider keys", () => {
       args: { tone: "business", glossary: "", polishProvider: "gemini" },
       saved: {
         apiKeys: { gemini: "AIza-live", geminiSecondary: "AIza-finalizer" },
-        subtitle: { geminiPolishModel: "gemini-3.5-flash" },
+        subtitle: { engine: GEMINI_ENGINE_SELECTION, geminiPolishModel: "gemini-3.5-flash" },
       },
       env: {},
     }),
@@ -358,7 +254,7 @@ test("subtitle second-pass polish uses separated provider keys", () => {
       },
       saved: {
         apiKeys: { gemini: "AIza-live", geminiSecondary: "AIza-finalizer" },
-        subtitle: { geminiPolishModel: "gemini-3.5-flash" },
+        subtitle: { engine: GEMINI_ENGINE_SELECTION, geminiPolishModel: "gemini-3.5-flash" },
       },
       env: {},
     }),
@@ -370,7 +266,7 @@ test("subtitle second-pass polish uses separated provider keys", () => {
       args: { tone: "business", glossary: "", polishProvider: "gemini" },
       saved: {
         apiKeys: { gemini: "AIza-live" },
-        subtitle: { geminiPolishModel: "gemini-3.5-flash" },
+        subtitle: { engine: GEMINI_ENGINE_SELECTION, geminiPolishModel: "gemini-3.5-flash" },
       },
       env: {},
     }),
@@ -389,7 +285,7 @@ test("subtitle second-pass polish uses separated provider keys", () => {
   assert.deepEqual(
     selectSubtitlePolishOptions({
       args: { tone: "business", glossary: "", polishProvider: "gemini" },
-      saved: { apiKeys: { gemini: "AIza-live" }, subtitle: {} },
+      saved: { apiKeys: { gemini: "AIza-live" }, subtitle: { engine: GEMINI_ENGINE_SELECTION } },
       env: {},
     }),
     { provider: "gemini", apiKey: "AIza-live", modelId: "gemini-3.6-flash", fallbackModels: ["gemini-3.5-flash-lite"] },
@@ -398,6 +294,7 @@ test("subtitle second-pass polish uses separated provider keys", () => {
 
 test("subtitle:start validates runtime subtitle settings before opening providers", async () => {
   const { httpServer, url } = await startServer({
+    resolveCaptionEngine: async () => GEMINI_ENGINE_SELECTION,
     host: "127.0.0.1",
     port: 0,
     moonshineModel: "medium",
@@ -446,6 +343,7 @@ test("subtitle:start validates runtime subtitle settings before opening provider
 test("subtitle:stop without a sessionId cannot stop the active subtitle session", async () => {
   const sockets = [];
   const { httpServer, url } = await startServer({
+    resolveCaptionEngine: async () => GEMINI_ENGINE_SELECTION,
     host: "127.0.0.1",
     port: 0,
     moonshineModel: "medium",
@@ -503,6 +401,7 @@ test("subtitle:input-status preserves the microphone source for the stall watchd
     resolveSignal = resolve;
   });
   const { httpServer, url } = await startServer({
+    resolveCaptionEngine: async () => GEMINI_ENGINE_SELECTION,
     host: "127.0.0.1",
     port: 0,
     moonshineModel: "medium",
@@ -595,13 +494,13 @@ test("server requires exact local origin for mutating HTTP and websocket request
   });
 
   try {
-    const sameOriginResponse = await fetch(`${url}/api/session/reset`, {
+    const sameOriginResponse = await fetch(`${url}/api/subtitles/history/clear`, {
       method: "POST",
       headers: sameOriginHeaders(url),
     });
     assert.equal(sameOriginResponse.status, 200);
 
-    const missingOriginResponse = await fetch(`${url}/api/session/reset`, {
+    const missingOriginResponse = await fetch(`${url}/api/subtitles/history/clear`, {
       method: "POST",
     });
     assert.equal(missingOriginResponse.status, 403);
@@ -611,7 +510,7 @@ test("server requires exact local origin for mutating HTTP and websocket request
       code: "INVALID_ORIGIN",
     });
 
-    const response = await fetch(`${url}/api/session/reset`, {
+    const response = await fetch(`${url}/api/subtitles/history/clear`, {
       method: "POST",
       headers: { origin: "https://example.test" },
     });
@@ -628,7 +527,7 @@ test("server requires exact local origin for mutating HTTP and websocket request
       `${localOrigin}/forged-path`,
       localOrigin.replace(/:\d+$/u, ":444"),
     ]) {
-      const confused = await fetch(`${url}/api/session/reset`, {
+      const confused = await fetch(`${url}/api/subtitles/history/clear`, {
         method: "POST",
         headers: { origin },
       });
@@ -816,54 +715,6 @@ test("server returns a sanitized Gemini validation error", async () => {
   }
 });
 
-test("websocket screenshot messages update agent visual context", async () => {
-  let resolveGenerateText;
-  const generateTextStarted = new Promise((resolve) => {
-    resolveGenerateText = resolve;
-  });
-  const { httpServer, url, state } = await startServer({
-    host: "127.0.0.1",
-    port: 0,
-    moonshineModel: "medium",
-    openaiApiKey: "test",
-    createTranscription: ({ queueTranscript }) => ({
-      ready: async () => {},
-      sendAudio: () => queueTranscript("Update the visual layout"),
-      stop: () => {},
-      close: () => {},
-    }),
-    generateTextFn: async ({ messages }) => {
-      const currentCanvasMessage = messages.at(-1);
-      assert.deepEqual(currentCanvasMessage.content.at(-1), { type: "image", image: "data:image/png;base64,latest" });
-      resolveGenerateText();
-      return { text: "DONE", finishReason: "stop" };
-    },
-  });
-
-  try {
-    state.mode = "live";
-    const ws = new WebSocket(url.replace("http:", "ws:") + "/ws");
-    const initialMessages = new Promise((resolve) => {
-      let count = 0;
-      ws.on("message", () => {
-        count += 1;
-        if (count === 7) resolve();
-      });
-    });
-    await new Promise((resolve, reject) => {
-      ws.once("open", resolve);
-      ws.once("error", reject);
-    });
-    await initialMessages;
-    ws.send(JSON.stringify({ type: "whiteboard:screenshot", image: "data:image/png;base64,latest" }));
-    ws.send(JSON.stringify({ type: "audio", audio: "" }));
-    await generateTextStarted;
-    ws.close();
-  } finally {
-    await new Promise((resolve) => httpServer.close(resolve));
-  }
-});
-
 class FakeRealtimeSocket extends EventEmitter {
   constructor(url, init) {
     super();
@@ -892,398 +743,6 @@ class FakeRealtimeSocket extends EventEmitter {
     this.closed = true;
   }
 }
-
-test("websocket stop makes synchronous transcript flush stale", async () => {
-  let generateCalled = false;
-  let ws;
-  let resolveStopCalled;
-  const stopCalled = new Promise((resolve) => {
-    resolveStopCalled = resolve;
-  });
-  const { httpServer, url, state } = await startServer({
-    host: "127.0.0.1",
-    port: 0,
-    moonshineModel: "medium",
-    openaiApiKey: "test",
-    createTranscription: ({ queueTranscript }) => ({
-      ready: async () => {},
-      sendAudio: () => {},
-      stop: () => {
-        queueTranscript("Final flushed words");
-        resolveStopCalled();
-      },
-      close: () => {},
-    }),
-    generateTextFn: async () => {
-      generateCalled = true;
-      return { text: "DONE", finishReason: "stop" };
-    },
-  });
-
-  try {
-    state.mode = "live";
-    ws = new WebSocket(url.replace("http:", "ws:") + "/ws");
-    const initialMessages = new Promise((resolve) => {
-      let count = 0;
-      ws.on("message", () => {
-        count += 1;
-        if (count === 5) resolve();
-      });
-    });
-    await new Promise((resolve, reject) => {
-      ws.once("open", resolve);
-      ws.once("error", reject);
-    });
-    await initialMessages;
-    ws.send(JSON.stringify({ type: "stop" }));
-    await Promise.race([
-      stopCalled,
-      new Promise((_, reject) => setTimeout(() => reject(new Error("Timed out waiting for transcription stop.")), 2000)),
-    ]);
-    await state.idle();
-    assert.equal(generateCalled, false);
-    ws.close();
-  } finally {
-    ws?.close();
-    await new Promise((resolve) => httpServer.close(resolve));
-  }
-});
-
-test("runWhiteboardAgent rejects with a timeout instead of hanging forever", async () => {
-  await assert.rejects(
-    () =>
-      runWhiteboardAgent({
-        transcript: "hello",
-        state: { elements: [], agentHistory: [] },
-        wss: { clients: new Set() },
-        options: { agentTimeoutMs: 1 },
-        generateTextFn: () => new Promise(() => {}),
-      }),
-    /Whiteboard agent timed out/,
-  );
-});
-
-test("runWhiteboardAgent exposes whiteboard_apply that combines edits and viewport in one call", async () => {
-  const broadcasts = [];
-  const state = {
-    elements: [{ type: "text", id: "title", x: 72, y: 68, text: "Realtime Noel" }],
-    agentHistory: [],
-  };
-
-  await runWhiteboardAgent({
-    transcript: "Add a voice box and focus on it",
-    state,
-    wss: {
-      clients: new Set([
-        {
-          readyState: WebSocket.OPEN,
-          send: (message) => broadcasts.push(JSON.parse(message)),
-        },
-      ]),
-    },
-    options: {},
-    generateTextFn: async ({ tools }) => {
-      assert.equal(tools.updateWhiteboard, undefined);
-      assert.equal(tools.whiteboard_edit, undefined, "whiteboard_edit removed");
-      assert.equal(tools.whiteboard_viewport, undefined, "whiteboard_viewport removed");
-      assert.ok(tools.whiteboard_overwrite);
-      assert.ok(tools.whiteboard_apply);
-
-      const result = await tools.whiteboard_apply.execute({
-        operations: [
-          {
-            type: "insert_after",
-            line: 1,
-            element: { type: "rectangle", id: "voice", x: 80, y: 140, width: 220, height: 80 },
-          },
-        ],
-        viewport: { action: "scroll_to_content", focus_ids: ["voice"] },
-      });
-
-      assert.match(result, /001: \{"type":"text","id":"title"/);
-      assert.match(result, /002: \{"type":"rectangle","id":"voice"/);
-      assert.match(result, /Viewport scrolled to 1 element: \["voice"\]/);
-    },
-  });
-
-  assert.deepEqual(state.elements, [
-    { type: "text", id: "title", x: 72, y: 68, text: "Realtime Noel" },
-    { type: "rectangle", id: "voice", x: 80, y: 140, width: 220, height: 80 },
-  ]);
-  assert.deepEqual(
-    broadcasts,
-    [
-      { type: "whiteboard:update", elements: state.elements },
-      { type: "whiteboard:viewport", action: "scroll_to_content", focus_ids: ["voice"] },
-    ],
-  );
-});
-
-test("whiteboard_apply with operations only edits the canvas without touching viewport", async () => {
-  const broadcasts = [];
-  const state = {
-    elements: [{ type: "text", id: "title", x: 0, y: 0, text: "Hi" }],
-    agentHistory: [],
-  };
-
-  await runWhiteboardAgent({
-    transcript: "Add a box",
-    state,
-    wss: {
-      clients: new Set([
-        { readyState: WebSocket.OPEN, send: (msg) => broadcasts.push(JSON.parse(msg)) },
-      ]),
-    },
-    options: {},
-    generateTextFn: async ({ tools }) => {
-      const result = await tools.whiteboard_apply.execute({
-        operations: [
-          { type: "insert_after", line: 1, element: { type: "rectangle", id: "box", x: 10, y: 50, width: 100, height: 50 } },
-        ],
-      });
-      assert.match(result, /002: \{"type":"rectangle","id":"box"/);
-      assert.doesNotMatch(result, /Viewport/);
-    },
-  });
-
-  assert.equal(broadcasts.filter((m) => m.type === "whiteboard:viewport").length, 0);
-});
-
-test("whiteboard_apply with viewport only moves the camera without editing", async () => {
-  const broadcasts = [];
-  const state = {
-    elements: [{ type: "rectangle", id: "oauth-box", x: 0, y: 0, width: 200, height: 100 }],
-    agentHistory: [],
-  };
-
-  await runWhiteboardAgent({
-    transcript: "Zoom to the OAuth box",
-    state,
-    wss: {
-      clients: new Set([
-        { readyState: WebSocket.OPEN, send: (msg) => broadcasts.push(JSON.parse(msg)) },
-      ]),
-    },
-    options: {},
-    generateTextFn: async ({ tools }) => {
-      const result = await tools.whiteboard_apply.execute({
-        viewport: { action: "scroll_to_content", focus_ids: ["oauth-box"] },
-      });
-      assert.match(result, /Viewport scrolled to 1 element/);
-    },
-  });
-
-  assert.deepEqual(
-    broadcasts.filter((m) => m.type === "whiteboard:viewport"),
-    [{ type: "whiteboard:viewport", action: "scroll_to_content", focus_ids: ["oauth-box"] }],
-  );
-  assert.equal(broadcasts.filter((m) => m.type === "whiteboard:update").length, 0);
-});
-
-test("whiteboard_apply rejects calls with neither operations nor viewport", async () => {
-  let returned;
-  await runWhiteboardAgent({
-    transcript: "do nothing",
-    state: { elements: [], agentHistory: [] },
-    wss: { clients: new Set() },
-    options: {},
-    generateTextFn: async ({ tools }) => {
-      returned = await tools.whiteboard_apply.execute({});
-    },
-  });
-  assert.match(returned, /Provide at least one of operations or viewport/);
-});
-
-test("whiteboard_apply scroll_to_content without focus_ids returns a nudge to use them", async () => {
-  let returned;
-  await runWhiteboardAgent({
-    transcript: "scroll please",
-    state: { elements: [], agentHistory: [] },
-    wss: { clients: new Set() },
-    options: {},
-    generateTextFn: async ({ tools }) => {
-      returned = await tools.whiteboard_apply.execute({
-        viewport: { action: "scroll_to_content" },
-      });
-    },
-  });
-  assert.match(returned, /focus_ids/);
-});
-
-test("runWhiteboardAgent passes OpenAI reasoning effort provider option", async () => {
-  await runWhiteboardAgent({
-    transcript: "hello",
-    state: { elements: [], agentHistory: [] },
-    wss: { clients: new Set() },
-    options: {
-      agentProvider: {
-        provider: "openai",
-        model: "gpt-5.5",
-        apiKey: "test",
-        reasoningEffort: "low",
-      },
-    },
-    generateTextFn: async ({ providerOptions }) => {
-      assert.deepEqual(providerOptions, {
-        openai: { reasoningEffort: "low" },
-      });
-    },
-  });
-});
-
-test("runWhiteboardAgent always uses the production system prompt", async () => {
-  await runWhiteboardAgent({
-    transcript: "hello",
-    state: { elements: [], agentHistory: [] },
-    wss: { clients: new Set() },
-    options: { systemPrompt: "Custom whiteboard instructions" },
-    generateTextFn: async ({ system }) => {
-      assert.equal(system, whiteboardSystemPrompt());
-    },
-  });
-});
-
-test("runWhiteboardAgent records a model result summary in agent events", async () => {
-  const events = [];
-
-  await runWhiteboardAgent({
-    transcript: "hello",
-    state: { elements: [], agentHistory: [] },
-    wss: { clients: new Set() },
-    options: { onAgentEvent: (event) => events.push(event) },
-    generateTextFn: async () => ({ text: "DONE", finishReason: "stop", usage: { totalTokens: 12 } }),
-  });
-
-  const endEvent = events.find((event) => event.type === "model:end");
-  assert.deepEqual(endEvent.result, {
-    text: "DONE",
-    finishReason: "stop",
-    usage: { totalTokens: 12 },
-  });
-});
-
-test("runWhiteboardAgent passes Codex reasoning effort provider option", async () => {
-  await runWhiteboardAgent({
-    transcript: "hello",
-    state: { elements: [], agentHistory: [] },
-    wss: { clients: new Set() },
-    options: {
-      agentProvider: {
-        provider: "codex",
-        model: "gpt-5.5",
-        baseURL: "https://chatgpt.com/backend-api/codex",
-        apiKey: "test",
-        reasoningEffort: "low",
-      },
-    },
-    streamTextFn: ({ providerOptions }) => ({
-      consumeStream: async () => {
-        assert.deepEqual(providerOptions, {
-          openai: { reasoningEffort: "low", store: false, instructions: whiteboardSystemPrompt() },
-        });
-      },
-    }),
-  });
-});
-
-test("runWhiteboardAgent passes Codex fast mode provider option", async () => {
-  await runWhiteboardAgent({
-    transcript: "hello",
-    state: { elements: [], agentHistory: [] },
-    wss: { clients: new Set() },
-    options: {
-      agentProvider: {
-        provider: "codex",
-        model: "gpt-5.5",
-        requestedModel: "gpt-5.5-fast",
-        baseURL: "https://chatgpt.com/backend-api/codex",
-        apiKey: "test",
-        reasoningEffort: "low",
-        serviceTier: "priority",
-      },
-    },
-    streamTextFn: ({ providerOptions }) => ({
-      consumeStream: async () => {
-        assert.deepEqual(providerOptions, {
-          openai: { reasoningEffort: "low", serviceTier: "priority", store: false, instructions: whiteboardSystemPrompt() },
-        });
-      },
-    }),
-  });
-});
-
-test("runWhiteboardAgent passes Codex instructions provider option", async () => {
-  await runWhiteboardAgent({
-    transcript: "hello",
-    state: { elements: [], agentHistory: [] },
-    wss: { clients: new Set() },
-    options: {
-      agentProvider: {
-        provider: "codex",
-        model: "gpt-5.5",
-        baseURL: "https://chatgpt.com/backend-api/codex",
-        apiKey: "test",
-        reasoningEffort: "low",
-      },
-    },
-    streamTextFn: ({ providerOptions, system }) => ({
-      consumeStream: async () => {
-        assert.equal(providerOptions.openai.instructions, system);
-      },
-    }),
-  });
-});
-
-test("runWhiteboardAgent disables Codex response storage", async () => {
-  await runWhiteboardAgent({
-    transcript: "hello",
-    state: { elements: [], agentHistory: [] },
-    wss: { clients: new Set() },
-    options: {
-      agentProvider: {
-        provider: "codex",
-        model: "gpt-5.5",
-        baseURL: "https://chatgpt.com/backend-api/codex",
-        apiKey: "test",
-        reasoningEffort: "low",
-      },
-    },
-    streamTextFn: ({ providerOptions }) => ({
-      consumeStream: async () => {
-        assert.equal(providerOptions.openai.store, false);
-      },
-    }),
-  });
-});
-
-test("runWhiteboardAgent uses streaming for Codex responses", async () => {
-  let consumed = false;
-
-  await runWhiteboardAgent({
-    transcript: "hello",
-    state: { elements: [], agentHistory: [] },
-    wss: { clients: new Set() },
-    options: {
-      agentProvider: {
-        provider: "codex",
-        model: "gpt-5.5",
-        baseURL: "https://chatgpt.com/backend-api/codex",
-        apiKey: "test",
-        reasoningEffort: "low",
-      },
-    },
-    generateTextFn: async () => {
-      throw new Error("Codex should use streamText");
-    },
-    streamTextFn: () => ({
-      consumeStream: async () => {
-        consumed = true;
-      },
-    }),
-  });
-
-  assert.equal(consumed, true);
-});
 
 function collectWebSocketMessages(url, count) {
   return new Promise((resolve, reject) => {
@@ -1328,7 +787,7 @@ function waitForWebSocketMessage(ws, predicate) {
 
 test("caption engine settings come from the server catalog and reject unknown selections", async () => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "nova-model-settings-"));
-  const store = createSettingsStore({ filePath: path.join(dir, "settings.json"), env: {}, readCodexAuth: () => null });
+  const store = createSettingsStore({ filePath: path.join(dir, "settings.json"), env: {} });
   await store.load();
   const activeState = { active: true };
   let providerStarts = 0;
@@ -1347,11 +806,7 @@ test("caption engine settings come from the server catalog and reject unknown se
       config.captionEngines.stt.map((entry) => `${entry.provider}:${entry.model}`),
       ["gemini:gemini-3.5-transcribe-live", "soniox:stt-rt-v5"],
     );
-    assert.deepEqual(config.captionEngines.defaults, {
-      stt: { provider: "gemini", model: "gemini-3.5-transcribe-live", languageMode: "auto" },
-      translation: { provider: "gemini", model: "gemini-3.6-flash" },
-      summary: { provider: "gemini", model: "gemini-3.6-flash" },
-    });
+    assert.deepEqual(config.captionEngines.defaults, DEFAULT_ENGINE_SELECTION);
     // Availability is reported, never the key itself.
     assert.equal(JSON.stringify(config.captionEngines).includes("apiKey"), false);
     assert.equal(config.captionEngines.stt.every((entry) => entry.available === false), true);
@@ -1365,15 +820,13 @@ test("caption engine settings come from the server catalog and reject unknown se
     // Retired per-role model fields and unknown provider/model pairs are refused.
     assert.equal((await put({ geminiTranscribeModel: "gemini-3.7-flash" })).status, 400);
     assert.equal((await put({ engine: { stt: { provider: "gemini", model: "gemini-9.9-imaginary", languageMode: "auto" } } })).status, 400);
-    assert.equal((await put({ engine: { translation: { provider: "soniox", model: "stt-rt-v5" } } })).status, 400,
-      "a combined translation engine cannot be paired with a Gemini STT engine");
-    assert.deepEqual((await store.load()).subtitle.engine.stt, {
-      provider: "gemini", model: "gemini-3.5-transcribe-live", languageMode: "auto",
-    });
+    assert.equal((await put({ engine: { translation: { provider: "gemini", model: "gemini-3.6-flash" } } })).status, 400,
+      "Gemini translation cannot be paired with Soniox STT");
+    assert.deepEqual((await store.load()).subtitle.engine.stt, DEFAULT_ENGINE_SELECTION.stt);
 
     // A valid engine change is accepted even while a session is running: the
     // selection is picked up by the next channel restart.
-    assert.equal((await put({ engine: { translation: { provider: "gemini", model: "gemini-3.7-flash" } } })).status, 200);
+    assert.equal((await put({ engine: { ...GEMINI_ENGINE_SELECTION, translation: { provider: "gemini", model: "gemini-3.7-flash" } } })).status, 200);
     const saved = await store.load();
     assert.equal(saved.subtitle.engine.translation.model, "gemini-3.7-flash");
     assert.equal(saved.subtitle.engine.stt.model, "gemini-3.5-transcribe-live");
@@ -1384,12 +837,10 @@ test("caption engine settings come from the server catalog and reject unknown se
   }
 });
 
-// Task 6: a settings save that actually changes the engine (or a key it
-// requires) while captions are running must trigger an immediate hot swap so
-// the live session picks up the new provider without a manual stop/start.
-test("saving a different engine while captions run triggers an immediate channel restart", async () => {
+// Active sessions retain their assigned engine and credentials until the host ends them.
+test("saving an engine or key while captions run applies only to the next session", async () => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "nova-engine-hotswap-"));
-  const store = createSettingsStore({ filePath: path.join(dir, "settings.json"), env: {}, readCodexAuth: () => null });
+  const store = createSettingsStore({ filePath: path.join(dir, "settings.json"), env: {} });
   await store.load();
   await store.save({ apiKeys: { soniox: "fixture-key" } });
   const calls = [];
@@ -1418,7 +869,7 @@ test("saving a different engine while captions run triggers an immediate channel
       }),
     });
     assert.equal(response.status, 200);
-    assert.deepEqual(calls, [{ reason: "engine_change" }]);
+    assert.deepEqual(calls, []);
 
     const again = await fetch(`${url}/api/settings`, {
       method: "PUT",
@@ -1426,18 +877,16 @@ test("saving a different engine while captions run triggers an immediate channel
       body: JSON.stringify({ subtitle: { fontSize: 40 } }),
     });
     assert.equal(again.status, 200);
-    assert.equal(calls.length, 1, "unrelated settings do not restart the engine");
+    assert.equal(calls.length, 0, "unrelated settings do not restart the engine");
 
-    // Fix round 2 (M6): the key diff compared PRESENCE only, so REPLACING a
-    // live key (a rotated or corrected one) left the running channels talking
-    // to the provider with the old, rejected credential forever.
+    // Credential rotation also applies at the next product session boundary.
     const rotated = await fetch(`${url}/api/settings`, {
       method: "PUT",
       headers: sameOriginHeaders(url, { "content-type": "application/json" }),
       body: JSON.stringify({ apiKeys: { soniox: "fixture-key-rotated" } }),
     });
     assert.equal(rotated.status, 200);
-    assert.deepEqual(calls, [{ reason: "engine_change" }, { reason: "engine_change" }]);
+    assert.deepEqual(calls, []);
 
     // A key the selected engine does not use is still not a reason to restart.
     const unrelatedKey = await fetch(`${url}/api/settings`, {
@@ -1446,7 +895,7 @@ test("saving a different engine while captions run triggers an immediate channel
       body: JSON.stringify({ apiKeys: { openai: "sk-unrelated" } }),
     });
     assert.equal(unrelatedKey.status, 200);
-    assert.equal(calls.length, 2, "a key no selected engine requires never restarts the channels");
+    assert.equal(calls.length, 0, "a key no selected engine requires never restarts the channels");
 
     // Re-saving the SAME key value is not a change either.
     const sameKey = await fetch(`${url}/api/settings`, {
@@ -1455,9 +904,15 @@ test("saving a different engine while captions run triggers an immediate channel
       body: JSON.stringify({ apiKeys: { soniox: "fixture-key-rotated" } }),
     });
     assert.equal(sameKey.status, 200);
-    assert.equal(calls.length, 2, "an unchanged key value never restarts the channels");
+    assert.equal(calls.length, 0, "an unchanged key value never restarts the channels");
   } finally {
     await new Promise((resolve) => httpServer.close(resolve));
     await fs.rm(dir, { recursive: true, force: true });
   }
+});
+
+test("Soniox captions never request Gemini polish even when Gemini credentials exist", () => {
+  const args = { tone: "business", glossary: "NOVA = NOVA", sourceText: "안녕", translatedText: "…", required: true };
+  const saved = { apiKeys: { gemini: "fixture-key", geminiSecondary: "fixture-secondary" }, subtitle: { engine: DEFAULT_ENGINE_SELECTION } };
+  assert.equal(selectSubtitlePolishOptions({ args, saved, env: {} }), null);
 });

@@ -6,6 +6,7 @@ import {
   createSonioxFinalizeScheduler,
   createSonioxTokenReducer,
   hasSonioxContentTokens,
+  sonioxLanguageCode,
 } from "../../packages/caption-core/soniox-protocol.js";
 import { selectGeminiTranscriptionVocabularyFromLegacyText } from "../../packages/caption-core/index.js";
 
@@ -98,11 +99,17 @@ export function createSonioxTransport({
         languageMode: engine.stt.languageMode,
         languages,
         translation,
+        targetLanguage: typeof settings.sonioxTargetLanguage === "string" ? settings.sonioxTargetLanguage : undefined,
         context: { terms: contextTerms, translationTerms, domain: settings.translationDomain ?? "" },
         clientReferenceId,
       }));
     }
     return configJson;
+  }
+
+  function targetLanguageFromProvider(language) {
+    if (typeof settings.sonioxTargetLanguage === "string" && sonioxLanguageCode(settings.sonioxTargetLanguage) === language) return settings.sonioxTargetLanguage;
+    return languages.find((target) => sonioxLanguageCode(target) === language) ?? language;
   }
 
   function makeReducer(ctx) {
@@ -123,7 +130,7 @@ export function createSonioxTransport({
         });
       },
       onTranslationPartial: (event) => ctx.onTranslation?.({
-        targetLanguage: event.language,
+        targetLanguage: targetLanguageFromProvider(event.language),
         text: event.text,
         isFinal: false,
         sourceLanguage: event.sourceLanguage,
@@ -132,7 +139,7 @@ export function createSonioxTransport({
         provider: "soniox",
       }),
       onTranslationFinal: (event) => ctx.onTranslation?.({
-        targetLanguage: event.language,
+        targetLanguage: targetLanguageFromProvider(event.language),
         text: event.text,
         isFinal: true,
         sourceLanguage: event.sourceLanguage,

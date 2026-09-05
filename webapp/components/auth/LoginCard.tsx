@@ -244,11 +244,11 @@ export function LoginCard() {
 
   return (
     <AuthShell
-      title={t("title")}
+      title={t(mode === "signup" ? "signUp" : "title")}
       lede={t("lede")}
       aside={<p className="live-join-admin live-login-role-switch">{t("participantQuestion")} <a href="/watch">{t("participantEntry")}</a></p>}
     >
-      <section className="live-join-card live-login-card auth-card" aria-label={t("signInFormLabel")}>
+      <section className="live-join-card live-login-card auth-card" aria-label={t(mode === "signup" ? "signUp" : "signInFormLabel")}>
         <button type="button" className="live-primary-action auth-button auth-google" data-auth-action="google" onClick={() => void startGoogle()} disabled={submitting}>
           <GoogleIcon />
           <span>{t("googleContinue")}</span>

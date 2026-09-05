@@ -1,15 +1,15 @@
 import { localTermRetrievalContract } from "./local-term-retrieval.js";
 import { CAPTION_LANGUAGE_CODES, normalizeCaptionLanguage } from "./languages.js";
 import { captionPolishContract } from "./polish-policy.js";
-import { DEFAULT_ENGINE_SELECTION, migrateLegacyEngineSelection, normalizeEngineSelection } from "./caption-engine-catalog.js";
+import { GEMINI_ENGINE_SELECTION, migrateLegacyEngineSelection, normalizeEngineSelection } from "./caption-engine-catalog.js";
 
 const MAX_GLOSSARY_CHARACTERS = localTermRetrievalContract.maximumGlossaryCharacters;
 const MAX_DOMAIN_CHARACTERS = 2_000;
 const MAX_PRESET_ID_CHARACTERS = 128;
 const MAX_PRESET_NAME_CHARACTERS = 80;
-const DEFAULT_TRANSCRIPTION_MODEL = DEFAULT_ENGINE_SELECTION.stt.model;
+const DEFAULT_TRANSCRIPTION_MODEL = GEMINI_ENGINE_SELECTION.stt.model;
 const DEFAULT_POLISH_MODEL = "gemini-3.7-flash";
-const DEFAULT_ANALYSIS_MODEL = DEFAULT_ENGINE_SELECTION.summary.model;
+const DEFAULT_ANALYSIS_MODEL = GEMINI_ENGINE_SELECTION.summary.model;
 const DEFAULT_PARTIAL_STABILITY_MILLISECONDS = 140;
 const DEFAULT_PARTIAL_MAX_HOLD_MILLISECONDS = 500;
 const DEFAULT_COMMIT_SILENCE_MILLISECONDS = 1_200;
@@ -21,7 +21,7 @@ export const GEMINI_WORKLOAD_MODEL_MATRIX = deepFreeze({
   source: DEFAULT_TRANSCRIPTION_MODEL,
   glossaryExtraction: DEFAULT_POLISH_MODEL,
   topic: DEFAULT_ANALYSIS_MODEL,
-  translation: DEFAULT_ENGINE_SELECTION.translation.model,
+  translation: GEMINI_ENGINE_SELECTION.translation.model,
   polish: DEFAULT_POLISH_MODEL,
   recap: DEFAULT_ANALYSIS_MODEL,
 });

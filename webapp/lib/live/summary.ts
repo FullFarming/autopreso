@@ -1,5 +1,6 @@
 import type { LiveAgendaItem, LiveEventType, LiveSession, LiveTopicSnapshot } from "../live-contract";
 import { LANGUAGE_LABELS } from "../languageDetect";
+import { normalizeSpeakerProfile } from "../../../packages/caption-core/speaker-profile.js";
 import { getSupabaseServerAccess, supabaseAdminHeaders } from "../security/supabase-server-access";
 import { redactGeminiSensitiveText } from "../../../packages/caption-core/index.js";
 
@@ -23,6 +24,8 @@ const TRANSCRIPT_OMISSION_MARKER = "[... transcript middle omitted due to input 
 const UTTERANCE_OMISSION_MARKER = "[... utterance middle omitted ...]";
 
 export interface MeetingUtterance {
+  speakerProfile?: import("../../../packages/caption-core/speaker-profile.js").SpeakerProfile;
+  speakerAttribution?: "unresolved";
   seq: number;
   participantId: string | null;
   speakerName: string | null;
@@ -216,7 +219,7 @@ export async function fetchUtterances(
     const query = new URLSearchParams({
       session_id: `eq.${sessionId}`,
       language: `eq.${language}`,
-      select: "seq,participant_id,speaker_name,speaker_label,text,source_text,source_language,origin,utterance_key,translation_status,source_started_at,source_ended_at,emitted_at",
+      select: "seq,participant_id,speaker_name,speaker_label,speaker_profile,speaker_attribution,text,source_text,source_language,origin,utterance_key,translation_status,source_started_at,source_ended_at,emitted_at",
       order: "seq.asc",
       limit: String(Math.min(UTTERANCE_PAGE_SIZE, options.maxRows ?? UTTERANCE_PAGE_SIZE)),
     });
@@ -418,6 +421,8 @@ function parseUtteranceRow(row: Record<string, unknown>): MeetingUtterance | nul
   const text = String(row.text ?? "");
   if (!Number.isSafeInteger(seq) || seq < 0 || text.trim().length === 0) return null;
   return {
+    ...(row.speaker_profile == null ? {} : { speakerProfile: normalizeSpeakerProfile(row.speaker_profile) }),
+    ...(row.speaker_attribution === "unresolved" ? { speakerAttribution: "unresolved" as const } : {}),
     seq,
     participantId: typeof row.participant_id === "string"
       ? row.participant_id

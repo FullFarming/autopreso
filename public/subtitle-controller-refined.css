@@ -1,0 +1,56 @@
+html, body.subtitle-controller-body { margin:0; padding:0; background:transparent; overflow:hidden; color:var(--nova-fg-primary,#ddd); font-family:Pretendard,-apple-system,BlinkMacSystemFont,sans-serif; }
+.subtitle-controller-body .caption-controller-window.refined-controller { width:max-content; max-width:none; min-width:0; display:flex; flex-direction:column; align-items:flex-end; gap:12px; padding:8px; border:0; background:transparent; box-shadow:none; }
+.refined-controller [hidden] { display:none !important; }
+.refined-controller button { font:inherit; color:inherit; background:transparent; border:1px solid rgba(255,255,255,.22); border-radius:8px; cursor:pointer; padding:10px 14px; min-height:40px; }
+.refined-controller button:hover { background:rgba(255,255,255,.08); }
+.refined-controller button:focus-visible,.refined-controller input:focus-visible { outline:2px solid #0071e3; outline-offset:3px; }
+.refined-controller button:disabled { opacity:.45; cursor:default; }
+.controller-bar { display:flex; align-items:center; gap:12px; min-height:72px; padding:8px 20px; border:1px solid rgba(255,255,255,.28); border-radius:980px; background:var(--nova-surface-base,#0a0a0b); }
+.controller-wordmark { font-size:24px; font-weight:600; letter-spacing:-.02em; margin-right:8px; }
+.controller-session-status { display:flex; align-items:center; gap:8px; font-size:14px; max-width:190px; }
+.controller-state-dot { width:7px; height:7px; border-radius:50%; background:#0071e3; flex:none; }
+.controller-bar>button { border-color:transparent; display:flex; align-items:center; justify-content:center; gap:4px; flex-direction:column; min-width:52px; font-size:12px; padding:6px; }
+.controller-bar svg { width:22px; height:22px; fill:none; stroke:currentColor; stroke-width:1.6; }
+.controller-bar button[aria-expanded="true"] { border-color:#0071e3; color:#0071e3; }
+.controller-bar .controller-end { color:var(--nova-status-error,#f04452); border:1px solid currentColor; min-width:64px; margin-left:8px; font-size:14px; }
+#controller-live-call { display:flex; align-items:center; gap:8px; }
+#controller-elapsed { font-size:12px; font-variant-numeric:tabular-nums; }
+.controller-bar .mp-vu,#controller-engine { display:none; }
+.controller-popover { width:360px; max-width:calc(100vw - 32px); max-height:calc(var(--controller-available-height,720px) - 168px); display:flex; flex-direction:column; gap:16px; background:var(--nova-surface-base,#0a0a0b); border:1px solid rgba(255,255,255,.3); border-radius:8px; padding:20px; overflow:hidden; box-sizing:border-box; }
+.controller-popover header { display:flex; align-items:center; justify-content:space-between; gap:16px; flex:none; }
+.controller-popover header h2 { font-size:20px; font-weight:600; letter-spacing:-.02em; margin:0; }
+.controller-popover header button { flex:none; width:40px; padding:0; min-width:40px; border:0; font-size:24px; }
+.controller-popover-scroll { overflow:auto; min-height:0; padding:2px 4px 2px 0; overscroll-behavior:contain; }
+.controller-popover p { margin:0 0 16px; font-size:14px; }
+.controller-muted,.controller-popover legend,.range-labels { color:var(--nova-fg-secondary,#8b95a1); }
+.controller-popover fieldset { border:0; padding:0; margin:20px 0; }
+.controller-popover legend { font-size:14px; margin-bottom:12px; }
+.controller-position-grid { display:grid; grid-template-columns:repeat(3,1fr); gap:10px; }
+.controller-position-grid button { display:flex; flex-direction:column; align-items:center; gap:8px; padding:10px; font-size:14px; }
+.controller-position-grid button.active { border-color:#0071e3; color:#0071e3; }
+.position-preview { display:block; width:30px; height:22px; position:relative; }
+.position-preview:after { content:""; position:absolute; height:2px; left:2px; right:2px; background:currentColor; top:0; }
+.position-preview.middle:after { top:10px; }.position-preview.bottom:after { top:20px; }
+.controller-slider-field { display:grid; grid-template-columns:1fr auto; row-gap:14px; padding:18px 0; border-top:1px solid rgba(255,255,255,.16); font-size:14px; }
+.controller-slider-field output { color:#0071e3; font-variant-numeric:tabular-nums; }
+.controller-slider-field input { grid-column:1/-1; width:100%; margin:0; accent-color:#0071e3; min-height:24px; }
+.range-labels { grid-column:1/-1; display:flex; justify-content:space-between; font-size:12px; }
+#controller-caption-preview { padding:12px; border:1px solid rgba(255,255,255,.16); border-radius:8px; font-size:16px; text-align:center; background:rgba(0,0,0,var(--subtitle-opacity,.92)); }
+.controller-popover footer { display:flex; justify-content:space-between; align-items:center; gap:12px; flex:none; font-size:12px; color:var(--nova-fg-secondary,#8b95a1); }
+#controller-display-options label { display:flex; flex-direction:row; justify-content:flex-start; text-align:left; align-items:center; gap:10px; padding:12px 0; font-size:16px; }
+#controller-display-options input { flex:none; margin:0; width:20px; height:20px; accent-color:#0071e3; }
+.controller-web-output { display:flex; justify-content:space-between; gap:12px; padding:18px 0; border-top:1px solid rgba(255,255,255,.16); font-size:14px; }
+.controller-web-output strong { color:#0071e3; font-weight:400; }
+@media(max-width:640px) { .controller-bar { gap:4px; padding:8px 12px; }.controller-wordmark{font-size:20px;margin:0}.controller-session-status{max-width:110px;font-size:12px}.controller-bar>button{min-width:42px}.controller-bar .controller-end{min-width:48px;margin-left:2px} }
+
+.controller-popover footer button { flex:none; min-width:72px; }
+
+#controller-current-speaker { max-width:180px; min-height:44px; }
+#controller-current-speaker span { max-width:100%; overflow-wrap:anywhere; }
+#controller-speaker-popover { width:400px; }
+#controller-speaker-popover button { min-height:44px; }
+#controller-speaker-popover header button { min-width:44px; }
+#controller-speaker-popover .speaker-options { display:grid; gap:8px; margin-top:16px; }
+#controller-speaker-popover .speaker-choice { width:100%; text-align:left; }
+#controller-speaker-popover footer { flex-wrap:wrap; }
+#controller-speaker-popover footer [role=status] { flex:1 1 100%; overflow-wrap:anywhere; }

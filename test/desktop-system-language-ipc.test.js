@@ -25,7 +25,7 @@ test("system language IPC rejects foreign origins and unsupported values without
     setLanguage: (language) => calls.push(["ui", language]),
     installApplicationMenu: () => calls.push(["menu"]),
   });
-  vm.runInContext(sourceBetween("function isAllowedOrigin(", "function createNoopTranscription("), context);
+  vm.runInContext(sourceBetween("function isAllowedOrigin(", "// Boot must never reject silently."), context);
   vm.runInContext(sourceBetween("function applyUiLanguage(", "function destroyOverlayWindow("), context);
   vm.runInContext(sourceBetween('ipcMain.handle("app:set-ui-language"', 'ipcMain.handle("app:quit"'), context);
   const event = (url) => ({ sender: { getURL: () => url } });

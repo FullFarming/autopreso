@@ -7,7 +7,7 @@ import { WebSocket } from "ws";
 
 import { AUDIO_CONFIG } from "../src/config.js";
 import { createGatewayServer } from "../src/gateway-server.js";
-import { evaluateCaptionPolish, LiveMediaPipeline } from "../src/live-media-pipeline.js";
+import { evaluateCaptionPolish, LiveMediaPipeline } from "./helpers/gemini-pipeline.js";
 import { SupabaseLivePublisher } from "../src/supabase-adapters.js";
 
 const INPUT_FRAME_BYTES = AUDIO_CONFIG.inputSampleRate * 2 * AUDIO_CONFIG.chunkMilliseconds / 1_000;

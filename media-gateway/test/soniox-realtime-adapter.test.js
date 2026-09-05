@@ -119,8 +119,8 @@ test("(a) the first frame is the Soniox config and audio goes out as unchanged 1
   assert.equal(config.api_key, "fixture-key");
   assert.equal(config.sample_rate, 16_000);
   assert.equal(config.audio_format, "pcm_s16le");
-  assert.equal(config.language_hints_strict, true);
-  assert.deepEqual(config.language_hints, ["ko", "en"]);
+  assert.equal(config.language_hints_strict, false);
+  assert.deepEqual(config.language_hints, ["en", "ko"]);
   assert.deepEqual(config.translation, { type: "two_way", language_a: "ko", language_b: "en" });
   assert.ok(config.context.terms.includes("NOVA"));
   assert.deepEqual(config.context.translation_terms, [{ source: "NOVA", target: "노바" }]);
@@ -146,7 +146,7 @@ test("(a') a transcription-only selection sends no translation block and validat
   assert.equal("translation" in config, false);
   assert.deepEqual(config.language_hints, ["ko"]);
   stream.abort();
-  assert.throws(() => new SonioxRealtimeAdapter({ apiKey: "fixture-key", translation: true, translationLanguages: ["en", "ko", "ja"] }), /SONIOX_TRANSLATION_PAIR_REQUIRED/u);
+  assert.throws(() => new SonioxRealtimeAdapter({ apiKey: "fixture-key", translation: true, translationLanguages: ["en", "ko", "ja"] }), /SONIOX_TRANSLATION_TARGET_REQUIRED/u);
   assert.throws(() => new SonioxRealtimeAdapter({ apiKey: "", translation: false, translationLanguages: ["ko"] }), /SONIOX_API_KEY_REQUIRED/u);
 });
 
@@ -155,7 +155,8 @@ test("(b) source final + translation final + <end> commit one utterance carrying
   socket.message({ tokens: [sourceFinal("안녕하세요")] });
   socket.message({ tokens: [translationToken("Hello", { is_final: false })] });
   await flush();
-  assert.deepEqual(partials, [{ text: "안녕하세요", sourceLanguage: "ko" }]);
+  assert.equal(typeof partials[0].segmentId, "string");
+  assert.deepEqual(partials.map(({ segmentId, ...value }) => value), [{ text: "안녕하세요", sourceLanguage: "ko" }]);
   assert.equal(translations.length, 1);
   assert.equal(translations[0].language, "en");
   assert.equal(translations[0].text, "Hello");
@@ -166,7 +167,9 @@ test("(b) source final + translation final + <end> commit one utterance carrying
   socket.message({ tokens: [translationToken("Hello", { is_final: true }), { text: "<end>", is_final: true }] });
   await flush();
   assert.equal(finals.length, 1);
+  assert.equal(finals[0].segmentId, partials[0].segmentId);
   assert.deepEqual(finals[0], {
+    segmentId: partials[0].segmentId,
     speakerLabel: "speaker-1",
     text: "안녕하세요",
     rawText: "안녕하세요",

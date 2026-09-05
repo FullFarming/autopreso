@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { test } from "node:test";
+import vm from "node:vm";
 
 import { startServer } from "../src/server.js";
 
@@ -76,4 +77,50 @@ test("glossary detail popup supports search, per-language filtering, and custom 
 test("the preset bridge exposes bounded terms so the popup can render synced glossaries", () => {
   assert.match(electronMain, /terms: sanitizeGlossaryDocumentTerms\(result\.data\?\.document\)/u);
   assert.match(electronMain, /function sanitizeGlossaryDocumentTerms/u);
+});
+
+
+test("glossary selection uses modal focus ownership, filters rows, and restores its trigger", () => {
+  const listeners = new Map();
+  let focused = "";
+  const node = (id) => ({ id, hidden: true, style: {}, addEventListener(type, listener) { listeners.set(id + type, listener); },
+    setAttribute() {}, focus() { focused = id; } });
+  const trigger = node("trigger");
+  const search = node("search");
+  const done = node("done");
+  const rows = [{ textContent: "호텔 투자", hidden: false }, { textContent: "공통 비즈니스", hidden: false }];
+  let open = false;
+  const panel = { ...node("glossary-select-panel"), showModal() { open = true; }, close() { open = false; },
+    querySelector: () => search, querySelectorAll: (selector) => selector === "[data-glossary-select-close]" ? [done] : rows };
+  const root = { ...node("root"), querySelector: (selector) => selector === ".lang-select-trigger" ? trigger : panel };
+  const document = { querySelectorAll: () => [root], getElementById: () => null, addEventListener() {} };
+  const start = dashboard.indexOf("function setupLanguageDropdowns()");
+  const end = dashboard.indexOf("setupLanguageDropdowns();", start);
+  vm.runInNewContext(dashboard.slice(start, end) + "setupLanguageDropdowns();", { document });
+  listeners.get("triggerclick")();
+  assert.equal(open, true);
+  assert.equal(focused, "search");
+  listeners.get("searchinput")({ currentTarget: { value: "호텔" } });
+  assert.deepEqual(rows.map((row) => row.hidden), [false, true]);
+  listeners.get("doneclick")();
+  assert.equal(open, false);
+  assert.equal(panel.hidden, true);
+  assert.equal(focused, "trigger");
+  listeners.get("triggerclick")();
+  let prevented = false;
+  listeners.get("glossary-select-panelcancel")({ preventDefault() { prevented = true; } });
+  assert.equal(prevented, true);
+  assert.equal(open, false);
+  assert.equal(focused, "trigger");
+});
+
+test("caption setup has one glossary selector while management lives in settings", () => {
+  const captions = html.slice(html.indexOf('data-workspace-page="captions"'), html.indexOf('data-workspace-page="livecall"'));
+  assert.match(captions, /id="glossary-select-trigger"/);
+  assert.doesNotMatch(captions, /id="glossary-preset"|id="create-glossary-preset"/);
+  const settings = html.slice(html.indexOf('data-workspace-page="settings"'));
+  assert.match(settings, /id="glossary-preset"/);
+  assert.match(html, /<dialog id="glossary-detail-dialog"/);
+  assert.match(html, /class="glossary-detail-body"/);
+  assert.match(html, /id="glossary-detail-done"/);
 });

@@ -1,8 +1,6 @@
 import { after, NextRequest } from "next/server";
 
 import { AuthenticationError, requireHost } from "@/lib/auth/live-auth";
-import { isAdminRequest } from "@/lib/auth/require-admin";
-import { resolveEngineDefaultsOrFallback } from "@/lib/console/engine-defaults";
 import { LiveSessionError, toLiveFailure } from "@/lib/live/errors";
 import { isLiveCallEnabled } from "@/lib/live/feature-flag";
 import { generateSessionSummariesAfterEnd } from "@/lib/live/post-session-summary";
@@ -50,10 +48,6 @@ export async function PATCH(request: NextRequest, context: RouteContext) {
       return apiError(code === "INVALID_ENGINE_SELECTION" ? "자막 엔진 선택이 올바르지 않습니다." : "요청 형식이 올바르지 않습니다.", code, 400);
     }
     const input = parsed.data;
-    // Spec §9: a non-admin's `modelPreferences.engine` is replaced by the global engine (server authority).
-    const [engineDefaults, isAdmin] = input.modelPreferences === undefined
-      ? ([undefined, false] as const)
-      : await Promise.all([resolveEngineDefaultsOrFallback(), isAdminRequest(request)]);
     const session = await new LiveSessionService(getLiveSessionStore()).update(hostId, id, {
       version: input.version,
       title: input.title,
@@ -71,7 +65,7 @@ export async function PATCH(request: NextRequest, context: RouteContext) {
       eventType: input.eventType,
       agenda: input.agenda,
       modelPreferences: input.modelPreferences,
-    }, { engineDefaults, isAdmin });
+    });
     scheduleLiveSheetSyncAfterCommit(after);
     return apiSuccess(session);
   } catch (error: unknown) {

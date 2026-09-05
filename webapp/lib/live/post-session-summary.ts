@@ -96,7 +96,8 @@ export async function generateSummaryForLanguage(
     const participantById = new Map(participants.map((participant) => [participant.participantId, participant]));
     const attributed: MeetingUtterance[] = utterances.map((utterance) => {
       const participant = utterance.participantId ? participantById.get(utterance.participantId) : undefined;
-      return participant
+      // 2026-09-05 fix: 발언 당시 확정 신원과 미확정 표시는 이후 프로필 편집으로 다시 귀속하지 않는다.
+      return participant && !utterance.speakerProfile && utterance.speakerAttribution !== "unresolved"
         ? {
             ...utterance,
             speakerName: participant.displayName,

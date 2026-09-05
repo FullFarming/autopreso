@@ -1,5 +1,6 @@
 "use client";
 
+import { DotsThree } from "@phosphor-icons/react";
 import { useSystemText } from "@/components/system-language/SystemLanguageProvider";
 import { viewerMessages } from "@/lib/system-language/viewer-messages";
 
@@ -9,11 +10,12 @@ import styles from "./translation.module.css";
 
 interface ControlDrawerProps {
   triggerLabel: string;
+  iconOnly?: boolean;
   title: string;
   children: ReactNode;
 }
 
-export function ControlDrawer({ triggerLabel, title, children }: ControlDrawerProps) {
+export function ControlDrawer({ triggerLabel, title, children, iconOnly = false }: ControlDrawerProps) {
   const t = useSystemText(viewerMessages);
   const [isOpen, setIsOpen] = useState(false);
   const dialogRef = useRef<HTMLDialogElement>(null);
@@ -34,8 +36,8 @@ export function ControlDrawer({ triggerLabel, title, children }: ControlDrawerPr
 
   return (
     <>
-      <button ref={triggerRef} className={styles.secondaryButton} type="button" onClick={() => setIsOpen(true)}>
-        {triggerLabel}
+      <button ref={triggerRef} className={styles.secondaryButton} data-icon-only={iconOnly || undefined} type="button" aria-label={triggerLabel} aria-haspopup="dialog" aria-expanded={isOpen} onClick={() => setIsOpen(true)}>
+        {iconOnly ? <DotsThree size={24} weight="bold" aria-hidden="true" /> : triggerLabel}
       </button>
       {isOpen && typeof document !== "undefined" && createPortal(<dialog
         ref={dialogRef}

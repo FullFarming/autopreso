@@ -1,3 +1,6 @@
+import { initSubtitleControls } from "./subtitle-controls.js";
+import { mountSpeakerController } from "./subtitle-speakers.js";
+import { applyControllerAppearance, createLatestAppearanceSender } from "./controller-appearance.js";
 import {
   applyDocumentLanguage,
   applyTranslations,
@@ -22,6 +25,10 @@ const DEFAULT_SUBTITLE = {
   subtitlePositions: { en: "bottom-center", ko: "bottom-center", ja: "top-center" },
 };
 
+const fontRange = document.getElementById("controller-font-range");
+const appearanceSender = createLatestAppearanceSender((message) => sendControl(message));
+let appearanceEdits = {};
+const unsentAppearanceCommands = new Map();
 const opacityInput = document.getElementById("controller-opacity");
 const opacityValue = document.getElementById("controller-opacity-value");
 const fontSize = document.getElementById("controller-font-size");
@@ -121,7 +128,7 @@ function normalizeOverlayDisplayState(value) {
     || Number.isSafeInteger(value?.selectedDisplayId)
     ? String(value.selectedDisplayId)
     : "";
-  return { displays, selectedDisplayId, allDisplays: value?.allDisplays === true };
+  return { displays, selectedDisplayId, allDisplays: value?.allDisplays === true, controllerAvailableHeight: value?.controllerAvailableHeight };
 }
 
 function renderOverlayDisplayState(state) {
@@ -145,6 +152,7 @@ function renderOverlayDisplayState(state) {
   }
   displaySelect.disabled = isSelectingOverlayDisplay || state.displays.length === 0;
   renderAllDisplaysTick(state);
+  renderScreenCheckboxes(state);
 }
 
 // With the tick on, every screen carries the same captions, so choosing ONE
@@ -227,10 +235,23 @@ document.getElementById("controller-font-up")?.addEventListener("click", () => s
 // Vertical gap: how far the subtitle sits from its anchored screen edge.
 document.getElementById("controller-gap-down")?.addEventListener("click", () => sendControl({ command: "offset", delta: -8 }));
 document.getElementById("controller-gap-up")?.addEventListener("click", () => sendControl({ command: "offset", delta: 8 }));
-opacityInput?.addEventListener("input", () => updateOpacityReadout(Number(opacityInput.value)));
-opacityInput?.addEventListener("change", () => sendControl({ command: "opacity", opacity: Number(opacityInput.value) }));
+function previewAppearance(message, commit = false) {
+  const next = applyControllerAppearance(settings, message);
+  if (!next) return;
+  appearanceEdits = { ...appearanceEdits, ...(message.command === "font-size" ? { translationFontSize: next.translationFontSize, sourceFontSize: next.sourceFontSize }
+    : message.command === "opacity" ? { opacity: next.opacity } : { position: next.position, subtitlePositions: next.subtitlePositions }) };
+  settings = next;
+  renderSettings();
+  if (commit) appearanceSender.commit(message); else appearanceSender.input(message);
+}
+for (const [input, command] of [[opacityInput, "opacity"], [fontRange, "font-size"]]) {
+  const value = () => command === "opacity" ? { command, opacity: 1 - Number(input.value) / 100 } : { command, fontSize: Number(input.value) };
+  input?.addEventListener("input", () => previewAppearance(value()));
+  input?.addEventListener("change", () => previewAppearance(value(), true));
+  input?.addEventListener("blur", () => appearanceSender.flush());
+}
 for (const button of positionButtons) {
-  button.addEventListener("click", () => sendControl({ command: "position", position: button.dataset.controllerPosition }));
+  button.addEventListener("click", () => previewAppearance({ command: "position", position: button.dataset.controllerPosition }, true));
 }
 connect();
 
@@ -241,12 +262,17 @@ function connect() {
   ws = new WebSocket(`${proto}://${location.host}/ws`);
   ws.addEventListener("open", () => {
     translationHealth.socketState = "open";
+    for (const payload of unsentAppearanceCommands.values()) sendControl({ ...payload, preview: false });
+    unsentAppearanceCommands.clear();
     renderTranslationHealth();
   });
   ws.addEventListener("message", (event) => {
     const message = JSON.parse(event.data);
     if (message.type === "settings" && message.settings?.subtitle) {
-      settings = { ...DEFAULT_SUBTITLE, ...message.settings.subtitle };
+      for (const [key, value] of Object.entries(appearanceEdits)) {
+        if (JSON.stringify(message.settings.subtitle[key]) === JSON.stringify(value)) delete appearanceEdits[key];
+      }
+      settings = { ...DEFAULT_SUBTITLE, ...message.settings.subtitle, ...appearanceEdits };
       renderSettings();
     }
     if (message.type === "subtitle:input-status") updateVuMeter(message);
@@ -278,7 +304,10 @@ function updateVuMeter(message) {
 }
 
 function sendControl(payload) {
-  if (ws?.readyState !== WebSocket.OPEN) return;
+  if (ws?.readyState !== WebSocket.OPEN) {
+    if (["font-size", "opacity", "position"].includes(payload.command)) unsentAppearanceCommands.set(payload.command, payload);
+    return;
+  }
   ws.send(JSON.stringify({ type: "subtitle:control", ...payload }));
 }
 
@@ -288,17 +317,20 @@ function renderSettings() {
     : DEFAULT_SUBTITLE.translationLanguages;
   if (fontSize) fontSize.textContent = `${Math.round(Number(settings.translationFontSize) || DEFAULT_SUBTITLE.translationFontSize)}px`;
   if (gapValue) gapValue.textContent = String(Math.round(Number(settings.verticalOffset ?? DEFAULT_SUBTITLE.verticalOffset)));
-  if (opacityInput) opacityInput.value = String(Number(settings.opacity) || DEFAULT_SUBTITLE.opacity);
-  updateOpacityReadout(Number(settings.opacity) || DEFAULT_SUBTITLE.opacity);
+  if (fontRange) fontRange.value = String(settings.translationFontSize ?? DEFAULT_SUBTITLE.translationFontSize);
+  const opacity = Number.isFinite(Number(settings.opacity)) ? Number(settings.opacity) : DEFAULT_SUBTITLE.opacity;
+  if (opacityInput) opacityInput.value = String(Math.round((1 - opacity) * 100));
+  updateOpacityReadout(opacity);
   const activePosition = settings.subtitlePositions?.[languages[0]] || settings.position || DEFAULT_SUBTITLE.position;
   for (const button of positionButtons) {
     button.classList.toggle("active", button.dataset.controllerPosition === activePosition);
+    button.setAttribute("aria-pressed", String(button.dataset.controllerPosition === activePosition));
   }
 }
 
 function updateOpacityReadout(opacity) {
   document.documentElement.style.setProperty("--subtitle-opacity", String(opacity));
-  if (opacityValue) opacityValue.textContent = `${Math.round(opacity * 100)}%`;
+  if (opacityValue) opacityValue.textContent = `${Math.round((1 - opacity) * 100)}%`;
 }
 
 // Status writes go through these two helpers so the data-i18n marker stays in
@@ -520,6 +552,8 @@ if (window.realtimeNoelDesktop?.getLiveCallState && liveCallGroup && goLiveButto
       const state = await window.realtimeNoelDesktop.getLiveCallState();
       syncLiveBridgeStatus(state);
       liveCallGroup.hidden = !state?.armed;
+      document.getElementById("controller-stop").hidden = Boolean(state?.armed);
+      document.getElementById("controller-web-output-status").textContent = state?.live ? "진행 중" : state?.armed ? "준비 중" : "사용 안 함";
       if (state?.armed) {
         goLiveButton.disabled = isGoingLive || Boolean(state.live);
         goLiveButton.dataset.i18n = state.live && state.mediaWaiting
@@ -686,6 +720,7 @@ if (muteCaptionsButton && window.realtimeNoelDesktop?.setOverlaysMuted) {
   const paint = (muted) => {
     muteCaptionsButton.setAttribute("aria-pressed", String(muted));
     muteCaptionsButton.classList.toggle("is-muted", muted);
+    muteCaptionsButton.textContent = muted ? "자막 다시 표시" : "자막 잠시 숨기기";
     const key = muted ? "controller.showCaptions" : "controller.hideCaptions";
     muteCaptionsButton.dataset.i18nTitle = key;
     muteCaptionsButton.dataset.i18nAria = key;
@@ -705,3 +740,76 @@ if (muteCaptionsButton && window.realtimeNoelDesktop?.setOverlaysMuted) {
 } else if (muteCaptionsButton) {
   muteCaptionsButton.hidden = true;
 }
+
+
+function renderScreenCheckboxes(state) {
+  document.documentElement.style.setProperty("--controller-available-height", `${Math.max(200, Number(state.controllerAvailableHeight) || 720)}px`);
+  const container = document.getElementById("controller-display-options");
+  if (!container) return;
+  container.replaceChildren();
+  const controllerDisplay = state.displays.find((display) => display.isInternal) ?? state.displays.find((display) => display.isPrimary);
+  document.getElementById("controller-display-location").textContent = controllerDisplay?.isInternal ? "MacBook 내장 화면" : controllerDisplay?.label ?? "화면 연결 확인 중";
+  const count = state.displays.filter((display) => display.isSelected).length;
+  document.getElementById("controller-output-count").textContent = count ? `${count}개 화면에 표시` : "로컬 화면 표시 안 함";
+  for (const display of state.displays) {
+    const label = document.createElement("label");
+    const input = document.createElement("input");
+    input.type = "checkbox";
+    input.checked = display.isSelected === true;
+    input.disabled = isSelectingOverlayDisplay;
+    label.append(input, document.createTextNode(display.isInternal ? "MacBook 내장 화면" : display.label));
+    input.addEventListener("change", async () => {
+      const ids = state.displays.filter((candidate) => String(candidate.id) === String(display.id) ? input.checked : candidate.isSelected).map((candidate) => String(candidate.id));
+      isSelectingOverlayDisplay = true;
+      for (const input of container.querySelectorAll("input")) input.disabled = true;
+      try {
+        overlayDisplayState = normalizeOverlayDisplayState(await window.realtimeNoelDesktop.selectOverlayDisplays(ids));
+      } catch { await refreshOverlayDisplays(); }
+      finally { isSelectingOverlayDisplay = false; renderOverlayDisplayState(overlayDisplayState); }
+    });
+    container.append(label);
+  }
+}
+
+let openControllerPopover = null;
+let popoverTrigger = null;
+function closeControllerPopover(restoreFocus = true) {
+  if (!openControllerPopover) return;
+  openControllerPopover.hidden = true;
+  openControllerPopover = null;
+  popoverTrigger?.setAttribute("aria-expanded", "false");
+  if (restoreFocus) popoverTrigger?.focus();
+  appearanceSender.flush();
+}
+for (const trigger of document.querySelectorAll("[data-controller-popover]")) {
+  trigger.addEventListener("click", () => {
+    const panel = document.getElementById(trigger.dataset.controllerPopover);
+    const wasOpen = panel === openControllerPopover;
+    closeControllerPopover(false);
+    if (wasOpen) return;
+    openControllerPopover = panel;
+    popoverTrigger = trigger;
+    panel.hidden = false;
+    trigger.setAttribute("aria-expanded", "true");
+    panel.querySelector("button,input")?.focus();
+  });
+}
+for (const button of document.querySelectorAll("[data-close-popover]")) button.addEventListener("click", () => closeControllerPopover());
+document.addEventListener("keydown", (event) => {
+  if (!openControllerPopover) return;
+  if (event.key === "Escape") { event.preventDefault(); closeControllerPopover(); }
+  if (event.key === "Tab") {
+    const focusable = [...openControllerPopover.querySelectorAll("button:not(:disabled),input:not(:disabled),select:not(:disabled)")];
+    const first = focusable[0]; const last = focusable.at(-1);
+    if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last?.focus(); }
+    else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first?.focus(); }
+  }
+});
+document.addEventListener("pointerdown", (event) => {
+  if (openControllerPopover && !openControllerPopover.contains(event.target) && !popoverTrigger?.contains(event.target)) closeControllerPopover(false);
+});
+window.addEventListener("beforeunload", () => appearanceSender.close(), { once: true });
+
+mountSpeakerController(document.getElementById("controller-speaker-popover"), document.getElementById("controller-current-speaker"), window.realtimeNoelDesktop);
+
+initSubtitleControls();

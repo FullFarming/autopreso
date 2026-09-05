@@ -2,15 +2,15 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
   CAPTION_ENGINE_CATALOG, DEFAULT_ENGINE_SELECTION, EngineSelectionError,
-  captionEngineCatalogForClient, engineRequiredApiKeys, engineSelectionKey, findEngineEntry,
+  captionEngineCatalogForClient, engineRequiredApiKeys, engineSummaryRequiredApiKeys, engineSelectionKey, findEngineEntry,
   isCombinedEngine, migrateLegacyEngineSelection, normalizeEngineSelection,
   validateEngineForLanguages,
 } from "../packages/caption-core/caption-engine-catalog.js";
 
-test("default selection is Gemini Transcribe Live + Gemini 3.6 Flash + Gemini 3.6 Flash summary", () => {
+test("default selection is Soniox captions with independent Gemini summary", () => {
   assert.deepEqual(DEFAULT_ENGINE_SELECTION, {
-    stt: { provider: "gemini", model: "gemini-3.5-transcribe-live", languageMode: "auto" },
-    translation: { provider: "gemini", model: "gemini-3.6-flash" },
+    stt: { provider: "soniox", model: "stt-rt-v5", languageMode: "auto" },
+    translation: { provider: "soniox", model: "stt-rt-v5" },
     summary: { provider: "gemini", model: "gemini-3.6-flash" },
   });
   assert.deepEqual(normalizeEngineSelection(undefined), DEFAULT_ENGINE_SELECTION);
@@ -36,7 +36,7 @@ test("normalize rejects unknown models, unknown modes, and soniox translation wi
   assert.throws(() => normalizeEngineSelection({ ...base, stt: { provider: "gemini", model: "gemini-9-flash", languageMode: "auto" } }),
     (error) => error instanceof EngineSelectionError && error.code === "ENGINE_SELECTION_INVALID");
   assert.throws(() => normalizeEngineSelection({ ...base, stt: { provider: "gemini", model: "gemini-3.5-transcribe-live", languageMode: "ko" } }), EngineSelectionError);
-  assert.throws(() => normalizeEngineSelection({ ...base, translation: { provider: "soniox", model: "stt-rt-v5" } }), EngineSelectionError);
+  assert.throws(() => normalizeEngineSelection({ ...base, translation: { provider: "gemini", model: "gemini-3.6-flash" } }), EngineSelectionError);
   assert.throws(() => normalizeEngineSelection({ ...base, extra: 1 }), EngineSelectionError);
   const combined = normalizeEngineSelection({
     stt: { provider: "soniox", model: "stt-rt-v5", languageMode: "ko" },
@@ -44,9 +44,9 @@ test("normalize rejects unknown models, unknown modes, and soniox translation wi
     summary: { provider: "gemini", model: "gemini-3.7-flash" },
   });
   assert.equal(isCombinedEngine(combined), true);
-  assert.equal(isCombinedEngine(DEFAULT_ENGINE_SELECTION), false);
-  assert.deepEqual(engineRequiredApiKeys(combined), ["soniox", "gemini"]);
-  assert.deepEqual(engineRequiredApiKeys(DEFAULT_ENGINE_SELECTION), ["gemini"]);
+  assert.equal(isCombinedEngine(DEFAULT_ENGINE_SELECTION), true);
+  assert.deepEqual(engineRequiredApiKeys(combined), ["soniox"]);
+  assert.deepEqual(engineSummaryRequiredApiKeys(DEFAULT_ENGINE_SELECTION), ["gemini"]);
 });
 
 test("legacy Gemini fields migrate into engine and live-translate maps to transcribe", () => {
@@ -62,7 +62,7 @@ test("legacy Gemini fields migrate into engine and live-translate maps to transc
   });
   const kept = migrateLegacyEngineSelection({ engine: {
     stt: { provider: "soniox", model: "stt-rt-v5", languageMode: "auto" },
-    translation: { provider: "gemini", model: "gemini-3.5-flash-lite" },
+    translation: { provider: "soniox", model: "stt-rt-v5" },
     summary: { provider: "gemini", model: "gemini-3.6-flash" },
   }, geminiTranscribeModel: "gemini-3.5-live-translate-preview" });
   assert.equal(kept.stt.provider, "soniox", "explicit engine wins over legacy fields");
@@ -81,38 +81,26 @@ test("client view marks entries unavailable when the key is missing", () => {
 
 test("selection key is stable across property order", () => {
   const a = engineSelectionKey({ summary: { model: "gemini-3.6-flash", provider: "gemini" }, translation: { provider: "gemini", model: "gemini-3.6-flash" }, stt: { languageMode: "auto", model: "gemini-3.5-transcribe-live", provider: "gemini" } });
-  assert.equal(a, engineSelectionKey(DEFAULT_ENGINE_SELECTION));
+  assert.equal(a, engineSelectionKey(JSON.parse(JSON.stringify({ stt: { provider: "gemini", model: "gemini-3.5-transcribe-live", languageMode: "auto" }, translation: { provider: "gemini", model: "gemini-3.6-flash" }, summary: { provider: "gemini", model: "gemini-3.6-flash" } }))));
 });
 
-// Fix round 2 (I4): Soniox two-way translation is only expressible with exactly
-// two caption languages, so the catalog carries that as a capability the store
-// and the picker both read - rather than letting the pair be saved and then
-// dead-end at socket open.
-test("the soniox translation entry declares a two-language requirement the helper enforces", () => {
-  const sonioxTranslation = findEngineEntry("translation", "soniox", "stt-rt-v5");
-  assert.equal(sonioxTranslation.requiredLanguageCount, 2);
-  assert.equal(findEngineEntry("stt", "soniox", "stt-rt-v5").requiredLanguageCount, undefined);
-  assert.equal(findEngineEntry("translation", "gemini", "gemini-3.6-flash").requiredLanguageCount, undefined);
-
-  const combined = {
-    stt: { provider: "soniox", model: "stt-rt-v5", languageMode: "auto" },
-    translation: { provider: "soniox", model: "stt-rt-v5" },
-    summary: { provider: "gemini", model: "gemini-3.6-flash" },
-  };
-  assert.doesNotThrow(() => validateEngineForLanguages(combined, ["en", "ko"]));
-  for (const languages of [["ko"], ["en", "ko", "ja"], []]) {
-    assert.throws(() => validateEngineForLanguages(combined, languages), EngineSelectionError, JSON.stringify(languages));
-    assert.throws(() => validateEngineForLanguages(combined, languages), /자막 언어가 정확히 2개/u, JSON.stringify(languages));
-  }
-  // A Gemini engine carries no such constraint at any language count.
+test("both engines support one to three distinct caption languages", () => {
   for (const languages of [["ko"], ["en", "ko"], ["en", "ko", "ja"]]) {
     assert.doesNotThrow(() => validateEngineForLanguages(DEFAULT_ENGINE_SELECTION, languages));
   }
+  for (const languages of [[], ["ko", "ko"], ["en", "ko", "ja", "fr"], ["unknown"], null]) {
+    assert.throws(() => validateEngineForLanguages(DEFAULT_ENGINE_SELECTION, languages), EngineSelectionError);
+  }
+  assert.equal(findEngineEntry("translation", "soniox", "stt-rt-v5").requiredLanguageCount, undefined);
 });
 
-test("the client catalog view exposes requiredLanguageCount so the picker reads the constraint", () => {
-  const view = captionEngineCatalogForClient({ hasApiKeys: { gemini: true, soniox: true } });
-  const soniox = view.translation.find((entry) => entry.provider === "soniox");
-  assert.equal(soniox.requiredLanguageCount, 2);
-  assert.equal(Object.hasOwn(view.translation.find((entry) => entry.provider === "gemini"), "requiredLanguageCount"), false);
+test("client catalog constrains Flash translation to Gemini recognition", () => {
+  const view = captionEngineCatalogForClient();
+  assert.equal(view.translation.find((entry) => entry.provider === "gemini").requiresSttProvider, "gemini");
+});
+
+test("summary-only legacy settings keep the selected summary without opting captions into Gemini", () => {
+  const selection = migrateLegacyEngineSelection({ geminiSummaryModel: "gemini-3.7-flash" });
+  assert.equal(selection.stt.provider, "soniox");
+  assert.equal(selection.summary.model, "gemini-3.7-flash");
 });

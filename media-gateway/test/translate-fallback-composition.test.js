@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { createGeminiServerRuntime } from "../../packages/gemini-server/index.js";
-import { DEFAULT_ENGINE_SELECTION } from "../../packages/caption-core/caption-engine-catalog.js";
+import { GEMINI_ENGINE_SELECTION as DEFAULT_ENGINE_SELECTION } from "../../packages/caption-core/caption-engine-catalog.js";
 import { createTextTranslate } from "../src/engines/create-engines.js";
 
 const PRIMARY = DEFAULT_ENGINE_SELECTION.translation.model; // gemini-3.6-flash

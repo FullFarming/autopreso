@@ -5,7 +5,7 @@ import test from "node:test";
 import { createElement, type ComponentType } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import ts from "typescript";
-import { CircleNotch, Record as RecordIcon, Stop } from "@phosphor-icons/react";
+import { CircleNotch, Microphone, Stop } from "@phosphor-icons/react";
 import { formatSystemText, type SystemLanguage, type SystemMessages, type SystemTextValues } from "../../lib/system-language";
 import { viewerMessages } from "../../lib/system-language/viewer-messages";
 import { LANGUAGE_CODES } from "../../lib/languageDetect";
@@ -15,7 +15,7 @@ import * as presentation from "./translation/topic-presentation";
 const require = createRequire(import.meta.url);
 function load(file: string, language: SystemLanguage) {
   const dependencies: Record<string, unknown> = {
-    "@phosphor-icons/react": { CircleNotch, Record: RecordIcon, Stop },
+    "@phosphor-icons/react": { CircleNotch, Microphone, Stop },
     "@/components/system-language/SystemLanguageProvider": { useSystemText: (messages: SystemMessages) => (key: string, values?: SystemTextValues) => formatSystemText(messages, language, key, values) },
     "@/lib/system-language/viewer-messages": { viewerMessages },
     "../language-picker": languageLabels,
@@ -52,7 +52,7 @@ test("actual participant tabs retain source, selected lane and native names in e
   }
 });
 
-test("actual speaking controls have no visible words and preserve record, connecting, and stop semantics", () => {
+test("actual speaking controls expose a visible localized action and preserve microphone, connecting, and stop semantics", () => {
   for (const language of ["ko", "en", "ja"] as const) {
     const { ParticipantSpeakButton } = load("./ParticipantSpeakButton.tsx", language);
     for (const state of ["idle", "starting", "speaking"] as const) {
@@ -62,7 +62,7 @@ test("actual speaking controls have no visible words and preserve record, connec
       assert.ok(html.includes(`data-speak-state="${state}"`));
       assert.ok(html.includes(`aria-pressed="${state !== "idle"}"`));
       assert.match(html, /<svg[^>]*aria-hidden="true"/u);
-      assert.equal(html.replace(/<[^>]*>/gu, "").trim(), "");
+      assert.equal(html.replace(/<[^>]*>/gu, "").trim(), label);
       assert.equal(html.includes('disabled=""'), state === "idle");
     }
   }

@@ -48,7 +48,7 @@ export function InviteQrDialog({ sessionTitle, invitation, onClose }: { sessionT
     const surface = surfaceRef.current;
     if (!dialog || !surface) return;
     const previousFocus = document.activeElement;
-    dialog.showModal();
+    if (!dialog.open) dialog.showModal();
     closeRef.current?.focus();
     setCanFullscreen(Boolean(document.fullscreenEnabled && typeof surface.requestFullscreen === "function"));
     const receiveFullscreenChange = () => setIsFullscreen(document.fullscreenElement === surface);

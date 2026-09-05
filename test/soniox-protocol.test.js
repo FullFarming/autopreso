@@ -8,21 +8,22 @@ import {
   createSonioxTokenReducer,
 } from "../packages/caption-core/soniox-protocol.js";
 
-test("config: auto mode restricts to ko+en, single modes pin one language, two_way for two languages", () => {
+test("config: auto mode uses selected languages, single modes pin one language, two_way for two languages", () => {
   const auto = buildSonioxConfig({ apiKey: "fixture-key", languageMode: "auto", languages: ["en", "ko"], translation: true, context: { terms: ["NOVA"] }, clientReferenceId: "s1" });
   assert.equal(auto.model, "stt-rt-v5");
   assert.deepEqual([auto.audio_format, auto.sample_rate, auto.num_channels], ["pcm_s16le", 16000, 1]);
-  assert.deepEqual(auto.language_hints, ["ko", "en"]);
-  assert.equal(auto.language_hints_strict, true);
+  assert.deepEqual(auto.language_hints, ["en", "ko"]);
+  assert.equal(auto.language_hints_strict, false);
   assert.deepEqual(auto.translation, { type: "two_way", language_a: "ko", language_b: "en" });
   assert.equal(auto.enable_endpoint_detection, true);
   assert.equal(auto.max_endpoint_delay_ms, 2000);
   const ko = buildSonioxConfig({ apiKey: "fixture-key", languageMode: "ko", languages: ["en", "ko"], translation: true });
   assert.deepEqual(ko.language_hints, ["ko"]);
+  assert.equal(ko.language_hints_strict, true);
   const none = buildSonioxConfig({ apiKey: "fixture-key", languageMode: "auto", languages: ["en", "ko"], translation: false });
   assert.equal(Object.hasOwn(none, "translation"), false);
   assert.throws(() => buildSonioxConfig({ apiKey: "", languageMode: "auto", languages: ["en", "ko"] }), /SONIOX_API_KEY_REQUIRED/u);
-  assert.throws(() => buildSonioxConfig({ apiKey: "k", languageMode: "auto", languages: ["en", "ko", "ja"], translation: true }), /SONIOX_TRANSLATION_PAIR/u);
+  assert.throws(() => buildSonioxConfig({ apiKey: "k", languageMode: "auto", languages: ["en", "ko", "ja"], translation: true }), /SONIOX_TRANSLATION_TARGET_REQUIRED/u);
 });
 
 // Fix round 2 (M5): translation_terms is bounded by pair COUNT and by total
@@ -260,4 +261,37 @@ test("finalize scheduler: noteFinalizeSent blocks re-sends, dispose cancels time
   scheduler.noteTokens({ hasPendingFinalText: true, atMs: 11_300 });
   clock.advance(10_000);
   assert.deepEqual(fired, [1_300], "a disposed scheduler never fires again");
+});
+
+
+test("one-way target connections preserve source hints for all three languages", () => {
+  for (const targetLanguage of ["en", "ko", "ja"]) {
+    const config = buildSonioxConfig({ apiKey: "fixture-key", languages: ["en", "ko", "ja"], targetLanguage });
+    assert.deepEqual(config.language_hints, ["en", "ko", "ja"]);
+    assert.deepEqual(config.translation, { type: "one_way", target_language: targetLanguage });
+  }
+  const single = buildSonioxConfig({ apiKey: "fixture-key", languages: ["ja"] });
+  assert.deepEqual(single.translation, { type: "one_way", target_language: "ja" });
+  const pair = buildSonioxConfig({ apiKey: "fixture-key", languages: ["ja", "en"] });
+  assert.deepEqual(pair.language_hints, ["ja", "en"]);
+  assert.deepEqual(pair.translation, { type: "two_way", language_a: "ja", language_b: "en" });
+});
+
+test("Soniox config rejects invalid languages and targets before opening a connection", () => {
+  for (const languages of [[], ["en", "en"], ["en", "ko", "ja", "fr"], ["bad"], null]) {
+    assert.throws(() => buildSonioxConfig({ apiKey: "fixture-key", languages }), /SONIOX_LANGUAGES_INVALID/);
+  }
+  assert.throws(() => buildSonioxConfig({ apiKey: "fixture-key", languages: ["en", "ja"], targetLanguage: "ko" }), /SONIOX_TRANSLATION_TARGET_INVALID/);
+});
+
+test("Chinese script variants use Soniox ISO language codes on the wire", () => {
+  const config = buildSonioxConfig({ apiKey: "fixture-key", languages: ["en", "zh-Hans", "zh-Hant"], targetLanguage: "zh-Hant" });
+  assert.deepEqual(config.language_hints, ["en", "zh"]);
+  assert.deepEqual(config.translation, { type: "one_way", target_language: "zh" });
+});
+
+test("one output language never restricts automatic recognition to that language", () => {
+  const config = buildSonioxConfig({ apiKey: "fixture-key", languages: ["en"] });
+  assert.deepEqual(config.translation, { type: "one_way", target_language: "en" });
+  assert.equal(config.language_hints_strict, false);
 });

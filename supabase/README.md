@@ -558,3 +558,40 @@ Local SQL verification without a linked project:
 ```sh
 NOVA_PGLITE_MODULE=/path/to/pglite/dist/index.js node --test test/auth-profiles-sql.test.js
 ```
+
+## 2026-09-05: 사용자별 엔진과 연속 세션 접근
+
+`202609050001_user_engine_access_renewal.sql`은 기존 마이그레이션 다음에 적용합니다. 운영 DB에는 자동 적용하지 않습니다. 신규 프로젝트 bootstrap에도 동일 SQL이 포함됩니다.
+
+- 기존 및 신규 `profiles`는 `voice_provider = soniox`, `voice_provider_revision = 1`로 초기화됩니다. 기존 세션의 엔진과 기록은 변경하지 않습니다.
+- 관리자는 `set_profile_voice_provider_v1`로 사용자 배정만 바꿉니다. 서버는 새 세션을 만들 때 `read_host_voice_assignment_v1` 결과를 세션에 고정하며, 재연결 시 이를 유지해야 합니다. `list_profiles_admin_v2`는 배정 정보를 함께 반환합니다.
+- 라이브 상태에서 기존 접근 만료 시각과 일치하는 아직 열린 입장 창·미철회 초대만 접근 연장과 함께 연장합니다. 짧게 설정한 입장 창, 준비/일시정지 상태, 만료 또는 철회된 초대는 그대로 둡니다.
+- 호스트 인증 후 `renew_live_session_access_v1`을 호출하면 남은 접근 시간이 15분 이하일 때 6시간의 유한 접근 창을 갱신합니다. 종료/삭제된 세션, 다른 호스트, 비활성 프로필은 갱신되지 않습니다.
+- 서버에서 유효한 참가자 쿠키를 검증한 뒤 `renew_live_viewer_access_v1(session_id, grant_id, user_id)`로 해당 참가자의 유효한 접근만 갱신합니다. 반환값은 만료 시각이며 쿠키/미디어 토큰도 함께 재발급해야 합니다. 만료되거나 철회된 참가자 권한은 복구하지 않습니다.
+- 호스트가 돌아오지 않아 접근 창이 만료되면 유료 미디어와 접근은 중단할 수 있지만, 저장된 제품 세션은 종료하지 않습니다. 기존 cleanup의 실제 종료 기준을 유지합니다.
+- `noel` 관리자 구성은 서버에서 자격 증명을 확인한 뒤 실제 Supabase Auth 사용자를 생성/확인하고 기존 bootstrap profile RPC로 연결합니다. 비밀번호를 SQL이나 저장소에 넣지 않습니다.
+
+롤백 시 기존 마이그레이션을 수정하거나 컬럼을 삭제하지 마세요. 직전 애플리케이션으로 되돌리되 사용자별 배정 경로와 15분 접근 갱신 계약의 호환성을 먼저 확인해야 합니다.
+
+## 2026-09-05: 로컬 캡션 서버 권한
+
+`202609050002_managed_caption_sessions.sql`을 사용자 엔진 마이그레이션 다음에 적용합니다. 새 `managed_caption_sessions`에는 세션 식별자·소유자·배정 엔진/버전·언어·상태·유한 접근 만료만 저장하며 원문·번역문·음성은 저장하지 않습니다. 기존 사용자/라이브콜 데이터는 변경하지 않습니다.
+
+서버는 시작 시 승인된 프로필의 최신 배정과 비교해 세션을 등록하고, 임시 키 발급·번역·접근 갱신마다 활성 상태와 소유자를 재검증합니다. 로컬 캡션 종료는 `stop_managed_caption_session_v1`으로 기록하며 반복 종료는 같은 성공 결과입니다. 종료된 세션의 예전 서명 티켓으로 다시 키를 받거나 접근을 연장할 수 없습니다. 연결 교체는 기존 세션 ID를 유지하고, 6시간 접근은 만료 전에 갱신합니다. 네트워크 장기 단절로 접근이 만료되면 기존 자격으로 키 발급·번역을 계속하지 않습니다. 복귀 시 유효한 호스트 인증 및 승인 상태를 새로 확인하고, 서명·소유자가 확인된 세션을 갱신한 뒤 같은 엔진 배정으로 복구합니다. 종료된 세션은 복구하지 않습니다.
+
+모든 RPC는 service role 전용이며 테이블 직접 접근·클라이언트 접근은 차단합니다. 기존 행이 없는 새 테이블이므로 백필은 없습니다. 롤백 시 테이블/상태는 보존하고 이전 stateless broker로 되돌리지 마세요. 이전 티켓을 다시 허용하면 종료 후 재사용 방지가 사라집니다.
+
+## 2026-09-05: 호스트 발언자 명단·회사·부서·사진
+
+`202609050003_live_speaker_roster.sql`을 기존 마이그레이션 뒤에 적용합니다. 새 `live_speaker_rosters`(현재 명단), `live_speaker_profile_versions`(불변 프로필 버전), `live_speaker_photos`(불변 사진)만 추가하며 기존 행 백필은 없습니다. 명단이 없는 세션을 조회하면 revision/appliedRevision 0, 빈 명단을 반환합니다. 운영 적용은 별도 승인 후 수행합니다.
+
+- 호스트 소유권을 검증한 서버만 `get_live_speaker_roster_v1`과 `replace_live_speaker_roster_v1`을 호출합니다. 교체는 세션 행 잠금과 expectedRevision 비교로 동시에 수정한 두 요청 중 하나만 허용합니다. 최대 30명, 이름 40자, 회사·부서 각각 80자이며 연결 참여자·사진은 같은 세션이어야 합니다.
+- 프로필 ID별 이름·회사·부서·사진·연결 참여자 변경 시 서버가 version을 증가시켜 새 불변 행을 생성합니다. 삭제된 명단 항목의 과거 버전·사진은 그대로 남습니다. 준비 중에는 즉시 적용 완료 처리하고, 진행 중에는 게이트웨이가 오디오 경계를 반영한 뒤 `ack_live_speaker_roster_v1`으로 appliedRevision을 갱신합니다.
+- `create_live_speaker_photo_v1`은 호스트 소유권과 종료 상태를 검사하고 PNG/JPEG/WebP 256KiB 이하의 새 사진만 저장합니다. 서버에서 실제 이미지 디코딩·정규화 후 호출해야 합니다. 사진 조회 RPC는 service role 전용이며 호출 API가 호스트·참여자 접근권을 별도로 검증해야 합니다.
+- 모든 테이블 직접 접근과 익명·로그인 클라이언트 RPC 실행은 차단하며 service role에 지정 RPC 실행만 허용합니다. 종료/실패 세션은 명단·사진 쓰기를 거부합니다.
+
+롤백은 이전 애플리케이션으로 전환하고 새 테이블/프로필/사진을 보존하는 방식입니다. 영구 삭제 정책은 별도 정리 작업에 통합해야 하며 이 마이그레이션에서 과거 기록을 삭제하지 않습니다. 로컬 SQL 검증: `NOVA_PGLITE_MODULE=/path/to/pglite/dist/index.js node --test test/live-speaker-roster-sql.test.js`.
+
+`202609050004_speaker_profile_history.sql`은 명단 마이그레이션 바로 뒤에 적용합니다. 원문·번역 행에 nullable `speaker_profile`·`speaker_attribution`을 추가하므로 기존 기록은 NULL을 유지합니다. source v4 RPC는 오디오 시점의 6개 필드 프로필을 불변 버전 행과 대조하고, 기존 원문/캡션 RPC의 인증·상태·순서·멱등성 검사를 유지합니다. `unresolved`는 프로필 없는 미확정 화자에만 허용합니다. 같은 기록 키에 다른 프로필을 덮어쓰면 충돌로 거부합니다. 기존 원문 조회 함수는 권한 검사 함수를 보존한 래퍼로 바뀌며 두 추가 컬럼을 반환합니다. 호스트·참여자 재접속 스냅샷에도 프로필을 복원합니다.
+
+새 명단·사진·버전은 부모 세션의 기존 영구 삭제 시점에만 함께 정리됩니다. 명단 수정·프로필 삭제는 과거 버전·사진을 삭제하지 않습니다. 롤백 시 RPC와 컬럼은 유지하고 애플리케이션부터 되돌립니다. `test/live-speaker-full-migrations-sql.test.js`는 격리된 PGlite에서 전체 순서의 애플리케이션 마이그레이션과 실제 원문·캡션·기록 RPC를 검증합니다. Supabase의 auth/realtime/storage 및 pg_cron은 로컬 플랫폼 대역이며, 실제 클라우드 스케줄·이미지 스토리지는 이 검사에 포함되지 않습니다.

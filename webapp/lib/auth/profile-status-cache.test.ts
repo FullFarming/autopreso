@@ -32,11 +32,11 @@ test("assertHostApproved rejects pending, rejected, and disabled profiles with A
   assert.deepEqual(await assertHostApproved("h1", ok), { role: "admin" });
 });
 
-test("a store outage does not lock out a host whose last known status was approved", async () => {
+test("an expired cached approval fails closed during a store outage", async () => {
   let fail = false; let now = 0;
   const cache = createProfileStatusCache({ read: async () => { if (fail) throw new Error("down"); return row("approved"); }, now: () => now });
   await cache.get("h1"); fail = true; now = 120_000;
-  assert.deepEqual(await assertHostApproved("h1", cache), { role: "host" });
+  await assert.rejects(assertHostApproved("h1", cache), AuthenticationError);
 });
 
 test("a profile-backed host id whose profile row is gone is rejected, while a legacy password host id still falls through", async () => {

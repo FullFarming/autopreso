@@ -36,7 +36,7 @@ function synthesizePcm24k({ voice, fallbackVoice, text }) {
   return buffer.subarray(buffer.indexOf(Buffer.from("data")) + 8);
 }
 
-const settings = JSON.parse(fs.readFileSync(path.join(os.homedir(), ".config", "realtime-noel", "settings.json"), "utf8"));
+const settings = JSON.parse(fs.readFileSync(path.join(os.homedir(), ".config", "nova", "settings.json"), "utf8"));
 console.log(`[probe] pair=${pair} speak=${speak} (engine: openai)`);
 
 const events = [];

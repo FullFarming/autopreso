@@ -287,14 +287,17 @@
   color: var(--nova-fg-primary);
   box-shadow: var(--nova-shadow-medium);
 }
+.drawer[open] { display: flex; flex-direction: column; overflow: hidden; }
 .drawer::backdrop { background: var(--nova-scrim); }
-.drawerHeader { position: sticky; top: 0; z-index: 1; display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 16px 24px; background: var(--nova-surface-float); }
+.drawerHeader { flex: 0 0 auto; min-width: 0; overflow-wrap: anywhere; position: sticky; top: 0; z-index: 1; display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 16px 24px; background: var(--nova-surface-float); }
 .drawerHeader button { flex: 0 0 auto; }
 .drawerHeader h2 { margin: 0; font-size: var(--nova-font-size-t4); line-height: var(--nova-line-height-t4); }
-.drawerBody { min-width: 0; overflow: auto; padding: 0 24px 24px; }
-.drawerBody :is(button, select, summary) { white-space: nowrap; }
-.drawerBody .selectLabel { flex-wrap: nowrap; min-width: max-content; }
-.drawerBody .segmented { min-width: max-content; }
+.drawerBody { min-width: 0; min-height: 0; overflow-y: auto; overflow-x: hidden; overflow-wrap: anywhere; padding: 0 24px 24px; }
+.drawerBody :is(button, select, summary) { max-width: 100%; min-height: 44px; white-space: normal; overflow-wrap: anywhere; }
+.drawerBody .selectLabel { flex-wrap: wrap; min-width: 0; }
+.drawerBody .segmented { min-width: 0; }
+.drawerBody .segmented > div { flex-wrap: wrap; }
+.secondaryButton[data-icon-only="true"] { display: inline-flex; align-items: center; justify-content: center; width: 44px; min-width: 44px; padding: 0; }
 .secondaryButton { padding-inline: 16px; }
 
 .srOnly {

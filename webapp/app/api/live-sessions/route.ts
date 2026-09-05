@@ -1,8 +1,8 @@
 import { after, NextRequest } from "next/server";
 
 import { AuthenticationError, requireHost } from "@/lib/auth/live-auth";
-import { isAdminRequest } from "@/lib/auth/require-admin";
-import { resolveEngineDefaultsOrFallback } from "@/lib/console/engine-defaults";
+import { ConsoleStoreError } from "@/lib/console/console-store";
+import { resolveHostEngineAssignment } from "@/lib/console/engine-defaults";
 import { toLiveFailure } from "@/lib/live/errors";
 import { isLiveCallEnabled } from "@/lib/live/feature-flag";
 import { LiveSessionService } from "@/lib/live/service";
@@ -40,6 +40,7 @@ export async function GET(request: NextRequest) {
     });
   } catch (error: unknown) {
     if (error instanceof AuthenticationError) return apiError(error.message, "HOST_AUTH_REQUIRED", 401);
+    if (error instanceof ConsoleStoreError) return apiError("배정된 자막 엔진을 확인할 수 없습니다.", "ENGINE_ASSIGNMENT_UNAVAILABLE", 503);
     const failure = toLiveFailure(error);
     return apiError(failure.body.error, failure.body.code, failure.status);
   }
@@ -55,9 +56,7 @@ export async function POST(request: NextRequest) {
       return apiError(code === "INVALID_ENGINE_SELECTION" ? "자막 엔진 선택이 올바르지 않습니다." : "요청 형식이 올바르지 않습니다.", code, 400);
     }
     const input = parsed.data;
-    // Spec §9: the global engine is the only Live Call engine; a non-admin's
-    // `modelPreferences.engine` is replaced by it inside the service.
-    const [engineDefaults, isAdmin] = await Promise.all([resolveEngineDefaultsOrFallback(), isAdminRequest(request)]);
+    const { engine: engineDefaults, assignmentRevision } = await resolveHostEngineAssignment(hostId);
     const session = await new LiveSessionService(getLiveSessionStore()).create(hostId, {
       title: input.title,
       scheduledAt: input.scheduledAt,
@@ -74,12 +73,13 @@ export async function POST(request: NextRequest) {
       eventType: input.eventType,
       agenda: input.agenda,
       modelPreferences: input.modelPreferences,
-    }, { engineDefaults, isAdmin });
+    }, { engineDefaults, assignmentRevision });
     scheduleLiveSheetSyncAfterCommit(after);
     return apiSuccess(session, { status: 201 });
   } catch (error: unknown) {
     if (error instanceof BoundedJsonBodyError) return apiError(error.message, error.code, error.status);
     if (error instanceof AuthenticationError) return apiError(error.message, "HOST_AUTH_REQUIRED", 401);
+    if (error instanceof ConsoleStoreError) return apiError("배정된 자막 엔진을 확인할 수 없습니다.", "ENGINE_ASSIGNMENT_UNAVAILABLE", 503);
     const failure = toLiveFailure(error);
     return apiError(failure.body.error, failure.body.code, failure.status);
   }

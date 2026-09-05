@@ -6,7 +6,7 @@ import {
   redactGeminiSensitiveText,
   selectGeminiTranscriptionVocabulary,
 } from "../../packages/caption-core/index.js";
-import { DEFAULT_ENGINE_SELECTION, findEngineEntry } from "../../packages/caption-core/caption-engine-catalog.js";
+import { GEMINI_ENGINE_SELECTION, findEngineEntry } from "../../packages/caption-core/caption-engine-catalog.js";
 
 const GEMINI_INPUT_CHUNK_BYTES = 3_200;
 /** @type {number} */
@@ -22,7 +22,7 @@ const DEFAULT_ATTEMPT_TIMEOUT_MILLISECONDS = 2_800;
 export class GeminiLiveTranscriptionAdapter {
   constructor({
     client,
-    model = DEFAULT_ENGINE_SELECTION.stt.model,
+    model = GEMINI_ENGINE_SELECTION.stt.model,
     languageCodes = [],
     compiledGlossary = null,
     connectionLifetimeMilliseconds = 570_000,
@@ -77,7 +77,7 @@ export class GeminiLiveTranscriptionAdapter {
     this.now = now;
   }
 
-  async open({ onFinalUtterance, onPartialTranscript = null, onContinuityDiscard = () => {}, signal }) {
+  async open({ onFinalUtterance, onPartialTranscript = null, onContinuityDiscard = () => {}, onReconnectRequired = (_error) => {}, signal }) {
     if (signal?.aborted) throw new Error("STT_CONNECT_ABORTED");
     if (typeof onFinalUtterance !== "function"
       || (onPartialTranscript !== null && typeof onPartialTranscript !== "function")
@@ -91,6 +91,7 @@ export class GeminiLiveTranscriptionAdapter {
     let session = null;
     let audioOffsetMs = 0;
     let lastFinalOffsetMs = 0;
+    let segmentSequence = 0;
     let inputTail = Buffer.alloc(0);
     let pendingFrames = 0;
     let writeTail = Promise.resolve();
@@ -119,12 +120,14 @@ export class GeminiLiveTranscriptionAdapter {
       return providerCloseTask;
     };
     const fail = (error) => {
+      const firstFailure = terminalError === null;
       terminalError ??= error;
       if (lifetimeTimer !== null) clearTimeoutFn(lifetimeTimer);
       if (connectionTimer !== null) clearTimeoutFn(connectionTimer);
       connectController.abort(terminalError);
       rejectConnect(terminalError);
       closeProviderSession();
+      if (firstFailure && session && !isClosing && ["STT_PROVIDER_CLOSED", "STT_PROVIDER_FAILED", "STT_CONNECTION_ROLLOVER_REQUIRED"].includes(error.message)) onReconnectRequired(error);
     };
     const onAbort = () => fail(new Error(session ? "STT_DRAIN_ABORTED" : "STT_CONNECT_ABORTED"));
     signal?.addEventListener("abort", onAbort, { once: true });
@@ -138,7 +141,7 @@ export class GeminiLiveTranscriptionAdapter {
           return;
         }
         try {
-          const callback = onPartialTranscript?.({ text: parsed.text, sourceLanguage: parsed.languageCode });
+          const callback = onPartialTranscript?.({ text: parsed.text, sourceLanguage: parsed.languageCode, segmentId: String(segmentSequence) });
           if (callback && typeof callback.then === "function") {
             pendingPartials += 1;
             Promise.resolve(callback)
@@ -153,6 +156,7 @@ export class GeminiLiveTranscriptionAdapter {
         return;
       }
       pendingUtterances += 1;
+      const segmentId = String(segmentSequence++);
       const sourceStartOffsetMs = lastFinalOffsetMs;
       const sourceEndOffsetMs = Math.max(sourceStartOffsetMs, audioOffsetMs);
       lastFinalOffsetMs = sourceEndOffsetMs;
@@ -162,6 +166,7 @@ export class GeminiLiveTranscriptionAdapter {
         text: parsed.text,
         rawText: parsed.rawText,
         sourceLanguage: parsed.languageCode,
+        segmentId,
         speakerLabel: "1",
         sourceStartOffsetMs,
         sourceEndOffsetMs,
@@ -189,13 +194,14 @@ export class GeminiLiveTranscriptionAdapter {
       callbacks: {
         onmessage: (message) => {
           if (terminalError || closeRequested || didClose) return;
+          if (message?.goAway) onReconnectRequired(new Error("STT_CONNECTION_ROLLOVER_REQUIRED"));
           const content = message?.serverContent;
           // outputTranscription and modelTurn.inlineData are intentionally
           // ignored: this provider can only promote input speech to text.
           emitTranscript(content?.interimInputTranscription, false);
           emitTranscript(content?.inputTranscription, true);
         },
-        onerror: () => { if (!closeRequested && !didClose) fail(new Error("STT_PROVIDER_FAILED")); },
+        onerror: (error) => { if (!closeRequested && !didClose) fail(new Error(error?.message === "GOOGLE_LIVE_PROVIDER_REJECTED" ? "STT_PROVIDER_REJECTED" : "STT_PROVIDER_FAILED")); },
         onclose: () => {
           if (!isClosing && !terminalError) fail(new Error("STT_PROVIDER_CLOSED"));
         },
@@ -233,16 +239,14 @@ export class GeminiLiveTranscriptionAdapter {
       writeTail = work.catch((error) => { fail(error instanceof Error ? error : new Error("STT_PROVIDER_WRITE_FAILED")); });
       return work.finally(() => { pendingFrames -= 1; });
     };
-    const flushAudio = async (frame, { padTail = false } = {}) => {
+    const flushAudio = async (frame, { flushTail = false } = {}) => {
       const combined = inputTail.byteLength === 0 ? frame : Buffer.concat([inputTail, frame]);
-      const completeBytes = padTail
-        ? (combined.byteLength > 0 ? Math.ceil(combined.byteLength / GEMINI_INPUT_CHUNK_BYTES) * GEMINI_INPUT_CHUNK_BYTES : 0)
+      const completeBytes = flushTail
+        ? combined.byteLength
         : combined.byteLength - (combined.byteLength % GEMINI_INPUT_CHUNK_BYTES);
-      inputTail = padTail ? Buffer.alloc(0) : Buffer.from(combined.subarray(completeBytes));
+      inputTail = flushTail ? Buffer.alloc(0) : Buffer.from(combined.subarray(completeBytes));
       if (completeBytes === 0) return;
-      const payload = completeBytes <= combined.byteLength
-        ? combined.subarray(0, completeBytes)
-        : Buffer.concat([combined, Buffer.alloc(completeBytes - combined.byteLength)]);
+      const payload = combined.subarray(0, completeBytes);
       for (let offset = 0; offset < completeBytes; offset += GEMINI_INPUT_CHUNK_BYTES) {
         const chunk = payload.subarray(offset, offset + GEMINI_INPUT_CHUNK_BYTES);
         if (terminalError || didClose) throw terminalError ?? new Error("STT_STREAM_CLOSED");
@@ -252,7 +256,7 @@ export class GeminiLiveTranscriptionAdapter {
             mimeType: `audio/pcm;rate=${AUDIO_CONFIG.inputSampleRate}`,
           },
         });
-        audioOffsetMs += 100;
+        audioOffsetMs += chunk.byteLength / (AUDIO_CONFIG.inputSampleRate * 2) * 1_000;
       }
     };
     return {
@@ -264,7 +268,7 @@ export class GeminiLiveTranscriptionAdapter {
       },
       audioStreamEnd() {
         return enqueueWrite(async () => {
-          await flushAudio(Buffer.alloc(0), { padTail: true });
+          await flushAudio(Buffer.alloc(0), { flushTail: true });
           await session.sendRealtimeInput({ audioStreamEnd: true });
         });
       },
@@ -300,7 +304,7 @@ export class GeminiLiveTranscriptionAdapter {
           await Promise.race([(async () => {
           await writeTail;
           if (inputTail.byteLength > 0 && !terminalError) {
-            await flushAudio(Buffer.alloc(0), { padTail: true });
+            await flushAudio(Buffer.alloc(0), { flushTail: true });
           }
           if (!terminalError) await session.sendRealtimeInput?.({ audioStreamEnd: true });
           // Gemini may deliver the final inputTranscription only after the end
@@ -447,7 +451,7 @@ export class GeminiTextTranslateAdapter {
   // is lost because the finalized utterance translates again on its own budget.
   constructor({
     client,
-    model = DEFAULT_ENGINE_SELECTION.translation.model,
+    model = GEMINI_ENGINE_SELECTION.translation.model,
     fallbackModels = [],
     fallbackClients = [],
     timeoutMilliseconds = DEFAULT_FINAL_TRANSLATION_TIMEOUT_MILLISECONDS,

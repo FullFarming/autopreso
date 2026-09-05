@@ -17,6 +17,7 @@ const MINIMUM_ROLLOVER_MILLISECONDS = 60_000;
  *  keep the 540 s `STT_CONFIG.rolloverMilliseconds`; Soniox advertises
  *  `maxConnectionMilliseconds` (290 min) and rolls shortly before it. */
 export function resolveRolloverMilliseconds(stream) {
+  if (stream?.managesOwnRollover === true) return Infinity;
   const limit = stream?.maxConnectionMilliseconds;
   if (!Number.isFinite(limit) || limit <= 0) return STT_CONFIG.rolloverMilliseconds;
   return Math.max(MINIMUM_ROLLOVER_MILLISECONDS, limit - ROLLOVER_LEAD_MILLISECONDS);
@@ -24,6 +25,10 @@ export function resolveRolloverMilliseconds(stream) {
 
 export class RollingSpeechSession {
   #stream = null;
+  #totalAudioOffsetMs = 0;
+  #rolloverTimer = null;
+  #rotationPending = false;
+  #failedStreams = new WeakSet();
   #startedAt = 0;
   #rolloverMilliseconds = STT_CONFIG.rolloverMilliseconds;
   #overlapFrames = [];
@@ -48,8 +53,13 @@ export class RollingSpeechSession {
   constructor({
     provider, onFinalUtterance, onPartialTranscript = null, onPartialTranslation = null, onRemap,
     capturePcmWindows = false, now = Date.now,
+    onConnectionState = (_state) => {},
     maxPendingUtterances = 64,
+    setTimer = setTimeout, clearTimer = clearTimeout,
   }) {
+    this.setTimer = setTimer;
+    this.clearTimer = clearTimer;
+    this.onConnectionState = onConnectionState;
     this.provider = provider;
     this.onFinalUtterance = onFinalUtterance;
     this.onPartialTranscript = onPartialTranscript;
@@ -83,6 +93,7 @@ export class RollingSpeechSession {
       this.#streamAudioOffsetMs = 0;
       this.#startedAt = this.now();
       this.#rolloverMilliseconds = resolveRolloverMilliseconds(this.#stream);
+      this.#armRollover();
     })().catch((error) => { this.#terminalError = error; throw error; });
     return this.#startPromise;
   }
@@ -90,13 +101,15 @@ export class RollingSpeechSession {
   async #openStream(options) {
     const controller = new AbortController();
     const sourceGeneration = randomUUID();
+    const sessionAudioOffsetMs = this.#totalAudioOffsetMs;
     // `partialsRetired` flips at swap time, the moment a replacement stream
     // owns the lanes; `isRetired` flips only once close() has resolved. A
     // draining socket may keep emitting for seconds in between, and its
     // partials would otherwise race the new stream's on the same lane (both
     // peek the same coming seq). Its finals stay welcome until the real
     // retire: delivering the tail is the whole reason the drain exists.
-    const admission = { isRetired: false, partialsRetired: false };
+    const admission = { isRetired: false, partialsRetired: false, endOffsetMs: null };
+    let openedStream = null;
     this.#pendingOpens.add(controller);
     let rejectAborted;
     const aborted = new Promise((_, reject) => { rejectAborted = reject; });
@@ -106,17 +119,26 @@ export class RollingSpeechSession {
       if (controller.signal.aborted) throw this.#terminalError ?? new Error("STT_STREAM_CLOSED");
       return this.provider.open({
         ...options, signal: controller.signal,
+        onConnectionState: this.onConnectionState,
+        onReconnectRequired: (error) => {
+          if (openedStream && !admission.partialsRetired && !admission.isRetired) this.#requestRollover(openedStream, error);
+        },
         onFinalUtterance: (utterance) => {
-          if (!admission.isRetired && !controller.signal.aborted && !this.#isClosed) return options.onFinalUtterance({ ...utterance, sourceGeneration });
+          if (!admission.isRetired && !controller.signal.aborted && !this.#isClosed) return options.onFinalUtterance({ ...utterance, sourceGeneration,
+            sourceGenerationStartOffsetMs: sessionAudioOffsetMs + (utterance.sourceGenerationStartOffsetMs ?? 0),
+            sourceGenerationEndOffsetMs: admission.endOffsetMs,
+            sourceSessionStartOffsetMs: sessionAudioOffsetMs + (Number.isFinite(utterance.sourceSessionStartOffsetMs) ? utterance.sourceSessionStartOffsetMs : utterance.sourceStartOffsetMs),
+            sourceSessionEndOffsetMs: sessionAudioOffsetMs + (Number.isFinite(utterance.sourceSessionEndOffsetMs) ? utterance.sourceSessionEndOffsetMs : utterance.sourceEndOffsetMs) });
         },
         onPartialTranscript: (value) => {
-          if (!admission.partialsRetired && !admission.isRetired && !controller.signal.aborted && !this.#isClosing && !this.#isClosed) return options.onPartialTranscript?.(value);
+          if (!admission.partialsRetired && !admission.isRetired && !controller.signal.aborted && !this.#isClosing && !this.#isClosed) return options.onPartialTranscript?.({ ...value, sourceGeneration, sourceGenerationStartOffsetMs: sessionAudioOffsetMs });
         },
         onPartialTranslation: (value) => {
-          if (!admission.partialsRetired && !admission.isRetired && !controller.signal.aborted && !this.#isClosing && !this.#isClosed) return options.onPartialTranslation?.(value);
+          if (!admission.partialsRetired && !admission.isRetired && !controller.signal.aborted && !this.#isClosing && !this.#isClosed) return options.onPartialTranslation?.({ ...value, sourceGeneration, sourceGenerationStartOffsetMs: sessionAudioOffsetMs });
         },
       });
     }).then(async (stream) => {
+      openedStream = stream;
       this.#streamAdmissions.set(stream, admission);
       if (controller.signal.aborted || this.#isClosing || this.#isClosed) {
         await this.#closeStreamOnce(stream);
@@ -142,9 +164,15 @@ export class RollingSpeechSession {
       if (this.#terminalError) throw this.#terminalError;
       if (this.#isClosed) throw new Error("STT_STREAM_CLOSED");
       if (!this.#isClosing && this.now() - this.#startedAt >= this.#rolloverMilliseconds) await this.#rollover();
-      await this.#stream.sendAudio(ownedFrame);
+      const writingStream = this.#stream;
+      try { await writingStream.sendAudio(ownedFrame); } catch (error) {
+        if (this.#isClosing || this.#isClosed || !this.#failedStreams.has(writingStream)) throw error;
+        if (this.#stream === writingStream) await this.#rollover();
+        await this.#stream.sendAudio(ownedFrame);
+      }
       this.#pcmRing?.push(ownedFrame, this.#streamAudioOffsetMs);
       this.#streamAudioOffsetMs += AUDIO_CONFIG.chunkMilliseconds;
+      this.#totalAudioOffsetMs += AUDIO_CONFIG.chunkMilliseconds;
       this.#overlapFrames.push(ownedFrame.slice());
       const maxFrames = STT_CONFIG.overlapMilliseconds / AUDIO_CONFIG.chunkMilliseconds;
       if (this.#overlapFrames.length > maxFrames) this.#overlapFrames.shift()?.fill(0);
@@ -155,6 +183,45 @@ export class RollingSpeechSession {
     }).finally(() => { this.#pendingWrites -= 1; ownedFrame.fill(0); });
     this.#writeTail = work.catch(() => undefined);
     return work;
+  }
+
+  #armRollover() {
+    this.clearTimer(this.#rolloverTimer);
+    if (this.#isClosing || this.#isClosed || !Number.isFinite(this.#rolloverMilliseconds)) return;
+    const stream = this.#stream;
+    this.#rolloverTimer = this.setTimer(() => this.#requestRollover(stream), this.#rolloverMilliseconds);
+    this.#rolloverTimer?.unref?.();
+  }
+
+  #requestRollover(stream, error = null) {
+    if (this.#isClosing || this.#isClosed || this.#terminalError || stream !== this.#stream) return;
+    if (error && error.message !== "STT_CONNECTION_ROLLOVER_REQUIRED") this.#failedStreams.add(stream);
+    if (this.#rotationPending) return;
+    this.#rotationPending = true;
+    this.onConnectionState({ status: "connecting", code: "STT_RECONNECTING" });
+    this.clearTimer(this.#rolloverTimer);
+    const task = this.#writeTail.then(async () => {
+      if (!this.#isClosing && !this.#isClosed && stream === this.#stream) await this.#rollover();
+      if (!this.#isClosing && !this.#isClosed) this.onConnectionState({ status: "ready" });
+    }).catch((failure) => {
+      this.#terminalError ??= failure;
+      this.#stream?.abort?.();
+      if (!this.#isClosing && !this.#isClosed) this.onConnectionState({ status: "failed", code: "STT_RECONNECT_FAILED" });
+    }).finally(() => { this.#rotationPending = false; });
+    this.#writeTail = task;
+  }
+
+  rotateAtSpeakerBoundary() {
+    const task = this.#writeTail.then(async () => {
+      if (this.#terminalError) throw this.#terminalError;
+      if (this.#isClosing || this.#isClosed) throw new Error("STT_STREAM_CLOSED");
+      await Promise.all(this.#drainingStreams);
+      if (this.#isClosing || this.#isClosed) throw new Error("STT_STREAM_CLOSED");
+      if (this.#terminalError) throw this.#terminalError;
+      await this.#rollover();
+    });
+    this.#writeTail = task.catch(() => undefined);
+    return task;
   }
 
   async #rollover() {
@@ -197,6 +264,7 @@ export class RollingSpeechSession {
         this.#streamAudioOffsetMs = 0;
         this.#startedAt = this.now();
         this.#rolloverMilliseconds = resolveRolloverMilliseconds(next);
+        this.#armRollover();
         this.#clearOverlapFrames();
         this.#retirePartials(previous);
         this.#drainPrevious(previous, previousPcmRing);
@@ -223,6 +291,7 @@ export class RollingSpeechSession {
       this.#streamAudioOffsetMs = nextAudioOffsetMs;
       this.#startedAt = this.now();
       this.#rolloverMilliseconds = resolveRolloverMilliseconds(next);
+        this.#armRollover();
     } catch (error) {
       await Promise.allSettled([this.#closeStreamOnce(previous), this.#closeStreamOnce(next)]);
       previousPcmRing?.clear();
@@ -235,6 +304,7 @@ export class RollingSpeechSession {
   close() {
     if (this.#closePromise) return this.#closePromise;
     this.#isClosing = true;
+    this.clearTimer(this.#rolloverTimer);
     for (const controller of this.#pendingOpens) controller.abort();
     this.#closePromise = (async () => {
       let deadline;
@@ -277,6 +347,7 @@ export class RollingSpeechSession {
   abort() {
     this.#terminalError ??= new Error("STT_DRAIN_ABORTED");
     this.#isClosing = true;
+    this.clearTimer(this.#rolloverTimer);
     this.#removeExternalAbort?.();
     for (const controller of this.#pendingOpens) controller.abort();
     this.#stream?.abort?.();
@@ -289,7 +360,7 @@ export class RollingSpeechSession {
    *  on while its finals keep flowing until `#closeStreamOnce` retires it. */
   #retirePartials(stream) {
     const admission = this.#streamAdmissions.get(stream);
-    if (admission) admission.partialsRetired = true;
+    if (admission) { admission.partialsRetired = true; admission.endOffsetMs = this.#totalAudioOffsetMs; }
   }
 
   #closeStreamOnce(stream) {
@@ -310,6 +381,7 @@ export class RollingSpeechSession {
     this.#retiringStreams.add(stream);
     const task = this.#closeStreamOnce(stream)
       .catch((error) => {
+        if (this.#failedStreams.has(stream)) return;
         this.#terminalError ??= error instanceof Error ? error : new Error("STT_STREAM_DRAIN_FAILED");
         this.#stream?.abort?.();
       })

@@ -102,11 +102,11 @@ test("publisher and both replay readers use the additive provenance contract", a
     readFile(webStoreUrl, "utf8"),
   ]);
   assert.match(gateway, /p_origin: event\.origin \?\? null,\s*p_utterance_key: event\.utteranceKey \?\? null/iu);
-  assert.match(gateway, /select: "seq,participant_id,speaker_label,speaker_name,text,source_text,source_language,origin,utterance_key,translation_status,/u);
+  assert.match(gateway, /select: "seq,participant_id,speaker_label,speaker_name,speaker_profile,speaker_attribution,text,source_text,source_language,origin,utterance_key,translation_status,/u);
   assert.match(gateway, /row\.origin === "source" \? \{ origin: "source" \} : \{\}/u);
   assert.match(gateway, /row\.utterance_key[\s\S]*?\{ utteranceKey: row\.utterance_key \}/u);
   assert.match(webStore, /origin: string \| null;\s*utterance_key: string \| null;\s*translation_status: "verbatim" \| "translated" \| "failed" \| null;/u);
   assert.match(webStore, /if \(row\.origin === "source"\) caption\.origin = "source";/u);
   assert.match(webStore, /if \(row\.utterance_key\) caption\.utteranceKey = row\.utterance_key;/u);
-  assert.match(webStore, /select: "seq,participant_id,speaker_label,speaker_name,text,source_text,source_language,source_started_at,origin,utterance_key,translation_status,source_ended_at,emitted_at,authoritative_source_id,translation_capture"/u);
+  assert.match(webStore, /select: "seq,participant_id,speaker_label,speaker_name,speaker_profile,speaker_attribution,text,source_text,source_language,source_started_at,origin,utterance_key,translation_status,source_ended_at,emitted_at,authoritative_source_id,translation_capture"/u);
 });

@@ -192,3 +192,13 @@ test("bounded pagination and immutable drafts preserve edits outside the visible
   assert.equal(firstDrafts["term-88"], undefined);
   assert.notEqual(nextDrafts, firstDrafts);
 });
+
+
+test("second and third language drafts survive paging, search, and save", () => {
+  const term: GlossaryTermPresentation = { id: "multi", source: "매출", target: "Revenue", translations: { en: "Revenue", ja: "売上", "zh-Hans": "收入" }, doNotTranslate: false, aliases: [], status: "approved" };
+  const first = applyGlossaryTermDraft({}, term.id, "translation:ja", "売上高");
+  const drafts = applyGlossaryTermDraft(first, term.id, "translation:zh-Hans", "营业收入");
+  assert.equal(createGlossaryTermWindow([term], "売上高", 0, drafts).totalMatchCount, 1);
+  assert.deepEqual(createGlossaryDraftEdits([term], drafts)[0]?.translations, { en: "Revenue", ja: "売上高", "zh-Hans": "营业收入" });
+  assert.equal(term.translations?.ja, "売上");
+});

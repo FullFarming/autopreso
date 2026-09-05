@@ -117,7 +117,8 @@ export async function POST(request: NextRequest, context: { params: Promise<{ id
       const participantById = new Map(participants.map((participant) => [participant.participantId, participant]));
       const attributedUtterances = utterances.map((utterance) => {
         const participant = utterance.participantId ? participantById.get(utterance.participantId) : undefined;
-        return participant
+        // 2026-09-05 fix: 수동 재생성도 발언 당시 신원을 보존하고 미확정 발언을 현재 참여자에게 추측 배정하지 않는다.
+        return participant && !utterance.speakerProfile && utterance.speakerAttribution !== "unresolved"
           ? {
               ...utterance,
               speakerName: participant.displayName,

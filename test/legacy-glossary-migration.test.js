@@ -90,7 +90,7 @@ async function createLegacySettingsFile(overrides = {}) {
 
 test("exact shipped legacy full glossary advances without shrinking and keeps tone", async () => {
   const { filePath, legacyGlossary } = await createLegacySettingsFile();
-  const store = createSettingsStore({ filePath, env: {}, readCodexAuth: noCodexAuth });
+  const store = createSettingsStore({ filePath, env: {} });
 
   const settings = await store.load();
 
@@ -106,7 +106,7 @@ test("a one-character Custom glossary change is never mistaken for the shipped l
   const { filePath, legacyGlossary } = await createLegacySettingsFile({
     glossary: `${await fs.readFile(LEGACY_GLOSSARY_URL, "utf8")}!`,
   });
-  const store = createSettingsStore({ filePath, env: {}, readCodexAuth: noCodexAuth });
+  const store = createSettingsStore({ filePath, env: {} });
 
   const settings = await store.load();
 
@@ -120,7 +120,7 @@ test("a one-character Custom domain change preserves both legacy fields", async 
   const { filePath, legacyGlossary } = await createLegacySettingsFile({
     translationDomain: `${LEGACY_DOMAIN}!`,
   });
-  const store = createSettingsStore({ filePath, env: {}, readCodexAuth: noCodexAuth });
+  const store = createSettingsStore({ filePath, env: {} });
 
   const settings = await store.load();
 
@@ -140,7 +140,7 @@ test("the previous 15k compact default advances to the restored full CRE preset"
     translationDomain: PREVIOUS_COMPACT_DOMAIN,
   });
 
-  const settings = await createSettingsStore({ filePath, env: {}, readCodexAuth: noCodexAuth }).load();
+  const settings = await createSettingsStore({ filePath, env: {} }).load();
 
   assert.equal(settings.subtitle.glossaryPresetId, DEFAULT_SUBTITLE_SETTINGS.glossaryPresetId);
   assert.equal(settings.subtitle.glossary, DEFAULT_SUBTITLE_SETTINGS.glossary);
@@ -157,7 +157,7 @@ test("a one-character edit to the previous compact default remains Custom", asyn
     translationDomain: PREVIOUS_COMPACT_DOMAIN,
   });
 
-  const settings = await createSettingsStore({ filePath, env: {}, readCodexAuth: noCodexAuth }).load();
+  const settings = await createSettingsStore({ filePath, env: {} }).load();
 
   assert.equal(settings.subtitle.glossaryPresetId, "");
   assert.equal(settings.subtitle.glossary, customGlossary);
@@ -174,7 +174,7 @@ test("the previous 11k focused default advances to the restored full CRE preset"
     translationDomain: PREVIOUS_FOCUSED_DOMAIN,
   });
 
-  const settings = await createSettingsStore({ filePath, env: {}, readCodexAuth: noCodexAuth }).load();
+  const settings = await createSettingsStore({ filePath, env: {} }).load();
 
   assert.equal(settings.subtitle.glossaryPresetId, DEFAULT_SUBTITLE_SETTINGS.glossaryPresetId);
   assert.equal(settings.subtitle.glossary, DEFAULT_SUBTITLE_SETTINGS.glossary);
@@ -190,7 +190,7 @@ test("a one-character edit to the previous 11k focused default remains Custom", 
     translationDomain: PREVIOUS_FOCUSED_DOMAIN,
   });
 
-  const settings = await createSettingsStore({ filePath, env: {}, readCodexAuth: noCodexAuth }).load();
+  const settings = await createSettingsStore({ filePath, env: {} }).load();
 
   assert.equal(settings.subtitle.glossaryPresetId, "");
   assert.equal(settings.subtitle.glossary, customGlossary);
@@ -210,7 +210,7 @@ test("the released 12k focused default advances to the restored full CRE preset"
     translationDomain: PREVIOUS_FOCUSED_DOMAIN,
   });
 
-  const settings = await createSettingsStore({ filePath, env: {}, readCodexAuth: noCodexAuth }).load();
+  const settings = await createSettingsStore({ filePath, env: {} }).load();
 
   assert.equal(settings.subtitle.glossaryPresetId, DEFAULT_SUBTITLE_SETTINGS.glossaryPresetId);
   assert.equal(settings.subtitle.glossary, DEFAULT_SUBTITLE_SETTINGS.glossary);
@@ -230,7 +230,7 @@ test("a one-character edit to the released 12k focused default remains Custom", 
     translationDomain: PREVIOUS_FOCUSED_DOMAIN,
   });
 
-  const settings = await createSettingsStore({ filePath, env: {}, readCodexAuth: noCodexAuth }).load();
+  const settings = await createSettingsStore({ filePath, env: {} }).load();
 
   assert.equal(settings.subtitle.glossaryPresetId, "");
   assert.equal(settings.subtitle.glossary, customGlossary);

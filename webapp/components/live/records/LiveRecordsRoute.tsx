@@ -64,6 +64,9 @@ export function LiveRecordsRoute() {
   const [isDetailLoading, setIsDetailLoading] = useState(false);
   const detailCacheRef = useRef(new Map<string, LiveRecordApiDetail>());
   const detailRequestGenerationRef = useRef(0);
+  const detailAbortRef = useRef<AbortController | null>(null);
+  const detailRequestPendingRef = useRef(false);
+  useEffect(() => () => { detailAbortRef.current?.abort(); }, []);
   const selectedDetailKeyRef = useRef("");
   const [isLoading, setIsLoading] = useState(true);
   const [isRetryingSync, setIsRetryingSync] = useState(false);
@@ -80,6 +83,10 @@ export function LiveRecordsRoute() {
   useEffect(() => { void loadList(); }, [loadList]);
 
   const openDetail = useCallback(async (id: string, language?: string) => {
+    detailAbortRef.current?.abort();
+    const controller = new AbortController();
+    detailAbortRef.current = controller;
+    detailRequestPendingRef.current = true;
     const cacheKey = recordDetailCacheKey(id, language);
     const requestGeneration = detailRequestGenerationRef.current + 1;
     detailRequestGenerationRef.current = requestGeneration;
@@ -96,7 +103,8 @@ export function LiveRecordsRoute() {
     if (!detail && !cached) setIsLoading(true);
     setError("");
     try {
-      const result = await fetchLiveRecordDetail(id, language);
+      const result = await fetchLiveRecordDetail(id, language, controller.signal);
+      if (controller.signal.aborted) return;
       detailCacheRef.current.set(cacheKey, result);
       if (requestGeneration !== detailRequestGenerationRef.current
         || selectedDetailKeyRef.current !== cacheKey) return;
@@ -104,17 +112,33 @@ export function LiveRecordsRoute() {
       setSelectedLaneId(`translation:${result.selectedLanguage}`);
       setDisplayedDetailKey(cacheKey);
     } catch {
+      if (controller.signal.aborted) return;
       if (requestGeneration === detailRequestGenerationRef.current
         && selectedDetailKeyRef.current === cacheKey) {
         setError("라이브콜 기록을 불러오지 못했습니다. 다시 시도해 주세요.");
       }
     } finally {
       if (requestGeneration === detailRequestGenerationRef.current) {
+        detailRequestPendingRef.current = false;
         setIsDetailLoading(false);
         setIsLoading(false);
       }
     }
   }, [detail]);
+
+  useEffect(() => {
+    if (!detail || error || selectedDetailKey !== displayedDetailKey || detail.summaryStates[detail.selectedLanguage]?.status !== "running") return;
+    const pollingDetailKey = displayedDetailKey;
+    let timer: ReturnType<typeof setTimeout>;
+    let disposed = false;
+    const check = () => {
+      if (disposed || selectedDetailKeyRef.current !== pollingDetailKey) return;
+      if (document.hidden || detailRequestPendingRef.current) { timer = setTimeout(check, 25_000); return; }
+      void openDetail(detail.record.sessionId, detail.selectedLanguage);
+    };
+    timer = setTimeout(check, 25_000);
+    return () => { disposed = true; clearTimeout(timer); };
+  }, [detail, error, openDetail, selectedDetailKey, displayedDetailKey]);
 
   const presentation = useMemo(() => detail ? detailPresentation(detail) : null, [detail]);
   const panel = detail && displayedDetailKey === selectedDetailKey ? <RecordSummaryPanel summary={detail.summary}
@@ -136,6 +160,8 @@ export function LiveRecordsRoute() {
 
   const closeDetail = useCallback(() => {
     detailRequestGenerationRef.current += 1;
+    detailRequestPendingRef.current = false;
+    detailAbortRef.current?.abort();
     selectedDetailKeyRef.current = "";
     setSelectedDetailKey("");
     setDisplayedDetailKey("");

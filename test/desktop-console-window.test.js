@@ -219,7 +219,7 @@ test("a new Live Call takes its engine from the admin's global default published
   assert.deepEqual(plain(await soniox.seed()), { engine: plain(sonioxEngine) });
 });
 
-test("an absent, invalid, or unreachable global default falls back to the catalog default — never to the local caption engine", async () => {
+test("an absent, invalid, or unreachable assignment blocks start without choosing another engine", async () => {
   for (const config of [
     { ok: true, data: { gatewayUrl: "wss://gw.example.test" } },
     { ok: true, data: { gatewayUrl: "wss://gw.example.test", engineDefaults: null } },
@@ -231,11 +231,11 @@ test("an absent, invalid, or unreachable global default falls back to the catalo
     { ok: false, code: "HOST_LOGIN_REQUIRED" },
   ]) {
     const h = seedHarness({ config });
-    assert.deepEqual(plain(await h.seed()), plain(catalogDefaultPreferences), JSON.stringify(config));
+    await assert.rejects(h.seed(), undefined, JSON.stringify(config));
   }
   const seedSource = section("async function seedLiveCallEngineDefaults", "async function openLiveStageOverlay");
   assert.doesNotMatch(seedSource, /subtitle|settingsStore|engineDefaultsSeen|\.save\(/u, "the seed reads no local settings and persists nothing");
-  assert.match(seedSource, /DEFAULT_ENGINE_SELECTION/u);
+  assert.doesNotMatch(seedSource, /DEFAULT_ENGINE_SELECTION/u);
 });
 
 test("the local caption engine never reaches the Live Call body: a Soniox subtitle.engine still submits the admin engine", () => {

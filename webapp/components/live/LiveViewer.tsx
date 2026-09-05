@@ -1,5 +1,7 @@
 "use client";
 
+import { SystemLanguageButton } from "@/components/system-language/SystemLanguageButton";
+import { useLiveAccessRenewal } from "@/lib/live/use-access-renewal";
 import { useSystemText, useSystemLanguage } from "@/components/system-language/SystemLanguageProvider";
 import { formatViewerSystemStatus, viewerMessages } from "@/lib/system-language/viewer-messages";
 import { formatSystemText, SYSTEM_LOCALES, type SystemLanguage } from "@/lib/system-language";
@@ -91,7 +93,7 @@ import {
   type ViewerState,
 } from "./viewer-controller-contract";
 import { useViewerRecovery } from "./useViewerRecovery";
-import { getSafeSummaryErrorMessage, getSafeTranscriptErrorMessage, isSummaryEmptyCode } from "./useHostSummaryLifecycle";
+import { getSafeSummaryErrorMessage, getSafeTranscriptErrorMessage, isSummaryEmptyCode, isSummaryReadRetryable } from "./useHostSummaryLifecycle";
 import {
   connectViewerGatewayOnce,
   createViewerGatewayConnectionGate,
@@ -201,6 +203,7 @@ export function ViewerStage({ captions, status, sessionStatus = "live" }: {
           <CaptionEntry
             key={`${caption.language}-${caption.seq}`}
             text={caption.text}
+            speakerProfile={caption.speakerProfile} sessionId={caption.sessionId}
             speakerLabel={caption.speaker?.name?.trim() || caption.speaker?.label?.trim() || t("호스트")}
             timestamp={new Date(caption.emittedAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
             isFinal={caption.isFinal}
@@ -250,7 +253,8 @@ function captionLaneInput(caption: CaptionEvent, index: number, total: number): 
     languageObservation: caption.languageObservation,
     origin: caption.origin,
     text: caption.text,
-    speakerLabel: caption.speaker?.name?.trim() || caption.speaker?.label?.trim() || "",
+    speakerProfile: caption.speakerProfile, sessionId: caption.sessionId,
+    speakerLabel: caption.speakerProfile?.displayName || caption.speaker?.name?.trim() || caption.speaker?.label?.trim() || "",
     // 5B: the contract already ships a per-speaker colorToken; the viewer used
     // to drop it. Name text carries identity, color only reinforces it.
     speakerColor: resolveViewerSpeakerColor(caption.speaker),
@@ -384,6 +388,8 @@ export default function LiveViewer({ compact = false }: { compact?: boolean }) {
   const [minutesPollingStartedAt, setMinutesPollingStartedAt] = useState<number | null>(null);
   const [minutesPollingRound, setMinutesPollingRound] = useState(0);
   const minutesLoadGenerationRef = useRef(0);
+  const minutesReadAbortRef = useRef<AbortController | null>(null);
+  useEffect(() => () => { minutesReadAbortRef.current?.abort(); }, []);
   const isSessionEndedRef = useRef(false);
   const markSessionEndedRef = useRef<() => void>(() => {});
   const markSessionFailedRef = useRef<() => void>(() => {});
@@ -401,6 +407,8 @@ export default function LiveViewer({ compact = false }: { compact?: boolean }) {
   const [isBusy, setIsBusy] = useState(false);
   const [pendingInviteToken, setPendingInviteToken] = useState("");
   const [hasLeftSession, setHasLeftSession] = useState(false);
+  useLiveAccessRenewal({ sessionId: viewer?.session.id ?? null, audience: "viewer",
+    active: !!viewer && !hasLeftSession && ["preparing", "live", "paused"].includes(sessionStatus), onError: setError });
   // Caption text size is a continuous scale on a CSS custom property, not a
   // three-step class cycle. The old `.is-text-large`/`.is-text-largest`
   // classes only had CSS under `.is-compact`, so the control silently did
@@ -569,66 +577,55 @@ export default function LiveViewer({ compact = false }: { compact?: boolean }) {
   const loadMinutes = useCallback(async (
     requestedLanguage: string = languageRef.current,
     resource: "both" | "summary" | "transcript" = "both",
-  ): Promise<boolean> => {
+  ): Promise<boolean | "pending"> => {
     if (!viewer || !requestedLanguage || isRecordsExpired) return false;
-    const generation = minutesLoadGenerationRef.current + 1;
-    minutesLoadGenerationRef.current = generation;
+    const generation = ++minutesLoadGenerationRef.current;
+    minutesReadAbortRef.current?.abort();
+    const controller = new AbortController();
+    minutesReadAbortRef.current = controller;
+    const signal = AbortSignal.any([controller.signal, AbortSignal.timeout(15_000)]);
+    const isCurrent = () => !controller.signal.aborted && generation === minutesLoadGenerationRef.current && requestedLanguage === languageRef.current;
     setIsMinutesLoading(true);
-    const language = encodeURIComponent(requestedLanguage);
-    const fetchMinutesResource = async <T,>(path: string): Promise<T> => readApi<T>(await fetch(path));
+    let shouldContinuePolling: boolean | "pending" = false;
+    let hasFatalSummaryError = false;
+    const summaryRequest = resource === "transcript" ? Promise.resolve() : settleRequest(
+      fetch(`/api/live-sessions/${viewer.session.id}/summary?language=${encodeURIComponent(requestedLanguage)}`, { cache: "no-store", signal })
+        .then((response) => readApi<{ summary: MeetingSummary; createdAt: string }>(response)),
+    ).then((result) => {
+      if (!isCurrent()) return;
+      if (result.ok) {
+        setSummaryRecord(result.value); setSummaryError(""); setIsSummaryEmpty(false);
+        return;
+      }
+      const code = result.error instanceof ApiRequestError ? result.error.code : undefined;
+      const status = result.error instanceof ApiRequestError ? result.error.status : 0;
+      if (code === "SUMMARY_NOT_READY" || code === "SUMMARY_GENERATION_RUNNING") {
+        setSummaryRecord(null); setSummaryError(""); setIsSummaryEmpty(false);
+        shouldContinuePolling = "pending";
+      } else if (isSummaryEmptyCode(code)) {
+        setSummaryRecord(null); setSummaryError(""); setIsSummaryEmpty(true);
+      } else if (isSummaryReadRetryable(code, status)) {
+        setSummaryError(""); shouldContinuePolling = true;
+      } else {
+        setSummaryRecord(null); setSummaryError(getSafeSummaryErrorMessage(code));
+        setMinutesPollingState("failed"); hasFatalSummaryError = true;
+      }
+    });
+    const transcriptRequest = resource === "summary" ? Promise.resolve() : settleRequest(
+      loadViewerSourceRecord(viewer.session.id, (input, init) => fetch(input, { ...init, signal })),
+    ).then((result) => {
+      if (!isCurrent()) return;
+      if (result.ok) {
+        setTranscript(result.value.utterances); setRecordingGaps(result.value.recordingGaps);
+        setTranscriptTopics([]); setMinutesEvent(null); setIsTranscriptLoaded(true); setTranscriptError("");
+      } else {
+        setTranscriptError(getSafeTranscriptErrorMessage(result.error instanceof ApiRequestError ? result.error.code : undefined));
+        if (shouldContinuePolling !== "pending") shouldContinuePolling = true;
+      }
+    });
     try {
-      const [summaryResult, transcriptResult] = await Promise.all([
-        resource === "transcript" ? Promise.resolve(null) : settleRequest(fetchMinutesResource<{ summary: MeetingSummary; createdAt: string }>(
-          `/api/live-sessions/${viewer.session.id}/summary?language=${language}`,
-        )),
-        resource === "summary" ? Promise.resolve(null) : settleRequest(loadViewerSourceRecord(viewer.session.id)),
-      ]);
-      // A late EN response must never replace the KO record selected while it
-      // was in flight. The same generation guard covers manual retries.
-      if (generation !== minutesLoadGenerationRef.current || requestedLanguage !== languageRef.current) return false;
-      let shouldContinuePolling = false;
-      let hasFatalSummaryError = false;
-      if (summaryResult?.ok) {
-        setSummaryRecord(summaryResult.value);
-        setSummaryError("");
-        setIsSummaryEmpty(false);
-      } else if (summaryResult && summaryResult.error instanceof ApiRequestError
-        && summaryResult.error.code === "SUMMARY_NOT_READY") {
-        setSummaryRecord(null);
-        setSummaryError("");
-        setIsSummaryEmpty(false);
-        shouldContinuePolling = true;
-      } else if (summaryResult && summaryResult.error instanceof ApiRequestError
-        && isSummaryEmptyCode(summaryResult.error.code)) {
-        setSummaryRecord(null);
-        setSummaryError("");
-        setIsSummaryEmpty(true);
-      } else if (summaryResult) {
-        setSummaryRecord(null);
-        setSummaryError(getSafeSummaryErrorMessage(
-          summaryResult.error instanceof ApiRequestError ? summaryResult.error.code : undefined,
-        ));
-        setMinutesPollingState("failed");
-        hasFatalSummaryError = true;
-      }
-      if (transcriptResult?.ok) {
-        setTranscript(transcriptResult.value.utterances);
-        setRecordingGaps(transcriptResult.value.recordingGaps);
-        setTranscriptTopics([]);
-        setMinutesEvent(null);
-        setIsTranscriptLoaded(true);
-        setTranscriptError("");
-      } else if (transcriptResult) {
-        setTranscript([]); setRecordingGaps([]);
-        setTranscriptTopics([]);
-        setMinutesEvent(null);
-        setIsTranscriptLoaded(false);
-        setTranscriptError(getSafeTranscriptErrorMessage(
-          transcriptResult.error instanceof ApiRequestError ? transcriptResult.error.code : undefined,
-        ));
-        if (!hasFatalSummaryError) shouldContinuePolling = true;
-      }
-      return shouldContinuePolling;
+      await Promise.all([summaryRequest, transcriptRequest]);
+      return isCurrent() && !hasFatalSummaryError ? shouldContinuePolling : false;
     } finally {
       if (generation === minutesLoadGenerationRef.current) setIsMinutesLoading(false);
     }
@@ -654,7 +651,7 @@ export default function LiveViewer({ compact = false }: { compact?: boolean }) {
         const missingResource = summaryRecord || isSummaryEmpty ? "transcript" : isTranscriptLoaded ? "summary" : "both";
         return loadMinutes(languageRef.current, missingResource);
       },
-      onExhausted: () => setMinutesPollingState("exhausted"),
+      onExhausted: () => { setMinutesPollingState("exhausted"); setSummaryError("요약 상태 확인이 지연되고 있습니다. 다시 확인해 주세요."); },
       onError: () => {
         setMinutesPollingState("failed");
         setSummaryError(getSafeSummaryErrorMessage(undefined));
@@ -1470,7 +1467,7 @@ export default function LiveViewer({ compact = false }: { compact?: boolean }) {
     if (!recordsExpiresAt) return;
     const expire = () => {
       if (!isRecordsAccessExpired(recordsExpiresAt, Date.now())) return;
-      setIsRecordsExpired(true); minutesLoadGenerationRef.current += 1;
+      setIsRecordsExpired(true); minutesLoadGenerationRef.current += 1; minutesReadAbortRef.current?.abort();
       setTranscript([]); setRecordingGaps([]); setTranscriptTopics([]); setSummaryRecord(null); setMinutesPollingState("idle");
     };
     expire();
@@ -1837,7 +1834,7 @@ export default function LiveViewer({ compact = false }: { compact?: boolean }) {
     if (!draft) return sourceFinalCaptions;
     return [...sourceFinalCaptions, {
       id: `source-draft:${draft.generation}`, text: draft.text, language: draft.sourceLanguage,
-      speakerLabel: draft.speaker.label, timestamp: formatMinuteTime(draft.emittedAt), isFinal: false,
+      speakerLabel: draft.speakerProfile?.displayName || draft.speaker.label, speakerProfile: draft.speakerProfile, sessionId: draft.sessionId, timestamp: formatMinuteTime(draft.emittedAt), isFinal: false,
     }];
   }, [sourceFinalCaptions, sourceDraftState.draft]);
   const selectedLaneCaptions = selectedLane?.kind === "source" ? sourceLaneCaptions : targetLaneCaptions;
@@ -1919,7 +1916,7 @@ export default function LiveViewer({ compact = false }: { compact?: boolean }) {
       <ViewerReadingFeed key={lane.id} captions={selectedLaneCaptions} language={lane.language} kind={lane.kind}
         onReadingAnchorChange={rememberReadingAnchor} />
     </>
-  ), [isSourceLoading, rememberReadingAnchor, selectedLaneCaptions, sourceError, synchronizeSourceLedger]);
+  ), [isSourceLoading, rememberReadingAnchor, selectedLaneCaptions, sourceError, synchronizeSourceLedger, t]);
 
   if (isRestoringViewer) {
     return (
@@ -2060,13 +2057,14 @@ export default function LiveViewer({ compact = false }: { compact?: boolean }) {
 
   return (
     <main className={`live-viewer-shell ${compact ? "is-compact" : ""}`}
-      data-viewer-surface="caption-first" data-reading-state={isSessionEnded ? "ended" : "live"} data-compact={compact || undefined}
+      data-inline-system-language="true" data-viewer-surface="caption-first" data-reading-state={isSessionEnded ? "ended" : "live"} data-compact={compact || undefined}
       style={{ "--live-caption-scale": captionScale } as CSSProperties}>
       <div className="live-viewer-translation-layout viewer-notebook">
         <TranslationToolbar ariaLabel={t("실시간 자막 제어")}>
           <strong>NOVA</strong>
           <span className="viewer-session-status">{isSessionEnded ? t("회의 종료") : t("라이브")}</span>
-          <ControlDrawer triggerLabel={t("더보기")} title={t("세션 제어")}>
+          <SystemLanguageButton compact />
+          <ControlDrawer iconOnly triggerLabel={t("더보기")} title={t("세션 제어")}>
             <ViewerSessionContext title={viewer.session.title} scheduledAt={viewer.session.scheduledAt} />
             <label className="live-viewer-text-scale" htmlFor="live-caption-scale">
               <span>{t("자막 글자 크기")}</span>

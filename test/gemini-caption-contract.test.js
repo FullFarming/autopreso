@@ -1,3 +1,4 @@
+import { DEFAULT_ENGINE_SELECTION, GEMINI_ENGINE_SELECTION } from "../packages/caption-core/caption-engine-catalog.js";
 import assert from "node:assert/strict";
 import test from "node:test";
 
@@ -94,7 +95,7 @@ test("Caption Only and Live Call canonicalize every Gemini caption setting to on
   assert.equal(GEMINI_CAPTION_ENGINE_CONTRACT.fallback.voiceProvider, null);
   const defaults = createGeminiCaptionConfig();
   assert.deepEqual(defaults.models, {
-    transcription: "gemini-3.5-transcribe-live",
+    transcription: DEFAULT_ENGINE_SELECTION.stt.model,
     polish: "gemini-3.7-flash",
     summary: "gemini-3.6-flash",
   });
@@ -110,7 +111,7 @@ test("fixed source and summary selections share the one allowed policy", () => {
   });
   assert.equal(config.models.transcription, DEFAULT_GEMINI_MODEL_SELECTION.source);
   assert.equal(config.models.summary, DEFAULT_GEMINI_MODEL_SELECTION.summary);
-  assert.equal(geminiCaptionConfigFingerprint(config), geminiCaptionConfigFingerprint(createGeminiCaptionConfig()));
+  assert.equal(geminiCaptionConfigFingerprint(config), geminiCaptionConfigFingerprint(createGeminiCaptionConfig({ engine: GEMINI_ENGINE_SELECTION })));
   assert.equal(Object.isFrozen(GEMINI_MODEL_CATALOG.source[0]), true);
   assert.deepEqual(GEMINI_MODEL_CATALOG.source.map(({ id }) => id), ["gemini-3.5-transcribe-live"]);
   assert.equal(readGeminiSelectedModel("summary", undefined), "gemini-3.6-flash");
@@ -118,13 +119,13 @@ test("fixed source and summary selections share the one allowed policy", () => {
 
 test("unrecognized legacy model settings silently fall back to the default (migration, not override); the models field shape and the standalone selector remain strict", () => {
   for (const value of [null, "", "gemini-3.7-pro", " gemini-3.6-flash", {}, 3]) {
-    assert.equal(createGeminiCaptionConfig({ geminiTranscribeModel: value }).models.transcription, DEFAULT_GEMINI_MODEL_SELECTION.source);
+    assert.equal(createGeminiCaptionConfig({ geminiTranscribeModel: value }).models.transcription, DEFAULT_ENGINE_SELECTION.stt.model);
     assert.equal(createGeminiCaptionConfig({ geminiSummaryModel: value }).models.summary, DEFAULT_GEMINI_MODEL_SELECTION.summary);
   }
   assert.equal(createGeminiCaptionConfig({ geminiTranscribeModel: "gemini-3.5-transcribe-live" }).models.transcription, "gemini-3.5-transcribe-live");
   // The first-defined alias wins; a stale `models` value behind it is migrated, not compared for conflict.
   assert.equal(createGeminiCaptionConfig({ geminiSummaryModel: "gemini-3.6-flash", models: { summary: "gemini-3.7-flash" } }).models.summary, "gemini-3.6-flash");
-  assert.equal(createGeminiCaptionConfig({ geminiTranscribeModel: "gemini-3.6-flash", models: { transcription: "unlisted" } }).models.transcription, DEFAULT_GEMINI_MODEL_SELECTION.source);
+  assert.equal(createGeminiCaptionConfig({ geminiTranscribeModel: "gemini-3.6-flash", models: { transcription: "unlisted" } }).models.transcription, DEFAULT_ENGINE_SELECTION.stt.model);
   assert.throws(() => createGeminiCaptionConfig({ models: "not-an-object" }), /GEMINI_MODEL_OVERRIDE_FORBIDDEN/u);
   assert.throws(() => createGeminiCaptionConfig({ models: { unknownField: "x" } }), /GEMINI_MODEL_OVERRIDE_FORBIDDEN/u);
   assert.equal(readGeminiSelectedModel("translation", "gemini-3.5-transcribe-live"), "gemini-3.5-transcribe-live");
@@ -137,12 +138,12 @@ test("known historical model choices migrate to one current runtime identity", (
   const sourceOnly = createGeminiCaptionConfig({ geminiTranscribeModel: "gemini-3.6-flash" });
   const summaryOnly = createGeminiCaptionConfig({ geminiSummaryModel: "gemini-3.5-flash" });
   assert.equal(sourceOnly.models.summary, "gemini-3.6-flash");
-  assert.equal(summaryOnly.models.transcription, "gemini-3.5-transcribe-live");
+  assert.equal(summaryOnly.models.transcription, DEFAULT_ENGINE_SELECTION.stt.model);
   assert.equal(geminiCaptionConfigFingerprint(sourceOnly), geminiCaptionConfigFingerprint(baseline));
   assert.equal(geminiCaptionConfigFingerprint(summaryOnly), geminiCaptionConfigFingerprint(baseline));
-  // A prior live-translate source setting migrates to the same canonical engine as a fresh default.
+  // A known historical Gemini source pin remains Gemini; fresh users get Soniox.
   const legacySource = createGeminiCaptionConfig({ geminiTranscribeModel: "gemini-3.5-live-translate-preview" });
-  assert.equal(geminiCaptionConfigFingerprint(legacySource), geminiCaptionConfigFingerprint(baseline));
+  assert.equal(geminiCaptionConfigFingerprint(legacySource), geminiCaptionConfigFingerprint(createGeminiCaptionConfig({ engine: GEMINI_ENGINE_SELECTION })));
 });
 
 test("Gemini workload models are fixed and shared redaction preserves ordinary business figures", () => {
@@ -179,7 +180,7 @@ test("Gemini workload models are fixed and shared redaction preserves ordinary b
 });
 
 test("caption model changes alter fingerprints and an unlisted `models` key still cannot become a runtime override", () => {
-  const config = createGeminiCaptionConfig();
+  const config = createGeminiCaptionConfig({ engine: GEMINI_ENGINE_SELECTION });
   const previous = { ...config, models: { ...config.models, live: "gemini-3.5-transcribe-live" } };
   assert.notEqual(geminiCaptionConfigFingerprint(config), geminiCaptionConfigFingerprint(previous));
   assert.throws(() => createGeminiCaptionConfig({ models: { live: "gemini-3.5-transcribe-live" } }), /GEMINI_MODEL_OVERRIDE_FORBIDDEN/u);

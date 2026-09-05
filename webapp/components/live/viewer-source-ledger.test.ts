@@ -3,6 +3,8 @@ import { test } from "node:test";
 import { readFileSync } from "node:fs";
 import ts from "typescript";
 import { mergeViewerSourceLedger, loadViewerSourceSnapshot, createViewerSourceDraftState, reduceViewerSourceDraft } from "./viewer-source-ledger";
+import { ApiRequestError, settleRequest } from "./viewer-controller-contract";
+import { isSummaryEmptyCode, isSummaryReadRetryable } from "./useHostSummaryLifecycle";
 import type { SourceEvent, SourceDraftEvent } from "../../lib/live/source-contract";
 
 const sessionId = "0192d0f4-9f72-7a36-91f5-6a76ef736f41";
@@ -127,4 +129,41 @@ test("invalid session, repeated page cursor, auth failure and abort stop source 
   controller.abort();
   await assert.rejects(loadViewerSourceSnapshot(sessionId, 0, controller.signal, forbidden));
   assert.equal(calls, 1);
+});
+
+test("ended viewer applies source immediately while summary waits and drops obsolete language responses", async () => {
+  const viewer = readFileSync(new URL("./LiveViewer.tsx", import.meta.url), "utf8");
+  const declaration = viewer.slice(viewer.indexOf("const loadMinutes ="), viewer.indexOf("// Contract C7:"));
+  const code = ts.transpileModule(`${declaration}\nreturn loadMinutes;`, { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None } }).outputText;
+  let completeSummary: ((response: Response) => void) | undefined;
+  let transcript: unknown = null; let summary: unknown = null;
+  const languageRef = { current: "ko" };
+  const dependencies = {
+    useCallback: (callback: unknown) => callback, viewer: { session: { id: sessionId } }, isRecordsExpired: false, languageRef,
+    minutesLoadGenerationRef: { current: 0 }, minutesReadAbortRef: { current: null },
+    setIsMinutesLoading() {}, setSummaryRecord: (value: unknown) => { summary = value; }, setSummaryError() {}, setIsSummaryEmpty() {}, setMinutesPollingState() {},
+    setTranscript: (value: unknown) => { transcript = value; }, setRecordingGaps() {}, setTranscriptTopics() {}, setMinutesEvent() {}, setIsTranscriptLoaded() {}, setTranscriptError() {},
+    fetch: () => new Promise<Response>((resolve) => { completeSummary = resolve; }),
+    readApi: async (response: Response) => {
+      if (response.status === 404) throw new ApiRequestError("pending", "SUMMARY_NOT_READY", 404);
+      if (response.status === 503) throw new ApiRequestError("failed", "SUMMARY_GENERATION_PERMANENT_FAILED", 503);
+      return { summary: { title: "원래 언어 요약" }, createdAt: "2026-09-05" };
+    },
+    loadViewerSourceRecord: async () => ({ utterances: [{ text: "먼저 도착한 원문" }], recordingGaps: [] }),
+    settleRequest, ApiRequestError, isSummaryEmptyCode, isSummaryReadRetryable,
+    getSafeSummaryErrorMessage: () => "요약 확인 오류", getSafeTranscriptErrorMessage: () => "원문 확인 오류",
+  };
+  const load = new Function(...Object.keys(dependencies), code)(...Object.values(dependencies)) as () => Promise<boolean | "pending">;
+  const pendingRead = load();
+  await Promise.resolve(); await Promise.resolve(); await Promise.resolve();
+  assert.deepEqual(transcript, [{ text: "먼저 도착한 원문" }]);
+  assert.equal(summary, null);
+  languageRef.current = "en";
+  assert.ok(completeSummary); completeSummary(new Response());
+  assert.equal(await pendingRead, false);
+  assert.equal(summary, null, "late original-language summary must not replace the newly selected language");
+  const waiting = load(); assert.ok(completeSummary); completeSummary(new Response(null, { status: 404 }));
+  assert.equal(await waiting, "pending", "known generation pending must remain automatically pollable");
+  const failed = load(); assert.ok(completeSummary); completeSummary(new Response(null, { status: 503 }));
+  assert.equal(await failed, false, "authoritative generation failure must stop even when HTTP is 503");
 });

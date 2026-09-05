@@ -24,6 +24,8 @@ export interface TranscriptReadRecord {
   };
   topics: LiveTopicSnapshot["topics"];
   utterances: Array<{
+    speakerProfile?: import("../../../packages/caption-core/speaker-profile.js").SpeakerProfile;
+    speakerAttribution?: "unresolved";
     seq: number;
     speaker: string;
     text: string;
@@ -202,6 +204,8 @@ async function readFreshLiveTranscript(
     },
     topics: topicSnapshot.topics,
     utterances: projectedUtterances.map((utterance) => ({
+      ...(utterance.speakerProfile ? { speakerProfile: utterance.speakerProfile } : {}),
+      ...(utterance.speakerAttribution ? { speakerAttribution: utterance.speakerAttribution } : {}),
       seq: utterance.seq,
       speaker: utterance.speakerName ?? utterance.speakerLabel ?? "발표자",
       text: utterance.text,
@@ -266,6 +270,8 @@ async function readFreshHostLiveTranscript(
     },
     topics: topicSnapshot.topics,
     utterances: projectedUtterances.map((utterance) => ({
+      ...(utterance.speakerProfile ? { speakerProfile: utterance.speakerProfile } : {}),
+      ...(utterance.speakerAttribution ? { speakerAttribution: utterance.speakerAttribution } : {}),
       seq: utterance.seq,
       speaker: utterance.speakerName ?? utterance.speakerLabel ?? "발표자",
       text: utterance.text,

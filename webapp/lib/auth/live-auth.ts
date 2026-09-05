@@ -166,12 +166,16 @@ export function getBearerToken(request: Pick<NextRequest, "headers">): string | 
 export async function createViewerGrantToken(
   input: Pick<ViewerGrantClaims, "grantId" | "sessionId" | "userId">,
   now: number = Date.now(),
+  expiresAt: number = now + VIEWER_GRANT_TTL_MS,
 ): Promise<{ token: string; claims: ViewerGrantClaims }> {
+  if (!Number.isSafeInteger(expiresAt) || expiresAt <= now || expiresAt > now + VIEWER_GRANT_TTL_MS) {
+    throw new AuthenticationError("시청자 인증 만료 시각이 올바르지 않습니다.");
+  }
   const claims: ViewerGrantClaims = {
     role: "VIEWER",
     ...input,
     issuedAt: now,
-    expiresAt: now + VIEWER_GRANT_TTL_MS,
+    expiresAt,
   };
   return { token: await signClaims(LIVE_VIEWER_TOKEN_SECRET, claims), claims };
 }

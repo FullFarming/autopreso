@@ -62,7 +62,7 @@
 .versionList,
 .validation ul { margin: 16px 0 0; padding: 0; list-style: none; }
 .presetList { display: grid; gap: 8px; }
-.presetButton { display: grid; width: 100%; text-align: left; }
+.presetButton { display: grid; width: 100%; min-width: 0; text-align: left; overflow-wrap: anywhere; }
 .presetButton span,
 .presetButton small { overflow-wrap: anywhere; color: var(--nova-fg-secondary); font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
 .presetButton[aria-current="true"] { background: var(--nova-brand-subtle); color: var(--nova-brand-fg); }
@@ -70,7 +70,7 @@
 
 .workspaceActions { flex-wrap: wrap; padding: 16px; border-bottom: 1px solid var(--nova-surface-hairline); }
 .workspaceActions > div { flex: 1 1 220px; }
-.editor { padding: 24px; }
+.editor { padding: 24px; container-type: inline-size; container-name: glossary-editor; }
 .metadataGrid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; margin-top: 20px; }
 .metadataGrid label,
 .metadataGrid > div,
@@ -108,13 +108,13 @@
 
 .termSection { margin-top: 24px; }
 .termHeader,
-.termRow { display: grid; grid-template-columns: minmax(140px, 1fr) minmax(140px, 1fr) minmax(140px, 1fr) minmax(220px, auto); gap: 12px; }
+.termRow { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)) minmax(0, 1.2fr); gap: 12px; }
 .termHeader { margin-top: 16px; padding: 0 12px 8px; color: var(--nova-fg-secondary); font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
 .termList { display: grid; gap: 8px; }
 .termRow { padding: 12px; border-radius: var(--nova-radius-md); background: var(--nova-surface-base); }
 .termRow[data-status="candidate"] { border-left: 2px solid var(--nova-status-warn); }
 .termActions { display: flex; min-width: 0; align-items: end; gap: 6px; flex-wrap: wrap; }
-.termPagination { display: flex; justify-content: flex-end; gap: 8px; margin-top: 12px; }
+.termPagination { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; margin-top: 12px; }
 .statusChip { display: inline-flex; min-height: 24px; align-items: center; padding-inline: 10px; border-radius: var(--nova-radius-pill); background: var(--nova-surface-float); color: var(--nova-fg-secondary); font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
 
 .validation,
@@ -242,64 +242,59 @@
 
 .registrationDialog {
   box-sizing: border-box;
-  background: var(--nova-surface-base);
-  border-radius: var(--nova-radius-md);
-  color: var(--nova-fg-primary);
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  height: min(880px, calc(100dvh - 32px - env(safe-area-inset-top) - env(safe-area-inset-bottom)));
   max-height: calc(100dvh - 32px - env(safe-area-inset-top) - env(safe-area-inset-bottom));
-  max-width: calc(100vw - 32px);
+  width: min(720px, calc(100% - 32px));
+  max-width: calc(100% - 32px);
   margin: auto;
-  border: 1px solid var(--nova-surface-hairline);
   min-width: 0;
-  overflow: auto;
-  padding: 24px;
-  width: min(720px, calc(100vw - 32px));
+  padding: 0;
+  overflow: hidden;
+  border: 1px solid var(--nova-surface-hairline);
+  border-radius: var(--nova-radius-md);
+  background: var(--nova-surface-base);
+  color: var(--nova-fg-primary);
+  font: var(--nova-ui-font);
+  letter-spacing: var(--nova-ui-letter-spacing);
 }
 .registrationDialog::backdrop { background: var(--nova-scrim); }
 .registrationDialog button { min-height: 44px; padding: 8px 16px; border: 1px solid var(--nova-surface-hairline); border-radius: var(--nova-radius-sm); background: var(--nova-surface-float); color: var(--nova-fg-primary); cursor: pointer; font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
 .registrationDialog button:disabled { color: var(--nova-fg-tertiary); cursor: not-allowed; }
 .registrationDialog :is(input:not([type="checkbox"], [type="search"]), select, textarea) { box-sizing: border-box; width: 100%; min-height: 44px; padding: 8px 12px; border: 1px solid var(--nova-surface-hairline); border-radius: var(--nova-radius-sm); background: var(--nova-surface-layered); color: var(--nova-fg-primary); font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
-.registrationDialog > header { flex-direction: row; align-items: center; }
+.registrationDialog > header { flex-direction: row; align-items: center; padding: 16px 24px; border-bottom: 1px solid var(--nova-surface-hairline); }
 .registrationDialog > header button { flex: 0 0 auto; }
-.registrationDialog > header h2 { min-width: 0; overflow-x: auto; white-space: nowrap; }
-
-.registrationDialog > * { flex-shrink: 0; min-width: 0; }
-.registrationDialog > header { position: sticky; top: -24px; z-index: 1; background: var(--nova-surface-base); }
-.registrationDialog :is(button, summary, label) { white-space: nowrap; }
+.registrationDialog > header h2 { min-width: 0; overflow-wrap: anywhere; font-size: var(--nova-font-size-t4); line-height: var(--nova-line-height-t4); font-weight: 600; }
+.registrationDialog > * { min-width: 0; }
+.registrationDialog :is(button, summary, label) { white-space: normal; overflow-wrap: anywhere; }
 .registrationDialog :is(button, input, select, textarea) { min-width: 0; max-width: 100%; }
 .registrationDialog :is(button, a, input:not([type="search"]), select, textarea):focus-visible { outline: 2px solid var(--nova-system-default); outline-offset: 2px; }
-.registrationForm { display: flex; flex-direction: column; gap: 8px; overflow-x: auto; }
+.registrationBody { display: grid; align-content: start; gap: 12px; min-width: 0; min-height: 0; padding: 16px 24px; overflow-y: auto; overflow-x: hidden; overscroll-behavior: contain; }
+.registrationBody > p { margin: 0; overflow-wrap: anywhere; }
+.registrationFooter { display: grid; gap: 8px; padding: 12px 24px 16px; border-top: 1px solid var(--nova-surface-hairline); }
+.registrationFooter > p { margin: 0; max-height: 72px; overflow-y: auto; overflow-wrap: anywhere; }
+.registrationFooter > p:empty { display: none; }
+.registrationForm { display: flex; min-width: 0; flex-direction: column; gap: 8px; }
 .registrationForm > label { display: grid; min-width: 0; grid-template-columns: minmax(0, 1fr); gap: 8px; }
-
-.registrationForm textarea {
-  border-radius: var(--nova-radius-sm);
-  font-family: var(--nova-font);
-  overflow: auto;
-  overflow-wrap: normal;
-  white-space: pre;
-  width: 100%;
+.registrationForm textarea { overflow: auto; overflow-wrap: normal; white-space: pre; }
+.registrationActions { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; padding-block: 4px; }
+.registrationDialog .registrationActions button { width: 100%; min-width: 0; min-height: 44px; }
+.workspace :is(button, strong, summary, .announcement), .importPreview { overflow-wrap: anywhere; }
+.workspace :is(input, button, .fileInput) { box-sizing: border-box; min-width: 0; max-width: 100%; }
+.workspace :is(.sectionHeading, .versionList li) { flex-wrap: wrap; }
+@container glossary-editor (max-width: 720px) {
+  .termHeader { display: none; }
+  .termRow { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .termActions { align-items: center; }
 }
-
-.registrationActions { display: grid; grid-auto-flow: column; grid-auto-columns: minmax(180px, 1fr); gap: 8px; overflow-x: auto; padding-block: 4px; }
-
-.registrationDialog .registrationActions button { width: 100%; min-width: 0; min-height: 44px; max-width: none; overflow-x: auto; }
-
+@container glossary-editor (max-width: 460px) {
+  .termRow, .metadataGrid { grid-template-columns: minmax(0, 1fr); }
+}
 @media (max-width: 767px) {
-  .registrationDialog { padding: 16px; }
-  .registrationDialog > header { top: -16px; }
+  .registrationDialog > header, .registrationBody, .registrationFooter { padding-inline: 16px; }
 }
 
-:global(.live-workspace-viewport) .workspace { grid-template-columns: minmax(220px, 280px) minmax(0, 1fr); }
-:global(.live-workspace-viewport) .presetList { grid-template-columns: minmax(0, 1fr); }
-:global(.live-workspace-viewport) .metadataGrid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
-:global(.live-workspace-viewport) .termSection { overflow-x: auto; }
-:global(.live-workspace-viewport) .termHeader,
-:global(.live-workspace-viewport) .termRow { display: grid; min-width: 740px; grid-template-columns: repeat(3, minmax(140px, 1fr)) minmax(220px, auto); }
-:global(.live-workspace-viewport) .secondaryGrid,
-:global(.live-workspace-viewport) .sessionChecklistOptions { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-:global(.live-workspace-viewport) .sectionHeading,
-:global(.live-workspace-viewport) .sessionChecklistHeading { flex-direction: row; align-items: center; }
-:global(.live-workspace-viewport) :is(.workspaceActions, .termActions) { flex-wrap: nowrap; overflow-x: auto; }
-:global(.live-workspace-viewport) :is(.presetButton, .metadataGrid strong, .versionList li span, .sessionChecklistOption strong, .sessionChecklistOption small) { white-space: nowrap; overflow-x: auto; overflow-wrap: normal; }
+.termTranslations { display: grid; gap: 8px; min-width: 0; }
+.termProtection { display: flex !important; align-items: center; gap: 8px; min-height: 44px; }
+.termProtection input { width: auto; min-height: auto; }

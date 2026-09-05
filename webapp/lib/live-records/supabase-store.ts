@@ -3,6 +3,7 @@ import {
   supabaseAdminHeaders,
 } from "../security/supabase-server-access";
 import { LiveRecordsError } from "./errors";
+import { normalizeSpeakerProfile } from "../../../packages/caption-core/speaker-profile.js";
 import type {
   ConsentPurpose,
   AuthoritativeTranscriptItem,
@@ -394,11 +395,15 @@ function parseParticipantRow(row: Record<string, unknown>): LiveRecordParticipan
 }
 
 function parseAuthoritativeTranscriptRow(row: Record<string, unknown>): AuthoritativeTranscriptItem {
-  assertExactKeys(row, AUTHORITATIVE_TRANSCRIPT_KEYS);
+  const { speaker_profile: profile, speaker_attribution: attribution, ...legacy } = row;
+  assertExactKeys(legacy, AUTHORITATIVE_TRANSCRIPT_KEYS);
+  if (attribution != null && attribution !== "unresolved") throw unavailable();
   const speakerRole = requiredSpeakerRole(row, "speaker_role");
   const participantId = nullableString(row, "participant_id");
   if ((speakerRole === "participant") !== (participantId !== null)) throw unavailable();
   return {
+    ...(profile == null ? {} : { speakerProfile: normalizeSpeakerProfile(profile) }),
+    ...(attribution === "unresolved" ? { speakerAttribution: "unresolved" as const } : {}),
     sourceUtteranceId: requiredUuid(row, "source_utterance_id"),
     sourceSeq: requiredSafeInteger(row, "source_seq", 1),
     utteranceKey: requiredBoundedString(row, "utterance_key", 200, 600),

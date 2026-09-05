@@ -9,7 +9,8 @@ export const VIEWER_SOURCE_HISTORY_LIMIT = 12_000;
 export function presentViewerSourceEvent(source: SourceEvent): TopicCaptionPresentation {
   return {
     id: source.utteranceKey, utteranceKey: source.utteranceKey, text: source.text,
-    language: source.sourceLanguage, speakerLabel: source.speaker.label,
+    language: source.sourceLanguage, speakerLabel: source.speakerProfile?.displayName || source.speaker.label,
+    speakerProfile: source.speakerProfile, sessionId: source.sessionId,
     timestamp: formatMinuteTime(source.emittedAt), isFinal: true,
   };
 }

@@ -16,8 +16,8 @@ test("readStoredEngineDefaults(null) is the catalog default and a valid Gemini s
   const gemini = { stt: { provider: "gemini", model: "gemini-3.5-transcribe-live", languageMode: "auto" }, translation: { provider: "gemini", model: "gemini-3.7-flash" }, summary: { provider: "gemini", model: "gemini-3.7-flash" } };
   assert.deepEqual(readStoredEngineDefaults(gemini), gemini);
   // A partial stored object is completed from the defaults (stt languageMode, missing roles).
-  assert.deepEqual(readStoredEngineDefaults({ translation: { provider: "gemini", model: "gemini-3.5-flash-lite" } }), {
-    ...DEFAULT_ENGINE_SELECTION, translation: { provider: "gemini", model: "gemini-3.5-flash-lite" },
+  assert.deepEqual(readStoredEngineDefaults({ stt: gemini.stt, translation: { provider: "gemini", model: "gemini-3.5-flash-lite" } }), {
+    ...DEFAULT_ENGINE_SELECTION, stt: gemini.stt, translation: { provider: "gemini", model: "gemini-3.5-flash-lite" },
   });
 });
 
@@ -56,14 +56,14 @@ test("the cache returns the fail-open fallback when Supabase is unconfigured and
 
 test("the module singleton reads through getConsoleStore(), the store seam invalidates it, and resolveEngineDefaults normalizes the stored engine", async () => {
   const fake = new SupabaseConsoleStore({
-    fetchFn: async () => new Response(JSON.stringify([{ legacy_password_login_enabled: false, engine: { translation: { provider: "gemini", model: "gemini-3.7-flash" } }, engine_updated_at: null, engine_updated_by_email: null }]), { status: 200 }),
+    fetchFn: async () => new Response(JSON.stringify([{ legacy_password_login_enabled: false, engine: { stt: { provider: "gemini", model: "gemini-3.5-transcribe-live", languageMode: "auto" }, translation: { provider: "gemini", model: "gemini-3.7-flash" } }, engine_updated_at: null, engine_updated_by_email: null }]), { status: 200 }),
     getServerAccess: () => ({ url: "https://project.supabase.test", credential: { key: "fixture-secret", kind: "secret" as const } }),
   });
   try {
     __setConsoleStoreForTests(fake);
     const value = await consoleSettingsCache.get();
     assert.equal(value.legacyPasswordLoginEnabled, false);
-    assert.deepEqual(await resolveEngineDefaults(), { ...DEFAULT_ENGINE_SELECTION, translation: { provider: "gemini", model: "gemini-3.7-flash" } });
+    assert.deepEqual(await resolveEngineDefaults(), { ...DEFAULT_ENGINE_SELECTION, stt: { provider: "gemini", model: "gemini-3.5-transcribe-live", languageMode: "auto" }, translation: { provider: "gemini", model: "gemini-3.7-flash" } });
     const broken = new SupabaseConsoleStore({ fetchFn: async () => new Response("{}", { status: 500 }), getServerAccess: fake["getServerAccess"] });
     __setConsoleStoreForTests(broken);
     // Swapping the store dropped the memo: the broken store is consulted and, with no previous value, its error surfaces.
@@ -71,4 +71,23 @@ test("the module singleton reads through getConsoleStore(), the store seam inval
   } finally {
     __setConsoleStoreForTests(null);
   }
+});
+
+test("assigned engine resolution is user-specific and fails closed on lookup failures", async () => {
+  const { resolveHostEngineAssignment } = await import("./engine-defaults");
+  const calls: string[] = [];
+  const store = new SupabaseConsoleStore({
+    fetchFn: async (_url, init) => { calls.push(JSON.parse(String(init?.body)).p_host_id); return Response.json([{ provider: "soniox", revision: 3 }]); },
+    getServerAccess: () => ({ url: "https://project.supabase.test", credential: { key: "fixture-secret", kind: "secret" as const } }),
+  });
+  __setConsoleStoreForTests(store);
+  try {
+    const result = await resolveHostEngineAssignment("host-a");
+    assert.equal(result.engine.stt.provider, "soniox");
+    assert.equal(result.engine.translation.provider, "soniox");
+    assert.equal(result.assignmentRevision, "3");
+    assert.deepEqual(calls, ["host-a"]);
+    __setConsoleStoreForTests(new SupabaseConsoleStore({ fetchFn: async () => Response.json({}, {status:503}), getServerAccess: store["getServerAccess"] }));
+    await assert.rejects(resolveHostEngineAssignment("host-b"));
+  } finally { __setConsoleStoreForTests(null); }
 });

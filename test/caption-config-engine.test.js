@@ -24,7 +24,7 @@ test("legacy live-translate settings migrate to Transcribe Live", () => {
 test("fingerprint changes when the engine changes", () => {
   const base = { translationLanguages: ["en", "ko"] };
   const a = geminiCaptionConfigFingerprint(createGeminiCaptionConfig(base));
-  const b = geminiCaptionConfigFingerprint(createGeminiCaptionConfig({ ...base, engine: { ...createGeminiCaptionConfig(base).engine, stt: { provider: "soniox", model: "stt-rt-v5", languageMode: "auto" }, translation: { provider: "soniox", model: "stt-rt-v5" } } }));
+  const b = geminiCaptionConfigFingerprint(createGeminiCaptionConfig({ ...base, engine: { ...createGeminiCaptionConfig(base).engine, stt: { provider: "gemini", model: "gemini-3.5-transcribe-live", languageMode: "auto" }, translation: { provider: "gemini", model: "gemini-3.6-flash" } } }));
   assert.notEqual(a, b);
 });
 
@@ -50,4 +50,9 @@ test("stored legacy source pins accept only the historical Live models; flash id
     assert.throws(() => readStoredGeminiModelSelection("summary", model));
   }
   assert.throws(() => readStoredGeminiModelSelection("translation", "gemini-3.6-flash"));
+});
+
+test("Gemini compatibility migration preserves summary pins and never returns a Soniox model", () => {
+  assert.equal(migrateLegacyGeminiModelSelection("summary", "gemini-3.7-flash"), "gemini-3.7-flash");
+  assert.equal(migrateLegacyGeminiModelSelection("source", "unknown-old-model"), "gemini-3.5-transcribe-live");
 });

@@ -1,4 +1,6 @@
 import type { TranslationCapture } from "./live/translation-capture";
+import type { SpeakerProfile } from "../../packages/caption-core/speaker-profile.js";
+export type { SpeakerProfile } from "../../packages/caption-core/speaker-profile.js";
 import type { LiveModelPreferences } from "./live/model-preferences";
 import type { LanguageObservation, SourceEvent, SourceDraftEvent, SourceDraftClearEvent } from "./live/source-contract";
 export type { LanguageObservation, SourceEvent, SourceSnapshot, SourceDraftEvent, SourceDraftClearEvent } from "./live/source-contract";
@@ -155,6 +157,7 @@ export interface LiveParticipantActivity extends LiveParticipantIdentity {
 }
 
 export interface LiveSpeechActivity extends LiveParticipantIdentity {
+  speakerProfile?: SpeakerProfile;
   seq: number;
   participantId: string | null;
   text: string;
@@ -186,6 +189,8 @@ export interface LiveFloorHolder {
 }
 
 export interface CaptionEvent {
+  speakerProfile?: SpeakerProfile;
+  speakerAttribution?: "unresolved";
   translationCapture?: TranslationCapture;
   observedSourceLanguage?: string | null;
   type: "caption";

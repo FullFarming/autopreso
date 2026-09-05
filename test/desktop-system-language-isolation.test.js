@@ -26,7 +26,7 @@ test("system language repaint preserves unsaved translation targets and glossary
   const engineFields = Object.fromEntries(["engineStt", "engineLanguageMode", "engineTranslation", "engineSummary"].map(name => [name, {
     value: "", disabled: false, ownerDocument, replaceChildren() {}, addEventListener() {},
   }]));
-  // No Gemini key: every option is unavailable, which is exactly the state a
+  // No provider keys: every option is unavailable, which is exactly the state a
   // language repaint must not silently "fix" by writing a settings patch.
   const engineCatalog = captionEngineCatalogForClient({ hasApiKeys: {} });
   const engineSettings = { engine: engineCatalog.defaults };
@@ -61,5 +61,5 @@ test("system language repaint preserves unsaved translation targets and glossary
   assert.equal(engineFields.engineStt.value, `${engineCatalog.defaults.stt.provider}:${engineCatalog.defaults.stt.model}`);
   assert.equal(engineFields.engineSummary.value, `${engineCatalog.defaults.summary.provider}:${engineCatalog.defaults.summary.model}`);
   assert.deepEqual(engineSettings, { engine: engineCatalog.defaults }, "language repaint must not migrate or save settings");
-  assert.equal(engineFields.engineLanguageMode.disabled, true, "the Gemini STT has a single input-language mode");
+  assert.equal(engineFields.engineLanguageMode.value, engineCatalog.defaults.stt.languageMode, "repaint retains the assigned input-language mode");
 });

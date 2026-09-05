@@ -1,4 +1,5 @@
 // @ts-nocheck - the fake socket implements only the WebSocket surface under test.
+import { GEMINI_ENGINE_SELECTION } from "../packages/caption-core/caption-engine-catalog.js";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import { test } from "node:test";
@@ -51,6 +52,7 @@ function createHarness({ polish, settings = {}, apiKeys = {}, ...options } = {})
       load: async () => ({
         apiKeys: { gemini: "test-key", geminiSecondary: "", ...apiKeys },
         subtitle: {
+          engine: GEMINI_ENGINE_SELECTION,
           inputMode: "mic",
           translationLanguages: ["en", "ko", "ja"],
           glossary: "Cushman & Wakefield = 쿠시먼앤드웨이크필드\nNOI = 순영업소득",
@@ -145,11 +147,11 @@ test("a provider-delivered translation is committed without a text-translation c
   await new Promise((resolve) => setTimeout(resolve, 30));
 
   assert.deepEqual(polishCalls, []);
-  const partials = events.filter((event) => event.type === "subtitle:partial");
+  const partials = events.filter((event) => event.type === "subtitle:partial" && !event.isSourceCaption);
   assert.equal(partials.length, 1);
   assert.equal(partials[0].targetLanguage, "en");
   assert.equal(partials[0].translatedText, "Hello everyone");
-  const committed = events.filter((event) => event.type === "subtitle:committed");
+  const committed = events.filter((event) => event.type === "subtitle:committed" && !event.isSourceCaption);
   assert.equal(committed.length, 1);
   assert.equal(committed[0].targetLanguage, "en");
   assert.equal(committed[0].translatedText, "Hello everyone, welcome.");
@@ -187,12 +189,12 @@ test("a provider translation that merely echoes the source is dropped, not commi
     provider: "soniox",
     segmentId: "echo-1",
   });
-  assert.equal(events.some((event) => event.type === "subtitle:committed"), false, JSON.stringify(events));
+  assert.equal(events.some((event) => event.type === "subtitle:committed" && !event.isSourceCaption), false, JSON.stringify(events));
   assert.equal(events.some((event) => event.code === "TEXT_TRANSLATION_FAILED"), false);
   assert.deepEqual(polishCalls, [], "a dropped provider translation must not fall back to a Gemini call");
 });
 
-test("a provider translation whose source is already this lane's language clears the lane", async () => {
+test("a same-language provider translation cannot clear the original lane", async () => {
   const { events } = await runProviderTranslation({
     text: "안녕하세요 여러분",
     targetLanguage: "ko",
@@ -203,10 +205,8 @@ test("a provider translation whose source is already this lane's language clears
     segmentId: "same-lang-1",
   });
   const cleared = events.filter((event) => event.type === "subtitle:clear");
-  assert.equal(cleared.length, 1, JSON.stringify(events));
-  assert.equal(cleared[0].targetLanguage, "ko");
-  assert.equal(cleared[0].reason, "same_language_source");
-  assert.equal(events.some((event) => event.type === "subtitle:committed"), false);
+  assert.equal(cleared.length, 0, JSON.stringify(events));
+  assert.equal(events.some((event) => event.type === "subtitle:committed" && !event.isSourceCaption), false);
 });
 
 test("a provider final that never reached the target language reports TEXT_TRANSLATION_FAILED", async () => {
@@ -222,10 +222,10 @@ test("a provider final that never reached the target language reports TEXT_TRANS
   const failures = events.filter((event) => event.code === "TEXT_TRANSLATION_FAILED");
   assert.equal(failures.length, 1, JSON.stringify(events));
   assert.equal(failures[0].targetLanguage, "ko");
-  assert.equal(events.some((event) => event.type === "subtitle:committed"), false);
+  assert.equal(events.some((event) => event.type === "subtitle:committed" && !event.isSourceCaption), false);
 });
 
-test("a same-language provider PARTIAL is ignored while the FINAL clears the lane", async () => {
+test("same-language provider PARTIAL and FINAL do not clear the original lane", async () => {
   const base = {
     text: "안녕하세요 여러분",
     targetLanguage: "ko",
@@ -237,12 +237,11 @@ test("a same-language provider PARTIAL is ignored while the FINAL clears the lan
   const partial = await runProviderTranslation({ ...base, isFinal: false });
   assert.equal(partial.events.some((event) => event.type === "subtitle:clear"), false,
     `a partial must not clear the lane: ${JSON.stringify(partial.events)}`);
-  assert.equal(partial.events.some((event) => event.type === "subtitle:partial"), false);
+  assert.equal(partial.events.some((event) => event.type === "subtitle:partial" && !event.isSourceCaption), false);
 
   const final = await runProviderTranslation({ ...base, isFinal: true });
   const cleared = final.events.filter((event) => event.type === "subtitle:clear");
-  assert.equal(cleared.length, 1, JSON.stringify(final.events));
-  assert.equal(cleared[0].reason, "same_language_source");
+  assert.equal(cleared.length, 0, JSON.stringify(final.events));
 });
 
 const SONIOX_ENGINE = Object.freeze({
@@ -272,9 +271,9 @@ const settle = (milliseconds) => new Promise((resolve) => setTimeout(resolve, mi
 // and is covered directly by test/soniox-transport.test.js.
 test("a soniox engine that cannot build a config is refused before any socket opens", async () => {
   const { manager, sockets } = createSonioxHarness({
-    settings: { translationLanguages: ["en", "ko", "ja"] },
+    settings: { engine: { ...SONIOX_ENGINE, stt: { provider: "soniox", model: "unsupported", languageMode: "auto" } } },
   });
-  await assert.rejects(manager.start({ sessionId: "soniox-bad-pair" }), /자막 언어가 정확히 2개/u);
+  await assert.rejects(manager.start({ sessionId: "soniox-bad-pair" }), /지원하지 않는 엔진/u);
   try {
     await settle(10);
     assert.equal(sockets.length, 0, "no socket is opened for an unusable config");
@@ -367,7 +366,7 @@ test("soniox engine sends config first, binary audio frames, and commits provide
     socket.open();
     const config = JSON.parse(socket.sent[0]);
     assert.equal(config.model, "stt-rt-v5");
-    assert.deepEqual(config.language_hints, ["ko", "en"]);
+    assert.deepEqual(config.language_hints, ["en", "ko"]);
     manager.sendAudio({
       sessionId: "soniox-engine",
       source: "mic",
@@ -381,7 +380,7 @@ test("soniox engine sends config first, binary audio frames, and commits provide
     ] })));
     await new Promise((resolve) => setTimeout(resolve, 30));
 
-    const committed = events.filter((event) => event.type === "subtitle:committed");
+    const committed = events.filter((event) => event.type === "subtitle:committed" && !event.isSourceCaption);
     assert.equal(committed.length, 1, JSON.stringify(events));
     assert.equal(committed[0].targetLanguage, "en");
     assert.equal(committed[0].translatedText, "Hello");
@@ -422,7 +421,7 @@ test("a combined engine's source partials never reach the Gemini text lane", asy
     ] })));
     await new Promise((resolve) => setTimeout(resolve, 40));
     assert.equal(textCalls, 0, "a source interim must not buy a Gemini preview");
-    assert.equal(events.some((event) => event.type === "subtitle:partial" && event.translationProvider === "gemini"), false,
+    assert.equal(events.some((event) => event.type === "subtitle:partial" && !event.isSourceCaption && event.translationProvider === "gemini"), false,
       JSON.stringify(events));
 
     // The provider's own translation still flows, and the final still commits.
@@ -433,10 +432,10 @@ test("a combined engine's source partials never reach the Gemini text lane", asy
     ] })));
     await new Promise((resolve) => setTimeout(resolve, 40));
     assert.equal(textCalls, 0, "a provider-translated final is never re-translated");
-    const committed = events.filter((event) => event.type === "subtitle:committed");
+    const committed = events.filter((event) => event.type === "subtitle:committed" && !event.isSourceCaption);
     assert.equal(committed.length, 1, JSON.stringify(events));
     assert.equal(committed[0].translationProvider, "soniox");
-    assert.equal(events.some((event) => event.type === "subtitle:partial" && event.translationProvider === "gemini"), false);
+    assert.equal(events.some((event) => event.type === "subtitle:partial" && !event.isSourceCaption && event.translationProvider === "gemini"), false);
   } finally { await manager.stop(); }
 });
 
@@ -470,7 +469,7 @@ test("one source opens one Transcribe session and final source fans out through 
 
   assert.deepEqual(requests.map((request) => request.targetLanguage).sort(), ["ja", "ko"]);
   assert.equal(requests.every((request) => request.translatedText === "…"), true);
-  const committed = events.filter((event) => event.type === "subtitle:committed");
+  const committed = events.filter((event) => event.type === "subtitle:committed" && !event.isSourceCaption);
   assert.equal(committed.length, 2);
   assert.equal(committed.some((event) => event.targetLanguage === "en"), false);
   assert.equal(events.some((event) => event.type === "subtitle:translated-audio"), false);
@@ -501,10 +500,10 @@ test("latest interim wins, publishes translated preview only, and final invalida
   releaseFirst("폐기할 첫 초안");
   await new Promise((resolve) => setTimeout(resolve, 30));
 
-  const partials = events.filter((event) => event.type === "subtitle:partial");
+  const partials = events.filter((event) => event.type === "subtitle:partial" && !event.isSourceCaption);
   assert.equal(partials.some((event) => event.translatedText === "폐기할 첫 초안"), false);
   assert.equal(partials.every((event) => event.translatedText !== event.sourceText), true);
-  assert.equal(events.some((event) => event.type === "subtitle:committed" && event.translatedText === "최종 문장"), true);
+  assert.equal(events.some((event) => event.type === "subtitle:committed" && !event.isSourceCaption && event.translatedText === "최종 문장"), true);
 });
 
 test("interim preview translation is physically bounded to one Gemini text call per lane", async () => {
@@ -559,7 +558,7 @@ test("translation failure never leaks source text into a target caption lane", a
   await new Promise((resolve) => setTimeout(resolve, 20));
 
   assert.equal(
-    events.some((event) => ["subtitle:partial", "subtitle:committed"].includes(event.type)),
+    events.some((event) => ["subtitle:partial", "subtitle:committed"].includes(event.type) && !event.isSourceCaption),
     false,
     JSON.stringify(events),
   );
@@ -608,7 +607,7 @@ test("Transcribe rollover drains the old socket and preserves bounded new audio 
     serverContent: { inputTranscription: { text: "Tail sentence", languageCode: "en-US" } },
   }));
   await new Promise((resolve) => setTimeout(resolve, 5));
-  assert.equal(events.some((event) => event.type === "subtitle:committed" && event.sourceText === "Tail sentence"), true);
+  assert.equal(events.some((event) => event.type === "subtitle:committed" && !event.isSourceCaption && event.sourceText === "Tail sentence"), true);
   const oldAudioPayloadCount = sockets[0].sent.filter((value) => {
     try { return Boolean(JSON.parse(value).realtimeInput?.audio); } catch { return false; }
   }).length;
@@ -639,7 +638,7 @@ test("Transcribe rollover drains the old socket and preserves bounded new audio 
   await manager.stop();
 });
 
-test("mixed Korean speech still gets a Korean target translation while its mixed source remains unchanged", async () => {
+test("mixed Korean speech preserves the original caption without a same-target model call", async () => {
   const sourceText = "이번 분기 Revenue와 Operating Margin이 개선됐습니다.";
   const requests = [];
   const { manager, sockets, events } = createHarness({
@@ -655,11 +654,11 @@ test("mixed Korean speech still gets a Korean target translation while its mixed
     sockets[0].emit("message", JSON.stringify({ setupComplete: {} }));
     sockets[0].emit("message", JSON.stringify({ serverContent: { inputTranscription: { text: sourceText, languageCode: "ko" } } }));
     await new Promise((resolve) => setTimeout(resolve, 30));
-    const korean = events.filter((event) => event.type === "subtitle:committed" && event.targetLanguage === "ko");
+    const korean = events.filter((event) => event.type === "subtitle:committed" && event.isSourceCaption && event.targetLanguage === "ko");
     assert.equal(korean.length, 1);
     assert.equal(korean[0].sourceText, sourceText);
-    assert.equal(korean[0].translatedText, "이번 분기 매출과 영업 이익률이 개선됐습니다.");
-    assert.equal(requests.filter((request) => request.targetLanguage === "ko").length, 1);
+    assert.equal(korean[0].translatedText, sourceText);
+    assert.equal(requests.filter((request) => request.targetLanguage === "ko").length, 0);
   } finally { await manager.stop(); }
 });
 
@@ -679,7 +678,7 @@ test("desktop finals reject unregistered capitalized English but accept explicit
       sockets[0].emit("message", JSON.stringify({ setupComplete: {} }));
       sockets[0].emit("message", JSON.stringify({ serverContent: { inputTranscription: { text: "Product revenue has increased.", languageCode: "en" } } }));
       await new Promise((resolve) => setTimeout(resolve, 30));
-      assert.equal(events.filter((event) => event.type === "subtitle:committed" && event.targetLanguage === "ko").length, expected);
+      assert.equal(events.filter((event) => event.type === "subtitle:committed" && !event.isSourceCaption && event.targetLanguage === "ko").length, expected);
       assert.equal(calls, 1);
     } finally { await manager.stop(); }
   }
@@ -702,7 +701,7 @@ test("desktop previews apply the same Korean output and protected-term rules wit
       sockets[0].emit("message", JSON.stringify({ setupComplete: {} }));
       sockets[0].emit("message", JSON.stringify({ serverContent: { interimInputTranscription: { text: "Product revenue has increased.", languageCode: "en" } } }));
       await new Promise((resolve) => setTimeout(resolve, 30));
-      assert.equal(events.filter((event) => event.type === "subtitle:partial" && event.targetLanguage === "ko").length, expected);
+      assert.equal(events.filter((event) => event.type === "subtitle:partial" && !event.isSourceCaption && event.targetLanguage === "ko").length, expected);
       assert.equal(calls, 1);
     } finally { await manager.stop(); }
   }
@@ -774,4 +773,109 @@ test("ctx.sendControl sends a text frame on the live socket and is a no-op after
   const sentBefore = socket.sent.length;
   assert.equal(ctxRef.sendControl('{"type":"finalize"}'), false, "a closed client refuses to send");
   assert.equal(socket.sent.length, sentBefore);
+});
+
+test("desktop keeps a sentence route through contrary partials and rechecks each final", async () => {
+  const { manager, sockets, events } = createHarness({ polish: async ({ targetLanguage }) => targetLanguage === "en" ? "The meeting is starting." : targetLanguage === "ja" ? "会議を始めます。" : "회의를 시작합니다." });
+  await manager.start({ sessionId: "routing-lock" });
+  try {
+    sockets[0].open(); sockets[0].emit("message", JSON.stringify({ setupComplete: {} }));
+    const emit = (text, languageCode, final = false) => sockets[0].emit("message", JSON.stringify({ serverContent: { [final ? "inputTranscription" : "interimInputTranscription"]: { text, languageCode } } }));
+    emit("회의를 시작합니다", "ko"); await new Promise(resolve => setTimeout(resolve, 25));
+    const before = events.filter(event => event.type === "subtitle:partial").length;
+    emit("The meeting is starting", "en"); await new Promise(resolve => setTimeout(resolve, 25));
+    assert.equal(events.filter(event => event.type === "subtitle:partial").length, before, "a contrary interim must not move the source or translation lane");
+    emit("The meeting is starting.", "en", true); await new Promise(resolve => setTimeout(resolve, 25));
+    emit("次の会議を始めます。", "ja"); await new Promise(resolve => setTimeout(resolve, 25));
+    assert.ok(events.some(event => event.type === "subtitle:committed" && event.isSourceCaption && event.targetLanguage === "en"));
+    assert.ok(events.some(event => event.type === "subtitle:partial" && event.isSourceCaption && event.targetLanguage === "ja"));
+  } finally { await manager.stop(); }
+});
+
+test("a short acronym does not acquire an English sentence route", async () => {
+  const { manager, sockets, events } = createHarness({ polish: async ({ targetLanguage }) => targetLanguage === "en" ? "Revenue increased." : "売上が増加しました。" });
+  await manager.start({ sessionId: "routing-acronym" });
+  try {
+    sockets[0].open(); sockets[0].emit("message", JSON.stringify({ setupComplete: {} }));
+    sockets[0].emit("message", JSON.stringify({ serverContent: { interimInputTranscription: { text: "API", languageCode: "en" } } }));
+    await new Promise(resolve => setTimeout(resolve, 25));
+    assert.equal(events.filter(event => event.type === "subtitle:partial").length, 0);
+    sockets[0].emit("message", JSON.stringify({ serverContent: { interimInputTranscription: { text: "매출이 늘었습니다", languageCode: "ko" } } }));
+    await new Promise(resolve => setTimeout(resolve, 25));
+    assert.ok(events.some(event => event.type === "subtitle:partial" && event.isSourceCaption && event.targetLanguage === "ko"));
+  } finally { await manager.stop(); }
+});
+
+test("mixed and contradictory provider observations never become a forged source partial", async () => {
+  const { manager, sockets, events } = createHarness({ polish: async ({ targetLanguage }) => targetLanguage === "en" ? "Revenue increased this quarter." : "今期の売上が増加しました。" });
+  await manager.start({ sessionId: "routing-observations" });
+  try {
+    sockets[0].open(); sockets[0].emit("message", JSON.stringify({ setupComplete: {} }));
+    const emit = (text, languageCode) => sockets[0].emit("message", JSON.stringify({ serverContent: { interimInputTranscription: { text, languageCode } } }));
+    emit("이번 분기 매출이 늘었습니다", "ko"); await settle(25);
+    const before = events.length;
+    emit("이번 분기 매출이 늘었습니다", "en"); await settle(25);
+    assert.equal(events.length, before, "contrary provider tags do not reroute even when source script is unchanged");
+    emit("이번 분기 API 매출이 늘었습니다", "und"); await settle(25);
+    const mixed = events.slice(before).filter(event => event.type === "subtitle:partial");
+    assert.ok(mixed.length > 0);
+    assert.ok(mixed.every(event => !event.isSourceCaption && event.sourceLanguage === "unknown"));
+  } finally { await manager.stop(); }
+});
+
+test("sentence routing is isolated by audio source and resets on reconnect and stop", async () => {
+  const { manager, sockets, events } = createHarness({ settings: { inputMode: "system_mic" }, reconnectBaseMs: 1, polish: async ({ targetLanguage }) => targetLanguage === "en" ? "The meeting is starting." : targetLanguage === "ja" ? "会議を始めます。" : "회의를 시작합니다." });
+  const emit = (socket, text, languageCode) => socket.emit("message", JSON.stringify({ serverContent: { interimInputTranscription: { text, languageCode } } }));
+  await manager.start({ sessionId: "routing-sources" });
+  try {
+    for (const socket of sockets) { socket.open(); socket.emit("message", JSON.stringify({ setupComplete: {} })); }
+    emit(sockets[0], "회의를 시작합니다", "ko");
+    emit(sockets[1], "The meeting is starting", "en"); await settle(25);
+    const originals = events.filter(event => event.type === "subtitle:partial" && event.isSourceCaption);
+    assert.ok(originals.some(event => event.source === "system" && event.targetLanguage === "ko"));
+    assert.ok(originals.some(event => event.source === "mic" && event.targetLanguage === "en"));
+    sockets[0].close(1006); await settle(15);
+    sockets[2].open(); sockets[2].emit("message", JSON.stringify({ setupComplete: {} }));
+    emit(sockets[2], "次の会議を始めます。", "ja"); await settle(25);
+    assert.ok(events.some(event => event.type === "subtitle:partial" && event.isSourceCaption && event.source === "system" && event.targetLanguage === "ja"));
+    await manager.stop(); await manager.start({ sessionId: "routing-after-stop" });
+    const fresh = sockets.at(-2); fresh.open(); fresh.emit("message", JSON.stringify({ setupComplete: {} }));
+    emit(fresh, "The next meeting is starting", "en"); await settle(25);
+    assert.ok(events.some(event => event.type === "subtitle:partial" && event.isSourceCaption && event.source === "system" && event.targetLanguage === "en"));
+  } finally { await manager.stop(); }
+});
+
+test("Soniox native translations hold contrary partials and finalize from source text before boundary reset", async () => {
+  const { manager, sockets, events } = createSonioxHarness();
+  await manager.start({ sessionId: "routing-soniox" });
+  try {
+    sockets[0].open();
+    const frame = tokens => sockets[0].emit("message", JSON.stringify({ tokens }));
+    frame([{ text: "회의를 시작합니다", language: "ko", is_final: false }]);
+    frame([{ text: "The meeting is starting", language: "en", source_language: "ko", translation_status: "translation", is_final: false }]);
+    const before = events.filter(event => event.type === "subtitle:partial").length;
+    frame([{ text: "Wrong provisional tag", language: "en", source_language: "en", translation_status: "translation", is_final: false }]);
+    assert.equal(events.filter(event => event.type === "subtitle:partial").length, before);
+    frame([{ text: "회의를 시작합니다", language: "ko", is_final: true }, { text: "The meeting is starting.", language: "en", source_language: "en", translation_status: "translation", is_final: true }, { text: "<end>" }]);
+    await settle(20);
+    assert.ok(events.some(event => event.type === "subtitle:committed" && !event.isSourceCaption && event.targetLanguage === "en" && event.sourceLanguage === "ko"));
+    frame([{ text: "The next meeting is starting", language: "en", is_final: false }]);
+    assert.ok(events.some(event => event.type === "subtitle:partial" && event.isSourceCaption && event.targetLanguage === "en"));
+  } finally { await manager.stop(); }
+});
+
+test("a rejected contrary partial invalidates translations already in flight", async () => {
+  const pending = [];
+  const { manager, sockets, events } = createHarness({ polish: ({ targetLanguage }) => new Promise(resolve => pending.push({ resolve, targetLanguage })) });
+  await manager.start({ sessionId: "routing-stale-translation" });
+  try {
+    sockets[0].open(); sockets[0].emit("message", JSON.stringify({ setupComplete: {} }));
+    const emit = (text, languageCode) => sockets[0].emit("message", JSON.stringify({ serverContent: { interimInputTranscription: { text, languageCode } } }));
+    emit("회의를 시작합니다", "ko"); await settle(15);
+    assert.equal(pending.length, 2);
+    emit("The meeting is starting", "en");
+    for (const request of pending) request.resolve(request.targetLanguage === "en" ? "The meeting is starting." : "会議を始めます。");
+    await settle(15);
+    assert.equal(events.filter(event => event.type === "subtitle:partial" && !event.isSourceCaption).length, 0);
+  } finally { await manager.stop(); }
 });

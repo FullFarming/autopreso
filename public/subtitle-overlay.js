@@ -1,3 +1,5 @@
+import { renderCaptionSpeakerProfile } from "./subtitle-speakers.js";
+import { applyControllerAppearance, captureAppearanceEdits, acknowledgeAppearance } from "./controller-appearance.js";
 const DEFAULT_SUBTITLE = {
   fontFamily: "Arial, Helvetica, sans-serif",
   translationFontSize: 38,
@@ -62,6 +64,7 @@ const zones = {
   "bottom-center": overlay.querySelector('[data-zone="bottom-center"]'),
 };
 let settings = { ...DEFAULT_SUBTITLE };
+let appearanceEdits = {};
 let lastSubtitleAt = 0;
 let inputActiveUntil = 0;
 
@@ -139,9 +142,15 @@ function connect() {
   ws.addEventListener("message", (event) => {
     if (ws !== activeSocket) return;
     const message = JSON.parse(event.data);
+    if (message.type === "subtitle:control") {
+      const next = applyControllerAppearance(settings, message);
+      if (next) { appearanceEdits = { ...appearanceEdits, ...captureAppearanceEdits(next, message) }; applySettings(next); }
+    }
     if (message.type === "settings" && message.settings?.subtitle) {
       adoptSubtitleStream(message);
-      applySettings(message.settings.subtitle);
+      const acknowledged = acknowledgeAppearance(message.settings.subtitle, appearanceEdits);
+      appearanceEdits = acknowledged.edits;
+      applySettings(acknowledged.settings);
     }
     if (message.type === "subtitle:snapshot") {
       if (!acceptFloorOwnedSubtitleSnapshot(message)) return;
@@ -646,6 +655,8 @@ function clearLiveLaneRuntime(lane) {
 function clearStaleReverseLane(message) {
   const sourceLanguage = message.sourceLanguage;
   if (!sourceLanguage) return;
+  // Every selected language now owns a lane, including the spoken original.
+  if (message.isSourceCaption === true || lanes.get(laneKey(sourceLanguage))?.isSourceCaption === true) return;
   if (laneKey(sourceLanguage) === laneKey(message.targetLanguage)) return;
   if (lanes.has(laneKey(sourceLanguage))) clearSubtitleLane(sourceLanguage);
 }
@@ -721,7 +732,8 @@ function updateLiveCallSpeaker(message, lane) {
   lane.shell.classList.toggle("is-live-call", isLiveCall);
   if (!isLiveCall || !speaker || typeof speaker !== "object") {
     lane.speakerLabel.hidden = true;
-    lane.speakerLabel.textContent = "";
+    lane.speakerLabel.dataset.speakerProfileKey = "";
+    renderCaptionSpeakerProfile(lane.speakerLabel, null, null, null, "");
     return;
   }
   const role = speaker.role === "participant" ? "participant" : "host";
@@ -729,7 +741,13 @@ function updateLiveCallSpeaker(message, lane) {
   const text = [name, role === "participant" ? String(speaker.department ?? "").trim() : "", role === "participant" ? String(speaker.jobTitle ?? "").trim() : ""]
     .filter(Boolean)
     .join(" · ");
-  if (lane.speakerLabel.textContent !== text) lane.speakerLabel.textContent = text;
+  const unresolved = speaker.speakerAttribution === "unresolved" || message.speakerAttribution === "unresolved";
+  const profile = unresolved ? null : speaker.speakerProfile || message.speakerProfile;
+  const profileKey = JSON.stringify([message.liveSessionId, profile, text, unresolved]);
+  if (lane.speakerLabel.dataset.speakerProfileKey !== profileKey) {
+    lane.speakerLabel.dataset.speakerProfileKey = profileKey;
+    renderCaptionSpeakerProfile(lane.speakerLabel, profile, message.liveSessionId, window.realtimeNoelDesktop, unresolved ? "발언자 확인 필요" : text);
+  }
   lane.speakerLabel.hidden = false;
 }
 
@@ -737,6 +755,7 @@ function renderCommittedSubtitle(message, fromSnapshot = false) {
   const lane = ensureLane(message.targetLanguage);
   if (!acceptLaneEvent(lane, message, fromSnapshot)) return;
   if (!acceptDirection(message)) return;
+  lane.isSourceCaption = message.isSourceCaption === true;
   prepareLiveFloorReplacement(message, lane);
   updateLiveCallSpeaker(message, lane);
   updateLiveGeneration(message, lane);
@@ -779,6 +798,7 @@ function renderPredictedSubtitle(message, fromSnapshot = false) {
   const lane = ensureLane(message.targetLanguage);
   if (!acceptLaneEvent(lane, message, fromSnapshot)) return;
   if (!acceptDirection(message)) return;
+  lane.isSourceCaption = message.isSourceCaption === true;
   prepareLiveFloorReplacement(message, lane);
   // A new live hypothesis for direction X→Y means the speaker is currently
   // speaking X, so the reverse Y→X lane is stale and must clear NOW — not wait

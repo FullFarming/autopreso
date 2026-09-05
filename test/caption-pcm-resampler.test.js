@@ -42,7 +42,9 @@ test("Gemini Caption-only transport uses the same shared FIR bytes", () => {
   const samples = Array.from({ length: 2_400 }, (_, index) => ((index * 97) % 20_000) - 10_000);
   const input = pcm16Buffer(samples);
   const expected = createCaptionPcmResampler()(input);
-  const payload = JSON.parse(createGeminiTranscribeTransport().audioPayload(input.toString("base64")));
+  const encoded = createGeminiTranscribeTransport().audioPayload(input.toString("base64"));
+  if (typeof encoded !== "string") throw new Error("Expected one audio frame");
+  const payload = JSON.parse(encoded);
 
   assert.deepEqual(Buffer.from(payload.realtimeInput.audio.data, "base64"), expected);
   assert.equal(payload.realtimeInput.audio.mimeType, "audio/pcm;rate=16000");

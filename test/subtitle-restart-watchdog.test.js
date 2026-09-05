@@ -1,3 +1,4 @@
+import { GEMINI_ENGINE_SELECTION } from "../packages/caption-core/caption-engine-catalog.js";
 // Server-side session recovery:
 //  1. restartChannels() rebuilds the translation channels in place — same
 //     sessionId, audio capture untouched — so an overlay double-click (or any
@@ -53,6 +54,7 @@ function buildManager({ broadcasts = [], sockets = [], watchdog, now, subtitle =
       load: async () => ({
         apiKeys: { gemini: "AIza-test" },
         subtitle: {
+          engine: GEMINI_ENGINE_SELECTION,
           translationProvider: "gemini",
           inputMode: "mic",
           languagePair: { a: "en", b: "ko" },
@@ -100,7 +102,7 @@ test("restartChannels rebuilds translation channels while keeping the session al
 
   // Audio continues to flow into the NEW channels under the same session id.
   const before = sockets.reduce((sum, socket) => sum + socket.sent.length, 0);
-  manager.sendAudio({ sessionId: "active", source: "mic", audio: "AAAA" });
+  manager.sendAudio({ sessionId: "active", source: "mic", audio: Buffer.alloc(4800).toString("base64") });
   const after = sockets.reduce((sum, socket) => sum + socket.sent.length, 0);
   assert.ok(after > before, "audio reaches the rebuilt channels");
 
@@ -281,7 +283,7 @@ test("a delayed restart cannot tear down a newer session", async () => {
   let loadCount = 0;
   const saved = {
     apiKeys: { gemini: "AIza-test" },
-    subtitle: { translationProvider: "gemini", inputMode: "mic", languagePair: { a: "en", b: "ko" } },
+    subtitle: { engine: GEMINI_ENGINE_SELECTION, translationProvider: "gemini", inputMode: "mic", languagePair: { a: "en", b: "ko" } },
   };
   /** @type {(value: typeof saved) => void} */
   let releaseDelayedLoad = () => {};
@@ -397,7 +399,7 @@ test("restartChannels resolves false and cleans up when the replacement engine c
     settingsStore: {
       load: async () => ({
         apiKeys: { gemini: "AIza-test" },
-        subtitle: { translationProvider: "gemini", inputMode: "mic", languagePair: { a: "en", b: "ko" } },
+        subtitle: { engine: GEMINI_ENGINE_SELECTION, translationProvider: "gemini", inputMode: "mic", languagePair: { a: "en", b: "ko" } },
       }),
     },
     createWebSocket: (url, protocols, init) => {

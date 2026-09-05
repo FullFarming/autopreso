@@ -69,6 +69,10 @@ export function createMediaGatewayRuntimeLoader({
 
   return Object.freeze({
     load,
+    async loadForEngine(engine) {
+      const selection = assertEngineKeys(engine, { GEMINI_API_KEY: config.geminiApiKey, SONIOX_API_KEY: config.sonioxApiKey });
+      return isCombinedEngine(selection) ? { liveClient: null, geminiRuntime: null } : load();
+    },
     async bindTopicModel(sessionId, model) {
       const { geminiRuntime } = await load();
       if (!topicGenerators.has(sessionId) && topicGenerators.size >= GATEWAY_GEMINI_LIMITS.maximumTrackedSessions) throw new Error("GEMINI_TOPIC_MODEL_STATE_EXHAUSTED");
@@ -264,22 +268,6 @@ export async function startMediaGateway(config = readGatewayEnvironment(), {
     // the factory below re-checks the same env before any pipeline exists.
     engineKeyEnvironment: { GEMINI_API_KEY: config.geminiApiKey, SONIOX_API_KEY: config.sonioxApiKey },
     async pipelineFactory(message, previousPipeline, onHostEvent, options = {}) {
-      // Per-language caption seq survives host reconnects and process
-      // restarts. Durable-failure recovery is stricter: the failed final has
-      // already consumed an in-memory seq but its commit outcome is unknown,
-      // so only the reconciled durable max may seed the replacement.
-      const [{ liveClient, geminiRuntime }, initialSequences, compiledGlossary] = await Promise.all([
-        runtimeLoader.load(),
-        resolvePipelineInitialSequences({
-          publisher,
-          message,
-          previousPipeline,
-          recoveryReason: options.recoveryReason,
-          requireDurableSeed: options.requireDurableSeed,
-          signal: options.signal,
-        }),
-        pinnedGlossaryLoader.load(message.sessionId, { signal: options.signal }),
-      ]);
       const captionPolishPolicy = resolveCaptionPolishPolicy(message.sessionId);
       const captionConfig = createGeminiCaptionConfig({
         ...(message.captionConfig ?? {
@@ -292,19 +280,35 @@ export async function startMediaGateway(config = readGatewayEnvironment(), {
         }),
         captionPolishPolicy,
       });
+      // Per-language caption seq survives host reconnects and process
+      // restarts. Durable-failure recovery is stricter: the failed final has
+      // already consumed an in-memory seq but its commit outcome is unknown,
+      // so only the reconciled durable max may seed the replacement.
+      const [{ liveClient, geminiRuntime }, initialSequences, compiledGlossary] = await Promise.all([
+        runtimeLoader.loadForEngine(captionConfig.engine),
+        resolvePipelineInitialSequences({
+          publisher,
+          message,
+          previousPipeline,
+          recoveryReason: options.recoveryReason,
+          requireDurableSeed: options.requireDurableSeed,
+          signal: options.signal,
+        }),
+        pinnedGlossaryLoader.load(message.sessionId, { signal: options.signal }),
+      ]);
       // The session's engine selection picks the STT provider and the text
       // translator. A selection whose provider key is absent is refused here,
       // before any paid connection or pipeline exists; the host sees
       // ENGINE_KEY_MISSING through gatewayMessage. Key values are only tested
       // for presence and never copied into a pipeline or a log. A selection the
-      // catalog only supports at one caption-language count (Soniox's pair) is
+      // catalog does not support for the selected caption languages is
       // refused the same way as ENGINE_SELECTION_INVALID.
       const engine = captionConfig.engine;
       assertEngineKeys(engine, { GEMINI_API_KEY: config.geminiApiKey, SONIOX_API_KEY: config.sonioxApiKey });
       assertEngineForLanguages(engine, captionConfig.languages);
       const textTranslate = createTextTranslate({ engine, geminiRuntime, sessionId: message.sessionId });
       if (textTranslate === null && !isCombinedEngine(engine)) throw new Error("TEXT_TRANSLATE_REQUIRED");
-      await runtimeLoader.bindTopicModel(message.sessionId, captionConfig.models.summary);
+      if (!isCombinedEngine(engine)) await runtimeLoader.bindTopicModel(message.sessionId, captionConfig.models.summary);
       return new LiveMediaPipeline({
         sessionId: message.sessionId,
         sessionType: message.sessionType,
@@ -326,14 +330,13 @@ export async function startMediaGateway(config = readGatewayEnvironment(), {
         onHostEvent,
         onFatalError: options.onFatalError,
         dependencies: {
-          // One host STT stream per session (Gemini Transcribe Live, or Soniox
-          // which also attaches per-lane translations to every final); the
-          // pipeline translates committed text into the other caption lanes.
+          // Gemini uses one STT connection; three-language Soniox owns one
+          // native connection per target, but only one authoritative source.
           speechToText: createSpeechToText({
             engine,
             liveClient,
             sonioxApiKey: config.sonioxApiKey,
-            languageCodes: config.sttLanguageCodes,
+            languageCodes: [],
             compiledGlossary,
             glossaryText: captionConfig.glossary,
             domainText: captionConfig.domain,

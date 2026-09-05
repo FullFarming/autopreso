@@ -27,9 +27,10 @@ test("workspace exposes the complete structured glossary workflow without a raw 
 
 test("form controls have stable names, labels, announcements, and explicit candidate approval", () => {
   const combined = [read("GlossaryEditor.tsx"), read("GlossaryTermRows.tsx"), read("GlossaryImportPreview.tsx"), read("GlossaryValidationSummary.tsx")].join("\n");
-  for (const name of ["presetName", "domain", "sourceTerm", "targetTerm", "aliases", "glossaryImport"]) {
+  for (const name of ["presetName", "domain", "sourceTerm", "aliases", "glossaryImport"]) {
     assert.match(combined, new RegExp(`name="${name}"`, "u"));
   }
+  assert.match(combined, /name=\{`targetTerm-\$\{language\}`\}/u);
   assert.match(combined, /htmlFor=/u);
   assert.match(combined, /role="alert"/u);
   assert.match(combined, /aria-live="polite"/u);
@@ -119,4 +120,23 @@ test("host pins the selected glossary array before invite or Start and preserves
   assert.match(host, /if \(glossarySelections\.length\)[\s\S]*pinGlossariesToSession\(next, glossarySelections\)[\s\S]*\/invites/u);
   assert.match(host, /if \(isGlossaryPinPending\)[\s\S]*세션 용어집 적용을 완료한 뒤 라이브를 시작/u);
   assert.match(host, /catch \(reason: unknown\)[\s\S]*setGlossarySelections\(previousSelections\)/u);
+});
+
+test("glossary dialog retains header and actions while the body scrolls without horizontal layout floors", () => {
+  const css = read("glossary.module.css");
+  const dialog = read("GlossaryRegistrationDialog.tsx");
+  assert.match(dialog, /className=\{styles.registrationBody\}/u);
+  assert.match(dialog, /<footer className=\{styles.registrationFooter\}/u);
+  assert.match(dialog, /previousFocus.isConnected/u);
+  assert.match(dialog, /closeRef.current\?\.focus\(\)/u);
+  assert.match(css, /grid-template-rows:\s*auto minmax\(0, 1fr\) auto/u);
+  assert.match(css, /\.registrationBody[\s\S]*overflow-y:\s*auto/u);
+  assert.doesNotMatch(css, /min-width:\s*740px|minmax\(180px/u);
+  assert.match(css, /@container glossary-editor/u);
+});
+
+test("registration dialog percentage width preserves margins beside native scrollbars", () => {
+  const css = read("glossary.module.css");
+  assert.match(css, /width: min\(720px, calc\(100% - 32px\)\)/u);
+  assert.doesNotMatch(css, /100vw/u);
 });

@@ -27,11 +27,11 @@ export async function fetchLiveRecordPage(page: number, search: string): Promise
   return data.page as unknown as LiveRecordListPage;
 }
 
-export async function fetchLiveRecordDetail(sessionId: string, language?: string): Promise<LiveRecordDetail> {
+export async function fetchLiveRecordDetail(sessionId: string, language?: string, signal?: AbortSignal): Promise<LiveRecordDetail> {
   const params = new URLSearchParams();
   if (language) params.set("language", language);
   const suffix = params.size ? `?${params}` : "";
-  const data = await readEnvelope(await fetch(`/api/live-records/${encodeURIComponent(sessionId)}${suffix}`, { cache: "no-store" }));
+  const data = await readEnvelope(await fetch(`/api/live-records/${encodeURIComponent(sessionId)}${suffix}`, { cache: "no-store", signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(15_000)]) : AbortSignal.timeout(15_000) }));
   if (!isRecord(data.detail) || !isRecord(data.detail.record) || !isRecord(data.detail.transcript)
     || !Array.isArray(data.detail.transcript.utterances) || !Array.isArray(data.detail.topics)
     || !Array.isArray(data.detail.participants) || typeof data.detail.selectedLanguage !== "string") {

@@ -12,7 +12,7 @@ import {
   normalizeSubtitleSettings,
 } from "../src/subtitle-realtime.js";
 
-test("desktop caption settings are caption-only and pin Gemini Transcribe Live", () => {
+test("desktop caption settings are caption-only and default to native Soniox", () => {
   const settings = normalizeSubtitleSettings({
     outputMode: "audio",
     audioLanguage: "ja",
@@ -26,16 +26,16 @@ test("desktop caption settings are caption-only and pin Gemini Transcribe Live",
   assert.equal(settings.outputMode, "captions");
   // The per-role model pins now live on the canonical engine selection.
   assert.deepEqual(settings.engine.stt, {
-    provider: "gemini",
-    model: "gemini-3.5-transcribe-live",
+    provider: "soniox",
+    model: "stt-rt-v5",
     languageMode: "auto",
   });
-  assert.equal(settings.engine.translation.provider, "gemini");
+  assert.equal(settings.engine.translation.provider, "soniox");
   assert.equal(settings.engine.summary.provider, "gemini");
   for (const retiredKey of ["audioLanguage", "audioVolume", "voiceProvider", "model", "geminiModel"]) {
     assert.equal(Object.hasOwn(settings, retiredKey), false);
   }
-  assert.equal(normalizeRealtimeModel("gemini-3.5-live-translate-preview"), "gemini-3.5-transcribe-live");
+  assert.equal(normalizeRealtimeModel("gemini-3.5-live-translate-preview"), "stt-rt-v5");
 });
 
 test("an explicitly selected engine survives normalization instead of being pinned back", () => {
@@ -54,7 +54,7 @@ test("an explicitly selected engine survives normalization instead of being pinn
 // Fix round 2 (I4): a combined Soniox engine can only be configured for a
 // language PAIR. Start/restart must refuse the invalid pair here rather than
 // opening a socket that the provider rejects.
-test("normalization refuses a soniox translation engine unless exactly two caption languages are set", () => {
+test("normalization supports one to three Soniox caption languages", () => {
   const combined = {
     stt: { provider: "soniox", model: "stt-rt-v5", languageMode: "auto" },
     translation: { provider: "soniox", model: "stt-rt-v5" },
@@ -62,12 +62,9 @@ test("normalization refuses a soniox translation engine unless exactly two capti
   };
   const ok = normalizeSubtitleSettings({ engine: combined, translationLanguages: ["en", "ko"] });
   assert.equal(ok.engine.translation.provider, "soniox");
-  assert.throws(
-    () => normalizeSubtitleSettings({ engine: combined, translationLanguages: ["en", "ko", "ja"] }),
-    /자막 언어가 정확히 2개/u,
-  );
-  // A Gemini engine is unaffected by the caption-language count.
-  assert.equal(normalizeSubtitleSettings({ translationLanguages: ["en", "ko", "ja"] }).engine.translation.provider, "gemini");
+  for (const translationLanguages of [["ja"], ["en", "ko", "ja"]]) {
+    assert.equal(normalizeSubtitleSettings({ engine: combined, translationLanguages }).engine.translation.provider, "soniox");
+  }
 });
 
 test("language detection remains stable for code-switching and proper nouns", () => {

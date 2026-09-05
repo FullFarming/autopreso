@@ -4,6 +4,8 @@ export interface GlossaryTermPresentation {
   readonly id: string;
   readonly source: string;
   readonly target: string;
+  readonly translations?: Readonly<Record<string, string>>;
+  readonly doNotTranslate?: boolean;
   readonly aliases: readonly string[];
   readonly note?: string;
   readonly status: GlossaryTermStatus;
@@ -171,11 +173,13 @@ export interface GlossaryDraftEdits {
     id: string;
     source: string;
     target: string;
+    translations?: Readonly<Record<string, string>>;
+    doNotTranslate?: boolean;
     aliases: string;
   }>[];
 }
 
-export type GlossaryTermDraftField = "source" | "target" | "aliases";
+export type GlossaryTermDraftField = "source" | "target" | "aliases" | "doNotTranslate" | `translation:${string}`;
 export type GlossaryTermDrafts = Readonly<Record<string, Partial<Record<GlossaryTermDraftField, string>>>>;
 
 export interface GlossaryTermWindowItem {
@@ -239,11 +243,13 @@ export function createGlossaryDraftEdits(
     source: drafts[term.id]?.source ?? term.source,
     target: drafts[term.id]?.target ?? term.target,
     aliases: drafts[term.id]?.aliases ?? term.aliases.join(", "),
+    ...(term.translations ? { translations: Object.fromEntries(Object.entries(term.translations).map(([language, value]) => [language, drafts[term.id]?.[`translation:${language}`] ?? value])) } : {}),
+    ...(term.doNotTranslate !== undefined || drafts[term.id]?.doNotTranslate !== undefined ? { doNotTranslate: drafts[term.id]?.doNotTranslate === undefined ? Boolean(term.doNotTranslate) : drafts[term.id]?.doNotTranslate === "true" } : {}),
   }));
 }
 
 function matchesGlossaryQuery(term: GlossaryTermPresentation, query: string): boolean {
-  return [term.source, term.target, ...term.aliases].some((value) => value.normalize("NFC").toLocaleLowerCase().includes(query));
+  return [term.source, term.target, ...Object.values(term.translations ?? {}), ...term.aliases].some((value) => value.normalize("NFC").toLocaleLowerCase().includes(query));
 }
 
 function applyTermDraft(term: GlossaryTermPresentation, drafts: GlossaryTermDrafts): GlossaryTermPresentation {
@@ -253,6 +259,8 @@ function applyTermDraft(term: GlossaryTermPresentation, drafts: GlossaryTermDraf
     ...term,
     source: draft.source ?? term.source,
     target: draft.target ?? term.target,
+    ...(term.translations ? { translations: Object.fromEntries(Object.entries(term.translations).map(([language, value]) => [language, draft[`translation:${language}`] ?? value])) } : {}),
+    doNotTranslate: draft.doNotTranslate === undefined ? term.doNotTranslate : draft.doNotTranslate === "true",
     aliases: draft.aliases === undefined ? term.aliases : draft.aliases.split(",").map((alias) => alias.trim()).filter(Boolean),
   };
 }

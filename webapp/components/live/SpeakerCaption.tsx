@@ -1,4 +1,5 @@
-import type { CaptionEvent, SpeakerAssignment } from "@/lib/live-contract";
+import { SpeakerIdentity } from "./SpeakerIdentity";
+import type { SpeakerProfile, CaptionEvent, SpeakerAssignment } from "@/lib/live-contract";
 
 const SPEAKER_COLORS = ["#1D1740", "#0093AD", "#F1B434", "#007C58", "#8E1000", "#545859"] as const;
 
@@ -35,7 +36,8 @@ export function resolveViewerSpeakerColor(speaker: SpeakerAssignment | null): st
  *  gateway attributes the caption to a participant identity. Everything not
  *  attributed to a floor participant is the host microphone, so it reads as
  *  "Host" instead of leaking raw diarization labels (S1, S2…). */
-export function speakerMetaLine(speaker: SpeakerAssignment | null): string {
+export function speakerMetaLine(speaker: SpeakerAssignment | null, profile?: SpeakerProfile): string {
+  if (profile) return [profile.displayName, profile.company, profile.department].filter(Boolean).join(" · ");
   if (!speaker) return "Host";
   if (!speaker.speakerId.startsWith("participant:")) return "Host";
   const name = speaker.name?.trim() || "Participant";
@@ -47,7 +49,7 @@ export function speakerMetaLine(speaker: SpeakerAssignment | null): string {
 export default function SpeakerCaption({ caption, active = false }: { caption: CaptionEvent; active?: boolean }) {
   const color = resolveSpeakerColor(caption.speaker);
   const speaker = caption.speaker;
-  const label = speakerMetaLine(speaker);
+  const label = speakerMetaLine(speaker, caption.speakerProfile);
 
   return (
     <article
@@ -57,7 +59,7 @@ export default function SpeakerCaption({ caption, active = false }: { caption: C
     >
       <div className="live-caption-speaker">
         <span className="live-speaker-dot" style={{ backgroundColor: color }} aria-hidden="true" />
-        <span>{label}</span>
+        <SpeakerIdentity profile={caption.speakerProfile} sessionId={caption.sessionId} fallback={label} />
         <span className="live-speaker-line" style={{ backgroundColor: color }} aria-hidden="true" />
         {!caption.isFinal && <span className="live-caption-state">Listening</span>}
       </div>

@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs";
 import test from "node:test";
 import vm from "node:vm";
 import { createGeminiCaptionConfig, geminiCaptionConfigFingerprint } from "../packages/caption-core/index.js";
-import { DEFAULT_ENGINE_SELECTION, EngineSelectionError, engineSelectionKey, normalizeEngineSelection } from "../packages/caption-core/caption-engine-catalog.js";
+import { GEMINI_ENGINE_SELECTION, DEFAULT_ENGINE_SELECTION, EngineSelectionError, engineSelectionKey, normalizeEngineSelection } from "../packages/caption-core/caption-engine-catalog.js";
 import { resolveLiveCallLanguages } from "../src/subtitle-languages.js";
 
 const main = readFileSync(new URL("../electron/main.js", import.meta.url), "utf8");
@@ -32,7 +32,7 @@ const sameEngine = (actual, expected, message) => assert.equal(engineSelectionKe
 
 // Plan 2 Task 4: `modelPreferences` is `{ engine, engineHistory }`. The engine the
 // server stored (spec §9: the admin's global engine) is the only Live Call engine.
-const gemini37 = normalizeEngineSelection({ ...DEFAULT_ENGINE_SELECTION, translation: { provider: "gemini", model: "gemini-3.7-flash" }, summary: { provider: "gemini", model: "gemini-3.7-flash" } });
+const gemini37 = normalizeEngineSelection({ ...GEMINI_ENGINE_SELECTION, translation: { provider: "gemini", model: "gemini-3.7-flash" }, summary: { provider: "gemini", model: "gemini-3.7-flash" } });
 const soniox = normalizeEngineSelection({
   stt: { provider: "soniox", model: "stt-rt-v5", languageMode: "ko" },
   translation: { provider: "soniox", model: "stt-rt-v5" },
@@ -177,4 +177,15 @@ test("malformed stored model-preference shapes stop activation without defaultin
 test("the desktop no longer imports the Gemini model shim for Live Call preferences", () => {
   assert.doesNotMatch(main, /gemini-model-catalog\.js|GeminiModelSelectionError|migrateLegacyGeminiModelSelection|INVALID_GEMINI_MODEL_SELECTION/u);
   assert.match(main, /"ENGINE_SELECTION_INVALID"/u);
+});
+
+
+test("desktop session assignment lookup fails closed and never buys the default engine on failure", async () => {
+  const seedSource = section("async function seedLiveCallEngineDefaults", "async function openLiveStageOverlay");
+  for (const result of [{ok:false,code:'AUTH_REQUIRED'}, {ok:true,data:{}}, {ok:true,data:{engineDefaults:null}}]) {
+    const seed=vm.runInNewContext(`${helpers}\n${seedSource}\nseedLiveCallEngineDefaults`, context({liveCallApi:async()=>result}));
+    await assert.rejects(seed('https://example.test'), /배정된 자막 엔진/u);
+  }
+  const seed=vm.runInNewContext(`${helpers}\n${seedSource}\nseedLiveCallEngineDefaults`, context({liveCallApi:async()=>({ok:true,data:{engineDefaults:gemini37}})}));
+  sameEngine((await seed('https://example.test')).engine,gemini37);
 });

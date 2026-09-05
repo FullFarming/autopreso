@@ -1,4 +1,7 @@
 const entries: readonly (readonly [string, string, string, string?])[] = [
+  ["나가기", "Leave", "退出"],
+  ["나가기 도움말", "Leave help", "退出のヘルプ"],
+  ["페이지를 나가도 세션은 유지됩니다.", "The session stays active when you leave this page.", "ページを離れてもセッションは継続します。"],
   ["발표", "Presentation", "プレゼンテーション"],
   ["1인 발표", "Single presenter", "発表者1人"],
   ["회의", "Meeting", "会議"],

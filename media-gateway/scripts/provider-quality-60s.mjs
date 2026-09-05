@@ -6,6 +6,7 @@ import {
   geminiCaptionConfigFingerprint,
   GEMINI_WORKLOAD_MODEL_MATRIX,
 } from "../../packages/caption-core/index.js";
+import { GEMINI_ENGINE_SELECTION } from "../../packages/caption-core/caption-engine-catalog.js";
 import { LiveMediaPipeline } from "../src/live-media-pipeline.js";
 
 const SIMULATED_AUDIO_MILLISECONDS = 60_000;
@@ -42,6 +43,7 @@ const QUALITY_CASES = Object.freeze([
  */
 export async function runGeminiCaptionQualityCheck() {
   const config = createGeminiCaptionConfig({
+    engine: GEMINI_ENGINE_SELECTION,
     translationLanguages: ["en", "ko"],
     glossaryPresetId: "quality-fixture",
     glossaryPresetName: "Gemini quality fixture",

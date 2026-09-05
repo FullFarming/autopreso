@@ -1,5 +1,7 @@
+import { initSubtitleControls, mountCaptionDisplayPicker } from "./subtitle-controls.js";
+import { mountSpeakerRoster } from "./subtitle-speakers.js";
 // Workspace chrome for the desktop dashboard: page routing between
-// Captions / Live Call / Records / Settings,
+// Captions / Live Call (including records) / Settings,
 // the footer Restart control, and the local Live Call draft. This file owns
 // presentation glue only — all caption/session logic stays in
 // subtitle-dashboard.js, which binds by element id and keeps working
@@ -44,12 +46,14 @@ applyTranslations(document);
 
 function activatePage(page) {
   if (!PAGE_TITLE_KEYS[page] || !main) return;
+  const focusedPage = document.activeElement?.closest?.("[data-workspace-page]");
   main.dataset.activePage = page;
   for (const section of pages) {
     section.classList.toggle("is-active", section.dataset.workspacePage === page);
   }
   for (const link of navLinks) {
-    const isCurrent = link.dataset.workspaceNav === page && link.closest("nav");
+    const railPage = page === "records" ? "livecall" : page;
+    const isCurrent = link.dataset.workspaceNav === railPage && link.closest("nav");
     link.classList.toggle("is-current", Boolean(isCurrent));
     if (link.closest("nav")) {
       if (isCurrent) link.setAttribute("aria-current", "page");
@@ -59,6 +63,10 @@ function activatePage(page) {
   if (pageTitle) {
     pageTitle.dataset.i18n = PAGE_TITLE_KEYS[page];
     pageTitle.textContent = t(PAGE_TITLE_KEYS[page]);
+  }
+  if (focusedPage && focusedPage.dataset.workspacePage !== page && pageTitle) {
+    pageTitle.tabIndex = -1;
+    pageTitle.focus();
   }
   // The caption session footer only makes sense on the captions page.
   if (footer) footer.hidden = page !== "captions";
@@ -282,6 +290,11 @@ syncLiveDraftLanguages();
 // process with the stored host cookies; the stage overlay window (countdown
 // + QR + access code) opens instead of the dashboard web page. ────────────
 
+const speakerRoster = mountSpeakerRoster(document.getElementById("live-speaker-roster"), window.realtimeNoelDesktop);
+let pendingSpeakerStart = null;
+let pendingSpeakerRegistration = null;
+let isSpeakerSessionCreating = false;
+
 const startLiveCallButton = document.getElementById("schedule-live-call");
 const liveWorkspaceStatus = document.getElementById("live-workspace-status");
 
@@ -305,6 +318,9 @@ startLiveCallButton?.addEventListener("click", async () => {
     setLiveStatus(t("live.desktopOnly"));
     return;
   }
+  if (isSpeakerSessionCreating) return;
+  if (pendingSpeakerRegistration) { setLiveStatus("등록한 세션의 발언자 저장을 먼저 완료해 주세요."); return; }
+  isSpeakerSessionCreating = true;
   startLiveCallButton.disabled = true;
   startLiveCallButton.setAttribute("aria-busy", "true");
   setLiveStatus(t("live.creating"));
@@ -322,7 +338,12 @@ startLiveCallButton?.addEventListener("click", async () => {
       languages: selectedLiveCallLanguages(),
       coverImage: liveDraftCoverData,
     };
-    const result = await bridge.startLiveCall(draft);
+    const result = pendingSpeakerStart || await bridge.startLiveCall(draft);
+    if (result?.ok && result.sessionId && speakerRoster) {
+      pendingSpeakerStart = result;
+      await speakerRoster.persistForSession(result.sessionId);
+      pendingSpeakerStart = null;
+    }
     if (result?.code === "HOST_LOGIN_REQUIRED" || result?.code === "HOST_LOGIN_REJECTED") {
       const authorizationMessage = result.code === "HOST_LOGIN_REJECTED"
         ? t("live.hostLoginRejected")
@@ -349,6 +370,7 @@ startLiveCallButton?.addEventListener("click", async () => {
     setLiveStatus(message);
     if (selectedCover) setCoverStatus(message, true);
   } finally {
+    isSpeakerSessionCreating = false;
     startLiveCallButton.disabled = false;
     startLiveCallButton.removeAttribute("aria-busy");
   }
@@ -450,7 +472,16 @@ function renderRegisteredSessions(sessions, statusText = "") {
       }
       void deleteRegisteredSession(session.id, deleteButton);
     });
-    row.append(meta, startButton, deleteButton);
+    const speakersButton = document.createElement("button");
+    speakersButton.type = "button";
+    speakersButton.textContent = "발언자 관리";
+    speakersButton.addEventListener("click", async () => {
+      try {
+        await speakerRoster?.loadSession(session.id);
+        document.getElementById("live-speaker-roster")?.scrollIntoView({ block: "center", behavior: "smooth" });
+      } catch (error) { setLiveStatus(error.message); }
+    });
+    row.append(meta, speakersButton, startButton, deleteButton);
     rows.push(row);
   }
   registeredSessionList.replaceChildren(...rows);
@@ -508,7 +539,10 @@ async function startRegisteredSession(sessionId, button) {
     setLiveStatus(result?.ok
       ? t("live.stageUp", { code: result.admissionCode ?? "?" })
       : liveCallFailureMessage(result?.code, "live.registeredStartFailed"));
-    if (result?.ok) void refreshRegisteredSessions({ quiet: true });
+    if (result?.ok) {
+      void refreshRegisteredSessions({ quiet: true });
+      await speakerRoster?.loadSession(sessionId);
+    }
   } finally {
     button.disabled = false;
     button.removeAttribute("aria-busy");
@@ -521,12 +555,20 @@ registerLiveCallButton?.addEventListener("click", async () => {
     setLiveStatus(t("live.desktopOnly"));
     return;
   }
+  if (isSpeakerSessionCreating) return;
+  if (pendingSpeakerStart) { setLiveStatus("생성한 세션의 발언자 저장을 먼저 완료해 주세요."); return; }
+  isSpeakerSessionCreating = true;
   registerLiveCallButton.disabled = true;
   registerLiveCallButton.setAttribute("aria-busy", "true");
   setLiveStatus(t("live.registering"));
   try {
     const draft = await collectLiveDraft();
-    const result = await bridge.registerLiveCall(draft);
+    const result = pendingSpeakerRegistration || await bridge.registerLiveCall(draft);
+    if (result?.ok && result.sessionId && speakerRoster) {
+      pendingSpeakerRegistration = result;
+      await speakerRoster.persistForSession(result.sessionId);
+      pendingSpeakerRegistration = null;
+    }
     setLiveStatus(result?.ok
       ? t("live.registered.ok", { title: result.title || t("live.registeredNoTitle") })
       : liveCallFailureMessage(result?.code, "live.registerFailed"));
@@ -534,6 +576,7 @@ registerLiveCallButton?.addEventListener("click", async () => {
   } catch (error) {
     setLiveStatus(error instanceof Error ? error.message : t("live.registerFailedPlain"));
   } finally {
+    isSpeakerSessionCreating = false;
     registerLiveCallButton.disabled = false;
     registerLiveCallButton.removeAttribute("aria-busy");
   }
@@ -723,3 +766,6 @@ subscribe(() => {
 mountSystemLanguageButton(document.getElementById("workspace-system-language"));
 
 activatePage("captions");
+
+initSubtitleControls();
+mountCaptionDisplayPicker(window.realtimeNoelDesktop);

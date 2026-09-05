@@ -1,3 +1,5 @@
+import { CAPTION_LANGUAGE_CODES, normalizeCaptionLanguage } from "./languages.js";
+
 /**
  * Single source of truth for caption engine providers and models.
  * Desktop, gateway, and webapp all read this; nothing else may hard-code a
@@ -25,7 +27,7 @@ const SONIOX_RT = {
   capability: { canRestrictSource: true, combinedSttTranslation: true, maxSessionMs: 18_000_000, vocabularyLimit: 10_000, languageModes: ["auto", "ko", "en"] },
 };
 const flash = (model, label, fallbackModels) => ({
-  provider: "gemini", model, label, requiredApiKey: "gemini", fallbackModels,
+  provider: "gemini", model, label, requiredApiKey: "gemini", fallbackModels, requiresSttProvider: "gemini",
   capability: { canRestrictSource: false, combinedSttTranslation: false, maxSessionMs: 0, vocabularyLimit: 0, languageModes: [] },
 });
 
@@ -35,9 +37,7 @@ export const CAPTION_ENGINE_CATALOG = deepFreeze({
     flash("gemini-3.5-flash-lite", "Gemini 3.5 Flash-Lite", ["gemini-3.6-flash"]),
     flash("gemini-3.6-flash", "Gemini 3.6 Flash", ["gemini-3.5-flash-lite"]),
     flash("gemini-3.7-flash", "Gemini 3.7 Flash", ["gemini-3.6-flash", "gemini-3.5-flash-lite"]),
-    // Soniox translates with `type: "two_way"`, which takes exactly one
-    // language pair: with 1 or 3+ caption languages there is no config to send.
-    { ...SONIOX_RT, label: "Soniox stt-rt-v5 (STT 결합)", requiresSttProvider: "soniox", requiredLanguageCount: 2 },
+    { ...SONIOX_RT, label: "Soniox stt-rt-v5 (STT 결합)", requiresSttProvider: "soniox" },
   ],
   summary: [
     flash("gemini-3.6-flash", "Gemini 3.6 Flash", ["gemini-3.7-flash"]),
@@ -46,6 +46,12 @@ export const CAPTION_ENGINE_CATALOG = deepFreeze({
 });
 
 export const DEFAULT_ENGINE_SELECTION = deepFreeze({
+  stt: { provider: "soniox", model: "stt-rt-v5", languageMode: "auto" },
+  translation: { provider: "soniox", model: "stt-rt-v5" },
+  summary: { provider: "gemini", model: "gemini-3.6-flash" },
+});
+
+export const GEMINI_ENGINE_SELECTION = deepFreeze({
   stt: { provider: "gemini", model: "gemini-3.5-transcribe-live", languageMode: "auto" },
   translation: { provider: "gemini", model: "gemini-3.6-flash" },
   summary: { provider: "gemini", model: "gemini-3.6-flash" },
@@ -97,11 +103,8 @@ export function normalizeEngineSelection(input) {
 }
 
 /**
- * Some engines only work at one caption-language count (Soniox's two-way
- * translation needs exactly a pair). The catalog owns that number so the
- * settings store and the picker enforce the same rule instead of hard-coding a
- * provider name, and so an invalid pair is refused at save time rather than
- * dead-ending when the provider socket opens.
+ * Product sessions support one to three distinct caption languages. Soniox
+ * uses separate target connections when the requested set exceeds a pair.
  *
  * @param {unknown} engine
  * @param {unknown} translationLanguages
@@ -110,11 +113,10 @@ export function normalizeEngineSelection(input) {
 export function validateEngineForLanguages(engine, translationLanguages) {
   const selection = normalizeEngineSelection(engine);
   const count = Array.isArray(translationLanguages) ? translationLanguages.length : 0;
-  for (const role of ENGINE_ROLES) {
-    const required = findEngineEntry(role, selection[role].provider, selection[role].model)?.requiredLanguageCount;
-    if (typeof required === "number" && count !== required) {
-      throw new EngineSelectionError("Soniox 번역은 자막 언어가 정확히 2개일 때만 사용할 수 있습니다.");
-    }
+  const languages = Array.isArray(translationLanguages) ? translationLanguages.map(normalizeCaptionLanguage) : [];
+  if (count < 1 || count > 3 || new Set(languages).size !== count
+    || !languages.every((language) => CAPTION_LANGUAGE_CODES.includes(language))) {
+    throw new EngineSelectionError("지원하는 자막 언어를 중복 없이 1~3개 선택해 주세요.");
   }
   return selection;
 }
@@ -133,10 +135,11 @@ const LEGACY_FLASH = Object.freeze(["gemini-3.5-flash-lite", "gemini-3.6-flash",
 export function migrateLegacyEngineSelection(input = {}) {
   if (!isRecord(input)) return DEFAULT_ENGINE_SELECTION;
   if (input.engine !== undefined) return normalizeEngineSelection(input.engine);
-  const sttModel = LEGACY_SOURCE_TO_STT[input.geminiTranscribeModel] ?? DEFAULT_ENGINE_SELECTION.stt.model;
-  const translationModel = LEGACY_FLASH.includes(input.geminiPolishModel) ? input.geminiPolishModel : DEFAULT_ENGINE_SELECTION.translation.model;
+  const sttModel = LEGACY_SOURCE_TO_STT[input.geminiTranscribeModel];
+  const translationModel = LEGACY_FLASH.includes(input.geminiPolishModel) ? input.geminiPolishModel : GEMINI_ENGINE_SELECTION.translation.model;
   const summaryModel = LEGACY_FLASH.includes(input.geminiSummaryModel) && input.geminiSummaryModel !== "gemini-3.5-flash-lite"
     ? input.geminiSummaryModel : DEFAULT_ENGINE_SELECTION.summary.model;
+  if (!sttModel) return normalizeEngineSelection({ ...DEFAULT_ENGINE_SELECTION, summary: { provider: "gemini", model: summaryModel } });
   return normalizeEngineSelection({
     stt: { provider: "gemini", model: sttModel, languageMode: "auto" },
     translation: { provider: "gemini", model: translationModel },
@@ -150,14 +153,20 @@ export function isCombinedEngine(engine) {
   return Boolean(entry?.capability.combinedSttTranslation) && selection.translation.provider === selection.stt.provider;
 }
 
+/** Caption runtime only: summary availability must not gate live captions. */
 export function engineRequiredApiKeys(engine) {
   const selection = normalizeEngineSelection(engine);
   const keys = [];
-  for (const role of ENGINE_ROLES) {
+  for (const role of ["stt", "translation"]) {
     const key = findEngineEntry(role, selection[role].provider, selection[role].model).requiredApiKey;
     if (!keys.includes(key)) keys.push(key);
   }
   return keys;
+}
+
+export function engineSummaryRequiredApiKeys(engine) {
+  const { summary } = normalizeEngineSelection(engine);
+  return [findEngineEntry("summary", summary.provider, summary.model).requiredApiKey];
 }
 
 export function engineSelectionKey(engine) {

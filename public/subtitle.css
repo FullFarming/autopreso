@@ -24,7 +24,7 @@
   --nova-indigo-500: #6566f7;
   --nova-indigo-400: #7576ff;
   --nova-indigo-100: #c9c9fc;
-  --nova-blue-500: #3182f6;
+  --nova-blue-500: #0071e3;
   --nova-red-500: #f04452;
   --nova-green-500: #03b26c;
   --nova-yellow-500: #ffc342;
@@ -40,13 +40,13 @@
   --nova-fg-secondary: var(--nova-grey-400);
   --nova-fg-tertiary: var(--nova-grey-500);
   --nova-fg-disabled: var(--nova-grey-800);
-  --nova-brand-default: var(--nova-indigo-500);
-  --nova-brand-hover: var(--nova-indigo-400);
-  --nova-brand-pressed: var(--nova-indigo-600);
-  --nova-brand-subtle: rgba(101, 102, 247, 0.16);
-  --nova-brand-fg: var(--nova-indigo-100);
+  --nova-brand-default: var(--nova-blue-500);
+  --nova-brand-hover: color-mix(in srgb, var(--nova-blue-500) 88%, var(--nova-white-0));
+  --nova-brand-pressed: color-mix(in srgb, var(--nova-blue-500) 88%, var(--nova-black-1000));
+  --nova-brand-subtle: color-mix(in srgb, var(--nova-blue-500) 16%, transparent);
+  --nova-brand-fg: var(--nova-white-0);
   --nova-system-default: var(--nova-blue-500);
-  --nova-system-subtle: rgba(49, 130, 246, 0.16);
+  --nova-system-subtle: color-mix(in srgb, var(--nova-blue-500) 16%, transparent);
   --nova-status-live: var(--nova-red-500);
   --nova-status-live-subtle: rgba(240, 68, 82, 0.16);
   --nova-status-ok: var(--nova-green-500);
@@ -66,7 +66,7 @@
   --nova-text-subtle: var(--nova-fg-tertiary);
   --nova-text-disabled: var(--nova-fg-disabled);
   --nova-blue: var(--nova-system-default);
-  --nova-blue-strong: var(--nova-brand-hover);
+  --nova-blue-strong: var(--nova-system-default);
   --nova-red: var(--nova-status-error);
   --nova-green: var(--nova-status-ok);
   --nova-yellow: var(--nova-status-warn);
@@ -5454,3 +5454,111 @@ body.theme-light {
 .glossary-select-panel .glossary-selection-option strong {
   font-weight: 500;
 }
+
+.live-record-actions { display: flex; justify-content: flex-end; margin-bottom: 16px; }
+.live-record-actions a { min-height: 44px; display: inline-flex; align-items: center; }
+
+#settings-panel-advanced > .cfg-section { grid-template-columns: minmax(0, 1fr); align-items: start; }
+#settings-panel-advanced .settings-panel[data-engine-assignment="readonly"] {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: var(--nova-gap-16);
+  padding: var(--nova-inset);
+}
+#caption-engine-status { grid-column: 1 / -1; }
+#settings-panel-advanced .settings-drawer { width: 100%; min-width: 0; }
+#settings-panel-advanced .settings-drawer .settings-panel { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+#settings-panel-advanced .settings-drawer .settings-panel > * { min-width: 0; }
+@media (max-width: 767px) {
+  #settings-panel-advanced .settings-drawer .settings-panel { grid-template-columns: minmax(0, 1fr); }
+}
+
+@media (max-width: 599px) {
+  .workspace-footer,
+  .workspace-footer.player-bar {
+    position: static;
+    width: 100%;
+    grid-template-columns: minmax(0, 1fr);
+    margin-top: var(--nova-gap-16);
+  }
+  .player-bar-left,
+  .player-bar-right,
+  .player-bar .dashboard-actions.player-bar-center {
+    flex-wrap: wrap;
+    min-width: 0;
+    max-width: 100%;
+    justify-self: start;
+  }
+  .subtitle-app-rail {
+    flex-wrap: wrap;
+    overflow-x: visible;
+  }
+  .subtitle-app-rail nav {
+    width: 100%;
+    flex-wrap: wrap;
+  }
+  .subtitle-preview { padding: var(--nova-gap-16); }
+}
+
+/* 2026-09-05 feat: One preparation column and native top-layer dialogs keep
+   session controls reachable in small desktop windows. */
+[data-workspace-page="captions"] .cfg-section { grid-template-columns: minmax(0, 1fr); gap: 12px; }
+[data-workspace-page="captions"] .caption-task-preview { order: initial; }
+[data-workspace-page="captions"] .subtitle-preview { min-height: 144px; padding: 24px; }
+.subtitle-dashboard :is(button, a.secondary),
+.glossary-detail-dialog button { min-height: 44px; border-radius: 8px; }
+.subtitle-dashboard :is(input:not([type="checkbox"], [type="range"]), select, textarea) { min-width: 0; max-width: 100%; border-radius: 8px; }
+.subtitle-dashboard :is(.field-help, .field-status, .glossary-selection-status, .audio-meter-row strong, .audio-meter-row span) { overflow-wrap: anywhere; white-space: normal; }
+.audio-meter-row { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) minmax(44px, auto); }
+.audio-meter-row > *, .audio-inspector-heading > * { min-width: 0; }
+.audio-inspector-heading { flex-wrap: wrap; }
+.glossary-management { display: grid; gap: 16px; min-width: 0; }
+.glossary-preset-actions { flex-wrap: wrap; }
+
+#glossary-select-panel,
+#glossary-detail-dialog {
+  position: fixed;
+  inset: 0;
+  box-sizing: border-box;
+  width: min(640px, calc(100% - 32px));
+  min-width: 0;
+  max-width: calc(100% - 32px);
+  height: auto;
+  max-height: calc(100dvh - 32px);
+  margin: auto;
+  padding: 0;
+  border: 1px solid var(--nova-surface-hairline);
+  border-radius: 12px;
+  background: var(--nova-surface-base);
+  color: var(--nova-fg-primary);
+  overflow: hidden;
+}
+#glossary-select-panel[open], #glossary-detail-dialog[open] { display: flex; flex-direction: column; gap: 0; }
+#glossary-select-panel[hidden], #glossary-detail-dialog:not([open]) { display: none; }
+#glossary-select-panel::backdrop, #glossary-detail-dialog::backdrop { background: var(--nova-scrim, rgba(0,0,0,.56)); }
+.glossary-modal-heading, .glossary-detail-heading, .glossary-modal-footer { display: flex; flex: 0 0 auto; align-items: center; justify-content: space-between; gap: 12px; padding: 16px; }
+.glossary-modal-heading h2, .glossary-detail-heading h2 { margin: 0; min-width: 0; white-space: normal; overflow-wrap: anywhere; }
+.glossary-modal-heading button, .glossary-detail-heading button { flex: 0 0 auto; }
+.glossary-modal-footer { justify-content: flex-end; border-top: 1px solid var(--nova-surface-hairline); }
+.glossary-modal-body, .glossary-detail-body { flex: 1 1 auto; min-height: 0; overflow-y: auto; overscroll-behavior: contain; padding: 0 16px 16px; }
+.glossary-modal-search { display: grid; gap: 8px; margin-bottom: 16px; }
+.glossary-detail-body { display: block; }
+.glossary-detail-body > * + * { margin-top: 12px; }
+.glossary-detail-body .glossary-detail-terms { display: block; }
+.glossary-detail-body .glossary-detail-terms > li { min-height: min-content; }
+.glossary-detail-terms { min-height: 0; overflow: visible; }
+.glossary-detail-language-chip, .glossary-detail-button { min-height: 44px; }
+.glossary-detail-custom-row input { width: 100%; }
+.glossary-detail-overlay { background: transparent; pointer-events: none; }
+.glossary-detail-dialog { pointer-events: auto; }
+#glossary-select-panel .glossary-option-row[hidden] { display: none; }
+@media (max-width: 599px) {
+  .audio-meter-row { grid-template-columns: minmax(0, 1fr) auto; }
+  .audio-meter-row > :first-child { grid-column: 1 / -1; }
+  .glossary-detail-custom-row { display: grid; grid-template-columns: minmax(0, 1fr); }
+  .glossary-detail-custom-row input { flex-basis: auto; }
+}
+
+.language-search-field { display: grid; gap: 8px; margin-bottom: 12px; }
+.lang-select-panel .lang-pill[hidden] { display: none; }

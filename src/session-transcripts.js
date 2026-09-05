@@ -1,5 +1,6 @@
 import fs from "node:fs/promises";
 import path from "node:path";
+import { normalizeSpeakerProfile } from "../packages/caption-core/speaker-profile.js";
 
 // Per-session transcript recorder for local caption sessions. Unlike the
 // rolling 200-line subtitle history (translation-only), this store keeps the
@@ -126,6 +127,9 @@ export function createSessionTranscripts({
       at: at.toISOString(),
       elapsedMs: Math.max(0, at.getTime() - active.startedMs),
       speaker: normalizeLineText(message.speaker).slice(0, 80),
+      ...(message.speakerProfile ? { speakerProfile: normalizeSpeakerProfile(message.speakerProfile) } : {}),
+      ...(message.speakerAttribution === "unresolved" ? { speakerAttribution: "unresolved" } : {}),
+      ...(typeof message.liveSessionId === "string" && /^[0-9a-f-]{36}$/iu.test(message.liveSessionId) ? { liveSessionId: message.liveSessionId } : {}),
       sourceText,
       translatedText,
       sourceLanguage: normalizeLineText(message.sourceLanguage).slice(0, 16),
@@ -232,6 +236,8 @@ export function createSessionTranscripts({
             at: typeof line?.at === "string" ? line.at : "",
             elapsedMs: Math.max(0, atMs - startedMs),
             speaker: normalizeLineText(line?.speaker).slice(0, 80),
+            ...(line?.speakerProfile ? { speakerProfile: normalizeSpeakerProfile(line.speakerProfile) } : {}),
+            ...(line?.speakerAttribution === "unresolved" ? { speakerAttribution: "unresolved" } : {}),
             sourceText,
             translatedText,
             sourceLanguage: normalizeLineText(line?.sourceLanguage).slice(0, 16),

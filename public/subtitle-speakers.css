@@ -1,0 +1,38 @@
+.speaker-roster { padding:24px 0; border-top:1px solid var(--nova-surface-hairline); font-size:var(--nova-font-size-t6,15px); line-height:var(--nova-line-height-t6,22.5px); }
+.speaker-heading,.speaker-actions,.speaker-row,.speaker-identity { display:flex; align-items:center; gap:12px; min-width:0; }
+.speaker-heading,.speaker-row { justify-content:space-between; flex-wrap:wrap; }
+.speaker-actions { flex-wrap:wrap; }
+.speaker-heading h2 { margin:0; font-size:var(--nova-font-size-t4,20px); line-height:var(--nova-line-height-t4,29px); font-weight:600; }
+.speaker-roster button,.speaker-editor button,.speaker-editor input,.speaker-editor select { font:inherit; color:inherit; min-height:44px; border:1px solid var(--nova-surface-hairline); border-radius:8px; background:transparent; padding:10px 14px; max-width:100%; }
+.speaker-roster button,.speaker-editor button { cursor:pointer; }
+.speaker-roster button:focus-visible,.speaker-editor :is(button,input,select):focus-visible { outline:2px solid #0071e3; outline-offset:2px; }
+.speaker-roster button[aria-pressed=true],.speaker-choice[aria-pressed=true] { border-color:#0071e3; color:#0071e3; }
+.speaker-roster button:disabled,.speaker-editor button:disabled { opacity:.45; cursor:default; }
+.speaker-row { padding:16px 0; border-bottom:1px solid var(--nova-surface-hairline); }
+.speaker-row>.speaker-actions { flex-shrink:0; max-width:100%; }
+.speaker-row>.speaker-actions>button { height:44px; box-sizing:border-box; padding:8px 12px; white-space:nowrap; }
+.speaker-list { margin:16px 0; }
+.speaker-identity { flex:1; text-align:left; overflow-wrap:anywhere; }
+.speaker-identity-text { display:grid; min-width:0; }
+.speaker-identity-text strong { font-weight:600; }
+.speaker-avatar { flex:0 0 44px; width:44px; height:44px; display:grid; place-items:center; overflow:hidden; border:1px solid var(--nova-surface-hairline); border-radius:980px; background:var(--nova-surface-float); color:var(--nova-fg-primary); }
+.speaker-avatar img { width:100%; height:100%; object-fit:cover; }
+.speaker-muted { color:var(--nova-fg-secondary); font-size:var(--nova-font-size-t7,13px); line-height:var(--nova-line-height-t7,19.5px); }
+.speaker-status { min-height:24px; overflow-wrap:anywhere; }
+.speaker-editor { width:min(520px,calc(100vw - 32px)); max-height:calc(100dvh - 32px); padding:0; overflow:hidden; border:1px solid var(--nova-surface-hairline); border-radius:8px; background:var(--nova-surface-base); color:var(--nova-fg-primary); font-family:var(--nova-font); font-size:var(--nova-font-size-t6,15px); line-height:var(--nova-line-height-t6,22.5px); }
+.speaker-editor::backdrop { background:rgba(0,0,0,.56); }
+.speaker-editor-layout { display:flex; flex-direction:column; max-height:calc(100dvh - 34px); margin:0; }
+.speaker-editor header,.speaker-editor footer { flex:none; display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:12px; padding:20px; border-bottom:1px solid var(--nova-surface-hairline); }
+.speaker-editor header h2 { margin:0; font-size:var(--nova-font-size-t4,20px); line-height:var(--nova-line-height-t4,29px); font-weight:600; }
+.speaker-editor footer { border-bottom:0; border-top:1px solid var(--nova-surface-hairline); justify-content:flex-end; }
+.speaker-editor button[type=submit] { background:#0071e3; color:var(--nova-fg-on-brand,#fff); border-color:#0071e3; }
+.speaker-editor-body { padding:20px; min-height:0; overflow-y:auto; overscroll-behavior:contain; }
+.speaker-editor-body label { display:grid; gap:8px; margin-bottom:20px; }
+.speaker-editor-body input,.speaker-editor-body select { width:100%; box-sizing:border-box; }
+.speaker-editor-body option { background:var(--nova-surface-base); color:var(--nova-fg-primary); }
+.speaker-editor [hidden],.speaker-roster [hidden] { display:none!important; }
+@media(max-width:640px) { .speaker-row>.speaker-actions { width:100%; }.speaker-row>.speaker-actions button { flex:1; } }
+
+.session-transcript-lines li.has-speaker-profile { flex-wrap:wrap; align-items:center; }
+.session-transcript-lines .has-speaker-profile .session-transcript-speaker { display:inline-flex; align-items:center; flex:0 1 auto; min-width:0; max-width:100%; overflow-wrap:anywhere; }
+.session-transcript-lines .has-speaker-profile>span:last-child { flex-basis:100%; min-width:0; overflow-wrap:anywhere; }

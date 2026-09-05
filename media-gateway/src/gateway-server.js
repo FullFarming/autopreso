@@ -16,12 +16,9 @@ import { verifyAdminGatewayToken, verifyLiveToken } from "./token-verifier.js";
 import { ViewerTicketReplayGuard } from "./viewer-ticket-replay-guard.js";
 import { ViewerAuthorizationBatcher } from "./viewer-authorization-batcher.js";
 import { MediaDemandCoordinator } from "./media-demand-coordinator.js";
-import { assertEngineForLanguages, assertEngineKeys } from "./engines/create-engines.js";
+import { assertEngineKeys } from "./engines/create-engines.js";
 import {
-  createGeminiCaptionConfig,
   DEFAULT_ENGINE_SELECTION,
-  engineSelectionKey,
-  geminiCaptionConfigFingerprint,
 } from "../../packages/caption-core/index.js";
 
 const AUTH_TIMEOUT_MILLISECONDS = 5_000;
@@ -338,7 +335,6 @@ export function createGatewayServer({
   /** Key PRESENCE only, consulted before an admin engine switch builds anything.
    *  Production passes the validated gateway config; tests pass fixtures. */
   engineKeyEnvironment = process.env,
-  engineSwitchCooldownMilliseconds = 2_000,
 }) {
   if (!Number.isFinite(heartbeatIntervalMilliseconds) || heartbeatIntervalMilliseconds <= 0) throw new Error("INVALID_HEARTBEAT_INTERVAL");
   if (typeof viewerTicketReplayGuard?.consume !== "function") throw new Error("INVALID_VIEWER_TICKET_REPLAY_GUARD");
@@ -388,9 +384,6 @@ export function createGatewayServer({
     ?? Math.min(DEFAULT_FLOOR_RESUME_COOLDOWN_MILLISECONDS, floorTakeCooldownMilliseconds);
   if (!Number.isFinite(hostReconnectGraceMilliseconds) || hostReconnectGraceMilliseconds < 0) {
     throw new Error("INVALID_HOST_RECONNECT_GRACE");
-  }
-  if (!Number.isFinite(engineSwitchCooldownMilliseconds) || engineSwitchCooldownMilliseconds < 0) {
-    throw new Error("INVALID_ENGINE_SWITCH_COOLDOWN");
   }
   const hostSessions = new Map();
   const failedHostSessions = new Map();
@@ -1074,15 +1067,10 @@ export function createGatewayServer({
     metrics.set("host_sessions", hostSessions.size);
     return true;
   }, { bypassQueueLimit: true });
-  // ── Admin-triggered engine switch (auth console spec §9) ──────────────────
-  // POST /internal/sessions/:sessionId/engine with a short-lived ADMIN token.
-  // A live session gets the same replacement the host `update` performs (open
-  // the new pipeline → ready → close the old one; seq reseeds from the retiring
-  // pipeline, contract C1). A session this gateway does not hold is "queued":
-  // the DB value applies at the next activation.
+  // Existing integrations get an explicit refusal: assignments are persisted
+  // on users for their next session, never on an active media pipeline.
   const ENGINE_ROUTE_PATTERN = /^\/internal\/sessions\/([^/?#]+)\/engine$/u;
   const MAX_ENGINE_BODY_BYTES = 16 * 1_024;
-  const engineSwitchAttempts = new Map();
   const jsonResponse = (response, statusCode, body, headers = {}) => {
     response.writeHead(statusCode, { "Content-Type": "application/json", "Cache-Control": "no-store", ...headers });
     response.end(JSON.stringify(body));
@@ -1111,150 +1099,6 @@ export function createGatewayServer({
     request.on("end", () => { if (!isOverflowing) resolve(Buffer.concat(chunks).toString("utf8")); });
     request.on("error", () => reject(new Error("INVALID_ENGINE_BODY")));
   });
-  const switchSessionEngine = (sessionId, engine) => withHostSessionLock(sessionId, async () => {
-    if (isShuttingDown) return { statusCode: 503, body: { result: "failed", code: "GATEWAY_SHUTTING_DOWN" } };
-    const attemptAt = now();
-    const lastAttemptAt = engineSwitchAttempts.get(sessionId);
-    if (lastAttemptAt !== undefined && attemptAt - lastAttemptAt < engineSwitchCooldownMilliseconds) {
-      metrics.increment("engine_switch_rate_limited_total");
-      return { statusCode: 429, body: { result: "failed", code: "ENGINE_SWITCH_RATE_LIMITED" } };
-    }
-    engineSwitchAttempts.set(sessionId, attemptAt);
-    const state = hostSessions.get(sessionId);
-    if (!state || state.isDetaching) return { statusCode: 200, body: { result: "queued" } };
-    if (state.isDraining) return { statusCode: 409, body: { result: "failed", code: "MEDIA_DRAINING" } };
-    try {
-      assertEngineForLanguages(engine, state.settings.languages);
-    } catch (error) {
-      return { statusCode: 400, body: { result: "failed", code: error?.code === "ENGINE_SELECTION_INVALID" ? "ENGINE_SELECTION_INVALID" : engineFailureCode(error) } };
-    }
-    // The canonical caption config round-trips through the builder; only the
-    // engine changes, so glossary/domain/tone/languages stay exactly as pinned.
-    const { models: _previousModels, ...previousCaptionInput } = state.settings.captionConfig ?? {
-      languages: state.settings.languages,
-      outputMode: state.settings.outputMode,
-      glossaryText: state.settings.glossaryText,
-      glossaryPack: state.settings.glossaryPack,
-      domainText: state.settings.domainText,
-      translationTone: state.settings.translationTone,
-    };
-    let nextCaptionConfig;
-    try {
-      nextCaptionConfig = createGeminiCaptionConfig({ ...previousCaptionInput, engine });
-    } catch {
-      return { statusCode: 400, body: { result: "failed", code: "ENGINE_SELECTION_INVALID" } };
-    }
-    const currentEngine = state.settings.captionConfig?.engine ?? DEFAULT_ENGINE_SELECTION;
-    if (engineSelectionKey(currentEngine) === engineSelectionKey(nextCaptionConfig.engine)) {
-      // Re-deploying the running engine is idempotent: no pipeline, no viewer churn.
-      return { statusCode: 200, body: { result: "switched" } };
-    }
-    const captionConfigFingerprint = geminiCaptionConfigFingerprint(nextCaptionConfig);
-    const hostMessage = {
-      ...state.settings,
-      captionConfig: nextCaptionConfig,
-      captionConfigFingerprint,
-      languages: [...state.settings.languages],
-    };
-    const previousPipeline = state.pipeline;
-    const pipelineGeneration = randomUUID();
-    const mediaFence = state.demandEpoch === null ? null : { epoch: state.demandEpoch, ownerId: demand.ownerId };
-    const announceLanguages = (status) => Promise.all(hostMessage.languages.map((language) => {
-      const event = { type: "language-status", sessionId, language, status };
-      sendHostEvent(state.hostOutput, event);
-      return deliverEvent(sessionId, language, event);
-    }));
-    sendEngineStatus(state.webSocket, sessionId, nextCaptionConfig.engine, "connecting");
-    await announceLanguages("preparing");
-    const operationAbortController = new AbortController();
-    const abortForShutdown = () => operationAbortController.abort(
-      shutdownAbortController.signal.reason ?? new Error("GATEWAY_SHUTTING_DOWN"),
-    );
-    shutdownAbortController.signal.addEventListener("abort", abortForShutdown, { once: true });
-    const startTimer = setTimeoutFn(
-      () => operationAbortController.abort(new Error("HOST_START_TIMEOUT")),
-      hostStartTimeoutMilliseconds,
-    );
-    let candidate = null;
-    try {
-      const factoryPromise = Promise.resolve().then(() => pipelineFactory(
-        hostMessage,
-        previousPipeline,
-        (event) => {
-          if (event?.translationCapture != null
-            && !createMediaEventGuard(sessionId, { pipelineGeneration, mediaFence })()) return;
-          sendHostEvent(state.hostOutput, event);
-        },
-        {
-          signal: operationAbortController.signal,
-          pipelineGeneration,
-          requireDurableSeed: state.demandEpoch !== null,
-          mediaFence,
-          onFatalError: () => failOwnedPipeline(sessionId, candidate),
-        },
-      ));
-      void factoryPromise.then((lateCandidate) => {
-        pipelineSessionIds.set(lateCandidate, sessionId);
-        if (operationAbortController.signal.aborted) return closePipelineOnce(lateCandidate).catch(() => undefined);
-        return undefined;
-      }, () => undefined);
-      candidate = await waitForAbort(factoryPromise, operationAbortController.signal);
-      await waitForAbort(
-        Promise.resolve().then(() => candidate.start({ signal: operationAbortController.signal })),
-        operationAbortController.signal,
-      );
-      if (isShuttingDown) throw new Error("GATEWAY_SHUTTING_DOWN");
-      if (hostSessions.get(sessionId) !== state || state.isDetaching || state.isDraining) throw new Error("SESSION_NOT_STARTED");
-    } catch (error) {
-      // The replacement never took ownership: the old pipeline keeps serving,
-      // so viewers are told the lanes are ready again.
-      const code = engineFailureCode(error);
-      try { await closePipelineOnce(candidate); } catch { metrics.increment("pipeline_close_failures_total"); }
-      metrics.increment("engine_switch_failures_total");
-      sendEngineStatus(state.webSocket, sessionId, nextCaptionConfig.engine, "failed", code);
-      if (hostSessions.get(sessionId) === state && !state.isDetaching) await announceLanguages("ready");
-      return { statusCode: 409, body: { result: "failed", code } };
-    } finally {
-      clearTimeoutFn(startTimer);
-      shutdownAbortController.signal.removeEventListener("abort", abortForShutdown);
-    }
-    state.pipeline = candidate;
-    state.pipelineGeneration = pipelineGeneration;
-    state.settings = { ...state.settings, captionConfig: nextCaptionConfig, captionConfigFingerprint };
-    pipelineSessionIds.set(candidate, sessionId);
-    try {
-      await closePipelineOnce(previousPipeline);
-    } catch {
-      // Same contract as the host `update`: two paid provider pipelines must
-      // never overlap, so a retiring pipeline that will not close ends the session.
-      state.isDetaching = true;
-      stopHostLease(state);
-      try { candidate.abortMedia?.(); } catch { /* close remains required */ }
-      await closePipelineOnce(candidate).catch(() => undefined);
-      if (hostSessions.get(sessionId) === state) hostSessions.delete(sessionId);
-      metrics.set("host_sessions", hostSessions.size);
-      metrics.increment("engine_switch_failures_total");
-      sendEngineStatus(state.webSocket, sessionId, nextCaptionConfig.engine, "failed", "PIPELINE_CLEANUP_FAILED");
-      closePipelineSocket(state.webSocket, new Error("PIPELINE_CLEANUP_FAILED"));
-      return { statusCode: 409, body: { result: "failed", code: "PIPELINE_CLEANUP_FAILED" } };
-    }
-    const holder = floorHolders.get(sessionId);
-    if (holder) {
-      try {
-        candidate.setFloorSpeaker?.({
-          participantId: holder.participantId,
-          displayName: holder.displayName,
-          department: holder.department,
-          jobTitle: holder.jobTitle,
-        });
-      } catch {
-        // An engine switch must not revoke the floor.
-      }
-    }
-    metrics.increment("engine_switches_total");
-    sendEngineStatus(state.webSocket, sessionId, nextCaptionConfig.engine, "ready");
-    return { statusCode: 200, body: { result: "switched" } };
-  }, { bypassQueueLimit: true });
   const handleEngineRequest = async (request, response, sessionId) => {
     const refuse = (statusCode, code, headers) => {
       request.resume();
@@ -1285,14 +1129,12 @@ export function createGatewayServer({
     if (!body || typeof body !== "object" || Array.isArray(body) || Object.keys(body).some((key) => key !== "engine")) {
       return refuse(400, "INVALID_ENGINE_BODY");
     }
-    let engine;
     try {
-      engine = assertEngineKeys(body.engine, engineKeyEnvironment);
+      assertEngineKeys(body.engine, engineKeyEnvironment);
     } catch (error) {
       return refuse(400, error?.code === "ENGINE_KEY_MISSING" ? "ENGINE_KEY_MISSING" : "ENGINE_SELECTION_INVALID");
     }
-    const outcome = await switchSessionEngine(sessionId, engine);
-    return jsonResponse(response, outcome.statusCode, outcome.body);
+    return refuse(409, "NEXT_SESSION_ASSIGNMENT_REQUIRED");
   };
   const server = createServer((request, response) => {
     const engineRoute = ENGINE_ROUTE_PATTERN.exec(request.url ?? "");

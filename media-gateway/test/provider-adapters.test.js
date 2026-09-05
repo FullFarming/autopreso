@@ -8,7 +8,7 @@ import {
   createGeminiCustomVocabulary,
 } from "../src/google-provider-adapters.js";
 import { SupabaseViewerAuthorizer } from "../src/supabase-adapters.js";
-import { LiveMediaPipeline } from "../src/live-media-pipeline.js";
+import { LiveMediaPipeline } from "./helpers/gemini-pipeline.js";
 
 test("Transcribe close waits for physical provider closure and reports a bounded closure timeout", async (context) => {
   context.mock.timers.enable({ apis: ["setTimeout"] });
@@ -130,7 +130,7 @@ test("Gemini 3.5 Live Transcribe publishes interim hypotheses separately and com
   } });
   for (let tick = 0; tick < 3; tick += 1) await new Promise((resolve) => setImmediate(resolve));
 
-  assert.deepEqual(partials, [{ text: "NOVA 순영업소", sourceLanguage: "ko-KR" }]);
+  assert.deepEqual(partials, [{ text: "NOVA 순영업소", sourceLanguage: "ko-KR", segmentId: "0" }]);
   assert.equal(finals.length, 1);
   assert.equal(finals[0].text, "NOVA 순영업소득이 증가했습니다.");
   assert.equal(finals[0].sourceLanguage, "ko-KR");
@@ -612,7 +612,7 @@ test("Transcribe coalesces 40ms frames without negative padding and keeps the re
   await stream.close();
   assert.equal(chunks.length, 2);
   assert.equal(chunks[1].subarray(0, 640).every((value) => value === 3), true);
-  assert.equal(chunks[1].subarray(640).every((value) => value === 0), true);
+  assert.equal(chunks[1].byteLength, 640, "the final 20ms tail must not be padded with artificial silence");
 });
 
 test("Transcribe bounds pending partial callbacks and cannot enqueue a final after partial failure", async () => {

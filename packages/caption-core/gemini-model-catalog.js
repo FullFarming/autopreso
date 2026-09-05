@@ -1,12 +1,12 @@
 // Compatibility shim over caption-engine-catalog.js. Plan 2 replaces callers
 // (gateway, webapp, electron) with the engine catalog and deletes this file.
-import { CAPTION_ENGINE_CATALOG, DEFAULT_ENGINE_SELECTION, migrateLegacyEngineSelection } from "./caption-engine-catalog.js";
+import { CAPTION_ENGINE_CATALOG, GEMINI_ENGINE_SELECTION, migrateLegacyEngineSelection } from "./caption-engine-catalog.js";
 
 const sttModels = Object.freeze(CAPTION_ENGINE_CATALOG.stt.filter((entry) => entry.provider === "gemini").map((entry) => Object.freeze({ id: entry.model, label: entry.label })));
 const summaryModels = Object.freeze(CAPTION_ENGINE_CATALOG.summary.map((entry) => Object.freeze({ id: entry.model, label: entry.label })));
 export const GEMINI_MODEL_CATALOG = Object.freeze({ translation: sttModels, source: sttModels, summary: summaryModels });
 export const DEFAULT_GEMINI_MODEL_SELECTION = Object.freeze({
-  translation: DEFAULT_ENGINE_SELECTION.stt.model, source: DEFAULT_ENGINE_SELECTION.stt.model, summary: DEFAULT_ENGINE_SELECTION.summary.model,
+  translation: GEMINI_ENGINE_SELECTION.stt.model, source: GEMINI_ENGINE_SELECTION.stt.model, summary: GEMINI_ENGINE_SELECTION.summary.model,
 });
 export class GeminiModelSelectionError extends Error {
   constructor(message = "지원하지 않는 모델입니다. 설정에서 모델을 다시 선택해 주세요.") {
@@ -34,8 +34,9 @@ export function readStoredGeminiModelSelection(role, value) {
 }
 export function migrateLegacyGeminiModelSelection(role, value) {
   if (role === "source" || role === "translation") {
-    return migrateLegacyEngineSelection({ geminiTranscribeModel: value }).stt.model;
+    const selection = migrateLegacyEngineSelection({ geminiTranscribeModel: value });
+    return selection.stt.provider === "gemini" ? selection.stt.model : GEMINI_ENGINE_SELECTION.stt.model;
   }
-  if (role === "summary") return migrateLegacyEngineSelection({ geminiSummaryModel: value }).summary.model;
+  if (role === "summary") return migrateLegacyEngineSelection({ geminiTranscribeModel: GEMINI_ENGINE_SELECTION.stt.model, geminiSummaryModel: value }).summary.model;
   throw new GeminiModelSelectionError();
 }

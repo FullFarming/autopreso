@@ -1,5 +1,5 @@
 import { hasValidTranslationCaptureProvenance, type TranslationCapture } from "../../../lib/live/translation-capture";
-import type { CaptionTranslationStatus } from "@/lib/live-contract";
+import type { SpeakerProfile, CaptionTranslationStatus } from "@/lib/live-contract";
 import type { LanguageObservation } from "../../../lib/live/source-contract";
 import type { CaptionDisplayMode } from "./CaptionEntry";
 
@@ -16,6 +16,8 @@ export interface TopicCaptionPresentation {
   utteranceKey?: string;
   text: string;
   speakerLabel?: string;
+  speakerProfile?: SpeakerProfile;
+  sessionId?: string;
   speakerColor?: string;
   timestamp?: string;
   isFinal: boolean;

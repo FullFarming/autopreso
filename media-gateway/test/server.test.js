@@ -386,3 +386,40 @@ test("gateway Gemini admission budget covers a dense three-language session", as
   const source = await readFile(new URL("../src/server.js", import.meta.url), "utf8");
   assert.match(source, /createGeminiServerRuntime\(\{[\s\S]*?limits:\s*GATEWAY_GEMINI_LIMITS/u);
 });
+
+test('Soniox-only runtime needs no Gemini key and never imports or initializes Gemini', async () => {
+  const { DEFAULT_ENGINE_SELECTION, GEMINI_ENGINE_SELECTION } = await import('../../packages/caption-core/caption-engine-catalog.js');
+  let imports = 0;
+  const loader = createMediaGatewayRuntimeLoader({ config: { geminiApiKey: '', sonioxApiKey: 'fixture-key' }, getGateway: () => null,
+    importGoogleGenAI: async () => { imports++; throw new Error('GEMINI_MUST_NOT_LOAD'); } });
+  assert.deepEqual(await loader.loadForEngine(DEFAULT_ENGINE_SELECTION), { liveClient: null, geminiRuntime: null });
+  assert.equal(imports, 0);
+  await assert.rejects(loader.loadForEngine(GEMINI_ENGINE_SELECTION), /ENGINE_KEY_MISSING/u);
+  assert.equal(imports, 0);
+});
+
+test('Soniox with no Gemini key opens its native socket and sends PCM without starting live topic inference', async () => {
+  const { EventEmitter } = await import('node:events');
+  const { createSpeechToText } = await import('../src/engines/create-engines.js');
+  const { LiveMediaPipeline } = await import('../src/live-media-pipeline.js');
+  const { DEFAULT_ENGINE_SELECTION } = await import('../../packages/caption-core/caption-engine-catalog.js');
+  let imports = 0; const frames = [];
+  const loader = createMediaGatewayRuntimeLoader({ config: { geminiApiKey: '', sonioxApiKey: 'fixture-key' }, getGateway: () => null,
+    importGoogleGenAI: async () => { imports++; throw new Error('GEMINI_MUST_NOT_LOAD'); } });
+  const { liveClient } = await loader.loadForEngine(DEFAULT_ENGINE_SELECTION);
+  const stt = createSpeechToText({ engine: DEFAULT_ENGINE_SELECTION, liveClient, sonioxApiKey: 'fixture-key', translationLanguages: ['ko', 'en'] });
+  class Socket extends EventEmitter {
+    readyState = 1;
+    send(frame) { frames.push(frame); if (frame === '') this.emit('message', JSON.stringify({ finished: true })); }
+    close() { this.readyState = 3; this.emit('close'); }
+  }
+  stt.createWebSocket = () => new Socket();
+  const pipeline = new LiveMediaPipeline({ sessionId: 'soniox-no-gemini', sessionType: 'meeting', languages: ['ko','en'], dependencies: {
+    speechToText: stt, textTranslate: null,
+    publisher: { async publish() {}, startTopicSession() { assert.fail('Soniox must not invoke live topic inference'); } },
+  } });
+  await pipeline.start(); await pipeline.acceptAudio(new Uint8Array(1280)); await pipeline.close();
+  assert.equal(JSON.parse(frames[0]).model, 'stt-rt-v5');
+  assert.equal(frames.filter(frame => Buffer.isBuffer(frame)).length, 1);
+  assert.equal(imports, 0);
+});

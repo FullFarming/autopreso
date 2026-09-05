@@ -7,6 +7,7 @@ import {
   SUMMARY_RESET_FAILURE_CODES,
   getSafeSummaryErrorMessage,
   isSummaryEmptyCode,
+  isSummaryReadRetryable,
   shouldResetSummaryGeneration,
 } from "./useHostSummaryLifecycle";
 
@@ -19,8 +20,8 @@ test("every failure class a host cannot poll out of authorizes a reset request, 
     "SUMMARY_GENERATION_EXHAUSTED",
   ]);
   for (const code of SUMMARY_RESET_FAILURE_CODES) assert.equal(shouldResetSummaryGeneration(code), true);
-  // A request that never reached the API is also unrecoverable by polling.
-  assert.equal(shouldResetSummaryGeneration("SUMMARY_REQUEST_FAILED"), true);
+  // A missing response leaves generation unknown; only GET can establish its state.
+  assert.equal(shouldResetSummaryGeneration("SUMMARY_REQUEST_FAILED"), false);
   for (const pollableCode of ["", "SUMMARY_NOT_READY", "SUMMARY_GENERATION_RUNNING"]) {
     assert.equal(shouldResetSummaryGeneration(pollableCode), false,
       "a running or not-yet-ready generation must keep polling instead of resetting");
@@ -72,7 +73,7 @@ test("the recovery POST shows the skeleton while it runs instead of the failure 
     "the skeleton and its elapsed-time origin start before the POST is awaited");
   // A failed POST still reverts to the failure classes, as before.
   assert.match(retry, /if \(!payload\.ok\) \{[\s\S]*setPollingState\(payload\.code === "SUMMARY_GENERATION_EXHAUSTED" \? "exhausted" : "failed"\)/u);
-  assert.match(retry, /catch \{[\s\S]*setPollingState\("failed"\)/u);
+  assert.match(retry, /catch \{[\s\S]*setPollingRound\(\(round\) => round \+ 1\)/u);
   // The GET loop is keyed on pollingRound and may only restart once the POST
   // has answered; the pre-request block must not touch it.
   assert.doesNotMatch(beforeRequest, /setPollingRound/u);
@@ -104,4 +105,16 @@ test("an empty record stops polling without an error state or a retry affordance
   assert.match(lifecycle, /isSummaryEmpty/u);
   assert.match(lifecycle, /if \(!endedSession \|\| summary \|\| isSummaryEmpty\) return;/u,
     "a settled empty record must not restart the poll loop");
+});
+
+test("read transport failures never authorize regeneration or mask an authoritative terminal state", () => {
+  for (const status of [0, 408, 429, 500, 502, 503, 504]) assert.equal(isSummaryReadRetryable(undefined, status), true);
+  for (const code of ["SUMMARY_READ_TIMEOUT", "SUMMARY_STATE_FAILED", "SUMMARY_READY_MISSING", "SUMMARY_READ_FAILED"])
+    assert.equal(isSummaryReadRetryable(code, 504), true);
+  for (const code of SUMMARY_RESET_FAILURE_CODES) assert.equal(isSummaryReadRetryable(code, 503), false);
+  assert.equal(isSummaryReadRetryable("SUMMARY_FORBIDDEN", 403), false);
+  assert.equal(isSummaryReadRetryable("SUMMARY_REFUSED", 502), false);
+  const exhausted = lifecycle.slice(lifecycle.indexOf("onExhausted:"), lifecycle.indexOf("onError:"));
+  assert.doesNotMatch(exhausted, /SUMMARY_GENERATION_EXHAUSTED/);
+  assert.match(exhausted, /SUMMARY_REQUEST_FAILURE_CODE/);
 });

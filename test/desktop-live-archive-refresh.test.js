@@ -17,7 +17,7 @@ function nativeHarness(){
   net:{fetch:async(url,options)=>{imports.push({url,options});return {ok:true,json:async()=>({ok:true})};}},
  };
  const archive=main.slice(main.indexOf('async function archiveLiveCallSession('),main.indexOf('// ── Window reachability'));
- const allowed=main.slice(main.indexOf('function isAllowedOrigin('),main.indexOf('function createNoopTranscription('));
+ const allowed=main.slice(main.indexOf('function isAllowedOrigin('),main.indexOf('// Boot must never reject silently.'));
  const ipc=main.slice(main.indexOf('  ipcMain.handle("live-call:archive-refresh"'),main.indexOf('  ipcMain.handle("host-session:get"'));
  vm.runInNewContext(`${allowed}\n${archive}\n${ipc}`,context);
  return {context,remote,imports,sender,refresh:recordId=>handlers.get('live-call:archive-refresh')({sender},recordId),handler:handlers.get('live-call:archive-refresh')};

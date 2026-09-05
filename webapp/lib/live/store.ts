@@ -9,6 +9,7 @@ import { getLiveStoreConfig } from "./config";
 import { languageObservationSchema } from "./source-contract";
 import { coverImagePath, coverImageVersionFromPath } from "./cover-image";
 import { LiveSessionError } from "./errors";
+import { normalizeSpeakerProfile } from "../../../packages/caption-core/speaker-profile.js";
 
 const CANONICAL_LANGUAGE_CODES = new Set<string>(LANGUAGE_CODES);
 
@@ -85,6 +86,8 @@ interface UtteranceRow {
   participant_id: string | null;
   speaker_label: string | null;
   speaker_name: string | null;
+  speaker_profile?: unknown;
+  speaker_attribution?: string | null;
   text: string;
   source_text: string | null;
   source_started_at?: string | null;
@@ -109,6 +112,8 @@ function captionFromUtterance(sessionId: string, language: string, row: Utteranc
     throw new LiveSessionError("번역 기록의 출처 정보를 확인할 수 없습니다.", "INVALID_TRANSLATION_CAPTURE", 503);
   }
   const caption: CaptionEvent = {
+    ...(row.speaker_profile == null ? {} : { speakerProfile: normalizeSpeakerProfile(row.speaker_profile) }),
+    ...(row.speaker_attribution === "unresolved" ? { speakerAttribution: "unresolved" as const } : {}),
     type: "caption",
     seq: Number(row.seq),
     sessionId,
@@ -169,7 +174,7 @@ export class MemoryLiveSessionStore implements LiveSessionStore {
     const current = this.sessions.get(sessionId);
     if (!current || current.hostId !== hostId || current.version !== expectedVersion
       || !ACTIVE_SESSION_STATUSES.includes(current.status)) return null;
-    if (Date.parse(current.expiresAt) > this.now()) return structuredClone(current);
+    if (Date.parse(current.expiresAt) > this.now() + 15 * 60_000) return structuredClone(current);
     const renewed = { ...current, version: current.version + 1,
       expiresAt: new Date(Math.max(this.now(), Date.parse(current.scheduledAt ?? "") || 0) + 6 * 60 * 60_000).toISOString() };
     this.sessions.set(sessionId, renewed);
@@ -907,7 +912,7 @@ export class SupabaseLiveSessionStore implements LiveSessionStore {
     const query = new URLSearchParams({
       session_id: `eq.${sessionId}`,
       language: `eq.${language}`,
-      select: "seq,participant_id,speaker_label,speaker_name,text,source_text,source_language,source_started_at,origin,utterance_key,translation_status,source_ended_at,emitted_at,authoritative_source_id,translation_capture",
+      select: "seq,participant_id,speaker_label,speaker_name,speaker_profile,speaker_attribution,text,source_text,source_language,source_started_at,origin,utterance_key,translation_status,source_ended_at,emitted_at,authoritative_source_id,translation_capture",
       // 2026-07-26 fix: Serve the oldest bounded window, then let the gateway
       // keyset-replay every later page. One giant snapshot exceeded 5 seconds.
       order: "seq.asc",

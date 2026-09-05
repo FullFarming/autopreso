@@ -105,6 +105,56 @@ export class SupabaseProfileStore {
     return profile;
   }
 
+  /** Only call after environment-backed password verification; profile status is never overridden. */
+  async ensureLegacyAdmin(input: { hostId: string; bootstrapEmail: string }): Promise<ProfileRecord> {
+    const email = input.bootstrapEmail.trim().toLowerCase();
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/u.test(email)) {
+      throw new ProfileStoreError("ADMIN_BOOTSTRAP_EMAILS에 관리자 이메일을 설정해 주세요.", "ADMIN_BOOTSTRAP_CONFIG_REQUIRED", 503);
+    }
+    const existing = await this.readByHostId(input.hostId);
+    if (existing) {
+      if (existing.status !== "approved" || existing.role !== "admin") {
+        throw new ProfileStoreError("관리자 계정이 비활성화되었거나 권한이 없습니다.", "ADMIN_PROFILE_DISABLED", 403);
+      }
+      return existing;
+    }
+    const { url, credential } = this.getServerAccess();
+    const requestAdmin = async (path: string, init: RequestInit = {}): Promise<unknown> => {
+      let response: Response;
+      try {
+        response = await this.fetchFn(`${url}/auth/v1/admin/users${path}`, {
+          ...init, cache: "no-store", headers: { ...supabaseAdminHeaders(credential), "content-type": "application/json" },
+        });
+      } catch { throw new ProfileStoreError("관리자 계정을 준비할 수 없습니다.", "ADMIN_BOOTSTRAP_UNAVAILABLE", 503); }
+      if (!response.ok) throw new ProfileStoreError("관리자 계정을 준비할 수 없습니다.", "ADMIN_BOOTSTRAP_UNAVAILABLE", 503);
+      return response.json();
+    };
+    let userId: string | undefined;
+    let reachedEnd = false;
+    for (let page = 1; page <= 10; page += 1) {
+      const result = await requestAdmin(`?page=${page}&per_page=1000`);
+      if (!isRecord(result) || !Array.isArray(result.users)) throw new ProfileStoreError("관리자 계정 응답이 올바르지 않습니다.", "ADMIN_BOOTSTRAP_UNAVAILABLE", 503);
+      const match = result.users.find((user: unknown) => isRecord(user) && typeof user.email === "string" && user.email.toLowerCase() === email);
+      if (isRecord(match) && typeof match.id === "string" && UUID.test(match.id)) { userId = match.id; break; }
+      if (result.users.length < 1000) { reachedEnd = true; break; }
+    }
+    if (!userId && !reachedEnd) throw new ProfileStoreError("관리자 계정을 먼저 등록해 주세요.", "ADMIN_BOOTSTRAP_UNAVAILABLE", 503);
+    if (!userId) {
+      // Admin createUser does not send confirmation mail. No reusable password is stored here.
+      const result = await requestAdmin("", { method: "POST", body: JSON.stringify({ email, email_confirm: true }) });
+      if (!isRecord(result) || typeof result.id !== "string" || !UUID.test(result.id)) throw new ProfileStoreError("관리자 계정 응답이 올바르지 않습니다.", "ADMIN_BOOTSTRAP_UNAVAILABLE", 503);
+      userId = result.id;
+    }
+    const profile = await this.upsertOnLogin({
+      user: { id: userId, email, emailConfirmed: true, displayName: input.hostId },
+      bootstrap: true, legacyHostId: input.hostId,
+    });
+    if (profile.hostId !== input.hostId || profile.role !== "admin" || profile.status !== "approved") {
+      throw new ProfileStoreError("관리자 계정 연결을 확인해 주세요.", "ADMIN_BOOTSTRAP_CONFLICT", 409);
+    }
+    return profile;
+  }
+
   async issueDesktopCode(input: { profileId: string; state: string; expiresAt: Date }): Promise<string> {
     if (!STATE_PATTERN.test(input.state)) throw new ProfileStoreError("로그인 상태 값이 올바르지 않습니다.", "DESKTOP_STATE_INVALID", 400);
     const code = randomBytes(32).toString("hex");

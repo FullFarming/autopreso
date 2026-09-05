@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { LiveMediaPipeline } from "../src/live-media-pipeline.js";
+import { LiveMediaPipeline } from "./helpers/gemini-pipeline.js";
 
 const ENGLISH_UTTERANCE = Object.freeze({
   speakerLabel: "1",

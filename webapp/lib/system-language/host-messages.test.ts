@@ -104,7 +104,10 @@ test("host localization never becomes a dependency of connection or scheduled wo
   assert.match(source, /captions=\{hostCaptions\}/u);
   const domainFunction = source.slice(source.indexOf("function buildLiveSessionDomainText"), source.indexOf("const OUTPUT_OPTIONS"));
   assert.doesNotMatch(domainFunction, /\bt\(/u);
-  assert.match(source, /REQUIRED_SESSION_LANGUAGES = \["en", "ko"\]/u);
+  // 2026-09-05 fix: Output languages are the host's explicit selection, independent of UI locale.
+  assert.match(source, /const languages = selectedLanguages;/u);
+  assert.match(source, /<LanguagePicker[^>]*value=\{languages\}[^>]*onChange=\{setLanguages\}[^>]*minSelection=\{1\} maxSelection=\{3\}/u);
+  assert.doesNotMatch(source, /REQUIRED_SESSION_LANGUAGES/u);
 });
 
 test("every explicit host translation key exists without translating user and AI content", () => {

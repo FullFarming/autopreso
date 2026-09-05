@@ -1,5 +1,11 @@
 import { z } from "zod";
 import { recordingGapSchema } from "../live-recap/contract";
+import { normalizeSpeakerProfile } from "../../../packages/caption-core/speaker-profile.js";
+
+export const speakerProfileSnapshotSchema = z.unknown().transform((value, context) => {
+  try { return normalizeSpeakerProfile(value); }
+  catch { context.addIssue({ code: "custom", message: "발언자 정보가 올바르지 않습니다." }); return z.NEVER; }
+});
 
 const language = z.string().regex(/^[a-z]{2,3}(?:-[A-Za-z]{4})?$/u).max(16);
 const instant = z.iso.datetime({ offset: true });
@@ -17,6 +23,8 @@ export const languageObservationSchema = z.object({
     : value.languageCode === "und"), "관측 언어 분류가 올바르지 않습니다.");
 
 export const sourceEventSchema = z.object({
+  speakerProfile: speakerProfileSnapshotSchema.optional(),
+  speakerAttribution: z.literal("unresolved").optional(),
   type: z.literal("source"), sessionId: z.uuid(), sourceUtteranceId: z.uuid(), sourceSeq: sequence,
   utteranceKey: z.string().min(1).max(200).regex(/^[^<>\p{Cc}\p{Cf}]+$/u), text: z.string().min(1).max(16_000),
   sourceLanguage: language,
@@ -42,6 +50,8 @@ export type SourceEvent = z.infer<typeof sourceEventSchema>;
 export type SourceSnapshot = z.infer<typeof sourceSnapshotSchema>;
 
 export const sourceDraftEventSchema = z.object({
+  speakerProfile: speakerProfileSnapshotSchema.optional(),
+  speakerAttribution: z.literal("unresolved").optional(),
   type: z.literal("source-draft"), sessionId: z.uuid(), generation: z.uuid(), revision: sequence,
   text: z.string().min(1).max(16_000), sourceLanguage: language, languageObservation: languageObservationSchema,
   speaker: z.object({ role: z.enum(["host", "participant", "unknown"]), label: z.string().min(1).max(80) }).strict(),

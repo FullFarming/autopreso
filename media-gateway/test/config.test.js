@@ -58,7 +58,7 @@ test("gateway reads an optional trimmed Soniox key and never requires it at star
   assert.equal(readGatewayEnvironment(gatewayEnvironment()).sonioxApiKey, "");
   assert.equal(readGatewayEnvironment({ ...gatewayEnvironment(), SONIOX_API_KEY: "   " }).sonioxApiKey, "");
   assert.equal(readGatewayEnvironment({ ...gatewayEnvironment(), SONIOX_API_KEY: "  fixture-soniox-key  " }).sonioxApiKey, "fixture-soniox-key");
-  assert.throws(() => readGatewayEnvironment({ ...gatewayEnvironment(), GEMINI_API_KEY: "" }), /GEMINI_API_KEY/u);
+  assert.equal(readGatewayEnvironment({ ...gatewayEnvironment(), GEMINI_API_KEY: "", SONIOX_API_KEY: "fixture" }).geminiApiKey, "");
 });
 
 test("live settings normalize every legacy audio output mode to captions-only", () => {
@@ -94,7 +94,7 @@ test("live settings accept one to three unique languages", () => {
   assert.equal(captionConfig.voiceProvider, null);
   assert.match(captionConfigFingerprint, /^gemini-caption-v5-[a-f0-9]{16}$/u);
   assert.deepEqual(captionConfig.engine, DEFAULT_ENGINE_SELECTION);
-  assert.deepEqual(captionConfig.models, { transcription: "gemini-3.5-transcribe-live", polish: "gemini-3.7-flash", summary: "gemini-3.6-flash" });
+  assert.deepEqual(captionConfig.models, { transcription: "stt-rt-v5", polish: "gemini-3.7-flash", summary: "gemini-3.6-flash" });
   assert.equal("live" in captionConfig.models, false, "the direct Live Translate role is retired");
   assert.equal(captionConfig.polishPolicy.mode, "selective");
   const legacyTownhall = validateLiveSettings({ mode: "townhall", languages: ["ko"], voiceOutputMode: "auto_voice" });

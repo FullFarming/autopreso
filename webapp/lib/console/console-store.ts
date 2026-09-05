@@ -3,7 +3,7 @@ import { getSupabaseServerAccess, supabaseAdminHeaders } from "../security/supab
 import { EngineSelectionError, normalizeEngineSelection } from "../../../packages/caption-core/caption-engine-catalog.js";
 import type { EngineSelection } from "./engine-defaults";
 
-export interface ConsoleProfileRow extends ProfileRecord { createdAt: string; lastLoginAt: string | null; approvedAt: string | null }
+export interface ConsoleProfileRow extends ProfileRecord { createdAt: string; lastLoginAt: string | null; approvedAt: string | null; voiceProvider?: "soniox" | "gemini"; voiceProviderRevision?: string }
 export type ConsoleSummaryStatus = "failed" | "succeeded" | "running" | null;
 export interface ConsoleSessionRow {
   id: string; title: string | null; hostId: string; hostEmail: string | null; mode: string; status: string; languages: string[];
@@ -66,6 +66,7 @@ function mapProfileRow(row: unknown): ConsoleProfileRow {
   }
   return {
     id: row.id, email: row.email, displayName: optionalString(row.display_name), status: row.status as ProfileStatus, role: row.role as ProfileRole,
+    voiceProvider: row.voice_provider === "gemini" ? "gemini" : "soniox", voiceProviderRevision: String(row.voice_provider_revision ?? 1),
     hostId: row.host_id, createdAt: row.created_at, lastLoginAt: optionalString(row.last_login_at), approvedAt: optionalString(row.approved_at),
   };
 }
@@ -156,9 +157,28 @@ export class SupabaseConsoleStore {
   }
 
   async listProfiles(input: { status?: ProfileStatus; limit?: number; before?: string } = {}): Promise<ConsoleProfileRow[]> {
-    const rows = await this.rpc("list_profiles_admin_v1", { p_status: input.status ?? null, p_limit: input.limit ?? 50, p_before: input.before ?? null });
+    const rows = await this.rpc("list_profiles_admin_v2", { p_status: input.status ?? null, p_limit: input.limit ?? 50, p_before: input.before ?? null });
     if (!Array.isArray(rows)) throw rowInvalid();
     return rows.map(mapProfileRow);
+  }
+
+  async readHostVoiceAssignment(hostId: string): Promise<{ provider: "soniox" | "gemini"; revision: string }> {
+    return this.readVoiceAssignment(await this.rpc("read_host_voice_assignment_v1", { p_host_id: hostId }));
+  }
+
+  async setProfileVoiceProvider(input: { actorId: string; profileId: string; provider: "soniox" | "gemini" }): Promise<{ provider: "soniox" | "gemini"; revision: string }> {
+    return this.readVoiceAssignment(await this.rpc("set_profile_voice_provider_v1", {
+      p_actor_id: input.actorId, p_profile_id: input.profileId, p_provider: input.provider,
+    }));
+  }
+
+  private readVoiceAssignment(rows: unknown): { provider: "soniox" | "gemini"; revision: string } {
+    if (!Array.isArray(rows) || rows.length !== 1 || !isRecord(rows[0])) throw rowInvalid();
+    const { provider, revision } = rows[0];
+    if (provider !== "soniox" && provider !== "gemini") throw rowInvalid();
+    const parsedRevision = String(revision);
+    if (!/^[1-9][0-9]{0,18}$/u.test(parsedRevision)) throw rowInvalid();
+    return { provider, revision: parsedRevision };
   }
 
   async countPending(): Promise<number> {

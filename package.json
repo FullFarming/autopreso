@@ -1,7 +1,7 @@
 {
-  "name": "realtime-noel",
+  "name": "nova",
   "version": "0.2.3",
-  "description": "Realtime bilingual subtitles and visual note taking.",
+  "description": "NOVA live translation captions.",
   "license": "MIT",
   "author": "Kun Chen <kun@kunchenguid.com>",
   "homepage": "https://github.com/kyeongmankim/realtime-noel#readme",
@@ -18,7 +18,7 @@
   "type": "module",
   "main": "electron/main.js",
   "bin": {
-    "realtime-noel": "src/cli.js"
+    "nova": "src/nova-cli.js"
   },
   "files": [
     "assets/",
@@ -30,15 +30,13 @@
     "src/"
   ],
   "scripts": {
-    "build:moonshine-sidecars": "node ./scripts/build-moonshine-sidecars.js",
     "desktop": "node ./scripts/start-desktop.js",
-    "dev": "node ./src/cli.js",
+    "dev": "node ./src/nova-cli.js",
     "dist:mac": "electron-builder --mac dmg --arm64 --publish never",
     "dist:mac:x64": "electron-builder --mac dmg --x64 --publish never",
     "dist:win": "electron-builder --win portable --x64 --publish never",
-    "prepare:release-packages": "node ./scripts/prepare-release-packages.js",
     "spike:engine": "node ./scripts/engine-spike.mjs",
-    "start": "node ./src/cli.js",
+    "start": "node ./src/nova-cli.js",
     "cloud-run:configure-scale-zero": "bash ./scripts/configure-cloud-run-scale-zero.sh",
     "cloud-run:verify-scale-zero": "node ./scripts/verify-cloud-run-scale-zero.mjs",
     "test": "node --test \"test/**/*.test.js\" \"packages/gemini-server/*.test.js\"",
@@ -61,15 +59,9 @@
       "assets/**",
       "electron/**",
       "packages/caption-core/**",
-      "packages/moonshine-darwin-arm64/**",
-      "packages/moonshine-darwin-x64/package.json",
-      "packages/moonshine-darwin-x64/LICENSE",
       "public/**",
       "src/**",
       "package.json"
-    ],
-    "asarUnpack": [
-      "packages/moonshine-darwin-*/bin/**"
     ],
     "mac": {
       "category": "public.app-category.productivity",
@@ -115,10 +107,6 @@
     "open": "^11.0.0",
     "ws": "^8.20.0",
     "zod": "^4.4.3"
-  },
-  "optionalDependencies": {
-    "@realtime-noel/moonshine-darwin-arm64": "0.1.1",
-    "@realtime-noel/moonshine-darwin-x64": "0.1.1"
   },
   "devDependencies": {
     "@types/express": "^5.0.6",

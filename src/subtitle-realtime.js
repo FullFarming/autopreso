@@ -2,6 +2,7 @@
 import { HttpsProxyAgent } from "https-proxy-agent";
 import { WebSocket } from "ws";
 
+import { createManagedCaptionSocket } from "./caption-engine/managed-caption-socket.js";
 import { createSttTransport } from "./caption-engine/create-stt-transport.js";
 import { DEFAULT_SUBTITLE_SETTINGS } from "./settings-store.js";
 import {
@@ -16,6 +17,7 @@ import {
   createCrossChannelEchoDeduper,
   createGeminiCaptionConfig,
   createSourceLanguageConsensus,
+  resolveSourceLanguageObservation,
   detectSourceLanguage as detectCaptionSourceLanguage,
   isEllipsisPlaceholder,
   isOutputInTargetLanguage,
@@ -40,17 +42,16 @@ const TRANSCRIBE_ROLLOVER_MS = 570_000;
 const TRANSCRIBE_FINAL_DRAIN_MS = 750;
 const RECONNECT_BASE_MS = 500;
 const RECONNECT_MAX_MS = 5_000;
-const MAX_AUTO_RECONNECTS = 10;
 const MAX_TRANSCRIPT_CHARACTERS = 16_384;
 const KEEPALIVE_INTERVAL_MS = 4_000;
 const KEEPALIVE_IDLE_MS = 8_000;
 // Provider rejections that a retry cannot fix: reconnecting would only burn the
 // ladder and hide the real cause from the user.
-const NON_RETRYABLE_TRANSPORT_ERRORS = new Set(["SONIOX_UNAUTHENTICATED", "SONIOX_INVALID_REQUEST"]);
+const NON_RETRYABLE_TRANSPORT_ERRORS = new Set(["SONIOX_UNAUTHENTICATED", "SONIOX_INVALID_REQUEST", "GEMINI_TRANSCRIBE_UNAUTHENTICATED", "GEMINI_TRANSCRIBE_INVALID_REQUEST"]);
 
 function redactTransportDiagnostic(value) {
   return String(value ?? "")
-    .replace(/([?&](?:key|api_key|token)=)[^&\s]+/giu, "$1[redacted-secret]")
+    .replace(/([?&](?:key|api_key|access_token|token)=)[^&\s]+/giu, "$1[redacted-secret]")
     .replace(/(?:AIza|sk-)[A-Za-z0-9_-]+/gu, "[redacted-secret]")
     .replace(/[A-Za-z0-9+/]{64,}={0,2}/gu, "[redacted-data]")
     .replace(/[\u0000-\u001f\u007f]/gu, " ")
@@ -178,14 +179,17 @@ export function createSubtitleRealtimeManager(options = {}) {
     if (missingKey) throw new Error(`${missingKey} API key is required for the selected caption engine.`);
   }
 
-  /** @param {{sessionId?: string, settings?: Record<string, unknown>}} [input] */
-  async function start({ sessionId, settings = {} } = {}) {
+  /** @param {{sessionId?: string, settings?: Record<string, unknown>, managedSession?: Record<string, unknown>}} [input] */
+  async function start({ sessionId, settings = {}, managedSession = null } = {}) {
     if (typeof sessionId !== "string" || !sessionId) throw new Error("subtitle:start requires a sessionId.");
     await stop();
     const saved = settingsStore ? await settingsStore.load() : {};
     const normalizedSettings = normalizeSubtitleSettings({ ...(saved.subtitle ?? {}), ...(settings ?? {}) });
-    const apiKeys = readApiKeys(saved);
+    const apiKeys = managedSession ? { soniox: "managed", gemini: "managed" } : readApiKeys(saved);
+    if (managedSession && (typeof options.createCaptionCredential !== "function" || typeof options.translateCaption !== "function" || typeof options.renewCaptionSession !== "function" || typeof options.stopCaptionSession !== "function")) throw new Error("MANAGED_CAPTION_UNAVAILABLE");
     assertEngineApiKeys(normalizedSettings.engine, apiKeys);
+    state.managedSession = managedSession;
+    state.managedRenewal = null;
     state.sessionId = sessionId;
     state.settings = normalizedSettings;
     state.captionConfig = createGeminiCaptionConfig(normalizedSettings);
@@ -200,31 +204,68 @@ export function createSubtitleRealtimeManager(options = {}) {
     broadcast?.({ type: "subtitle:status", status: "listening" });
   }
 
+  async function currentManagedSession(ownerSessionId, ownerManagedSession) {
+    if (!state.active || state.sessionId !== ownerSessionId || state.managedSession?.sessionId !== ownerManagedSession.sessionId) throw new Error("CAPTION_SESSION_STOPPED");
+    const expiresAt = typeof state.managedSession.expiresAt === "number" ? state.managedSession.expiresAt : Date.parse(state.managedSession.expiresAt);
+    if (!Number.isFinite(expiresAt)) throw new Error("CAPTION_SESSION_EXPIRY_INVALID");
+    if (expiresAt - readNow() < 15 * 60_000) {
+      if (!state.managedRenewal) {
+        const renewal = options.renewCaptionSession(state.managedSession).then((renewed) => {
+          if (!state.active || state.sessionId !== ownerSessionId || state.managedSession?.sessionId !== ownerManagedSession.sessionId || renewed.sessionId !== ownerManagedSession.sessionId) throw new Error("CAPTION_SESSION_STOPPED");
+          state.managedSession = renewed;
+          return renewed;
+        }).finally(() => { if (state.managedRenewal === renewal) state.managedRenewal = null; });
+        state.managedRenewal = renewal;
+      }
+      await state.managedRenewal;
+    }
+    return state.managedSession;
+  }
+
   function ensureClient(source) {
     const existing = state.clients.get(source);
     if (existing) return existing;
     const ownerSessionId = state.sessionId;
     const ownerGeneration = producerGeneration;
-    const client = createSourceTranscriptionClient({
+    const ownerManagedSession = state.managedSession;
+    const pinnedSettings = state.settings;
+    const targets = languageTargets(state.settings);
+    const splitTargets = state.settings.engine.translation.provider === "soniox" && targets.length === 3
+      ? targets : [null];
+    const children = splitTargets.map((targetLanguage) => createSourceTranscriptionClient({
       source,
       settings: state.settings,
+      targetLanguage,
       captionConfig: state.captionConfig,
-      transport: createTransport({
+      transport: Object.assign(createTransport({
         engine: state.settings.engine,
-        settings: state.settings,
+        settings: { ...state.settings, ...(targetLanguage ? { sonioxTargetLanguage: targetLanguage } : {}) },
         apiKeys: state.apiKeys,
-      }),
-      createWebSocket,
+      }), ownerManagedSession ? { maximumSessionMilliseconds: 600_000, rolloverMilliseconds: 540_000 } : {}),
+      createWebSocket: ownerManagedSession ? (url, protocols, init) => createManagedCaptionSocket({
+        url, protocols, init, provider: pinnedSettings.engine.stt.provider, createWebSocket,
+        getCredential: async () => options.createCaptionCredential(
+          await currentManagedSession(ownerSessionId, ownerManagedSession), pinnedSettings.engine.stt.provider, pinnedSettings,
+        ),
+      }) : createWebSocket,
       broadcast: (message) => broadcastCurrent(message, ownerSessionId, ownerGeneration),
       log,
-      polish,
+      polish: ownerManagedSession ? async (input) => options.translateCaption(
+        await currentManagedSession(ownerSessionId, ownerManagedSession), input,
+      ) : polish,
       polishTimeoutMs,
       setupAckTimeoutMs,
       partialTranslationDebounceMs,
       transcribeRolloverMs,
       transcribeFinalDrainMs,
       reconnectBaseMs,
-    });
+    }));
+    const client = {
+      open: () => children.forEach((child) => child.open()),
+      sendAudio: (audio) => children.forEach((child) => child.sendAudio(audio)),
+      close: (options) => Promise.all(children.map((child) => child.close(options))),
+      waitUntilReady: (timeout) => Promise.all(children.map((child) => child.waitUntilReady(timeout))),
+    };
     state.clients.set(source, client);
     return client;
   }
@@ -237,6 +278,7 @@ export function createSubtitleRealtimeManager(options = {}) {
 
   async function stop(sessionId = state.sessionId) {
     if (sessionId !== state.sessionId && state.sessionId !== null) return false;
+    const managedSession = state.managedSession;
     const wasActive = state.active || state.sessionId !== null || state.clients.size > 0;
     stopWatchdog();
     const clients = [...state.clients.values()];
@@ -244,23 +286,30 @@ export function createSubtitleRealtimeManager(options = {}) {
     state.active = false;
     state.sessionId = null;
     state.captionConfig = null;
+    state.managedSession = null;
     producerGeneration += 1;
     livenessBySource.clear();
     if (wasActive) broadcast?.({ type: "subtitle:status", status: "idle" });
     await Promise.all(clients.map((client) => client.close({ graceful: true })));
+    if (managedSession) await options.stopCaptionSession(managedSession);
     return wasActive;
   }
 
   function close() {
+    const managedSession = state.managedSession;
     stopWatchdog();
     const clients = [...state.clients.values()];
     state.clients.clear();
     state.active = false;
     state.sessionId = null;
     state.captionConfig = null;
+    state.managedSession = null;
     producerGeneration += 1;
     livenessBySource.clear();
     for (const client of clients) void client.close();
+    if (managedSession) void options.stopCaptionSession(managedSession).catch(() => {
+      log.warn?.("[subtitle] 관리형 자막 종료를 서버에 확인하지 못했습니다.");
+    });
   }
 
   // Task 6: open the replacement channels BEFORE tearing down the old ones,
@@ -278,10 +327,9 @@ export function createSubtitleRealtimeManager(options = {}) {
       if (!state.active || state.sessionId !== ownerSessionId) return false;
       const normalizedSettings = normalizeSubtitleSettings({
         ...(state.settings ?? {}),
-        ...(saved.subtitle ?? {}),
         inputMode: state.settings.inputMode,
       });
-      const apiKeys = readApiKeys(saved);
+      const apiKeys = state.managedSession ? { soniox: "managed", gemini: "managed" } : readApiKeys(saved);
       assertEngineApiKeys(normalizedSettings.engine, apiKeys);
       const previousClients = [...state.clients.values()];
       state.clients.clear();
@@ -351,6 +399,7 @@ function createSourceTranscriptionClient({
   source,
   settings,
   captionConfig,
+  targetLanguage: onlyTargetLanguage,
   transport,
   createWebSocket,
   broadcast,
@@ -365,7 +414,7 @@ function createSourceTranscriptionClient({
 }) {
   const providerLabel = transport.providerLabel ?? "Gemini Transcribe";
   const maximumSessionMs = transport.maximumSessionMilliseconds ?? Number.POSITIVE_INFINITY;
-  const lanes = languageTargets(settings).map((targetLanguage) => createTextTranslationLane({
+  const lanes = (onlyTargetLanguage ? [onlyTargetLanguage] : languageTargets(settings)).map((targetLanguage) => createTextTranslationLane({
     source,
     targetLanguage,
     settings,
@@ -375,6 +424,27 @@ function createSourceTranscriptionClient({
     polishTimeoutMs,
     partialTranslationDebounceMs,
   }));
+  let routingLanguage = null;
+  let routingSegmentId = null;
+  function resetRouting() { routingLanguage = null; routingSegmentId = null; }
+  function prepareRoutingEvent(event, isFinal, isTranslation = false) {
+    if (event.segmentId && routingSegmentId && event.segmentId !== routingSegmentId) resetRouting();
+    if (event.segmentId) routingSegmentId = event.segmentId;
+    if (isFinal) return event;
+    const text = isTranslation ? event.sourceText : event.text;
+    const provider = isTranslation ? event.sourceLanguage : event.languageCode;
+    const observation = resolveSourceLanguageObservation(text, provider);
+    if (observation.state === "single") {
+      if (routingLanguage && observation.languageCode !== routingLanguage) return null;
+      routingLanguage = observation.languageCode;
+    } else if (observation.state !== "mixed" || !routingLanguage
+      || !observation.languages.includes(routingLanguage)) return null;
+    const providerLanguage = normalizeProviderLanguageCode(provider);
+    if (providerLanguage && providerLanguage !== routingLanguage) return null;
+    // 2026-09-05 fix: a routing hold is not language evidence. Mixed source text
+    // keeps its observation and cannot become a verbatim source caption.
+    return { ...event, sourceObservation: observation, routingSourceLanguage: routingLanguage };
+  }
   let socket = null;
   let configured = false;
   // Woken by markTransportReady (success) and by the socket "close" handler
@@ -410,6 +480,11 @@ function createSourceTranscriptionClient({
   // and Soniox's EMPTY end-of-audio frame, which the provider only honours as
   // a text frame (an empty binary frame never finishes the stream).
   function sendTransportPayload(openedSocket, payload) {
+    if (payload === null || payload === undefined) return;
+    if (Array.isArray(payload)) {
+      for (const part of payload) sendTransportPayload(openedSocket, part);
+      return;
+    }
     if (transport.binaryAudio && Buffer.isBuffer(payload)) openedSocket.send(payload, { binary: true });
     else openedSocket.send(payload);
   }
@@ -499,15 +574,7 @@ function createSourceTranscriptionClient({
 
   function scheduleReconnect() {
     if (noReconnect || intentionalClose || reconnectTimer) return;
-    if (reconnectAttempts >= MAX_AUTO_RECONNECTS) {
-      broadcast({
-        type: "subtitle:error",
-        message: `${providerLabel} 재연결을 중단했습니다 (${source}). 네트워크와 API 키를 확인한 뒤 자막을 다시 시작하세요.`,
-        code: "TRANSCRIBE_RECONNECT_EXHAUSTED",
-      });
-      return;
-    }
-    const delay = Math.min(reconnectBaseMs * 2 ** reconnectAttempts, RECONNECT_MAX_MS);
+    const delay = reconnectAttempts === 0 ? 0 : Math.min(reconnectBaseMs * 2 ** Math.min(reconnectAttempts, 8), RECONNECT_MAX_MS);
     reconnectAttempts += 1;
     replayOnNextOpen = true;
     reconnectTimer = setTimeout(() => {
@@ -566,21 +633,39 @@ function createSourceTranscriptionClient({
         // for a preview of a line the provider is about to translate itself and
         // paint it as translationProvider "gemini" over the provider's partial.
         onInterim: (event) => {
-          if (transport.providesTranslation === true) return;
+          const routed = prepareRoutingEvent(event, false);
+          if (!routed) { for (const lane of lanes) lane.invalidatePreview(); return; }
+          event = routed;
+          if (transport.providesTranslation === true) {
+            for (const lane of lanes) lane.acceptSource(event, false);
+            return;
+          }
           for (const lane of lanes) lane.preview(event);
         },
-        onFinal: (event) => { for (const lane of lanes) lane.commit(event); },
+        onFinal: (event) => {
+          for (const lane of lanes) lane.commit(prepareRoutingEvent(event, true));
+          if (transport.providesTranslation !== true) resetRouting();
+        },
         // Combined STT+translation providers surface the translation themselves;
         // Gemini Transcribe never fires these two.
         onTranslation: (event) => {
-          for (const lane of lanes) if (lane.targetLanguage === event.targetLanguage) lane.acceptProviderTranslation(event);
+          const routed = prepareRoutingEvent(event, event.isFinal, true);
+          if (!routed) return;
+          for (const lane of lanes) if (lane.targetLanguage === routed.targetLanguage) lane.acceptProviderTranslation(routed);
         },
-        onBoundary: (kind) => { for (const lane of lanes) lane.onProviderBoundary?.(kind); },
+        onBoundary: (kind) => { resetRouting(); for (const lane of lanes) lane.onProviderBoundary?.(kind); },
         onServerGoAway: () => {
           requestGracefulRollover(openedSocket, "provider_go_away");
         },
         onError: (code, detail) => {
           if (NON_RETRYABLE_TRANSPORT_ERRORS.has(code)) noReconnect = true;
+          if (code === "GEMINI_TRANSCRIBE_UNAVAILABLE") openedSocket.close();
+          if (noReconnect) openedSocket.close();
+          if (code === "SONIOX_MAX_DURATION" || code === "SONIOX_KEY_EXPIRED") {
+            replayOnNextOpen = true;
+            reconnectAttempts = 0;
+            openedSocket.close();
+          }
           broadcast({
             type: "subtitle:error",
             code,
@@ -615,6 +700,7 @@ function createSourceTranscriptionClient({
     });
     openedSocket.on("close", (code, reason) => {
       if (socket !== openedSocket) return;
+      resetRouting();
       const didGracefulRollover = rolloverSocket === openedSocket;
       socket = null;
       configured = false;
@@ -672,6 +758,12 @@ function createSourceTranscriptionClient({
       });
     },
     sendAudio(audio) {
+      if (intentionalClose || noReconnect) return;
+      if (reconnectTimer) {
+        const enqueuedAt = Date.now();
+        pendingAudio = [...pendingAudio, { audio, enqueuedAt }].filter((pending) => enqueuedAt - pending.enqueuedAt <= MAX_PENDING_AUDIO_AGE_MS).slice(-MAX_PENDING_AUDIO_CHUNKS);
+        return;
+      }
       // Audio arrives from an async WebSocket listener with no outer catch, so a
       // transport that refuses to start must not throw out of here either.
       let connection;
@@ -755,6 +847,7 @@ function createTextTranslationLane({
   let closed = false;
 
   function resolveSourceLanguage(event) {
+    if (event.sourceObservation) return event.sourceObservation.state === "single" ? event.sourceObservation.languageCode : "unknown";
     const detected = detectSourceLanguage(event.text, { minimumSignalChars: 1 });
     if (detected !== "unknown") return detected;
     return normalizeProviderLanguageCode(event.languageCode) || "unknown";
@@ -776,10 +869,26 @@ function createTextTranslationLane({
     return translationRoleForSource(sourceLanguage, targetLanguage, settings);
   }
 
+  function acceptSource(event, isFinal) {
+    if (closed) return false;
+    const text = boundTranscript(event.text).trim();
+    const sourceLanguage = resolveSourceLanguage(event);
+    if (!text || sourceLanguage !== targetLanguage) return false;
+    broadcast({
+      type: isFinal ? "subtitle:committed" : "subtitle:partial",
+      source, targetLanguage, sourceLanguage, translationRole: 1,
+      translationProvider: settings.engine.stt.provider,
+      sourceText: text, translatedText: text, isAuthoritative: isFinal,
+      segmentId: event.segmentId, isSourceCaption: true,
+    });
+    return true;
+  }
+
   async function translatePreview(event, revision) {
+    if (acceptSource(event, false)) return;
     const sourceText = boundTranscript(event.text).trim();
     const sourceLanguage = resolveSourceLanguage(event);
-    const translationRole = resolveTranslationRole(sourceText, sourceLanguage);
+    const translationRole = resolveTranslationRole(sourceText, event.routingSourceLanguage || sourceLanguage);
     if (!translationRole || closed) return;
     const translated = String(await withTimeout(() => polish({
       translatedText: "…",
@@ -842,10 +951,10 @@ function createTextTranslationLane({
   async function commitNow(event) {
     // Soniox already committed this segment's translation through
     // acceptProviderTranslation; re-translating it would double-bill and race.
-    if (event.providerTranslated) return;
+    if (acceptSource(event, true) || event.providerTranslated) return;
     const sourceText = boundTranscript(event.text).trim();
     const sourceLanguage = resolveSourceLanguage(event);
-    const translationRole = resolveTranslationRole(sourceText, sourceLanguage);
+    const translationRole = resolveTranslationRole(sourceText, event.routingSourceLanguage || sourceLanguage);
     if (!translationRole || closed) {
       if (sourceLanguage === targetLanguage) {
         broadcast({ type: "subtitle:clear", source, targetLanguage, reason: "same_language_source", translationProvider: "gemini" });
@@ -911,12 +1020,12 @@ function createTextTranslationLane({
   function acceptProviderTranslationNow(event) {
     if (closed) return;
     const sourceText = boundTranscript(event.sourceText ?? "").trim();
-    const sourceLanguage = normalizeProviderLanguageCode(event.sourceLanguage)
-      || resolveSourceLanguage({ text: sourceText, languageCode: event.sourceLanguage });
+    const sourceLanguage = resolveSourceLanguage({ text: sourceText, languageCode: event.sourceLanguage, sourceObservation: event.sourceObservation });
     // resolveTranslationRole comes first so the mixed-Korean exception (Korean
     // speech that still needs its Korean rendition) keeps its role instead of
     // being cleared away as same-language.
-    const translationRole = resolveTranslationRole(sourceText || event.text, sourceLanguage);
+    const translationRole = resolveTranslationRole(sourceText || event.text, event.routingSourceLanguage || sourceLanguage);
+    if (sourceLanguage === targetLanguage) return;
     if (!translationRole) {
       // Finals only, exactly like commitNow: the speaker has moved to this
       // lane's own language, so drop the stale rendition. A partial in that
@@ -987,6 +1096,7 @@ function createTextTranslationLane({
 
   return {
     preview,
+    acceptSource,
     commit,
     invalidatePreview,
     close,
@@ -1105,7 +1215,7 @@ export function normalizeSubtitleSettings(settings = {}) {
     translationFontSize,
     sourceFontSize: clampNumber(merged.sourceFontSize, 14, 96, Math.max(14, translationFontSize - 2)),
     maxWidth: clampNumber(merged.maxWidth, 320, 3000, DEFAULT_SUBTITLE_SETTINGS.maxWidth),
-    opacity: clampNumber(merged.opacity, 0.2, 1, DEFAULT_SUBTITLE_SETTINGS.opacity),
+    opacity: clampNumber(merged.opacity, 0, 1, DEFAULT_SUBTITLE_SETTINGS.opacity),
     maxSubtitleLines: Math.round(clampNumber(merged.maxSubtitleLines, 1, 8, DEFAULT_SUBTITLE_SETTINGS.maxSubtitleLines)),
     recordProvider: ["none", "ollama"].includes(merged.recordProvider) ? merged.recordProvider : DEFAULT_SUBTITLE_SETTINGS.recordProvider,
     tone: ["natural", "business"].includes(merged.tone) ? merged.tone : DEFAULT_SUBTITLE_SETTINGS.tone,

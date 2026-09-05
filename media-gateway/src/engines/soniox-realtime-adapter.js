@@ -26,6 +26,7 @@ import {
   createSonioxFinalizeScheduler,
   createSonioxTokenReducer,
   hasSonioxContentTokens,
+  sonioxLanguageCode,
 } from "../../../packages/caption-core/soniox-protocol.js";
 import { selectGeminiTranscriptionVocabularyFromLegacyText } from "../../../packages/caption-core/index.js";
 
@@ -95,6 +96,7 @@ export class SonioxRealtimeAdapter {
     languageMode = "auto",
     translation = false,
     translationLanguages = [],
+    targetLanguage,
     glossaryText = "",
     domainText = "",
     endpoint = "us",
@@ -122,6 +124,7 @@ export class SonioxRealtimeAdapter {
       apiKey,
       languageMode,
       languages,
+      targetLanguage,
       translation: translation === true,
       context: { terms: contextTerms, translationTerms, domain: domainText ?? "" },
       clientReferenceId: `nova-gateway-${now().toString(36)}`,
@@ -130,7 +133,7 @@ export class SonioxRealtimeAdapter {
     this.provider = "soniox";
     this.languageMode = languageMode;
     this.translation = translation === true;
-    this.translationLanguages = [...languages];
+    this.translationLanguages = targetLanguage ? [targetLanguage] : [...languages];
     this.endpoint = SONIOX_ENDPOINTS[endpoint] ?? SONIOX_ENDPOINTS.us;
     this.createWebSocket = createWebSocket;
     this.now = now;
@@ -149,7 +152,7 @@ export class SonioxRealtimeAdapter {
    * @param {{onFinalUtterance: Function, onPartialTranscript?: Function|null,
    *   onPartialTranslation?: Function|null, onContinuityDiscard?: Function, signal?: AbortSignal}} input
    */
-  async open({ onFinalUtterance, onPartialTranscript = null, onPartialTranslation = null, onContinuityDiscard = () => {}, signal } = {}) {
+  async open({ onFinalUtterance, onPartialTranscript = null, onPartialTranslation = null, onContinuityDiscard = () => {}, onReconnectRequired = () => {}, signal } = {}) {
     if (signal?.aborted) throw new Error("STT_CONNECT_ABORTED");
     if (typeof onFinalUtterance !== "function"
       || (onPartialTranscript !== null && typeof onPartialTranscript !== "function")
@@ -221,6 +224,7 @@ export class SonioxRealtimeAdapter {
       translations = {};
       rejectConnect(error);
       closeSocket();
+      if (!isClosing && ["SONIOX_MAX_DURATION", "SONIOX_UNAVAILABLE", "STT_PROVIDER_CLOSED", "STT_PROVIDER_FAILED"].includes(error.message)) onReconnectRequired(error);
     };
 
     const emitPartial = (callback, payload) => {
@@ -237,15 +241,17 @@ export class SonioxRealtimeAdapter {
       } catch { fail(new Error("STT_PARTIAL_CALLBACK_FAILED")); }
     };
 
+    const targetLanguages = this.translationLanguages;
+    const resolveTranslationLanguage = language => targetLanguages.find(target => sonioxLanguageCode(target) === language) ?? language;
     const reducer = createSonioxTokenReducer({
-      onSourcePartial: (event) => emitPartial(onPartialTranscript, { text: event.text, sourceLanguage: event.language ?? undefined }),
+      onSourcePartial: (event) => emitPartial(onPartialTranscript, { text: event.text, sourceLanguage: event.language ?? undefined, segmentId: event.segmentId }),
       // Buffered until the boundary so one segment yields one utterance that
       // already carries its translation lanes.
       onSourceFinal: (event) => { segment = { ...event }; },
       onTranslationPartial: (event) => emitPartial(onPartialTranslation, {
-        language: event.language, text: event.text, sourceLanguage: event.sourceLanguage ?? undefined, segmentId: event.segmentId,
+        language: resolveTranslationLanguage(event.language), text: event.text, sourceLanguage: event.sourceLanguage ?? undefined, segmentId: event.segmentId,
       }),
-      onTranslationFinal: (event) => { translations[event.language] = { text: event.text, sourceLanguage: event.sourceLanguage ?? undefined }; },
+      onTranslationFinal: (event) => { translations[resolveTranslationLanguage(event.language)] = { text: event.text, sourceLanguage: event.sourceLanguage ?? undefined }; },
       onBoundary: () => {
         scheduler.noteBoundary();
         const closed = segment;
@@ -263,6 +269,7 @@ export class SonioxRealtimeAdapter {
           text: closed.text,
           rawText: closed.text,
           sourceLanguage: closed.language ?? undefined,
+          segmentId: closed.segmentId,
           sourceStartOffsetMs,
           sourceEndOffsetMs,
           sourceEndedAt: new Date(now()).toISOString(),

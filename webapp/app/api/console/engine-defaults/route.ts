@@ -3,7 +3,6 @@ import { z } from "zod";
 
 import { requireAdmin } from "@/lib/auth/require-admin";
 import { consoleEngineCatalog, consoleFailure, invalidConsoleRequest, normalizeSubmittedEngine } from "@/lib/console/console-route";
-import { deployEngineToActiveSessions, readDeployGatewayUrl } from "@/lib/console/engine-deploy";
 import { getConsoleStore } from "@/lib/console/console-store";
 import { consoleSettingsCache, readStoredEngineDefaults } from "@/lib/console/engine-defaults";
 import { apiError, apiSuccess } from "@/lib/security/api-response";
@@ -31,14 +30,7 @@ export async function GET(request: NextRequest) {
   }
 }
 
-/**
- * `PUT /api/console/engine-defaults { engine }` → `{ engine, results, summary }` (spec §9 "배포").
- * Stores the normalized global default, invalidates the settings memo so new sessions see it,
- * then switches every `preparing`/`live` session (admin RPC + gateway push; one `results`
- * row per session, `summary` = counts of switched/queued/failed) and writes one audit row
- * with those counters. A downed gateway or a dead session never fails the request: it is
- * reported per row. Only the store writes (defaults, audit) can turn the response into an error.
- */
+/** Saves catalog settings without changing any running session. User assignment is managed separately. */
 export async function PUT(request: NextRequest) {
   try {
     assertStrictOrigin(request);
@@ -52,11 +44,7 @@ export async function PUT(request: NextRequest) {
     const store = getConsoleStore();
     await store.setEngineDefaults({ actorId: profile.id, engine });
     consoleSettingsCache.invalidate();
-    const { results, summary } = await deployEngineToActiveSessions({
-      store, actorId: profile.id, actorHostId: profile.hostId, engine, gatewayUrl: readDeployGatewayUrl(),
-    });
-    await store.recordEngineDeploy({ actorId: profile.id, engine, summary });
-    return apiSuccess({ engine, results, summary }, { headers: privateNoStoreHeaders() });
+    return apiSuccess({ engine, appliesFrom: "next-session", results: [], summary: { switched: 0, queued: 0, failed: 0 } }, { headers: privateNoStoreHeaders() });
   } catch (error: unknown) {
     return consoleFailure(error, "엔진 기본값을 저장할 수 없습니다.", "CONSOLE_ENGINE_WRITE_FAILED");
   }

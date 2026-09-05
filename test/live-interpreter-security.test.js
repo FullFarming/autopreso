@@ -127,7 +127,7 @@ function readyTranscription() {
   return { ready: async () => {}, sendAudio() {}, stop() {}, close() {} };
 }
 
-test("Live Interpreter assets receive local-only CSP and no-store without changing unrelated assets", async () => {
+test("NOVA does not expose retired Live Interpreter assets", async () => {
   const { httpServer, url } = await startServer({
     host: "127.0.0.1", port: 0, moonshineModel: "medium", openaiApiKey: "test",
     createTranscription: readyTranscription,
@@ -135,12 +135,10 @@ test("Live Interpreter assets receive local-only CSP and no-store without changi
   try {
     for (const asset of ["live-interpreter.html", "live-interpreter.js", "live-interpreter-audio.js", "live-interpreter.css"]) {
       const response = await fetch(`${url}/${asset}`);
-      assert.equal(response.status, 200, asset);
-      assert.match(response.headers.get("cache-control") ?? "", /no-store/u, asset);
-      if (asset.endsWith(".html")) assert.equal(response.headers.get("content-security-policy"), EXPECTED_CSP);
+      assert.equal(response.status, 404, asset);
     }
     const unrelated = await fetch(`${url}/app.js`);
-    assert.equal(unrelated.headers.get("content-security-policy"), null);
+    assert.equal(unrelated.status, 404);
   } finally {
     await new Promise((resolve) => httpServer.close(resolve));
   }

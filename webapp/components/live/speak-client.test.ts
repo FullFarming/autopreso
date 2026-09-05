@@ -682,8 +682,9 @@ test("post-session errors map stable codes to Korean copy without exposing provi
       "raw API errors must never reach the post-session UI");
     assert.doesNotMatch(source, /Unable to (?:load|retry) the (?:AI summary|transcript)/u);
   }
-  assert.match(viewer, /getSafeSummaryErrorMessage\([\s\S]{0,160}summaryResult\.error\.code/u);
-  assert.match(viewer, /getSafeTranscriptErrorMessage\([\s\S]{0,160}transcriptResult\.error\.code/u);
+  assert.match(viewer, /const code = result\.error instanceof ApiRequestError \? result\.error\.code : undefined/u);
+  assert.match(viewer, /getSafeSummaryErrorMessage\(code\)/u);
+  assert.match(viewer, /getSafeTranscriptErrorMessage\(result\.error instanceof ApiRequestError \? result\.error\.code : undefined\)/u);
 
   const userFacingErrorAssignments = [hostLifecycle, viewer]
     .flatMap((source) => [...source.matchAll(/set(?:Summary|Transcript)Error\(([^\n;]+)\)/gu)])
@@ -705,4 +706,22 @@ test("host dashboard presents setup, invite, live, and ended as exclusive surfac
   }
   assert.doesNotMatch(host, /\{isConfiguring &&/u,
     "configuration must not bypass the mutually exclusive surface resolver");
+});
+
+test("authoritative pending stays pollable beyond six rounds while hidden pages pause and repeated read errors stop", async () => {
+  const timers: Array<() => void> = [];
+  let reads = 0; let exhausted = 0; let hidden = false; let pending = true;
+  const stop = startSummaryPollLoop({
+    poll: async () => { reads += 1; return pending ? "pending" : true; },
+    onExhausted: () => { exhausted += 1; }, onError: () => assert.fail("unexpected error"),
+    isHidden: () => hidden, random: () => 1,
+    timerApi: { setTimeout: (callback, delay) => { assert.ok(delay <= 25_000); timers.push(callback); return timers.length; }, clearTimeout: () => {} },
+  });
+  const tick = async () => { const callback = timers.shift(); assert.ok(callback); callback(); await Promise.resolve(); await Promise.resolve(); };
+  for (let round = 0; round < 16; round += 1) await tick();
+  assert.equal(reads, 16); assert.equal(exhausted, 0);
+  hidden = true; await tick(); assert.equal(reads, 16);
+  hidden = false; pending = false;
+  for (let round = 0; round < 6; round += 1) await tick();
+  assert.equal(exhausted, 1); assert.equal(timers.length, 0); stop();
 });

@@ -1,156 +1,49 @@
-<h1 align="center">Realtime Noel</h1>
+# NOVA
 
-<p align="center">
-  <a href="https://github.com/kyeongmankim/realtime-noel/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/kyeongmankim/realtime-noel/ci.yml?style=flat-square&label=ci" /></a>
-  <a href="https://github.com/kyeongmankim/realtime-noel/actions/workflows/release-please.yml"><img alt="Release" src="https://img.shields.io/github/actions/workflow/status/kyeongmankim/realtime-noel/release-please.yml?style=flat-square&label=release" /></a>
-  <a href="https://www.npmjs.com/package/realtime-noel"><img alt="npm" src="https://img.shields.io/npm/v/realtime-noel?style=flat-square" /></a>
-  <a href="https://img.shields.io/badge/platform-macOS-blue?style=flat-square"><img alt="Platform" src="https://img.shields.io/badge/platform-macOS-blue?style=flat-square" /></a>
-  <a href="https://x.com/kunchenguid"><img alt="X" src="https://img.shields.io/badge/X-@kunchenguid-black?style=flat-square" /></a>
-  <a href="https://discord.gg/Wsy2NpnZDu"><img alt="Discord" src="https://img.shields.io/discord/1439901831038763092?style=flat-square&label=discord" /></a>
-</p>
+실시간 자막과 Live Call을 위한 데스크톱·웹 프로젝트입니다. 아직 alpha 단계입니다.
 
-<h3 align="center">Let the whiteboard whiteboard itself.</h3>
+캔버스 / Excalidraw / Realtime Noel은 독립 Git 저장소
+`../realtime-noel-canvas`로 분리했습니다. 이 프로젝트의 기본 주소는 NOVA만 엽니다.
 
-<p align="center">
-  <img src="https://raw.githubusercontent.com/kyeongmankim/realtime-noel/main/assets/realtime-noel.png" alt="Realtime Noel whiteboard hero screenshot" width="960" />
-</p>
+## 실행
 
-> [!WARNING]
-> Realtime Noel is in **alpha** and under active development. Expect rough edges, breaking changes, and the occasional weird drawing. Bug reports welcome.
-
-You wanted to give the talk, not build the deck.
-
-Realtime Noel runs a local web app with a live Excalidraw canvas and a listening agent.
-You speak; transcripts stream to a model; the model draws, labels, and rearranges the whiteboard in real time.
-Stage a few seed elements, hit start, and present.
-
-- **Hands free** - your speech drives an agent that edits an Excalidraw scene as you talk, no clicking required.
-- **Bring your own model** - use your OpenAI API key or Codex subscription. Realtime Noel itself is completely free and open source.
-- **Can run locally** - use Moonshine for transcription and Ollama for the agent and you get a fully local setup.
-
-## Quick Start
+Node.js 24 이상이 필요합니다.
 
 ```sh
-$ npx realtime-noel          # boots the server, opens the browser
-Realtime Noel listening at http://127.0.0.1:3210
-
-# In the browser:
-# 1. Drop reference materials onto the staging canvas (title, agenda, etc).
-# 2. Pick your microphone, transcription model, agent model, and optional Agent instructions.
-# 3. Click "Start Realtime Noel" and start talking.
+npm ci
+npm run dev -- --no-open
+# http://127.0.0.1:3317 — NOVA captions
+npm run desktop
 ```
 
-## Install
+`webapp/`과 `media-gateway/`는 각각 별도 package.json/lockfile을 갖습니다.
+각 디렉터리에서 의존성을 설치합니다. 웹과 게이트웨이 설정은
+[운영 설정](docs/superpowers/status/2026-09-05-operator-setup.md)을 참고하세요.
 
-**npm (recommended)**
+## 저장소와 설정
+
+- 현재 저장소: NOVA 자막·Live Call·설정, 기본 포트 3317.
+- 형제 저장소 `../realtime-noel-canvas`: 캔버스·에이전트, 기본 포트 3319.
+- NOVA 설정·기록: `~/.config/nova/`.
+- 캔버스 설정: `~/.config/realtime-noel/`.
+- NOVA는 기존 공유 위치의 자막 설정·기록·녹음만 최초에 가져옵니다. 원본과
+  이미 존재하는 NOVA 데이터는 덮어쓰거나 삭제하지 않습니다.
+
+[분리 결과와 실행 안내](docs/superpowers/status/2026-09-05-project-separation.md)
+
+## 검증
 
 ```sh
-npm install -g realtime-noel
-realtime-noel
+npm run typecheck
+npm test
+npm run test:all
 ```
 
-**npx (no install)**
-
-```sh
-npx realtime-noel
-```
-
-**From source**
-
-```sh
-git clone https://github.com/kyeongmankim/realtime-noel.git
-cd realtime-noel
-npm install
-npm start
-```
-
-## How It Works
-
-```
-  ┌──────────┐   audio    ┌──────────────┐   text   ┌──────────────┐
-  │   mic    │──────────► │     STT      │────────► │  whiteboard  │
-  │ (browser)│   24kHz    │ Moonshine /  │ chunks   │    agent     │
-  └──────────┘            │ OpenAI WS    │          │ (OpenAI /    │
-                          └──────────────┘          │  Codex /     │
-                                                    │  Ollama)     │
-                                                    └──────┬───────┘
-                                                           │ tool calls
-                                                           ▼
-                                                  ┌────────────────┐
-                                                  │   Excalidraw   │
-                                                  │  scene (live)  │
-                                                  └────────────────┘
-```
-
-- **Two modes** - "staging" lets you sketch seed content client-side; "live" hands the canvas over to the agent, biases OpenAI Realtime transcription toward staging text and labels, and starts streaming transcripts.
-- **Local server, local network only** - the Express + WebSocket server binds to 127.0.0.1; nothing is exposed beyond your machine.
-- **Persistent settings** - models, API keys, STT engine choices, and Agent instructions live in `~/.config/realtime-noel/settings.json` and survive restarts.
-- **Warmup loop** - after you hit start the agent primes itself against your staging content and Agent instructions so the first sentence you say doesn't get a cold model.
-
-## CLI Reference
-
-| Command        | Description                                  |
-| -------------- | -------------------------------------------- |
-| `realtime-noel`    | Start the local server and open the browser. |
-| `realtime-noel -h` | Show help.                                   |
-
-### Flags
-
-| Flag         | Description                                   |
-| ------------ | --------------------------------------------- |
-| `--no-open`  | Start the server without opening the browser. |
-| `-h, --help` | Show help.                                    |
-
-## Configuration
-
-Settings persist at `~/.config/realtime-noel/settings.json` and are managed from the in-app status panel.
-Agent instructions are saved automatically from staging, can be up to 100,000 characters, and take effect on the next Start Realtime Noel.
-The live Session cost card estimates agent token costs and OpenAI Realtime audio costs for the current presentation, resetting on Start Realtime Noel or session reset.
-OpenAI prices use the built-in May 2026 rate table; local providers show `$0.0000`, Codex shows token volume because it routes through your subscription, and unknown models show `n/a`.
-
-### Defaults on first run
-
-When no settings file exists, Realtime Noel picks providers based on what it finds in your environment:
-
-| You have...                                | Agent provider                 | Transcription              |
-| ------------------------------------------ | ------------------------------ | -------------------------- |
-| Nothing                                    | OpenAI `gpt-5.5` (needs a key) | Moonshine `medium` (macOS) |
-| `OPENAI_API_KEY` in env                    | OpenAI `gpt-5.5`               | OpenAI Realtime            |
-| Codex CLI signed in (`~/.codex/auth.json`) | Codex `gpt-5.5-fast`           | Moonshine `medium`         |
-| Codex CLI signed in + `OPENAI_API_KEY`     | Codex `gpt-5.5-fast`           | OpenAI Realtime            |
-| `OLLAMA_MODEL` set                         | Ollama (your model)            | Moonshine `medium`         |
-
-Auto-detection precedence: **Codex CLI auth wins over `OLLAMA_MODEL` wins over `OPENAI_API_KEY`** for the agent. Transcription flips to OpenAI Realtime any time an OpenAI key is present, otherwise Moonshine. After first run, this auto-detection no longer applies - change providers from the in-app status panel.
-
-### Environment variables
-
-Provider variables only seed `settings.json` on first run. Once the file exists, they're ignored - edit the file or use the in-app panel. Log path variables are read on each process start.
-
-| Variable               | Purpose                                               |
-| ---------------------- | ----------------------------------------------------- |
-| `PORT`                 | Port to listen on. Default: `3210`.                   |
-| `OPENAI_API_KEY`       | Seeds the OpenAI key for both agent and Realtime STT. |
-| `OPENAI_MODEL`         | Seeds the OpenAI agent model.                         |
-| `OPENAI_BASE_URL`      | Seeds the OpenAI agent API base URL.                  |
-| `CODEX_MODEL`          | Seeds the Codex model.                                |
-| `OLLAMA_MODEL`         | Seeds the Ollama model.                               |
-| `REALTIME_NOEL_CACHE_LOG`  | Cache usage log path. Default: `~/.config/realtime-noel/logs/cache.log`. |
-| `REALTIME_NOEL_DEBUG_LOG`  | Agent debug log path. Default: `~/.config/realtime-noel/logs/debug.log`. |
-
-Local Moonshine transcription ships as an optional native sidecar for `darwin-arm64` and `darwin-x64`. On other platforms, choose OpenAI Realtime in the STT panel.
+운영 배포는 자동 수행하지 않습니다. 라이브 API 키·인증·서버 설정은 운영 설정
+문서의 절차를 따르며 비밀값을 소스 코드에 기록하지 않습니다.
 
 ## Credits
 
 - [Excalidraw](https://github.com/excalidraw/excalidraw) - the whiteboard canvas, scene model, and rendering.
 - [Moonshine](https://github.com/moonshine-ai/moonshine) the local speech-to-text model that makes the offline path possible.
 - [Vercel AI SDK](https://github.com/vercel/ai) - tool-calling agent loop and provider abstraction.
-
-## Development
-
-```sh
-npm install                       # install deps
-npm run dev                       # run the CLI from source
-npm run typecheck                 # tsc --noEmit
-npm test                          # node --test
-npm run build:moonshine-sidecars  # build the Python sidecar binaries
-```

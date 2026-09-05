@@ -65,7 +65,7 @@ test("tables scroll inside their wrapper, numbers are tabular, rows report busy 
   // M-6: under 767 px the rows become grid cards (display: grid strips the implicit table roles), so
   // the semantics are pinned explicitly on every data row and cell.
   assert.match(users, /<tr key=\{row\.id\} role="row"/u);
-  assert.equal(users.match(/<td role="cell" data-label=/gu)?.length, 7, "every data cell carries role=cell");
+  assert.equal(users.match(/<td role="cell" data-label=/gu)?.length, 8, "every data cell carries role=cell");
   assert.match(users, /<th scope="col" role="columnheader">/u);
   // I-2: the disable dialog closes on failure too, so the row's inline alert is not hidden behind the backdrop.
   assert.match(users, /finally \{[^}]*setDisableTarget\(null\)/u);
@@ -76,16 +76,12 @@ test("tables scroll inside their wrapper, numbers are tabular, rows report busy 
   assert.match(sessions, /className="console-num"/u);
 });
 
-test("the engine page deploys through a confirm dialog and renders per-session results when the PUT returns them", () => {
-  // M-1: a deploy switches every preparing/live session, not just the ones created this week.
-  assert.match(engine, /\/api\/console\/sessions\?range=all/u, "active-session count comes from the sessions route over the whole history");
-  assert.doesNotMatch(engine, /range=7d/u);
-  assert.match(engine, /countActiveSessions\(/u);
-  assert.match(engine, /t\("배포"\)/u);
-  assert.doesNotMatch(engine, /t\("저장"\)/u, "the primary action is 배포, not 저장");
-  assert.match(engine, /t\("진행 중인 세션 \{count\}개가 즉시 전환됩니다\."/u);
-  assert.match(engine, /t\("진행 중인 세션 수를 확인할 수 없습니다\. 진행 중인 세션은 모두 즉시 전환됩니다\."\)/u, "an unknown count gets its own sentence");
-  assert.doesNotMatch(engine, /"\?"/u, "no ?개 placeholder count");
+test("engine defaults apply next session and user assignments expose two providers", () => {
+  assert.doesNotMatch(engine, /console\/sessions\?range=all/u);
+  assert.doesNotMatch(engine, /즉시 전환됩니다/u);
+  assert.match(engine, /다음 세션부터 적용됩니다/u);
+  assert.match(users, /voiceProvider/u);
+  assert.match(users, /다음 세션 엔진/u);
   assert.match(engine, /<ConfirmDialog/u);
   assert.match(engine, /results/u);
   assert.match(engine, /role="status"/u);
@@ -99,8 +95,6 @@ test("the engine page deploys through a confirm dialog and renders per-session r
   // I-2: both dialogs close in finally, so a failure alert renders in front of the operator.
   assert.match(engine, /finally \{[^}]*setIsConfirmOpen\(false\)/u);
   assert.match(engine, /finally \{[^}]*setIsLegacyConfirmOpen\(false\)/u);
-  assert.match(engine, /filterTranslationOptions\(/u);
-  assert.match(engine, /languageModesFor\(/u);
   assert.match(engine, /isEngineDirty\(/u);
   assert.match(engine, /disabled=\{[^}]*available === false/u, "unavailable catalog entries are disabled options");
   assert.match(engine, /legacyPasswordLoginEnabled/u);
@@ -180,9 +174,10 @@ test("the dashboard rail offers the console only to admins, and the session keep
   const railStart = dashboard.indexOf('<aside className="live-host-rail">');
   const railEnd = dashboard.indexOf("</aside>", railStart);
   const rail = dashboard.slice(railStart, railEnd);
-  assert.match(rail, /href="\/records"/u);
-  assert.match(rail, /isConsoleAdmin && <a href="\/console">\{t\("콘솔"\)\}<\/a>/u);
-  assert.ok(rail.indexOf('href="/records"') < rail.indexOf('href="/console"'), "the console link follows 라이브콜 기록");
+  assert.doesNotMatch(rail, /href="\/records"/u);
+  assert.match(dashboard, /href="\/records"/u);
+  assert.match(dashboard, /isConsoleAdmin && <a className="glass-btn" href="\/console">/u);
+  assert.doesNotMatch(rail, /href="\/console"/u);
   assert.match(dashboard, /fetch\("\/api\/auth\/session", \{[^}]*credentials: "same-origin"/u);
   assert.match(dashboard, /role === "admin"/u);
   for (const language of ["ko", "en", "ja"] as const) assert.ok(hostMessages[language]["콘솔"], language);

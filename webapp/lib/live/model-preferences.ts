@@ -35,7 +35,7 @@ export interface EngineHistoryEntry { engine: EngineSelection; changedAt: string
  * catalog default) or an object. `modelPreferences: null` is malformed —
  * nothing ever writes it, so a reader must fail closed rather than default it.
  */
-export interface LiveModelPreferences { engine: EngineSelection; engineHistory: EngineHistoryEntry[] }
+export interface LiveModelPreferences { engine: EngineSelection; engineHistory: EngineHistoryEntry[]; assignmentRevision?: string }
 
 /** Client input shape: only the engine. History is server-owned. */
 export interface LiveModelPreferencesInput { engine: EngineSelection }
@@ -152,8 +152,10 @@ export function readLiveModelPreferences(value: unknown): LiveModelPreferences {
     if (!isKnownLegacyModel("source", value.source) || !isKnownLegacyModel("summary", value.summary)) throw invalidEngine();
     return { engine: migrateLegacyPreferences(value.source, value.summary), engineHistory: [] };
   }
-  if (!keys.includes("engine") || keys.some((key) => key !== "engine" && key !== "engineHistory")) throw invalidEngine();
-  return { engine: toEngine(value.engine), engineHistory: readEngineHistory(value.engineHistory) };
+  if (!keys.includes("engine") || keys.some((key) => key !== "engine" && key !== "engineHistory" && key !== "assignmentRevision")) throw invalidEngine();
+  const revision = value.assignmentRevision;
+  if (revision !== undefined && (typeof revision !== "string" || !/^[1-9][0-9]{0,18}$/u.test(revision))) throw invalidEngine();
+  return { engine: toEngine(value.engine), engineHistory: readEngineHistory(value.engineHistory), ...(revision === undefined ? {} : { assignmentRevision: revision }) };
 }
 
 /**
@@ -167,7 +169,7 @@ export function applyEngineSelection(
   engine: EngineSelection,
   change: { changedAt: string; byHostId: string; reason: EngineHistoryReason },
 ): LiveModelPreferences {
-  if (isSameEngineSelection(current.engine, engine)) return { engine: current.engine, engineHistory: [...current.engineHistory] };
+  if (isSameEngineSelection(current.engine, engine)) return { ...current, engine: current.engine, engineHistory: [...current.engineHistory] };
   const entry: EngineHistoryEntry = { engine, changedAt: change.changedAt, byHostId: change.byHostId, reason: change.reason };
   return { engine, engineHistory: [...current.engineHistory, entry].slice(-MAX_ENGINE_HISTORY_ENTRIES) };
 }

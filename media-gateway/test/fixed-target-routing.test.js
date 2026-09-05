@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { LiveMediaPipeline } from "../src/live-media-pipeline.js";
+import { LiveMediaPipeline } from "./helpers/gemini-pipeline.js";
 import { SupabaseLivePublisher } from "../src/supabase-adapters.js";
 import { compileGlossaryDocumentV1 } from "../../packages/caption-core/index.js";
 

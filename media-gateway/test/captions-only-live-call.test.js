@@ -2,8 +2,9 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
 
-import { LiveMediaPipeline } from "../src/live-media-pipeline.js";
-import { createGeminiCaptionConfig, DEFAULT_ENGINE_SELECTION } from "../../packages/caption-core/index.js";
+import { LiveMediaPipeline } from "./helpers/gemini-pipeline.js";
+import { GEMINI_ENGINE_SELECTION as DEFAULT_ENGINE_SELECTION } from "../../packages/caption-core/caption-engine-catalog.js";
+import { createGeminiCaptionConfig } from "../../packages/caption-core/index.js";
 
 const TARGET_TEXT = {
   en: "translated business update",

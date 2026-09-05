@@ -13,7 +13,7 @@ import { MemoryLiveSessionStore, SupabaseLiveSessionStore } from "./store";
 import { createLiveSessionInputSchema, liveSessionInputErrorCode, updateLiveSessionInputSchema } from "../security/live-input-validation";
 
 const plain = <T,>(value: T): T => JSON.parse(JSON.stringify(value)) as T;
-const gemini37 = { ...DEFAULT_ENGINE_SELECTION, translation: { provider: "gemini", model: "gemini-3.7-flash" }, summary: { provider: "gemini", model: "gemini-3.7-flash" } };
+const gemini37 = { ...DEFAULT_ENGINE_SELECTION, stt: { provider: "gemini", model: "gemini-3.5-transcribe-live", languageMode: "auto" }, translation: { provider: "gemini", model: "gemini-3.7-flash" }, summary: { provider: "gemini", model: "gemini-3.7-flash" } };
 const soniox = {
   stt: { provider: "soniox", model: "stt-rt-v5", languageMode: "ko" },
   translation: { provider: "soniox", model: "stt-rt-v5" },
@@ -25,11 +25,11 @@ test("client input is `{ engine }` validated by the catalog; the legacy per-role
   assert.deepEqual(plain(readNewLiveModelPreferences(undefined)), { engine: plain(DEFAULT_ENGINE_SELECTION) });
   assert.deepEqual(plain(readNewLiveModelPreferences({ engine: soniox })), { engine: soniox });
   // Partial engines complete from the catalog defaults (stt languageMode, missing roles).
-  assert.deepEqual(plain(readNewLiveModelPreferences({ engine: { translation: { provider: "gemini", model: "gemini-3.7-flash" } } })),
-    { engine: { ...plain(DEFAULT_ENGINE_SELECTION), translation: { provider: "gemini", model: "gemini-3.7-flash" } } });
+  assert.deepEqual(plain(readNewLiveModelPreferences({ engine: { stt: gemini37.stt, translation: { provider: "gemini", model: "gemini-3.7-flash" } } })),
+    { engine: { ...plain(DEFAULT_ENGINE_SELECTION), stt: gemini37.stt, translation: { provider: "gemini", model: "gemini-3.7-flash" } } });
   // Old desktop builds: `{ source, summary }` → the engine they meant (retired live-translate source → Transcribe Live).
   const legacy = readNewLiveModelPreferences({ source: "gemini-3.5-live-translate-preview", summary: "gemini-3.7-flash" });
-  assert.deepEqual(plain(legacy.engine), { ...plain(DEFAULT_ENGINE_SELECTION), summary: { provider: "gemini", model: "gemini-3.7-flash" } });
+  assert.deepEqual(plain(legacy.engine), { ...plain(DEFAULT_ENGINE_SELECTION), stt: gemini37.stt, translation: { provider: "gemini", model: "gemini-3.6-flash" }, summary: { provider: "gemini", model: "gemini-3.7-flash" } });
   assert.equal(readNewLiveModelPreferences({ source: "gemini-3.5-transcribe-live", summary: "gemini-3.5-flash" }).engine.summary.model, "gemini-3.6-flash",
     "a retired summary id maps to the catalog default, never to a model outside the summary role");
   for (const invalid of [null, {}, [], "gemini", { engine: null }, { engine: "gemini" }, { engine: [] },
@@ -46,6 +46,8 @@ test("client input is `{ engine }` validated by the catalog; the legacy per-role
 });
 
 test("HTTP create and update validate the same nested engine shape, not arbitrary provider configuration", () => {
+  assert.deepEqual(createLiveSessionInputSchema.parse({ sessionType: "meeting" }).languages, ["ko", "en"]);
+  assert.deepEqual(createLiveSessionInputSchema.parse({ sessionType: "meeting", languages: ["ja", "zh-Hans", "en"] }).languages, ["ja", "zh-Hans", "en"]);
   for (const modelPreferences of [{ engine: DEFAULT_ENGINE_SELECTION }, { engine: soniox }, { source: "gemini-3.5-transcribe-live", summary: "gemini-3.6-flash" }]) {
     const created = createLiveSessionInputSchema.safeParse({ sessionType: "meeting", languages: ["ko"], modelPreferences });
     assert.equal(created.success, true, JSON.stringify(modelPreferences));
@@ -161,42 +163,26 @@ test("create: non-admins get the global engine (a sent engine is replaced, not r
   sameEngine(adminUnspecified.modelPreferences?.engine, gemini37);
   const direct = await service.create("host-1", { ...base, modelPreferences: { engine: soniox } });
   sameEngine(direct.modelPreferences?.engine, DEFAULT_ENGINE_SELECTION);
-  assert.equal(direct.modelPreferences?.engine.stt.provider, "gemini", "no console defaults and no admin → the catalog default, never the host's request (fix M3)");
+  assert.equal(direct.modelPreferences?.engine.stt.provider, "soniox", "no console defaults and no admin → the catalog default, never the host's request (fix M3)");
   assert.deepEqual(plain((await service.create("host-1", base)).modelPreferences), { engine: plain(DEFAULT_ENGINE_SELECTION), engineHistory: [] });
   await assert.rejects(service.create("host-1", { ...base, modelPreferences: { engine: { stt: { provider: "nope", model: "x" } } } }, { engineDefaults: gemini37, isAdmin: true }),
     (error: unknown) => error instanceof Error && "code" in error && error.code === "INVALID_ENGINE_SELECTION");
-  // Soniox two-way translation needs exactly two caption languages: refused at create, not at go-live.
-  await assert.rejects(service.create("host-1", { ...base, languages: ["ko", "en", "ja"] }, { engineDefaults: soniox }),
-    (error: unknown) => error instanceof Error && "code" in error && error.code === "ENGINE_LANGUAGE_COUNT_INVALID");
+  const three = await service.create("host-1", { ...base, languages: ["ko", "en", "ja"] }, { engineDefaults: soniox });
+  assert.deepEqual(three.languages, ["ko", "en", "ja"]);
 });
 
-test("update: the engine may change while live, each change appends engineHistory, and non-admin engines are replaced by the global default", async () => {
-  let now = Date.UTC(2026, 8, 4, 9, 0, 0);
-  const store = new MemoryLiveSessionStore(() => now);
-  const service = new LiveSessionService(store, () => now);
-  const created = await service.create("host-1", { title: "Engine", sessionType: "meeting", languages: ["ko"], ticker: "NOVA" }, { engineDefaults: DEFAULT_ENGINE_SELECTION });
-  const edited = await service.update("host-1", created.id, { version: created.version, title: "Renamed" });
-  assert.deepEqual(plain(edited.modelPreferences), { engine: plain(DEFAULT_ENGINE_SELECTION), engineHistory: [] }, "an unrelated edit keeps the engine and appends nothing");
-  assert.equal(edited.ticker, "NOVA");
-  const started = await store.startOwned(created.id, "host-1", edited.version);
-  assert.equal(started?.status, "live");
-  now += 60_000;
-  const adminSwitch = await service.update("admin-1", created.id, { version: started!.version, modelPreferences: { engine: soniox } }, { engineDefaults: DEFAULT_ENGINE_SELECTION, isAdmin: true })
-    .catch(() => null);
-  assert.equal(adminSwitch, null, "the session is owned by host-1; another host id cannot update it");
-  const hostSwitch = await service.update("host-1", created.id, { version: started!.version, modelPreferences: { engine: soniox } }, { engineDefaults: gemini37, isAdmin: true });
-  assert.equal(hostSwitch.status, "live");
-  assert.deepEqual(plain(hostSwitch.modelPreferences), { engine: soniox, engineHistory: [{ engine: soniox, changedAt: "2026-09-04T09:01:00.000Z", byHostId: "host-1", reason: "admin" }] });
-  now += 60_000;
-  const nonAdmin = await service.update("host-1", created.id, { version: hostSwitch.version, modelPreferences: { engine: DEFAULT_ENGINE_SELECTION } }, { engineDefaults: gemini37 });
-  assert.deepEqual(plain(nonAdmin.modelPreferences), { engine: gemini37, engineHistory: [
-    { engine: soniox, changedAt: "2026-09-04T09:01:00.000Z", byHostId: "host-1", reason: "admin" },
-    { engine: gemini37, changedAt: "2026-09-04T09:02:00.000Z", byHostId: "host-1", reason: "server-default" },
-  ] }, "a non-admin engine is replaced by the global default, and that replacement is what the history records");
-  const sameAgain = await service.update("host-1", created.id, { version: nonAdmin.version, modelPreferences: { engine: gemini37 } }, { engineDefaults: gemini37 });
-  assert.equal(sameAgain.modelPreferences?.engineHistory.length, 2, "re-sending the current engine appends nothing");
-  await assert.rejects(service.update("host-1", created.id, { version: sameAgain.version, languages: ["ko", "en", "ja"], modelPreferences: { engine: soniox } }, { engineDefaults: soniox }),
-    (error: unknown) => error instanceof Error && "code" in error && error.code === "ENGINE_LANGUAGE_COUNT_INVALID");
+test("session assignment is pinned across admin changes, edits and reconnect reads", async () => {
+  const store = new MemoryLiveSessionStore();
+  const service = new LiveSessionService(store);
+  const created = await service.create("host-1", { sessionType: "meeting", languages: ["ko","en","ja"], modelPreferences: { engine: gemini37 } }, { engineDefaults: soniox, assignmentRevision: "7", isAdmin: true });
+  sameEngine(created.modelPreferences?.engine, soniox);
+  assert.equal(created.modelPreferences?.assignmentRevision,"7");
+  const changed = await service.update("host-1", created.id, { version: created.version, title: "New title", modelPreferences: { engine: gemini37 } }, {engineDefaults:gemini37, assignmentRevision:"8",isAdmin:true});
+  assert.deepEqual(changed.modelPreferences,created.modelPreferences);
+  assert.deepEqual((await store.getOwned(created.id,"host-1"))?.modelPreferences,created.modelPreferences);
+  const next = await service.create("host-1", {sessionType:"meeting",languages:["ko","en"]}, {engineDefaults:gemini37,assignmentRevision:"8"});
+  sameEngine(next.modelPreferences?.engine,gemini37);
+  assert.equal(next.modelPreferences?.assignmentRevision,"8");
 });
 
 test("the Supabase store writes the service's preferences and keeps the stored ones when a patch carries none", async () => {
@@ -259,7 +245,7 @@ test("stored modelPreferences of a listed session is parsed per row: one poisone
   try {
     const listed = await store.listOwnedActive("owner");
     assert.deepEqual(listed.map((session) => session.id), ["session-good-1", "session-good-2"]);
-    sameEngine(listed[1]?.modelPreferences?.engine, { ...DEFAULT_ENGINE_SELECTION, summary: { provider: "gemini", model: "gemini-3.7-flash" } });
+    sameEngine(listed[1]?.modelPreferences?.engine, { ...DEFAULT_ENGINE_SELECTION, stt: gemini37.stt, translation: { provider: "gemini", model: "gemini-3.6-flash" }, summary: { provider: "gemini", model: "gemini-3.7-flash" } });
     assert.equal(logged.length, 2);
     assert.match(logged[0], /INVALID_STORED_SESSION/u);
     assert.match(logged[0], /session-poisoned/u);
@@ -293,7 +279,7 @@ test("HTTP input: a malformed engine is its own 400 code (INVALID_ENGINE_SELECTI
 });
 
 test("engine labels come from the catalog; a combined engine shows one provider", () => {
-  assert.equal(formatEngineLabel(DEFAULT_ENGINE_SELECTION), "Gemini 3.5 Transcribe Live · Gemini 3.6 Flash");
+  assert.equal(formatEngineLabel(DEFAULT_ENGINE_SELECTION), "Soniox stt-rt-v5");
   assert.equal(formatEngineLabel(gemini37), "Gemini 3.5 Transcribe Live · Gemini 3.7 Flash");
   assert.equal(formatEngineLabel(soniox), "Soniox stt-rt-v5");
   assert.equal(formatEngineLabel({ stt: { provider: "nope", model: "x" } }), "—");
@@ -302,10 +288,9 @@ test("engine labels come from the catalog; a combined engine shows one provider"
 test("routes: the service is the engine authority, /api/live-config publishes availability booleans only, and the host UI is read-only", () => {
   const create = readFileSync(new URL("../../app/api/live-sessions/route.ts", import.meta.url), "utf8");
   const patch = readFileSync(new URL("../../app/api/live-sessions/[id]/route.ts", import.meta.url), "utf8");
-  for (const source of [create, patch]) {
-    assert.match(source, /resolveEngineDefaultsOrFallback\(\), isAdminRequest\(request\)/u);
-    assert.match(source, /\{ engineDefaults, isAdmin \}/u);
-  }
+  assert.match(create, /resolveHostEngineAssignment\(hostId\)/u);
+  assert.match(create, /\{ engineDefaults, assignmentRevision \}/u);
+  assert.doesNotMatch(patch, /resolveEngineDefaults|resolveHostEngineAssignment/u);
   const liveConfig = readFileSync(new URL("../../app/api/live-config/route.ts", import.meta.url), "utf8");
   assert.match(liveConfig, /captionEngines: captionEngineAvailability\(\)/u);
   assert.doesNotMatch(liveConfig, /process\.env\.(?:GEMINI|SONIOX)_API_KEY/u, "the route never touches key values");

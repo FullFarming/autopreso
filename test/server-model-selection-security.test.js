@@ -31,10 +31,12 @@ function deferred() {
 
 async function harness(context, beforeSave = async (_patch) => {}, options = {}, beforeLoad = async () => {}) {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "nova-model-security-"));
-  const store = createSettingsStore({ filePath: path.join(dir, "settings.json"), env: {}, readCodexAuth: () => null });
+  const store = createSettingsStore({ filePath: path.join(dir, "settings.json"), env: {} });
   await store.load();
+  await store.save({ subtitle: { engine: GEMINI_ENGINE } });
   const state = { active: false, starts: 0, saves: 0, startRequests: [] };
   const { httpServer, url } = await startServer({
+    resolveCaptionEngine: async () => { await beforeLoad(); return (await store.load()).subtitle.engine; },
     ...options,
     host: "127.0.0.1", port: 0, moonshineModel: "medium",
     settingsStore: { ...store,

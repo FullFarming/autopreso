@@ -567,7 +567,7 @@ test("preload exposes only narrow Live Interpreter methods with listener cleanup
 test("main wires the sanitized transcript store and awaits bounded interpreter shutdown", async () => {
   const main = await fs.readFile(path.join(process.cwd(), "electron", "main.js"), "utf8");
   assert.match(main, /createLiveInterpreterStore\(\{[\s\S]*?app\.getPath\("userData"\)[\s\S]*?"live-interpreter"/u);
-  assert.match(main, /label: "Live Interpreter"[\s\S]*?liveInterpreterRuntime\.open\(\)/u);
+  assert.doesNotMatch(main, /label: "Live Interpreter"/u);
   assert.match(main, /liveInterpreterRuntime\.shutdown\(\)/u);
   assert.match(main, /Promise\.race\(\[[\s\S]*?Promise\.allSettled\(tasks\)[\s\S]*?setTimeout\(resolve, 4_000\)/u);
 });

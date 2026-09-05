@@ -147,13 +147,13 @@ test("assertReady owns every start-time rejection and setupPayloads never throws
   });
   assert.throws(() => keyless.assertReady(), /Soniox API key/u);
 
-  for (const translationLanguages of [["en", "ko", "ja"], ["ja"]]) {
+  for (const translationLanguages of [["en", "ko", "ja"]]) {
     const transport = createSonioxTransport({
       engine: sonioxEngine("auto"),
       settings: { translationLanguages, glossary: "" },
       apiKey: "fixture-key",
     });
-    assert.throws(() => transport.assertReady(), /SONIOX_TRANSLATION_PAIR_REQUIRED/u,
+    assert.throws(() => transport.assertReady(), /SONIOX_TRANSLATION_(?:PAIR|TARGET)_REQUIRED/u,
       `${translationLanguages.join("+")} is not a two_way pair`);
     assert.doesNotThrow(() => transport.setupPayloads());
     assert.deepEqual(transport.setupPayloads(), [], "an unusable config yields no setup payload");

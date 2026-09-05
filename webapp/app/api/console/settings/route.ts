@@ -14,7 +14,7 @@ export const dynamic = "force-dynamic";
 
 const putSettingsSchema = z.object({ legacyPasswordLoginEnabled: z.boolean() }).strict();
 /** Sent back when the switch is turned off so the console can confirm that `ADMIN_USER_IDS` password login stops working. */
-export const LEGACY_LOGIN_DISABLED_WARNING = "LEGACY_LOGIN_DISABLED_WARNING";
+const LEGACY_LOGIN_DISABLED_WARNING = "LEGACY_LOGIN_DISABLED_WARNING";
 
 /** `GET /api/console/settings` → `{ legacyPasswordLoginEnabled }`. */
 export async function GET(request: NextRequest) {

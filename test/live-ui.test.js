@@ -275,31 +275,17 @@ test("desktop subtitle workspace starts Live Call without a web workspace launch
     read("public/subtitle-workspace.js"),
   ]);
   assert.match(html, /id="schedule-live-call"[^>]*data-i18n="live\.start"/);
-  assertLocalized("live.start", { en: /Start Live Call/ });
+  assertLocalized("live.start", { en: /^Start$/ });
   assert.doesNotMatch(html, /id="open-meeting-mode"|data-open-live-workspace|>Open Live Call</);
   assert.doesNotMatch(script, /open-meeting-mode|data-open-live-workspace|openLiveWorkspace|realtime-noel-web\.vercel\.app/);
   assert.match(workspace, /await bridge\.startLiveCall\(draft\)/);
   assert.match(workspace, /coverImage: liveDraftCoverData/);
 });
 
-test("desktop rail launches Meeting Prep, Live Coach, and Live Interpreter independently", async () => {
-  const [html, dashboard] = await Promise.all([
-    read("public/subtitle.html"),
-    read("public/subtitle-dashboard.js"),
-  ]);
-
-  assert.match(html, /id="open-meeting-prep"[^>]*data-i18n-aria="nav\.meetingPrep"[\s\S]{0,500}<span data-i18n="nav\.meetingPrep"/u);
-  assert.match(html, /id="open-live-coach"[^>]*data-i18n-aria="nav\.liveCoach"[\s\S]{0,500}<span data-i18n="nav\.liveCoach"/u);
-  assert.match(html, /id="open-live-interpreter"[^>]*data-i18n-aria="nav\.liveInterpreter"[\s\S]{0,500}<span data-i18n="nav\.liveInterpreter"/u);
-  assert.doesNotMatch(html, /id="open-(?:meeting-prep|live-coach|live-interpreter)"[^>]*data-workspace-nav=/u,
-    "desktop launchers must not be mistaken for in-dashboard page navigation");
-  assert.match(dashboard, /initializeMeetingCoachLaunch/);
-  assert.match(dashboard, /methodName: "meetingCoachOpenPrep"/);
-  assert.match(dashboard, /methodName: "meetingCoachOpenLiveWindows"/);
-  assert.match(dashboard, /initializeLiveInterpreterLaunch/);
-  assert.match(dashboard, /methodName: "openLiveInterpreter"/);
-  assert.match(dashboard, /button\.setAttribute\("aria-busy", "true"\)/);
-  assert.match(dashboard, /button\.removeAttribute\("aria-busy"\)/);
+test("desktop rail excludes retired meeting launchers", async () => {
+  const [html, dashboard] = await Promise.all([read("public/subtitle.html"), read("public/subtitle-dashboard.js")]);
+  assert.doesNotMatch(html, /id="open-(meeting-prep|live-coach|live-interpreter)"/u);
+  assert.doesNotMatch(dashboard, /initializeMeetingCoachLaunch|initializeLiveInterpreterLaunch/u);
 });
 
 test("desktop and mobile watch routes share the same viewer component", async () => {
@@ -394,16 +380,13 @@ test("host, viewer, and Chrome expose the same approved language set with three-
 
 test("owned user-visible surfaces carry the current product name", async () => {
   const paths = [
-    "public/index.html", "public/app.js", "public/starter-elements.js",
     "public/subtitle.html", "public/subtitle-controller.html", "public/subtitle-overlay.html",
     "public/subtitle-dashboard.js", "electron/main.js", "webapp/components/usePipOverlay.ts",
     "chrome-extension/manifest.json", "chrome-extension/sidepanel.html",
   ];
   const sources = await Promise.all(paths.map(read));
   const joined = sources.join("\n");
-  // The desktop subtitle product is NOVA. The whiteboard pages (index.html /
-  // app.js) are a separate product and keep their own name, and the webapp is a
-  // separately deployed guest surface -- neither is renamed here.
+  // Canvas assets live in the independent realtime-noel-canvas repository.
   assert.match(joined, /NOVA/);
   assert.doesNotMatch(joined, /Realtime_Noel|AutoPreso|Auto Preso/);
 });
@@ -548,7 +531,7 @@ test("desktop Live workspace exposes only the local Start action", async () => {
   ]);
 
   assert.match(html, /id="schedule-live-call"[^>]*data-i18n="live\.start"/);
-  assertLocalized("live.start", { en: /Start Live Call/ });
+  assertLocalized("live.start", { en: /^Start$/ });
   assert.doesNotMatch(html, /id="open-meeting-mode"|data-open-live-workspace|>Open Live Call</);
   assert.doesNotMatch(script, /openLiveWorkspace|window\.open\("https:\/\/realtime-noel-web\.vercel\.app\//);
   assert.match(workspace, /t\("live\.stageUp", \{ code: result\.admissionCode/);
@@ -731,8 +714,12 @@ test("caption language stays direct while secondary controls live in the drawer"
   assert.match(viewer, /buildTranslationLanes/u);
   assert.match(viewer, /projectCaptionLane/u);
 
-  assert.match(viewer, /<ControlDrawer triggerLabel=\{t\("더보기"\)\} title=\{t\("세션 제어"\)\}>/u);
-  assert.match(demo, /<ControlDrawer triggerLabel=\{t\("더보기"\)\} title=\{t\("미리보기 제어"\)\}>/u);
+  assert.match(viewer, /<ControlDrawer iconOnly triggerLabel=\{t\("더보기"\)\} title=\{t\("세션 제어"\)\}>/u);
+  assert.match(demo, /<ControlDrawer iconOnly triggerLabel=\{t\("더보기"\)\} title=\{t\("미리보기 제어"\)\}>/u);
+  for (const surface of [viewer, demo]) {
+    assert.equal((surface.match(/<SystemLanguageButton compact/gu) ?? []).length, 1);
+    assert.match(surface, /<SystemLanguageButton compact \/>[\s\S]*<ControlDrawer iconOnly/u);
+  }
   assert.match(demo, /ariaLabel=\{t\("자막 언어"\)\}/u);
   assert.match(viewer, /type="range"/u);
   assert.match(viewer, /setCaptionScale\(Number\(event\.currentTarget\.value\)\)/u);
@@ -776,7 +763,7 @@ test("the LIVE feed never folds a speaker paragraph", async () => {
   // The paragraph body and its speaker header stay — only the control is gone,
   // and the header must no longer be a button.
   assert.match(feed, /<p className="live-turn-body">/u);
-  assert.match(feed, /<strong>\{turn\.speakerLabel\}<\/strong>/u);
+  assert.match(feed, /<SpeakerIdentity profile=\{turn\.speakerProfile\} sessionId=\{turn\.sessionId\} fallback=\{turn\.speakerLabel\}/u);
 
   // The in-progress paragraph stays in the same canonical record.
   assert.match(feed, /className=\{`live-turn-card \$\{hasPartial \? "is-live" : ""\}`\}/u);
@@ -1159,7 +1146,7 @@ test("login surface localizes NOVA system labels while preserving credential fie
   assert.match(login, /<FormButton type="submit"[^>]*data-auth-action="submit"/u);
   assert.match(login, /<FormError>\{error\}<\/FormError>/u);
   assert.match(controls, /role="alert"/u);
-  assert.match(login, /aria-label=\{t\("signInFormLabel"\)\}/u);
+  assert.match(login, /aria-label=\{t\(mode === "signup" \? "signUp" : "signInFormLabel"\)\}/u);
   assert.match(login, /href="\/watch">\{t\("participantEntry"\)\}/u);
   assert.doesNotMatch(login, /label="Display name"|label="Password"|>Sign in|Internal access only/);
 });
@@ -1335,7 +1322,7 @@ test("desktop local output is captions-only with no translated-audio playback la
   assert.doesNotMatch(html, /pt-output-group|pt-playback-options|audioLanguage|audioVolume|voiceProvider/);
   assert.doesNotMatch(html, /자막 엔진은 Gemini 고정이며/);
   assert.doesNotMatch(html, /pt-voice-method-help/);
-  assert.match(html, /data-i18n="output\.engineNote"[\s\S]{0,80}data-i18n="output\.engineNoteValue"/);
+  assert.match(html, /data-i18n="output\.engineNote"[\s\S]{0,80}관리자 배정/);
   assertLocalized("output.engineNote", { ko: /자막 엔진/ });
   assertLocalized("output.engineNoteValue", { ko: /Gemini 고정/ });
   assert.doesNotMatch(html, /pt-output-routing-help/);
@@ -1418,13 +1405,14 @@ test("viewer captions label the host as Host and participants by their identity"
   assert.doesNotMatch(viewer, /\?\? "Presenter"/);
 });
 
-test("Stage authorization failure returns the host to Electron Settings", async () => {
+test("Stage authorization failure returns the companion to host login", async () => {
   const stage = await read("webapp/components/live/LiveStageView.tsx");
 
   assert.match(stage, /opened directly by Electron[\s\S]{0,80}as a full-screen Stage overlay/);
-  assert.match(stage, /Host authorization is required for this Stage overlay\./);
-  assert.match(stage, /Return to NOVA Settings, save Host Authorization, then start Live Call again\./);
-  assert.doesNotMatch(stage, /Sign in as the host on this browser|separate named window|host dashboard/);
+  assert.match(stage, /이 회의를 준비한 호스트 계정으로 로그인해 주세요\./);
+  assert.match(stage, /href="\/login"/);
+  assert.match(stage, /clearHostState\(\);\s*setError\("auth"\)/);
+  assert.doesNotMatch(stage, /Return to NOVA Settings, save Host Authorization/);
 });
 
 test("armed controller can explicitly end Live Call without coupling caption controls", async () => {
@@ -1447,60 +1435,20 @@ test("armed controller can explicitly end Live Call without coupling caption con
   assert.doesNotMatch(controllerJs, /sendControl\(\{ command: "(?:restart|stop)" \}\)[\s\S]{0,120}endLiveCall/);
 });
 
-test("controller is a one-row mini-player: brand/drag zone, transport, adjust, window clusters", async () => {
-  const [html, css, main] = await Promise.all([
-    read("public/subtitle-controller.html"),
-    read("public/subtitle.css"),
-    read("electron/main.js"),
-  ]);
-  // Brand zone doubles as the drag handle and shows the status line + VU bar.
-  assert.match(html, /id="controller-drag"[^>]*class="controller-drag mp-brand"/);
-  assert.match(html, /id="controller-live-call-status"[^>]*class="mp-status"[^>]*role="status"/);
-  assert.match(html, /id="controller-vu-fill"/);
-  // Transport: Restart/Stop icons + big Go-Live + elapsed timer readout.
-  assert.match(html, /mp-transport"[^>]*data-i18n-aria="controller\.captionEngine"[\s\S]{0,1200}controller-restart/);
-  assertLocalized("controller.captionEngine", { en: /Caption engine/ });
-  assert.match(html, /id="controller-go-live"[^>]*>Go-Live</);
-  assert.match(html, /id="controller-elapsed"/);
-  // Adjust + window clusters exist; language preset row stays gone.
-  assert.match(html, /mp-adjust"[^>]*data-i18n-aria="controller\.appearance"/);
-  assert.match(html, /mp-window"[^>]*data-i18n-aria="controller\.appControls"[\s\S]{0,900}controller-quit/);
-  assertLocalized("controller.appearance", { en: /Subtitle appearance/ });
-  assertLocalized("controller.appControls", { en: /App controls/ });
-  assert.doesNotMatch(html, /data-controller-languages=/);
-  const controllerBody = html.slice(
-    html.indexOf('<div class="controller-body">'),
-    html.indexOf("</div>\n    </main>"),
-  );
-  assert.match(controllerBody, /id="controller-live-call"/u,
-    "Live Call controls must stay inside the same controller row as Caption Only controls");
-  const controllerBodyRule = css.match(/\.subtitle-controller-body \.controller-body\s*\{[^}]*\}/u)?.[0] ?? "";
-  assert.match(controllerBodyRule, /flex-direction:\s*row;/u);
-  assert.match(controllerBodyRule, /flex-wrap:\s*nowrap;/u,
-    "revealing Live Call controls must widen the pill instead of creating a second row");
-  const compactControllerStart = css.indexOf("@media (max-width: 1500px)");
-  const compactController = css.slice(
-    compactControllerStart,
-    css.indexOf("@media (max-width: 820px)", compactControllerStart),
-  );
-  assert.notEqual(compactController, "",
-    "the initial 1152px Electron viewport needs a compact one-row controller contract");
-  assert.match(compactController, /\.caption-controller-window\s*\{[^}]*gap:\s*6px;[^}]*padding:\s*6px 8px;/su);
-  assert.match(compactController, /\.controller-body\s*\{[^}]*gap:\s*4px;/su);
-  assert.match(compactController, /\.mp-brand\s*\{[^}]*flex-basis:\s*124px;/su);
-  assert.match(compactController, /\.controller-opacity input\s*\{[^}]*width:\s*58px;/su);
-  assert.match(compactController, /\.controller-display-select\s*\{[^}]*width:\s*132px;/su);
-  assert.match(compactController, /\.controller-tick > span:last-child\s*\{[^}]*position:\s*absolute;[^}]*clip-path:\s*inset\(50%\);/su,
-    "All screens keeps its accessible name without spending visible row width");
-  assert.match(css, /\.subtitle-controller-body \.controller-button,[\s\S]{0,180}min-height:\s*24px;/u,
-    "compact controls must preserve a 24px minimum hit height");
-  assert.match(css, /\.subtitle-controller-body \.controller-cluster \{/);
-  assert.match(css, /@keyframes mp-live-pulse/);
-  // Mini-player bar: initial window height well under the old 248px; the
-  // fit-height IPC then hugs the real content height.
-  const heightMatch = main.match(/const height = (\d+);(?=[\s\S]{0,900}controllerWindow = new BrowserWindow)/u);
-  assert.ok(heightMatch, "controller window height constant not found");
-  assert.ok(Number(heightMatch[1]) <= 120, `controller window height ${heightMatch[1]} should be ≤ 120`);
+test("controller keeps four primary actions in one pill with accessible separate popovers", async () => {
+  const [html, css, controller] = await Promise.all([read("public/subtitle-controller.html"), read("public/subtitle-controller-refined.css"), read("public/subtitle-controller.js")]);
+  for (const name of ["mic", "caption", "output"]) {
+    assert.match(html, new RegExp(`data-controller-popover="controller-${name}-popover"`));
+    assert.match(html, new RegExp(`id="controller-${name}-popover"[^>]*role="dialog"`));
+  }
+  assert.match(html, /id="controller-stop"/u);
+  assert.match(html, /id="controller-end-live-call"/u);
+  assert.match(html, /id="controller-drag"/u);
+  assert.match(html, /id="controller-live-call-status"[^>]*role="status"/u);
+  assert.match(css, /controller-bar \{ display:flex/u);
+  assert.match(css, /outline:2px solid #0071e3/u);
+  assert.match(controller, /event.key === "Escape"/u);
+  assert.match(controller, /appearanceSender.flush\(\)/u);
 });
 
 test("controller window hugs its content and shows live signal + elapsed time", async () => {
@@ -1514,7 +1462,7 @@ test("controller window hugs its content and shows live signal + elapsed time", 
   assert.match(controllerJs, /fitControllerHeight/);
   assert.match(preload, /fitControllerHeight: \(height, width\) => ipcRenderer\.send\("subtitle-controller:fit-height", height, width\)/);
   assert.match(main, /ipcMain\.on\("subtitle-controller:fit-height"/);
-  assert.match(main, /Math\.min\(240, Math\.max\(64, height\)\)/);
+  assert.match(main, /Math\.min\(target\.workArea\.height - 24, Math\.max\(64, height\)\)/);
   // The console hugs its content WIDTH too. A fixed width left slack that the
   // right-hand cluster was pushed across, so the clusters no longer pin apart.
   assert.match(css, /\.caption-controller-window \{[^}]*width: max-content/u);
@@ -1614,7 +1562,7 @@ test("subtitle vertical-gap control is wired controller → server → dashboard
   assert.match(controllerJs, /command: "offset", delta: -8/);
   assert.match(controllerJs, /command: "offset", delta: 8/);
   // Server allowlists the new command so it broadcasts to overlay + dashboard.
-  assert.match(serverJs, /"stop", "restart", "font", "offset", "position", "languages", "opacity"/);
+  assert.match(serverJs, /normalizeSubtitleControllerCommand/);
   // Dashboard applies it against the persisted verticalOffset setting.
   assert.match(dashboardJs, /message\.command === "offset"/);
   assert.match(dashboardJs, /function adjustControllerVerticalOffset\(delta\)/);
@@ -1845,75 +1793,18 @@ test("the selected desktop overlay recovers Live Call captions from one canonica
   assert.match(css, /\.subtitle-box\s*\{[^}]*88vw/su);
 });
 
-test("floating controller selects one connected caption display with an accessible live dropdown", async () => {
-  const [html, controller, css, preload, main, relay] = await Promise.all([
-    read("public/subtitle-controller.html"),
-    read("public/subtitle-controller.js"),
-    read("public/subtitle.css"),
-    read("electron/preload.js"),
-    read("electron/main.js"),
-    read("src/live-caption-ipc-relay.js"),
-  ]);
-
-  const windowCluster = html.slice(
-    html.indexOf('class="controller-cluster mp-window"'),
-    html.indexOf("</div>\n      </div>\n    </main>"),
-  );
-  const quitIndex = windowCluster.indexOf('id="controller-quit"');
-  const selectIndex = windowCluster.indexOf('id="controller-display"');
-  assert.ok(quitIndex >= 0 && selectIndex > quitIndex, "display selector must be the rightmost controller control");
-  assert.match(windowCluster, /<label[^>]*for="controller-display"[^>]*class="sr-only"/u);
-  assert.match(windowCluster, /<select id="controller-display"[^>]*aria-label=/u);
-  assert.doesNotMatch(windowCluster, /emoji|gradient|style=/iu);
-  assertLocalized("controller.displaySelect", { en: /Caption display/, ko: /자막 표시 화면/ });
-  assertLocalized("controller.displayLoading", { en: /Checking displays/, ko: /화면 확인 중/ });
-  assertLocalized("controller.displayUnavailable", { en: /No display available/, ko: /사용 가능한 화면 없음/ });
-  assertLocalized("controller.primaryDisplay", { en: /^Main$/, ko: /^메인$/ });
-
-  assert.match(preload, /listOverlayDisplays: \(\) => ipcRenderer\.invoke\("subtitle-overlay:list-displays"\)/u);
-  assert.match(preload, /selectOverlayDisplay: \(displayId\) => ipcRenderer\.invoke\("subtitle-overlay:select-display", displayId\)/u);
-  assert.match(preload, /onOverlayDisplaysChanged/u);
-  assert.match(preload, /return \(\) => ipcRenderer\.removeListener\("subtitle-overlay:displays-changed", handler\)/u);
-
-  assert.match(controller, /const displaySelect = document\.getElementById\("controller-display"\)/u);
-  assert.match(controller, /window\.realtimeNoelDesktop\.listOverlayDisplays\(\)/u);
-  assert.match(controller, /window\.realtimeNoelDesktop\.selectOverlayDisplay\(display\.id\)/u);
-  assert.match(controller, /window\.realtimeNoelDesktop\.onOverlayDisplaysChanged/u);
-  assert.match(controller, /option\.textContent = display\.label/u);
-  assert.match(controller, /displaySelect\.value = String\(state\.selectedDisplayId\)/u);
-  assert.match(controller, /displaySelect\.disabled =/u);
-  const displayController = controller.slice(
-    controller.indexOf("// ── Caption display selection"),
-    controller.indexOf('document.getElementById("controller-font-down")'),
-  );
-  assert.doesNotMatch(displayController, /innerHTML/u);
-
-  // Main owns bounds. The renderer sends only the opaque display id and never
-  // receives or echoes coordinates/URLs through the selection call.
-  const selectionCall = controller.slice(
-    controller.indexOf('displaySelect.addEventListener("change"'),
-    controller.indexOf("// ── VU meter"),
-  );
-  assert.doesNotMatch(selectionCall, /bounds|workArea|url|loadURL/iu);
-
-  assert.match(css, /\.controller-display-select\s*\{[^}]*border-radius:\s*var\(--nova-r-pill\)/su);
-  assert.match(css, /\.controller-display-select:focus-visible\s*\{[^}]*2px solid var\(--nova-blue\)/su);
-  assert.match(css, /\.sr-only\s*\{/u);
-
-  // Selection is persisted and controller placement is the opposite screen;
-  // one connected display remains a valid selectable state where both coexist.
-  assert.match(main, /overlayDisplayId/u);
-  assert.match(main, /controllerWindow/u);
-  assert.match(main, /selectedDisplayId/u);
+test("floating controller selects caption screens individually with an internal controller location", async () => {
+  const [html, controller, preload, main, relay] = await Promise.all([read("public/subtitle-controller.html"), read("public/subtitle-controller.js"), read("electron/preload.js"), read("electron/main.js"), read("src/live-caption-ipc-relay.js")]);
+  assert.match(html, /id="controller-display-options"/u);
+  assert.match(html, /id="controller-display-location"/u);
+  assert.match(controller, /input.type = "checkbox"/u);
+  assert.match(controller, /selectOverlayDisplays\(ids\)/u);
+  assert.doesNotMatch(controller, /\.innerHTML\s*=/u);
+  assert.match(preload, /subtitle-overlay:select-displays/u);
+  assert.match(main, /overlayDisplayIds: displayIds/u);
   assert.match(main, /resolveControllerDisplay/u);
-  assert.match(relay, /return connected\.find\([^\n]+\) \?\? overlayDisplay \?\? primary/u);
-
-  // The existing ResizeObserver fit-size path remains active, so a longer
-  // monitor label widens the pill/window instead of clipping or adding a row.
-  assert.match(controller, /new ResizeObserver\(requestFit\)\.observe\(consoleRoot\)/u);
+  assert.match(relay, /display.internal === true/u);
   assert.match(controller, /fitControllerHeight\(height, width\)/u);
-  assert.match(css, /\.caption-controller-window \{[^}]*width: max-content/u);
-  assert.match(css, /\.caption-controller-window \{[^}]*max-width: none/u);
 });
 
 // ---- Meeting feed rendering cost over a multi-hour call (2026-07-25) ----

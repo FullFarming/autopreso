@@ -1,5 +1,9 @@
 "use client";
 
+import { ActionWithHelp } from "../ui/ActionWithHelp";
+import { SpeakerRosterEditor } from "./SpeakerRosterEditor";
+
+import { useLiveAccessRenewal } from "@/lib/live/use-access-renewal";
 import { useSystemLanguage, useSystemText } from "@/components/system-language/SystemLanguageProvider";
 import { formatHostGlossaryLabel, hostMessages } from "@/lib/system-language/host-messages";
 import { inviteMessages } from "@/lib/system-language/invite-messages";
@@ -39,7 +43,6 @@ import {
 } from "./live-audio-client";
 import MeetingMinutes from "./MeetingMinutes";
 import { LanguagePicker } from "./LanguagePicker";
-import { withRequiredLanguages } from "./language-picker";
 import { resolveSpeakerColor } from "./SpeakerCaption";
 import { getDefaultLiveSchedule, validateLiveSchedule } from "./live-session-schedule";
 import {
@@ -76,7 +79,7 @@ import {
 } from "./scheduled-gateway-start";
 
 const LANGUAGE_OPTIONS = LANGUAGE_CODES.map((code) => ({ code, label: LANGUAGE_LABELS[code] }));
-const REQUIRED_SESSION_LANGUAGES = ["en", "ko"];
+const DEFAULT_SESSION_LANGUAGES = ["en", "ko"];
 
 const SESSION_TYPE_OPTIONS: Array<{ value: LiveSessionType; title: string; stateLabel: string }> = [
   { value: "presentation", title: "발표", stateLabel: "1인 발표" },
@@ -275,8 +278,8 @@ export default function LiveHostDashboard() {
   const [glossaryPack, setGlossaryPack] = useState<GlossaryPack>("general_cre");
   const [isEditingSession, setIsEditingSession] = useState(false);
   const inputSource: LiveInputSource = "mic";
-  const [selectedLanguages, setLanguages] = useState<string[]>([...REQUIRED_SESSION_LANGUAGES]);
-  const languages = useMemo(() => withRequiredLanguages(selectedLanguages, REQUIRED_SESSION_LANGUAGES), [selectedLanguages]);
+  const [selectedLanguages, setLanguages] = useState<string[]>([...DEFAULT_SESSION_LANGUAGES]);
+  const languages = selectedLanguages;
   const [session, setSession] = useState<LiveSession | null>(null);
   const [speakers, setSpeakers] = useState<SpeakerAssignment[]>([]);
   const [endedSession, setEndedSession] = useState<{ id: string; languages: string[] } | null>(null);
@@ -334,6 +337,11 @@ export default function LiveHostDashboard() {
   const recoveryAttemptSessionIdRef = useRef<string | null>(null);
   const manualRestartSessionIdRef = useRef<string | null>(null);
   const sessionId = session?.id ?? null;
+  useLiveAccessRenewal({ sessionId, audience: "host", active: !!session && ["preparing", "live", "paused"].includes(session.status),
+    onError: setError,
+    onRenew: ({ expiresAt, version }) => setSession((current) => current?.id === sessionId && version !== undefined && version >= current.version
+      ? { ...current, expiresAt, version } : current),
+  });
   const currentSessionIdRef = useRef<string | null>(sessionId);
   currentSessionIdRef.current = sessionId;
   const hostCaptions = useMemo(() => Object.values(hostCaptionsByLanguage).flat(), [hostCaptionsByLanguage]);
@@ -348,6 +356,7 @@ export default function LiveHostDashboard() {
     isTranscriptLoaded: isHostTranscriptLoaded,
     transcriptError: hostTranscriptError,
     isRetrying: isHostSummaryRetrying,
+    canRegenerateSummary,
     retry: retryHostSummary,
     reset: resetHostSummaryLifecycle,
   } = useHostSummaryLifecycle(endedSession);
@@ -1839,21 +1848,41 @@ export default function LiveHostDashboard() {
     );
   }
 
+  function showHostSettings(isOpen: boolean) {
+    setIsGlossaryWorkspaceOpen(isOpen);
+    requestAnimationFrame(() => {
+      document.getElementById(isOpen ? "host-settings-heading" : "host-live-navigation")?.focus();
+    });
+  }
+
   return (
     <main className="live-host-shell">
       <aside className="live-host-rail">
         <strong className="live-join-wordmark">NOVA</strong>
         <nav aria-label={t("호스트 작업 영역")}>
-          <button type="button" className="is-current" aria-current="page">{t("라이브")}</button>
-          <a href="/records">{t("라이브콜 기록")}</a>
-          {isConsoleAdmin && <a href="/console">{t("콘솔")}</a>}
-          <button type="button" disabled>{t("설정")}</button>
+          <button type="button" id="host-live-navigation" className={!isGlossaryWorkspaceOpen ? "is-current" : ""} aria-current={!isGlossaryWorkspaceOpen ? "page" : undefined}
+            onClick={() => showHostSettings(false)}>Live Call</button>
+          <button type="button" className={isGlossaryWorkspaceOpen ? "is-current" : ""} aria-current={isGlossaryWorkspaceOpen ? "page" : undefined}
+            onClick={() => showHostSettings(true)}>{t("설정")}</button>
         </nav>
         <p className="live-join-admin live-host-participant-link"><a href="/watch">{t("참가자로 입장")}</a></p>
         <footer className="live-join-credit">Realtime by Noel</footer>
       </aside>
       <WorkspaceViewport>
       <div className="live-host-workspace" data-host-surface={hostSurface}>
+        {isGlossaryWorkspaceOpen && <section id="host-glossary-workspace" className="glass live-panel" aria-labelledby="host-settings-heading">
+          <div className="live-section-heading">
+            <h1 id="host-settings-heading" tabIndex={-1}>{t("설정")}</h1>
+            <button type="button" className="glass-btn" onClick={() => showHostSettings(false)}>{t("닫기")}</button>
+          </div>
+          <p>배정된 엔진: {engineStatusLabel}</p>
+          {isConsoleAdmin && <a className="glass-btn" href="/console">{t("콘솔")}</a>}
+          <ConnectedGlossaryWorkspace sessionSelectionLabel={`${t("세션 용어집")} · ${glossarySelectionLabel}`}
+            onSessionSelection={applyGlossarySelection} />
+        </section>}
+        <div hidden={isGlossaryWorkspaceOpen}>
+        {session && <SpeakerRosterEditor key={session.id} sessionId={session.id} participants={participants} disabled={isBusy} />}
+        <div className="live-action-row"><a href="/host-screen">QR·진행 화면</a><a href="/records">{t("라이브콜 기록")}</a></div>
         <header className="live-host-page-heading">
           <div>
             <h1>{hostSurface === "ended" ? t("세션 완료") : session ? session.title : t("라이브 세션 만들기")}</h1>
@@ -1923,7 +1952,7 @@ export default function LiveHostDashboard() {
             transcript={hostTranscript}
             topics={hostTranscriptTopics}
             isTranscriptLoaded={isHostTranscriptLoaded}
-            summaryError={hostSummaryError}
+            summaryError={hostSummaryError} canRegenerateSummary={canRegenerateSummary}
             transcriptError={hostTranscriptError}
             isLoading={isHostSummaryRetrying}
             isSummaryEmpty={isHostSummaryEmpty}
@@ -2018,7 +2047,7 @@ export default function LiveHostDashboard() {
             </section>
             <div className="live-field-group">
               <LanguagePicker label={t("세션 언어")} value={languages} onChange={setLanguages} minSelection={1} maxSelection={3}
-                requiredLanguages={REQUIRED_SESSION_LANGUAGES} isDisabled={isBusy} />
+                isDisabled={isBusy} />
             </div>
             <details className="live-setup-advanced">
               <summary>{t("고급 설정")}</summary>
@@ -2076,12 +2105,9 @@ export default function LiveHostDashboard() {
                   disabled={isBusy || isGlossaryPinPending || session?.status === "live"}
                   onChange={(selections) => { void applyGlossarySelections(selections); }} />
                 <button type="button" className="glass-btn" aria-expanded={isGlossaryWorkspaceOpen}
-                  aria-controls="host-glossary-workspace" onClick={() => setIsGlossaryWorkspaceOpen((current) => !current)}>
+                  aria-controls="host-glossary-workspace" onClick={() => showHostSettings(!isGlossaryWorkspaceOpen)}>
                   {t("용어집 관리")} </button>
-                {isGlossaryWorkspaceOpen && <div id="host-glossary-workspace">
-                  <ConnectedGlossaryWorkspace sessionSelectionLabel={`${t("세션 용어집")} · ${glossarySelectionLabel}`}
-                    onSessionSelection={applyGlossarySelection} />
-                </div>}
+
               </div>
               <div className="live-field-group">
                 <strong>{t("스테이지 커버")}</strong>
@@ -2189,10 +2215,10 @@ export default function LiveHostDashboard() {
           </div>
           <div className="live-action-row live-surface-actions">
             {!invite && <button type="button" className="glass-btn" disabled={isBusy} onClick={() => void openAdmission()}>{t("참여자 입장 열기")}</button>}
-            <a className="glass-btn" href="/watch" onClick={() => {
+            <ActionWithHelp label={t("나가기 도움말")} help={t("페이지를 나가도 세션은 유지됩니다.")}><a className="glass-btn" href="/watch" onClick={() => {
               recoveryListGenerationRef.current += 1;
               recoveryAttemptSessionIdRef.current = null;
-            }}>{t("준비 나가기 · 세션 유지")}</a>
+            }}>{t("나가기")}</a></ActionWithHelp>
             <button type="button" className="glass-btn" onClick={openStageWindow}
               title={t("스테이지 화면 열기")}>
               {t("스테이지 열기")} </button>
@@ -2354,6 +2380,7 @@ export default function LiveHostDashboard() {
         />
       )}
       {(hostSurface === "invite" || hostSurface === "live") && <p className="live-privacy-note">{t("원본 오디오와 음성 특성은 저장하지 않습니다. 재연결을 위해 최신 확정 자막만 일시적으로 보관합니다.")}</p>}
+      </div>
       </div>
       </WorkspaceViewport>
       {isInviteQrOpen && session && <InviteQrDialog sessionTitle={session.title}

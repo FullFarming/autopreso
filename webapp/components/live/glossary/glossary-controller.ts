@@ -26,11 +26,13 @@ export function presentPreset(preset: GlossaryPreset, latestVersion: number, ter
   };
 }
 
-export function presentTerm(editable: EditableGlossaryTerm, targetLanguage: string): GlossaryTermPresentation {
+export function presentTerm(editable: EditableGlossaryTerm, targetLanguage: string, targetLanguages: readonly string[] = [targetLanguage]): GlossaryTermPresentation {
   return {
     id: editable.term.id,
     source: editable.term.source,
     target: editable.term.translations[targetLanguage] ?? "",
+    translations: Object.fromEntries(targetLanguages.map((language) => [language, editable.term.translations[language] ?? ""])),
+    doNotTranslate: editable.term.doNotTranslate,
     aliases: editable.term.aliases,
     note: editable.status === "candidate" ? "PDF에서 추출한 AI 후보" : undefined,
     status: editable.status,
@@ -51,11 +53,13 @@ export function presentVersions(
   }));
 }
 
-export function extractedCandidatesToEditable(candidates: readonly ExtractedGlossaryCandidate[]): EditableGlossaryTerm[] {
-  return candidates.map((candidate) => ({
+export function extractedCandidatesToEditable(candidates: readonly ExtractedGlossaryCandidate[], importId: string = crypto.randomUUID()): EditableGlossaryTerm[] {
+  return candidates.map((candidate, index) => ({
     status: "candidate",
     term: {
       ...candidate,
+      // Extraction IDs restart for each PDF; imports must never overwrite a reviewed term.
+      id: `pdf-${importId}-${index + 1}`,
       provenance: { kind: "ai_extracted", label: candidate.provenance.label ?? "PDF 후보" },
     },
   }));
@@ -90,12 +94,19 @@ export function buildEditedGlossaryDocument(
     const source = edit?.source.normalize("NFC").trim() ?? item.term.source;
     const target = edit?.target.normalize("NFC").trim() ?? (targetLanguage ? item.term.translations[targetLanguage] ?? "" : "");
     if (!source) issues.push({ id: `source-${item.term.id}`, severity: "error", message: "원문 용어를 입력해 주세요.", fieldId: `glossary-term-source-${index}` });
-    if (!target) issues.push({ id: `target-${item.term.id}`, severity: "error", message: "번역어를 입력해 주세요.", fieldId: `glossary-term-target-${index}` });
+    const doNotTranslate = edit?.doNotTranslate ?? item.term.doNotTranslate;
+    const translations = doNotTranslate ? {} : Object.fromEntries(current.targetLanguages.map((language) => [language,
+      (edit?.translations?.[language] ?? (language === targetLanguage ? target : item.term.translations[language]) ?? "").normalize("NFC").trim(),
+    ]));
+    for (const [language, value] of Object.entries(translations)) {
+      if (!value) issues.push({ id: `target-${item.term.id}-${language}`, severity: "error", message: `${language} 번역어를 입력해 주세요.`, fieldId: `glossary-term-target-${index}-${language}` });
+    }
     return [{
       ...item.term,
       source,
       aliases: (edit?.aliases ?? item.term.aliases.join(",")).split(",").map((alias) => alias.normalize("NFC").trim()).filter(Boolean),
-      translations: targetLanguage ? { ...item.term.translations, [targetLanguage]: target } : item.term.translations,
+      translations,
+      doNotTranslate,
     }];
   });
   const name = edits.name.normalize("NFC").trim();

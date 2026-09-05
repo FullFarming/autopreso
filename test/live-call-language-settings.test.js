@@ -26,7 +26,7 @@ test("settings store validates the Live Call language list but allows empty", as
   const os = await import("node:os");
   const path = await import("node:path");
   const directory = await mkdtemp(path.join(os.tmpdir(), "nova-livecall-langs-"));
-  const store = createSettingsStore({ filePath: path.join(directory, "settings.json"), env: {}, readCodexAuth: () => null });
+  const store = createSettingsStore({ filePath: path.join(directory, "settings.json"), env: {} });
   await store.load();
   await store.save({ subtitle: { liveCallTranslationLanguages: ["ja"] } });
   assert.deepEqual((await store.load()).subtitle.liveCallTranslationLanguages, ["ja"]);

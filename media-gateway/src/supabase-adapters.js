@@ -1,3 +1,4 @@
+import { normalizeSpeakerProfile } from "../../packages/caption-core/speaker-profile.js";
 import { LiveTopicCoordinator } from "./live-topic-coordinator.js";
 import { resolveBuiltInGlossaryDocument } from "./glossary-packs.js";
 import { compileGlossaryDocumentV1, mergeCompiledGlossariesV1 } from "../../packages/caption-core/index.js";
@@ -106,6 +107,8 @@ export class SupabaseLivePublisher {
 
   withMediaFence(mediaFence, { pipelineGeneration = null } = {}) {
     return {
+      fetchSpeakerRoster: (sessionId) => this.fetchSpeakerRoster(sessionId),
+      ackSpeakerRoster: (sessionId, revision) => this.ackSpeakerRoster(sessionId, revision),
       publish: (sessionId, language, event, options) => this.publish(sessionId, language, event, { ...options, mediaFence }),
       persistSourceRecordingGap: (input) => this.persistSourceRecordingGap(input, { mediaFence }),
       persistAuthoritativeSource: (input) => this.persistAuthoritativeSource(input, { mediaFence, pipelineGeneration }),
@@ -119,6 +122,21 @@ export class SupabaseLivePublisher {
       endTopicSession: (...args) => this.endTopicSession(...args),
       suspendTopicSession: (...args) => this.suspendTopicSession(...args),
     };
+  }
+
+  async fetchSpeakerRoster(sessionId) {
+    const value = await this.#request("/rest/v1/rpc/get_live_speaker_roster_gateway_v1", {
+      method: "POST", signal: AbortSignal.timeout(5000), body: JSON.stringify({ p_session_id: requireUuid(sessionId) }),
+    });
+    return normalizeGatewaySpeakerRoster(value, sessionId);
+  }
+
+  async ackSpeakerRoster(sessionId, revision) {
+    if (!Number.isSafeInteger(revision) || revision < 0) throw new Error("INVALID_SPEAKER_ROSTER");
+    const value = await this.#request("/rest/v1/rpc/ack_live_speaker_roster_v1", {
+      method: "POST", signal: AbortSignal.timeout(5000), body: JSON.stringify({ p_session_id: requireUuid(sessionId), p_revision: revision }),
+    });
+    return normalizeGatewaySpeakerRoster(value, sessionId);
   }
 
   async publish(sessionId, language, event, { onLiveEvent = null, mediaFence = null } = {}) {
@@ -138,14 +156,15 @@ export class SupabaseLivePublisher {
       ]);
       let durableResult;
       try {
-        // These headings exist only on the live Electron event. The deployed
-        // snapshot RPC intentionally rejects unknown top-level keys; durable
-        // identity remains in the validated nested speaker object/columns.
+        // Legacy snapshot wrappers reject these headings. Profile-aware SQL
+        // instead requires them to agree with the immutable roster snapshot.
         const durableEvent = { ...event };
-        delete durableEvent.speakerRole;
-        delete durableEvent.speakerName;
-        delete durableEvent.speakerDepartment;
-        delete durableEvent.speakerJobTitle;
+        if (!event.speakerProfile && event.speakerAttribution !== "unresolved") {
+          delete durableEvent.speakerRole;
+          delete durableEvent.speakerName;
+          delete durableEvent.speakerDepartment;
+          delete durableEvent.speakerJobTitle;
+        }
         // Language evidence is stored once on the linked authoritative source.
         delete durableEvent.languageObservation;
         // Producing-model provenance rides on the live event for the host and
@@ -251,7 +270,9 @@ export class SupabaseLivePublisher {
     const sourceLanguage = requirePattern(event.sourceLanguage, /^[a-z]{2,3}(?:-[A-Za-z]{4})?$/u, 16);
     const languageObservation = normalizeLanguageObservation(event.languageObservation, sourceLanguage);
     if (languageObservation === null) throw new Error("INVALID_SOURCE_DRAFT");
-    const draft = { ...base, text: requireBoundedText(event.text, 8000, 24000), sourceLanguage, languageObservation,
+    const draft = { ...base,
+      ...(event.speakerProfile ? { speakerProfile: normalizeSpeakerProfile(event.speakerProfile) } : {}),
+      ...(event.speakerAttribution === "unresolved" ? { speakerAttribution: "unresolved" } : {}), text: requireBoundedText(event.text, 8000, 24000), sourceLanguage, languageObservation,
       speaker: { role, label: role === "host" ? "발표자" : role === "participant" ? "참여자" : "화자 미상" },
       emittedAt: requireIsoInstant(event.emittedAt) };
     if (this.sourceEventFanout) await this.sourceEventFanout(draft, { mediaFence, pipelineGeneration });
@@ -263,7 +284,7 @@ export class SupabaseLivePublisher {
       throw new Error("AUTHORITATIVE_SOURCE_LANE_FAILED");
     }
     try {
-      const rpcVersion = normalized.languageObservation === null ? "v1" : "v2";
+      const rpcVersion = normalized.speakerProfile || normalized.speakerAttribution ? "v4" : normalized.languageObservation === null ? "v1" : "v2";
       const value = await this.#requestSnapshotGuard(
         `/rest/v1/rpc/persist_authoritative_live_source_utterance_${rpcVersion}${mediaFence ? "_fenced_v1" : ""}`,
         {
@@ -276,6 +297,7 @@ export class SupabaseLivePublisher {
             p_normalized_text: normalized.normalizedText,
             p_source_language: normalized.sourceLanguage,
             ...(rpcVersion === "v1" ? {} : { p_language_observation: normalized.languageObservation }),
+            ...(rpcVersion === "v4" ? { p_speaker_profile: normalized.speakerProfile, p_speaker_attribution: normalized.speakerAttribution } : {}),
             p_speaker_role: normalized.speakerRole,
             p_speaker_label: normalized.speakerLabel,
             p_speaker_name: normalized.speakerName,
@@ -297,8 +319,10 @@ export class SupabaseLivePublisher {
         type: "source", sessionId: normalized.sessionId, sourceUtteranceId: identity.sourceUtteranceId,
         sourceSeq: identity.sourceSeq, utteranceKey: normalized.utteranceKey, text: normalized.normalizedText,
         sourceLanguage: normalized.sourceLanguage, languageObservation: normalized.languageObservation,
-        speaker: { role: normalized.speakerRole, label: normalized.speakerRole === "host" ? "발표자"
-          : normalized.speakerRole === "participant" ? "참여자" : "화자 미상" },
+        ...(normalized.speakerProfile ? { speakerProfile: normalized.speakerProfile } : {}),
+        ...(normalized.speakerAttribution ? { speakerAttribution: normalized.speakerAttribution } : {}),
+        speaker: { role: normalized.speakerRole, label: normalized.speakerAttribution ? "발언자 확인 필요" : normalized.speakerProfile?.displayName ?? (normalized.speakerRole === "host" ? "발표자"
+          : normalized.speakerRole === "participant" ? "참여자" : "화자 미상") },
         isFinal: true, sourceStartedAt: normalized.sourceStartedAt, sourceEndedAt: normalized.sourceEndedAt,
         emittedAt: normalized.providerCommittedAt,
       }, { mediaFence, pipelineGeneration });
@@ -585,7 +609,7 @@ export class SupabaseLivePublisher {
       session_id: `eq.${sessionId}`,
       language: `eq.${language}`,
       seq: `gt.${afterSeq}`,
-      select: "seq,participant_id,speaker_label,speaker_name,text,source_text,source_language,origin,utterance_key,translation_status,source_ended_at,emitted_at,authoritative_source_id,translation_capture",
+      select: "seq,participant_id,speaker_label,speaker_name,speaker_profile,speaker_attribution,text,source_text,source_language,origin,utterance_key,translation_status,source_ended_at,emitted_at,authoritative_source_id,translation_capture",
       order: "seq.asc",
       limit: String(limit),
     });
@@ -613,6 +637,8 @@ export class SupabaseLivePublisher {
           lastSeenAt: row.emitted_at,
         }
         : null,
+      ...(row.speaker_profile ? { speakerProfile: normalizeSpeakerProfile(row.speaker_profile) } : {}),
+      ...(row.speaker_attribution === "unresolved" ? { speakerAttribution: "unresolved" } : {}),
       text: row.text,
       isFinal: true,
       // Replayed history must support the same 원문보기 disclosure as live
@@ -909,7 +935,11 @@ function readStoredEngineSelection(preferences) {
     return migrateLegacyEngineSelection({ geminiTranscribeModel: preferences.source, geminiSummaryModel: preferences.summary });
   }
   if (!Object.hasOwn(preferences, "engine") || !isPlainRecord(preferences.engine)
-    || Object.keys(preferences).some((key) => key !== "engine" && key !== "engineHistory")) return null;
+    || Object.keys(preferences).some((key) => key !== "engine" && key !== "engineHistory" && key !== "assignmentRevision")) return null;
+  if (preferences.assignmentRevision !== undefined
+    && (typeof preferences.assignmentRevision !== "string"
+      || !/^[1-9][0-9]{0,18}$/u.test(preferences.assignmentRevision)
+      || BigInt(preferences.assignmentRevision) > 9223372036854775807n)) return null;
   try {
     return normalizeEngineSelection(preferences.engine);
   } catch {
@@ -980,6 +1010,8 @@ function normalizeAuthoritativeSourceInput(input) {
     sourceLanguage,
     languageObservation: normalizeLanguageObservation(input.languageObservation, sourceLanguage),
     speakerRole: input.speakerRole,
+    speakerProfile: input.speakerProfile == null ? null : normalizeSpeakerProfile(input.speakerProfile),
+    speakerAttribution: input.speakerAttribution === "unresolved" ? "unresolved" : null,
     speakerLabel: optionalSnapshot(input.speakerLabel, 80),
     speakerName: optionalSnapshot(input.speakerName, 40),
     speakerDepartment: optionalSnapshot(input.speakerDepartment, 80),
@@ -1584,4 +1616,19 @@ function createSupabaseHeaders(credential, initialHeaders) {
   if (credential.keyType === "legacy-service-role") headers.set("authorization", `Bearer ${credential.apiKey}`);
   else headers.delete("authorization");
   return headers;
+}
+
+function normalizeGatewaySpeakerRoster(value, sessionId) {
+  if (!value || value.sessionId !== sessionId || !Number.isSafeInteger(value.revision) || value.revision < 0
+    || !Number.isSafeInteger(value.appliedRevision) || value.appliedRevision < 0 || value.appliedRevision > value.revision
+    || !Array.isArray(value.speakers) || value.speakers.length > 200) throw new Error("INVALID_SPEAKER_ROSTER");
+  const speakers = value.speakers.map((speaker) => ({ ...normalizeSpeakerProfile(speaker),
+    participantId: speaker.participantId == null ? null : requireUuid(speaker.participantId) }));
+  const ids = speakers.map((speaker) => speaker.id);
+  if (new Set(ids).size !== ids.length) throw new Error("INVALID_SPEAKER_ROSTER");
+  const linked = speakers.map((speaker) => speaker.participantId).filter(Boolean);
+  if (new Set(linked).size !== linked.length) throw new Error("INVALID_SPEAKER_ROSTER");
+  const activeOnsiteSpeakerId = value.activeOnsiteSpeakerId == null ? null : requireUuid(value.activeOnsiteSpeakerId);
+  if (activeOnsiteSpeakerId && !ids.includes(activeOnsiteSpeakerId)) throw new Error("INVALID_SPEAKER_ROSTER");
+  return { sessionId, revision: value.revision, appliedRevision: value.appliedRevision, activeOnsiteSpeakerId, speakers };
 }

@@ -1,3 +1,5 @@
+import { renderCaptionSpeakerProfile } from "./subtitle-speakers.js";
+import { applyControllerAppearance, captureAppearanceEdits, acknowledgeAppearance } from "./controller-appearance.js";
 import {
   CAPTION_AUDIO_PROCESSOR_BUFFER_SIZE,
   CAPTION_AUDIO_SAMPLE_RATE,
@@ -471,61 +473,6 @@ for (const tab of settingsViewTabs) {
 activateSettingsView("general");
 document.getElementById("manage-glossaries")?.addEventListener("click", () => activateSettingsView("advanced"));
 
-async function initializeDesktopLaunch({ buttonId, methodName, failureKey, availabilityMethodName = "" }) {
-  const button = document.getElementById(buttonId);
-  const desktopBridge = window.realtimeNoelDesktop;
-  if (!button || typeof desktopBridge?.[methodName] !== "function") return;
-  button.hidden = true;
-  try {
-    if (availabilityMethodName) {
-      if (typeof desktopBridge?.[availabilityMethodName] !== "function") return;
-      const response = await desktopBridge[availabilityMethodName]();
-      const isEnabled = response === true || (response?.ok === true && response.data === true);
-      if (!isEnabled) return;
-    }
-    button.hidden = false;
-    button.addEventListener("click", async () => {
-      button.disabled = true;
-      button.setAttribute("aria-busy", "true");
-      try {
-        const result = await desktopBridge[methodName]();
-        if (result?.ok === false) throw new Error(result.error || failureKey);
-      } catch {
-        showError(new Error(t(failureKey)));
-      } finally {
-        button.disabled = false;
-        button.removeAttribute("aria-busy");
-      }
-    });
-  } catch {
-    button.hidden = true;
-  }
-}
-
-function initializeMeetingCoachLaunch() {
-  return Promise.all([
-    initializeDesktopLaunch({
-      buttonId: "open-meeting-prep",
-      methodName: "meetingCoachOpenPrep",
-      failureKey: "launch.meetingPrepFailed",
-    }),
-    initializeDesktopLaunch({
-      buttonId: "open-live-coach",
-      methodName: "meetingCoachOpenLiveWindows",
-      failureKey: "launch.liveCoachFailed",
-    }),
-  ]);
-}
-
-function initializeLiveInterpreterLaunch() {
-  return initializeDesktopLaunch({
-    buttonId: "open-live-interpreter",
-    methodName: "openLiveInterpreter",
-    failureKey: "launch.liveInterpreterFailed",
-    availabilityMethodName: "getLiveInterpreterEnabled",
-  });
-}
-
 // Live Call feature flag (desktop host, REALTIME_NOEL_LIVE_CALL_ENABLED):
 // when the host disables Live Call, hide the whole entry section. Base
 // caption features are unaffected.
@@ -536,8 +483,6 @@ if (window.realtimeNoelDesktop?.getLiveCallEnabled) {
   }).catch(() => {});
 }
 
-void initializeMeetingCoachLaunch();
-void initializeLiveInterpreterLaunch();
 
 document.getElementById("export-settings")?.addEventListener("click", () => {
   window.location.href = "/api/settings/export";
@@ -718,11 +663,15 @@ function updateGlossaryDropdownSummary() {
 // glossary (직접 입력) through the normal settings save path.
 
 const GLOSSARY_DETAIL_RENDER_CAP = 200;
+let glossaryDetailReturnFocus = null;
+let glossaryDetailRequestRevision = 0;
 const glossaryDetailState = { label: "", sourceKind: "", sourceId: "", sourceLanguage: "", targetLanguages: [], terms: [], language: "all", query: "" };
 
 async function openGlossaryDetail({ sourceKind, sourceId, label, documentVersion, targetLanguage }) {
   const overlay = document.getElementById("glossary-detail-overlay");
   if (!overlay) return;
+  const requestRevision = ++glossaryDetailRequestRevision;
+  const returnFocus = document.activeElement;
   try {
     let detail;
     if (sourceKind === "builtin") {
@@ -749,12 +698,16 @@ async function openGlossaryDetail({ sourceKind, sourceId, label, documentVersion
         terms,
       };
     }
+    if (requestRevision !== glossaryDetailRequestRevision) return;
+    glossaryDetailReturnFocus = returnFocus;
     Object.assign(glossaryDetailState, detail, { sourceKind, sourceId, language: "all", query: "" });
     const search = document.getElementById("glossary-detail-search");
     if (search) search.value = "";
     setGlossaryCustomStatus();
     renderGlossaryDetail();
     overlay.hidden = false;
+    const dialog = document.getElementById("glossary-detail-dialog");
+    if (dialog && !dialog.open) dialog.showModal();
     document.getElementById("glossary-detail-search")?.focus();
   } catch (error) {
     showError(error);
@@ -762,8 +715,12 @@ async function openGlossaryDetail({ sourceKind, sourceId, label, documentVersion
 }
 
 function closeGlossaryDetail() {
+  glossaryDetailRequestRevision += 1;
+  document.getElementById("glossary-detail-dialog")?.close();
   const overlay = document.getElementById("glossary-detail-overlay");
   if (overlay) overlay.hidden = true;
+  glossaryDetailReturnFocus?.focus?.();
+  glossaryDetailReturnFocus = null;
 }
 
 function glossaryDetailFilteredTerms() {
@@ -877,6 +834,11 @@ function saveGlossaryCustomTerm() {
     });
 }
 
+document.getElementById("glossary-detail-done")?.addEventListener("click", closeGlossaryDetail);
+document.getElementById("glossary-detail-dialog")?.addEventListener("cancel", (event) => {
+  event.preventDefault();
+  closeGlossaryDetail();
+});
 document.getElementById("glossary-detail-close")?.addEventListener("click", closeGlossaryDetail);
 document.getElementById("glossary-detail-overlay")?.addEventListener("pointerdown", (event) => {
   if (event.target === event.currentTarget) closeGlossaryDetail();
@@ -1451,12 +1413,7 @@ const LANGUAGE_KO_LABELS = {
 };
 
 function languageDisplayName(language) {
-  const native = language.nativeLabel || language.label || language.code;
-  // The Korean alias is only useful while the UI itself is Korean; the English
-  // UI shows the native name (and the search box still matches Korean input).
-  if (getLanguage() !== "ko") return native;
-  const koLabel = LANGUAGE_KO_LABELS[language.code];
-  return koLabel && koLabel !== native ? `${koLabel} · ${native}` : native;
+  return language.nativeLabel || language.label || language.code;
 }
 
 function renderLanguagePills() {
@@ -1557,16 +1514,36 @@ function setupLanguageDropdowns() {
     const trigger = root.querySelector(".lang-select-trigger");
     const panel = root.querySelector(".lang-select-panel");
     if (!trigger || !panel) continue;
+    const isGlossaryModal = panel.id === "glossary-select-panel";
+    panel.querySelector("[data-language-search]")?.addEventListener("input", (event) => {
+      const query = event.currentTarget.value.normalize("NFC").toLocaleLowerCase();
+      for (const row of panel.querySelectorAll(".lang-pill")) {
+        const code = row.querySelector("input")?.value ?? "";
+        const searchable = `${row.textContent} ${code} ${LANGUAGE_KO_LABELS[code] ?? ""}`.normalize("NFC").toLocaleLowerCase();
+        row.hidden = !searchable.includes(query);
+      }
+    });
     const close = () => {
+      if (isGlossaryModal) panel.close();
       panel.hidden = true;
       panel.style.marginLeft = "";
       trigger.setAttribute("aria-expanded", "false");
+      if (isGlossaryModal) trigger.focus();
     };
+    if (isGlossaryModal) {
+      panel.addEventListener("cancel", (event) => { event.preventDefault(); close(); });
+      for (const button of panel.querySelectorAll("[data-glossary-select-close]")) button.addEventListener("click", close);
+      panel.querySelector("#glossary-selection-search")?.addEventListener("input", (event) => {
+        const query = event.currentTarget.value.normalize("NFC").toLocaleLowerCase();
+        for (const row of panel.querySelectorAll(".glossary-option-row")) row.hidden = !row.textContent.normalize("NFC").toLocaleLowerCase().includes(query);
+      });
+    }
     trigger.addEventListener("click", () => {
       const isOpen = !panel.hidden;
       if (isOpen) { close(); return; }
       panel.hidden = false;
       trigger.setAttribute("aria-expanded", "true");
+      if (isGlossaryModal) { panel.showModal(); panel.querySelector("input[type=search]")?.focus(); return; }
       // Clamp the panel inside the viewport: it opens trigger-aligned, but a
       // narrow trigger near the right edge would otherwise push it off-screen.
       panel.style.marginLeft = "";
@@ -1584,7 +1561,7 @@ function setupLanguageDropdowns() {
       }
     });
     document.addEventListener("pointerdown", (event) => {
-      if (!panel.hidden && !root.contains(event.target)) close();
+      if (!isGlossaryModal && !panel.hidden && !root.contains(event.target)) close();
     });
   }
   document.getElementById("live-call-language-clear")?.addEventListener("click", () => {
@@ -2436,10 +2413,14 @@ function renderSessionTranscript(container, lines, language = "en") {
     const totalSeconds = Math.floor((line.elapsedMs ?? 0) / 1000);
     stamp.textContent = `${String(Math.floor(totalSeconds / 60)).padStart(2, "0")}:${String(totalSeconds % 60).padStart(2, "0")}`;
     item.append(stamp);
-    if (line.speaker) {
+    if (line.speakerProfile || line.speaker || line.speakerAttribution === "unresolved") {
+      if (line.speakerProfile) item.classList.add("has-speaker-profile");
       const speaker = document.createElement("strong");
       speaker.className = "session-transcript-speaker";
-      speaker.textContent = line.speaker;
+      const recordSessionId = typeof line.liveSessionId === "string" ? line.liveSessionId
+        : /^live-([0-9a-f-]{36})$/iu.exec(openSessionDetail.id)?.[1];
+      const unresolved = line.speakerAttribution === "unresolved";
+      renderCaptionSpeakerProfile(speaker, unresolved ? null : line.speakerProfile, recordSessionId, window.realtimeNoelDesktop, unresolved ? "발언자 확인 필요" : line.speaker || "");
       item.append(speaker);
     }
     const text = document.createElement("span");
@@ -2582,7 +2563,9 @@ function connectWebSocket() {
     const message = JSON.parse(event.data);
     if (message.type === "settings" && message.settings?.subtitle) {
       const keyFlagsBefore = engineKeyFlagSignature();
-      state.settings = normalizeCaptionSettings(message.settings.subtitle);
+      const acknowledged = acknowledgeAppearance(message.settings.subtitle, controllerAppearanceEdits);
+      controllerAppearanceEdits = acknowledged.edits;
+      state.settings = normalizeCaptionSettings(acknowledged.settings);
       state.hasOpenAIKey = Boolean(message.settings.hasOpenAIKey);
       state.hasGeminiKey = Boolean(message.settings.hasGeminiKey);
       state.hasGeminiSecondaryKey = Boolean(message.settings.hasGeminiSecondaryKey);
@@ -2851,9 +2834,6 @@ async function startSubtitles() {
     if (geminiSecondaryKeyInput?.value.trim()) apiKeysPatch.geminiSecondary = geminiSecondaryKeyInput.value.trim();
     if (sonioxKeyInput?.value.trim()) apiKeysPatch.soniox = sonioxKeyInput.value.trim();
     if (Object.keys(apiKeysPatch).length > 0) patch.apiKeys = apiKeysPatch;
-    if (!state.hasGeminiKey && !geminiKeyInput?.value.trim()) {
-      throw new Error(t("key.geminiRequired"));
-    }
     await saveSettings(patch);
     if (geminiKeyInput?.value.trim()) {
       state.hasGeminiKey = true;
@@ -3001,7 +2981,58 @@ async function reconfigureLiveCallLocalProvider() {
   return state.sessionId === sessionId && activeCaptionSessionOwner === "live-call";
 }
 
+let controllerAppearanceSaveTimer = null;
+let controllerAppearanceSavePromise = Promise.resolve();
+let pendingControllerAppearance = null;
+let controllerAppearanceEdits = {};
+
+function persistLatestControllerAppearance() {
+  clearTimeout(controllerAppearanceSaveTimer);
+  controllerAppearanceSaveTimer = null;
+  controllerAppearanceSavePromise = controllerAppearanceSavePromise.then(async () => {
+    const subtitle = pendingControllerAppearance;
+    pendingControllerAppearance = null;
+    if (!subtitle) return;
+    try { await saveSettings({ subtitle }); } catch (error) { showError(error); }
+  });
+  return controllerAppearanceSavePromise;
+}
+
+function previewControllerAppearance(message) {
+  const next = applyControllerAppearance(state.settings, message);
+  if (!next) return false;
+  state.settings = next;
+  controllerAppearanceEdits = { ...controllerAppearanceEdits, ...captureAppearanceEdits(next, message) };
+  if (message.command === "font-size") {
+    form.elements.translationFontSize.value = next.translationFontSize;
+    form.elements.translationFontSizeRange.value = next.translationFontSize;
+    keepSourceTwoPixelsSmaller();
+  }
+  if (message.command === "opacity") {
+    form.elements.opacity.min = "0";
+    form.elements.opacity.value = next.opacity;
+    if (controllerOpacity) { controllerOpacity.min = "0"; controllerOpacity.value = String(next.opacity); }
+  }
+  if (message.command === "position") {
+    for (const language of readTranslationLanguagesFromForm()) {
+      const radio = form.querySelector(`input[name="pos-${language}"][value="${message.position}"]`);
+      if (radio) radio.checked = true;
+    }
+  }
+  applyPreviewSettings(next);
+  updateSessionSummary();
+  pendingControllerAppearance = {
+    translationFontSize: next.translationFontSize, sourceFontSize: next.sourceFontSize,
+    opacity: next.opacity, position: next.position, subtitlePositions: next.subtitlePositions,
+  };
+  clearTimeout(controllerAppearanceSaveTimer);
+  if (message.preview === true) controllerAppearanceSaveTimer = setTimeout(() => { void persistLatestControllerAppearance(); }, 300);
+  else void persistLatestControllerAppearance();
+  return true;
+}
+
 async function handleSubtitleControllerCommand(message) {
+  if (previewControllerAppearance(message)) return;
   if (message.command === "stop") {
     await stopSubtitles();
     return;
@@ -4061,8 +4092,9 @@ function updateSessionSummary() {
 }
 
 function updateServiceStrip() {
-  const geminiStatus = state.hasGeminiKey ? "Gemini Live: ready" : "Gemini Live: key needed";
-  setRealtimeApiStatus(geminiStatus, state.hasGeminiKey ? "active" : "error");
+  const provider = state.settings?.engine?.stt?.provider;
+  const engineLabel = provider === "soniox" ? "Soniox" : provider === "gemini" ? "Gemini" : "자막 엔진";
+  setRealtimeApiStatus(`${engineLabel} · 로그인 후 배정 연결`, "idle");
   setTopicModelStatus(recorderStatusText(state.history.recorderStatus), state.history.recorderStatus?.lastError ? "error" : "active");
 }
 
@@ -4363,7 +4395,7 @@ function persistControllerOpacity() {
 }
 
 function setControllerOpacity(value) {
-  const opacity = Math.max(0.2, Math.min(1, readNumber(value, state.settings.opacity ?? DEFAULT_SUBTITLE.opacity)));
+  const opacity = Math.max(0, Math.min(1, readNumber(value, state.settings.opacity ?? DEFAULT_SUBTITLE.opacity)));
   form.elements.opacity.value = opacity;
   if (controllerOpacity) controllerOpacity.value = String(opacity);
   void persistControllerSubtitleSettings(t("notice.opacitySaved"));
@@ -4936,12 +4968,12 @@ function normalizeLiveCallCaptionRelay(caption) {
     || caption.speaker?.isParticipant === true
     ? "participant"
     : "host";
-  const speakerName = speakerRole === "host"
+  const speakerName = caption.speakerAttribution === "unresolved" ? "발언자 확인 필요" : caption.speakerProfile?.displayName || (speakerRole === "host"
     ? "Host"
     : String(caption.speakerName
       ?? caption.speaker?.name
       ?? caption.speaker?.label
-      ?? t("live.participant"));
+      ?? t("live.participant")));
   const key = getLiveCallCaptionRelayKey(caption);
   const isFinal = caption.isFinal === true;
   return {
@@ -4962,6 +4994,8 @@ function normalizeLiveCallCaptionRelay(caption) {
       sourceSeq: Number.isSafeInteger(caption.seq) ? caption.seq : null,
       sourceText: String(caption.sourceText ?? (caption.origin === "source" ? text : "")),
       speaker: speakerName,
+      ...(caption.speakerProfile ? { speakerProfile: caption.speakerProfile } : {}),
+      ...(caption.speakerAttribution === "unresolved" ? { speakerAttribution: "unresolved" } : {}),
       speakerRole,
       speakerDepartment: speakerRole === "participant"
         ? String(caption.speakerDepartment ?? caption.speaker?.department ?? "")

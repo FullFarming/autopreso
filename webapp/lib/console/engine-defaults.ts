@@ -86,3 +86,18 @@ export async function resolveEngineDefaultsOrFallback(): Promise<EngineSelection
   try { return await resolveEngineDefaults(); }
   catch { return readStoredEngineDefaults(null); }
 }
+
+/** A fresh server lookup at each new session; an unavailable policy never changes providers. */
+export async function resolveHostEngineAssignment(hostId: string): Promise<{ engine: EngineSelection; assignmentRevision: string }> {
+  const assignment = await getConsoleStore().readHostVoiceAssignment(hostId);
+  const engine = normalizeEngineSelection({
+    stt: assignment.provider === "soniox"
+      ? { provider: "soniox", model: "stt-rt-v5", languageMode: "auto" }
+      : { provider: "gemini", model: "gemini-3.5-transcribe-live", languageMode: "auto" },
+    translation: assignment.provider === "soniox"
+      ? { provider: "soniox", model: "stt-rt-v5" }
+      : { provider: "gemini", model: "gemini-3.6-flash" },
+    summary: { provider: "gemini", model: "gemini-3.6-flash" },
+  }) as EngineSelection;
+  return { engine, assignmentRevision: assignment.revision };
+}

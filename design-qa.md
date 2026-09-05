@@ -1,3 +1,15 @@
+# 컨트롤러·버튼·모달 디자인 QA — 2026-09-05
+
+final result: passed within the locally verified UI scope
+
+- 승인된 컨트롤러, 단일 열 캡션, 문단형 참가자 기록과 실제 화면을 비교했다. 모달 겹침, 낮은 화면의 컨트롤러 잘림, 투명도 0 복원, 무표기 발언 버튼을 수정했다.
+- 최종 자동 검사: desktop 1,703 pass/16 skip/0 fail; web 974+77 pass/0 fail; 양쪽 TypeScript 및 diff 검사 통과.
+- 375×568 실제 브라우저에서 입력폼 저장 버튼과 고정 하단 영역의 겹침 없음, 16px 좌우 여백과 긴 문구 줄바꿈을 확인했다. 컨트롤러는 높이 600px 모의 화면에서 검증했다.
+- 실제 인증/음성 제공자/물리적 다중 모니터, Drive·녹음·결제·예약 QR 후속 범위의 완료를 뜻하지 않는다. 배포하지 않았다.
+- 상세 증거와 A1–A8 검수: [검수 보고서](docs/superpowers/status/2026-09-05-ui-polish-verification.md).
+
+---
+
 # 호스트 원문 연속 화자·문단 후속 QA — 2026-08-31
 
 final result: passed

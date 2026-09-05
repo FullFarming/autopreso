@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { readFileSync } from "node:fs";
 
 import { findLanguages, removeSourceLanguage, updateLanguageSelection, withRequiredLanguages } from "./language-picker";
 
@@ -60,4 +61,20 @@ test("restoring legacy language choices does not silently discard them to fit th
   const restored = withRequiredLanguages(["ja", "fr", "de"], ["en", "ko"]);
   assert.deepEqual(restored, ["ja", "fr", "de", "en", "ko"]);
   assert.deepEqual(withRequiredLanguages(["en", "ko"], ["en", "ko"]), ["en", "ko"]);
+});
+
+
+test("host selection preserves exactly one Japanese lane or three selected languages", () => {
+  const limits = { minSelection: 1, maxSelection: 3 };
+  let selected = ["en", "ko"];
+  selected = updateLanguageSelection(selected, "ja", "add", limits);
+  selected = updateLanguageSelection(selected, "ko", "remove", limits);
+  selected = updateLanguageSelection(selected, "en", "remove", limits);
+  assert.deepEqual(selected, ["ja"]);
+  selected = updateLanguageSelection(selected, "zh-Hans", "add", limits);
+  selected = updateLanguageSelection(selected, "en", "add", limits);
+  assert.deepEqual(selected, ["ja", "zh-Hans", "en"]);
+  const host = readFileSync(new URL("./LiveHostDashboard.tsx", import.meta.url), "utf8");
+  assert.match(host, /const languages = selectedLanguages;/);
+  assert.doesNotMatch(host, /requiredLanguages=|withRequiredLanguages|REQUIRED_SESSION_LANGUAGES/);
 });

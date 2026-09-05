@@ -25,12 +25,12 @@ test("listProfiles posts { p_status, p_limit, p_before } with the secret credent
     created_at: "2026-09-02T00:00:00+00:00", last_login_at: null, approved_at: null,
   }]));
   const rows = await store.listProfiles({ status: "pending", limit: 20, before: "2026-09-03T00:00:00.000Z" });
-  assert.equal(calls[0].url, "https://project.supabase.test/rest/v1/rpc/list_profiles_admin_v1");
+  assert.equal(calls[0].url, "https://project.supabase.test/rest/v1/rpc/list_profiles_admin_v2");
   assert.deepEqual(body(calls[0]), { p_status: "pending", p_limit: 20, p_before: "2026-09-03T00:00:00.000Z" });
   assert.equal(new Headers(calls[0].init.headers).get("apikey"), "fixture-secret");
   assert.deepEqual(rows, [{
     id: TARGET, email: "b@x.io", displayName: "Bee", status: "pending", role: "host", hostId: TARGET,
-    createdAt: "2026-09-02T00:00:00+00:00", lastLoginAt: null, approvedAt: null,
+    createdAt: "2026-09-02T00:00:00+00:00", lastLoginAt: null, approvedAt: null, voiceProvider: "soniox", voiceProviderRevision: "1",
   }]);
   const all = storeWith(() => json([]));
   assert.deepEqual(await all.store.listProfiles({}), []);
@@ -97,11 +97,11 @@ test("readSettings maps a fresh project (engine null, no updater) and a configur
 
 test("setEngineDefaults normalizes through the catalog before sending p_engine and refuses an invalid selection without a request", async () => {
   const { store, calls } = storeWith(() => json(true));
-  await store.setEngineDefaults({ actorId: ADMIN, engine: { stt: { provider: "soniox", model: "stt-rt-v5", languageMode: "ko" }, translation: { provider: "gemini", model: "gemini-3.7-flash" }, summary: { provider: "gemini", model: "gemini-3.7-flash" } } });
+  await store.setEngineDefaults({ actorId: ADMIN, engine: { stt: { provider: "soniox", model: "stt-rt-v5", languageMode: "ko" }, translation: { provider: "soniox", model: "stt-rt-v5" }, summary: { provider: "gemini", model: "gemini-3.7-flash" } } });
   assert.equal(calls[0].url, "https://project.supabase.test/rest/v1/rpc/set_engine_defaults_v1");
   assert.deepEqual(body(calls[0]), {
     p_actor_id: ADMIN,
-    p_engine: { stt: { provider: "soniox", model: "stt-rt-v5", languageMode: "ko" }, translation: { provider: "gemini", model: "gemini-3.7-flash" }, summary: { provider: "gemini", model: "gemini-3.7-flash" } },
+    p_engine: { stt: { provider: "soniox", model: "stt-rt-v5", languageMode: "ko" }, translation: { provider: "soniox", model: "stt-rt-v5" }, summary: { provider: "gemini", model: "gemini-3.7-flash" } },
   });
   const invalid = storeWith(() => json(true));
   await assert.rejects(
@@ -155,7 +155,7 @@ test("listActiveSessions posts {} to list_live_session_ids_admin_v1 and maps id/
 });
 
 test("setSessionEngineAsAdmin normalizes the engine, posts actor/session/engine, maps the row, and returns null for no match", async () => {
-  const engine = { stt: { provider: "soniox", model: "stt-rt-v5", languageMode: "ko" }, translation: { provider: "gemini", model: "gemini-3.7-flash" }, summary: { provider: "gemini", model: "gemini-3.7-flash" } };
+  const engine = { stt: { provider: "soniox", model: "stt-rt-v5", languageMode: "ko" }, translation: { provider: "soniox", model: "stt-rt-v5" }, summary: { provider: "gemini", model: "gemini-3.7-flash" } };
   const { store, calls } = storeWith(() => json([{ id: SESSION, status: "live", version: 4 }]));
   assert.deepEqual(await store.setSessionEngineAsAdmin({ actorId: ADMIN, sessionId: SESSION, engine }), { id: SESSION, status: "live", version: 4 });
   assert.equal(calls[0].url, "https://project.supabase.test/rest/v1/rpc/set_live_session_engine_admin_v1");

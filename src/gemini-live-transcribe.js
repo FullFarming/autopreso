@@ -25,7 +25,11 @@ function normalizeCustomVocabulary(values) {
     .slice(0, MAX_CUSTOM_VOCABULARY_ENTRIES);
 }
 
-export function buildGeminiTranscribeSetupMessage({ customVocabulary = [] } = {}) {
+export function geminiTranscribeLanguageCodes(languageMode = "auto") {
+  return languageMode === "auto" ? [] : [languageMode];
+}
+
+export function buildGeminiTranscribeSetupMessage({ customVocabulary = [], languageCodes = [] } = {}) {
   const vocabulary = normalizeCustomVocabulary(customVocabulary);
   return JSON.stringify({
     setup: {
@@ -34,7 +38,7 @@ export function buildGeminiTranscribeSetupMessage({ customVocabulary = [] } = {}
         responseModalities: ["TEXT"],
       },
       inputAudioTranscription: {
-        languageCodes: [],
+        languageCodes: [...new Set(languageCodes)].filter((code) => typeof code === "string" && /^[a-z]{2,3}(?:-[A-Za-z0-9]{2,8})*$/u.test(code)).slice(0, 14),
         // 2026-08-27 feat: authoritative source must remain literal. Cleanup,
         // translation, and terminology repair happen in the bounded text lane.
         mode: "VERBATIM",
@@ -76,6 +80,10 @@ export function handleGeminiTranscribeMessage(raw, context = {}) {
   if (message.error !== undefined) {
     const detail = sanitizeGeminiErrorDetail(message.error?.message ?? message.error?.status)
       || "Unknown Gemini Transcribe error";
+    const status = message.error?.code;
+    const code = status === 401 || status === 403 ? "GEMINI_TRANSCRIBE_UNAUTHENTICATED"
+      : status === 400 ? "GEMINI_TRANSCRIBE_INVALID_REQUEST" : "GEMINI_TRANSCRIBE_UNAVAILABLE";
+    context.onError?.(code);
     context.broadcast?.({
       type: "subtitle:error",
       message: `Gemini Transcribe 오류: ${detail}`,
@@ -97,8 +105,12 @@ export function handleGeminiTranscribeMessage(raw, context = {}) {
   if (final) context.onFinal?.(final);
 }
 
-export function createGeminiTranscribeTransport({ apiKey = "", customVocabulary = [] } = {}) {
+export function createGeminiTranscribeTransport({ apiKey = "", customVocabulary = [], languageCodes = [] } = {}) {
   const resampleInput = createCaptionPcmResampler();
+  let pendingPcm = Buffer.alloc(0);
+  const audioMessage = (pcm) => JSON.stringify({ realtimeInput: { audio: {
+    data: pcm.toString("base64"), mimeType: `audio/pcm;rate=${GEMINI_SAMPLE_RATE}`,
+  } } });
   return {
     requiresSetupAck: true,
     connect({ createWebSocket }) {
@@ -106,23 +118,26 @@ export function createGeminiTranscribeTransport({ apiKey = "", customVocabulary 
       return createWebSocket(url, undefined, {});
     },
     setupPayloads() {
-      return [buildGeminiTranscribeSetupMessage({ customVocabulary })];
+      return [buildGeminiTranscribeSetupMessage({ customVocabulary, languageCodes })];
     },
     audioPayload(base64Pcm24k) {
-      return JSON.stringify({
-        realtimeInput: {
-          audio: {
-            data: resampleInput(Buffer.from(base64Pcm24k, "base64")).toString("base64"),
-            mimeType: `audio/pcm;rate=${GEMINI_SAMPLE_RATE}`,
-          },
-        },
-      });
+      pendingPcm = Buffer.concat([pendingPcm, resampleInput(Buffer.from(base64Pcm24k, "base64"))]);
+      const payloads = [];
+      while (pendingPcm.length >= 3200) {
+        payloads.push(audioMessage(pendingPcm.subarray(0, 3200)));
+        pendingPcm = pendingPcm.subarray(3200);
+      }
+      return payloads.length === 0 ? null : payloads.length === 1 ? payloads[0] : payloads;
     },
     handleMessage(raw, context) {
       handleGeminiTranscribeMessage(raw, context);
     },
     closePayload() {
-      return JSON.stringify({ realtimeInput: { audioStreamEnd: true } });
+      const end = JSON.stringify({ realtimeInput: { audioStreamEnd: true } });
+      if (!pendingPcm.length) return end;
+      const tail = audioMessage(pendingPcm);
+      pendingPcm = Buffer.alloc(0);
+      return [tail, end];
     },
   };
 }

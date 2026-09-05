@@ -55,3 +55,9 @@ test("the dialog keeps native focus containment, opt-in fullscreen and stale QR 
   assert.match(css, /min-height: 44px/u);
   assert.match(css, /outline: 2px solid var\(--nova-web-action\)/u);
 });
+
+test("QR dialog margins account for the native viewport scrollbar", () => {
+  const css = readFileSync(new URL("./InviteQrDialog.module.css", import.meta.url), "utf8");
+  assert.match(css, /width: calc\(100% - 32px\)/u);
+  assert.doesNotMatch(css, /100vw/u);
+});

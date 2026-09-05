@@ -59,6 +59,35 @@ const testUtterance = {
   emittedAt: "2026-07-28T00:00:01.000Z",
 };
 
+test("summary keeps capture-time speaker identity after the online participant profile changes", async () => {
+  const profile = { id: sessionId, version: 1, displayName: "발언 당시 이름", company: "이전 회사", department: "이전 부서", photoAssetId: null };
+  const rosterMember = { participantId: sessionId, displayName: "변경된 이름", department: "새 부서", jobTitle: "새 직책",
+    joinedAt: "2026-07-28T00:00:00.000Z", lastSeenAt: "2026-07-28T00:00:00.000Z", isPresent: false,
+    utteranceCount: 1, speakingSeconds: 1, lastSpokeAt: null, email: null, company: null, summaryConsentAt: null };
+  const outcome = await generateSummaryForLanguage(sessionId, "host-1", "ko", {
+    claim: async () => ({ status: "claimed", generationToken: "token-1" }),
+    fetchUtterances: async () => [{ ...testUtterance, participantId: sessionId, speakerName: profile.displayName,
+      speakerDepartment: profile.department, speakerProfile: profile },
+    { ...testUtterance, seq: 2, participantId: sessionId, speakerName: "발언자 확인 필요", speakerAttribution: "unresolved" }],
+    fetchTopicTranscript: async () => topicSnapshot, fetchSessionContext: async () => null,
+    buildRoster: async () => [rosterMember],
+    generate: async input => {
+      assert.equal(input.utterances[0].speakerName, profile.displayName);
+      assert.equal(input.utterances[0].speakerDepartment, profile.department);
+      assert.equal(input.utterances[0].speakerJobTitle, null);
+      assert.equal(input.utterances[1].speakerName, "발언자 확인 필요");
+      assert.equal(input.utterances[1].speakerDepartment, null);
+      return { summary: storedSummary, model: "gemini-3.6-flash" };
+    }, complete: async () => true, fail: async () => true,
+  });
+  assert.equal(outcome.status, "saved");
+});
+
+test("manual summary regeneration preserves immutable or unresolved attribution before roster enrichment", async () => {
+  const source = await readFile("app/api/live-sessions/[id]/summary/route.ts", "utf8");
+  assert.match(source, /return participant && !utterance\.speakerProfile && utterance\.speakerAttribution !== "unresolved"/u);
+});
+
 test("ready and non-reclaimable claims never invoke Gemini generation", async () => {
   for (const status of ["ready", "running", "exhausted", "permanent_failed"] as const) {
     let generationCalls = 0;

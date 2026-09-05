@@ -1,5 +1,21 @@
 # Tasks: Structured Glossary RAG + Earnings-Call Live Experience
 
+## Requested 2026-09-05 — 핵심 제품·엔진·인증
+
+상세 결과: [구현 보고](../docs/superpowers/status/2026-09-05-core-product-implementation.md), [운영 설정](../docs/superpowers/status/2026-09-05-operator-setup.md).
+
+- [x] G1 — 실제 raw WebSocket 경로와 공식 wire 계약 확인. 초기 SDK 장애 추정 정정.
+- [x] G2 — 입력 언어 힌트와 PCM 프레이밍 정합.
+- [x] G3 — 연결 교체/goAway/장시간 접근 복구와 호스트 종료 분리.
+- [x] G4 — Soniox 자체 번역 3개 언어, Gemini 직렬 번역 및 원문 표시.
+- [x] G5 — 관리자 배정, noel 인증, 단기 키·서버 번역, 종료 권한 검증.
+- [x] G6 — 캡션/Live Call/설정과 다국어 용어집 화면 개선.
+- [x] G7a — 로컬 통합·적대적 검증 및 배포 빌드.
+- [ ] G7b — 실제 공급자·실제 음성으로 누락률/지연과 장시간 운용 측정.
+- [ ] 운영 설정 — 관리자 이메일, OAuth/모델 키, migration 적용 및 명시적 승인 후 배포.
+
+The completed tasks below belong to the historical module, not the newly requested work.
+
 Source: [`plan.md`](./plan.md)  
 Status: Implementation complete; awaiting explicit release approval
 

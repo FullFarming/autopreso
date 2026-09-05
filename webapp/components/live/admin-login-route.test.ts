@@ -41,7 +41,8 @@ test("participant join screen offers the admin sign-in route", () => {
 
 test("admin sign-in page names the admin role and routes back to participant join", () => {
   assert.match(loginSource, /<LoginCard\s*\/>/u);
-  assert.match(cardSource, /aria-label=\{t\("signInFormLabel"\)\}/u);
+  assert.match(cardSource, /aria-label=\{t\(mode === "signup" \? "signUp" : "signInFormLabel"\)\}/u);
+  assert.match(cardSource, /title=\{t\(mode === "signup" \? "signUp" : "title"\)\}/u);
   assert.match(cardSource, /href="\/watch"/u);
   assert.match(cardSource, /t\("participantEntry"\)/u);
 });

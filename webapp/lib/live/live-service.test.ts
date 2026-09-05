@@ -792,17 +792,22 @@ test("manual preparation does not pull future sessions into the automatic prewar
   assert.equal(await isScheduledWithinNextMinute(), false);
 });
 
-test("session languages always include both ko and en caption lanes", async () => {
-  const service = new LiveSessionService(new MemoryLiveSessionStore());
-  const koOnly = await service.create("host-1", { sessionType: "meeting", languages: ["ko"] });
-  assert.deepEqual(koOnly.languages, ["ko", "en"]);
-  const jaOnly = await service.create("host-1", { sessionType: "meeting", languages: ["ja"] });
-  assert.deepEqual(jaOnly.languages, ["ja", "ko", "en"]);
-  // The union never exceeds the 3-language cap: extras beyond capacity drop.
-  const crowded = await service.create("host-1", { sessionType: "meeting", languages: ["ja", "fr", "ko"] });
-  assert.deepEqual(crowded.languages, ["ja", "ko", "en"]);
-  const updated = await service.update("host-1", koOnly.id, { version: 1, languages: ["ja"] });
-  assert.deepEqual(updated.languages, ["ja", "ko", "en"]);
+test("session create and update preserve exactly the selected one to three output languages", async () => {
+  const store = new MemoryLiveSessionStore();
+  const service = new LiveSessionService(store);
+  const single = await service.create("host-1", { sessionType: "meeting", languages: ["ja"] });
+  assert.deepEqual(single.languages, ["ja"]);
+  const selected = ["ja", "zh-Hans", "en"];
+  const created = await service.create("host-1", { sessionType: "meeting", languages: selected });
+  assert.deepEqual(created.languages, selected);
+  const updated = await service.update("host-1", created.id, { version: created.version, languages: ["fr", "de", "it"] });
+  assert.deepEqual(updated.languages, ["fr", "de", "it"]);
+  const renamed = await service.update("host-1", created.id, { version: updated.version, title: "Unchanged language selection" });
+  assert.deepEqual(renamed.languages, updated.languages);
+  assert.deepEqual((await store.getOwned(created.id, "host-1"))?.languages, updated.languages);
+  const defaults = await service.create("host-1", { sessionType: "meeting", languages: undefined });
+  assert.deepEqual(defaults.languages, ["ko", "en"]);
+  await assert.rejects(service.create("host-1", { sessionType: "meeting", languages: [] }), /1개 이상/u);
 });
 
 test("pause and resume are guarded versioned transitions between live and paused", async () => {

@@ -1,6 +1,6 @@
 import { selectGeminiTranscriptionVocabularyFromLegacyText } from "../../packages/caption-core/index.js";
 import { normalizeEngineSelection } from "../../packages/caption-core/caption-engine-catalog.js";
-import { createGeminiTranscribeTransport, geminiTranscribeContract } from "../gemini-live-transcribe.js";
+import { createGeminiTranscribeTransport, geminiTranscribeContract, geminiTranscribeLanguageCodes } from "../gemini-live-transcribe.js";
 import { createSonioxTransport } from "./soniox-transport.js";
 
 /**
@@ -28,7 +28,8 @@ export function createSttTransport({ engine, settings = {}, apiKeys, createSonio
     const apiKey = apiKeys?.gemini ?? "";
     const transport = createGeminiTranscribeTransport({
       apiKey,
-      customVocabulary: [...selectGeminiTranscriptionVocabularyFromLegacyText(settings.glossary)],
+      languageCodes: geminiTranscribeLanguageCodes(selection.stt.languageMode),
+      customVocabulary: [...selectGeminiTranscriptionVocabularyFromLegacyText(settings.glossary ?? "")],
     });
     return Object.assign(transport, {
       providerLabel: "Gemini Transcribe",

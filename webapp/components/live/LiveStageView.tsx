@@ -15,6 +15,7 @@ import type {
   LiveSpeechActivity,
 } from "@/lib/live-contract";
 import { InviteQrCode } from "./LiveHostDashboard";
+import { buildAdmissionJoinUrl } from "./admission-link";
 import { CaptionEntry, TranslationViewport } from "./translation";
 import { getCurrentStageInvite, hasOpenStageAdmission, type HostInvitation } from "./invite-share";
 
@@ -38,23 +39,6 @@ async function readResponse<T>(response: Response): Promise<T> {
   return payload.data;
 }
 
-function readInviteFromHash(sessionId: string): HostInvitation | null {
-  const fragment = window.location.hash.startsWith("#") ? window.location.hash.slice(1) : window.location.hash;
-  const params = new URLSearchParams(fragment);
-  const url = params.get("invite");
-  const admissionCode = params.get("code");
-  const expiresAt = params.get("expiresAt");
-  if (!url || !admissionCode || !/^\d{6}$/u.test(admissionCode)
-    || !expiresAt || !Number.isFinite(Date.parse(expiresAt))) return null;
-  try {
-    const parsed = new URL(url, window.location.origin);
-    if (parsed.origin !== window.location.origin) return null;
-  } catch {
-    return null;
-  }
-  return { sessionId, url, admissionCode, expiresAt };
-}
-
 import { formatCountdown } from "@/lib/live/countdown";
 export { formatCountdown };
 
@@ -62,56 +46,93 @@ export default function LiveStageView({ sessionId }: { sessionId: string }) {
   const [session, setSession] = useState<LiveSession | null>(null);
   const [invite, setInvite] = useState<HostInvitation | null>(null);
   const latestSessionRef = useRef<LiveSession | null>(null);
+  const refreshGenerationRef = useRef(0);
+  const [inviteError, setInviteError] = useState(false);
+  const [inviteRetryKey, setInviteRetryKey] = useState(0);
   const [participants, setParticipants] = useState<LiveParticipantActivity[]>([]);
   const [recentSpeeches, setRecentSpeeches] = useState<LiveSpeechActivity[]>([]);
   const [coverState, setCoverState] = useState<"idle" | "loading" | "loaded" | "failed">("idle");
   const [error, setError] = useState<"" | "auth" | "generic">("");
   const [now, setNow] = useState(() => Date.now());
 
-  // Host authorization: the session GET requires the host cookie; anyone
-  // else sees the auth error state. Other failures (network, 500) must NOT
-  // masquerade as an authorization problem — they get the generic state.
+  const clearHostState = useCallback(() => {
+    latestSessionRef.current = null;
+    setSession(null);
+    setInvite(null);
+    setParticipants([]);
+    setRecentSpeeches([]);
+    setInviteError(false);
+  }, []);
+
   const refreshSession = useCallback(async () => {
+    const generation = ++refreshGenerationRef.current;
+    const isCurrent = () => generation === refreshGenerationRef.current;
     try {
       const response = await fetch(`/api/live-sessions/${sessionId}`, {
-        method: "GET",
-        cache: "no-store",
+        method: "GET", cache: "no-store",
       });
-      if (response.status === 401 || response.status === 403) {
-        latestSessionRef.current = null;
-        setInvite(null);
+      if (!isCurrent()) return;
+      if ([401, 403, 404].includes(response.status)) {
+        clearHostState();
         setError("auth");
         return;
       }
       const latest = await readResponse<LiveSession>(response);
+      if (!isCurrent()) return;
       if (latestSessionRef.current?.id === latest.id && latestSessionRef.current.version > latest.version) return;
       latestSessionRef.current = latest;
       setSession(latest);
       setError("");
+      if (["stopped", "failed"].includes(latest.status)) {
+        setInvite(null);
+        setParticipants([]);
+        setRecentSpeeches([]);
+        return;
+      }
       try {
+        const activityResponse = await fetch(`/api/live-sessions/${sessionId}/participants`, {
+          method: "GET", cache: "no-store",
+        });
+        if (!isCurrent()) return;
+        if ([401, 403, 404].includes(activityResponse.status)) {
+          clearHostState();
+          setError("auth");
+          return;
+        }
         const activity = await readResponse<{
           participants: LiveParticipantActivity[];
           recentSpeeches: LiveSpeechActivity[];
-        }>(
-          await fetch(`/api/live-sessions/${sessionId}/participants`, { method: "GET", cache: "no-store" }),
-        );
+        }>(activityResponse);
+        if (!isCurrent()) return;
         setParticipants(activity.participants.filter((participant) => participant.isPresent));
         setRecentSpeeches(activity.recentSpeeches);
       } catch {
-        // Keep the last successful stack while participant polling recovers.
+        if (!isCurrent()) return;
+        setParticipants([]);
+        setRecentSpeeches([]);
       }
     } catch {
-      latestSessionRef.current = null;
+      if (!isCurrent()) return;
+      clearHostState();
       setError("generic");
     }
-  }, [sessionId]);
+  }, [clearHostState, sessionId]);
 
   useEffect(() => {
-    setInvite(readInviteFromHash(sessionId));
-    void refreshSession();
-    const poll = window.setInterval(() => { void refreshSession(); }, 5_000);
-    return () => window.clearInterval(poll);
-  }, [refreshSession, sessionId]);
+    clearHostState();
+    let isDisposed = false;
+    let poll: number | undefined;
+    const refreshAndSchedule = async () => {
+      await refreshSession();
+      if (!isDisposed) poll = window.setTimeout(() => { void refreshAndSchedule(); }, 5_000);
+    };
+    void refreshAndSchedule();
+    return () => {
+      isDisposed = true;
+      refreshGenerationRef.current += 1;
+      window.clearTimeout(poll);
+    };
+  }, [clearHostState, refreshSession, sessionId]);
 
   // Fast path: the dashboard broadcasts status changes over a same-origin
   // BroadcastChannel, so Start flips this screen instantly instead of after
@@ -136,21 +157,28 @@ export default function LiveStageView({ sessionId }: { sessionId: string }) {
     if (!activeSession || error || !hasOpenStageAdmission(activeSession, Date.now())
       || getCurrentStageInvite(invite, activeSession, Date.now())) return;
     const admissionOpenUntil = activeSession.admissionOpenUntil;
+    setInviteError(false);
     let isDisposed = false;
     const controller = new AbortController();
     void (async () => {
       try {
-        const result = await readResponse<{ admissionCode: string; admissionOpenUntil: string }>(
-          await fetch(`/api/live-sessions/${sessionId}/invites`, {
+        const response = await fetch(`/api/live-sessions/${sessionId}/invites`, {
             method: "POST",
             headers: { "content-type": "application/json" },
             body: JSON.stringify({ action: "read-if-open" }),
             signal: controller.signal,
-          }),
-        );
+          });
+        if (isDisposed) return;
+        if ([401, 403, 404].includes(response.status)) {
+          refreshGenerationRef.current += 1;
+          clearHostState();
+          setError("auth");
+          return;
+        }
+        const result = await readResponse<{ admissionCode: string; admissionOpenUntil: string }>(response);
         const candidate = {
           sessionId,
-          url: `${window.location.origin}/watch`,
+          url: buildAdmissionJoinUrl(window.location.origin, result.admissionCode),
           admissionCode: result.admissionCode,
           expiresAt: result.admissionOpenUntil,
         };
@@ -159,11 +187,11 @@ export default function LiveStageView({ sessionId }: { sessionId: string }) {
           setInvite(candidate);
         }
       } catch {
-        // The stage still works without a QR; the dashboard shows one.
+        if (!isDisposed && !controller.signal.aborted) setInviteError(true);
       }
     })();
     return () => { isDisposed = true; controller.abort(); };
-  }, [error, invite, session?.id, session?.status, session?.admissionOpenUntil, sessionId]);
+  }, [clearHostState, error, invite, session, sessionId, inviteRetryKey]);
 
   useEffect(() => {
     const tick = window.setInterval(() => setNow(Date.now()), 1_000);
@@ -181,18 +209,19 @@ export default function LiveStageView({ sessionId }: { sessionId: string }) {
     return scheduled - now;
   }, [now, session?.scheduledAt]);
 
-  if (error && !session) {
+  if (error) {
     return (
       <main className="live-stage-shell" aria-label="Session stage">
         {error === "auth" ? (
           <>
-            <p className="live-stage-error" role="alert">Host authorization is required for this Stage overlay.</p>
-            <p className="live-stage-hint">Return to NOVA Settings, save Host Authorization, then start Live Call again.</p>
+            <p className="live-stage-error" role="alert">이 회의를 준비한 호스트 계정으로 로그인해 주세요.</p>
+            <p className="live-stage-hint">같은 계정으로 로그인한 뒤 QR·진행 화면에서 회의를 선택해 주세요.</p>
+            <a className="live-link-button" href="/login">호스트 로그인</a>
           </>
         ) : (
           <>
-            <p className="live-stage-error" role="alert">Unable to load the session.</p>
-            <p className="live-stage-hint">Check the network connection — the stage retries automatically.</p>
+            <p className="live-stage-error" role="alert">회의를 불러오지 못했습니다.</p>
+            <p className="live-stage-hint">연결을 확인해 주세요. 잠시 후 다시 확인합니다.</p>
           </>
         )}
       </main>
@@ -234,6 +263,16 @@ export default function LiveStageView({ sessionId }: { sessionId: string }) {
 
   return (
     <main className="live-stage-shell" aria-label="Session stage">
+      <nav className="live-stage-companion-navigation" aria-label="QR·진행 화면">
+        <a className="live-link-button" href="/host-screen">회의 목록</a>
+        <span>음성은 데스크톱에서 송출됩니다.</span>
+      </nav>
+      {!isEnded && !currentInvite && (
+        <div className="live-stage-invite-notice" role="status">
+          {inviteError ? <><span>QR을 불러오지 못했습니다.</span><button type="button" className="live-button-secondary" onClick={() => setInviteRetryKey((value) => value + 1)}>다시 불러오기</button></>
+            : <span>{hasOpenStageAdmission(session, now) ? "QR을 불러오는 중…" : "참여자 입장이 닫혀 있습니다. 데스크톱에서 입장을 열어 주세요."}</span>}
+        </div>
+      )}
       <div className="live-stage-frame">
         {!isEnded && session.hasCoverImage && coverState !== "failed" && (
           <img className={`live-stage-cover ${coverState === "loaded" ? "is-loaded" : ""} ${isPrelive ? "" : "is-dimmed"}`}
@@ -308,7 +347,7 @@ export default function LiveStageView({ sessionId }: { sessionId: string }) {
             >
               {recentSpeeches.map((speech) => (
                 <CaptionEntry key={`${speech.participantId ?? "host"}-${speech.seq}`}
-                  text={speech.text} speakerLabel={speech.displayName} isFinal />
+                  text={speech.text} speakerLabel={speech.displayName} speakerProfile={speech.speakerProfile} sessionId={sessionId} isFinal />
               ))}
             </TranslationViewport>
           </div>

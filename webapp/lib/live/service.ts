@@ -2,7 +2,6 @@ import type { GlossaryPack, LiveAgendaItem, LiveEventType, LiveOutputMode, LiveS
 import { validateEngineForLanguages } from "../../../packages/caption-core/caption-engine-catalog.js";
 import { LiveSessionError } from "./errors";
 import {
-  applyEngineSelection,
   defaultEngineSelection,
   readLiveModelPreferences,
   readNewLiveModelPreferences,
@@ -31,22 +30,6 @@ import {
 
 const SESSION_ACCESS_WINDOW_MILLISECONDS = 6 * 60 * 60 * 1_000;
 const MAX_SCHEDULE_AHEAD_MILLISECONDS = 30 * 24 * 60 * 60 * 1_000;
-const DUAL_CAPTION_LANGUAGES = ["ko", "en"] as const;
-const MAX_SESSION_LANGUAGES = 3;
-
-/** Contract C6: every Live session always carries both ko and en caption
- *  lanes, regardless of the host selection. When the union would exceed the
- *  3-language cap, host-selected extra languages are dropped from the end. */
-export function withDualCaptionLanguages(languages: readonly string[]): [string, ...string[]] {
-  const extras = languages.filter((language) => !DUAL_CAPTION_LANGUAGES.includes(language as typeof DUAL_CAPTION_LANGUAGES[number]));
-  const keptExtras = extras.slice(0, MAX_SESSION_LANGUAGES - DUAL_CAPTION_LANGUAGES.length);
-  const result: string[] = languages.filter((language) => !extras.includes(language) || keptExtras.includes(language));
-  for (const required of DUAL_CAPTION_LANGUAGES) {
-    if (!result.includes(required)) result.push(required);
-  }
-  return result as [string, ...string[]];
-}
-
 export class LiveSessionService {
   private readonly store: LiveSessionStore;
   private readonly now: () => number;
@@ -60,13 +43,13 @@ export class LiveSessionService {
     const { sessionType, outputMode, voiceProvider } = normalizeSessionSettings(input);
     const participantSpeakingEnabled = parseParticipantSpeakingEnabled(input.participantSpeakingEnabled, false);
     assertParticipantSpeakingConfiguration(sessionType, participantSpeakingEnabled);
-    const languages = withDualCaptionLanguages(parseLanguages(input.languages));
+    const languages = parseLanguages(input.languages === undefined ? ["ko", "en"] : input.languages);
     const title = parseTitle(input.title ?? "Live Session");
     const scheduledAt = parseScheduledAt(input.scheduledAt);
     const eventMetadata = parseEventMetadata(input);
     const engine = resolveEngineAuthority(readRequestedEngine(input.modelPreferences), options, options.engineDefaults ?? defaultEngineSelection());
     assertEngineForLanguages(engine, languages);
-    const modelPreferences: LiveModelPreferences = { engine, engineHistory: [] };
+    const modelPreferences: LiveModelPreferences = { engine, engineHistory: [], ...(options.assignmentRevision ? { assignmentRevision: options.assignmentRevision } : {}) };
     const scheduledTimestamp = scheduledAt === null ? this.now() : Date.parse(scheduledAt);
     if (scheduledTimestamp > this.now() + MAX_SCHEDULE_AHEAD_MILLISECONDS) {
       throw new LiveSessionError("라이브 일정은 30일 이내로 예약하세요.", "SCHEDULE_TOO_FAR", 400);
@@ -127,9 +110,9 @@ export class LiveSessionService {
     if (scheduledAt !== null && Date.parse(scheduledAt) > this.now() + MAX_SCHEDULE_AHEAD_MILLISECONDS) {
       throw new LiveSessionError("라이브 일정은 30일 이내로 예약하세요.", "SCHEDULE_TOO_FAR", 400);
     }
-    const languages = input.languages === undefined
-      ? withDualCaptionLanguages(current.languages)
-      : withDualCaptionLanguages(parseLanguages(input.languages));
+    const languages: [string, ...string[]] = input.languages === undefined
+      ? [...current.languages]
+      : parseLanguages(input.languages);
     const maxViewers = input.maxViewers === undefined ? current.maxViewers : parseMaxViewers(input.maxViewers);
     if (maxViewers < current.viewerCount) {
       throw new LiveSessionError("현재 접속자 수보다 최대 시청자를 낮출 수 없습니다.", "MAX_VIEWERS_BELOW_CURRENT", 409);
@@ -141,17 +124,9 @@ export class LiveSessionService {
     );
     assertParticipantSpeakingConfiguration(sessionType, participantSpeakingEnabled);
     const eventMetadata = parseEventMetadata(input, current);
-    // Plan 2 Task 4: the engine may change while the session is live (the
-    // gateway swaps pipelines on `update`); each change lands in engineHistory.
-    const currentPreferences = readLiveModelPreferences(current.modelPreferences);
-    const engine = resolveEngineAuthority(readRequestedEngine(input.modelPreferences), options, currentPreferences.engine);
-    assertEngineForLanguages(engine, languages);
-    const modelPreferences = applyEngineSelection(currentPreferences, engine, {
-      changedAt: new Date(this.now()).toISOString(), byHostId: hostId,
-      // A non-admin never reaches here with its own engine: whatever it sent was
-      // replaced by the global default above, and that is what the entry records.
-      reason: options.isAdmin === true ? "admin" : "server-default",
-    });
+    // 2026-09-05 fix: 배정 변경은 다음 세션부터 적용한다. 편집과 재연결은 시작 시 엔진을 유지한다.
+    const modelPreferences = readLiveModelPreferences(current.modelPreferences);
+    assertEngineForLanguages(modelPreferences.engine, languages);
     const updated = await this.store.updateOwned(sessionId, hostId, version, {
       sessionType,
       outputMode,
@@ -347,6 +322,7 @@ interface LegacySessionSettingsInput {
 export interface EngineAuthorityOptions {
   /** `resolveEngineDefaultsOrFallback()`; absent only for direct callers (tests) - then the client's engine stands. */
   engineDefaults?: EngineSelection;
+  assignmentRevision?: string;
   /** Admins (the console deploy path) may set an explicit engine. */
   isAdmin?: boolean;
 }
@@ -367,6 +343,7 @@ function readRequestedEngine(value: unknown): EngineSelection | undefined {
 // by the catalog default; it is never the requested engine (Task 4 fix M3).
 function resolveEngineAuthority(requested: EngineSelection | undefined, options: EngineAuthorityOptions, fallback: EngineSelection): EngineSelection {
   if (requested === undefined) return fallback;
+  if (options.assignmentRevision !== undefined) return options.engineDefaults ?? fallback;
   if (options.isAdmin === true) return requested;
   return options.engineDefaults ?? defaultEngineSelection();
 }
@@ -388,7 +365,7 @@ interface CreateServiceInput extends LegacySessionSettingsInput {
   sessionType?: unknown;
   outputMode?: unknown;
   voiceProvider?: unknown;
-  languages: unknown;
+  languages?: unknown;
   maxViewers?: unknown;
   participantSpeakingEnabled?: unknown;
   glossaryPack?: unknown;

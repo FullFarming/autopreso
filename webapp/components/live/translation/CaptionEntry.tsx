@@ -1,10 +1,13 @@
-import type { CaptionTranslationStatus } from "@/lib/live-contract";
+import { SpeakerIdentity } from "../SpeakerIdentity";
+import type { SpeakerProfile, CaptionTranslationStatus } from "@/lib/live-contract";
 import styles from "./translation.module.css";
 
 export type CaptionDisplayMode = "translation" | "source" | "bilingual";
 
 interface CaptionEntryProps {
   text: string;
+  speakerProfile?: SpeakerProfile;
+  sessionId?: string;
   speakerLabel?: string;
   speakerColor?: string;
   timestamp?: string;
@@ -17,7 +20,7 @@ interface CaptionEntryProps {
 }
 
 export function CaptionEntry({
-  text,
+  text, speakerProfile, sessionId,
   speakerLabel = "Speaker",
   speakerColor,
   timestamp,
@@ -51,8 +54,8 @@ export function CaptionEntry({
     <article className={styles.entry} data-list-item="caption"
       data-caption-state={state} data-active={isActive || undefined}>
       <header className={styles.entryMeta}>
-        <span className={styles.speakerBadge} aria-hidden="true">{speakerLabel.trim().charAt(0).toUpperCase() || "S"}</span>
-        <span className={styles.speakerName} style={speakerColor ? { color: speakerColor } : undefined}>{speakerLabel}</span>
+        {!speakerProfile?.photoAssetId && <span className={styles.speakerBadge} aria-hidden="true">{(speakerProfile?.displayName || speakerLabel).trim().charAt(0).toUpperCase() || "S"}</span>}
+        <span className={styles.speakerName} style={speakerColor ? { color: speakerColor } : undefined}><SpeakerIdentity profile={speakerProfile} sessionId={sessionId} fallback={speakerLabel} /></span>
         {timestamp && <time className={styles.timestamp}>{timestamp}</time>}
         {disclosureText && (
           <details className={styles.sourceDisclosure}>

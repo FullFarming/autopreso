@@ -7,7 +7,7 @@ import { commonMessages } from "../../lib/dictionaries/common";
 import { useSystemLanguage, useSystemText } from "./SystemLanguageProvider";
 import styles from "./system-language.module.css";
 
-export function SystemLanguageButton() {
+export function SystemLanguageButton({ compact = false }: { compact?: boolean }) {
   const { language, setLanguage, hasStorageError } = useSystemLanguage();
   const t = useSystemText(commonMessages);
   const [isOpen, setIsOpen] = useState(false);
@@ -40,10 +40,10 @@ export function SystemLanguageButton() {
   return <div className={styles.control} ref={rootRef} onBlur={(event) => {
     if (!event.currentTarget.contains(event.relatedTarget)) setIsOpen(false);
   }}>
-    <button ref={triggerRef} className={styles.trigger} type="button" aria-label={`${t("systemLanguage")}: ${SYSTEM_LANGUAGE_LABELS[language]}`}
+    <button ref={triggerRef} className={styles.trigger} data-compact={compact || undefined} type="button" aria-label={`${t("systemLanguage")}: ${SYSTEM_LANGUAGE_LABELS[language]}`}
       aria-haspopup="menu" aria-expanded={isOpen} aria-controls={menuId} onClick={() => setIsOpen((open) => !open)}
       onKeyDown={(event) => { if (event.key === "ArrowDown" || event.key === "ArrowUp") { event.preventDefault(); setIsOpen(true); } }}>
-      <Globe size={20} aria-hidden="true" /><span lang={language}>{SYSTEM_LANGUAGE_LABELS[language]}</span><CaretDown size={16} aria-hidden="true" />
+      <Globe size={20} aria-hidden="true" />{!compact && <><span lang={language}>{SYSTEM_LANGUAGE_LABELS[language]}</span><CaretDown size={16} aria-hidden="true" /></>}
     </button>
     {isOpen && <div id={menuId} className={styles.menu} role="menu" aria-label={t("chooseLanguage")} onKeyDown={handleMenuKey}>
       {SYSTEM_LANGUAGES.map((option, index) => <button key={option} ref={(element) => { optionsRef.current[index] = element; }}

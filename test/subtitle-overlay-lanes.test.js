@@ -1529,3 +1529,16 @@ test("legacy audio-only settings cannot suppress the captions-only overlay", asy
   ws.recv({ type: "subtitle:committed", targetLanguage: "en", sourceLanguage: "ko", translationProvider: "gemini", translatedText: "Captions remain active." });
   assert.match(dom.zoneText("bottom-center"), /Captions remain active/);
 });
+
+
+test("a trusted source caption remains visible beside its translated lane", async () => {
+  const dom = installDom();
+  await loadOverlay("source-with-translations");
+  const ws = dom.getWs(); ws.open(); ws.recv(SETTINGS);
+  ws.recv({ type: "subtitle:committed", targetLanguage: "ko", sourceLanguage: "ko", isSourceCaption: true,
+    translationProvider: "soniox", translatedText: "이번 분기 실적입니다." });
+  ws.recv({ type: "subtitle:committed", targetLanguage: "en", sourceLanguage: "ko", translationProvider: "soniox",
+    translatedText: "These are our quarterly results." });
+  assert.match(dom.zoneText("top-center"), /분기 실적/);
+  assert.match(dom.zoneText("bottom-center"), /quarterly results/);
+});

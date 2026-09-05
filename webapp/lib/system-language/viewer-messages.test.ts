@@ -1,3 +1,4 @@
+import { buildSpeakerPhotoUrl } from "../../../packages/caption-core/speaker-profile.js";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
@@ -59,9 +60,14 @@ test("actual participant reading controls render in three locales while speech a
     return loaded.exports;
   }
   const provider = loadModule("../../components/system-language/SystemLanguageProvider.tsx", { "../../lib/system-language": systemLanguage });
+  const identity = loadModule("../../components/live/SpeakerIdentity.tsx", {
+    "../../../packages/caption-core/speaker-profile.js": { buildSpeakerPhotoUrl },
+    "./SpeakerRosterEditor.module.css": { default: { identity: "identity", organization: "organization" } },
+  });
   const feed = loadModule("../../components/live/ViewerReadingFeed.tsx", {
     "@/components/system-language/SystemLanguageProvider": provider,
     "@/lib/system-language/viewer-messages": { viewerMessages },
+    "./SpeakerIdentity": identity,
   });
   assert.equal(typeof provider.SystemLanguageProvider, "function");
   assert.equal(typeof feed.ViewerReadingFeed, "object");
@@ -73,6 +79,7 @@ test("actual participant reading controls render in three locales while speech a
     "@/lib/system-language": systemLanguage,
     "./meeting-minutes-model": { formatMinuteTime: (instant: string) => instant },
     "./ViewerRecapRequest": { ViewerRecapRequest: () => null },
+    "./SummarySkeleton": loadModule("../../components/live/SummarySkeleton.tsx", {}),
   });
   const Minutes = minutes.ParticipantMeetingMinutes as React.ComponentType<Record<string, unknown>>;
   for (const locale of ["ko", "en", "ja"] as const) {

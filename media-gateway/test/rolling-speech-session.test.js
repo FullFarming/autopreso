@@ -353,7 +353,8 @@ test("one rolling host stream forwards interim transcripts without opening langu
   });
   await session.start();
   emitPartial({ text: "진행 중입니다", sourceLanguage: "ko-KR" });
-  assert.deepEqual(partials, [{ text: "진행 중입니다", sourceLanguage: "ko-KR" }]);
+  assert.match(partials[0].sourceGeneration, /^[0-9a-f-]{36}$/u);
+  assert.deepEqual(partials.map(({ sourceGeneration, ...value }) => value), [{ text: "진행 중입니다", sourceLanguage: "ko-KR", sourceGenerationStartOffsetMs: 0 }]);
   await session.close();
 });
 
@@ -559,9 +560,10 @@ test("partial translations flow from the active stream only and never from a ret
   await new Promise((resolve) => setImmediate(resolve));
   callbacks[0]({ language: "en", text: "retired", sourceLanguage: "ko" });
   callbacks[1]({ language: "en", text: "Hello", sourceLanguage: "ko" });
-  assert.deepEqual(translations, [
-    { language: "en", text: "Hel", sourceLanguage: "ko" },
-    { language: "en", text: "Hello", sourceLanguage: "ko" },
+  assert.notEqual(translations[0].sourceGeneration, translations[1].sourceGeneration);
+  assert.deepEqual(translations.map(({ sourceGeneration, ...value }) => value), [
+    { language: "en", text: "Hel", sourceLanguage: "ko", sourceGenerationStartOffsetMs: 0 },
+    { language: "en", text: "Hello", sourceLanguage: "ko", sourceGenerationStartOffsetMs: 0 },
   ]);
   await session.close();
 });

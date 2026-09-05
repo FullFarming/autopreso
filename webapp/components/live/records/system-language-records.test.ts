@@ -3,6 +3,7 @@ import { readFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import test from "node:test";
 import { createElement, type ComponentType } from "react";
+import * as React from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import ts from "typescript";
 import { formatSystemText, type SystemLanguage, type SystemMessages, type SystemTextValues } from "../../../lib/system-language";
@@ -10,6 +11,7 @@ import { formatSystemRecordDate, formatSystemRecordTime, recordsMessages } from 
 import { authMessages } from "../../../lib/system-language/auth-messages";
 import * as hostSessionClient from "../../../lib/auth/host-session-client";
 import * as loginRetry from "../../../app/(login)/login/login-retry";
+import * as recordedSpeakerPresentation from "./record-speaker-presentation";
 import * as loginCardModel from "../../../components/auth/login-card-model";
 import { loginMessages } from "../../../lib/system-language/login-messages";
 
@@ -77,6 +79,8 @@ function loadComponent(file: string, language: SystemLanguage, additional: Recor
     "@/lib/auth/host-session-client": hostSessionClient,
     "./login-retry": loginRetry,
     "./live-records.module.css": { default: {} },
+    "./ActionWithHelp.module.css": { default: {} },
+    "./record-speaker-presentation": recordedSpeakerPresentation,
     "./earnings.module.css": { default: {} },
     ...additional,
   };
@@ -84,7 +88,7 @@ function loadComponent(file: string, language: SystemLanguage, additional: Recor
     compilerOptions: { module: ts.ModuleKind.CommonJS, jsx: ts.JsxEmit.ReactJSX, target: ts.ScriptTarget.ES2022, esModuleInterop: true },
   }).outputText;
   const output = { exports: {} as Record<string, ComponentType<Record<string, unknown>>> };
-  new Function("require", "module", "exports", code)((id: string) => Object.hasOwn(dependencies, id) ? dependencies[id] : require(id), output, output.exports);
+  new Function("require", "module", "exports", code)((id: string) => id === "../SummarySkeleton" ? loadComponent("../SummarySkeleton.tsx", language) : id === "../../ui/ActionWithHelp" ? loadComponent("../../ui/ActionWithHelp.tsx", language) : id === "./RecordSpeakerIdentity" ? loadComponent("./RecordSpeakerIdentity.tsx", language) : Object.hasOwn(dependencies, id) ? dependencies[id] : require(id), output, output.exports);
   return output.exports;
 }
 
@@ -217,4 +221,67 @@ test("new client topic and section chrome can still server-render without access
     assert.ok(nav.includes(recordsMessages[language]["예정"]));
     assert.match(nav, /href="#captions" aria-current="location"/u);
   }
+});
+
+test("record speaker identity renders saved organization and safe photos with escaped names", () => {
+  const { RecordSpeakerIdentity } = loadComponent("./RecordSpeakerIdentity.tsx", "ko");
+  const speaker = { key: "snapshot", displayName: "<script>김서연</script>", organization: "노바 · 재무팀", photoUrl: "/api/live-sessions/session/speakers/photos/photo", initials: "김서", isUnresolved: false };
+  const photo = renderToStaticMarkup(createElement(RecordSpeakerIdentity, { speaker, fallbackName: "화자 미상" }));
+  assert.match(photo, /&lt;script&gt;김서연&lt;\/script&gt;/u);
+  assert.doesNotMatch(photo, /<script>/u);
+  assert.match(photo, /노바 · 재무팀/u);
+  assert.match(photo, /loading="lazy"/u);
+  assert.match(photo, /alt=""/u);
+  const fallback = renderToStaticMarkup(createElement(RecordSpeakerIdentity, { speaker: { ...speaker, photoUrl: null }, fallbackName: "화자 미상" }));
+  assert.match(fallback, /김서/u);
+  assert.doesNotMatch(fallback, /<img/u);
+});
+
+test("short export action and separate help remain localized and cannot submit a form", () => {
+  for (const language of ["ko", "en", "ja"] as const) {
+    const { ActionWithHelp } = loadComponent("../../ui/ActionWithHelp.tsx", language);
+    const markup = renderToStaticMarkup(createElement(ActionWithHelp, {
+      label: recordsMessages[language]["내보내기 도움말"],
+      help: recordsMessages[language]["이 회의의 전체 기록"],
+      children: createElement("button", { type: "button" }, recordsMessages[language]["Excel 저장"]),
+    }));
+    assert.ok(markup.includes(recordsMessages[language]["Excel 저장"]));
+    assert.ok(markup.includes(`aria-label="${recordsMessages[language]["내보내기 도움말"]}"`));
+    assert.equal((markup.match(/type="button"/g) ?? []).length, 2);
+    assert.match(markup, /aria-expanded="false"/);
+    assert.match(markup, /aria-controls="[^"]+"/);
+    assert.match(markup, /<p[^>]+hidden=""/);
+    assert.doesNotMatch(markup, /<button[^>]*>[^<]*<button/);
+  }
+});
+test("record navigation scrolls intact labels without squeezing four languages into fixed columns", () => {
+  const css = readFileSync(new URL("./live-records.module.css", import.meta.url), "utf8");
+  assert.match(css, /\.recordTabs \{[^}]*overflow-x: auto/);
+  assert.match(css, /\.recordTabs button \{[^}]*flex: 1 0 auto;[^}]*min-width: max-content;[^}]*white-space: nowrap/);
+  const help = readFileSync(new URL("../../ui/ActionWithHelp.tsx", import.meta.url), "utf8");
+  assert.match(help, /event.key === "Escape" && isOpen/);
+  assert.match(help, /event.stopPropagation\(\)/);
+  assert.match(help, /removeEventListener\("pointerdown", closeOutside\)/);
+});
+
+test("help click toggles independently and Escape closes help without closing its enclosing dialog", () => {
+  let isOpen = false;
+  let focusCount = 0;
+  const { ActionWithHelp } = loadComponent("../../ui/ActionWithHelp.tsx", "ko", { react: {
+    ...React, useState: () => [isOpen, (value: boolean | ((current: boolean) => boolean)) => { isOpen = typeof value === "function" ? value(isOpen) : value; }],
+    useId: () => "help-test", useEffect: () => {}, useRef: () => ({ current: { focus: () => { focusCount += 1; } } }),
+  } });
+  const render = () => Reflect.apply(ActionWithHelp, undefined, [{ label: "도움말", help: "설명", children: createElement("button", { type: "button" }, "저장") }]);
+  const initial: unknown = render();
+  assert.ok(React.isValidElement<{ children: React.ReactNode }>(initial));
+  const trigger = React.Children.toArray(initial.props.children)[1];
+  assert.ok(React.isValidElement<{ onClick: () => void; type: string }>(trigger));
+  assert.equal(trigger.props.type, "button");
+  trigger.props.onClick();
+  assert.equal(isOpen, true);
+  const opened: unknown = render();
+  assert.ok(React.isValidElement<{ onKeyDown: (event: { key: string; preventDefault: () => void; stopPropagation: () => void }) => void }>(opened));
+  let prevented = false; let stopped = false;
+  opened.props.onKeyDown({ key: "Escape", preventDefault: () => { prevented = true; }, stopPropagation: () => { stopped = true; } });
+  assert.equal(isOpen, false); assert.equal(prevented, true); assert.equal(stopped, true); assert.equal(focusCount, 1);
 });

@@ -32,6 +32,7 @@ export default function MeetingMinutes({
   transcriptError,
   isLoading,
   isSummaryEmpty = false,
+  canRegenerateSummary = false,
   minutesPollingState,
   minutesPollingStartedAt,
   onRetry,
@@ -49,6 +50,7 @@ export default function MeetingMinutes({
   isLoading: boolean;
   /** No speech was recorded: an empty record, not a generation failure. */
   isSummaryEmpty?: boolean;
+  canRegenerateSummary?: boolean;
   minutesPollingState: SummaryPollingState;
   minutesPollingStartedAt: number | null;
   onRetry: () => void;
@@ -120,14 +122,14 @@ export default function MeetingMinutes({
           : (
             <RecapStatePanel isBusy={isSummaryPolling}>
               {isSummaryPolling ? (
-                <SummarySkeleton label={t("회의 요약을 만들고 있습니다")}
+                <SummarySkeleton label={t(minutesPollingStartedAt !== null && clockMilliseconds - minutesPollingStartedAt > 60_000 ? "요약 준비가 오래 걸리고 있습니다. 원문은 먼저 확인할 수 있습니다." : "회의 요약을 만들고 있습니다")}
                   elapsedLabel={t("경과 시간 {elapsed}", { elapsed: elapsedTime })} />
               ) : isSummaryEmpty ? (
                 <p className="live-minutes-empty">{t("기록된 발언이 없어 요약을 만들 수 없습니다.")}</p>
               ) : (
                 <>
                   <p role={summaryError ? "alert" : undefined}>{t(summaryError || "회의 요약 생성이 예상보다 오래 걸리고 있습니다.")}</p>
-                  <button type="button" disabled={isLoading} onClick={onRetry}>{t(isLoading ? "확인 중…" : "다시 생성")}</button>
+                  <button type="button" disabled={isLoading} onClick={onRetry}>{t(isLoading ? "확인 중…" : canRegenerateSummary ? "다시 생성" : "다시 확인")}</button>
                 </>
               )}
             </RecapStatePanel>

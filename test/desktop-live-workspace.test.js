@@ -103,7 +103,7 @@ test("Stage navigation permits only the exact session path and origin", () => {
   assert.equal(isExactLiveStageUrl("javascript:alert(1)", "https://live.example.test", "/stage/one"), false);
 
   const isAllowedOrigin = vm.runInNewContext(
-    `${sourceBetween("function isAllowedOrigin", "function createNoopTranscription")}; isAllowedOrigin`,
+    `${sourceBetween("function isAllowedOrigin", "// Boot must never reject silently.")}; isAllowedOrigin`,
     { URL },
   );
   const allowed = new Set(["http://127.0.0.1:3210", "https://live.example.test"]);
@@ -407,6 +407,7 @@ function loadOverlayWindows({ displays, overlayEnabled = true, overlaysMuted = f
     resolveOverlayDisplays,
     resolveSelectedOverlayDisplay,
     overlayAllDisplays: false,
+    selectedOverlayDisplayIds: null,
     preferredOverlayDisplayId: "",
     selectedOverlayDisplayId: "",
     overlayWindows: new Map(),
@@ -550,8 +551,7 @@ test("the controller surfaces the caption hide with a visible state and no HTML 
   assert.match(preload, /setOverlaysMuted: \(muted\) => ipcRenderer\.invoke\("subtitle-overlay:set-muted"/u);
   // Both icons ship in the markup and a class picks one: innerHTML is forbidden
   // in this codebase and pinned by other tests.
-  assert.match(html, /mp-icon-when-visible/u);
-  assert.match(html, /mp-icon-when-muted/u);
+  assert.match(html, /id="controller-mute-captions"[^>]*aria-pressed="false"/u);
   assert.doesNotMatch(js, /\.innerHTML\s*=/u);
   // A forgotten mute is indistinguishable from broken captions, so the button
   // paints its state rather than only firing the IPC.

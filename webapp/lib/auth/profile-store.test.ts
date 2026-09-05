@@ -68,3 +68,25 @@ test("readByHostId returns null on empty result and issue/consume desktop codes 
 test("RPC failures map to a 503 store error without leaking the body", async () => {
   await assert.rejects(storeWith(() => json({ message: "boom secret" }, 500)).store.readByHostId("noel"), (e: ProfileStoreError) => e.code === "PROFILE_STORE_UNAVAILABLE" && e.status === 503 && !e.message.includes("boom"));
 });
+
+test("legacy admin provisioning requires configured identity and never revives a disabled profile", async () => {
+  const { store, calls } = storeWith(() => json([]));
+  await assert.rejects(store.ensureLegacyAdmin({ hostId: "noel", bootstrapEmail: "" }), /ADMIN_BOOTSTRAP_EMAILS/u);
+  assert.equal(calls.length, 0);
+  const disabled = storeWith(() => json([{ id: "00000000-0000-4000-8000-000000000011", email: "admin@example.test", host_id: "noel", role: "admin", status: "disabled" }]));
+  await assert.rejects(disabled.store.ensureLegacyAdmin({ hostId:"noel", bootstrapEmail:"admin@example.test" }), (e: ProfileStoreError) => e.code === "ADMIN_PROFILE_DISABLED");
+  assert.equal(disabled.calls.length, 1);
+});
+
+test("verified legacy bootstrap links configured Auth identity without setting password or sending mail", async () => {
+  const id = "00000000-0000-4000-8000-000000000011";
+  const { store, calls } = storeWith((url, init) => {
+    if (url.includes("read_profile")) return json([]);
+    if (url.includes("/admin/users")) return json({ users:[{id,email:"admin@example.test"}] });
+    const body = JSON.parse(String(init.body));
+    assert.equal(body.p_bootstrap, true); assert.equal(body.p_legacy_host_id, "noel");
+    return json([{id,email:"admin@example.test",host_id:"noel",role:"admin",status:"approved"}]);
+  });
+  assert.equal((await store.ensureLegacyAdmin({hostId:"noel",bootstrapEmail:"admin@example.test"})).role,"admin");
+  assert.equal(calls.length,3);
+});

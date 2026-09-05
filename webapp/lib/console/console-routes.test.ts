@@ -6,11 +6,15 @@ import ts from "typescript";
 import * as zod from "zod";
 
 import * as captionEngineCatalog from "../../../packages/caption-core/caption-engine-catalog.js";
+import { createSessionToken } from "../session";
+import { requireAdminFromCookieValue } from "../auth/require-admin";
+import { __setProfileReaderForTests } from "../auth/profile-status-cache";
 import * as liveAuth from "../auth/live-auth";
 import type { ProfileRecord } from "../auth/profile-store";
 import * as boundedJsonBody from "../security/bounded-json-body";
 import * as csrf from "../security/csrf";
 import * as liveTopicValidation from "../security/live-topic-validation";
+import * as sessionSummary from "./session-summary";
 import * as consoleStore from "./console-store";
 import * as engineDefaults from "./engine-defaults";
 
@@ -49,7 +53,7 @@ test("the legacy login route refuses when the console switch is off and live-con
   assert.ok(login.indexOf("LEGACY_LOGIN_DISABLED") < login.indexOf("readBoundedJsonBody(request)"), "the switch is consulted before the body is read");
   const liveConfig = routeSource("live-config");
   assert.match(liveConfig, /engineDefaults/u);
-  assert.match(liveConfig, /resolveEngineDefaultsOrFallback\(\)/u);
+  assert.match(liveConfig, /resolveHostEngineAssignment\(hostId\)/u);
 });
 
 // --- (b) handler tests through the same transpile-and-inject harness host-session.test.ts uses ----
@@ -123,6 +127,7 @@ function loadRoute(name: string, overrides: Record<string, unknown> = {}): Recor
     zod,
     "@/lib/auth/live-auth": liveAuth,
     "@/lib/console/console-route": consoleRoute,
+    "@/lib/console/session-summary": sessionSummary,
     "@/lib/console/console-store": consoleStore,
     "@/lib/console/engine-defaults": engineDefaults,
     "@/lib/console/engine-deploy": engineDeploy,
@@ -185,13 +190,14 @@ function installFakeStore(overrides: Partial<Pick<FakeStore, "settings" | "sessi
       case "listProfiles": return [{ ...ADMIN, id: TARGET_UUID, hostId: TARGET_UUID, email: "b@x.io", role: "host", status: "pending", createdAt: "2026-09-02T00:00:00+00:00", lastLoginAt: null, approvedAt: null }];
       case "countPending": return 1;
       case "setProfileStatus": return { id: TARGET_UUID, status: (args as { status: string }).status, role: "host" };
+      case "setProfileVoiceProvider": return {provider: (args as {provider:string}).provider,revision:"2"};
       case "setProfileRole": return { id: TARGET_UUID, status: "approved", role: (args as { role: string }).role };
       case "listSessions": return fake.sessions;
       case "readSettings": return fake.settings;
       default: return undefined;
     }
   };
-  const store = Object.fromEntries(["listProfiles", "countPending", "setProfileStatus", "setProfileRole", "listSessions", "readSettings", "setEngineDefaults", "setLegacyPasswordLogin", "listActiveSessions", "setSessionEngineAsAdmin", "recordEngineDeploy"].map((m) => [m, record(m)]));
+  const store = Object.fromEntries(["listProfiles", "countPending", "setProfileStatus", "setProfileRole", "setProfileVoiceProvider", "listSessions", "readSettings", "setEngineDefaults", "setLegacyPasswordLogin", "listActiveSessions", "setSessionEngineAsAdmin", "recordEngineDeploy"].map((m) => [m, record(m)]));
   __setConsoleStoreForTests(store as unknown as SupabaseConsoleStore);
   return fake;
 }
@@ -371,7 +377,7 @@ test("GET /api/console/engine-defaults returns the normalized selection with a k
     // The 60 s settings memo must not outlive a write: prime it, write, and read again.
     fake.settings = { ...fake.settings, engine: null };
     assert.deepEqual(await engineDefaults.resolveEngineDefaults(), DEFAULT_ENGINE_SELECTION);
-    const partial = { translation: { provider: "gemini", model: "gemini-3.5-flash-lite" } };
+    const partial = { stt: { provider: "gemini", model: "gemini-3.5-transcribe-live", languageMode: "auto" }, translation: { provider: "gemini", model: "gemini-3.5-flash-lite" } };
     fake.settings = { ...fake.settings, engine: { ...DEFAULT_ENGINE_SELECTION, ...partial } };
     const saved = await put({ engine: partial });
     assert.equal(saved.status, 200);
@@ -381,8 +387,7 @@ test("GET /api/console/engine-defaults returns the normalized selection with a k
     // No running session: the deploy still answers the full shape and leaves one audit row with zero counters.
     assert.deepEqual(bodyOf(saved).data?.results, []);
     assert.deepEqual(bodyOf(saved).data?.summary, { switched: 0, queued: 0, failed: 0 });
-    assert.deepEqual(fake.calls.map((c) => c.method).filter((m) => m !== "readSettings"), ["setEngineDefaults", "listActiveSessions", "recordEngineDeploy"]);
-    assert.deepEqual(fake.calls.find((c) => c.method === "recordEngineDeploy")?.args, { actorId: ADMIN_UUID, engine: { ...DEFAULT_ENGINE_SELECTION, ...partial }, summary: { switched: 0, queued: 0, failed: 0 } });
+    assert.deepEqual(fake.calls.map((c) => c.method).filter((m) => m !== "readSettings"), ["setEngineDefaults"]);
     assert.equal(pushCalls.length, 0);
   });
 });
@@ -396,110 +401,14 @@ const SONIOX_COMBINED = { stt: { provider: "soniox", model: "stt-rt-v5", languag
 const deployRequest = (engine: unknown) => request("/api/console/engine-defaults", { method: "PUT", body: { engine } });
 const methodsOf = (fake: FakeStore, method: string) => fake.calls.filter((c) => c.method === method);
 
-test("PUT deploy: two live sessions → two admin RPC writes and two pushes with mixed results, one audit row, and the token never leaves the server", async () => {
+test("saving engine settings never mutates or contacts active sessions", async () => {
   await withEnvironment(async () => {
-    const fake = installFakeStore({ activeSessions: [{ id: SESSION_A, status: "live", languages: ["ko", "en"] }, { id: SESSION_B, status: "preparing", languages: ["ja"] }] });
-    pushOutcome = (sessionId) => sessionId === SESSION_A ? { result: "switched" } : { result: "queued", code: "SESSION_COLD" };
-    const route = loadRoute("console/engine-defaults", adminModule());
-    const engine = { ...DEFAULT_ENGINE_SELECTION, translation: { provider: "gemini", model: "gemini-3.7-flash" } };
-    const result = await route.PUT(deployRequest(engine));
+    const fake = installFakeStore();
+    const result = await loadRoute("console/engine-defaults", adminModule()).PUT(request("/api/console/engine-defaults", { method: "PUT", body: { engine: DEFAULT_ENGINE_SELECTION } }));
     assert.equal(result.status, 200);
-    const { data } = bodyOf(result);
-    assert.deepEqual(data?.engine, engine);
-    assert.deepEqual(data?.results, [{ sessionId: SESSION_A, result: "switched" }, { sessionId: SESSION_B, result: "queued", code: "SESSION_COLD" }]);
-    assert.deepEqual(data?.summary, { switched: 1, queued: 1, failed: 0 });
-
-    const order = fake.calls.map((c) => c.method);
-    assert.ok(order.indexOf("setEngineDefaults") < order.indexOf("listActiveSessions"), "the global default is stored before the session fan-out");
-    assert.deepEqual(methodsOf(fake, "setSessionEngineAsAdmin").map((c) => c.args), [
-      { actorId: ADMIN_UUID, sessionId: SESSION_A, engine }, { actorId: ADMIN_UUID, sessionId: SESSION_B, engine },
-    ]);
-    assert.deepEqual(pushCalls.map((c) => [c.gatewayUrl, c.sessionId, c.token]), [
-      ["wss://gateway.test/live", SESSION_A, `${TOKEN_FIXTURE_PREFIX}${SESSION_A}`], ["wss://gateway.test/live", SESSION_B, `${TOKEN_FIXTURE_PREFIX}${SESSION_B}`],
-    ]);
-    for (const call of pushCalls) assert.deepEqual(call.engine, engine);
-    assert.deepEqual(mintCalls, [{ hostId: ADMIN.hostId, sessionId: SESSION_A }, { hostId: ADMIN.hostId, sessionId: SESSION_B }], "one session-bound ADMIN token per push");
-    assert.deepEqual(methodsOf(fake, "recordEngineDeploy").map((c) => c.args), [{ actorId: ADMIN_UUID, engine, summary: { switched: 1, queued: 1, failed: 0 } }]);
-    assert.equal(order.at(-1), "recordEngineDeploy", "the audit row is written after the outcomes are known");
-    assert.doesNotMatch(JSON.stringify(result.body), new RegExp(TOKEN_FIXTURE_PREFIX, "u"));
-    assert.doesNotMatch(JSON.stringify(fake.calls), new RegExp(TOKEN_FIXTURE_PREFIX, "u"), "the token is never persisted");
-  });
-});
-
-test("PUT deploy: an unreachable or unconfigured gateway still writes every session row and reports failed with the client code", async () => {
-  await withEnvironment(async () => {
-    const fake = installFakeStore({ activeSessions: [{ id: SESSION_A, status: "live", languages: ["ko", "en"] }] });
-    pushOutcome = () => ({ result: "failed", code: "GATEWAY_UNREACHABLE" });
-    const route = loadRoute("console/engine-defaults", adminModule());
-    const unreachable = bodyOf(await route.PUT(deployRequest(DEFAULT_ENGINE_SELECTION)));
-    assert.equal(unreachable.ok, true);
-    assert.deepEqual(unreachable.data?.results, [{ sessionId: SESSION_A, result: "failed", code: "GATEWAY_UNREACHABLE" }]);
-    assert.deepEqual(unreachable.data?.summary, { switched: 0, queued: 0, failed: 1 });
-    assert.equal(methodsOf(fake, "setEngineDefaults").length, 1);
-    assert.equal(methodsOf(fake, "setSessionEngineAsAdmin").length, 1, "the DB write completes even though the gateway is down");
-    assert.deepEqual(methodsOf(fake, "recordEngineDeploy").at(-1)?.args, { actorId: ADMIN_UUID, engine: DEFAULT_ENGINE_SELECTION, summary: { switched: 0, queued: 0, failed: 1 } });
-
-    // No gateway URL in the environment: the DB is still authoritative, the push is skipped with a code, nothing is minted.
-    delete process.env.LIVE_GATEWAY_URL;
-    pushCalls.length = 0; mintCalls.length = 0;
-    const unconfigured = bodyOf(await route.PUT(deployRequest(DEFAULT_ENGINE_SELECTION)));
-    assert.deepEqual(unconfigured.data?.results, [{ sessionId: SESSION_A, result: "failed", code: "LIVE_GATEWAY_URL_MISSING" }]);
-    assert.equal(methodsOf(fake, "setSessionEngineAsAdmin").length, 2);
-    assert.equal(pushCalls.length, 0);
-    assert.equal(mintCalls.length, 0);
-
-    // NEXT_PUBLIC_LIVE_GATEWAY_URL is the fallback the viewer bundle already uses.
-    process.env.NEXT_PUBLIC_LIVE_GATEWAY_URL = "wss://public-gateway.test/live";
-    pushOutcome = () => ({ result: "switched" });
-    const viaPublic = bodyOf(await route.PUT(deployRequest(DEFAULT_ENGINE_SELECTION)));
-    assert.deepEqual(viaPublic.data?.results, [{ sessionId: SESSION_A, result: "switched" }]);
-    assert.equal(pushCalls.at(-1)?.gatewayUrl, "wss://public-gateway.test/live");
-  });
-});
-
-test("PUT deploy: a session that stopped between list and write is SESSION_NOT_ACTIVE, a throwing RPC is failed with its code, and both skip the gateway", async () => {
-  await withEnvironment(async () => {
-    const fake = installFakeStore({
-      activeSessions: [{ id: SESSION_A, status: "live", languages: ["ko"] }, { id: SESSION_B, status: "live", languages: ["ko"] }, { id: SESSION_C, status: "preparing", languages: ["ko"] }],
-      switchResults: { [SESSION_A]: null, [SESSION_B]: new ConsoleStoreError("down", "CONSOLE_STORE_UNAVAILABLE", 503) },
-    });
-    const route = loadRoute("console/engine-defaults", adminModule());
-    const result = await route.PUT(deployRequest(DEFAULT_ENGINE_SELECTION));
-    assert.equal(result.status, 200, "one dead session never fails the whole deploy");
-    const { data } = bodyOf(result);
-    assert.deepEqual(data?.results, [
-      { sessionId: SESSION_A, result: "failed", code: "SESSION_NOT_ACTIVE" },
-      { sessionId: SESSION_B, result: "failed", code: "CONSOLE_STORE_UNAVAILABLE" },
-      { sessionId: SESSION_C, result: "switched" },
-    ]);
-    assert.deepEqual(data?.summary, { switched: 1, queued: 0, failed: 2 });
-    assert.deepEqual(pushCalls.map((c) => c.sessionId), [SESSION_C]);
-    assert.deepEqual(mintCalls.map((c) => c.sessionId), [SESSION_C]);
-    assert.equal(methodsOf(fake, "setSessionEngineAsAdmin").length, 3);
-  });
-});
-
-test("PUT deploy: a Soniox combined engine is refused per 1- or 3-language session with ENGINE_LANGUAGE_COUNT_INVALID before any RPC or push", async () => {
-  await withEnvironment(async () => {
-    process.env.SONIOX_API_KEY = "set";
-    const fake = installFakeStore({ activeSessions: [
-      { id: SESSION_A, status: "live", languages: ["ko", "en", "ja"] }, { id: SESSION_B, status: "live", languages: ["ko", "en"] }, { id: SESSION_C, status: "preparing", languages: ["ko"] },
-    ] });
-    const route = loadRoute("console/engine-defaults", adminModule());
-    const result = await route.PUT(deployRequest(SONIOX_COMBINED));
-    assert.equal(result.status, 200);
-    const { data } = bodyOf(result);
-    assert.deepEqual(data?.engine, SONIOX_COMBINED);
-    assert.deepEqual(data?.results, [
-      { sessionId: SESSION_A, result: "failed", code: "ENGINE_LANGUAGE_COUNT_INVALID" },
-      { sessionId: SESSION_B, result: "switched" },
-      { sessionId: SESSION_C, result: "failed", code: "ENGINE_LANGUAGE_COUNT_INVALID" },
-    ]);
-    assert.deepEqual(data?.summary, { switched: 1, queued: 0, failed: 2 });
-    assert.deepEqual(methodsOf(fake, "setSessionEngineAsAdmin").map((c) => (c.args as { sessionId: string }).sessionId), [SESSION_B], "the language-count guard runs before the RPC");
-    assert.deepEqual(pushCalls.map((c) => c.sessionId), [SESSION_B]);
-    assert.equal(methodsOf(fake, "setEngineDefaults").length, 1, "the global default is still stored: new 2-language sessions may use it");
-    assert.doesNotMatch(JSON.stringify(result.body), /"set"/u);
+    assert.equal(bodyOf(result).data?.appliesFrom, "next-session");
+    assert.deepEqual(fake.calls.map((call) => call.method), ["setEngineDefaults"]);
+    assert.deepEqual(pushCalls, []);
   });
 });
 
@@ -531,6 +440,9 @@ test("GET/PUT /api/console/settings expose the legacy login switch and warn when
 
 test("POST /api/login is refused with LEGACY_LOGIN_DISABLED when the switch is off and reaches the body when it is on", async () => {
   const load = (settings: () => Promise<{ legacyPasswordLoginEnabled: boolean }>) => loadRoute("login", {
+    "@/lib/auth/bootstrap-admins": {},
+    "@/lib/auth/profile-store": {},
+    "@/lib/auth/profile-status-cache": {},
     "@/lib/session": { SESSION_COOKIE: "rnw_session", SESSION_TTL_SECONDS: 1, createSessionToken: async () => "unused" },
     "@/lib/security/host-login-config": { readHostLoginConfig: () => ({ isEnabled: true, userIds: new Set(["operator"]), password: "pw-fixture", passwordHash: undefined }) },
     "@/lib/security/host-password": { verifyHostPassword: async () => false },
@@ -552,30 +464,72 @@ test("POST /api/login is refused with LEGACY_LOGIN_DISABLED when the switch is o
   assert.equal(bodyOf(outage).code, "LOGIN_SECURITY_UNAVAILABLE");
 });
 
-test("GET /api/live-config adds the normalized engine defaults next to gatewayUrl and degrades to the catalog default on a console outage", async () => {
-  await withEnvironment(async () => {
-    const fake = installFakeStore({ settings: { legacyPasswordLoginEnabled: true, engine: { translation: { provider: "gemini", model: "gemini-3.5-flash-lite" } }, engineUpdatedAt: null, engineUpdatedByEmail: null } });
-    const previousGateway = process.env.NEXT_PUBLIC_LIVE_GATEWAY_URL;
-    process.env.NEXT_PUBLIC_LIVE_GATEWAY_URL = "wss://gateway.test/live";
-    try {
-      const route = loadRoute("live-config");
-      const { data } = bodyOf(await route.GET(request("/api/live-config")));
-      const captionEngines = captionEngineCatalog.captionEngineCatalogForClient({
-        hasApiKeys: { gemini: Boolean(process.env.GEMINI_API_KEY), soniox: Boolean(process.env.SONIOX_API_KEY) },
-      });
-      assert.deepEqual(data, { gatewayUrl: "wss://gateway.test/live", engineDefaults: { ...DEFAULT_ENGINE_SELECTION, translation: { provider: "gemini", model: "gemini-3.5-flash-lite" } }, captionEngines });
-      // Plan 2 Task 4: hosts learn which engines this deployment can run - availability booleans, never key values.
-      for (const role of ["stt", "translation", "summary"] as const) {
-        for (const entry of (data as unknown as { captionEngines: Record<typeof role, Array<Record<string, unknown>>> }).captionEngines[role]) assert.equal(typeof entry.available, "boolean");
-      }
-      assert.doesNotMatch(JSON.stringify(data), /AIza|sk-|apiKey/u);
-      fake.failWith = new ConsoleStoreError("down", "CONSOLE_STORE_UNAVAILABLE", 503);
-      engineDefaults.consoleSettingsCache.invalidate();
-      const degraded = bodyOf(await route.GET(request("/api/live-config")));
-      assert.equal(degraded.ok, true);
-      assert.deepEqual(degraded.data?.engineDefaults, DEFAULT_ENGINE_SELECTION);
-    } finally {
-      if (previousGateway === undefined) delete process.env.NEXT_PUBLIC_LIVE_GATEWAY_URL; else process.env.NEXT_PUBLIC_LIVE_GATEWAY_URL = previousGateway;
-    }
+test("live-config authenticates and fails closed rather than replacing a user's assignment", async () => {
+  let failure = false;
+  const route = loadRoute("live-config", {
+    "@/lib/auth/live-auth": { ...liveAuth, requireHost: async () => ({ hostId: "user-a" }) },
+    "@/lib/console/engine-defaults": { ...engineDefaults, resolveHostEngineAssignment: async (hostId: string) => {
+      assert.equal(hostId, "user-a"); if (failure) throw new Error("offline");
+      return { engine: DEFAULT_ENGINE_SELECTION, assignmentRevision: "4" };
+    } },
   });
+  const accepted = await route.GET(request("/api/live-config"));
+  assert.equal(accepted.status,200);
+  assert.equal(bodyOf(accepted).data?.assignmentRevision,"4");
+  assert.equal(accepted.headers.get("cache-control"),"private, no-store");
+  failure = true;
+  const denied = await route.GET(request("/api/live-config"));
+  assert.equal(denied.status,503); assert.equal(bodyOf(denied).code,"ENGINE_ASSIGNMENT_UNAVAILABLE");
+  const anonymous = loadRoute("live-config", { "@/lib/auth/live-auth": { ...liveAuth, requireHost: async () => { throw new liveAuth.AuthenticationError("auth"); } } });
+  assert.equal((await anonymous.GET(request("/api/live-config"))).status,401);
+});
+
+test("only an admin can assign a known provider and a save never touches an active session", async () => {
+  await withEnvironment(async () => {
+    const fake = installFakeStore();
+    const route = loadRoute("console/users", adminModule());
+    const patch = (body: unknown) => route.PATCH(request("/api/console/users",{method:"PATCH",body}));
+    const result = await patch({profileId:TARGET_UUID,voiceProvider:"gemini"});
+    assert.equal(result.status,200);
+    assert.deepEqual(bodyOf(result).data,{provider:"gemini",revision:"2"});
+    assert.deepEqual(fake.calls,[{method:"setProfileVoiceProvider",args:{actorId:ADMIN_UUID,profileId:TARGET_UUID,provider:"gemini"}}]);
+    for (const body of [{profileId:TARGET_UUID,voiceProvider:"attacker"},{profileId:TARGET_UUID,voiceProvider:"soniox",role:"admin"}]) assert.equal((await patch(body)).status,400);
+    const denied = await loadRoute("console/users",adminModule("host")).PATCH(request("/api/console/users",{method:"PATCH",body:{profileId:TARGET_UUID,voiceProvider:"gemini"}}));
+    assert.equal(denied.status,403);
+    assert.equal(fake.calls.length,1);
+  });
+});
+
+test("legacy admin bootstrap happens only after valid credentials and issues no cookie on setup failure", async () => {
+  const priorIds = process.env.ADMIN_USER_IDS; process.env.ADMIN_USER_IDS = "noel";
+  __setProfileReaderForTests(async () => ({ ...ADMIN, hostId: "noel" }));
+  let issuedToken = "";
+  try {
+  let valid = false; let bootstraps = 0; let tokens = 0; let bootstrapFails = false;
+  const route = loadRoute("login", {
+    "@/lib/session": { SESSION_COOKIE:"rnw_session",SESSION_TTL_SECONDS:3600,createSessionToken:async () => {tokens++;issuedToken=await createSessionToken("noel");return issuedToken;} },
+    "@/lib/auth/bootstrap-admins": {readBootstrapAdminConfig:()=>({legacyHostId:"noel",emails:new Set(["admin@example.test"])})},
+    "@/lib/auth/profile-store": {ProfileStoreError:class extends Error{},SupabaseProfileStore:class {async ensureLegacyAdmin(){bootstraps++;if(bootstrapFails)throw new Error("offline");return {role:"admin"};}}},
+    "@/lib/auth/profile-status-cache": {profileStatusCache:{invalidate:()=>undefined}},
+    "@/lib/security/host-login-config": {readHostLoginConfig:()=>({isEnabled:true,userIds:new Set(["noel"]),passwordHash:"fixture",password:""})},
+    "@/lib/security/host-password": {verifyHostPassword:async()=>valid},
+    "@/lib/security/hmac": {timingSafeEqual:()=>false},
+    "@/lib/security/live-admission-store": {LiveAdmissionError:class extends Error{},SupabaseLiveAdmissionStore:class{}},
+    "@/lib/security/live-input-validation": {hostLoginInputSchema:{safeParse:()=>({success:true,data:{id:"noel",password:"test-fixture",name:"Host"}})}},
+    "@/lib/security/live-rate-limit": {HostLoginRateLimitError:class extends Error{},enforceHostLoginRateLimit:async()=>undefined,enforceHostLoginCredentialRateLimits:async()=>undefined},
+    "@/lib/security/login-rate-limit": {loginRateLimiter:{check:()=>({isAllowed:true}),recordFailure:()=>({isAllowed:true}),clear:()=>undefined}},
+    "@/lib/console/engine-defaults": {consoleSettingsCache:{get:async()=>({legacyPasswordLoginEnabled:true})}},
+  });
+  assert.equal((await route.POST(request("/api/login",{method:"POST",body:{}}))).status,401);
+  assert.equal(bootstraps,0);assert.equal(tokens,0);
+  valid=true;bootstrapFails=true;
+  assert.equal((await route.POST(request("/api/login",{method:"POST",body:{}}))).status,503);
+  assert.equal(bootstraps,1);assert.equal(tokens,0);
+  bootstrapFails=false;
+  const result=await route.POST(request("/api/login",{method:"POST",body:{}}));
+  assert.equal(result.status,200);assert.equal(bodyOf(result).data?.role,"admin");
+  assert.equal(tokens,1);
+  const actor = await requireAdminFromCookieValue(issuedToken);
+  assert.equal(actor.hostId,"noel");assert.equal(actor.profile.role,"admin");assert.equal(actor.profile.id,ADMIN_UUID);
+  } finally { __setProfileReaderForTests(null);if(priorIds===undefined)delete process.env.ADMIN_USER_IDS;else process.env.ADMIN_USER_IDS=priorIds; }
 });

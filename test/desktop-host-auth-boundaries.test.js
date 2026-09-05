@@ -134,6 +134,7 @@ test("quit after async cleanup waits for the next event loop turn instead of ree
     app: { on: (event, listener) => handlers.set(event, listener), quit: () => { quits++; } },
     hasPreparedDesktopShutdown: false, isQuitting: false,
     liveCallSession: null, liveGatewayBridge: null, liveInterpreterRuntime: {},
+    liveAccessHeartbeat: { close() {} },
     prepareDesktopShutdown: async () => {},
     setImmediate: (callback) => { queued.push(callback); },
   };

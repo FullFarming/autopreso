@@ -494,7 +494,14 @@ function mountGoLiveController() {
   /** @type {string[]} */
   const statuses = [];
   let requests = 0;
+  const offlineStop = { hidden: false };
+  const webOutputStatus = { textContent: "" };
   const context = {
+    document: { getElementById(id) {
+      if (id === "controller-stop") return offlineStop;
+      if (id === "controller-web-output-status") return webOutputStatus;
+      throw new Error(`Unexpected controller node: ${id}`);
+    } },
     isLiveActionStatusLocked: false, goLiveButton: button,
     liveCallGroup: { hidden: false }, hostSpeakButton: { hidden: true }, endLiveCallButton: { disabled: false },
     translationHealth: {}, setLiveElapsed() {}, stopLiveElapsed() {}, syncLiveBridgeStatus() {},
@@ -508,7 +515,7 @@ function mountGoLiveController() {
   const api = vm.runInNewContext(`${declarations}\n${sync}\n${listener}\n({ syncLiveCall });`, context);
   const click = handlers.get("click");
   assert.ok(click);
-  return { click, poll: api.syncLiveCall, button, attributes, liveState, statuses,
+  return { click, poll: api.syncLiveCall, button, attributes, liveState, statuses, offlineStop, webOutputStatus,
     requests: () => requests,
     resolve: (result) => { const request = pending.shift(); assert.ok(request); request.resolve(result); },
     reject: () => { const request = pending.shift(); assert.ok(request); request.reject(new Error("mock IPC unavailable")); },
@@ -523,6 +530,8 @@ test("Go Live remains single flight through polling and double clicks before a f
   assert.equal(h.attributes.get("aria-busy"), "true");
   await h.poll();
   assert.equal(h.button.disabled, true, "a preparing status poll must not unlock a pending action");
+  assert.equal(h.offlineStop.hidden, true, "the offline stop action is hidden while a Live Call is armed");
+  assert.equal(h.webOutputStatus.textContent, "준비 중");
   await h.click();
   assert.equal(h.requests(), 1, "a repeated callback must not dispatch another IPC request");
   h.liveState.live = true;
@@ -530,6 +539,7 @@ test("Go Live remains single flight through polling and double clicks before a f
   await first;
   await h.poll();
   assert.equal(h.button.disabled, true, "the authoritative live state keeps Go Live disabled");
+  assert.equal(h.webOutputStatus.textContent, "진행 중");
   assert.equal(h.attributes.has("aria-busy"), false);
   assert.ok(h.statuses.includes("controller.liveStarted"));
   h.liveState.live = false;

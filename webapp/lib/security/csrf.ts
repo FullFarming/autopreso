@@ -44,12 +44,16 @@ export function isPublicMetadataRequest(pathname: string, search: string, method
 }
 
 export function isViewerSnapshotPath(pathname: string, method: string): boolean {
-  const match = /^\/api\/live-sessions\/[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\/(snapshot|source-snapshot|status|summary|transcript|leave|cover|viewer-session|records-session|recap-request|viewer-gateway-ticket|runtime|consents)$/iu.exec(pathname);
+  // 2026-09-05 feat: 사진은 라우트에서 회의별 host/viewer 권한을 다시 확인한다.
+  if (/^\/api\/live-sessions\/[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\/speakers\/photos\/[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(pathname)) {
+    return method === "GET" || method === "HEAD";
+  }
+  const match = /^\/api\/live-sessions\/[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\/(snapshot|source-snapshot|status|summary|transcript|leave|cover|viewer-session|records-session|recap-request|viewer-gateway-ticket|runtime|consents|access)$/iu.exec(pathname);
   if (!match) return false;
   const route = match[1];
   if (route === "source-snapshot" || route === "viewer-session" || route === "records-session" || route === "runtime") return method === "GET";
   if (route === "recap-request") return method === "GET" || method === "POST";
-  if (route === "viewer-gateway-ticket") return method === "POST";
+  if (route === "viewer-gateway-ticket" || route === "access") return method === "POST";
   if (route === "leave") return method === "POST";
   if (route === "consents") return method === "PUT";
   return PUBLIC_STATIC_METHODS.has(method);

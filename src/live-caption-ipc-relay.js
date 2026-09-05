@@ -26,9 +26,10 @@ export function resolveSelectedOverlayDisplay(displays, preferredDisplayId, prim
  *  showing the SAME captions. Deriving the whole window set from one rule keeps
  *  the toggle, hot-plug, and deselection reconciling identically instead of
  *  through separate branches that can disagree about which windows exist. */
-export function resolveOverlayDisplays(displays, preferredDisplayId, primaryDisplay, allDisplays = false) {
+export function resolveOverlayDisplays(displays, preferredDisplayId, primaryDisplay, allDisplays = false, selectedIds = null) {
   const connected = Array.isArray(displays) ? displays.filter(Boolean) : [];
   if (connected.length === 0) return [];
+  if (Array.isArray(selectedIds)) return connected.filter((display) => selectedIds.includes(String(display.id)));
   if (allDisplays === true) return connected;
   const selected = resolveSelectedOverlayDisplay(connected, preferredDisplayId, primaryDisplay);
   return selected ? [selected] : [];
@@ -38,8 +39,7 @@ export function resolveControllerDisplay(displays, overlayDisplay, primaryDispla
   const connected = Array.isArray(displays) ? displays.filter(Boolean) : [];
   if (connected.length === 0) return null;
   const primary = connected.find((display) => String(display.id) === String(primaryDisplay?.id ?? "")) ?? connected[0];
-  if (String(overlayDisplay?.id) !== String(primary.id)) return primary;
-  return connected.find((display) => String(display.id) !== String(overlayDisplay?.id)) ?? overlayDisplay ?? primary;
+  return connected.find((display) => display.internal === true) ?? primary;
 }
 
 function defaultSchedule(callback, delay) {

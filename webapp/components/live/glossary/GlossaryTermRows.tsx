@@ -33,8 +33,22 @@ export function GlossaryTermRows(props: GlossaryTermRowsProps) {
           <li key={term.id} className={styles.termRow} data-status={term.status}>
             <label htmlFor={`glossary-term-source-${index}`}><span>{t("원문")}</span><input id={`glossary-term-source-${index}`} name="sourceTerm"
               value={props.drafts[term.id]?.source ?? term.source} onChange={(event) => props.onChangeDraft(term.id, "source", event.currentTarget.value)} disabled={props.isBusy} /></label>
-            <label htmlFor={`glossary-term-target-${index}`}><span>{t("번역어")}</span><input id={`glossary-term-target-${index}`} name="targetTerm"
-              value={props.drafts[term.id]?.target ?? term.target} onChange={(event) => props.onChangeDraft(term.id, "target", event.currentTarget.value)} disabled={props.isBusy} /></label>
+            <div className={styles.termTranslations}>
+              {Object.entries(term.translations ?? { target: term.target }).map(([language, value]) => (
+                <label key={language} htmlFor={`glossary-term-target-${index}-${language}`}>
+                  <span>{t("번역어")} {language === "target" ? "" : language}</span>
+                  <input id={`glossary-term-target-${index}-${language}`} name={`targetTerm-${language}`}
+                    value={props.drafts[term.id]?.[language === "target" ? "target" : `translation:${language}`] ?? value}
+                    onChange={(event) => props.onChangeDraft(term.id, language === "target" ? "target" : `translation:${language}`, event.currentTarget.value)}
+                    disabled={props.isBusy || term.doNotTranslate} />
+                </label>
+              ))}
+              <label className={styles.termProtection}>
+                <input type="checkbox" checked={Boolean(term.doNotTranslate)} disabled={props.isBusy}
+                  onChange={(event) => props.onChangeDraft(term.id, "doNotTranslate", String(event.currentTarget.checked))} />
+                <span>원문 유지</span>
+              </label>
+            </div>
             <label htmlFor={`glossary-term-aliases-${index}`}><span>{t("별칭")}</span><input id={`glossary-term-aliases-${index}`} name="aliases"
               value={props.drafts[term.id]?.aliases ?? term.aliases.join(", ")} onChange={(event) => props.onChangeDraft(term.id, "aliases", event.currentTarget.value)} disabled={props.isBusy} /></label>
             <div className={styles.termActions}>

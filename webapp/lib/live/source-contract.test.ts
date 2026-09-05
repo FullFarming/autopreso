@@ -8,6 +8,17 @@ const event = { type: 'source', sessionId: '00000000-0000-4000-8000-000000000001
     evidence: 'neutral', languages: [] }, speaker: { role: 'host', label: '발표자' }, isFinal: true,
   sourceStartedAt: null, sourceEndedAt: '2026-08-31T00:00:00.000Z', emittedAt: '2026-08-31T00:00:00.001Z' };
 
+test('source replay preserves immutable speaker company and department and rejects malformed identity', () => {
+  const speakerProfile = { id: event.sessionId, version: 1, displayName: '김민지', company: '노바', department: '제품팀', photoAssetId: null };
+  const parsed = sourceEventSchema.parse({ ...event, speakerProfile });
+  assert.deepEqual(parsed.speakerProfile, speakerProfile);
+  speakerProfile.displayName = '새 이름';
+  assert.equal(parsed.speakerProfile?.displayName, '김민지');
+  assert.equal(sourceEventSchema.safeParse({ ...event, speakerProfile: { ...speakerProfile, id: '../other' } }).success, false);
+  assert.equal(sourceEventSchema.safeParse({ ...event, speakerAttribution: 'unresolved' }).success, true);
+  assert.equal(sourceEventSchema.safeParse({ ...event, speakerAttribution: 'guessed' }).success, false);
+});
+
 test('canonical source accepts neutral und without discarding language observations', () => {
   assert.deepEqual(sourceEventSchema.parse(event), event);
   assert.equal(sourceEventSchema.safeParse({ ...event, languageObservation: null, sourceLanguage: 'en' }).success, true);

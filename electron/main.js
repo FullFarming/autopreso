@@ -1,12 +1,14 @@
+import { registerSpeakerRosterIpc } from "./speaker-roster-ipc.js";
 import { app, BrowserWindow, desktopCapturer, dialog, ipcMain, Menu, net, screen, session, shell, systemPreferences } from "electron";
 import { randomBytes, randomUUID } from "node:crypto";
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 
 import { WebSocket } from "ws";
 
 import { startServer } from "../src/server.js";
+import { getNovaConfigPaths, migrateNovaConfig } from "../src/nova-config.js";
+import { geminiTranscribeLanguageCodes } from "../src/gemini-live-transcribe.js";
 import { createCaptionPcmResampler } from "../src/caption-pcm-resampler.js";
 import { encodeLiveAudioWireFrame } from "../src/live-audio-wire.js";
 import { requestLiveGatewayDrain } from "../src/live-gateway-drain.js";
@@ -23,17 +25,19 @@ import {
   resolveOverlayDisplays,
   resolveSelectedOverlayDisplay,
 } from "../src/live-caption-ipc-relay.js";
-import { createSettingsStore, migrateSettingsFile, validateSubtitleSettings } from "../src/settings-store.js";
+import { createSettingsStore, validateSubtitleSettings } from "../src/settings-store.js";
 import {
   CAPTION_LANGUAGE_CODES,
   convertLegacyGlossaryTextToDocumentV1,
   createGeminiCaptionConfig,
   geminiCaptionConfigFingerprint,
+  selectGeminiTranscriptionVocabularyFromLegacyText,
 } from "../packages/caption-core/index.js";
 import { createLiveCallArchive, readLiveArchiveSessionId } from "../src/live-call-archive.js";
 import { DEFAULT_ENGINE_SELECTION, EngineSelectionError, normalizeEngineSelection } from "../packages/caption-core/caption-engine-catalog.js";
 import { registerLiveInterpreterIpc, resolveLiveInterpreterEnabled } from "./live-interpreter-ipc.js";
 import { registerMeetingCoachIpc } from "./meeting-coach-ipc.js";
+import { createLiveAccessHeartbeat } from "./live-access-heartbeat.js";
 import { createDesktopLiveDemandController } from "./live-demand-controller.js";
 import { readDesktopSystemLanguage, persistDesktopSystemLanguage } from "./system-language-store.js";
 import { createDesktopHostSession } from "./desktop-host-session.js";
@@ -44,10 +48,8 @@ import { createDesktopLoginState, findDesktopAuthDeepLink, isAllowedDesktopExter
 // over IPC so the application menu speaks the same language.
 import { normalizeLanguage, setLanguage, t as translate } from "../public/subtitle-i18n.js";
 
-const APP_CONFIG_DIR = "realtime-noel";
-const LEGACY_CONFIG_DIR = ["auto", "preso"].join("");
-const SETTINGS_PATH = path.join(os.homedir(), ".config", APP_CONFIG_DIR, "settings.json");
-const LEGACY_SETTINGS_PATH = path.join(os.homedir(), ".config", LEGACY_CONFIG_DIR, "settings.json");
+const APP_CONFIG_DIR = "nova";
+const SETTINGS_PATH = getNovaConfigPaths().settingsPath;
 const PREFERRED_PORT = 3210;
 // Keep this below the renderer-side capture timeout (8s in subtitle-dashboard.js)
 // so the main process can answer before the renderer reports its own timeout.
@@ -112,7 +114,8 @@ let stageWindow = null;
 // the controller's "all displays" tick on it holds one per connected screen,
 // every one rendering the SAME caption stream from the local server.
 const overlayWindows = new Map();
-let overlayAllDisplays = false;
+let overlayAllDisplays = true;
+let selectedOverlayDisplayIds = null;
 let preferredOverlayDisplayId = "";
 let selectedOverlayDisplayId = "";
 // Overlay windows whose page currently hosts the cursor over a subtitle box —
@@ -190,7 +193,7 @@ function quarantineSettingsFile() {
 }
 
 async function loadSettingsStoreResiliently() {
-  await migrateSettingsFile({ fromPath: LEGACY_SETTINGS_PATH, toPath: SETTINGS_PATH });
+  await migrateNovaConfig();
   const settingsStore = createSettingsStore({ filePath: SETTINGS_PATH });
   try {
     return { settingsStore, settings: await settingsStore.load(), quarantinedPath: "" };
@@ -221,7 +224,8 @@ async function createApp() {
   const { settingsStore, settings, quarantinedPath } = await loadSettingsStoreResiliently();
   overlayEnabled = settings.subtitle?.overlayEnabled !== false;
   preferredOverlayDisplayId = settings.subtitle?.overlayDisplayId ?? "";
-  overlayAllDisplays = settings.subtitle?.overlayAllDisplays === true;
+  overlayAllDisplays = settings.subtitle?.overlayAllDisplays !== false;
+  selectedOverlayDisplayIds = Array.isArray(settings.subtitle?.overlayDisplayIds) ? settings.subtitle.overlayDisplayIds : null;
   server = await startDesktopServer(settingsStore);
   const liveCallEnabled = isLiveCallEnabled();
   const liveWorkspaceUrl = resolveLiveWorkspaceUrl();
@@ -323,10 +327,13 @@ function overlayDisplayState() {
       id: String(display.id),
       label: String(display.label ?? "Display").replace(/[\u0000-\u001f\u007f]/gu, " ").trim().slice(0, 160) || "Display",
       isPrimary: String(display.id) === String(primaryDisplay?.id),
+      isInternal: display.internal === true,
+      isSelected: resolveOverlayDisplays(displays, preferredOverlayDisplayId, primaryDisplay, overlayAllDisplays, selectedOverlayDisplayIds).some((target) => target.id === display.id),
       isConnected: true,
     })),
     selectedDisplayId: selectedOverlayDisplayId,
     allDisplays: overlayAllDisplays,
+    controllerAvailableHeight: resolveControllerDisplay(displays, selected, primaryDisplay)?.workArea?.height ?? 720,
   };
 }
 
@@ -349,8 +356,9 @@ function positionControllerForOverlayDisplay() {
   const [currentWidth, currentHeight] = controllerWindow.getSize();
   const width = Math.min(currentWidth, Math.max(CONTROLLER_MIN_WIDTH, target.workArea.width - 48));
   const x = Math.round(target.workArea.x + (target.workArea.width - width) / 2);
-  const y = Math.round(target.workArea.y + target.workArea.height - currentHeight - 120);
-  controllerWindow.setBounds({ x, y, width, height: currentHeight });
+  const height = Math.min(currentHeight, target.workArea.height - 24);
+  const y = Math.max(target.workArea.y + 12, Math.round(target.workArea.y + target.workArea.height - height - 24));
+  controllerWindow.setBounds({ x, y, width, height });
 }
 
 // ── Renderer death recovery ────────────────────────────────────────────────
@@ -406,6 +414,42 @@ function attachRendererRecovery(window, { label, reload, onFailure }) {
   return { cancel: clearReloadTimer };
 }
 
+async function managedCaptionRequest(pathname, body, baseUrl = liveWorkspaceUrl) {
+  const result = await liveCallApi(baseUrl, pathname, { method: "POST", body });
+  if (!result.ok || !result.data) throw new Error("관리자 배정 자막 연결을 준비하지 못했습니다. 로그인과 연결 상태를 확인해 주세요.");
+  return result.data;
+}
+
+const managedCaptionCallbacks = {
+  startCaptionSession: async (languages) => {
+    const workspaceBaseUrl = liveWorkspaceUrl;
+    return { ...await managedCaptionRequest("/api/captions/session", { languages }, workspaceBaseUrl), workspaceBaseUrl };
+  },
+  stopCaptionSession: (managedSession) => managedCaptionRequest("/api/captions/stop", { ticket: managedSession.ticket }, managedSession.workspaceBaseUrl),
+  renewCaptionSession: async (managedSession) => ({
+    ...await managedCaptionRequest("/api/captions/renew", { ticket: managedSession.ticket }, managedSession.workspaceBaseUrl),
+    workspaceBaseUrl: managedSession.workspaceBaseUrl,
+  }),
+  createCaptionCredential: (managedSession, provider, settings) => managedCaptionRequest("/api/captions/credentials", {
+    ticket: managedSession.ticket,
+    provider,
+    languageCodes: provider === "gemini" ? geminiTranscribeLanguageCodes(settings.engine.stt.languageMode)
+      : settings.engine.stt.languageMode === "auto" ? settings.translationLanguages : [settings.engine.stt.languageMode],
+    customVocabulary: [...selectGeminiTranscriptionVocabularyFromLegacyText(settings.glossary ?? "")],
+  }, managedSession.workspaceBaseUrl),
+  translateCaption: async (managedSession, input) => {
+    const glossaryTerms = String(input.glossary ?? "").split("\n").map((line) => line.split("="))
+      .filter((parts) => parts.length === 2).map(([source, target]) => ({ source: source.trim(), target: target.trim() }))
+      .filter((term) => term.source.length > 0 && term.source.length <= 80 && term.target.length > 0 && term.target.length <= 80).slice(0, 100);
+    const result = await managedCaptionRequest("/api/captions/translate", {
+      ticket: managedSession.ticket, sourceText: input.sourceText, targetLanguage: input.targetLanguage,
+      glossaryTerms,
+    }, managedSession.workspaceBaseUrl);
+    if (typeof result.text !== "string") throw new Error("자막 번역 응답을 확인할 수 없습니다.");
+    return result.text;
+  },
+};
+
 async function startDesktopServer(settingsStore) {
   const transcriptsDir = path.join(path.dirname(SETTINGS_PATH), "transcripts");
   try {
@@ -414,8 +458,9 @@ async function startDesktopServer(settingsStore) {
       port: PREFERRED_PORT,
       settingsStore,
       transcriptsDir,
-      createTranscription: createNoopTranscription,
       liveCallProducerCapability,
+      ...managedCaptionCallbacks,
+      resolveCaptionEngine: async () => (await seedLiveCallEngineDefaults(liveWorkspaceUrl)).engine,
       canStartSubtitleSession: () => isDesktopAuthenticated && !isHostLogoutPending && !isHostLoginPending,
     });
   } catch (error) {
@@ -426,8 +471,9 @@ async function startDesktopServer(settingsStore) {
     port: 0,
     settingsStore,
     transcriptsDir,
-    createTranscription: createNoopTranscription,
     liveCallProducerCapability,
+    ...managedCaptionCallbacks,
+    resolveCaptionEngine: async () => (await seedLiveCallEngineDefaults(liveWorkspaceUrl)).engine,
     canStartSubtitleSession: () => isDesktopAuthenticated && !isHostLogoutPending && !isHostLoginPending,
   });
 }
@@ -725,6 +771,12 @@ function parseLiveWorkspaceUrl(value) {
 // The subtitle controller then shows a Go-Live button to flip it live.
 
 let liveCallSession = null; // { sessionId, version, baseUrl, status }
+const liveAccessHeartbeat = createLiveAccessHeartbeat({
+  getSession: () => liveCallSession,
+  request: (active, signal) => liveCallApi(active.baseUrl,
+    `/api/live-sessions/${encodeURIComponent(active.sessionId)}/access?audience=host`, { method: "POST", signal }),
+  onFailure: () => { console.warn("[live] 호스트 접근 갱신에 실패했습니다. 다음 갱신에서 재시도합니다."); },
+});
 let isLiveCallStarting = false;
 let isLiveCallEnding = false;
 let isLiveCallGoingLive = false;
@@ -733,7 +785,7 @@ let isLiveCallGoingLive = false;
 // save-time verification; expiry surfaces as NETWORK_UNAVAILABLE.
 const LIVE_CALL_API_TIMEOUT_MS = 15_000;
 
-async function liveCallApi(baseUrl, pathname, { method = "POST", body, timeoutMilliseconds = LIVE_CALL_API_TIMEOUT_MS } = {}) {
+async function liveCallApi(baseUrl, pathname, { method = "POST", body, timeoutMilliseconds = LIVE_CALL_API_TIMEOUT_MS, signal } = {}) {
   const origin = new URL(baseUrl).origin;
   let response;
   try {
@@ -741,7 +793,8 @@ async function liveCallApi(baseUrl, pathname, { method = "POST", body, timeoutMi
       method,
       credentials: "include",
       headers: { "content-type": "application/json", origin },
-      signal: AbortSignal.timeout(Math.max(1, Math.min(LIVE_CALL_API_TIMEOUT_MS, timeoutMilliseconds))),
+      signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(Math.max(1, Math.min(LIVE_CALL_API_TIMEOUT_MS, timeoutMilliseconds)))])
+        : AbortSignal.timeout(Math.max(1, Math.min(LIVE_CALL_API_TIMEOUT_MS, timeoutMilliseconds))),
       ...(body === undefined ? {} : { body: JSON.stringify(body) }),
     });
   } catch {
@@ -1242,25 +1295,15 @@ function toLiveCallApiInput(config) {
   };
 }
 
-// Global engine defaults (spec §9, 2026-09-04): the console's engine is the
-// ONLY Live Call engine. A NEW Live Call is created with the model preferences
-// derived from `/api/live-config.engineDefaults`; the desktop `subtitle.engine`
-// is local-captions-only and is neither read here nor written. When the
-// workspace is unreachable or publishes nothing usable, the catalog default
-// stands in (the server overwrites a non-admin `modelPreferences.engine` with
-// the global value anyway). Never throws — a console outage must not block
-// go-live.
+// The authenticated assignment is pinned when a session starts. A failed lookup
+// cannot authorize a different provider or incur an unexpected model charge.
 async function seedLiveCallEngineDefaults(baseUrl) {
-  let engineDefaults = DEFAULT_ENGINE_SELECTION;
-  try {
-    const configResult = await liveCallApi(baseUrl, "/api/live-config", { method: "GET" });
-    const published = configResult.ok ? configResult.data?.engineDefaults : undefined;
-    if (published && typeof published === "object" && !Array.isArray(published)) engineDefaults = normalizeEngineSelection(published);
-  } catch (error) {
-    console.warn(`[live] global engine default unusable, using the catalog default: ${error?.message ?? error}`);
-    engineDefaults = DEFAULT_ENGINE_SELECTION;
+  const configResult = await liveCallApi(baseUrl, "/api/live-config", { method: "GET" });
+  const published = configResult.ok ? configResult.data?.engineDefaults : undefined;
+  if (!published || typeof published !== "object" || Array.isArray(published)) {
+    throw new Error("배정된 자막 엔진을 확인할 수 없습니다. 로그인과 연결 상태를 확인해 주세요.");
   }
-  return readLiveCallModelPreferences({ engine: engineDefaults });
+  return readLiveCallModelPreferences({ engine: normalizeEngineSelection(published) });
 }
 
 async function openLiveStageOverlay(baseUrl, sessionId, invite) {
@@ -1590,7 +1633,7 @@ function syncOverlayBounds() {
   const displays = screen.getAllDisplays();
   const preferredId = typeof preferredOverlayDisplayId === "string" ? preferredOverlayDisplayId : "";
   const primary = typeof screen.getPrimaryDisplay === "function" ? screen.getPrimaryDisplay() : displays[0];
-  const targets = resolveOverlayDisplays(displays, preferredId, primary, overlayAllDisplays);
+  const targets = resolveOverlayDisplays(displays, preferredId, primary, overlayAllDisplays, selectedOverlayDisplayIds);
   const selected = resolveSelectedOverlayDisplay(displays, preferredId, primary);
   selectedOverlayDisplayId = selected ? String(selected.id) : "";
   const targetIds = new Set(targets.map((display) => String(display.id)));
@@ -3023,16 +3066,6 @@ function installApplicationMenu(serverUrl) {
           accelerator: "CommandOrControl+Shift+M",
           click: () => { showDashboardWindow(); },
         },
-        {
-          label: "Meeting Prep",
-          accelerator: "CommandOrControl+Shift+P",
-          click: () => { void meetingCoachRuntime?.openPrep?.(); },
-        },
-        ...(typeof liveInterpreterRuntime !== "undefined" && liveInterpreterRuntime?.isEnabled?.() ? [{
-          label: "Live Interpreter",
-          accelerator: "CommandOrControl+Shift+I",
-          click: () => { void liveInterpreterRuntime.open(); },
-        }] : []),
         { type: "separator" },
         {
           label: translate("menu.showCaptionController"),
@@ -3078,6 +3111,21 @@ function destroyOverlayWindow() {
 }
 
 function registerOverlayIpc(settingsStore, { localAppOrigin, liveWorkspaceUrl, liveCallEnabled }) {
+  registerSpeakerRosterIpc({
+    ipcMain, workspaceUrl: liveWorkspaceUrl,
+    ensureHostSession: () => ensureDesktopHostSession(liveWorkspaceUrl),
+    request: (pathname, options) => liveCallApi(liveWorkspaceUrl, pathname, options),
+    fetch: (url, options) => net.fetch(url, options),
+    isAllowedSender: (event, channel) => {
+      if (liveCallEnabled !== true || isHostLogoutPending || isHostLoginPending) return false;
+      if (event.senderFrame && event.sender.mainFrame && event.senderFrame !== event.sender.mainFrame) return false;
+      if (!isAllowedOrigin(event.sender.getURL(), new Set([localAppOrigin]))) return false;
+      const isHostWindow = [dashboardWindow, controllerWindow].some(window => window && !window.isDestroyed() && window.webContents === event.sender);
+      if (isHostWindow) return channel !== "live-call:speakers-photo-upload" || dashboardWindow?.webContents === event.sender;
+      return channel === "live-call:speakers-photo-read"
+        && [...overlayWindows.values()].some(window => window && !window.isDestroyed() && window.webContents === event.sender);
+    },
+  });
   ipcMain.handle("live-call:archive-refresh", async (event, recordId) => {
     if (!dashboardWindow || dashboardWindow.isDestroyed() || event.sender !== dashboardWindow.webContents
       || !isAllowedOrigin(event.sender.getURL(), new Set([localAppOrigin]))) return { ok: false, code: "FORBIDDEN" };
@@ -3863,6 +3911,16 @@ function registerOverlayIpc(settingsStore, { localAppOrigin, liveWorkspaceUrl, l
     }
     return overlayDisplayState();
   });
+  ipcMain.handle("subtitle-overlay:select-displays", async (event, displayIds) => {
+    if (!isAllowedOrigin(event.sender.getURL(), new Set([localAppOrigin]))) throw new Error("FORBIDDEN");
+    validateSubtitleSettings({ overlayDisplayIds: displayIds });
+    if (!Array.isArray(displayIds) || displayIds.some((id) => !screen.getAllDisplays().some((display) => String(display.id) === id))) throw new Error("DISPLAY_UNAVAILABLE");
+    await settingsStore.save({ subtitle: { overlayDisplayIds: displayIds, overlayAllDisplays: false } });
+    selectedOverlayDisplayIds = [...displayIds];
+    overlayAllDisplays = false;
+    syncOverlayBoundsAndTop();
+    return overlayDisplayState();
+  });
   ipcMain.handle("subtitle-overlay:select-display", async (event, displayId) => {
     if (!isAllowedOrigin(event.sender.getURL(), new Set([localAppOrigin]))) {
       return { displays: [], selectedDisplayId: "" };
@@ -3876,7 +3934,8 @@ function registerOverlayIpc(settingsStore, { localAppOrigin, liveWorkspaceUrl, l
     const previousPreferredDisplayId = preferredOverlayDisplayId;
     preferredOverlayDisplayId = displayId;
     try {
-      await settingsStore.save({ subtitle: { overlayDisplayId: preferredOverlayDisplayId } });
+      await settingsStore.save({ subtitle: { overlayDisplayId: preferredOverlayDisplayId, overlayDisplayIds: null } });
+      selectedOverlayDisplayIds = null;
     } catch (error) {
       preferredOverlayDisplayId = previousPreferredDisplayId;
       throw error;
@@ -3898,7 +3957,8 @@ function registerOverlayIpc(settingsStore, { localAppOrigin, liveWorkspaceUrl, l
     const previous = overlayAllDisplays;
     overlayAllDisplays = allDisplays;
     try {
-      await settingsStore.save({ subtitle: { overlayAllDisplays } });
+      await settingsStore.save({ subtitle: { overlayAllDisplays, overlayDisplayIds: null } });
+      selectedOverlayDisplayIds = null;
     } catch (error) {
       overlayAllDisplays = previous;
       throw error;
@@ -3979,7 +4039,12 @@ function registerOverlayIpc(settingsStore, { localAppOrigin, liveWorkspaceUrl, l
     const dy = Number(deltaY);
     if (!Number.isFinite(dx) || !Number.isFinite(dy)) return;
     const [x, y] = controllerWindow.getPosition();
-    controllerWindow.setPosition(Math.round(x + dx), Math.round(y + dy));
+    const target = resolveControllerDisplay(screen.getAllDisplays(), null, screen.getPrimaryDisplay());
+    if (!target) return;
+    const [width, height] = controllerWindow.getSize();
+    const area = target.workArea;
+    controllerWindow.setPosition(Math.round(Math.max(area.x, Math.min(area.x + area.width - width, x + dx))),
+      Math.round(Math.max(area.y, Math.min(area.y + area.height - height, y + dy))));
   });
   // The console asks for the exact content height so the transparent window
   // hugs it — no empty band, even when the voice row appears in audio mode.
@@ -3988,14 +4053,16 @@ function registerOverlayIpc(settingsStore, { localAppOrigin, liveWorkspaceUrl, l
     if (!controllerWindow || controllerWindow.isDestroyed()) return;
     const height = Number(contentHeight);
     if (!Number.isFinite(height)) return;
-    const clampedHeight = Math.round(Math.min(240, Math.max(64, height)));
+    const target = resolveControllerDisplay(screen.getAllDisplays(), null, screen.getPrimaryDisplay());
+    if (!target) return;
+    const clampedHeight = Math.round(Math.min(target.workArea.height - 24, Math.max(64, height)));
     const [x, y] = controllerWindow.getPosition();
     const [currentWidth, currentHeight] = controllerWindow.getSize();
     // Width follows the content as well. The console's clusters change with the
     // session -- the Live Call group, Host Speak and the voice row all come and
     // go -- so a fixed width leaves slack, and the right-hand cluster was being
     // pushed across it. Never wider than the work area.
-    const workArea = screen.getDisplayNearestPoint({ x, y }).workArea;
+    const workArea = target.workArea;
     const requestedWidth = Number(contentWidth);
     const clampedWidth = Number.isFinite(requestedWidth) && requestedWidth > 0
       ? Math.round(Math.min(workArea.width - 48, Math.max(CONTROLLER_MIN_WIDTH, requestedWidth)))
@@ -4007,7 +4074,8 @@ function registerOverlayIpc(settingsStore, { localAppOrigin, liveWorkspaceUrl, l
     const maxX = workArea.x + workArea.width - clampedWidth;
     const nextX = Math.min(Math.max(workArea.x, centeredX), Math.max(workArea.x, maxX));
     controllerWindow.setMinimumSize(Math.min(CONTROLLER_MIN_WIDTH, clampedWidth), clampedHeight);
-    controllerWindow.setBounds({ x: nextX, y, width: clampedWidth, height: clampedHeight });
+    const nextY = Math.max(workArea.y, Math.min(workArea.y + workArea.height - clampedHeight, y + currentHeight - clampedHeight));
+    controllerWindow.setBounds({ x: nextX, y: nextY, width: clampedWidth, height: clampedHeight });
   });
   ipcMain.handle("subtitle-controller:set-visible", (_event, visible) => {
     if (!controllerWindow || controllerWindow.isDestroyed()) createControllerWindow(server.url);
@@ -4151,19 +4219,10 @@ function isAllowedOrigin(value, allowedMediaOrigins) {
   }
 }
 
-function createNoopTranscription() {
-  return {
-    ready: async () => {},
-    sendAudio: () => {},
-    stop: () => {},
-    close: () => {},
-  };
-}
-
 // Boot must never reject silently. An unhandled rejection here left the user
 // with a dock icon and nothing else — no window, no dialog, no log they'd find.
 if (singleInstanceLock) {
-  app.whenReady().then(createApp).then(() => { isDesktopBooting = false; }).catch((error) => {
+  app.whenReady().then(createApp).then(() => { isDesktopBooting = false; liveAccessHeartbeat.start(); }).catch((error) => {
     isDesktopBooting = false;
     console.error(`[boot] startup failed: ${error?.stack ?? error}`);
     try {
@@ -4231,6 +4290,7 @@ async function prepareDesktopShutdown() {
 }
 
 app.on("before-quit", (event) => {
+  liveAccessHeartbeat.close();
   if (!hasPreparedDesktopShutdown && (liveCallSession || liveGatewayBridge || liveInterpreterRuntime)) {
     console.info("[desktop] shutdown prepare");
     hasPreparedDesktopShutdown = true;

@@ -10,14 +10,10 @@ import { consoleMessages } from "@/lib/system-language/console-messages";
 import { ConfirmDialog } from "./ConfirmDialog";
 import { consoleErrorKey, consoleFetch } from "./console-client";
 import {
-  countActiveSessions,
   deployCodeLabelKey,
   deployResultLabelKey,
-  filterTranslationOptions,
   formatConsoleDate,
   isEngineDirty,
-  languageModeLabelKey,
-  languageModesFor,
   reconcileEngineSelection,
   type ConsoleEngineCatalog,
   type ConsoleEngineCatalogEntry,
@@ -28,7 +24,6 @@ interface EngineDefaultsResponse { engine: EngineSelection; catalog: ConsoleEngi
 interface DeployResult { sessionId: string; result: "switched" | "queued" | "failed"; code?: string }
 interface EnginePutResponse { engine: EngineSelection; results?: DeployResult[] }
 interface SettingsResponse { legacyPasswordLoginEnabled: boolean; warning?: string }
-interface SessionsResponse { sessions: { status: string }[] }
 
 function entryKey(entry: Pick<ConsoleEngineCatalogEntry, "provider" | "model">): string {
   return `${entry.provider}/${entry.model}`;
@@ -38,12 +33,7 @@ function findEntry(entries: readonly ConsoleEngineCatalogEntry[], key: string): 
   return entries.find((entry) => entryKey(entry) === key) ?? null;
 }
 
-/**
- * `/console/engine` (spec §9): one global Live Call engine, deployed with "배포". The confirm
- * dialog names how many `preparing`/`live` sessions switch immediately, and the panel shows the
- * per-session result table when the server returns one. Also hosts the account section with the
- * legacy password-login switch. Nothing is stored locally until the server has answered.
- */
+/** Next-session defaults and account settings; active sessions keep their pinned engine. */
 export function EnginePanel() {
   const t = useSystemText(consoleMessages);
   const { language } = useSystemLanguage();
@@ -59,10 +49,8 @@ export function EnginePanel() {
   const [deployError, setDeployError] = useState<string | null>(null);
   const [deployStatus, setDeployStatus] = useState<string | null>(null);
   const [results, setResults] = useState<DeployResult[] | null>(null);
-  const [activeCount, setActiveCount] = useState<number | null>(null);
   const [isConfirmOpen, setIsConfirmOpen] = useState(false);
   const [isDeploying, setIsDeploying] = useState(false);
-  const [isCounting, setIsCounting] = useState(false);
   const [legacyLogin, setLegacyLogin] = useState<boolean | null>(null);
   const [isLegacyConfirmOpen, setIsLegacyConfirmOpen] = useState(false);
   const [isSavingSettings, setIsSavingSettings] = useState(false);
@@ -104,20 +92,9 @@ export function EnginePanel() {
     setResults(null);
   }
 
-  async function openDeployConfirm() {
-    setIsCounting(true);
+  function openDeployConfirm() {
     setDeployError(null);
-    try {
-      // A deploy switches every preparing/live session, however old - so count over the whole history.
-      const data = await consoleFetch<SessionsResponse>("/api/console/sessions?range=all");
-      setActiveCount(countActiveSessions(data.sessions));
-    } catch {
-      // The count is advisory; the dialog still opens and says the number is unknown.
-      setActiveCount(null);
-    } finally {
-      setIsCounting(false);
-      setIsConfirmOpen(true);
-    }
+    setIsConfirmOpen(true);
   }
 
   async function deploy() {
@@ -130,8 +107,8 @@ export function EnginePanel() {
       const data = await consoleFetch<EnginePutResponse>("/api/console/engine-defaults", { method: "PUT", body: { engine: draft } });
       setSaved(data.engine);
       setDraft(data.engine);
-      if (Array.isArray(data.results)) setResults(data.results);
-      else setDeployStatus("배포했습니다.");
+      if (Array.isArray(data.results) && data.results.length > 0) setResults(data.results);
+      setDeployStatus("저장했습니다. 다음 세션부터 적용됩니다.");
       // The PUT answers with the engine only; the author and time come back from the read.
       await loadEngine();
     } catch (error) {
@@ -167,8 +144,6 @@ export function EnginePanel() {
     ));
   }
 
-  const translationOptions = catalog && draft ? filterTranslationOptions(catalog, draft.stt.provider) : [];
-  const languageModes = catalog && draft ? languageModesFor(catalog, draft.stt.provider, draft.stt.model) : ["auto"];
 
   return (
     <>
@@ -176,7 +151,7 @@ export function EnginePanel() {
         <div className="live-section-heading">
           <h2 id={headingId}>{t("라이브 콜 엔진 기본값")}</h2>
         </div>
-        <p className="live-help">{t("배포하면 새 세션과 진행 중인 세션 모두 이 엔진으로 즉시 전환됩니다. 호스트는 엔진을 바꿀 수 없습니다.")}</p>
+        <p className="live-help">사용자별 엔진은 가입 관리에서 배정합니다. 변경 사항은 다음 세션부터 적용됩니다.</p>
         {loadError && (
           <div className="live-error" role="alert">
             <span>{t(loadError)}</span>
@@ -186,30 +161,19 @@ export function EnginePanel() {
         {catalog && draft && (
           <div className="console-engine-grid">
             <label className="console-field">
-              <span>{t("음성 인식 (STT)")}</span>
-              <select value={entryKey(draft.stt)} disabled={isDeploying}
+              <span>자막 엔진</span>
+              <select value={draft.stt.provider} disabled={isDeploying}
                 onChange={(event) => {
-                  const entry = findEntry(catalog.stt, event.target.value);
-                  if (entry) updateDraft({ ...draft, stt: { provider: entry.provider, model: entry.model, languageMode: draft.stt.languageMode } });
+                  const provider = event.currentTarget.value;
+                  const stt = catalog.stt.find((entry) => entry.provider === provider);
+                  const translation = catalog.translation.find((entry) => entry.provider === provider);
+                  if (stt && translation) updateDraft({ ...draft,
+                    stt: { provider: stt.provider, model: stt.model, languageMode: "auto" },
+                    translation: { provider: translation.provider, model: translation.model },
+                  });
                 }}>
-                {renderOptions(catalog.stt)}
-              </select>
-            </label>
-            <label className="console-field">
-              <span>{t("입력 언어 모드")}</span>
-              <select value={draft.stt.languageMode} disabled={isDeploying || languageModes.length <= 1}
-                onChange={(event) => updateDraft({ ...draft, stt: { ...draft.stt, languageMode: event.target.value } })}>
-                {languageModes.map((mode) => <option key={mode} value={mode}>{t(languageModeLabelKey(mode))}</option>)}
-              </select>
-            </label>
-            <label className="console-field">
-              <span>{t("번역")}</span>
-              <select value={entryKey(draft.translation)} disabled={isDeploying}
-                onChange={(event) => {
-                  const entry = findEntry(translationOptions, event.target.value);
-                  if (entry) updateDraft({ ...draft, translation: { provider: entry.provider, model: entry.model } });
-                }}>
-                {renderOptions(translationOptions)}
+                <option value="soniox">Soniox</option>
+                <option value="gemini">Gemini</option>
               </select>
             </label>
             <label className="console-field">
@@ -225,12 +189,12 @@ export function EnginePanel() {
           </div>
         )}
         <div className="console-deploy-row">
-          <button type="button" className="accent-btn live-primary-action" disabled={!isDirty || isDeploying || isCounting} aria-busy={isDeploying || isCounting}
+          <button type="button" className="accent-btn live-primary-action" disabled={!isDirty || isDeploying} aria-busy={isDeploying}
             onClick={() => void openDeployConfirm()}>
-            {isDeploying ? t("배포 중…") : t("배포")}
+            {isDeploying ? "저장 중…" : "저장"}
           </button>
           <p className="live-help console-last-change">
-            {updatedAt ? t("마지막 변경: {email} · {time}", { email: updatedByEmail ?? "—", time: formatConsoleDate(updatedAt, locale) }) : t("아직 배포한 적이 없습니다. 카탈로그 기본값이 적용됩니다.")}
+            {updatedAt ? t("마지막 변경: {email} · {time}", { email: updatedByEmail ?? "—", time: formatConsoleDate(updatedAt, locale) }) : "아직 변경한 적이 없습니다."}
           </p>
         </div>
         {deployError && <p className="live-error" role="alert">{t(deployError)}</p>}
@@ -260,13 +224,14 @@ export function EnginePanel() {
           </div>
         )}
         <ConfirmDialog
+          variant="primary"
           open={isConfirmOpen}
-          title={t("엔진 배포")}
-          body={<p>{activeCount === null ? t("진행 중인 세션 수를 확인할 수 없습니다. 진행 중인 세션은 모두 즉시 전환됩니다.") : t("진행 중인 세션 {count}개가 즉시 전환됩니다.", { count: activeCount })}</p>}
-          confirmLabel={t("배포")}
+          title="다음 세션 설정 저장"
+          body={<p>진행 중인 자막과 Live Call은 현재 엔진을 유지합니다.</p>}
+          confirmLabel="저장"
           busy={isDeploying}
           onCancel={() => setIsConfirmOpen(false)}
-          onConfirm={() => void deploy()}
+          onConfirm={deploy}
         />
       </section>
 
@@ -290,13 +255,14 @@ export function EnginePanel() {
         </label>
         {settingsStatus && <p className="console-status-line" role="status">{t(settingsStatus)}</p>}
         <ConfirmDialog
+          variant="destructive"
           open={isLegacyConfirmOpen}
           title={t("레거시 로그인을 끌까요?")}
           body={<p>{t("비밀번호로 로그인한 호스트는 다음 요청부터 거부됩니다. 관리자 계정이 Supabase로 로그인할 수 있는지 먼저 확인하세요.")}</p>}
           confirmLabel={t("끄기")}
           busy={isSavingSettings}
           onCancel={() => setIsLegacyConfirmOpen(false)}
-          onConfirm={() => void saveLegacyLogin(false)}
+          onConfirm={() => saveLegacyLogin(false)}
         />
       </section>
     </>

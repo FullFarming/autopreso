@@ -9,6 +9,9 @@ import type { RecordingGap } from "@/lib/live-recap/contract";
 import { groupTranscriptReading } from "../transcript-reading-model";
 import { fetchLiveRecordOriginals } from "./records-client";
 import styles from "./live-records.module.css";
+import SummarySkeleton from "../SummarySkeleton";
+import { getRecordSpeakerPresentation } from "./record-speaker-presentation";
+import { RecordSpeakerIdentity } from "./RecordSpeakerIdentity";
 
 export function RecordOriginalPanel({ sessionId, loadOriginals = fetchLiveRecordOriginals }: {
   sessionId: string;
@@ -23,14 +26,14 @@ export function RecordOriginalPanel({ sessionId, loadOriginals = fetchLiveRecord
   const [error, setError] = useState("");
   const readingTurns = useMemo(() => groupTranscriptReading(items.map((item) => ({
     id: item.sourceUtteranceId, seq: item.sourceSeq,
-    speakerKey: item.speakerRole === "unknown" ? `unknown:${item.sourceUtteranceId}`
-      : item.participantId ? `participant:${item.participantId}`
-        : item.speakerRole === "host" ? JSON.stringify(["host", item.speakerLabel, item.speakerName]) : `unknown:${item.sourceUtteranceId}`,
-    speaker: item.speakerName || item.speakerLabel || "",
+    speakerKey: getRecordSpeakerPresentation(sessionId, item).key,
+    speaker: getRecordSpeakerPresentation(sessionId, item).displayName,
     startedAt: item.sourceStartedAt || item.sourceEndedAt, endedAt: item.sourceEndedAt,
     text: item.effectiveText, language: item.sourceLanguage, rawText: item.rawText, isCorrected: item.correctionRevision > 0,
-  })), recordingGaps), [items, recordingGaps]);
-  const sourceSpeakerRoles = useMemo(() => new Map(items.map((item) => [item.sourceUtteranceId, item.speakerRole])), [items]);
+  })), recordingGaps), [items, recordingGaps, sessionId]);
+  const recordedSpeakers = useMemo(() => new Map(items.map((item) => [item.sourceUtteranceId, {
+    ...getRecordSpeakerPresentation(sessionId, item), role: item.speakerRole,
+  }])), [items, sessionId]);
   const inFlightRef = useRef(false);
   const controllerRef = useRef<AbortController | null>(null);
 
@@ -81,7 +84,8 @@ export function RecordOriginalPanel({ sessionId, loadOriginals = fetchLiveRecord
     </section>}
     {items.length === 0 && !isLoading && !error && <p className={styles.empty}>{t("저장된 원문이 없습니다.")}</p>}
     <ol className={styles.transcriptList}>{readingTurns.map((turn) => <li key={turn.key} data-reading-turn={turn.key}>
-      <div className={styles.transcriptMeta}><span>{turn.speaker || t(sourceSpeakerRoles.get(turn.key) === "host" ? "진행자" : sourceSpeakerRoles.get(turn.key) === "participant" ? "참여자" : "화자 미상")}</span>
+      <div className={styles.transcriptMeta}>{recordedSpeakers.get(turn.key) && <RecordSpeakerIdentity speaker={recordedSpeakers.get(turn.key)}
+        fallbackName={t(recordedSpeakers.get(turn.key)?.isUnresolved ? "화자 미상" : recordedSpeakers.get(turn.key)?.role === "host" ? "진행자" : recordedSpeakers.get(turn.key)?.role === "participant" ? "참여자" : "화자 미상")} />}
         <time dateTime={turn.startedAt}>{formatSystemRecordDate(turn.startedAt, language)}</time>
       </div>
       <div className={styles.transcriptParagraphs}>{turn.paragraphs.map((paragraph) => <div key={paragraph.key}>
@@ -109,7 +113,7 @@ export function RecordSummaryPanel({ summary, status, onRefresh }: {
   const t = useSystemText(recordsMessages);
   const { language } = useSystemLanguage();
   if (!summary) return <div className={styles.statePanel} role="status">
-    <p>{t(status === "running" ? "AI 요약을 정리하고 있습니다." : status === "missing" ? "아직 저장된 AI 요약이 없습니다." : "AI 요약을 확인하지 못했습니다.")}</p>
+    {status === "running" ? <SummarySkeleton label={t("AI 요약을 정리하고 있습니다.")} /> : <p>{t(status === "missing" ? "아직 저장된 AI 요약이 없습니다." : "AI 요약을 확인하지 못했습니다.")}</p>}
     <button type="button" onClick={onRefresh}>{t("요약 상태 새로고침")}</button>
   </div>;
   const content = summary.summary;

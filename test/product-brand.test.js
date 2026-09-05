@@ -50,10 +50,11 @@ test("no product surface carries a retired display name", async () => {
   assert.deepEqual(violations, []);
 });
 
-test("packaging changes the display name without changing compatibility identifiers", async () => {
+test("NOVA packaging keeps the installed desktop identity while separating its CLI", async () => {
   const packageJson = JSON.parse(await readFile(path.join(ROOT, "package.json"), "utf8"));
   assert.equal(packageJson.build.productName, "NOVA");
-  assert.equal(packageJson.name, "realtime-noel");
+  assert.equal(packageJson.name, "nova");
+  assert.deepEqual(packageJson.bin, { nova: "src/nova-cli.js" });
   assert.equal(packageJson.build.appId, "com.realtime-noel.app");
   for (const message of Object.values(packageJson.build.mac.extendInfo)) {
     // The OS shows productName in Privacy & Security, so the usage strings

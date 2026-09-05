@@ -19,9 +19,10 @@ const listQuerySchema = z.object({
 const patchUserSchema = z.object({
   profileId: z.uuid(),
   status: z.enum(["approved", "rejected", "disabled"]).optional(),
+  voiceProvider: z.enum(["soniox", "gemini"]).optional(),
   reason: z.string().trim().max(200).optional(),
   role: z.enum(["host", "admin"]).optional(),
-}).strict().refine((v) => (v.status ? 1 : 0) + (v.role ? 1 : 0) === 1, "status 또는 role 중 하나만 지정합니다.");
+}).strict().refine((v) => (v.status ? 1 : 0) + (v.role ? 1 : 0) + (v.voiceProvider ? 1 : 0) === 1, "status 또는 role 중 하나만 지정합니다.");
 
 /** `GET /api/console/users?status=&before=` → `{ profiles: ConsoleProfileRow[], pendingCount }`. */
 export async function GET(request: NextRequest) {
@@ -47,9 +48,11 @@ export async function PATCH(request: NextRequest) {
     const { profile } = await requireAdmin(request);
     const parsed = patchUserSchema.safeParse(await readBoundedJsonBody(request));
     if (!parsed.success) return invalidConsoleRequest();
-    const { profileId, status, role, reason } = parsed.data;
+    const { profileId, status, role, reason, voiceProvider } = parsed.data;
     const store = getConsoleStore();
-    const result = status
+    const result = voiceProvider
+      ? await store.setProfileVoiceProvider({ actorId: profile.id, profileId, provider: voiceProvider })
+      : status
       ? await store.setProfileStatus({ actorId: profile.id, profileId, status, reason })
       : await store.setProfileRole({ actorId: profile.id, profileId, role: role as "host" | "admin" });
     return apiSuccess(result, { headers: privateNoStoreHeaders() });

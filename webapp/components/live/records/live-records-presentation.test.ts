@@ -1,3 +1,4 @@
+import ts from "typescript";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
@@ -52,12 +53,13 @@ test("records list and detail expose admin workflows without eager transcript DO
   assert.match(detail, /role="tablist"/u);
   assert.match(detail, /ArrowRight[\s\S]*ArrowLeft[\s\S]*Home[\s\S]*End/u);
   assert.match(detail, /RecordPeopleTable/u);
-  assert.match(detail, /동기화 다시 시도/u);
+  assert.match(detail, /record\.syncState === "failed"[\s\S]*disabled=\{isRetryingSync\} onClick=\{onRetrySync\}>\{t\("동기화"\)\}/u);
   assert.match(detail, /삭제하려면 기록 제목/u);
   assert.match(detail, /deleteConfirmation !== record\.title/u);
   assert.match(detail, /placeholder=\{record\.title\}/u);
   assert.match(detail, /selectedTab === 1 && <RecordOriginalPanel/u);
-  assert.match(detail, /전체 Excel 내보내기/u);
+  assert.match(detail, /ActionWithHelp label=\{t\("내보내기 도움말"\)\} help=\{t\("이 회의의 전체 기록"\)\}/u);
+  assert.match(detail, /isExporting \? "준비 중" : "Excel 저장"/u);
   assert.match(detail, /anchor\.download = result\.fileName/u);
   assert.match(detail, /exportInFlightRef\.current/u);
   assert.doesNotMatch(detail, /dangerouslySetInnerHTML/u);
@@ -107,7 +109,7 @@ test("host originals render one speaker header per turn and preserve correction 
   const panel = readFileSync(new URL("./RecordContentPanels.tsx", import.meta.url), "utf8");
   const styles = readFileSync(new URL("./live-records.module.css", import.meta.url), "utf8");
   assert.match(panel, /readingTurns.map\(\(turn\) => <li/u);
-  assert.match(panel, /turn.speaker[\s\S]*turn.startedAt/u);
+  assert.match(panel, /RecordSpeakerIdentity speaker=\{recordedSpeakers.get\(turn.key\)\}[\s\S]*turn.startedAt/u);
   assert.match(panel, /turn.paragraphs.map/u);
   assert.match(panel, /paragraph.fragments.map/u);
   assert.match(panel, /data-source-utterance-id=\{fragment.id\}/u);
@@ -143,9 +145,8 @@ test("host originals keep one paragraph per speaker turn and stamp every utteran
 
 test("host reading identity does not merge unknown speakers or participants without ids", () => {
   const panel = readFileSync(new URL("./RecordContentPanels.tsx", import.meta.url), "utf8");
-  assert.match(panel, /speakerKey: item.speakerRole === "unknown" \? `unknown:\$\{item.sourceUtteranceId\}`/u);
-  assert.match(panel, /item.participantId \? `participant:\$\{item.participantId\}`/u);
-  assert.match(panel, /item.speakerRole === "host" \? JSON.stringify\(\["host", item.speakerLabel, item.speakerName\]\) : `unknown:\$\{item.sourceUtteranceId\}`/u);
+  assert.match(panel, /speakerKey: getRecordSpeakerPresentation\(sessionId, item\).key/u);
+  assert.match(panel, /speaker: getRecordSpeakerPresentation\(sessionId, item\).displayName/u);
   assert.match(panel, /seq: item.sourceSeq/u);
 });
 
@@ -157,4 +158,33 @@ test("only demonstration numbering is removed and original pagination is retaine
   assert.match(fixture, /length: 75/u);
   assert.match(fixture, /length: 45/u);
   assert.match(demo, /sourceSeq > cursor\).slice\(0, 50\)/u);
+});
+
+test("automatic summary refresh cannot revert a language switch or abort a manual read", () => {
+  const route = readFileSync(new URL("./LiveRecordsRoute.tsx", import.meta.url), "utf8");
+  const start = route.indexOf("  useEffect(() => {\n    if (!detail || error ||");
+  const effect = route.slice(start, route.indexOf("  const presentation =", start));
+  assert.ok(start >= 0);
+  const code = ts.transpileModule(effect, { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None } }).outputText;
+  let timer: (() => void) | undefined;
+  let cleanup: (() => void) | undefined;
+  const refreshed: string[] = [];
+  const selectedDetailKeyRef = { current: "meeting:ko" };
+  const detailRequestPendingRef = { current: false };
+  const dependencies = {
+    useEffect: (callback: () => (() => void) | undefined) => { cleanup = callback(); },
+    detail: { record: { sessionId: "meeting" }, selectedLanguage: "ko", summaryStates: { ko: { status: "running" } } },
+    error: "", displayedDetailKey: "meeting:ko", selectedDetailKey: "meeting:ko", selectedDetailKeyRef, detailRequestPendingRef,
+    document: { hidden: false }, setTimeout: (callback: () => void) => { timer = callback; return 1; }, clearTimeout: () => { timer = undefined; },
+    openDetail: (_id: string, language: string) => { refreshed.push(language); },
+  };
+  const run = () => new Function(...Object.keys(dependencies), code)(...Object.values(dependencies));
+  run(); selectedDetailKeyRef.current = "meeting:en"; assert.ok(timer); timer();
+  assert.deepEqual(refreshed, [], "a stale KO timer must not select KO after EN was selected");
+  cleanup?.(); selectedDetailKeyRef.current = "meeting:ko"; run();
+  detailRequestPendingRef.current = true; assert.ok(timer); timer();
+  assert.deepEqual(refreshed, [], "a same-language manual request must not be aborted by automatic refresh");
+  detailRequestPendingRef.current = false; assert.ok(timer); timer();
+  assert.deepEqual(refreshed, ["ko"], "automatic refresh resumes once the current selection is idle");
+  cleanup?.(); assert.equal(timer, undefined);
 });

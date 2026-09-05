@@ -43,9 +43,11 @@ export function GlossaryRegistrationDialog({ isOpen, isBusy = false, preview, st
   const [targetLanguages, setTargetLanguages] = useState<readonly string[]>(["en"]);
   const [prompt, setPrompt] = useState("");
   const [pasted, setPasted] = useState("");
+  const [validatedPaste, setValidatedPaste] = useState<string | null>(null);
   const [localNotice, setLocalNotice] = useState("");
   const [isMounted, setIsMounted] = useState(false);
   const dialogRef = useRef<HTMLDialogElement>(null);
+  const closeRef = useRef<HTMLButtonElement>(null);
 
   useEffect(() => { setIsMounted(true); }, []);
 
@@ -54,9 +56,10 @@ export function GlossaryRegistrationDialog({ isOpen, isBusy = false, preview, st
     if (!isOpen || !dialog) return;
     const previousFocus = document.activeElement;
     if (!dialog.open) dialog.showModal();
+    closeRef.current?.focus();
     return () => {
       dialog.close();
-      if (previousFocus instanceof HTMLElement) previousFocus.focus();
+      if (previousFocus instanceof HTMLElement && previousFocus.isConnected) previousFocus.focus();
     };
   }, [isOpen, isMounted]);
 
@@ -100,8 +103,9 @@ export function GlossaryRegistrationDialog({ isOpen, isBusy = false, preview, st
         onCancel={(event) => { event.preventDefault(); onClose(); }}>
         <header className={styles.sectionHeading}>
           <h2 id={titleId}>{t("언어집 등록")}</h2>
-          <button type="button" onClick={onClose}>{t("닫기")}</button>
+          <button ref={closeRef} type="button" onClick={onClose}>{t("닫기")}</button>
         </header>
+        <div className={styles.registrationBody}>
         <p>{t("1단계 — 언어를 고르고 프롬프트를 생성한 뒤, AI 툴에 문서와 함께 붙여 넣어 용어집을 만들어 옵니다.")}</p>
         <div className={styles.registrationForm}>
           <label>{t("이름")}<input type="text" name="registrationName" value={name} maxLength={80} disabled={isBusy}
@@ -129,12 +133,8 @@ export function GlossaryRegistrationDialog({ isOpen, isBusy = false, preview, st
         <div className={styles.registrationForm}>
           <label htmlFor={pasteId}>{t("결과 붙여넣기")}</label>
           <textarea id={pasteId} name="pastedGlossary" value={pasted} rows={8} wrap="off" disabled={isBusy}
-            onChange={(event) => setPasted(event.currentTarget.value)}
+            onChange={(event) => { setPasted(event.currentTarget.value); setValidatedPaste(null); }}
             placeholder={t("AI 툴이 출력한 결과 전체를 붙여 넣으세요.")} />
-          <div className={styles.registrationActions}>
-            <button type="button" disabled={isBusy || !pasted.trim()} onClick={() => onValidate(pasted)}>{t("검증")}</button>
-            <button type="button" disabled={isBusy || !preview} onClick={onRegister}>{t("언어집 등록")}</button>
-          </div>
         </div>
         {preview && (
           <div className={styles.importPreview}>
@@ -145,7 +145,14 @@ export function GlossaryRegistrationDialog({ isOpen, isBusy = false, preview, st
             </span>
           </div>
         )}
-        <p role="status" aria-live="polite">{formatGlossaryStatus(localNotice || statusMessage, t)}</p>
+        </div>
+        <footer className={styles.registrationFooter}>
+          <p role="status" aria-live="polite">{formatGlossaryStatus(localNotice || statusMessage, t)}</p>
+          <div className={styles.registrationActions}>
+            <button type="button" disabled={isBusy || !pasted.trim()} onClick={() => { setLocalNotice(""); setValidatedPaste(pasted); onValidate(pasted); }}>{t("검증")}</button>
+            <button type="button" disabled={isBusy || !preview || validatedPaste !== pasted} onClick={() => { setLocalNotice(""); if (validatedPaste === pasted) onRegister(); }}>{t("언어집 등록")}</button>
+          </div>
+        </footer>
       </dialog>
     </div>, document.body,
   );

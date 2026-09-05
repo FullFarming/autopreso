@@ -1,4 +1,10 @@
 const rows = [
+  ["요약 준비가 오래 걸리고 있습니다. 원문은 먼저 확인할 수 있습니다.", "The summary is taking longer. You can read the transcript now.", "要約の準備に時間がかかっています。先に原文をご覧いただけます。"],
+  ["요약 상태 확인이 지연되고 있습니다. 다시 확인해 주세요.", "Checking the summary is taking longer. Please check again.", "要約の状態確認が遅れています。もう一度確認してください。"],
+  ["Excel 저장", "Save Excel", "Excel保存"],
+  ["내보내기 도움말", "Export help", "エクスポートのヘルプ"],
+  ["동기화", "Sync", "同期"],
+  ["삭제", "Delete", "削除"],
   ["라이브콜 기록", "Live call records", "ライブ通話の記録"],
   ["기록 불러오는 중", "Loading records", "記録を読み込み中"],
   ["{count}개", "{count} records", "{count}件"],

@@ -132,7 +132,6 @@ export function readGatewayEnvironment(environment = process.env) {
   const participantDemandValue = environment.LIVE_PARTICIPANT_DEMAND_ENABLED ?? "false";
   if (!["true", "false"].includes(participantDemandValue)) throw new Error("INVALID_PARTICIPANT_DEMAND_ENABLED");
   const required = [
-    "GEMINI_API_KEY",
     "GOOGLE_CLOUD_PROJECT",
     "SUPABASE_URL",
     "LIVE_GATEWAY_TOKEN_SECRET",
@@ -146,9 +145,9 @@ export function readGatewayEnvironment(environment = process.env) {
     }
   }
   // Provider/model selection is governed by the shared engine catalog carried in
-  // each session's captionConfig.engine, never by env. SONIOX_API_KEY is
-  // optional: a Soniox engine selection without it is rejected per session
-  // (ENGINE_KEY_MISSING) instead of failing gateway startup.
+  // each session's captionConfig.engine, never by env. Provider keys are
+  // optional at startup; an assigned engine without its key is rejected
+  // per session (ENGINE_KEY_MISSING) before opening a provider.
   const sonioxApiKey = String(environment.SONIOX_API_KEY ?? "").trim();
   const supabaseSecretKey = typeof environment.SUPABASE_SECRET_KEY === "string"
     ? environment.SUPABASE_SECRET_KEY.trim()
@@ -225,7 +224,7 @@ export function readGatewayEnvironment(environment = process.env) {
   return {
     port: Number(environment.PORT ?? 8080),
     host: isExactLocalSupabase && canUseLocalSupabase ? "127.0.0.1" : "0.0.0.0",
-    geminiApiKey: environment.GEMINI_API_KEY,
+    geminiApiKey: String(environment.GEMINI_API_KEY ?? "").trim(),
     sonioxApiKey,
     projectId: environment.GOOGLE_CLOUD_PROJECT,
     baseUrl: supabaseUrl.origin,

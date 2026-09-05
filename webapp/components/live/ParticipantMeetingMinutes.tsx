@@ -11,6 +11,7 @@ import type { MeetingSummary } from "@/lib/live/summary";
 import type { LiveTopicPublicMetadata } from "@/lib/live-contract";
 import type { TranscriptEntry } from "./meeting-minutes-model";
 import { formatMinuteTime } from "./meeting-minutes-model";
+import SummarySkeleton from "./SummarySkeleton";
 import { ViewerRecapRequest, type ViewerRecapClient } from "./ViewerRecapRequest";
 
 interface Props {
@@ -25,7 +26,7 @@ export function ParticipantMeetingMinutes({ sessionId, email, summary, transcrip
   summaryError, transcriptError, isSummaryEmpty = false, isLoading, isExpired, onRetry, recapClient, recordingGaps }: Props) {
   const t = useSystemText(viewerMessages);
   const { language: systemLanguage } = useSystemLanguage();
-  const [tab, setTab] = useState<"source" | "summary">("summary");
+  const [tab, setTab] = useState<"source" | "summary">("source");
   const id = useId();
   const sourceByTopic = useMemo(() => new Map(topics.map((topic) => [topic.id, transcript.filter((entry) => entry.topicId === topic.id)])), [topics, transcript]);
   function selectKey(event: KeyboardEvent<HTMLButtonElement>) {
@@ -71,7 +72,9 @@ export function ParticipantMeetingMinutes({ sessionId, email, summary, transcrip
             <button type="button" className="viewer-text-button" onClick={() => { setTab("source"); document.getElementById(`${id}-source`)?.focus(); }}>{t("전체 발언 원문 보기")}</button>
           </details>)}
         </div> : isSummaryEmpty ? <p role="status">{t("기록된 발언이 없어 요약을 만들 수 없습니다.")}</p>
-        : <p role={summaryError ? "alert" : "status"}>{t(summaryError) || t("회의 요약을 준비하고 있어요. 원문은 먼저 확인할 수 있어요.")}</p>}
+        : summaryError ? <p role="alert">{t(summaryError)}</p>
+        : isLoading ? <SummarySkeleton label={t("회의 요약을 준비하고 있어요. 원문은 먼저 확인할 수 있어요.")} />
+        : <p role="status">{t("요약 상태 확인이 지연되고 있습니다. 다시 확인해 주세요.")}</p>}
       {(transcriptError || (!isSummaryEmpty && (summaryError || (!summary && !isLoading)))) && <button className="viewer-text-button" type="button" disabled={isLoading} onClick={onRetry}>{isLoading ? t("확인 중…") : t("다시 확인")}</button>}
     </div>
     <ViewerRecapRequest key={sessionId} sessionId={sessionId} email={email} isExpired={isExpired} client={recapClient} />

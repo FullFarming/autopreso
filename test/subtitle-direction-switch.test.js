@@ -1,3 +1,4 @@
+import { GEMINI_ENGINE_SELECTION } from "../packages/caption-core/caption-engine-catalog.js";
 // Direction-switch smoothness ("영어였다가 한글이었다가 통역이 부드럽게 이어지지 않음"):
 //  1. when the spoken language flips mid-utterance, the subtitle that is ALREADY
 //     ON SCREEN is finalized as a committed line (sentence completed) instead of
@@ -47,7 +48,7 @@ test("a finalized Transcribe segment remains committed when the source language 
     settingsStore: {
       load: async () => ({
         apiKeys: { gemini: "AIza-test" },
-        subtitle: { translationProvider: "gemini", inputMode: "mic", languagePair: { a: "en", b: "ko" } },
+        subtitle: { engine: GEMINI_ENGINE_SELECTION, translationProvider: "gemini", inputMode: "mic", languagePair: { a: "en", b: "ko" } },
       }),
     },
     createWebSocket: (url, protocols, init) => {
@@ -388,6 +389,7 @@ async function runDirectionSwitchScenario() {
       load: async () => ({
         apiKeys: { gemini: "AIza-test" },
         subtitle: {
+          engine: GEMINI_ENGINE_SELECTION,
           translationProvider: "gemini",
           inputMode: "mic",
           languagePair: { a: "en", b: "ko" },
@@ -431,12 +433,12 @@ async function runDirectionSwitchScenario() {
 test("Gemini provider codes do not make cumulative source text pin KO to EN to KO switching", async () => {
   const broadcasts = await runDirectionSwitchScenario();
   const englishFinals = broadcasts.filter((message) => message.type === "subtitle:committed" && message.targetLanguage === "en");
-  assert.equal(englishFinals.length, 2);
+  assert.equal(englishFinals.length, 3);
   assert.equal(englishFinals.at(-1).sourceLanguage, "ko");
   assert.equal(englishFinals.at(-1).sourceText, "다시 한국어로 호텔 투자 전략을 설명합니다");
   assert.equal(
     englishFinals.some((message) => message.sourceLanguage === "en"),
-    false,
-    "same-language EN target output must never be emitted during the middle English segment",
+    true,
+    "the middle English segment is retained as an original caption without translation",
   );
 });

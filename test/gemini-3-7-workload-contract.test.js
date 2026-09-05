@@ -7,7 +7,7 @@ import {
   GEMINI_WORKLOAD_MODEL_MATRIX,
 } from "../packages/caption-core/index.js";
 import { evaluateGlossaryQuality } from "../packages/caption-core/glossary-quality-eval.js";
-import { CAPTION_ENGINE_CATALOG, DEFAULT_ENGINE_SELECTION, findEngineEntry } from "../packages/caption-core/caption-engine-catalog.js";
+import { CAPTION_ENGINE_CATALOG, GEMINI_ENGINE_SELECTION, findEngineEntry } from "../packages/caption-core/caption-engine-catalog.js";
 import { GEMINI_WORKLOAD_THINKING_LEVELS, GENERATE_WORKLOADS, resolveGeminiWorkloadModel, WORKLOAD_OUTPUT_CODEPOINTS } from "../packages/gemini-server/policy.js";
 import {
   createGeminiPdfGlossaryExtractor,
@@ -20,8 +20,8 @@ import {
 } from "../media-gateway/src/google-provider-adapters.js";
 
 const TEXT_MODEL = "gemini-3.7-flash";
-const TRANSCRIPTION_MODEL = DEFAULT_ENGINE_SELECTION.stt.model;
-const TRANSLATION_MODEL = DEFAULT_ENGINE_SELECTION.translation.model;
+const TRANSCRIPTION_MODEL = GEMINI_ENGINE_SELECTION.stt.model;
+const TRANSLATION_MODEL = GEMINI_ENGINE_SELECTION.translation.model;
 // Two-stage captions: Transcribe (STT) -> Flash text translation. The REST
 // workloads the session runtime may dispatch, in dispatch order for the loop below.
 const REST_WORKLOADS = Object.freeze(["topic", "translation", "polish", "recap"]);

@@ -25,7 +25,8 @@ test("stage keeps access prelive, translations live, and a clean completion stat
   assert.match(stage, /className="live-stage-complete"/u);
   assert.match(stage, /\{isPrelive && currentInvite && \(/u);
   assert.doesNotMatch(stage, /is-faded-out|aria-hidden=\{!isPrelive\}/u);
-  assert.doesNotMatch(stage, /<(?:button|a)\b/u);
+  assert.match(stage, /href="\/host-screen"/u);
+  assert.doesNotMatch(stage, /getUserMedia|startBroadcast|LiveAudioClient|gateway-token/u);
 });
 
 // 2026-08-22: the access code + QR must stay reachable until the host ends the
@@ -44,11 +45,11 @@ test("stage gates creation and display on current admission and rejects late inv
   assert.match(stage, /hasOpenStageAdmission\(activeSession, Date\.now\(\)\)/u);
   assert.match(stage, /action: "read-if-open"/u);
   assert.doesNotMatch(stage, /action: "create"|action: "create-if-open"/u);
-  assert.match(stage, /url: `\$\{window\.location\.origin\}\/watch`/u);
+  assert.match(stage, /url: buildAdmissionJoinUrl\(window\.location\.origin, result\.admissionCode\)/u);
   assert.match(stage, /getCurrentStageInvite\(candidate, latestSessionRef\.current, Date\.now\(\)\)/u);
   assert.match(stage, /getCurrentStageInvite\(invite, session, now\)/u);
   assert.match(stage, /controller\.abort\(\)/u);
-  assert.match(stage, /params\.get\("expiresAt"\)/u);
+  assert.doesNotMatch(stage, /readInviteFromHash|window\.location\.hash/u);
 });
 
 test("login composes shared accessible controls with only the required credentials", () => {

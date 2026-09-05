@@ -99,6 +99,13 @@ export function mountCaptionEngineSettings({ form, getSettings, save, onSaved, o
     }));
   }
   function refresh() {
+    if (form.querySelector('[data-engine-assignment="readonly"]')?.dataset?.engineAssignment === "readonly") {
+      const assigned = getSettings()?.engine;
+      const label = form.querySelector("#caption-engine-label");
+      if (label) label.textContent = assigned?.stt?.provider === "soniox" ? "Soniox" : assigned?.stt?.provider === "gemini" ? "Gemini" : "확인 중";
+      if (status) status.textContent = "관리자가 배정하며 다음 세션부터 적용됩니다.";
+      return;
+    }
     const engine = catalog ? currentEngine() : null;
     if (!catalog || !engine) {
       for (const name of ALL_FIELDS) {
@@ -167,6 +174,7 @@ export function mountCaptionEngineSettings({ form, getSettings, save, onSaved, o
     if (status) status.textContent = translate(hasSaveError ? "engine.saveFailed" : "engine.appliesNow");
   }
   async function commit() {
+    if (form.querySelector('[data-engine-assignment="readonly"]')?.dataset?.engineAssignment === "readonly") return;
     if (!catalog || isPending) return;
     const stt = selectedEntry("stt");
     const summary = selectedEntry("summary");

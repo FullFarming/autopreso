@@ -30,6 +30,7 @@
    Caption displays and semantic status colors retain their separate roles. */
 
 :root {
+  --nova-control-height: 44px;
   --nova-web-background: #15151A;
   --nova-web-text: #FFFFFF;
   --nova-web-action: #0071E3;
@@ -371,7 +372,7 @@ input:focus-visible {
 .live-panel { min-width: 0; padding: 22px; }
 .live-wizard { margin-top: 16px; padding: 24px; }
 .live-wizard-progress { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 6px; margin-bottom: 20px; padding: 4px; border: 1px solid var(--hairline); border-radius: var(--nova-r-pill); background: var(--nova-web-background); }
-.live-wizard-progress button { display: inline-flex; min-width: 0; min-height: 38px; align-items: center; justify-content: center; gap: 7px; border: 0; border-radius: var(--nova-r-pill); background: transparent; color: var(--body); font: 600 11px/1 var(--font-sans); }
+.live-wizard-progress button { display: inline-flex; min-width: 0; min-height: var(--nova-control-height); align-items: center; justify-content: center; gap: 7px; border: 0; border-radius: var(--nova-r-pill); background: transparent; color: var(--body); font: 600 11px/1 var(--font-sans); }
 .live-wizard-progress button span { display: grid; width: 18px; height: 18px; place-items: center; border: 1px solid var(--hairline-strong); border-radius: var(--nova-r-pill); color: var(--muted); font-size: 9px; }
 .live-wizard-progress button.is-current { background: var(--primary); color: var(--on-primary); }
 .live-wizard-progress button.is-current span { border-color: var(--on-primary); color: var(--on-primary); }
@@ -385,7 +386,7 @@ input:focus-visible {
 .live-wizard-footer,
 .live-wizard-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 18px; }
 .live-wizard-footer button,
-.live-wizard-actions button { min-width: 96px; min-height: 40px; border-radius: var(--nova-r-pill); padding: 0 16px; font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
+.live-wizard-actions button { min-width: 96px; min-height: var(--nova-control-height); border-radius: var(--nova-r-pill); padding: 0 16px; font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
 .live-mode-grid-two { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 .live-field-group { display: grid; gap: 9px; min-width: 0; }
 .live-field-group > strong,
@@ -444,7 +445,7 @@ input:focus-visible {
 .live-mode-card span { display: block; color: var(--body); font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
 
 .live-segmented { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); padding: 4px; border: 1px solid var(--hairline); border-radius: var(--nova-r-pill); background: var(--nova-web-background); }
-.live-segmented button { min-width: 0; min-height: 37px; border: 0; border-radius: var(--nova-r-pill); background: transparent; color: var(--body); white-space: nowrap; font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
+.live-segmented button { min-width: 0; min-height: var(--nova-control-height); border: 0; border-radius: var(--nova-r-pill); background: transparent; color: var(--body); white-space: nowrap; font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
 .live-segmented button.is-selected { background: var(--primary); color: var(--on-primary); box-shadow: none; }
 .live-help { margin: 14px 1px 0; color: var(--muted); font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
 
@@ -466,7 +467,7 @@ input:focus-visible {
 .live-admission-code small { color: var(--on-dark-soft); font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
 .live-invite-actions { display: flex; flex-wrap: wrap; justify-content: center; gap: 8px; margin-top: 12px; }
 .live-invite-actions button,
-.live-invite-actions a { display: inline-flex; min-height: 38px; align-items: center; justify-content: center; padding: 0 14px; border: 1px solid rgba(255,255,255,.22); border-radius: var(--nova-r-pill); background: var(--surface); color: var(--ink); text-decoration: none; white-space: nowrap; font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
+.live-invite-actions a { display: inline-flex; min-height: var(--nova-control-height); align-items: center; justify-content: center; padding: 0 14px; border: 1px solid rgba(255,255,255,.22); border-radius: var(--nova-r-pill); background: var(--surface); color: var(--ink); text-decoration: none; white-space: nowrap; font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
 .live-invite-actions button:hover,
 .live-invite-actions a:hover { border-color: var(--surface); }
 .live-invite-share { display: grid; justify-items: center; gap: 10px; margin-top: 12px; }
@@ -475,8 +476,8 @@ input:focus-visible {
 .live-invite-qr > span { max-width: 170px; color: var(--body); text-align: center; font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
 .live-invite-qr figcaption { color: var(--muted); font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
 .live-invite-feedback { display: block; min-height: 14px; margin-top: 7px; color: var(--muted); text-align: center; font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
-.live-action-row { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; }
-.live-action-row button { min-height: 38px; padding: 0 14px; white-space: nowrap; font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
+.live-action-row { display: flex; align-items: start; flex-wrap: wrap; gap: 8px; margin-top: 14px; }
+.live-action-row button { min-height: var(--nova-control-height); padding: 0 14px; white-space: nowrap; font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
 .live-danger-button { border: 1px solid var(--nova-status-error); border-radius: var(--nova-r-pill); background: transparent; color: var(--nova-status-error); }
 
 .live-monitor-panel { margin-top: 16px; }
@@ -599,7 +600,7 @@ input:focus-visible {
 .live-host-shell .live-wizard-progress { display: none; }
 .live-host-shell .live-wizard-body { grid-column: 1; min-height: 0; }
 .live-host-shell .live-wizard-footer { position: sticky; bottom: 0; z-index: 2; grid-column: 1; padding: 14px 0 0; border-top: 1px solid var(--nova-surface-hairline); background: var(--nova-surface-base); }
-.live-host-shell .live-wizard-footer button { min-width: 0; min-height: 50px; flex: 1 1 0; border-radius: 8px; overflow-x: auto; white-space: nowrap; }
+.live-host-shell .live-wizard-footer button { min-width: 0; min-height: var(--nova-control-height); flex: 1 1 0; border-radius: 8px; overflow-x: auto; white-space: nowrap; }
 .live-host-shell .live-wizard-footer .accent-btn { flex: 1; }
 .live-setup-mobile-access { grid-column: 2; grid-row: 1 / span 4; display: flex; min-width: 0; flex-direction: column; gap: 14px; padding-left: 42px; border-left: 1px solid rgba(255,255,255,.18); }
 .live-setup-mobile-access h2 { margin: 0; color: #fff; font-size: 16px; }
@@ -612,7 +613,7 @@ input:focus-visible {
 .live-host-shell .live-schedule-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 .live-host-shell .live-schedule-grid .live-title-field { grid-column: 1 / -1; }
 .live-host-shell .live-mode-card { min-height: 86px; }
-.live-setting-row { display: grid; width: 100%; min-height: 52px; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 12px; padding: 0 14px; border: 1px solid var(--nova-surface-hairline); border-radius: var(--nova-radius-sm); background: var(--nova-surface-base); color: var(--nova-fg-primary); text-align: left; }
+.live-setting-row { display: grid; width: 100%; min-height: var(--nova-control-height); grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 12px; padding: 0 14px; border: 1px solid var(--nova-surface-hairline); border-radius: var(--nova-radius-sm); background: var(--nova-surface-base); color: var(--nova-fg-primary); text-align: left; }
 .live-setting-row strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .live-setting-row small { color: var(--nova-fg-secondary); font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
 .live-capability-switch { cursor: pointer; }
@@ -774,7 +775,7 @@ input:focus-visible {
 .live-mic-picker { display: grid; gap: 6px; font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
 .live-mic-picker select { min-height: 44px; border: 1px solid var(--nova-surface-hairline); border-radius: var(--nova-radius-sm); background: var(--nova-surface-base); color: var(--nova-fg-primary); padding: 0 12px; font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
 .live-host-hidden-notice { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 0; border: 1px solid var(--nova-surface-hairline); border-radius: var(--nova-radius-md); background: var(--nova-surface-layered); color: var(--nova-fg-primary); padding: 10px 14px; font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
-.live-host-hidden-notice button { min-height: 32px; border: 1px solid var(--nova-surface-hairline); border-radius: var(--nova-radius-sm); background: transparent; color: var(--nova-fg-primary); padding: 0 12px; cursor: pointer; font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
+.live-host-hidden-notice button { min-height: var(--nova-control-height); border: 1px solid var(--nova-surface-hairline); border-radius: var(--nova-radius-sm); background: transparent; color: var(--nova-fg-primary); padding: 0 12px; cursor: pointer; font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
 .live-host-inspector-body button,
 .live-host-inspector-body a { min-height: 44px; }
 .live-host-end-confirm { min-height: 44px; }
@@ -844,16 +845,16 @@ input:focus-visible {
 .live-join-lede { margin: 0; max-width: 36ch; color: var(--nova-text-muted); word-break: keep-all; font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
 .live-join-card { display: grid; width: min(430px, calc(100% - 40px)); gap: 14px; align-self: center; justify-self: center; margin: 0; padding: clamp(24px, 4vh, 44px) 0; color: var(--nova-text); }
 .live-join-card > .live-join-invite-chip { display: flex; align-items: center; gap: 9px; margin: 0 0 8px; border: 1px solid var(--nova-hairline-strong); border-radius: var(--nova-r-pill); background: var(--nova-surface-raised); color: var(--nova-text); padding: 11px 16px; font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
-.live-join-card .live-name-input.live-join-name-hero { height: 66px; font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
+.live-join-card .live-name-input.live-join-name-hero { height: var(--nova-control-height); font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
 .live-join-wordmark { margin: 0; color: var(--nova-text); font-size: 12px; font-weight: 600; letter-spacing: .22em; text-transform: uppercase; }
 .live-join-card h1 { margin: 6px 0 10px; font-size: clamp(2.3rem, 8vw, 3.4rem); }
 .live-join-card > p { margin: 0 0 24px; color: var(--body); font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
 .live-join-card label { display: block; margin-bottom: 0; color: var(--nova-text-muted); font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
 .live-join-card input { width: 100%; height: 62px; border: 1px solid var(--hairline-strong); border-radius: 16px; background: var(--surface); color: var(--ink); text-align: center; font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
-.live-join-card .live-name-input { height: 58px; border-color: var(--nova-hairline-strong); border-radius: var(--nova-r-sm); background: var(--nova-surface); color: var(--nova-text); padding: 0 16px; text-align: left; font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
+.live-join-card .live-name-input { height: var(--nova-control-height); border-color: var(--nova-hairline-strong); border-radius: var(--nova-r-sm); background: var(--nova-surface); color: var(--nova-text); padding: 0 16px; text-align: left; font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
 .live-join-card .live-name-input::placeholder { color: var(--nova-text-subtle); }
 .live-join-card .live-name-input:focus-visible { outline: 2px solid var(--nova-blue); outline-offset: 2px; }
-.live-join-card .live-code-input { height: 58px; border-color: var(--nova-hairline-strong); border-radius: var(--nova-r-sm); background: var(--nova-surface); color: var(--nova-text); font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); font-variant-numeric: tabular-nums; }
+.live-join-card .live-code-input { height: var(--nova-control-height); border-color: var(--nova-hairline-strong); border-radius: var(--nova-r-sm); background: var(--nova-surface); color: var(--nova-text); font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); font-variant-numeric: tabular-nums; }
 .live-join-card .live-code-input::placeholder { color: var(--nova-text-subtle); }
 .live-join-card > small { display: block; margin: 8px 2px 20px; color: var(--muted); font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
 .live-join-card .live-primary-action { width: 100%; min-height: 54px; margin-top: 4px; border: 0; border-radius: var(--nova-r-sm); background: var(--nova-text); color: var(--nova-surface); font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
@@ -889,7 +890,7 @@ input:focus-visible {
 .live-viewer-toolbar > strong { margin-right: auto; white-space: nowrap; font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
 .live-viewer-toolbar label { color: var(--muted); font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
 .live-viewer-toolbar select,
-.live-viewer-toolbar button { min-height: 34px; border: 1px solid var(--hairline-strong); border-radius: var(--nova-r-pill); background: var(--surface); color: var(--ink); padding: 0 12px; font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
+.live-viewer-toolbar button { min-height: var(--nova-control-height); border: 1px solid var(--hairline-strong); border-radius: var(--nova-r-pill); background: var(--surface); color: var(--ink); padding: 0 12px; font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
 .live-viewer-toolbar button.is-selected { background: var(--primary); color: var(--on-primary); }
 .live-viewer-toolbar .live-leave-button { border-color: var(--nova-status-error); color: var(--nova-status-error); }
 .live-text-size-button { min-width: 38px; padding: 0 9px !important; font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
@@ -1184,7 +1185,7 @@ input:focus-visible {
 .live-recovery-list li { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px; border: 1px solid var(--hairline-strong); border-radius: 12px; padding: 10px 14px; }
 .live-recovery-list li > div { display: grid; gap: 2px; }
 .live-recovery-list small { color: var(--muted); font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
-.live-recovery-list button { min-height: 38px; padding: 0 16px; font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
+.live-recovery-list button { min-height: var(--nova-control-height); padding: 0 16px; font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
 
 /* Action items with owner/due (contract C7). */
 .live-summary-actions-list li { display: grid; gap: 2px; }
@@ -1313,7 +1314,7 @@ input:focus-visible {
 /* Participant entry shares the same web palette as the host. */
 .live-join-heading { margin: 0; color: var(--nova-text); font-size: clamp(2rem, 7vw, 2.8rem); line-height: 1.1; }
 .live-join-lede { margin: 0 0 18px; color: var(--nova-text-muted); font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
-.live-join-card .live-primary-action { min-height: 56px; border: 0; border-radius: var(--nova-r-pill); background: var(--nova-text); color: var(--nova-surface); transition: transform .12s; font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
+.live-join-card .live-primary-action { min-height: var(--nova-control-height); border: 0; border-radius: var(--nova-r-pill); background: var(--nova-text); color: var(--nova-surface); transition: transform .12s; font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
 .live-join-card .live-primary-action:active { transform: scale(.98); }
 .live-join-card .live-primary-action:disabled { opacity: .45; }
 .live-join-card .live-code-input { border-color: var(--nova-hairline-strong); background: var(--nova-surface); color: var(--nova-text); font-variant-numeric: tabular-nums; }
@@ -1343,7 +1344,7 @@ input:focus-visible {
    the caption-controls row it fell back to the default dark ink — rgb(12,10,9),
    the exact shell background — so it rendered invisible. Style it here rather
    than by ancestry, and mirror the language pill so the two read as one group. */
-.live-caption-controls .live-text-size-button { min-height: 34px; min-width: 40px; border: 1px solid var(--hairline-strong); border-radius: var(--nova-r-pill); background: var(--surface); color: var(--body); cursor: pointer; font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
+.live-caption-controls .live-text-size-button { min-height: var(--nova-control-height); min-width: var(--nova-control-height); border: 1px solid var(--hairline-strong); border-radius: var(--nova-r-pill); background: var(--surface); color: var(--body); cursor: pointer; font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
 .live-caption-controls .live-text-size-button[aria-expanded="true"] { background: var(--primary); color: var(--on-primary); border-color: transparent; }
 .live-viewer-shell.is-compact .live-caption-controls .live-text-size-button { min-height: 44px; min-width: 44px; border-color: rgba(255,255,255,.16); background: rgba(255,255,255,.07); color: #fff; }
 .live-viewer-shell.is-compact .live-caption-controls .live-text-size-button[aria-expanded="true"] { background: var(--nova-web-action); color: var(--nova-web-text); }
@@ -1552,7 +1553,7 @@ input:focus-visible {
 .viewer-microphone-slot { min-height: 72px; padding-bottom: env(safe-area-inset-bottom); }
 .viewer-notebook .viewer-microphone-capsule,
 .viewer-notebook .viewer-recap-cta { display: flex; align-items: center; justify-content: center; width: 100%; min-height: 56px; padding: 12px 24px; background: var(--nova-web-action); color: var(--nova-web-text); border: 0; box-sizing: border-box; }
-.viewer-notebook .viewer-microphone-capsule { border-radius: var(--nova-radius-pill); }
+.viewer-notebook .viewer-microphone-capsule { gap: 8px; border-radius: var(--nova-radius-pill); font: var(--nova-ui-font); }
 .viewer-notebook .viewer-recap-cta { border-radius: var(--nova-radius-sm); font: var(--nova-ui-font); }
 .viewer-notebook .viewer-recap-cta:disabled { opacity: .65; cursor: default; }
 .viewer-record-tabs { display: flex; gap: 24px; border-bottom: 1px solid var(--nova-surface-hairline); margin-bottom: 24px; }
@@ -1858,9 +1859,9 @@ input:focus-visible {
 /* 2026-09-03 feat(auth): login card (Google, email/password, signup), /auth/callback, /pending.
    One primary action (Google); the credential form and the footer links stay quiet. */
 .auth-card { display: flex; flex-direction: column; gap: 12px; max-width: 26rem; }
-.auth-card .auth-button { min-height: 44px; width: 100%; display: inline-flex; align-items: center; justify-content: center; gap: 10px; padding: 0 16px; border-radius: 12px; font: var(--nova-ui-font); font-weight: 600; letter-spacing: var(--nova-ui-letter-spacing); cursor: pointer; }
+.auth-card .auth-button { min-height: 44px; width: 100%; display: inline-flex; align-items: center; justify-content: center; gap: 10px; padding: 0 16px; border-radius: 8px; font: var(--nova-ui-font); font-weight: 600; letter-spacing: var(--nova-ui-letter-spacing); cursor: pointer; }
 .auth-card .auth-button:disabled { cursor: default; }
-.auth-card .auth-google { min-height: 52px; }
+.auth-card .auth-google { min-height: var(--nova-control-height); }
 .auth-google svg { width: 18px; height: 18px; flex: none; }
 .auth-card .auth-secondary,
 .auth-card .auth-submit { border: 1px solid var(--nova-hairline-strong); background: transparent; color: inherit; text-decoration: none; }
@@ -1956,7 +1957,7 @@ th.console-num, td.console-num { text-align: right; }
 .console-field select { width: 100%; }
 .console-field select:disabled { opacity: .55; }
 .console-deploy-row { display: flex; flex-wrap: wrap; align-items: center; gap: 14px; }
-.console-deploy-row .live-primary-action { min-height: 46px; border-radius: var(--nova-radius-sm); }
+.console-deploy-row .live-primary-action { min-height: var(--nova-control-height); border-radius: var(--nova-radius-sm); }
 .console-last-change { flex: 1 1 240px; }
 .console-status-line { margin: 0; color: var(--nova-status-ok); font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
 .console-switch-row { cursor: pointer; }
@@ -1995,4 +1996,71 @@ th.console-num, td.console-num { text-align: right; }
 }
 @media (prefers-reduced-motion: reduce) {
   .console-dialog { animation: none; }
+}
+
+/* 2026-09-05 feat: Paragraph reading owns the available width; controls stay outside its scroll area. */
+.live-viewer-shell .viewer-notebook { width: min(100%, 960px); padding: 16px; gap: 12px; }
+.viewer-notebook > [role="toolbar"] { min-height: 44px; gap: 8px; padding-bottom: 8px; overflow: visible; }
+.viewer-notebook > [role="toolbar"] > strong { margin-right: auto; }
+.viewer-session-status { color: var(--nova-fg-secondary); font: var(--nova-ui-font); }
+.viewer-meeting-heading { padding-block: 4px 8px; }
+.viewer-meeting-heading h1 { margin-bottom: 4px; font-size: 22px; line-height: 31px; }
+.viewer-reading-scroll { scrollbar-gutter: auto; padding-inline: 0; }
+.viewer-reading-scroll article { margin-bottom: 24px; }
+.viewer-reading-scroll article > header { flex-wrap: wrap; gap: 4px 12px; margin: 0 0 8px; overflow-wrap: anywhere; }
+.viewer-reading-scroll article > header time { flex-shrink: 0; font-variant-numeric: tabular-nums; }
+.viewer-caption-text { color: var(--nova-fg-secondary); font-size: calc(16px * var(--live-caption-scale, 1)); line-height: calc(24px * var(--live-caption-scale, 1)); font-weight: 400; }
+.viewer-reading-scroll article[data-current="true"] .viewer-caption-text { color: var(--nova-web-text); }
+.viewer-reading-scroll article[data-caption-state="failed"] .viewer-caption-text { color: var(--nova-fg-secondary); }
+.viewer-microphone-slot { min-height: 0; padding-top: 8px; padding-bottom: max(8px, env(safe-area-inset-bottom)); }
+.viewer-follow-button { max-width: calc(100% - 32px); white-space: normal; overflow-wrap: anywhere; }
+
+/* 2026-09-05 fix: Long profile and session values wrap without enlarging forms or dialogs. */
+:is(.live-login-shell, .live-viewer-shell, .live-records-route, .live-modal-root) :where(input, select, textarea) { min-width: 0; max-width: 100%; box-sizing: border-box; }
+:is(.live-login-shell, .live-viewer-shell, .live-records-route, .live-modal-root) :where(button) { min-height: 44px; overflow-wrap: anywhere; }
+:is(.live-login-shell, .live-viewer-shell, .live-records-route, .live-modal-root) :where(h1, h2, h3, p, label) { overflow-wrap: anywhere; }
+.live-login-form label { white-space: normal; min-width: 0; }
+.live-speak-sheet header strong { white-space: normal; overflow-wrap: anywhere; overflow-x: visible; }
+.live-speak-sheet header { flex-wrap: wrap; }
+.live-speak-sheet { box-sizing: border-box; max-height: calc(100dvh - 16px); overflow-y: auto; }
+
+@media (max-width: 600px) {
+  .live-viewer-shell .viewer-notebook { padding-inline: 12px; padding-top: 8px; gap: 8px; }
+  .viewer-notebook > [role="toolbar"] { flex-wrap: wrap; }
+  .viewer-notebook > [role="toolbar"] > strong { font-size: 22px; line-height: 31px; }
+  .viewer-meeting-heading h1 { font-size: 22px; line-height: 31px; }
+}
+
+/* 2026-09-05 fix: At high zoom or landscape height, let controls scroll instead of collapsing the transcript. */
+@media (max-height: 480px) {
+  .live-viewer-shell[data-reading-state="live"] { overflow-y: auto; }
+  .live-viewer-shell[data-reading-state="live"] .viewer-notebook { height: auto; min-height: 100%; overflow: visible; }
+  .live-viewer-shell[data-reading-state="live"] .live-viewer-caption-region { flex: none; min-height: 200px; }
+  .live-viewer-shell[data-reading-state="live"] .viewer-reading-scroll { min-height: 160px; max-height: 50dvh; }
+}
+
+/* 2026-09-05 fix: Companion navigation remains in document flow so wrapped notices cannot cover the QR frame. */
+.live-stage-shell:has(> .live-stage-companion-navigation) { display: flex; flex-direction: column; align-items: center; gap: 16px; }
+.live-stage-companion-navigation, .live-stage-invite-notice { display: flex; flex-wrap: wrap; align-items: center; gap: 12px 24px; width: min(100%, 1600px); flex-shrink: 0; font-size: 15px; line-height: 1.5; letter-spacing: -.02em; word-break: keep-all; overflow-wrap: anywhere; }
+.live-stage-companion-navigation > span { color: var(--nova-text-muted); }
+.live-stage-companion-navigation a, .live-stage-invite-notice button { display: inline-flex; align-items: center; justify-content: center; min-height: 44px; padding: 10px 16px; border: 1px solid var(--nova-hairline); border-radius: 8px; color: var(--nova-web-text); background: transparent; font: inherit; white-space: normal; text-decoration: none; }
+.live-stage-companion-navigation a:focus-visible, .live-stage-invite-notice button:focus-visible { outline: 2px solid var(--nova-web-action); outline-offset: 2px; }
+.live-stage-shell:has(> .live-stage-companion-navigation) > .live-stage-frame { display: grid; flex-shrink: 0; width: min(100%, 1600px); height: auto; min-height: min(720px, calc(100dvh - 140px)); aspect-ratio: auto; }
+.live-stage-shell:has(> .live-stage-companion-navigation) .live-stage-grid,
+.live-stage-shell:has(> .live-stage-companion-navigation) .live-stage-translation,
+.live-stage-shell:has(> .live-stage-companion-navigation) .live-stage-complete { height: auto; min-height: min-content; }
+.live-stage-shell:has(> .live-stage-companion-navigation) .live-stage-grid { grid-template-columns: minmax(0, 1.35fr) minmax(320px, .65fr); gap: 24px; }
+.live-stage-shell:has(> .live-stage-companion-navigation) .live-stage-access .live-invite-qr { max-width: 100%; }
+.live-stage-shell:has(> .live-stage-companion-navigation) .live-stage-access .live-invite-qr img { width: clamp(220px, 24vw, 300px); max-width: 100%; height: auto; aspect-ratio: 1; }
+.live-stage-shell:has(> .live-stage-companion-navigation) .live-stage-access.is-live .live-invite-qr img { width: 160px; height: auto; }
+.live-stage-shell:has(> .live-stage-companion-navigation) .live-stage-title { min-width: 0; overflow-wrap: anywhere; }
+@media (max-width: 760px) {
+  .live-stage-shell:has(> .live-stage-companion-navigation) > .live-stage-frame { min-height: calc(100dvh - 140px); }
+  .live-stage-shell:has(> .live-stage-companion-navigation) .live-stage-grid { grid-template-columns: minmax(0, 1fr); }
+  .live-stage-shell:has(> .live-stage-companion-navigation) .live-stage-translation-header { grid-template-columns: minmax(0, 1fr); gap: 16px; }
+  .live-stage-shell:has(> .live-stage-companion-navigation) .live-stage-access.is-live { justify-self: start; max-width: 100%; }
+}
+@media (max-width: 480px) {
+  .live-stage-shell:has(> .live-stage-companion-navigation) .live-stage-access.is-live { grid-template-columns: minmax(0, 1fr); justify-items: center; }
+  .live-stage-shell:has(> .live-stage-companion-navigation) .live-stage-access.is-live .live-stage-code { justify-items: center; }
 }

@@ -43,7 +43,7 @@ test("fresh and empty settings receive the actual default glossary while custom 
   const defaultPreset = GLOSSARY_PRESETS.find((entry) => entry.id === DEFAULT_GLOSSARY_PRESET_ID);
   assert.ok(defaultPreset);
 
-  const freshStore = createSettingsStore({ filePath: await settingsPath(), env: {}, readCodexAuth: noCodexAuth });
+  const freshStore = createSettingsStore({ filePath: await settingsPath(), env: {} });
   const fresh = await freshStore.load();
   assert.equal(fresh.subtitle.glossaryPresetId, DEFAULT_GLOSSARY_PRESET_ID);
   assert.equal(fresh.subtitle.glossaryPresetName, "");
@@ -52,7 +52,7 @@ test("fresh and empty settings receive the actual default glossary while custom 
 
   const emptyPath = await settingsPath();
   await fs.writeFile(emptyPath, JSON.stringify({ subtitle: { glossary: "", translationDomain: "" } }));
-  const empty = await createSettingsStore({ filePath: emptyPath, env: {}, readCodexAuth: noCodexAuth }).load();
+  const empty = await createSettingsStore({ filePath: emptyPath, env: {} }).load();
   assert.equal(empty.subtitle.glossaryPresetId, DEFAULT_GLOSSARY_PRESET_ID);
   assert.equal(empty.subtitle.glossary, defaultPreset.glossary);
   assert.equal(empty.subtitle.translationDomain, defaultPreset.domain);
@@ -65,7 +65,7 @@ test("fresh and empty settings receive the actual default glossary while custom 
       translationDomain: defaultPreset.domain,
     },
   }));
-  const exact = await createSettingsStore({ filePath: exactPath, env: {}, readCodexAuth: noCodexAuth }).load();
+  const exact = await createSettingsStore({ filePath: exactPath, env: {} }).load();
   assert.equal(exact.subtitle.glossaryPresetId, DEFAULT_GLOSSARY_PRESET_ID);
 
   const customPath = await settingsPath();
@@ -75,7 +75,7 @@ test("fresh and empty settings receive the actual default glossary while custom 
       translationDomain: "Private board meeting",
     },
   }));
-  const customStore = createSettingsStore({ filePath: customPath, env: {}, readCodexAuth: noCodexAuth });
+  const customStore = createSettingsStore({ filePath: customPath, env: {} });
   const custom = await customStore.load();
   assert.equal(custom.subtitle.glossaryPresetId, "");
   assert.equal(custom.subtitle.glossaryPresetName, "");
@@ -98,7 +98,6 @@ test("Caption-only and Live host resolve the exact same built-in preset fingerpr
   const liveSettings = await createSettingsStore({
     filePath: await settingsPath(),
     env: {},
-    readCodexAuth: noCodexAuth,
   }).load();
 
   const expectedFingerprint = fingerprint(`${preset.glossary}\u0000${preset.domain}`);
@@ -126,7 +125,7 @@ test("editing one character of the current default converts it to Custom without
     },
   }));
 
-  const settings = await createSettingsStore({ filePath, env: {}, readCodexAuth: noCodexAuth }).load();
+  const settings = await createSettingsStore({ filePath, env: {} }).load();
 
   assert.equal(settings.subtitle.glossaryPresetId, "");
   assert.equal(settings.subtitle.glossaryPresetName, "");

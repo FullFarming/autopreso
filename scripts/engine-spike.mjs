@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 // scripts/engine-spike.mjs
 // Real-API comparison of caption STT providers on ONE 16 kHz mono WAV.
-// Keys: SONIOX_API_KEY from ~/.config/realtime-noel/soniox.env (or env),
-//       Gemini from ~/.config/realtime-noel/settings.json apiKeys.gemini (or GEMINI_API_KEY).
+// Keys: SONIOX_API_KEY from ~/.config/nova/soniox.env (or env),
+//       Gemini from ~/.config/nova/settings.json apiKeys.gemini (or GEMINI_API_KEY).
 // Never prints keys. Writes scratch/engine-spike-<ts>.json.
 import fs from "node:fs/promises";
 import os from "node:os";
@@ -85,9 +85,9 @@ export function parseEnvValue(text, name) {
 async function readKeys() {
   const home = os.homedir();
   let soniox = process.env.SONIOX_API_KEY ?? "";
-  try { const env = await fs.readFile(path.join(home, ".config/realtime-noel/soniox.env"), "utf8"); soniox ||= parseEnvValue(env, "SONIOX_API_KEY"); } catch {}
+  try { const env = await fs.readFile(path.join(home, ".config/nova/soniox.env"), "utf8"); soniox ||= parseEnvValue(env, "SONIOX_API_KEY"); } catch {}
   let gemini = process.env.GEMINI_API_KEY ?? "";
-  try { const settings = JSON.parse(await fs.readFile(path.join(home, ".config/realtime-noel/settings.json"), "utf8")); gemini ||= settings.apiKeys?.gemini ?? ""; } catch {}
+  try { const settings = JSON.parse(await fs.readFile(path.join(home, ".config/nova/settings.json"), "utf8")); gemini ||= settings.apiKeys?.gemini ?? ""; } catch {}
   return { soniox, gemini };
 }
 
@@ -166,7 +166,7 @@ async function main() {
   const results = [];
   for (const provider of args.providers) {
     if (provider === "soniox") {
-      if (!keys.soniox) throw new Error("SONIOX_API_KEY missing (env or ~/.config/realtime-noel/soniox.env)");
+      if (!keys.soniox) throw new Error("SONIOX_API_KEY missing (env or ~/.config/nova/soniox.env)");
       for (const mode of args.modes) results.push(await runSoniox({ key: keys.soniox, pcm, mode, endpoint: args.endpoint, realtime: args.realtime }));
     } else if (provider === "gemini") {
       if (!keys.gemini) throw new Error("Gemini API key missing (settings.json apiKeys.gemini or GEMINI_API_KEY)");

@@ -134,6 +134,8 @@ export interface AuthoritativeTranscriptTranslation {
 }
 
 export interface AuthoritativeTranscriptItem {
+  speakerProfile?: import("../../../packages/caption-core/speaker-profile.js").SpeakerProfile;
+  speakerAttribution?: "unresolved";
   sourceUtteranceId: string;
   sourceSeq: number;
   utteranceKey: string;

@@ -4,6 +4,7 @@ import { useSystemText } from "@/components/system-language/SystemLanguageProvid
 import { viewerMessages } from "@/lib/system-language/viewer-messages";
 
 import { memo, useEffect, useRef, useState } from "react";
+import { SpeakerIdentity } from "./SpeakerIdentity";
 import type { TopicCaptionPresentation } from "./translation/topic-presentation";
 
 export const ViewerReadingFeed = memo(function ViewerReadingFeed({ captions, language, kind = "translation", onReadingAnchorChange }: {
@@ -46,11 +47,12 @@ export const ViewerReadingFeed = memo(function ViewerReadingFeed({ captions, lan
       }}>
       {captions.length === 0 ? <p className="viewer-muted" role="status">{t("발표가 시작되면 자막이 여기에 표시됩니다.")}</p> : captions.map((caption, index) => {
         const previous = captions[index - 1];
-        const showSpeaker = !previous || previous.speakerLabel !== caption.speakerLabel || previous.timestamp !== caption.timestamp;
+        const showSpeaker = !previous || previous.speakerLabel !== caption.speakerLabel || previous.speakerProfile?.id !== caption.speakerProfile?.id || previous.speakerProfile?.version !== caption.speakerProfile?.version || previous.timestamp !== caption.timestamp;
         const failed = caption.translationStatus === "failed";
         return <article key={caption.utteranceKey ?? caption.id} data-utterance-key={caption.utteranceKey ?? caption.id}
+          data-current={index === captions.length - 1 || undefined}
           data-caption-state={failed ? "failed" : caption.isFinal ? "final" : "partial"}>
-          {showSpeaker && <header>{kind === "source" ? t(caption.speakerLabel || "발표자") : caption.speakerLabel || t("발표자")}{caption.timestamp && <time>{caption.timestamp}</time>}</header>}
+          {showSpeaker && <header><SpeakerIdentity profile={caption.speakerProfile} sessionId={caption.sessionId} fallback={kind === "source" ? t(caption.speakerLabel || "발표자") : caption.speakerLabel || t("발표자")} />{caption.timestamp && <time>{caption.timestamp}</time>}</header>}
           <p lang={caption.language ?? language} className="viewer-caption-text">{failed ? t("번역을 불러오지 못했어요.") : caption.text}
             {caption.pendingText && <span className="viewer-caption-draft"> {caption.pendingText}</span>}</p>
           {(!caption.isFinal || caption.pendingText) && <span className="viewer-muted viewer-drafting-label">{kind === "source" ? t("작성 중") : t("번역 중")}</span>}
@@ -60,6 +62,6 @@ export const ViewerReadingFeed = memo(function ViewerReadingFeed({ captions, lan
     {!isFollowing && <button className="viewer-follow-button" type="button" onClick={() => {
       isPinned.current = true; setIsFollowing(true); if (scroll.current) scroll.current.scrollTop = scroll.current.scrollHeight;
     }}>{t("실시간으로 돌아가기")}</button>}
-    <span className="sr-only" aria-live="polite" aria-atomic="true">{latestFinal?.text}</span>
+    <span className="sr-only" aria-live="polite" aria-atomic="true">{latestFinal?.text.slice(0, 500)}</span>
   </section>;
 });

@@ -169,7 +169,7 @@ test("Gemini transcription ignores translated-audio and malformed provider event
   } });
   await settleCallbacks();
 
-  assert.deepEqual(partials, [{ text: "NOVA net oper", sourceLanguage: "en-US" }]);
+  assert.deepEqual(partials, [{ text: "NOVA net oper", sourceLanguage: "en-US", segmentId: "0" }]);
   assert.equal(finals.length, 1);
   assert.equal(finals[0].text, "NOVA net operating income increased.");
   assert.equal(finals[0].sourceLanguage, "en-US");

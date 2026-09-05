@@ -117,3 +117,9 @@ test("registration dialog offers prompt copy, paste registration, and language t
   assert.match(dialog, /languageTag/u);
   assert.doesNotMatch(dialog, /fetch\(|\/api\//u);
 });
+
+test("editing a validated paste requires a new validation before registration", () => {
+  const dialog = readFileSync(resolve(process.cwd(), "components/live/glossary", "GlossaryRegistrationDialog.tsx"), "utf8");
+  assert.match(dialog, /setPasted\(event.currentTarget.value\); setValidatedPaste\(null\)/u);
+  assert.match(dialog, /disabled=\{isBusy \|\| !preview \|\| validatedPaste !== pasted\}/u);
+});

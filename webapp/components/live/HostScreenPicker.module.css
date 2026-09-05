@@ -1,0 +1,23 @@
+.page { min-height: 100dvh; padding: 32px 24px; background: var(--nova-web-background); color: var(--nova-web-text); }
+.content { width: 100%; max-width: 880px; margin: 0 auto; font-size: 1.0625rem; line-height: 1.5; letter-spacing: -.02em; word-break: keep-all; overflow-wrap: anywhere; }
+.back { display: inline-flex; align-items: center; min-height: 44px; margin-bottom: 32px; color: inherit; font-weight: 600; text-decoration: none; }
+.heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 24px; }
+.heading h1 { margin: 0 0 8px; font-size: 1.375rem; line-height: 1.4091; font-weight: 600; }
+.heading p, .notice { color: color-mix(in srgb, var(--nova-web-text) 72%, transparent); margin: 0; font-size: .9375rem; line-height: 1.5; }
+.notice { margin: 16px 0 32px; }
+.button { display: inline-flex; align-items: center; justify-content: center; min-height: 44px; padding: 10px 16px; border: 1px solid color-mix(in srgb, var(--nova-web-text) 25%, transparent); border-radius: 8px; background: transparent; color: inherit; font: inherit; font-size: .9375rem; text-decoration: none; cursor: pointer; overflow-wrap: anywhere; }
+.button:disabled { opacity: .5; cursor: wait; }
+.heading .button { flex-shrink: 0; }
+.list { margin: 0; padding: 0; list-style: none; }
+.list li { border-bottom: 1px solid color-mix(in srgb, var(--nova-web-text) 16%, transparent); }
+.session { display: flex; align-items: center; justify-content: space-between; gap: 24px; padding: 24px 12px; min-height: 44px; border-radius: 8px; color: inherit; text-decoration: none; }
+.sessionInfo { display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+.sessionInfo strong { font-weight: 600; }
+.sessionInfo > span { font-size: .8125rem; line-height: 1.5; color: color-mix(in srgb, var(--nova-web-text) 72%, transparent); }
+.open { flex-shrink: 0; color: var(--nova-web-action); font-size: .9375rem; line-height: 1.5; font-weight: 600; }
+.message { padding: 32px 0; font-size: .9375rem; line-height: 1.5; }
+.message h2 { margin: 0 0 8px; font-size: 1.0625rem; line-height: 1.5; font-weight: 600; }
+.message p { margin: 0 0 16px; }
+.back:focus-visible, .button:focus-visible, .session:focus-visible { outline: 2px solid var(--nova-web-action); outline-offset: 2px; }
+@media (hover: hover) { .session:hover, .button:not(:disabled):hover { background: color-mix(in srgb, var(--nova-web-text) 5%, transparent); } }
+@media (max-width: 480px) { .page { padding: 20px 16px; } .heading { flex-wrap: wrap; gap: 16px; } .session { align-items: flex-start; flex-direction: column; gap: 16px; padding: 20px 4px; } }

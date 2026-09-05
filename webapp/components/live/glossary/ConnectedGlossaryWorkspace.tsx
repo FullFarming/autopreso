@@ -204,7 +204,7 @@ export function ConnectedGlossaryWorkspace({ sessionSelectionLabel, onSessionSel
           sourceLanguage: document.sourceLanguage, targetLanguages: document.targetLanguages, domain: document.domain,
         });
         const extracted = extractedCandidatesToEditable(candidates);
-        setEditableTerms((current) => [...current.filter((item) => !extracted.some((candidate) => candidate.term.id === item.term.id)), ...extracted]);
+        setEditableTerms((current) => [...current, ...extracted]);
         setFeedback(`AI 후보 ${extracted.length}개를 검토 목록에 추가했습니다. 후보를 개별 승인해 주세요.`);
         return;
       }
@@ -269,7 +269,7 @@ export function ConnectedGlossaryWorkspace({ sessionSelectionLabel, onSessionSel
   return (
     <div>
       <GlossaryWorkspace presets={isDraft ? [selectedPresentation, ...presentationPresets] : presentationPresets}
-        selectedPreset={selectedPresentation} terms={editableTerms.map((item) => presentTerm(item, document.targetLanguages[0] ?? ""))}
+        selectedPreset={selectedPresentation} terms={editableTerms.map((item) => presentTerm(item, document.targetLanguages[0] ?? "", document.targetLanguages))}
         versions={presentVersions(versions, selectedPresentation.activeVersion, document)} validationIssues={validationIssues}
         importPreview={importPreview} registrationPreview={registrationPreview}
         registrationStatus={error || registrationStatus}

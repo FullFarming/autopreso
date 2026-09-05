@@ -35,9 +35,9 @@ test("local provider close and replacement start share one serialized transition
   const cleanup = serverSource.indexOf("pendingSubtitleProviderStarts -= 1;", queuedStart);
   assert.ok(pending >= 0 && queuedStart > pending && cleanup > queuedStart);
   const startTransition = serverSource.slice(queuedStart, cleanup);
-  assert.match(startTransition, /const saved = await options\.settingsStore\?\.load\(\)/u);
-  assert.match(startTransition, /subtitleSessionId !== requestedSessionId \|\| isSubtitleSessionStopping\) return/u);
-  assert.match(startTransition, /await subtitles\.start\(\{ sessionId: requestedSessionId, settings: startSettings \}\)/u);
+  assert.match(startTransition, /engine = normalizeEngineSelection\(await options\.resolveCaptionEngine\(\)\)/u);
+  assert.match(startTransition, /subtitleSessionId !== requestedSessionId \|\| isSubtitleSessionStopping\) \{[\s\S]{0,150}return;/u);
+  assert.match(startTransition, /await subtitles\.start\(\{ sessionId: requestedSessionId, settings: startSettings, managedSession \}\)/u);
   assert.match(serverSource, /finally \{\s*pendingSubtitleProviderStarts -= 1;/u);
   assert.match(serverSource, /didAttemptLocalProviderStart[\s\S]{0,2500}stopSubtitleProviderSafely\(requestedSessionId, "start_failed"\)/u);
 });

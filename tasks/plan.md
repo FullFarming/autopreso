@@ -1,5 +1,13 @@
 # Implementation Plan: Structured Glossary RAG + Earnings-Call Live Experience
 
+Latest requested work (2026-09-05, local implementation complete; deployment configuration and real-provider evaluation pending):
+- [Soniox default, up to three languages, host-ended sessions](../docs/superpowers/plans/2026-09-05-soniox-default-host-ended-sessions.md)
+- [Gemini Transcribe → Flash official-source implementation plan](../docs/superpowers/plans/2026-09-05-gemini-transcribe-serial-implementation.md)
+
+Current implementation evidence: [2026-09-05 report](../docs/superpowers/status/2026-09-05-core-product-implementation.md).
+
+The completion status below describes the historical 2026-08-15 module, not these new plans.
+
 Status: Implementation complete; awaiting explicit release approval  
 Date: 2026-08-15  
 Module: `glossary-rag-earnings-call`

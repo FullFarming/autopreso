@@ -2223,128 +2223,34 @@ test("internal engine endpoint fails closed on token, method, size, body, and en
   assert.deepEqual(keyless.json, { result: "failed", code: "ENGINE_KEY_MISSING" });
   assert.equal(pipelines.length, 0, "validation failures never reach the pipeline factory");
 
-  // A session this gateway does not hold: the DB value applies at next activation.
+  // A cold gateway cannot claim an assignment was queued without persisting it.
   const cold = await postEngine(port, SESSION_ID, signAdminToken("gateway-secret"), { engine: FLASH_37_ENGINE });
-  assert.equal(cold.status, 200);
-  assert.deepEqual(cold.json, { result: "queued" });
+  assert.equal(cold.status, 409);
+  assert.deepEqual(cold.json, { result: "failed", code: "NEXT_SESSION_ASSIGNMENT_REQUIRED" });
   assert.equal(pipelines.length, 0);
 });
 
-test("admin engine switch on a live session replaces the pipeline with seq continuity and notifies host and viewers", async (context) => {
+test("admin engine changes cannot replace an active session or interrupt audio", async (context) => {
   const pipelines = [];
-  let clock = Date.now();
-  const gateway = createEngineSwitchGateway({ pipelines, now: () => clock });
-  await new Promise((resolve) => gateway.server.listen(0, "127.0.0.1", resolve));
+  const gateway = createEngineSwitchGateway({ pipelines });
+  await new Promise(resolve => gateway.server.listen(0, "127.0.0.1", resolve));
   context.after(async () => gateway.close());
   const { port } = gateway.server.address();
-  const url = `ws://127.0.0.1:${port}/live`;
-
-  const host = await connectHost(url);
-  context.after(() => host.terminate());
-  const hostMessages = [];
-  host.on("message", (data) => { hostMessages.push(JSON.parse(data.toString("utf8"))); });
-  await startHostSocket(host, SESSION_ID, ["ko", "en"]);
-  const startStatuses = hostMessages.filter((message) => message.type === "engine-status");
-  assert.deepEqual(startStatuses.map(({ role, provider, model, status }) => ({ role, provider, model, status })), [
-    { role: "stt", provider: "gemini", model: "gemini-3.5-transcribe-live", status: "connecting" },
-    { role: "translation", provider: "gemini", model: "gemini-3.6-flash", status: "connecting" },
-    { role: "stt", provider: "gemini", model: "gemini-3.5-transcribe-live", status: "ready" },
-    { role: "translation", provider: "gemini", model: "gemini-3.6-flash", status: "ready" },
-  ], "normal start reports connecting then ready for both roles");
-  assert.ok(startStatuses.every((message) => message.sessionId === SESSION_ID && message.code === undefined));
-  assert.ok(hostMessages.findIndex((message) => message.type === "started") > hostMessages.findIndex((message) => message.status === "ready"),
-    "ready precedes the started ACK because start() has resolved by then");
-  hostMessages.length = 0;
-
-  const { viewer, events } = await subscribeViewer(url, "en", "engine-viewer");
-  context.after(() => viewer.terminate());
-
-  const switched = await postEngine(port, SESSION_ID, signAdminToken("gateway-secret", { now: clock }), { engine: FLASH_37_ENGINE });
-  assert.equal(switched.status, 200);
-  assert.deepEqual(switched.json, { result: "switched" });
-  assert.equal(pipelines.length, 2);
-  assert.equal(pipelines[0].closed, 1, "the old pipeline is closed after the new one is ready");
-  assert.equal(pipelines[1].closed, 0);
-  assert.equal(pipelines[1].previous, pipelines[0], "the factory receives the retiring pipeline so lastSequences reseed the counter (contract C1)");
-  assert.equal(pipelines[1].settings.captionConfig.engine.translation.model, "gemini-3.7-flash");
-  assert.deepEqual(pipelines[1].settings.languages, ["ko", "en"]);
-  assert.equal(pipelines[1].settings.sessionId, SESSION_ID);
-  assert.notEqual(pipelines[1].settings.captionConfigFingerprint, pipelines[0].settings.captionConfigFingerprint);
-
-  const switchStatuses = hostMessages.filter((message) => message.type === "engine-status");
-  assert.deepEqual(switchStatuses.map(({ role, model, status }) => ({ role, model, status })), [
-    { role: "stt", model: "gemini-3.5-transcribe-live", status: "connecting" },
-    { role: "translation", model: "gemini-3.7-flash", status: "connecting" },
-    { role: "stt", model: "gemini-3.5-transcribe-live", status: "ready" },
-    { role: "translation", model: "gemini-3.7-flash", status: "ready" },
-  ]);
-  await waitForGatewayCondition(() => events.filter((event) => event.type === "language-status").length >= 2);
-  assert.deepEqual(events.filter((event) => event.type === "language-status").map(({ language, status }) => ({ language, status })), [
-    { language: "en", status: "preparing" },
-    { language: "en", status: "ready" },
-  ], "viewers see preparing while the new engine opens, then ready from the new pipeline");
-  assert.match(gateway.metrics.render(), /realtime_noel_host_sessions 1/u);
-  assert.match(gateway.metrics.render(), /realtime_noel_engine_switches_total 1/u);
-  assert.equal(host.readyState, WebSocket.OPEN, "the host socket survives an admin switch");
-
-  const limited = await postEngine(port, SESSION_ID, signAdminToken("gateway-secret", { now: clock }), { engine: FLASH_37_ENGINE });
-  assert.equal(limited.status, 429);
-  assert.deepEqual(limited.json, { result: "failed", code: "ENGINE_SWITCH_RATE_LIMITED" });
-  clock += 2_000;
-  const unchanged = await postEngine(port, SESSION_ID, signAdminToken("gateway-secret", { now: clock }), { engine: FLASH_37_ENGINE });
-  assert.equal(unchanged.status, 200);
-  assert.deepEqual(unchanged.json, { result: "switched" });
-  assert.equal(pipelines.length, 2, "re-deploying the running engine is idempotent and builds no pipeline");
-
-  // Host audio after the switch reaches the NEW pipeline only.
-  let accepted = 0;
-  pipelines[1].acceptAudio = async () => { accepted += 1; };
-  pipelines[0].acceptAudio = async () => { throw new Error("old pipeline must not receive audio"); };
-  host.send(Buffer.alloc(1_280));
-  await waitForGatewayCondition(() => accepted === 1);
-});
-
-test("a failed admin engine switch keeps the old pipeline serving, reports engine-status failed, and re-announces viewers ready", async (context) => {
-  const pipelines = [];
-  const gateway = createEngineSwitchGateway({ pipelines, factoryFailure: () => new Error("STT_PROVIDER_UNAVAILABLE") });
-  await new Promise((resolve) => gateway.server.listen(0, "127.0.0.1", resolve));
-  context.after(async () => gateway.close());
-  const { port } = gateway.server.address();
-  const url = `ws://127.0.0.1:${port}/live`;
-  const host = await connectHost(url);
+  const host = await connectHost(`ws://127.0.0.1:${port}/live`);
   context.after(() => host.terminate());
   await startHostSocket(host, SESSION_ID, ["ko", "en"]);
-  const hostMessages = [];
-  host.on("message", (data) => { hostMessages.push(JSON.parse(data.toString("utf8"))); });
-  const { viewer, events } = await subscribeViewer(url, "ko", "engine-viewer-fail");
-  context.after(() => viewer.terminate());
-
-  const failed = await postEngine(port, SESSION_ID, signAdminToken("gateway-secret"), { engine: FLASH_37_ENGINE });
-  assert.equal(failed.status, 409);
-  assert.deepEqual(failed.json, { result: "failed", code: "STT_PROVIDER_UNAVAILABLE" });
+  const response = await postEngine(port, SESSION_ID, signAdminToken("gateway-secret"), { engine: FLASH_37_ENGINE });
+  assert.equal(response.status, 409);
+  assert.deepEqual(response.json, { result: "failed", code: "NEXT_SESSION_ASSIGNMENT_REQUIRED" });
   assert.equal(pipelines.length, 1);
-  assert.equal(pipelines[0].closed, 0, "the running pipeline is untouched when the replacement cannot open");
-  const statuses = hostMessages.filter((message) => message.type === "engine-status");
-  assert.deepEqual(statuses.map(({ role, status, code }) => ({ role, status, code })), [
-    { role: "stt", status: "connecting", code: undefined },
-    { role: "translation", status: "connecting", code: undefined },
-    { role: "stt", status: "failed", code: "STT_PROVIDER_UNAVAILABLE" },
-    { role: "translation", status: "failed", code: "STT_PROVIDER_UNAVAILABLE" },
-  ]);
-  await waitForGatewayCondition(() => events.filter((event) => event.type === "language-status").length >= 2);
-  assert.deepEqual(events.filter((event) => event.type === "language-status").map(({ status }) => status), ["preparing", "ready"]);
-  assert.equal(host.readyState, WebSocket.OPEN);
-  assert.match(gateway.metrics.render(), /realtime_noel_host_sessions 1/u);
-  assert.match(gateway.metrics.render(), /realtime_noel_engine_switch_failures_total 1/u);
-
-  // Host audio still flows to the surviving pipeline.
+  assert.equal(pipelines[0].closed, 0);
   let accepted = 0;
-  pipelines[0].acceptAudio = async () => { accepted += 1; };
-  host.send(Buffer.alloc(1_280));
+  pipelines[0].acceptAudio = async () => { accepted++; };
+  host.send(Buffer.alloc(1280));
   await waitForGatewayCondition(() => accepted === 1);
 });
 
-test("admin engine switch preserves the participant floor on the replacement pipeline", async (context) => {
+test("rejected active engine change preserves the participant floor", async (context) => {
   const pipelines = [];
   const gateway = createEngineSwitchGateway({ pipelines });
   await new Promise((resolve) => gateway.server.listen(0, "127.0.0.1", resolve));
@@ -2368,7 +2274,8 @@ test("admin engine switch preserves the participant floor on the replacement pip
   await speakStarted;
 
   const switched = await postEngine(port, SESSION_ID, signAdminToken("gateway-secret"), { engine: FLASH_37_ENGINE });
-  assert.deepEqual(switched.json, { result: "switched" });
-  assert.equal(pipelines[1].floorSpeaker?.displayName, "Guest", "the floor holder is re-attributed on the new pipeline");
+  assert.deepEqual(switched.json, { result: "failed", code: "NEXT_SESSION_ASSIGNMENT_REQUIRED" });
+  assert.equal(pipelines.length, 1);
+  assert.equal(pipelines[0].floorSpeaker?.displayName, "Guest", "the current floor holder remains attributed");
   assert.equal(speaker.readyState, WebSocket.OPEN, "an engine switch does not end the participant's turn");
 });

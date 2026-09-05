@@ -5,7 +5,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import type { ApiResponse, LiveTopicPublicMetadata } from "@/lib/live-contract";
 import type { MeetingSummary } from "@/lib/live/summary";
 import type { TranscriptEntry } from "./MeetingMinutes";
-import { startSummaryPollLoop, type SummaryPollingState } from "./meeting-summary-polling";
+import { startSummaryPollLoop, type SummaryPollingState, type SummaryPollResult } from "./meeting-summary-polling";
 
 interface EndedSessionReference {
   id: string;
@@ -33,8 +33,14 @@ export function isSummaryEmptyCode(code: string | undefined): boolean {
 }
 
 export function shouldResetSummaryGeneration(code: string): boolean {
-  return (SUMMARY_RESET_FAILURE_CODES as readonly string[]).includes(code)
-    || code === SUMMARY_REQUEST_FAILURE_CODE;
+  return (SUMMARY_RESET_FAILURE_CODES as readonly string[]).includes(code);
+}
+
+export function isSummaryReadRetryable(code: string | undefined, status = 0): boolean {
+  if (code && (shouldResetSummaryGeneration(code) || code === "SUMMARY_REFUSED")) return false;
+  return code === "SUMMARY_READ_TIMEOUT" || code === "SUMMARY_STATE_FAILED"
+    || code === "SUMMARY_READY_MISSING" || code === "SUMMARY_READ_FAILED"
+    || status === 0 || status === 408 || status === 429 || status >= 500;
 }
 
 export function getSafeSummaryErrorMessage(code: string | undefined): string {
@@ -74,15 +80,21 @@ export function useHostSummaryLifecycle(endedSession: EndedSessionReference | nu
   const [transcriptError, setTranscriptError] = useState("");
   const [isRetrying, setIsRetrying] = useState(false);
   const retryRef = useRef(false);
+  const readAbortRef = useRef<AbortController | null>(null);
+  const transcriptAbortRef = useRef<AbortController | null>(null);
 
-  const loadSummary = useCallback(async (): Promise<boolean> => {
+  const loadSummary = useCallback(async (): Promise<SummaryPollResult> => {
     const language = endedSession?.languages[0];
     if (!endedSession || !language) return false;
+    readAbortRef.current?.abort();
+    const controller = new AbortController();
+    readAbortRef.current = controller;
     try {
       const response = await fetch(`/api/live-sessions/${endedSession.id}/summary?language=${encodeURIComponent(language)}`, {
-        method: "GET", cache: "no-store",
+        method: "GET", cache: "no-store", signal: AbortSignal.any([controller.signal, AbortSignal.timeout(15_000)]),
       });
       const payload = await response.json() as ApiResponse<{ summary: MeetingSummary; createdAt: string }>;
+      if (controller.signal.aborted) return false;
       if (payload.ok) {
         setSummary(payload.data);
         setSummaryError("");
@@ -93,7 +105,8 @@ export function useHostSummaryLifecycle(endedSession: EndedSessionReference | nu
       if (payload.code === "SUMMARY_NOT_READY" || payload.code === "SUMMARY_GENERATION_RUNNING") {
         setSummaryFailureCode("");
         setPollingState("polling");
-        return true;
+        setSummaryError("");
+        return "pending";
       }
       if (isSummaryEmptyCode(payload.code)) {
         setSummary(null);
@@ -102,26 +115,35 @@ export function useHostSummaryLifecycle(endedSession: EndedSessionReference | nu
         setPollingState("idle");
         return false;
       }
+      if (isSummaryReadRetryable(payload.code, response.status)) {
+        setSummaryError(""); setSummaryFailureCode(SUMMARY_REQUEST_FAILURE_CODE); setPollingState("polling");
+        return true;
+      }
       setSummaryError(getSafeSummaryErrorMessage(payload.code));
       setSummaryFailureCode(payload.code ?? "");
       setPollingState(payload.code === "SUMMARY_GENERATION_EXHAUSTED" ? "exhausted" : "failed");
       return false;
     } catch {
-      setSummaryError(getSafeSummaryErrorMessage(undefined));
+      if (controller.signal.aborted) return false;
+      setSummaryError("");
       setSummaryFailureCode(SUMMARY_REQUEST_FAILURE_CODE);
-      setPollingState("failed");
-      return false;
+      setPollingState("polling");
+      return true;
     }
   }, [endedSession]);
 
   const loadTranscript = useCallback(async () => {
     const language = endedSession?.languages[0];
     if (!endedSession || !language) return;
+    transcriptAbortRef.current?.abort();
+    const controller = new AbortController();
+    transcriptAbortRef.current = controller;
     try {
       const response = await fetch(`/api/live-sessions/${endedSession.id}/transcript?language=${encodeURIComponent(language)}`, {
-        method: "GET", cache: "no-store",
+        method: "GET", cache: "no-store", signal: AbortSignal.any([controller.signal, AbortSignal.timeout(15_000)]),
       });
       const payload = await response.json() as ApiResponse<{ topics: LiveTopicPublicMetadata[]; utterances: TranscriptEntry[] }>;
+      if (controller.signal.aborted) return;
       if (!payload.ok) {
         setTranscript([]);
         setTopics([]);
@@ -134,6 +156,7 @@ export function useHostSummaryLifecycle(endedSession: EndedSessionReference | nu
       setIsTranscriptLoaded(true);
       setTranscriptError("");
     } catch {
+      if (controller.signal.aborted) return;
       setTranscript([]);
       setTopics([]);
       setIsTranscriptLoaded(false);
@@ -177,8 +200,8 @@ export function useHostSummaryLifecycle(endedSession: EndedSessionReference | nu
       setPollingRound((round) => round + 1);
     } catch {
       setSummaryFailureCode(SUMMARY_REQUEST_FAILURE_CODE);
-      setPollingState("failed");
-      setSummaryError(getSafeSummaryErrorMessage(undefined));
+      setSummaryError("");
+      setPollingRound((round) => round + 1);
     } finally {
       retryRef.current = false;
       setIsRetrying(false);
@@ -197,14 +220,17 @@ export function useHostSummaryLifecycle(endedSession: EndedSessionReference | nu
       if (isDisposed || !shouldContinue) return;
       stopPolling = startSummaryPollLoop({
         poll: loadSummary,
-        onExhausted: () => { setPollingState("exhausted"); setSummaryFailureCode("SUMMARY_GENERATION_EXHAUSTED"); setSummaryError(""); },
+        onExhausted: () => { setPollingState("exhausted"); setSummaryFailureCode(SUMMARY_REQUEST_FAILURE_CODE); setSummaryError("요약 상태 확인이 지연되고 있습니다. 다시 확인해 주세요."); },
         onError: () => { setPollingState("failed"); setSummaryFailureCode(SUMMARY_REQUEST_FAILURE_CODE); setSummaryError(getSafeSummaryErrorMessage(undefined)); },
       });
     });
-    return () => { isDisposed = true; stopPolling(); };
+    return () => { isDisposed = true; stopPolling(); readAbortRef.current?.abort(); };
   }, [endedSession, summary, isSummaryEmpty, pollingRound, loadSummary]);
 
-  useEffect(() => { if (endedSession) void loadTranscript(); }, [endedSession, loadTranscript]);
+  useEffect(() => {
+    if (endedSession) void loadTranscript();
+    return () => { transcriptAbortRef.current?.abort(); };
+  }, [endedSession, loadTranscript]);
 
   const retry = useCallback(() => {
     if (shouldResetSummaryGeneration(summaryFailureCode)) void retrySummary();
@@ -218,5 +244,5 @@ export function useHostSummaryLifecycle(endedSession: EndedSessionReference | nu
   }, []);
 
   return { summary, summaryError, summaryFailureCode, isSummaryEmpty, pollingState, pollingStartedAt, transcript, topics,
-    isTranscriptLoaded, transcriptError, isRetrying, retry, reset };
+    isTranscriptLoaded, transcriptError, isRetrying, canRegenerateSummary: shouldResetSummaryGeneration(summaryFailureCode), retry, reset };
 }

@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { GeminiTextTranslateAdapter } from "../src/google-provider-adapters.js";
-import { LiveMediaPipeline } from "../src/live-media-pipeline.js";
+import { LiveMediaPipeline } from "./helpers/gemini-pipeline.js";
 
 function createPipelineHarness({ languages = ["ko", "en"], textTranslate, captionPolish } = {}) {
   const events = [];

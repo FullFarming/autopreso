@@ -118,9 +118,9 @@ test("the all-displays tick is persisted, local-only, and reconciles every surfa
   ]);
 
   // Persisted like the display selection, so the choice survives a restart.
-  assert.match(settingsStore, /overlayAllDisplays: false/u);
+  assert.match(settingsStore, /overlayAllDisplays: true/u);
   assert.match(settingsStore, /overlayAllDisplays must be a boolean/u);
-  assert.match(main, /overlayAllDisplays = settings\.subtitle\?\.overlayAllDisplays === true/u);
+  assert.match(main, /overlayAllDisplays = settings\.subtitle\?\.overlayAllDisplays !== false/u);
 
   // Same origin fence as every other overlay IPC, and a boolean-only payload.
   const handler = main.slice(
@@ -132,23 +132,20 @@ test("the all-displays tick is persisted, local-only, and reconciles every surfa
   assert.match(handler, /typeof allDisplays !== "boolean"/u);
   // Persist before reconciling, and roll the in-memory flag back on failure so
   // the windows can never disagree with the saved setting.
-  assert.match(handler, /await settingsStore\.save\(\{ subtitle: \{ overlayAllDisplays \} \}\)/u);
+  assert.match(handler, /await settingsStore\.save\(\{ subtitle: \{ overlayAllDisplays, overlayDisplayIds: null \} \}\)/u);
   assert.match(handler, /catch \(error\)[\s\S]{0,80}overlayAllDisplays = previous/u);
   assert.match(handler, /syncOverlayBounds\(\)[\s\S]{0,200}notifyOverlayDisplaysChanged\(\)/u);
   assert.match(preload, /setOverlayAllDisplays: \(allDisplays\) => ipcRenderer\.invoke\("subtitle-overlay:set-all-displays", allDisplays\)/u);
 
-  // Controller surface: a real switch that reports its state to assistive tech.
-  assert.match(controllerHtml, /id="controller-all-displays"[\s\S]{0,200}role="switch"/u);
-  assert.match(controllerHtml, /aria-checked="false"/u);
-  assert.match(controllerJs, /setOverlayAllDisplays\(next\)/u);
-  assert.match(controllerJs, /allDisplaysTick\.setAttribute\("aria-checked"/u);
-  // Choosing ONE caption display is meaningless while every display shows the
-  // same captions, so the picker is disabled rather than silently inert.
-  assert.match(controllerJs, /displaySelect\.disabled = displaySelect\.disabled \|\| state\.allDisplays/u);
+  assert.match(controllerHtml, /id="controller-display-options"/u);
+  assert.match(controllerJs, /input.type = "checkbox"/u);
+  assert.match(controllerJs, /selectOverlayDisplays\(ids\)/u);
+  assert.match(preload, /subtitle-overlay:select-displays/u);
+
 });
 
-test("controller uses the other display when possible and shares the only display otherwise", () => {
+test("controller uses primary fallback independently of overlay and shares the only display", () => {
   assert.equal(resolveControllerDisplay(displays, displays[1], displays[0]).id, 10);
-  assert.equal(resolveControllerDisplay(displays, displays[0], displays[0]).id, 20);
+  assert.equal(resolveControllerDisplay(displays, displays[0], displays[0]).id, 10);
   assert.equal(resolveControllerDisplay([displays[0]], displays[0], displays[0]).id, 10);
 });

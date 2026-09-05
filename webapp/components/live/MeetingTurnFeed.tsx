@@ -7,13 +7,16 @@
 
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 
-import type { CaptionEvent } from "@/lib/live-contract";
+import { SpeakerIdentity } from "./SpeakerIdentity";
+import type { SpeakerProfile, CaptionEvent } from "@/lib/live-contract";
 import { resolveSpeakerColor, speakerMetaLine } from "./SpeakerCaption";
 
 export interface MeetingTurn {
   key: string;
   speakerIdentity: string;
   speakerLabel: string;
+  speakerProfile?: SpeakerProfile;
+  sessionId?: string;
   speakerColor: string;
   startedAt: string;
   captions: Array<{ seq: number; text: string; isFinal: boolean }>;
@@ -25,8 +28,8 @@ export interface MeetingTurn {
 export function groupCaptionsIntoTurns(captions: CaptionEvent[]): MeetingTurn[] {
   const turns: MeetingTurn[] = [];
   for (const caption of captions) {
-    const speakerIdentity = caption.speaker?.speakerId ?? "host";
-    const speakerLabel = speakerMetaLine(caption.speaker);
+    const speakerIdentity = caption.speakerProfile ? `${caption.speakerProfile.id}:${caption.speakerProfile.version}` : caption.speaker?.speakerId ?? "host";
+    const speakerLabel = speakerMetaLine(caption.speaker, caption.speakerProfile);
     const previous = turns.at(-1);
     const previousCaption = previous?.captions.at(-1);
     if (previous && previous.speakerIdentity === speakerIdentity && previousCaption?.seq === caption.seq) {
@@ -44,7 +47,7 @@ export function groupCaptionsIntoTurns(captions: CaptionEvent[]): MeetingTurn[] 
     turns.push({
       key: `turn-${caption.seq}`,
       speakerIdentity,
-      speakerLabel,
+      speakerLabel, speakerProfile: caption.speakerProfile, sessionId: caption.sessionId,
       speakerColor: resolveSpeakerColor(caption.speaker),
       startedAt: caption.emittedAt,
       captions: [{ seq: caption.seq, text: caption.text, isFinal: caption.isFinal }],
@@ -129,7 +132,7 @@ const MeetingTurnCard = memo(function MeetingTurnCard({ turn, recentFromIndex }:
           summarised per paragraph and expanded to the full original. */}
       <header>
         <span className="live-speaker-dot" style={{ backgroundColor: turn.speakerColor }} aria-hidden="true" />
-        <strong>{turn.speakerLabel}</strong>
+        <SpeakerIdentity profile={turn.speakerProfile} sessionId={turn.sessionId} fallback={turn.speakerLabel} />
         <time dateTime={turn.startedAt}>{formatTurnTime(turn.startedAt)}</time>
       </header>
       <p className="live-turn-body">

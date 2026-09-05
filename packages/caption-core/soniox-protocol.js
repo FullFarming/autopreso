@@ -1,3 +1,5 @@
+import { CAPTION_LANGUAGE_CODES } from "./languages.js";
+
 // Pure Soniox wire helpers shared by the desktop transport and the gateway adapter.
 // Source: soniox.com/docs/api-reference/stt/websocket-api, /docs/stt/rt/real-time-translation,
 // /docs/stt/concepts/language-restrictions (fetched 2026-09-02).
@@ -7,7 +9,9 @@ export const SONIOX_ENDPOINTS = Object.freeze({
   jp: "wss://stt-rt.jp.soniox.com/transcribe-websocket",
 });
 export const SONIOX_CONTROL = Object.freeze({ finalize: '{"type":"finalize"}', keepalive: '{"type":"keepalive"}' });
-const AUTO_LANGUAGES = Object.freeze(["ko", "en"]);
+
+export const sonioxLanguageCode = (language) => ["zh-Hans", "zh-Hant"].includes(language) ? "zh" : language;
+
 const MAX_CONTEXT_CHARACTERS = 9_000; // documented cap ~10,000 chars / 8,000 tokens; stay under it
 const MAX_TRANSLATION_TERMS = 200;
 // 200 pairs of long phrases would still overflow the context payload, so the
@@ -63,7 +67,7 @@ function boundedTermPairs(values) {
  * Builds the single JSON frame Soniox expects before any audio.
  *
  * @param {{apiKey?: string, model?: string, languageMode?: string, languages?: string[],
- *   translation?: boolean,
+ *   translation?: boolean, targetLanguage?: string,
  *   context?: {terms?: unknown, translationTerms?: unknown, domain?: unknown},
  *   clientReferenceId?: string}} [input]
  * @returns {Record<string, unknown>}
@@ -74,21 +78,26 @@ export function buildSonioxConfig({
   languageMode = "auto",
   languages = ["en", "ko"],
   translation = true,
+  targetLanguage,
   context = {},
   clientReferenceId = "",
 } = {}) {
   if (typeof apiKey !== "string" || !apiKey.trim()) throw new Error("SONIOX_API_KEY_REQUIRED");
   if (model !== SONIOX_MODEL) throw new Error("SONIOX_MODEL_INVALID");
-  const hints = languageMode === "auto" ? [...AUTO_LANGUAGES] : [languageMode];
-  if (!hints.every((code) => AUTO_LANGUAGES.includes(code))) throw new Error("SONIOX_LANGUAGE_MODE_INVALID");
+  if (!Array.isArray(languages) || languages.length < 1 || languages.length > 3
+    || new Set(languages).size !== languages.length
+    || !languages.every((code) => CAPTION_LANGUAGE_CODES.includes(code))) throw new Error("SONIOX_LANGUAGES_INVALID");
+  const hints = languageMode === "auto" ? [...languages] : [languageMode];
+  if (!hints.every((code) => CAPTION_LANGUAGE_CODES.includes(code))) throw new Error("SONIOX_LANGUAGE_MODE_INVALID");
   const config = /** @type {Record<string, unknown>} */ ({
     api_key: apiKey,
     model,
     audio_format: "pcm_s16le",
     sample_rate: 16000,
     num_channels: 1,
-    language_hints: hints,
-    language_hints_strict: true,
+    language_hints: [...new Set(hints.map(sonioxLanguageCode))],
+    // Output targets are hints, not a restriction on the speaker's input.
+    language_hints_strict: languageMode !== "auto",
     enable_language_identification: true,
     enable_speaker_diarization: false,
     enable_endpoint_detection: true,
@@ -110,10 +119,17 @@ export function buildSonioxConfig({
     };
   }
   if (translation) {
-    const targets = [...new Set(languages)];
-    if (targets.length !== 2) throw new Error("SONIOX_TRANSLATION_PAIR_REQUIRED");
-    const [a, b] = targets.includes("ko") ? ["ko", targets.find((code) => code !== "ko")] : targets;
-    config.translation = { type: "two_way", language_a: a, language_b: b };
+    if (targetLanguage !== undefined && !languages.includes(targetLanguage)) throw new Error("SONIOX_TRANSLATION_TARGET_INVALID");
+    const target = targetLanguage ?? (languages.length === 1 ? languages[0] : undefined);
+    if (target) {
+      config.translation = { type: "one_way", target_language: sonioxLanguageCode(target) };
+    } else {
+      if (languages.length !== 2) throw new Error("SONIOX_TRANSLATION_TARGET_REQUIRED");
+      const [a, b] = languages.includes("ko") ? ["ko", languages.find((code) => code !== "ko")] : languages;
+      config.translation = sonioxLanguageCode(a) === sonioxLanguageCode(b)
+        ? { type: "one_way", target_language: sonioxLanguageCode(a) }
+        : { type: "two_way", language_a: sonioxLanguageCode(a), language_b: sonioxLanguageCode(b) };
+    }
   }
   return config;
 }

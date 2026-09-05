@@ -2,6 +2,7 @@ import type { SystemMessages, SystemTextValues } from "../system-language";
 
 export const viewerMessages: SystemMessages = {
   "ko": {
+    "요약 상태 확인이 지연되고 있습니다. 다시 확인해 주세요.": "요약 상태 확인이 지연되고 있습니다. 다시 확인해 주세요.",
     "English": "영어",
     "Korean": "한국어",
     "Japanese": "일본어",
@@ -218,6 +219,7 @@ export const viewerMessages: SystemMessages = {
     "This QR invite is invalid or has expired.": "QR 초대가 유효하지 않거나 만료되었습니다."
   },
   "en": {
+    "요약 상태 확인이 지연되고 있습니다. 다시 확인해 주세요.": "Checking the summary is taking longer. Please check again.",
     "English": "English",
     "Korean": "Korean",
     "Japanese": "Japanese",
@@ -434,6 +436,7 @@ export const viewerMessages: SystemMessages = {
     "This QR invite is invalid or has expired.": "This QR invite is invalid or has expired."
   },
   "ja": {
+    "요약 상태 확인이 지연되고 있습니다. 다시 확인해 주세요.": "要約の状態確認が遅れています。もう一度確認してください。",
     "English": "英語",
     "Korean": "韓国語",
     "Japanese": "日本語",

@@ -134,8 +134,7 @@ test("glossary presets restore exactly and expose accessible synced-preset contr
   assert.match(js, /confirmDeleteGlossaryPresetButton\?\.focus\(\)/);
   assert.match(js, /event\.key !== "Escape"/);
   assert.match(js, /deleteGlossaryPresetButton\.focus\(\)/);
-  assert.doesNotMatch(html + js, /<dialog|showModal\(|HTMLDialogElement|popover=|window\.confirm/,
-    "the editor must not depend on Dialog or Popover APIs");
+  assert.doesNotMatch(html + js, /window\.confirm/, "deletion remains an inline confirmation");
 
   assertLocalized("glossary.presetCustomHelp", { ko: /직접 수정했거나.*일치하지 않는/ });
   assertLocalized("glossary.groupBuiltIn", { ko: /내장/ });
@@ -149,10 +148,8 @@ test("subtitle dashboard exposes main controls, Gemma recording, and settings dr
   const html = readFileSync(path.join(rootDir, "public", "subtitle.html"), "utf8");
   const js = readFileSync(path.join(rootDir, "public", "subtitle-dashboard.js"), "utf8");
 
-  for (const section of ["prepare", "meeting", "records", "settings"]) {
-    assert.match(html, new RegExp(`class="rail-nav-section"[^>]*data-rail-section="${section}"[^>]*role="group"[^>]*aria-labelledby="rail-nav-${section}-label"`, "u"));
-    assert.match(html, new RegExp(`id="rail-nav-${section}-label"[^>]*class="rail-nav-section-label"`, "u"));
-  }
+  const rail = html.slice(html.indexOf('<nav '), html.indexOf('</nav>'));
+  assert.deepEqual([...rail.matchAll(/data-workspace-nav="([^"]+)"/gu)].map((match) => match[1]), ["captions", "livecall", "settings"]);
   const captureJs = readFileSync(path.join(rootDir, "public", "subtitle-audio-capture.js"), "utf8");
   const workspaceJs = readFileSync(path.join(rootDir, "public", "subtitle-workspace.js"), "utf8");
   const controllerHtml = readFileSync(path.join(rootDir, "public", "subtitle-controller.html"), "utf8");
@@ -374,32 +371,13 @@ test("subtitle dashboard exposes main controls, Gemma recording, and settings dr
   assert.match(html, /name="sourceFontSize"/);
   assert.match(html, /name="translationFontSizeRange"/);
   assert.doesNotMatch(html, /id="caption-player-controller"/);
-  assert.match(controllerHtml, /id="caption-player-controller"|class="caption-player-controller/);
+  assert.match(controllerHtml, /class="caption-controller-window refined-controller"/);
   assert.doesNotMatch(html, /class="preview-visualizer"/);
-  assert.match(controllerHtml, /id="controller-drag"/);
-  assert.match(controllerHtml, /class="controller-body"/);
-  assert.match(controllerHtml, /id="controller-restart"/);
-  assert.match(controllerHtml, /id="controller-stop"/);
-  assert.match(controllerHtml, /id="controller-font-down"/);
-  assert.match(controllerHtml, /id="controller-font-up"/);
-  // Desktop app controls: raise the main window, hide the floating console,
-  // quit the app directly.
-  assert.match(controllerHtml, /id="controller-main-window"[^>]*data-i18n="controller\.mainWindow"/);
-  assertLocalized("controller.mainWindow", { en: /Main/ });
-  assert.match(controllerHtml, /id="controller-hide"/);
-  assert.match(controllerHtml, /id="controller-quit"/);
+  for (const id of ["controller-drag", "controller-restart", "controller-stop", "controller-main-window", "controller-font-range", "controller-caption-popover", "controller-output-popover"]) {
+    assert.ok(controllerHtml.includes(`id="${id}"`));
+  }
   assert.match(controllerJs, /showMainWindow/);
-  assert.match(controllerJs, /setControllerVisible/);
-  assert.match(controllerJs, /quitApp/);
-  // Main sits in the App-controls cluster, before Hide and Quit so the
-  // destructive control stays pinned at the far edge.
-  const windowCluster = controllerHtml.slice(controllerHtml.indexOf('data-i18n-aria="controller.appControls"'));
-  assert.ok(
-    windowCluster.indexOf('id="controller-main-window"') < windowCluster.indexOf('id="controller-hide"')
-      && windowCluster.indexOf('id="controller-hide"') < windowCluster.indexOf('id="controller-quit"'),
-    "App controls order is Main -> Hide -> Quit",
-  );
-  // Outside Electron every desktop-only control is hidden, Main included.
+  assert.match(controllerJs, /event.key === "Escape"/);
   assert.match(controllerJs, /if \(mainWindowButton\) mainWindowButton\.hidden = true;/);
   assert.doesNotMatch(controllerHtml, /id="controller-language-preset"/);
   assert.match(controllerHtml, /<select id="controller-display"/u);
@@ -409,10 +387,7 @@ test("subtitle dashboard exposes main controls, Gemma recording, and settings dr
   assert.doesNotMatch(controllerHtml, /data-controller-languages=/);
   assert.doesNotMatch(controllerHtml, /class="controller-language-set"/);
   assert.doesNotMatch(controllerHtml, /통역 음성 엔진/u);
-  // Vertical-gap stepper lives beside the opacity control.
-  assert.match(controllerHtml, /id="controller-gap-down"/);
-  assert.match(controllerHtml, /id="controller-gap-up"/);
-  assert.match(controllerHtml, /id="controller-gap-value"/);
+  assert.match(controllerHtml, /id="controller-font-range"/);
   assert.match(controllerHtml, /id="controller-opacity"/);
   assert.match(controllerHtml, /id="controller-opacity-value"/);
   assert.match(controllerHtml, /data-controller-position="top-center"/);
@@ -455,7 +430,7 @@ test("subtitle dashboard exposes main controls, Gemma recording, and settings dr
   assert.match(controllerJs, /command: "restart"/);
   assert.match(controllerJs, /command: "stop"/);
   assert.match(controllerJs, /command: "offset"/);
-  assert.match(controllerJs, /command: "opacity"/);
+  assert.match(controllerJs, /\[opacityInput, "opacity"\]/);
   assert.match(js, /getOverlayEnabled/);
   assert.match(js, /setOverlayEnabled/);
   assert.match(js, /overlayEnabled: true/);
@@ -466,7 +441,7 @@ test("subtitle dashboard exposes main controls, Gemma recording, and settings dr
   assert.match(js, /displayMode: "translation_only"/);
   assert.match(js, /maxSubtitleLines: 2/);
   assert.match(js, /ollamaModel: "gemma3n:e2b"/);
-  assert.match(js, /Gemini Live: ready/);
+  assert.match(js, /로그인 후 배정 연결/);
   assert.match(js, /t\("status\.realtimeConnected"\)/);
   assertLocalized("status.realtimeConnected", { ko: /실시간 자막 연결됨/ });
   assert.match(js, /t\("history\.recorderFallback"\)/);
@@ -896,7 +871,7 @@ test("subtitle dashboard exposes source labels and level meter styles", () => {
   assert.match(html, /class="subtitle-app-rail"/);
   assert.match(html, /<img src="icons\/radio\.svg" alt="" aria-hidden="true" \/><span data-i18n="nav\.captions">/);
   assertLocalized("nav.captions", { en: /Captions/ });
-  assert.match(html, /<img src="icons\/file-text\.svg" alt="" aria-hidden="true" \/><span data-i18n="nav\.records">/);
+  assert.match(html, /data-workspace-nav="records"/);
   assertLocalized("nav.records", { en: /Records/ });
   assert.match(html, /<img src="icons\/users\.svg" alt="" aria-hidden="true" \/><span data-i18n="nav\.livecall">/);
   assertLocalized("nav.livecall", { en: /Live Call/ });
@@ -948,45 +923,15 @@ test("subtitle dashboard exposes source labels and level meter styles", () => {
   assert.match(css, /\.controller-chip\.active[\s\S]*?color: var\(--nova-fg-intense\)/);
 });
 
-test("desktop rail exposes Prepare, Meeting, Records, and Settings with independent meeting tools", () => {
+test("desktop rail exposes only Captions, Live Call, Settings and preserves keyboard navigation", () => {
   const html = readFileSync(path.join(rootDir, "public", "subtitle.html"), "utf8");
   const js = readFileSync(path.join(rootDir, "public", "subtitle-dashboard.js"), "utf8");
-
-  const prepareStart = html.indexOf('data-rail-section="prepare"');
-  const meetingPrep = html.indexOf('id="open-meeting-prep"');
-  const meetingStart = html.indexOf('data-rail-section="meeting"');
-  const captions = html.indexOf('data-workspace-nav="captions"');
-  const liveCall = html.indexOf('data-workspace-nav="livecall"');
-  const liveCoach = html.indexOf('id="open-live-coach"');
-  const liveInterpreter = html.indexOf('id="open-live-interpreter"');
-  const records = html.indexOf('data-rail-section="records"');
-  const settings = html.indexOf('data-rail-section="settings"');
-
-  assert.ok(prepareStart >= 0 && prepareStart < meetingPrep,
-    "Prepare must own the Meeting Prep launcher");
-  assert.ok(meetingPrep < meetingStart && meetingStart < captions && captions < liveCall
-    && liveCall < liveCoach && liveCoach < liveInterpreter,
-  "Meeting must expose Captions, Live Call, Live Coach, then Live Interpreter");
-  assert.ok(liveInterpreter < records && records < settings,
-    "Records and Settings remain top-level destinations after Meeting");
-
-  assert.match(html, /data-rail-icon="meeting-prep"/);
-  assert.match(html, /data-rail-icon="live-coach"/);
-  assert.match(html, /data-rail-icon="live-interpreter"/);
-  assert.doesNotMatch(html, /id="open-live-interpreter"[^>]*>[\s\S]{0,180}icons\/users\.svg/,
-    "Live Interpreter must not reuse the Live Call people icon");
-
-  for (const key of [
-    "nav.section.prepare", "nav.section.meeting", "nav.section.records", "nav.section.settings",
-    "nav.meetingPrep", "nav.liveCoach", "nav.liveInterpreter",
-  ]) assertLocalized(key);
-
-  assert.match(js, /meetingCoachOpenPrep/);
-  assert.match(js, /meetingCoachOpenLiveWindows/);
-  assert.match(js, /openLiveInterpreter/);
-  assert.match(js, /const railNavigationItems = \[\.\.\.document\.querySelectorAll\("\.subtitle-app-rail nav a, \.subtitle-app-rail nav button"\)\]/);
-  assert.match(js, /\["ArrowUp", "ArrowDown", "Home", "End"\]/);
-  assert.match(js, /availableItems\[nextIndex\]\?\.focus\(\)/);
+  const rail = html.slice(html.indexOf('<nav '), html.indexOf('</nav>'));
+  assert.deepEqual([...rail.matchAll(/data-workspace-nav="([^"]+)"/gu)].map((match) => match[1]), ["captions", "livecall", "settings"]);
+  assert.doesNotMatch(html, /id="open-(meeting-prep|live-coach|live-interpreter)"/u);
+  assert.doesNotMatch(js, /initializeMeetingCoachLaunch|initializeLiveInterpreterLaunch/u);
+  assert.match(html, /data-workspace-page="livecall"[\s\S]*?data-workspace-nav="records"/u);
+  assert.match(js, /availableItems\[nextIndex\]\?\.focus\(\)/u);
 });
 
 test("Records filters search, type, and status across calendar meetings and local sessions", () => {
@@ -994,7 +939,7 @@ test("Records filters search, type, and status across calendar meetings and loca
   const js = readFileSync(path.join(rootDir, "public", "subtitle-dashboard.js"), "utf8");
 
   assert.match(html, /id="records-search"[^>]*type="search"/u);
-  assert.match(html, /id="records-type-filter"[\s\S]*?value="all"[\s\S]*?value="captions"[\s\S]*?value="live-call"[\s\S]*?value="live-coach"[\s\S]*?value="live-interpreter"/u);
+  assert.match(html, /id="records-type-filter"[\s\S]*?value="all"[\s\S]*?value="captions"[\s\S]*?value="live-call"/u);
   assert.match(html, /id="records-status-filter"[\s\S]*?value="all"[\s\S]*?value="completed"[\s\S]*?value="in-progress"/u);
   assert.match(js, /function applySessionRecordFilters\(\)[\s\S]*?renderRecordsCalendar\([\s\S]*?renderSessionRecords\(/u,
     "one filter pass must feed both the calendar and local rows");
@@ -1080,8 +1025,6 @@ test("Dashboard and Records keyboard model never leaves focus inside a hidden su
 
   assert.match(js, /refreshButton\.disabled = true[\s\S]{0,120}refreshButton\.setAttribute\("aria-busy", "true"\)/u);
   assert.match(js, /refreshButton\.disabled = false[\s\S]{0,120}refreshButton\.removeAttribute\("aria-busy"\)/u);
-  assert.match(js, /button\.disabled = true[\s\S]{0,120}button\.setAttribute\("aria-busy", "true"\)/u,
-    "native feature launch buttons must be single-flight");
   assert.match(js, /trigger\.disabled = true[\s\S]{0,120}trigger\.setAttribute\("aria-busy", "true"\)/u,
     "record detail loading must be single-flight and expose its busy state");
 
@@ -2452,4 +2395,19 @@ test("dashboard boot preserves canonical server models and does not autosave an 
   assert.equal(errors.length, 0);
   assert.equal(writes.length, 1, "an actual retired setting may still be normalized once");
   assert.deepEqual(writes[0].subtitle.engine, JSON.parse(JSON.stringify(DEFAULT_SUBTITLE_SETTINGS.engine)));
+});
+
+
+test("managed caption start never requires a renderer Gemini key and badges follow assignment", () => {
+  const source = readFileSync(path.join(rootDir, "public/subtitle-dashboard.js"), "utf8");
+  const start = source.slice(source.indexOf("async function startSubtitles()"), source.indexOf("async function stopSubtitles()"));
+  assert.doesNotMatch(start, /geminiRequired/);
+  const calls = [];
+  const context = vm.createContext({ state: { settings: { engine: { stt: { provider: "soniox" } } }, history: {} },
+    setRealtimeApiStatus: (...args) => calls.push(args), setTopicModelStatus() {}, recorderStatusText: () => "" });
+  const status = source.slice(source.indexOf("function updateServiceStrip()"), source.indexOf("function languageLabel("));
+  vm.runInContext(status + "updateServiceStrip()", context);
+  assert.match(calls[0][0], /Soniox/);
+  assert.doesNotMatch(calls[0][0], /key needed|Gemini/);
+  assert.equal(calls[0][1], "idle");
 });

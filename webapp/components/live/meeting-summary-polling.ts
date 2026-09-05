@@ -1,3 +1,5 @@
+export type SummaryPollResult = boolean | "pending";
+
 export type SummaryPollingState = "idle" | "polling" | "exhausted" | "failed";
 
 const SUMMARY_POLL_BASE_DELAYS_MILLISECONDS = [2_000, 4_000, 8_000, 12_000, 16_000, 20_000] as const;
@@ -8,9 +10,10 @@ interface SummaryPollTimerApi {
 }
 
 interface SummaryPollLoopOptions {
-  poll: () => Promise<boolean>;
+  poll: () => Promise<SummaryPollResult>;
   onExhausted: () => void;
   onError: (error: unknown) => void;
+  isHidden?: () => boolean;
   random?: () => number;
   timerApi?: SummaryPollTimerApi;
 }
@@ -23,25 +26,31 @@ export function getSummaryPollDelayMilliseconds(attempt: number, randomValue: nu
 
 export function startSummaryPollLoop({
   poll, onExhausted, onError, random = Math.random,
+  isHidden = () => typeof document !== "undefined" && document.hidden,
   timerApi = {
     setTimeout: (callback, delayMilliseconds) => window.setTimeout(callback, delayMilliseconds),
     clearTimeout: (timer) => window.clearTimeout(timer),
   },
 }: SummaryPollLoopOptions): () => void {
   let attempt = 0;
+  let consecutiveReadFailures = 0;
   let timer: number | null = null;
   let isDisposed = false;
   const scheduleNext = () => {
     if (isDisposed) return;
-    if (attempt >= SUMMARY_POLL_BASE_DELAYS_MILLISECONDS.length) {
+    if (consecutiveReadFailures >= SUMMARY_POLL_BASE_DELAYS_MILLISECONDS.length) {
       onExhausted();
       return;
     }
     timer = timerApi.setTimeout(() => {
       timer = null;
+      if (isHidden()) { scheduleNext(); return; }
       attempt += 1;
       void poll().then((shouldContinue) => {
-        if (!isDisposed && shouldContinue) scheduleNext();
+        if (!isDisposed && shouldContinue) {
+          consecutiveReadFailures = shouldContinue === "pending" ? 0 : consecutiveReadFailures + 1;
+          scheduleNext();
+        }
       }).catch((error: unknown) => {
         if (!isDisposed) onError(error);
       });

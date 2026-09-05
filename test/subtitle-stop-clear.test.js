@@ -1,3 +1,4 @@
+import { GEMINI_ENGINE_SELECTION } from "../packages/caption-core/caption-engine-catalog.js";
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import os from "node:os";
@@ -84,6 +85,7 @@ function createSubtitleManagerHarness({ failStart = false } = {}) {
 test("Live Call hybrid audio accepts local PCM without a Gateway floor", async () => {
   const harness = createSubtitleManagerHarness();
   const { httpServer, url } = await startServer({
+    resolveCaptionEngine: async () => GEMINI_ENGINE_SELECTION,
     host: "127.0.0.1",
     port: 0,
     env: {},
@@ -126,6 +128,7 @@ test("Live Call hybrid audio accepts local PCM without a Gateway floor", async (
 test("Live Call keeps local Caption Only independent from Gateway floor routing", async () => {
   const harness = createSubtitleManagerHarness();
   const { httpServer, url, applyLiveCallFloorSnapshot } = await startServer({
+    resolveCaptionEngine: async () => GEMINI_ENGINE_SELECTION,
     host: "127.0.0.1",
     port: 0,
     env: {},
@@ -402,6 +405,7 @@ test("subtitle:stopped is emitted only after provider release and permits the ne
   const starts = [];
   const stops = [];
   const { httpServer, url } = await startServer({
+    resolveCaptionEngine: async () => GEMINI_ENGINE_SELECTION,
     host: "127.0.0.1",
     port: 0,
     env: {},
@@ -466,6 +470,7 @@ test("configured Live Call producer capability protects hybrid control and parti
   const harness = createSubtitleManagerHarness();
   const producerCapability = "test-live-call-producer-capability-32";
   const { httpServer, url, applyLiveCallFloorSnapshot } = await startServer({
+    resolveCaptionEngine: async () => GEMINI_ENGINE_SELECTION,
     host: "127.0.0.1",
     port: 0,
     env: {},
@@ -579,6 +584,7 @@ test("configured Live Call producer capability protects hybrid control and parti
 test("renderer floor claims stay validated without gating the local provider", async () => {
   const harness = createSubtitleManagerHarness();
   const { httpServer, url, applyLiveCallFloorSnapshot } = await startServer({
+    resolveCaptionEngine: async () => GEMINI_ENGINE_SELECTION,
     host: "127.0.0.1",
     port: 0,
     env: {},
@@ -725,6 +731,7 @@ test("renderer floor claims stay validated without gating the local provider", a
 test("a failed local half of Live Call compensates both provider and gateway relay ownership", async () => {
   const harness = createSubtitleManagerHarness({ failStart: true });
   const { httpServer, url } = await startServer({
+    resolveCaptionEngine: async () => GEMINI_ENGINE_SELECTION,
     host: "127.0.0.1",
     port: 0,
     env: {},
@@ -791,6 +798,7 @@ test("a failed local half of Live Call compensates both provider and gateway rel
 test("closing a hybrid Live Call owner releases both the local provider and relay for recovery", async () => {
   const harness = createSubtitleManagerHarness();
   const { httpServer, url, applyLiveCallFloorSnapshot } = await startServer({
+    resolveCaptionEngine: async () => GEMINI_ENGINE_SELECTION,
     host: "127.0.0.1",
     port: 0,
     env: {},
@@ -857,6 +865,7 @@ test("closing a hybrid Live Call owner releases both the local provider and rela
 test("keyed Live Call source staging evicts the oldest entry at its explicit memory cap", async () => {
   const transcriptsDir = await fs.mkdtemp(path.join(os.tmpdir(), "live-source-cap-"));
   const { httpServer, url } = await startServer({
+    resolveCaptionEngine: async () => GEMINI_ENGINE_SELECTION,
     host: "127.0.0.1",
     port: 0,
     env: {},
@@ -917,6 +926,7 @@ test("keyed Live Call source staging evicts the oldest entry at its explicit mem
 
 test("participant Live Call captions normalize and bound display and record text", async () => {
   const { httpServer, url } = await startServer({
+    resolveCaptionEngine: async () => GEMINI_ENGINE_SELECTION,
     host: "127.0.0.1",
     port: 0,
     env: {},
@@ -964,6 +974,7 @@ test("participant Live Call captions normalize and bound display and record text
 
 test("an accepted gateway-caption stop broadcasts idle and removes the late-join subtitle snapshot", async () => {
   const { httpServer, url } = await startServer({
+    resolveCaptionEngine: async () => GEMINI_ENGINE_SELECTION,
     host: "127.0.0.1",
     port: 0,
     env: {},
@@ -1033,6 +1044,7 @@ test("live-call captions clear after the caption-only silence window", async () 
   // event — so the relay must synthesize it, or live-call captions linger on
   // the overlay 5x longer than caption-only ones.
   const { httpServer, url } = await startServer({
+    resolveCaptionEngine: async () => GEMINI_ENGINE_SELECTION,
     host: "127.0.0.1",
     port: 0,
     env: {},
@@ -1135,6 +1147,7 @@ test("only out-of-order live-call finals are records-only; in-order finals keep 
   // the gateway's polish pass delays a final past newer partials, and painting
   // that rewinds the lane to an older sentence.
   const { httpServer, url } = await startServer({
+    resolveCaptionEngine: async () => GEMINI_ENGINE_SELECTION,
     host: "127.0.0.1",
     port: 0,
     env: {},
@@ -1245,6 +1258,7 @@ test("desktop terminal paths clear caption text and speaker state without treati
 test("desktop logout gate refuses preflight and start without opening a subtitle provider", async () => {
   const harness = createSubtitleManagerHarness();
   const server = await startServer({
+    resolveCaptionEngine: async () => GEMINI_ENGINE_SELECTION,
     host: "127.0.0.1", port: 0, env: {}, canStartSubtitleSession: () => false,
     createTranscription: () => ({ ready: async () => {}, sendAudio() {}, stop() {}, close() {} }),
     createSubtitleRealtimeManager: (options) => harness.factory(options),
@@ -1271,6 +1285,7 @@ test("rejecting a start while logout checks an active producer does not clear it
   const entered = deferred();
   const harness = createSubtitleManagerHarness();
   const server = await startServer({
+    resolveCaptionEngine: async () => GEMINI_ENGINE_SELECTION,
     host: "127.0.0.1", port: 0, env: {}, canStartSubtitleSession: () => canStart,
     createTranscription: () => ({ ready: async () => {}, sendAudio() {}, stop() {}, close() {} }),
     createSubtitleRealtimeManager: (options) => ({ ...harness.factory(options), start: async () => { entered.resolve(); await startBarrier.promise; } }),

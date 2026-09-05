@@ -3,6 +3,7 @@
 import { useId, useMemo, useState } from "react";
 import { ParticipantSpeakButton } from "@/components/live/ParticipantSpeakButton";
 import { ViewerSessionContext } from "@/components/live/LiveViewer";
+import { SystemLanguageButton } from "@/components/system-language/SystemLanguageButton";
 import { ViewerReadingFeed } from "@/components/live/ViewerReadingFeed";
 import { ParticipantMeetingMinutes } from "@/components/live/ParticipantMeetingMinutes";
 import type { ViewerRecapClient } from "@/components/live/ViewerRecapRequest";
@@ -96,11 +97,12 @@ export default function MobileWatchDemoPage() {
       },
     };
   }, [previewState]);
-  return <main className="live-viewer-shell is-compact live-viewer-topic-demo" data-preview="desktop mobile" data-reading-state={isEnded ? "ended" : "live"}>
+  return <main className="live-viewer-shell is-compact live-viewer-topic-demo" data-inline-system-language="true" data-preview="desktop mobile" data-reading-state={isEnded ? "ended" : "live"}>
     <div className="live-viewer-translation-layout viewer-notebook">
       <TranslationToolbar ariaLabel={t("실시간 자막 제어")}>
         <strong>NOVA</strong><span className="viewer-session-status">{t(isEnded ? "회의 종료" : "라이브")}</span>
-        <ControlDrawer triggerLabel={t("더보기")} title={t("미리보기 제어")}>
+        <SystemLanguageButton compact />
+        <ControlDrawer iconOnly triggerLabel={t("더보기")} title={t("미리보기 제어")}>
           <ViewerSessionContext title="2026년 2분기 실적 발표" scheduledAt="2026-08-31T13:30:00+09:00" />
           <label className="live-topic-demo-state-selector" htmlFor={previewStateFieldId}><span>{t("미리보기 상태")}</span>
             <select id={previewStateFieldId} name="previewState" aria-label={t("미리보기 상태")} value={previewState} onChange={(event) => {

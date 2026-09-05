@@ -242,7 +242,7 @@ test("the Settings picker accepts the shared server catalog and every option val
   }
   for (const entry of shared.stt) {
     for (const languageMode of entry.languageModes) {
-      const translation = entry.provider === "soniox" ? { provider: "soniox", model: "stt-rt-v5" } : shared.defaults.translation;
+      const translation = entry.provider === "soniox" ? { provider: "soniox", model: "stt-rt-v5" } : { provider: "gemini", model: shared.translation.find((option) => option.provider === "gemini").model };
       assert.doesNotThrow(() => validateSubtitleSettings({
         engine: { stt: { provider: entry.provider, model: entry.model, languageMode }, translation, summary: shared.defaults.summary },
       }), `${entry.provider}:${entry.model}/${languageMode}`);
@@ -330,4 +330,18 @@ test("a saved combined translation repaints as the catalog default when the lang
   h.controls.setCatalog(pairCatalog);
   assert.equal(h.fields.engineTranslation.value, "gemini:gemini-3.6-flash", "the unusable saved pick falls back to the default");
   assert.deepEqual(h.saved, [], "a repaint never writes settings on its own");
+});
+
+
+test("assigned caption engine is read-only and a forged select change does not save", async () => {
+  const h = harness();
+  const label = { textContent: "" };
+  h.form.querySelector = (selector) => selector === '[data-engine-assignment="readonly"]'
+    ? { textContent: "", dataset: { engineAssignment: "readonly" } } : selector === "#caption-engine-label" ? label : h.status;
+  h.controls.setCatalog(catalog);
+  assert.equal(label.textContent, "Gemini");
+  h.fields.engineStt.value = "soniox:stt-rt-v5";
+  h.fields.engineStt.dispatchEvent(new Event("change"));
+  await tick();
+  assert.deepEqual(h.saved, []);
 });
