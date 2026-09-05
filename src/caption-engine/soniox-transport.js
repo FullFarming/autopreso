@@ -11,7 +11,9 @@ import {
 import { selectGeminiTranscriptionVocabularyFromLegacyText } from "../../packages/caption-core/index.js";
 
 const REPLAY_RING_BYTES = 48_000; // 1.5 s of 16 kHz mono PCM16
-const ROLLOVER_MS = 17_400_000; // 290 min, under Soniox's 300-min stream cap
+const MAXIMUM_SESSION_MS = 18_000_000; // Soniox's 300-min stream cap
+const ROLLOVER_MS = 17_400_000; // 290 min, under the cap
+const ROLLOVER_HEADROOM_MS = 60_000; // an offset may never push the roll into the cap
 const MAX_MESSAGE_BYTES = 1_048_576;
 const ERROR_CODES = Object.freeze({
   invalid_request: "SONIOX_INVALID_REQUEST",
@@ -63,13 +65,20 @@ function setUnrefTimer(callback, delay) {
  * createSonioxFinalizeScheduler asks for `<fin>` after 1.2 s without new tokens
  * while final source text is pending, or at a 15 s segment cap, once per segment.
  *
+ * Rollover stagger: `rolloverOffsetMilliseconds` shifts this transport's roll so
+ * two inputs started together (desktop mic + system) do not reconnect in the
+ * same instant and double the live Soniox connection count at the roll.
+ *
  * @param {{engine: any, settings: Record<string, unknown>, apiKey?: string,
- *   endpoint?: "us"|"jp", now?: () => number,
+ *   endpoint?: "us"|"jp", now?: () => number, rolloverOffsetMilliseconds?: number,
  *   setTimer?: (callback: () => void, delay: number) => any, clearTimer?: (timer: any) => void}} input
  */
 export function createSonioxTransport({
   engine, settings, apiKey, endpoint = "us", now = Date.now, setTimer = setUnrefTimer, clearTimer = clearTimeout,
+  rolloverOffsetMilliseconds = 0,
 }) {
+  const rolloverOffset = Number.isFinite(rolloverOffsetMilliseconds) && rolloverOffsetMilliseconds > 0
+    ? Math.trunc(rolloverOffsetMilliseconds) : 0;
   const resample = createCaptionPcmResampler();
   const languages = Array.isArray(settings.translationLanguages) ? settings.translationLanguages : ["en", "ko"];
   const translation = engine.translation.provider === "soniox";
@@ -175,11 +184,11 @@ export function createSonioxTransport({
     // are transcript progress, not a cue to buy a Gemini preview translation.
     providesTranslation: translation,
     providerLabel: "Soniox",
-    maximumSessionMilliseconds: 18_000_000,
+    maximumSessionMilliseconds: MAXIMUM_SESSION_MS,
     // Soniox streams for 300 minutes; rolling at 290 keeps the desktop well
     // inside that cap without paying a reconnect plus audio replay every 9.5
     // minutes the way the shared Gemini rollover would.
-    rolloverMilliseconds: ROLLOVER_MS,
+    rolloverMilliseconds: Math.min(ROLLOVER_MS + rolloverOffset, MAXIMUM_SESSION_MS - ROLLOVER_HEADROOM_MS),
     replayRingBytes: REPLAY_RING_BYTES,
     assertReady() {
       if (!String(apiKey ?? "").trim()) throw new Error("Soniox API key is required for realtime subtitles.");

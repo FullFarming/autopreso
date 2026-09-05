@@ -422,15 +422,9 @@ function migrateSettings(settings, { strictEngine = false } = {}) {
   if (settings.subtitle?.displayMode === "translation_source") {
     settings.subtitle.displayMode = DEFAULT_SUBTITLE_SETTINGS.displayMode;
   }
-  if (
-    settings.subtitle?.translateAllLanguages === true
-    && Array.isArray(settings.subtitle.translationLanguages)
-    && settings.subtitle.translationLanguages.length === 2
-    && settings.subtitle.translationLanguages[0] === "en"
-    && settings.subtitle.translationLanguages[1] === "ko"
-  ) {
-    settings.subtitle.translationLanguages = ["en", "ko", "ja"];
-  }
+  // A saved language list is the user's choice: loading never adds a language.
+  // (An earlier migration expanded ["en","ko"] to ["en","ko","ja"] when
+  // translateAllLanguages was on - a silent third Soniox connection.)
   if (settings.subtitle?.maxWidth === 1100) {
     settings.subtitle.maxWidth = DEFAULT_SUBTITLE_SETTINGS.maxWidth;
   }

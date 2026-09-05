@@ -183,6 +183,16 @@ test("createSettingsStore persists source display and all-language subtitle opti
   );
 });
 
+test("loading never adds a language: a saved [en, ko] stays two languages even with translateAllLanguages on", async () => {
+  const filePath = await tempPath();
+  await fs.writeFile(filePath, JSON.stringify({ subtitle: { translationLanguages: ["en", "ko"], translateAllLanguages: true } }));
+  const settings = await createSettingsStore({ filePath, env: {} }).load();
+  assert.deepEqual(settings.subtitle.translationLanguages, ["en", "ko"]);
+  const store = createSettingsStore({ filePath, env: {} });
+  await store.save({ subtitle: { translationLanguages: ["en", "ko"], translateAllLanguages: true } });
+  assert.deepEqual((await createSettingsStore({ filePath, env: {} }).load()).subtitle.translationLanguages, ["en", "ko"]);
+});
+
 test("createSettingsStore persists and validates selected subtitle translation languages", async () => {
   const filePath = await tempPath();
   const store = createSettingsStore({ filePath, env: {} });

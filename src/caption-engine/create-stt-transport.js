@@ -19,10 +19,14 @@ import { createSonioxTransport } from "./soniox-transport.js";
  * onServerGoAway, onError?, broadcast, sendControl(text) -> boolean (transport-
  * initiated control frame on the live socket; Soniox's finalize uses it)
  *
+ * `rolloverOffsetMilliseconds` staggers a long-session provider's roll per
+ * input (see soniox-transport.js); the Gemini transport rolls on the client's
+ * shared 9.5-minute timer and ignores it.
+ *
  * @param {{engine?: unknown, settings?: Record<string, unknown>, apiKeys?: Record<string, string>,
- *   createSonioxTransportImpl?: Function}} input
+ *   rolloverOffsetMilliseconds?: number, createSonioxTransportImpl?: Function}} input
  */
-export function createSttTransport({ engine, settings = {}, apiKeys, createSonioxTransportImpl } = {}) {
+export function createSttTransport({ engine, settings = {}, apiKeys, rolloverOffsetMilliseconds = 0, createSonioxTransportImpl } = {}) {
   const selection = normalizeEngineSelection(engine);
   if (selection.stt.provider === "gemini") {
     const apiKey = apiKeys?.gemini ?? "";
@@ -44,6 +48,7 @@ export function createSttTransport({ engine, settings = {}, apiKeys, createSonio
       engine: selection,
       settings,
       apiKey: apiKeys?.soniox ?? "",
+      rolloverOffsetMilliseconds,
     });
   }
   throw new Error("ENGINE_SELECTION_INVALID");

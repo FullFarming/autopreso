@@ -173,6 +173,18 @@ test("Soniox owns its own rollover instead of the shared 9.5-minute Gemini one",
   assert.equal(transport.rolloverMilliseconds < transport.maximumSessionMilliseconds, true);
 });
 
+test("a rollover offset staggers the roll per input and can never reach the 300-minute cap", () => {
+  const make = (rolloverOffsetMilliseconds) => createSonioxTransport({
+    engine: sonioxEngine("auto"), settings: { translationLanguages: ["en", "ko"], glossary: "" }, apiKey: "fixture-key", rolloverOffsetMilliseconds,
+  });
+  assert.equal(make(30_000).rolloverMilliseconds, 17_430_000, "system input rolls 30 s after the mic");
+  assert.equal(make(0).rolloverMilliseconds, 17_400_000);
+  for (const invalid of [-5_000, Number.NaN, undefined, "30000"]) assert.equal(make(invalid).rolloverMilliseconds, 17_400_000, String(invalid));
+  const clamped = make(10 * 60_000);
+  assert.equal(clamped.rolloverMilliseconds, 17_940_000, "keeps 60 s of headroom under the cap");
+  assert.ok(clamped.rolloverMilliseconds < clamped.maximumSessionMilliseconds);
+});
+
 function createFakeTimers() {
   let nowMs = 0;
   let nextId = 1;

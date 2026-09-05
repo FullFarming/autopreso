@@ -39,6 +39,11 @@ const SETUP_ACK_TIMEOUT_MS = 8_000;
 const DEFAULT_POLISH_TIMEOUT_MS = 6_000;
 const PARTIAL_TRANSLATION_DEBOUNCE_MS = 160;
 const TRANSCRIBE_ROLLOVER_MS = 570_000;
+// Mic and system inputs start together, so without an offset every Soniox
+// lane of both inputs would roll in the same instant and briefly double the
+// account's live connection count (6 -> 12 for three languages). The system
+// input rolls 30 s after the mic.
+const SYSTEM_INPUT_ROLLOVER_OFFSET_MS = 30_000;
 const TRANSCRIBE_FINAL_DRAIN_MS = 750;
 const RECONNECT_BASE_MS = 500;
 const RECONNECT_MAX_MS = 5_000;
@@ -232,6 +237,7 @@ export function createSubtitleRealtimeManager(options = {}) {
     const targets = languageTargets(state.settings);
     const splitTargets = state.settings.engine.translation.provider === "soniox" && targets.length === 3
       ? targets : [null];
+    const rolloverOffsetMilliseconds = source === "system" ? SYSTEM_INPUT_ROLLOVER_OFFSET_MS : 0;
     const children = splitTargets.map((targetLanguage) => createSourceTranscriptionClient({
       source,
       settings: state.settings,
@@ -241,7 +247,8 @@ export function createSubtitleRealtimeManager(options = {}) {
         engine: state.settings.engine,
         settings: { ...state.settings, ...(targetLanguage ? { sonioxTargetLanguage: targetLanguage } : {}) },
         apiKeys: state.apiKeys,
-      }), ownerManagedSession ? { maximumSessionMilliseconds: 600_000, rolloverMilliseconds: 540_000 } : {}),
+        rolloverOffsetMilliseconds,
+      }), ownerManagedSession ? { maximumSessionMilliseconds: 600_000, rolloverMilliseconds: 540_000 + rolloverOffsetMilliseconds } : {}),
       createWebSocket: ownerManagedSession ? (url, protocols, init) => createManagedCaptionSocket({
         url, protocols, init, provider: pinnedSettings.engine.stt.provider, createWebSocket,
         getCredential: async () => options.createCaptionCredential(

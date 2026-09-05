@@ -879,3 +879,22 @@ test("a rejected contrary partial invalidates translations already in flight", a
     assert.equal(events.filter(event => event.type === "subtitle:partial" && !event.isSourceCaption).length, 0);
   } finally { await manager.stop(); }
 });
+
+// Desktop mic + system start together; without a per-input offset every Soniox
+// lane of both inputs would roll in the same instant (gateway lanes got their
+// own stagger in rolling-speech-session.js; this is the process-level half).
+test("the system input's transports roll 30 s after the mic's, per lane, and the managed override keeps the offset", async () => {
+  const requests = [];
+  const { manager, sockets } = createHarness({
+    settings: { inputMode: "system_mic", translationLanguages: ["en", "ko"] },
+    polish: async () => "unused",
+    createSttTransport: (input) => { requests.push(input); return createFakeCombinedTransport(); },
+  });
+  await manager.start({ sessionId: "rollover-stagger" });
+  try {
+    assert.equal(sockets.length, 2);
+    // audioSourcesForInputMode("system_mic") opens system first, then mic.
+    assert.deepEqual(requests.map((request) => request.rolloverOffsetMilliseconds), [30_000, 0]);
+    assert.ok(requests.every((request) => request.engine && request.settings && request.apiKeys), "the offset is an extra field, not a replacement");
+  } finally { await manager.stop(); }
+});
