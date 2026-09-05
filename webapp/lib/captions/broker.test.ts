@@ -116,3 +116,13 @@ test("an expired ticket renews within the 24 hour grace window and is gone for g
   await assert.rejects(f.broker.renew("user-a",{ticket:again.ticket}),(error:CaptionBrokerError)=>error.code==="CAPTION_SESSION_EXPIRED");
   assert.deepEqual(await f.broker.stop("user-a",{ticket:session.ticket}),{stopped:true},"the owner can still end it");
 });
+test("Gemini ephemeral token languages must be a subset of the ticket's pinned languages",async()=>{
+  const f=fixture();f.setEngine(gemini);const session=await f.broker.start("user-a",{languages:["ko","en"]});
+  for(const languageCodes of [["ja-JP"],["ko-KR","ja"],["xx-YY"]]){
+    await assert.rejects(f.broker.credentials("user-a",{ticket:session.ticket,provider:"gemini",languageCodes}),(error:CaptionBrokerError)=>error.code==="CAPTION_LANGUAGES_MISMATCH"&&error.status===400);
+  }
+  assert.equal(f.calls.length,0,"a mismatch never reaches the provider");
+  await f.broker.credentials("user-a",{ticket:session.ticket,provider:"gemini",languageCodes:["ko-KR","en-US"]});
+  await f.broker.credentials("user-a",{ticket:session.ticket,provider:"gemini"});
+  assert.equal(f.calls.length,2);
+});

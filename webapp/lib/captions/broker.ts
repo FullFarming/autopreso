@@ -1,7 +1,7 @@
 import { createHmac, randomUUID, timingSafeEqual } from "node:crypto";
 import { z } from "zod";
 import { geminiTranscriptionVocabularyContract as vocabularyContract } from "../../../packages/caption-core/gemini-transcription-vocabulary.js";
-import { CAPTION_LANGUAGE_CODES } from "../../../packages/caption-core/languages.js";
+import { CAPTION_LANGUAGE_CODES, normalizeCaptionLanguage } from "../../../packages/caption-core/languages.js";
 import type { ManagedCaptionSessions } from "./store";
 import { engineSelectionKey, normalizeEngineSelection } from "../../../packages/caption-core/caption-engine-catalog.js";
 import type { EngineSelection } from "../live/model-preferences";
@@ -140,6 +140,11 @@ export class CaptionBroker {
   async credentials(hostId: string, body: unknown) {
     const input = parse(credentialsInput, body); const claims = this.verify(input.ticket, hostId);
     if (input.provider !== claims.engine.stt.provider) throw new CaptionBrokerError("세션에 배정된 엔진만 사용할 수 있습니다.", "CAPTION_PROVIDER_FORBIDDEN", 403);
+    // The ephemeral token is constrained to the requested transcription
+    // languages; those must be a subset of the languages the ticket pinned.
+    if (!input.languageCodes.every((code) => claims.languages.includes(normalizeCaptionLanguage(code)))) {
+      throw new CaptionBrokerError("자막 언어가 세션에 배정된 언어와 다릅니다.", "CAPTION_LANGUAGES_MISMATCH", 400);
+    }
     await this.limit(hostId, "credentials"); await this.assertActive(claims); const now = this.now();
     const expiresAt = new Date(now + 60_000).toISOString();
     let result: unknown;
