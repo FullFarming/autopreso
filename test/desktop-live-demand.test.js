@@ -202,7 +202,8 @@ test("desktop main denies token, health and socket work without demand while leg
     warmLiveGatewayBeforeSocket: () => { calls.push("health"); },
     WebSocket: class { constructor() { calls.push("socket"); } },
   };
-  const ensure = vm.runInNewContext(`${mainSection("async function ensureLiveGatewayBridgeOnce", "async function ensureLiveGatewayBridgeForStatus")}; ensureLiveGatewayBridgeOnce`, context);
+  const ensure = vm.runInNewContext(`${mainSection("function readLiveCallModelPreferences", "function sanitizeLiveCallDraft")}
+${mainSection("async function ensureLiveGatewayBridgeOnce", "async function ensureLiveGatewayBridgeForStatus")}; ensureLiveGatewayBridgeOnce`, Object.assign(context, { createGeminiCaptionConfig, geminiCaptionConfigFingerprint, DEFAULT_ENGINE_SELECTION, EngineSelectionError, normalizeEngineSelection }));
   assert.equal((await ensure({ allowPreparing: true })).waiting, true);
   assert.deepEqual(calls, []);
   context.liveCallSession.demandEnabled = false;
@@ -274,7 +275,8 @@ function mainGatewayHarness() {
     liveBridgeAudioAdapters: new Map(), clearLiveBridgeCredentialRefresh() {}, clearLiveBridgeReconnect() {},
     setLiveBridgeAlert() {}, LIVE_GATEWAY_SOCKET_OPEN_TIMEOUT_MS: 500, Buffer, setTimeout, clearTimeout, console,
   };
-  const ensure = vm.runInNewContext(`${mainSection("async function ensureLiveGatewayBridgeOnce", "async function ensureLiveGatewayBridgeForStatus")}; ensureLiveGatewayBridgeOnce`, context);
+  const ensure = vm.runInNewContext(`${mainSection("function readLiveCallModelPreferences", "function sanitizeLiveCallDraft")}
+${mainSection("async function ensureLiveGatewayBridgeOnce", "async function ensureLiveGatewayBridgeForStatus")}; ensureLiveGatewayBridgeOnce`, Object.assign(context, { createGeminiCaptionConfig, geminiCaptionConfigFingerprint, DEFAULT_ENGINE_SELECTION, EngineSelectionError, normalizeEngineSelection }));
   return { sockets, session, context, attempts, ensure };
 }
 

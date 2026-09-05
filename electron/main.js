@@ -1163,6 +1163,30 @@ function pinLiveCallModelSettings(settings, modelPreferences) {
   return { ...rest, engine };
 }
 
+// Plan 2 Task 5 follow-up: an admin can switch a RUNNING Live Call's engine
+// (gateway `POST /internal/sessions/:id/engine`), after which the gateway serves
+// the new engine while this process still carries the arm-time captionConfig.
+// Re-sending that on a reconnect made `isSameHostSettings` fail, the gateway
+// rebuilt the pipeline with the OLD engine, and the authorizer's engine parity
+// check ended the session with SESSION_REVOKED. So every bridge (re)start
+// re-pins the engine from the session record it already reads (the web host
+// does the same in `refreshSettings`). Returns true when the config changed;
+// throws EngineSelectionError on a malformed record without touching the session.
+function refreshLiveCallEngineFromSession(armedSession, sessionData) {
+  const modelPreferences = readLiveCallModelPreferences(sessionData?.modelPreferences);
+  const settings = armedSession.gatewaySettings ?? {};
+  if (!settings.captionConfig) {
+    armedSession.modelPreferences = modelPreferences;
+    return false;
+  }
+  const captionConfig = createGeminiCaptionConfig(pinLiveCallModelSettings(settings.captionConfig, modelPreferences));
+  const captionConfigFingerprint = geminiCaptionConfigFingerprint(captionConfig);
+  armedSession.modelPreferences = modelPreferences;
+  if (captionConfigFingerprint === (settings.captionConfigFingerprint ?? "")) return false;
+  armedSession.gatewaySettings = { ...settings, captionConfig, captionConfigFingerprint };
+  return true;
+}
+
 function sanitizeLiveCallDraft(draft, subtitleSettings = {}, modelPreferences = undefined) {
   const source = draft && typeof draft === "object" ? draft : {};
   const title = typeof source.title === "string" && source.title.trim()
@@ -2333,6 +2357,13 @@ async function ensureLiveGatewayBridgeOnce({ allowPreparing = false, deadlineAt 
   }
   if (liveCallSession !== armedSession || !allowedStatuses.includes(armedSession.status) || isQuitting) {
     return { ok: false, code: "NOT_LIVE" };
+  }
+  // An admin may have switched the session's engine while it ran; the `start`
+  // below must carry the engine the gateway now serves, not the arm-time one.
+  try {
+    refreshLiveCallEngineFromSession(armedSession, currentSession.data);
+  } catch {
+    return { ok: false, code: "ENGINE_SELECTION_INVALID" };
   }
   if (liveGatewayBridge?.session === armedSession) {
     return { ok: true, streaming: liveGatewayBridge.ready === true };
