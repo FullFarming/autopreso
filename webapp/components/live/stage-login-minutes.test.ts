@@ -25,7 +25,11 @@ test("stage keeps access prelive, translations live, and a clean completion stat
   assert.match(stage, /className="live-stage-complete"/u);
   assert.match(stage, /\{isPrelive && currentInvite && \(/u);
   assert.doesNotMatch(stage, /is-faded-out|aria-hidden=\{!isPrelive\}/u);
-  assert.match(stage, /href="\/host-screen"/u);
+  // The companion link must never navigate the projector away from the stage:
+  // in a browser it opens a new tab; in the Electron stage window the same-
+  // origin window-open is denied by adoptStageWindow's setWindowOpenHandler.
+  assert.match(stage, /href="\/host-screen" target="_blank" rel="noopener"/u);
+  assert.doesNotMatch(stage, /href="\/host-screen"(?! target="_blank")/u);
   assert.doesNotMatch(stage, /getUserMedia|startBroadcast|LiveAudioClient|gateway-token/u);
 });
 

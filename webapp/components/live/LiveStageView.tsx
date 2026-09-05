@@ -264,7 +264,7 @@ export default function LiveStageView({ sessionId }: { sessionId: string }) {
   return (
     <main className="live-stage-shell" aria-label="Session stage">
       <nav className="live-stage-companion-navigation" aria-label="QR·진행 화면">
-        <a className="live-link-button" href="/host-screen">회의 목록</a>
+        <a className="live-link-button" href="/host-screen" target="_blank" rel="noopener">회의 목록</a>
         <span>음성은 데스크톱에서 송출됩니다.</span>
       </nav>
       {!isEnded && !currentInvite && (
