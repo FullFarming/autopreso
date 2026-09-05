@@ -192,3 +192,17 @@ test("Supabase absent or foreign photo returns a bounded 404 rather than exposin
   const store = new SupabaseSpeakerRosterStore({ baseUrl: "https://project.supabase.co", credential: { kind: "secret", key: "test" } }, async () => Response.json(null));
   await assert.rejects(store.getPhoto(sessionId, foreignId), { code: "SPEAKER_ROSTER_PHOTO", status: 404 });
 });
+
+// 2026-09-06 incident: GET /api/live-sessions/[id]/speakers answered 500 on Vercel because
+// photo.ts imported `sharp` at module load and the linux-x64 libvips shared object was not in
+// the traced function bundle (ERR_DLOPEN_FAILED). The roster read path never touches an image,
+// so the native module must load lazily inside normalizeSpeakerPhoto, and the @img binaries
+// must be traced into the function that does need them.
+test("sharp is loaded lazily by the photo normalizer, never at module load", async () => {
+  const { readFile } = await import("node:fs/promises");
+  const source = await readFile(new URL("./photo.ts", import.meta.url), "utf8");
+  assert.doesNotMatch(source, /^import\s+sharp\s+from\s+"sharp";?$/mu);
+  assert.match(source, /await import\("sharp"\)/u);
+  const config = await readFile(new URL("../../../next.config.mjs", import.meta.url), "utf8");
+  assert.match(config, /outputFileTracingIncludes[\s\S]*@img/u);
+});

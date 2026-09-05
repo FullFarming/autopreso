@@ -2777,6 +2777,9 @@ function requestSubtitleStart(payload) {
       if (message.type === "subtitle:error" && message.code === "SUBTITLE_START_FAILED") {
         if (message.sessionId && message.sessionId !== payload.sessionId) return;
         if (message.captionProducer && message.captionProducer !== expectedProducer) return;
+        // Local captions now run on the administrator-assigned engine, so the server refuses
+        // to start without a host login; show the localized instruction, not the code.
+        if (message.message === "HOST_LOGIN_REQUIRED") { finish(new Error(t("live.hostLoginRequired"))); return; }
         finish(new Error(message.message || t("error.subtitleStartFailed")));
       }
     };
@@ -2804,6 +2807,12 @@ async function handleSubtitleRuntimeError(message) {
   // Initial-start errors are owned by requestSubtitleStart, which rejects the
   // matching promise and lets that start path release its own capture exactly once.
   if (captionRuntimeState === "starting") return;
+  // 2026-09-06 fix: after a rejected start, the cleanup stop targets a session the server
+  // never accepted and is answered with SUBTITLE_SESSION_MISMATCH. That reply is
+  // informational once the dashboard no longer owns the session; painting it would hide
+  // the real start error (login required, broker unavailable, ...).
+  if (message.code === "SUBTITLE_SESSION_MISMATCH"
+    && (!state.running || message.sessionId !== state.sessionId)) return;
   if (liveBridgePreflightRequestId && message.code === "SUBTITLE_PREFLIGHT_FAILED") return;
   if (activeCaptionSessionOwner === "live-call" && state.running) {
     transitionCaptionRuntime("reconnecting");

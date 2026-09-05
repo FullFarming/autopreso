@@ -1,5 +1,11 @@
-import sharp from "sharp";
 import { LiveSessionError } from "../errors";
+
+// `sharp` is a native module. Loading it at module scope made every import of this file (and so
+// the roster GET, which never touches an image) fail with ERR_DLOPEN_FAILED when the platform
+// binary was not traced into the serverless bundle. Only the photo normalizer needs it.
+async function loadSharp() {
+  return (await import("sharp")).default;
+}
 
 export const MAX_SPEAKER_PHOTO_INPUT_BYTES = 2 * 1024 * 1024;
 export const MAX_SPEAKER_PHOTO_OUTPUT_BYTES = 256 * 1024;
@@ -32,6 +38,7 @@ export async function normalizeSpeakerPhoto(bytes: Uint8Array, contentType: stri
   if (bytes.byteLength > MAX_SPEAKER_PHOTO_INPUT_BYTES) throw oversizedPhoto();
   if (!bytes.byteLength || !CONTENT_TYPES.has(contentType)) throw invalidPhoto();
   try {
+    const sharp = await loadSharp();
     const image = sharp(bytes, { limitInputPixels: 16_000_000, failOn: "warning", animated: false });
     const metadata = await image.metadata();
     const expected = contentType === "image/jpeg" ? "jpeg" : contentType === "image/png" ? "png" : "webp";

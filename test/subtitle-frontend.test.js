@@ -2411,3 +2411,30 @@ test("managed caption start never requires a renderer Gemini key and badges foll
   assert.doesNotMatch(calls[0][0], /key needed|Gemini/);
   assert.equal(calls[0][1], "idle");
 });
+
+// 2026-09-06 incident: when a local caption start is rejected (managed broker unavailable,
+// host login required, ...), startSubtitles() cleans up with a subtitle:stop for a session the
+// server never accepted. The server answers SUBTITLE_SESSION_MISMATCH ("활성 자막 세션이
+// 아닙니다.") and the generic runtime-error handler painted THAT over the real start error,
+// so the operator saw a mismatch message instead of the cause.
+test("a session-mismatch reply to the dashboard's own cleanup stop never replaces the start error", () => {
+  const js = readFileSync(path.join(rootDir, "public", "subtitle-dashboard.js"), "utf8");
+  const start = js.indexOf("async function handleSubtitleRuntimeError(message)");
+  const end = js.indexOf("async function startSubtitles()", start);
+  assert.ok(start > 0 && end > start, "handleSubtitleRuntimeError precedes startSubtitles");
+  const handler = js.slice(start, end);
+  // A mismatch about a session the dashboard no longer owns is informational: no stop, no error.
+  assert.match(handler, /message\.code === "SUBTITLE_SESSION_MISMATCH"[\s\S]*?(!state\.running|message\.sessionId !== state\.sessionId)[\s\S]*?return;/u);
+  const mismatchGuard = handler.indexOf('"SUBTITLE_SESSION_MISMATCH"');
+  const genericStop = handler.indexOf("await stopSubtitles();");
+  assert.ok(mismatchGuard > 0 && mismatchGuard < genericStop, "the mismatch guard runs before the generic stop + showError path");
+});
+
+test("a start rejected for a missing host login shows the localized sign-in message, not the raw code", () => {
+  const js = readFileSync(path.join(rootDir, "public", "subtitle-dashboard.js"), "utf8");
+  const start = js.indexOf("function requestSubtitleStart(payload)");
+  const end = js.indexOf("async function handleSubtitleRuntimeError(message)", start);
+  assert.ok(start > 0 && end > start);
+  const requester = js.slice(start, end);
+  assert.match(requester, /message\.message === "HOST_LOGIN_REQUIRED"[\s\S]*?t\("live\.hostLoginRequired"\)/u);
+});
