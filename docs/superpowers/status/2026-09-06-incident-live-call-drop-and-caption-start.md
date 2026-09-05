@@ -34,7 +34,7 @@
 - 고착 세션 `42d1acbd…`를 웹앱과 같은 RPC `terminate_live_session`으로 종료(`stopped`, version 5).
 - Vercel 프로덕션 재배포(65b816a): `/speakers` 익명 401(모듈 로드 정상), `/login` 200.
 - DMG 재빌드·재설치: `/Applications/NOVA.app`(65b816a). 이전 설치는 `NOVA.app.bak-20260906-broken-4c2cbbf`, 9/1 빌드는 `NOVA.app.bak-20260906`.
-- 게이트웨이: 코드 변경 없음. 단, 운영 리비전 `nova-20260905`는 hardening 브랜치(ec128de) 시점 이미지라 통합 HEAD와 11개 파일 차이가 있어, HEAD(65b816a) 이미지를 별도 리비전으로 0% 트래픽에 준비한다(아래 참조).
+- 게이트웨이: 코드 변경 없음. 단, 운영 리비전 `nova-20260905`는 hardening 브랜치(ec128de) 시점 이미지라 통합 HEAD와 11개 파일 차이가 있어, HEAD(65b816a) 이미지(Cloud Build 6a475b83, digest f4bcb2ba…)를 리비전 `realtime-noel-media-gateway-head-20260906`(태그 `head-review`, 0% 트래픽, `/health` 200)으로 준비했다. 전환: `gcloud run services update-traffic realtime-noel-media-gateway --region asia-northeast3 --project gen-lang-client-0321430669 --to-revisions realtime-noel-media-gateway-head-20260906=100`.
 
 ## 게이트 (작업 트리, 65b816a)
 루트 1544 tests / 1523 pass / 0 fail / 21 skip; PGlite SQL 3파일 28/28; 웹앱 1048/1048 + 79/79; 타입체크 클린.
