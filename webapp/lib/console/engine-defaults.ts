@@ -87,17 +87,25 @@ export async function resolveEngineDefaultsOrFallback(): Promise<EngineSelection
   catch { return readStoredEngineDefaults(null); }
 }
 
-/** A fresh server lookup at each new session; an unavailable policy never changes providers. */
-export async function resolveHostEngineAssignment(hostId: string): Promise<{ engine: EngineSelection; assignmentRevision: string }> {
-  const assignment = await getConsoleStore().readHostVoiceAssignment(hostId);
-  const engine = normalizeEngineSelection({
-    stt: assignment.provider === "soniox"
+/**
+ * The one mapping from a profile's `voice_provider` to a Live Call engine (D2: Soniox
+ * recognition + own translation by default; Gemini Transcribe → Flash is the alternative).
+ * Pure, so the console's immediate switch and the host's session start pin the same engine.
+ */
+export function engineSelectionForVoiceProvider(provider: "soniox" | "gemini"): EngineSelection {
+  return normalizeEngineSelection({
+    stt: provider === "soniox"
       ? { provider: "soniox", model: "stt-rt-v5", languageMode: "auto" }
       : { provider: "gemini", model: "gemini-3.5-transcribe-live", languageMode: "auto" },
-    translation: assignment.provider === "soniox"
+    translation: provider === "soniox"
       ? { provider: "soniox", model: "stt-rt-v5" }
       : { provider: "gemini", model: "gemini-3.6-flash" },
     summary: { provider: "gemini", model: "gemini-3.6-flash" },
   }) as EngineSelection;
-  return { engine, assignmentRevision: assignment.revision };
+}
+
+/** A fresh server lookup at each new session; an unavailable policy never changes providers. */
+export async function resolveHostEngineAssignment(hostId: string): Promise<{ engine: EngineSelection; assignmentRevision: string }> {
+  const assignment = await getConsoleStore().readHostVoiceAssignment(hostId);
+  return { engine: engineSelectionForVoiceProvider(assignment.provider), assignmentRevision: assignment.revision };
 }

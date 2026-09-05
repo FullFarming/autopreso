@@ -95,23 +95,6 @@ test("readSettings maps a fresh project (engine null, no updater) and a configur
   await assert.rejects(storeWith(() => json([])).store.readSettings(), (e: ConsoleStoreError) => e.code === "CONSOLE_ROW_INVALID" && e.status === 502);
 });
 
-test("setEngineDefaults normalizes through the catalog before sending p_engine and refuses an invalid selection without a request", async () => {
-  const { store, calls } = storeWith(() => json(true));
-  await store.setEngineDefaults({ actorId: ADMIN, engine: { stt: { provider: "soniox", model: "stt-rt-v5", languageMode: "ko" }, translation: { provider: "soniox", model: "stt-rt-v5" }, summary: { provider: "gemini", model: "gemini-3.7-flash" } } });
-  assert.equal(calls[0].url, "https://project.supabase.test/rest/v1/rpc/set_engine_defaults_v1");
-  assert.deepEqual(body(calls[0]), {
-    p_actor_id: ADMIN,
-    p_engine: { stt: { provider: "soniox", model: "stt-rt-v5", languageMode: "ko" }, translation: { provider: "soniox", model: "stt-rt-v5" }, summary: { provider: "gemini", model: "gemini-3.7-flash" } },
-  });
-  const invalid = storeWith(() => json(true));
-  await assert.rejects(
-    invalid.store.setEngineDefaults({ actorId: ADMIN, engine: { stt: { provider: "gemini", model: "nope" } } as never }),
-    (e: ConsoleStoreError) => e.code === "ENGINE_INVALID" && e.status === 400,
-  );
-  assert.equal(invalid.calls.length, 0);
-  await assert.rejects(storeWith(() => json(false)).store.setEngineDefaults({ actorId: ADMIN, engine: DEFAULT_ENGINE_SELECTION }), (e: ConsoleStoreError) => e.code === "CONSOLE_WRITE_FAILED");
-});
-
 test("setLegacyPasswordLogin posts p_enabled and requires a true ack", async () => {
   const { store, calls } = storeWith(() => json(true));
   await store.setLegacyPasswordLogin({ actorId: ADMIN, enabled: false });
@@ -138,28 +121,40 @@ test("getConsoleStore returns one module singleton and the test seam swaps it", 
   assert.equal(getConsoleStore(), real);
 });
 
-test("listActiveSessions posts {} to list_live_session_ids_admin_v1 and maps id/status/languages", async () => {
+test("listActiveSessionsForHost posts { p_host_id } to list_live_session_ids_for_host_admin_v1 and maps id/status/languages", async () => {
   const { store, calls } = storeWith(() => json([
     { id: SESSION, status: "live", languages: ["ko", "en"] },
     { id: TARGET, status: "preparing", languages: ["ja"] },
   ]));
-  assert.deepEqual(await store.listActiveSessions(), [
+  assert.deepEqual(await store.listActiveSessionsForHost(TARGET), [
     { id: SESSION, status: "live", languages: ["ko", "en"] },
     { id: TARGET, status: "preparing", languages: ["ja"] },
   ]);
-  assert.equal(calls[0].url, "https://project.supabase.test/rest/v1/rpc/list_live_session_ids_admin_v1");
-  assert.deepEqual(body(calls[0]), {});
-  assert.deepEqual(await storeWith(() => json([])).store.listActiveSessions(), []);
-  await assert.rejects(storeWith(() => json([{ id: "not-a-uuid", status: "live", languages: [] }])).store.listActiveSessions(), (e: ConsoleStoreError) => e.code === "CONSOLE_ROW_INVALID" && e.status === 502);
-  await assert.rejects(storeWith(() => json({ id: SESSION })).store.listActiveSessions(), (e: ConsoleStoreError) => e.code === "CONSOLE_ROW_INVALID");
+  assert.equal(calls[0].url, "https://project.supabase.test/rest/v1/rpc/list_live_session_ids_for_host_admin_v1");
+  assert.deepEqual(body(calls[0]), { p_host_id: TARGET });
+  assert.deepEqual(await storeWith(() => json([])).store.listActiveSessionsForHost("noel"), []);
+  await assert.rejects(storeWith(() => json([{ id: "not-a-uuid", status: "live", languages: [] }])).store.listActiveSessionsForHost(TARGET), (e: ConsoleStoreError) => e.code === "CONSOLE_ROW_INVALID" && e.status === 502);
+  await assert.rejects(storeWith(() => json({ id: SESSION })).store.listActiveSessionsForHost(TARGET), (e: ConsoleStoreError) => e.code === "CONSOLE_ROW_INVALID");
 });
 
-test("setSessionEngineAsAdmin normalizes the engine, posts actor/session/engine, maps the row, and returns null for no match", async () => {
+test("setSessionEngineAsAdmin normalizes the engine, posts actor/session/engine/revision to the v2 RPC, maps the row, and returns null for no match", async () => {
   const engine = { stt: { provider: "soniox", model: "stt-rt-v5", languageMode: "ko" }, translation: { provider: "soniox", model: "stt-rt-v5" }, summary: { provider: "gemini", model: "gemini-3.7-flash" } };
   const { store, calls } = storeWith(() => json([{ id: SESSION, status: "live", version: 4 }]));
-  assert.deepEqual(await store.setSessionEngineAsAdmin({ actorId: ADMIN, sessionId: SESSION, engine }), { id: SESSION, status: "live", version: 4 });
-  assert.equal(calls[0].url, "https://project.supabase.test/rest/v1/rpc/set_live_session_engine_admin_v1");
-  assert.deepEqual(body(calls[0]), { p_actor_id: ADMIN, p_session_id: SESSION, p_engine: engine });
+  assert.deepEqual(await store.setSessionEngineAsAdmin({ actorId: ADMIN, sessionId: SESSION, engine, assignmentRevision: "7" }), { id: SESSION, status: "live", version: 4 });
+  assert.equal(calls[0].url, "https://project.supabase.test/rest/v1/rpc/set_live_session_engine_admin_v2");
+  assert.deepEqual(body(calls[0]), { p_actor_id: ADMIN, p_session_id: SESSION, p_engine: engine, p_assignment_revision: "7" });
+  // without a revision the stored one is left alone (null, not undefined - PostgREST needs the key)
+  const bare = storeWith(() => json([{ id: SESSION, status: "live", version: 5 }]));
+  await bare.store.setSessionEngineAsAdmin({ actorId: ADMIN, sessionId: SESSION, engine });
+  assert.deepEqual(body(bare.calls[0]), { p_actor_id: ADMIN, p_session_id: SESSION, p_engine: engine, p_assignment_revision: null });
+  // a malformed revision is refused locally, before any request
+  const badRevision = storeWith(() => json([]));
+  await assert.rejects(badRevision.store.setSessionEngineAsAdmin({ actorId: ADMIN, sessionId: SESSION, engine, assignmentRevision: "0x1" }), (e: ConsoleStoreError) => e.code === "ASSIGNMENT_REVISION_INVALID" && e.status === 400);
+  assert.equal(badRevision.calls.length, 0);
+  await assert.rejects(
+    storeWith(() => json({ message: "ASSIGNMENT_REVISION_INVALID", code: "22023" }, 400)).store.setSessionEngineAsAdmin({ actorId: ADMIN, sessionId: SESSION, engine: DEFAULT_ENGINE_SELECTION }),
+    (e: ConsoleStoreError) => e.code === "ASSIGNMENT_REVISION_INVALID" && e.status === 400,
+  );
   // the RPC returns no row for stopped / archived / unknown sessions: not an error
   assert.equal(await storeWith(() => json([])).store.setSessionEngineAsAdmin({ actorId: ADMIN, sessionId: SESSION, engine: DEFAULT_ENGINE_SELECTION }), null);
   // a non-catalog engine is refused locally without a request
@@ -183,10 +178,35 @@ test("setSessionEngineAsAdmin normalizes the engine, posts actor/session/engine,
   await assert.rejects(storeWith(() => json([{ id: SESSION, status: "live", version: "4" }])).store.setSessionEngineAsAdmin({ actorId: ADMIN, sessionId: SESSION, engine: DEFAULT_ENGINE_SELECTION }), (e: ConsoleStoreError) => e.code === "CONSOLE_ROW_INVALID");
 });
 
-test("recordEngineDeploy posts the deploy counters next to the engine as p_payload and requires a true ack", async () => {
+test("recordEngineDeploy posts the deploy counters next to the engine and the target user as p_payload and requires a true ack", async () => {
   const { store, calls } = storeWith(() => json(true));
-  await store.recordEngineDeploy({ actorId: ADMIN, engine: DEFAULT_ENGINE_SELECTION, summary: { switched: 2, queued: 1, failed: 3 } });
+  await store.recordEngineDeploy({ actorId: ADMIN, engine: DEFAULT_ENGINE_SELECTION, summary: { switched: 2, queued: 1, failed: 3 }, target: { profileId: TARGET, hostId: "noel", voiceProvider: "gemini", revision: "3" } });
   assert.equal(calls[0].url, "https://project.supabase.test/rest/v1/rpc/record_console_deploy_v1");
-  assert.deepEqual(body(calls[0]), { p_actor_id: ADMIN, p_payload: { engine: DEFAULT_ENGINE_SELECTION, sessionsSwitched: 2, sessionsFailed: 3, sessionsQueued: 1 } });
-  await assert.rejects(storeWith(() => json(false)).store.recordEngineDeploy({ actorId: ADMIN, engine: DEFAULT_ENGINE_SELECTION, summary: { switched: 0, queued: 0, failed: 0 } }), (e: ConsoleStoreError) => e.code === "CONSOLE_WRITE_FAILED" && e.status === 503);
+  assert.deepEqual(body(calls[0]), { p_actor_id: ADMIN, p_payload: {
+    engine: DEFAULT_ENGINE_SELECTION, sessionsSwitched: 2, sessionsFailed: 3, sessionsQueued: 1,
+    targetProfileId: TARGET, targetHostId: "noel", provider: "gemini", revision: "3",
+  } });
+  await assert.rejects(storeWith(() => json(false)).store.recordEngineDeploy({ actorId: ADMIN, engine: DEFAULT_ENGINE_SELECTION, summary: { switched: 0, queued: 0, failed: 0 }, target: { profileId: TARGET, hostId: "noel", voiceProvider: "soniox", revision: "1" } }), (e: ConsoleStoreError) => e.code === "CONSOLE_WRITE_FAILED" && e.status === 503);
+});
+
+test("setProfileVoiceProvider posts to the v2 RPC and maps the profile identity next to the assignment", async () => {
+  const { store, calls } = storeWith(() => json([{ id: TARGET, status: "approved", role: "host", host_id: "noel", provider: "gemini", revision: 3 }]));
+  assert.deepEqual(await store.setProfileVoiceProvider({ actorId: ADMIN, profileId: TARGET, provider: "gemini" }), {
+    id: TARGET, status: "approved", role: "host", hostId: "noel", provider: "gemini", revision: "3",
+  });
+  assert.equal(calls[0].url, "https://project.supabase.test/rest/v1/rpc/set_profile_voice_provider_v2");
+  assert.deepEqual(body(calls[0]), { p_actor_id: ADMIN, p_profile_id: TARGET, p_provider: "gemini" });
+  for (const row of [
+    { id: TARGET, status: "approved", role: "host", provider: "gemini", revision: 3 },
+    { id: TARGET, status: "approved", role: "host", host_id: "noel", provider: "whisper", revision: 3 },
+    { id: TARGET, status: "approved", role: "host", host_id: "noel", provider: "gemini", revision: "abc" },
+    { id: TARGET, status: "unknown", role: "host", host_id: "noel", provider: "gemini", revision: 3 },
+  ]) {
+    await assert.rejects(storeWith(() => json([row])).store.setProfileVoiceProvider({ actorId: ADMIN, profileId: TARGET, provider: "gemini" }), (e: ConsoleStoreError) => e.code === "CONSOLE_ROW_INVALID", JSON.stringify(row));
+  }
+  await assert.rejects(storeWith(() => json([])).store.setProfileVoiceProvider({ actorId: ADMIN, profileId: TARGET, provider: "gemini" }), (e: ConsoleStoreError) => e.code === "CONSOLE_ROW_INVALID");
+  await assert.rejects(
+    storeWith(() => json({ message: "VOICE_PROVIDER_INVALID", code: "22023" }, 400)).store.setProfileVoiceProvider({ actorId: ADMIN, profileId: TARGET, provider: "gemini" }),
+    (e: ConsoleStoreError) => e.code === "VOICE_PROVIDER_INVALID" && e.status === 400,
+  );
 });

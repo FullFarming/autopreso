@@ -11,12 +11,17 @@ export interface ConsoleSessionRow {
 }
 export interface ConsoleSettings { legacyPasswordLoginEnabled: boolean; engine: unknown; engineUpdatedAt: string | null; engineUpdatedByEmail: string | null }
 export interface ProfileMutationResult { id: string; status: ProfileStatus; role: ProfileRole }
-/** A session the deploy push can switch: `list_live_session_ids_admin_v1` returns only preparing/live, not archived. */
+export type VoiceProvider = "soniox" | "gemini";
+/** `set_profile_voice_provider_v2`: the profile identity the route answers with plus the assignment it now holds. */
+export interface VoiceProviderMutationResult extends ProfileMutationResult { hostId: string; provider: VoiceProvider; revision: string }
+/** A session the per-user switch targets: `list_live_session_ids_for_host_admin_v1` returns that host's preparing/live, not archived. */
 export interface ActiveSessionRow { id: string; status: string; languages: string[] }
-/** Row returned by `set_live_session_engine_admin_v1`; `version` is the bumped value. */
+/** Row returned by `set_live_session_engine_admin_v2`; `version` is the bumped value. */
 export interface SessionEngineSwitchResult { id: string; status: string; version: number }
 /** Per-deploy outcome counters (spec §9 감사); the route derives them from the per-session results. */
 export interface EngineDeploySummary { switched: number; queued: number; failed: number }
+/** The user a deploy targeted, recorded next to the counters so the audit row names who was switched. */
+export interface EngineDeployTarget { profileId: string; hostId: string; voiceProvider: VoiceProvider; revision: string }
 
 export class ConsoleStoreError extends Error {
   readonly code: string;
@@ -34,6 +39,7 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-
 const STATUSES = new Set<ProfileStatus>(["pending", "approved", "rejected", "disabled"]);
 const ROLES = new Set<ProfileRole>(["host", "admin"]);
 const SUMMARY_STATUSES = new Set<string>(["failed", "succeeded", "running"]);
+const ASSIGNMENT_REVISION = /^[1-9][0-9]{0,18}$/u;
 const isRecord = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
 const optionalString = (v: unknown): string | null => (typeof v === "string" ? v : null);
 const rowInvalid = () => new ConsoleStoreError("콘솔 응답이 올바르지 않습니다.", "CONSOLE_ROW_INVALID", 502);
@@ -50,6 +56,8 @@ const KNOWN_FAILURES: Record<string, [string, number]> = {
   PROFILE_NOT_FOUND: ["사용자를 찾을 수 없습니다.", 404],
   INVALID_ROLE: ["역할 값이 올바르지 않습니다.", 400],
   ENGINE_INVALID: ["엔진 설정이 올바르지 않습니다.", 400],
+  VOICE_PROVIDER_INVALID: ["엔진 제공자 값이 올바르지 않습니다.", 400],
+  ASSIGNMENT_REVISION_INVALID: ["엔진 배정 리비전이 올바르지 않습니다.", 400],
 };
 
 function mapRpcFailure(body: unknown): ConsoleStoreError {
@@ -76,6 +84,21 @@ function mapMutationRow(rows: unknown): ProfileMutationResult {
   const row: unknown = rows[0];
   if (!isRecord(row) || typeof row.id !== "string" || !UUID.test(row.id) || !STATUSES.has(row.status as ProfileStatus) || !ROLES.has(row.role as ProfileRole)) throw rowInvalid();
   return { id: row.id, status: row.status as ProfileStatus, role: row.role as ProfileRole };
+}
+
+function readVoiceAssignment(row: Record<string, unknown>): { provider: VoiceProvider; revision: string } {
+  const { provider, revision } = row;
+  if (provider !== "soniox" && provider !== "gemini") throw rowInvalid();
+  const parsedRevision = String(revision);
+  if (!ASSIGNMENT_REVISION.test(parsedRevision)) throw rowInvalid();
+  return { provider, revision: parsedRevision };
+}
+
+function mapVoiceProviderMutationRow(rows: unknown): VoiceProviderMutationResult {
+  const identity = mapMutationRow(rows);
+  const row = (rows as unknown[])[0] as Record<string, unknown>;
+  if (typeof row.host_id !== "string" || row.host_id.length === 0) throw rowInvalid();
+  return { ...identity, hostId: row.host_id, ...readVoiceAssignment(row) };
 }
 
 // bigint aggregates arrive as JSON numbers from PostgREST; a numeric string is accepted too.
@@ -162,23 +185,21 @@ export class SupabaseConsoleStore {
     return rows.map(mapProfileRow);
   }
 
-  async readHostVoiceAssignment(hostId: string): Promise<{ provider: "soniox" | "gemini"; revision: string }> {
-    return this.readVoiceAssignment(await this.rpc("read_host_voice_assignment_v1", { p_host_id: hostId }));
+  async readHostVoiceAssignment(hostId: string): Promise<{ provider: VoiceProvider; revision: string }> {
+    const rows = await this.rpc("read_host_voice_assignment_v1", { p_host_id: hostId });
+    if (!Array.isArray(rows) || rows.length !== 1 || !isRecord(rows[0])) throw rowInvalid();
+    return readVoiceAssignment(rows[0]);
   }
 
-  async setProfileVoiceProvider(input: { actorId: string; profileId: string; provider: "soniox" | "gemini" }): Promise<{ provider: "soniox" | "gemini"; revision: string }> {
-    return this.readVoiceAssignment(await this.rpc("set_profile_voice_provider_v1", {
+  /**
+   * D1: the operator's per-user assignment. The v2 RPC writes the profile (revision bumps only on a
+   * change, one `profile_events.engine_defaults` row with `kind: "user_assignment"`) and returns the
+   * profile identity plus its `host_id`, which the route needs to find the sessions to switch.
+   */
+  async setProfileVoiceProvider(input: { actorId: string; profileId: string; provider: VoiceProvider }): Promise<VoiceProviderMutationResult> {
+    return mapVoiceProviderMutationRow(await this.rpc("set_profile_voice_provider_v2", {
       p_actor_id: input.actorId, p_profile_id: input.profileId, p_provider: input.provider,
     }));
-  }
-
-  private readVoiceAssignment(rows: unknown): { provider: "soniox" | "gemini"; revision: string } {
-    if (!Array.isArray(rows) || rows.length !== 1 || !isRecord(rows[0])) throw rowInvalid();
-    const { provider, revision } = rows[0];
-    if (provider !== "soniox" && provider !== "gemini") throw rowInvalid();
-    const parsedRevision = String(revision);
-    if (!/^[1-9][0-9]{0,18}$/u.test(parsedRevision)) throw rowInvalid();
-    return { provider, revision: parsedRevision };
   }
 
   async countPending(): Promise<number> {
@@ -214,41 +235,45 @@ export class SupabaseConsoleStore {
     };
   }
 
-  async setEngineDefaults(input: { actorId: string; engine: EngineSelection }): Promise<void> {
-    const engine = normalizeEngineOrThrow(input.engine);
-    await this.rpcAck("set_engine_defaults_v1", { p_actor_id: input.actorId, p_engine: engine });
-  }
-
-  /** Sessions the deploy push targets: `status in ('preparing','live')`, not archive-deleted, oldest first. */
-  async listActiveSessions(): Promise<ActiveSessionRow[]> {
-    const rows = await this.rpc("list_live_session_ids_admin_v1", {});
+  /** Sessions a per-user switch targets: that host's `status in ('preparing','live')`, not archive-deleted, oldest first. */
+  async listActiveSessionsForHost(hostId: string): Promise<ActiveSessionRow[]> {
+    const rows = await this.rpc("list_live_session_ids_for_host_admin_v1", { p_host_id: hostId });
     if (!Array.isArray(rows)) throw rowInvalid();
     return rows.map(mapActiveSessionRow);
   }
 
   /**
    * Switches one running session's engine as an admin (the host PATCH RPC locks
-   * `preparing`). `null` means the RPC matched no row - the session stopped or was
+   * `preparing`). `assignmentRevision` is the profile's `voice_provider_revision` the
+   * session record should now carry (`modelPreferences.assignmentRevision`); omitted, the
+   * stored one stays. `null` means the RPC matched no row - the session stopped or was
    * archived between the list and the push - which the caller reports, not throws.
    */
-  async setSessionEngineAsAdmin(input: { actorId: string; sessionId: string; engine: EngineSelection }): Promise<SessionEngineSwitchResult | null> {
+  async setSessionEngineAsAdmin(input: { actorId: string; sessionId: string; engine: EngineSelection; assignmentRevision?: string }): Promise<SessionEngineSwitchResult | null> {
     const engine = normalizeEngineOrThrow(input.engine);
-    return mapSessionEngineSwitchRows(await this.rpc("set_live_session_engine_admin_v1", {
-      p_actor_id: input.actorId, p_session_id: input.sessionId, p_engine: engine,
+    if (input.assignmentRevision !== undefined && !ASSIGNMENT_REVISION.test(input.assignmentRevision)) {
+      throw new ConsoleStoreError(KNOWN_FAILURES.ASSIGNMENT_REVISION_INVALID[0], "ASSIGNMENT_REVISION_INVALID", 400);
+    }
+    return mapSessionEngineSwitchRows(await this.rpc("set_live_session_engine_admin_v2", {
+      p_actor_id: input.actorId, p_session_id: input.sessionId, p_engine: engine, p_assignment_revision: input.assignmentRevision ?? null,
     }));
   }
 
   /**
-   * One audit row per deploy: `profile_events.engine_defaults` with
-   * `{ engine, sessionsSwitched, sessionsFailed, sessionsQueued }` (the RPC tags it
-   * `kind: "deploy"`). Separate from `setEngineDefaults` because that RPC logs its
-   * `p_engine` verbatim and also stores it - counters must never enter the stored engine.
+   * One audit row per deploy: `profile_events.engine_defaults` with the engine, the
+   * `sessionsSwitched/Failed/Queued` counters and the user whose sessions were switched
+   * (the RPC tags it `kind: "deploy"`). The assignment itself is logged by
+   * `set_profile_voice_provider_v2` (`kind: "user_assignment"`); this row records what the
+   * push did with it.
    */
-  async recordEngineDeploy(input: { actorId: string; engine: EngineSelection; summary: EngineDeploySummary }): Promise<void> {
+  async recordEngineDeploy(input: { actorId: string; engine: EngineSelection; summary: EngineDeploySummary; target: EngineDeployTarget }): Promise<void> {
     const engine = normalizeEngineOrThrow(input.engine);
     await this.rpcAck("record_console_deploy_v1", {
       p_actor_id: input.actorId,
-      p_payload: { engine, sessionsSwitched: input.summary.switched, sessionsFailed: input.summary.failed, sessionsQueued: input.summary.queued },
+      p_payload: {
+        engine, sessionsSwitched: input.summary.switched, sessionsFailed: input.summary.failed, sessionsQueued: input.summary.queued,
+        targetProfileId: input.target.profileId, targetHostId: input.target.hostId, provider: input.target.voiceProvider, revision: input.target.revision,
+      },
     });
   }
 

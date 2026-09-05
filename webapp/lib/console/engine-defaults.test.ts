@@ -91,3 +91,18 @@ test("assigned engine resolution is user-specific and fails closed on lookup fai
     await assert.rejects(resolveHostEngineAssignment("host-b"));
   } finally { __setConsoleStoreForTests(null); }
 });
+
+test("engineSelectionForVoiceProvider is the pure D2 mapping both the session start and the console switch use", async () => {
+  const { engineSelectionForVoiceProvider } = await import("./engine-defaults");
+  const soniox = engineSelectionForVoiceProvider("soniox");
+  assert.deepEqual(soniox, {
+    stt: { provider: "soniox", model: "stt-rt-v5", languageMode: "auto" },
+    translation: { provider: "soniox", model: "stt-rt-v5" },
+    summary: { provider: "gemini", model: "gemini-3.6-flash" },
+  });
+  const gemini = engineSelectionForVoiceProvider("gemini");
+  assert.equal(gemini.stt.provider, "gemini");
+  assert.equal(gemini.stt.model, "gemini-3.5-transcribe-live");
+  assert.equal(gemini.translation.provider, "gemini");
+  assert.equal(gemini.summary.provider, "gemini");
+});

@@ -4,7 +4,7 @@ import { type EnginePushResult, pushEngineToGateway } from "../live/gateway-engi
 import { type ActiveSessionRow, ConsoleStoreError, type EngineDeploySummary, type SupabaseConsoleStore } from "./console-store";
 import type { EngineSelection } from "./engine-defaults";
 
-/** One row of the console's 세션별 전환 결과 table (spec §9). */
+/** One row of the console's per-session results (spec §9), now shown under the user row. */
 export interface EngineDeploySessionResult { sessionId: string; result: EnginePushResult["result"]; code?: string }
 export interface EngineDeployOutcome { results: EngineDeploySessionResult[]; summary: EngineDeploySummary }
 
@@ -13,7 +13,7 @@ export const ENGINE_DEPLOY_CONCURRENCY = 4;
 
 type PushEngine = typeof pushEngineToGateway;
 type MintToken = (input: { hostId: string; sessionId: string }) => Promise<{ token: string }>;
-type DeployStore = Pick<SupabaseConsoleStore, "listActiveSessions" | "setSessionEngineAsAdmin">;
+type DeployStore = Pick<SupabaseConsoleStore, "listActiveSessionsForHost" | "setSessionEngineAsAdmin">;
 
 /**
  * The gateway the push targets: the server-only `LIVE_GATEWAY_URL` first, then the
@@ -46,21 +46,23 @@ async function mapWithConcurrency<T, R>(items: readonly T[], limit: number, run:
 }
 
 /**
- * Spec §9 (2)+(3): after `set_engine_defaults_v1` succeeded, rewrite every
- * `preparing`/`live` session's engine through the admin RPC and tell the gateway to
- * swap pipelines. Per session, in order: the catalog language-count guard (a Soniox
- * combined engine needs exactly two caption languages - refused before any write),
- * the DB write (authoritative; `null` = the session stopped meanwhile), then the
- * push with a fresh session-bound ADMIN token. Nothing here throws for one session:
- * a dead session, a throwing RPC, or a downed gateway all become a `failed` row and
- * the loop continues, so the DB write completes for the other sessions regardless.
- * The token is minted per push and never returned or stored.
+ * D1 (2026-09-05): after `set_profile_voice_provider_v2` succeeded, rewrite every
+ * `preparing`/`live` session **of that user** through the admin RPC (pinning the profile's
+ * `assignmentRevision` on the record) and tell the gateway to swap pipelines. Per session,
+ * in order: the catalog language guard (1-3 distinct caption languages - refused before
+ * any write), the DB write (authoritative; `null` = the session stopped meanwhile), then
+ * the push with a fresh session-bound ADMIN token. Nothing here throws for one session:
+ * a dead session, a throwing RPC, or a downed gateway all become a `failed` row and the
+ * loop continues, so the DB write completes for the other sessions regardless. The token
+ * is minted per push and never returned or stored.
  */
-export async function deployEngineToActiveSessions({
+export async function deployEngineToHostSessions({
   store,
   actorId,
   actorHostId,
+  hostId,
   engine,
+  assignmentRevision,
   gatewayUrl,
   pushEngine = pushEngineToGateway,
   mintToken = createAdminGatewayToken,
@@ -69,13 +71,15 @@ export async function deployEngineToActiveSessions({
   store: DeployStore;
   actorId: string;
   actorHostId: string;
+  hostId: string;
   engine: EngineSelection;
+  assignmentRevision: string;
   gatewayUrl: string | null;
   pushEngine?: PushEngine;
   mintToken?: MintToken;
   concurrency?: number;
 }): Promise<EngineDeployOutcome> {
-  const sessions = await store.listActiveSessions();
+  const sessions = await store.listActiveSessionsForHost(hostId);
   const results = await mapWithConcurrency(sessions, Math.max(1, concurrency), async (session: ActiveSessionRow): Promise<EngineDeploySessionResult> => {
     const sessionId = session.id;
     try {
@@ -85,7 +89,7 @@ export async function deployEngineToActiveSessions({
       throw error;
     }
     try {
-      const written = await store.setSessionEngineAsAdmin({ actorId, sessionId, engine });
+      const written = await store.setSessionEngineAsAdmin({ actorId, sessionId, engine, assignmentRevision });
       if (!written) return { sessionId, result: "failed", code: "SESSION_NOT_ACTIVE" };
     } catch (error: unknown) {
       return { sessionId, result: "failed", code: error instanceof ConsoleStoreError ? error.code : "SESSION_SWITCH_FAILED" };
