@@ -394,6 +394,18 @@ export function createGatewayServer({
   }
   const hostSessions = new Map();
   const failedHostSessions = new Map();
+  // Admin engine-switch cooldown ledger (POST /internal/sessions/:id/engine).
+  // Entries are pruned when their session stops or detaches and evicted once
+  // older than the cooldown on every call, so a long-lived gateway never keeps
+  // one entry per session it ever saw.
+  const engineSwitchAttempts = new Map();
+  const pruneEngineSwitchAttempts = (sessionId = null, at = now()) => {
+    if (sessionId !== null) engineSwitchAttempts.delete(sessionId);
+    for (const [candidateId, attemptAt] of engineSwitchAttempts) {
+      if (at - attemptAt >= engineSwitchCooldownMilliseconds) engineSwitchAttempts.delete(candidateId);
+    }
+    metrics.set("engine_switch_attempts", engineSwitchAttempts.size);
+  };
   const demand = mediaDemandStore ? new MediaDemandCoordinator({
     store: mediaDemandStore,
     now,
@@ -823,6 +835,12 @@ export function createGatewayServer({
       deliverSerializedEvent(viewer, payload, serialized);
     });
   };
+  // A session dropped for PIPELINE_CLEANUP_FAILED has no pipeline left to
+  // publish anything, so viewers would sit on the last `ready`/`preparing`
+  // forever; every lane is told it is gone before the session disappears.
+  const announceLanesUnavailable = (sessionId, languages, code) => Promise.all([...new Set(languages)].map((language) =>
+    deliverEvent(sessionId, language, { type: "language-status", sessionId, language, status: "unavailable", code })
+      .catch(() => undefined)));
   const deliverSerializedEvent = (viewer, payload, serialized) => {
     if (slowConsumerPredicate(viewer)) {
       if ((payload?.type === "caption" && payload.isFinal !== true) || payload?.type === "source-draft") {
@@ -1036,6 +1054,7 @@ export function createGatewayServer({
     });
     closeAuthenticatedSessionSockets(sessionId, webSocket);
     hostSessions.delete(sessionId);
+    pruneEngineSwitchAttempts(sessionId);
     failedHostSessions.delete(sessionId);
     floorRevisions.delete(sessionId);
     participantProfiles.deleteSession(sessionId);
@@ -1062,6 +1081,7 @@ export function createGatewayServer({
     await releaseFloor(sessionId, { reason: "host-detached", broadcast: false }).catch(() => undefined);
     await broadcastFloor(sessionId, null).catch(() => undefined);
     hostSessions.delete(sessionId);
+    pruneEngineSwitchAttempts(sessionId);
     participantProfiles.deleteSession(sessionId);
     viewerAuthorizationLeases.deleteSession(sessionId);
     viewerAuthorizationBatcher.deleteSession(sessionId);
@@ -1082,7 +1102,6 @@ export function createGatewayServer({
   // the DB value applies at the next activation.
   const ENGINE_ROUTE_PATTERN = /^\/internal\/sessions\/([^/?#]+)\/engine$/u;
   const MAX_ENGINE_BODY_BYTES = 16 * 1_024;
-  const engineSwitchAttempts = new Map();
   const jsonResponse = (response, statusCode, body, headers = {}) => {
     response.writeHead(statusCode, { "Content-Type": "application/json", "Cache-Control": "no-store", ...headers });
     response.end(JSON.stringify(body));
@@ -1114,12 +1133,14 @@ export function createGatewayServer({
   const switchSessionEngine = (sessionId, engine) => withHostSessionLock(sessionId, async () => {
     if (isShuttingDown) return { statusCode: 503, body: { result: "failed", code: "GATEWAY_SHUTTING_DOWN" } };
     const attemptAt = now();
+    pruneEngineSwitchAttempts(null, attemptAt);
     const lastAttemptAt = engineSwitchAttempts.get(sessionId);
     if (lastAttemptAt !== undefined && attemptAt - lastAttemptAt < engineSwitchCooldownMilliseconds) {
       metrics.increment("engine_switch_rate_limited_total");
       return { statusCode: 429, body: { result: "failed", code: "ENGINE_SWITCH_RATE_LIMITED" } };
     }
     engineSwitchAttempts.set(sessionId, attemptAt);
+    metrics.set("engine_switch_attempts", engineSwitchAttempts.size);
     const state = hostSessions.get(sessionId);
     if (!state || state.isDetaching) return { statusCode: 200, body: { result: "queued" } };
     if (state.isDraining) return { statusCode: 409, body: { result: "failed", code: "MEDIA_DRAINING" } };
@@ -1159,13 +1180,18 @@ export function createGatewayServer({
     const previousPipeline = state.pipeline;
     const pipelineGeneration = randomUUID();
     const mediaFence = state.demandEpoch === null ? null : { epoch: state.demandEpoch, ownerId: demand.ownerId };
-    const announceLanguages = (status) => Promise.all(hostMessage.languages.map((language) => {
+    const announceLanguage = (language, status) => {
       const event = { type: "language-status", sessionId, language, status };
+      state.languageStatuses.set(language, status);
       sendHostEvent(state.hostOutput, event);
       return deliverEvent(sessionId, language, event);
-    }));
+    };
+    // Lane states as the retiring pipeline last published them (recorded in
+    // broadcastEvent). A failed switch may only restore what was true before
+    // it: a lane in cooldown/unavailable must not be promoted to ready.
+    const laneStatusesBeforeSwitch = new Map(state.languageStatuses);
     sendEngineStatus(state.webSocket, sessionId, nextCaptionConfig.engine, "connecting");
-    await announceLanguages("preparing");
+    await Promise.all(hostMessage.languages.map((language) => announceLanguage(language, "preparing")));
     const operationAbortController = new AbortController();
     const abortForShutdown = () => operationAbortController.abort(
       shutdownAbortController.signal.reason ?? new Error("GATEWAY_SHUTTING_DOWN"),
@@ -1212,7 +1238,17 @@ export function createGatewayServer({
       try { await closePipelineOnce(candidate); } catch { metrics.increment("pipeline_close_failures_total"); }
       metrics.increment("engine_switch_failures_total");
       sendEngineStatus(state.webSocket, sessionId, nextCaptionConfig.engine, "failed", code);
-      if (hostSessions.get(sessionId) === state && !state.isDetaching) await announceLanguages("ready");
+      if (hostSessions.get(sessionId) === state && !state.isDetaching) {
+        await Promise.all(hostMessage.languages.map((language) => {
+          // The retiring pipeline may have published a newer status meanwhile; that one stands.
+          if (state.languageStatuses.get(language) !== "preparing") return undefined;
+          const before = laneStatusesBeforeSwitch.get(language);
+          if (before === "ready") return announceLanguage(language, "ready");
+          if (before === undefined) state.languageStatuses.delete(language);
+          else state.languageStatuses.set(language, before);
+          return undefined;
+        }));
+      }
       return { statusCode: 409, body: { result: "failed", code } };
     } finally {
       clearTimeoutFn(startTimer);
@@ -1231,6 +1267,7 @@ export function createGatewayServer({
       stopHostLease(state);
       try { candidate.abortMedia?.(); } catch { /* close remains required */ }
       await closePipelineOnce(candidate).catch(() => undefined);
+      await announceLanesUnavailable(sessionId, hostMessage.languages, "PIPELINE_CLEANUP_FAILED");
       if (hostSessions.get(sessionId) === state) hostSessions.delete(sessionId);
       metrics.set("host_sessions", hostSessions.size);
       metrics.increment("engine_switch_failures_total");
@@ -1258,7 +1295,15 @@ export function createGatewayServer({
   const handleEngineRequest = async (request, response, sessionId) => {
     const refuse = (statusCode, code, headers) => {
       request.resume();
-      jsonResponse(response, statusCode, { result: "failed", code }, headers);
+      if (statusCode !== 413) {
+        jsonResponse(response, statusCode, { result: "failed", code }, headers);
+        return;
+      }
+      // A client still streaming an oversized (or never-terminated chunked)
+      // body must not keep this connection busy after the refusal.
+      jsonResponse(response, statusCode, { result: "failed", code }, { Connection: "close", ...headers });
+      if (response.writableFinished) request.destroy();
+      else response.once("finish", () => request.destroy());
     };
     if (!UUID_PATTERN.test(sessionId)) return refuse(404, "SESSION_NOT_FOUND");
     if (request.method !== "POST") return refuse(405, "METHOD_NOT_ALLOWED", { Allow: "POST" });
@@ -1690,15 +1735,18 @@ export function createGatewayServer({
               // Host reconnect within the grace window (contract C3): the same
               // host re-authenticating with unchanged settings reattaches the
               // detached pipeline — seq counters and the speaking floor survive.
-              if (message.type === "start"
+              const reattachMode = message.type === "start"
                 && previous
                 && !previous.isDetaching
-                && isSameHostSettings(previous.settings, hostMessage)
                 && ((previous.detached
                   && (previous.activationKey === null || previous.activationKey === message.activationKey))
                   || (!previous.detached
                     && previous.activationKey !== null
-                    && previous.activationKey === message.activationKey))) {
+                    && previous.activationKey === message.activationKey))
+                ? resolveWarmReattachMode(previous.settings, hostMessage)
+                : null;
+              let reattachRefusedRunningEngine = false;
+              if (reattachMode !== null) {
                 const reattachAbortController = new AbortController();
                 pendingHostControllers.add(reattachAbortController);
                 const abortReattachForShutdown = () => reattachAbortController.abort(new Error("GATEWAY_SHUTTING_DOWN"));
@@ -1708,20 +1756,39 @@ export function createGatewayServer({
                   hostStartTimeoutMilliseconds,
                 );
                 try {
-                  const isAuthorized = await authorizeHost(claims, hostMessage, reattachAbortController, {
+                  // The DB must name the engine that KEEPS RUNNING. In "same"
+                  // mode that is the incoming config; in "engine-repin" mode the
+                  // host still carries a pre-admin-switch engine, so the running
+                  // config is what gets checked (Task 5 follow-up I1).
+                  const authorizationSettings = reattachMode === "same" ? hostMessage : {
+                    ...hostMessage,
+                    captionConfig: previous.settings.captionConfig,
+                    captionConfigFingerprint: previous.settings.captionConfigFingerprint,
+                  };
+                  const isAuthorized = await authorizeHost(claims, authorizationSettings, reattachAbortController, {
                     requireLive: true,
                     compareVersion: false,
                   });
-                  if (!isAuthorized) throw new Error("SESSION_REVOKED");
-                  assertHostSocketActive(reattachAbortController.signal);
-                  if (hostSessions.get(claims.sessionId) !== previous || previous.isDetaching) {
-                    throw new Error("SESSION_NOT_STARTED");
+                  if (!isAuthorized && reattachMode === "engine-repin") {
+                    // The DB moved away from the running engine, so this gateway
+                    // is the stale side: fall through to the cold path, where the
+                    // incoming engine is rebuilt and the DB decides (today's rule).
+                    reattachRefusedRunningEngine = true;
+                    metrics.increment("host_reattach_engine_repin_refusals_total");
+                  } else {
+                    if (!isAuthorized) throw new Error("SESSION_REVOKED");
+                    assertHostSocketActive(reattachAbortController.signal);
+                    if (hostSessions.get(claims.sessionId) !== previous || previous.isDetaching) {
+                      throw new Error("SESSION_NOT_STARTED");
+                    }
                   }
                 } finally {
                   clearTimeoutFn(reattachTimer);
                   pendingHostControllers.delete(reattachAbortController);
                   shutdownAbortController.signal.removeEventListener("abort", abortReattachForShutdown);
                 }
+              }
+              if (reattachMode !== null && !reattachRefusedRunningEngine) {
                 const replacedWebSocket = previous.webSocket;
                 if (previous.graceTimer) {
                   clearTimeoutFn(previous.graceTimer);
@@ -1745,6 +1812,12 @@ export function createGatewayServer({
                 startHostLease(previous, claims);
                 if (replacedWebSocket !== webSocket && replacedWebSocket.readyState === WebSocket.OPEN) {
                   replacedWebSocket.close(4410, "REPLACED");
+                }
+                if (reattachMode === "engine-repin") {
+                  metrics.increment("host_reattach_engine_repins_total");
+                  // Host UIs are read-only about the engine (spec §9); tell the
+                  // returning host which engine is actually serving its session.
+                  sendEngineStatus(webSocket, claims.sessionId, previous.settings.captionConfig.engine, "ready");
                 }
                 metrics.increment("host_reattaches_total");
                 return {
@@ -1938,6 +2011,9 @@ export function createGatewayServer({
                   captionConfigFingerprint: hostMessage.captionConfigFingerprint,
                   languages: [...hostMessage.languages],
                 },
+                // start() has published `ready` per lane by now (pipeline contract);
+                // broadcastEvent keeps this current from here on.
+                languageStatuses: new Map(hostMessage.languages.map((language) => [language, "ready"])),
                 leaseTimer: null,
                 leaseAbortController: null,
                 leaseInFlight: null,
@@ -1962,6 +2038,8 @@ export function createGatewayServer({
                   state.isDetaching = true;
                   try { candidate.abortMedia?.(); } catch { /* close remains required */ }
                   await closePipelineOnce(candidate).catch(() => undefined);
+                  await announceLanesUnavailable(claims.sessionId,
+                    [...previous.settings.languages, ...hostMessage.languages], "PIPELINE_CLEANUP_FAILED");
                   hostSessions.delete(claims.sessionId);
                   metrics.set("host_sessions", hostSessions.size);
                   closePipelineSocket(previous.webSocket, new Error("PIPELINE_CLEANUP_FAILED"));
@@ -2441,6 +2519,10 @@ export function createGatewayServer({
         ? createMediaEventGuard(sessionId, context) : () => true;
       if (!canDeliver()) return;
       const state = hostSessions.get(sessionId);
+      if (event?.type === "language-status" && event.sessionId === sessionId && event.language === language
+        && typeof event.status === "string" && state?.settings.languages.includes(language)) {
+        state.languageStatuses?.set(language, event.status);
+      }
       if (state?.hostOutput.clientKind === "browser"
         && event?.type === "caption"
         && event.sessionId === sessionId
@@ -2594,6 +2676,11 @@ function waitForAbort(promise, signal) {
 }
 
 function isSameHostSettings(previousSettings, message) {
+  return isSameHostSettingsExceptCaptionConfig(previousSettings, message)
+    && (previousSettings.captionConfigFingerprint ?? "") === (message.captionConfigFingerprint ?? "");
+}
+
+function isSameHostSettingsExceptCaptionConfig(previousSettings, message) {
   return previousSettings.sessionType === message.sessionType
     && previousSettings.outputMode === message.outputMode
     && previousSettings.voiceProvider === message.voiceProvider
@@ -2607,9 +2694,41 @@ function isSameHostSettings(previousSettings, message) {
     && (previousSettings.glossaryText ?? "") === (message.glossaryText ?? "")
     && (previousSettings.translationTone ?? "") === (message.translationTone ?? "")
     && (previousSettings.domainText ?? "") === (message.domainText ?? "")
-    && (previousSettings.captionConfigFingerprint ?? "") === (message.captionConfigFingerprint ?? "")
     && previousSettings.languages.length === message.languages.length
     && previousSettings.languages.every((language, index) => language === message.languages[index]);
+}
+
+/**
+ * Contract C3 reattach decision for a host `start` inside the grace window.
+ *
+ * - "same": settings identical to the running ones (the long-standing rule).
+ * - "engine-repin": the incoming caption config differs from the running one
+ *   ONLY by engine — re-pinning it to the running engine reproduces the
+ *   running fingerprint exactly. That is a host still carrying its
+ *   pre-admin-switch engine (Task 5 follow-up I1). The caller authorizes the
+ *   RUNNING engine against the DB and keeps the pipeline warm; rebuilding the
+ *   stale engine only ended the session with SESSION_REVOKED.
+ * - null: anything else differs → cold rebuild, the DB decides.
+ *
+ * A same-engine config with a different fingerprint is a real settings change
+ * and stays cold.
+ */
+function resolveWarmReattachMode(previousSettings, message) {
+  if (isSameHostSettings(previousSettings, message)) return "same";
+  if (!isSameHostSettingsExceptCaptionConfig(previousSettings, message)) return null;
+  const runningConfig = previousSettings.captionConfig;
+  const incomingConfig = message.captionConfig;
+  if (!runningConfig?.engine || !incomingConfig?.engine) return null;
+  try {
+    if (engineSelectionKey(runningConfig.engine) === engineSelectionKey(incomingConfig.engine)) return null;
+    const { models: _incomingModels, ...incomingInput } = incomingConfig;
+    const repinned = createGeminiCaptionConfig({ ...incomingInput, engine: runningConfig.engine });
+    return geminiCaptionConfigFingerprint(repinned) === (previousSettings.captionConfigFingerprint ?? "")
+      ? "engine-repin"
+      : null;
+  } catch {
+    return null;
+  }
 }
 
 function removeViewer(topic, webSocket, topics) {

@@ -1,11 +1,13 @@
 import assert from "node:assert/strict";
 import { createHmac, randomUUID } from "node:crypto";
 import { once } from "node:events";
+import { connect as netConnect } from "node:net";
 import test from "node:test";
 
 import { WebSocket } from "ws";
 
 import { createGatewayServer } from "../src/gateway-server.js";
+import { DEFAULT_ENGINE_SELECTION, engineSelectionKey } from "../../packages/caption-core/index.js";
 
 const SESSION_ID = "11111111-1111-4111-8111-111111111111";
 const SESSION_TWO_ID = "11111111-1111-4111-8111-111111111112";
@@ -2371,4 +2373,303 @@ test("admin engine switch preserves the participant floor on the replacement pip
   assert.deepEqual(switched.json, { result: "switched" });
   assert.equal(pipelines[1].floorSpeaker?.displayName, "Guest", "the floor holder is re-attributed on the new pipeline");
   assert.equal(speaker.readyState, WebSocket.OPEN, "an engine switch does not end the participant's turn");
+});
+
+// ── Post-Task-5 hardening round: engine-aware reconnect, attempt pruning, 413 hangup, lane-aware re-announce, cleanup-failure lanes ──
+
+const SESSION_THREE_ID = "11111111-1111-4111-8111-111111111113";
+
+function createReconnectGateway({ pipelines, dbEngine, authorizations }) {
+  return createGatewayServer({
+    gatewaySecret: "gateway-secret",
+    viewerSecret: "viewer-secret",
+    engineKeyEnvironment: ENGINE_FIXTURE_KEYS,
+    hostReconnectGraceMilliseconds: 45_000,
+    viewerAuthorizer: {
+      async authorize() { return true; },
+      async authorizeBatch(requests) { return new Map(requests.map(({ key }) => [key, true])); },
+    },
+    hostAuthorizer: {
+      // Mirrors the Supabase authorizer's engine-parity rule (Plan 2 Task 4):
+      // only the DB engine may run; everything else about the session is fine.
+      async authorize(_claims, settings) {
+        const engine = settings.captionConfig?.engine ?? DEFAULT_ENGINE_SELECTION;
+        const accepted = engineSelectionKey(engine) === engineSelectionKey(dbEngine.current);
+        authorizations.push({ model: engine.translation.model, accepted });
+        return accepted;
+      },
+    },
+    async pipelineFactory(settings, previous) {
+      const pipeline = {
+        settings, previous, closed: 0,
+        async start() {}, async tick() {}, async acceptAudio() {}, async close() { this.closed += 1; },
+      };
+      pipelines.push(pipeline);
+      return pipeline;
+    },
+  });
+}
+
+async function reconnectHost(url, context, startMessage) {
+  const host = await connectHost(url);
+  context.after(() => host.terminate());
+  const messages = [];
+  host.on("message", (data) => { messages.push(JSON.parse(data.toString("utf8"))); });
+  const reply = nextJsonMatching(host, (message) => message.type === "started" || message.type === "error");
+  host.send(JSON.stringify({
+    type: "start", sessionId: SESSION_ID, version: 1,
+    sessionType: "presentation", outputMode: "captions", languages: ["ko", "en"],
+    ...startMessage,
+  }));
+  return { host, messages, reply: await reply };
+}
+
+test("after an admin switch a host reconnect reattaches warm on the running engine and only rebuilds when the DB names a different engine", { timeout: 5_000 }, async (context) => {
+  const pipelines = [];
+  const authorizations = [];
+  const dbEngine = { current: DEFAULT_ENGINE_SELECTION };
+  const gateway = createReconnectGateway({ pipelines, dbEngine, authorizations });
+  await new Promise((resolve) => gateway.server.listen(0, "127.0.0.1", resolve));
+  context.after(async () => gateway.close());
+  const { port } = gateway.server.address();
+  const url = `ws://127.0.0.1:${port}/live`;
+
+  const host = await connectHost(url);
+  await startHostSocket(host, SESSION_ID, ["ko", "en"]);
+  assert.equal(pipelines.length, 1);
+  // The admin console writes the DB first, then pushes the same engine here.
+  dbEngine.current = FLASH_37_ENGINE;
+  const switched = await postEngine(port, SESSION_ID, signAdminToken("gateway-secret"), { engine: FLASH_37_ENGINE });
+  assert.deepEqual(switched.json, { result: "switched" });
+  assert.equal(pipelines.length, 2);
+  assert.equal(pipelines[0].closed, 1);
+  host.terminate();
+  await once(host, "close");
+  await new Promise((resolve) => setImmediate(resolve));
+
+  // (a) A desktop that re-pinned from the session record (906fe46) sends the
+  // running engine: identical fingerprint, plain warm reattach.
+  const repinned = await reconnectHost(url, context, {
+    captionConfig: { languages: ["ko", "en"], outputMode: "captions", glossaryPack: "general_cre", engine: FLASH_37_ENGINE },
+  });
+  assert.equal(repinned.reply.type, "started");
+  assert.equal(pipelines.length, 2, "same-engine reconnect must not rebuild");
+  assert.equal(pipelines[1].closed, 0);
+  assert.match(gateway.metrics.render(), /realtime_noel_host_reattaches_total 1\b/u);
+  repinned.host.terminate();
+  await once(repinned.host, "close");
+  await new Promise((resolve) => setImmediate(resolve));
+
+  // (b) A desktop still carrying its arm-time captionConfig (old engine, nothing
+  // else changed): the gateway authorizes the RUNNING engine against the DB and
+  // reattaches warm instead of rebuilding the old engine into SESSION_REVOKED.
+  authorizations.length = 0;
+  const stale = await reconnectHost(url, context, {});
+  assert.equal(stale.reply.type, "started", `stale-engine reconnect must reattach warm, got ${JSON.stringify(stale.reply)}`);
+  assert.equal(pipelines.length, 2, "the running pipeline keeps serving; no rebuild with the stale engine");
+  assert.equal(pipelines[1].closed, 0);
+  assert.deepEqual(authorizations, [{ model: "gemini-3.7-flash", accepted: true }],
+    "the reattach is authorized with the running (DB-accepted) engine, never the stale one");
+  const readyStatuses = stale.messages.filter((message) => message.type === "engine-status");
+  assert.deepEqual(readyStatuses.map(({ role, model, status }) => ({ role, model, status })), [
+    { role: "stt", model: "gemini-3.5-transcribe-live", status: "ready" },
+    { role: "translation", model: "gemini-3.7-flash", status: "ready" },
+  ], "the reconnecting host learns which engine is actually running");
+  assert.match(gateway.metrics.render(), /realtime_noel_host_reattach_engine_repins_total 1\b/u);
+  stale.host.terminate();
+  await once(stale.host, "close");
+  await new Promise((resolve) => setImmediate(resolve));
+
+  // (c) Stale engine AND a real settings change: not a re-pin candidate, so it is
+  // today's cold path — rebuild with the incoming config, which the DB refuses.
+  const edited = await reconnectHost(url, context, { glossaryText: "다른 용어집" });
+  assert.equal(edited.reply.type, "error");
+  assert.equal(edited.reply.code, "SESSION_REVOKED");
+  assert.equal(pipelines.length, 2);
+  assert.equal(pipelines[1].closed, 0, "a refused rebuild never touches the running pipeline");
+  edited.host.terminate();
+  await once(edited.host, "close");
+  await new Promise((resolve) => setImmediate(resolve));
+
+  // (d) The DB no longer names the running engine (this gateway is the stale
+  // side): today's behaviour — rebuild with the incoming engine, DB decides.
+  dbEngine.current = DEFAULT_ENGINE_SELECTION;
+  authorizations.length = 0;
+  const moved = await reconnectHost(url, context, {});
+  assert.equal(moved.reply.type, "started");
+  assert.equal(pipelines.length, 3, "a DB engine that differs from the running one rebuilds");
+  assert.equal(pipelines[1].closed, 1);
+  assert.equal(pipelines[2].settings.captionConfig.engine.translation.model, "gemini-3.6-flash");
+  assert.equal(authorizations[0].model, "gemini-3.7-flash");
+  assert.equal(authorizations[0].accepted, false, "the running engine is checked first and refused");
+  assert.ok(authorizations.slice(1).every((entry) => entry.model === "gemini-3.6-flash" && entry.accepted));
+});
+
+test("engine switch attempts are pruned on stop and detach and stale entries are evicted after the cooldown", async (context) => {
+  const pipelines = [];
+  let clock = Date.now();
+  const gateway = createEngineSwitchGateway({ pipelines, now: () => clock });
+  await new Promise((resolve) => gateway.server.listen(0, "127.0.0.1", resolve));
+  context.after(async () => gateway.close());
+  const { port } = gateway.server.address();
+  const url = `ws://127.0.0.1:${port}/live`;
+  const attempts = () => Number(/realtime_noel_engine_switch_attempts (\d+)/u.exec(gateway.metrics.render())?.[1]);
+
+  const host = await connectHost(url);
+  context.after(() => host.terminate());
+  await startHostSocket(host, SESSION_ID, ["ko", "en"]);
+  assert.deepEqual((await postEngine(port, SESSION_ID, signAdminToken("gateway-secret", { now: clock }), { engine: FLASH_37_ENGINE })).json, { result: "switched" });
+  assert.equal(attempts(), 1);
+
+  const stopped = nextJsonMatching(host, (message) => message.type === "stopped");
+  host.send(JSON.stringify({ type: "stop", sessionId: SESSION_ID }));
+  await stopped;
+  assert.equal(attempts(), 0, "stop prunes the session's attempt entry");
+
+  const second = await connectHost(url);
+  context.after(() => second.terminate());
+  await startHostSocket(second, SESSION_ID, ["ko", "en"]);
+  const relaunched = await postEngine(port, SESSION_ID, signAdminToken("gateway-secret", { now: clock }), { engine: FLASH_37_ENGINE });
+  assert.equal(relaunched.status, 200, "a stopped session's cooldown must not survive into its next life");
+  assert.deepEqual(relaunched.json, { result: "switched" });
+  assert.equal(attempts(), 1);
+  assert.deepEqual((await postEngine(port, SESSION_TWO_ID, signAdminToken("gateway-secret", { now: clock, sessionId: SESSION_TWO_ID }), { engine: FLASH_37_ENGINE })).json, { result: "queued" });
+  assert.equal(attempts(), 2);
+
+  const detached = nextJsonMatching(second, (message) => message.type === "detached");
+  second.send(JSON.stringify({ type: "detach", sessionId: SESSION_ID }));
+  await detached;
+  assert.equal(attempts(), 1, "detach prunes the session's attempt entry");
+
+  clock += 2_000;
+  assert.deepEqual((await postEngine(port, SESSION_THREE_ID, signAdminToken("gateway-secret", { now: clock, sessionId: SESSION_THREE_ID }), { engine: FLASH_37_ENGINE })).json, { result: "queued" });
+  assert.equal(attempts(), 1, "entries older than the cooldown are evicted on the next call");
+});
+
+test("an oversized chunked engine body gets a 413 and the connection is destroyed instead of waiting for the client", { timeout: 5_000 }, async (context) => {
+  const pipelines = [];
+  const gateway = createEngineSwitchGateway({ pipelines });
+  await new Promise((resolve) => gateway.server.listen(0, "127.0.0.1", resolve));
+  context.after(async () => gateway.close());
+  const { port } = gateway.server.address();
+
+  const socket = netConnect({ host: "127.0.0.1", port });
+  context.after(() => socket.destroy());
+  await once(socket, "connect");
+  const received = [];
+  socket.on("data", (chunk) => received.push(chunk));
+  socket.write([
+    `POST /internal/sessions/${SESSION_ID}/engine HTTP/1.1`,
+    "Host: 127.0.0.1",
+    `Authorization: Bearer ${signAdminToken("gateway-secret")}`,
+    "Content-Type: application/json",
+    "Transfer-Encoding: chunked",
+    "", "",
+  ].join("\r\n"));
+  const chunk = "x".repeat(4_096);
+  for (let index = 0; index < 6; index += 1) {
+    socket.write(`${chunk.length.toString(16)}\r\n${chunk}\r\n`);
+  }
+  // No terminating chunk: a client that keeps the body open must not keep the
+  // connection (and its request slot) alive after the refusal.
+  const closed = await Promise.race([
+    once(socket, "close").then(() => true),
+    new Promise((resolve) => setTimeout(() => resolve(false), 2_000)),
+  ]);
+  const response = Buffer.concat(received).toString("utf8");
+  assert.match(response, /^HTTP\/1\.1 413 /u);
+  assert.match(response, /"code":"PAYLOAD_TOO_LARGE"/u);
+  assert.equal(closed, true, "the gateway must hang up after the 413");
+  assert.equal(pipelines.length, 0);
+});
+
+test("a failed admin engine switch re-announces ready only for lanes that were ready before the switch", async (context) => {
+  const pipelines = [];
+  const gateway = createEngineSwitchGateway({ pipelines, factoryFailure: () => new Error("STT_PROVIDER_UNAVAILABLE") });
+  await new Promise((resolve) => gateway.server.listen(0, "127.0.0.1", resolve));
+  context.after(async () => gateway.close());
+  const { port } = gateway.server.address();
+  const url = `ws://127.0.0.1:${port}/live`;
+  const host = await connectHost(url);
+  context.after(() => host.terminate());
+  await startHostSocket(host, SESSION_ID, ["ko", "en"]);
+  const ko = await subscribeViewer(url, "ko", "lane-ko");
+  context.after(() => ko.viewer.terminate());
+  const en = await subscribeViewer(url, "en", "lane-en");
+  context.after(() => en.viewer.terminate());
+
+  // The running pipeline's own transition: the ko lane is in cooldown.
+  await gateway.broadcastEvent(SESSION_ID, "ko", { type: "language-status", sessionId: SESSION_ID, language: "ko", status: "unavailable", code: "LANGUAGE_COOLDOWN" });
+  await waitForGatewayCondition(() => ko.events.some((event) => event.type === "language-status" && event.status === "unavailable"));
+
+  const failed = await postEngine(port, SESSION_ID, signAdminToken("gateway-secret"), { engine: FLASH_37_ENGINE });
+  assert.equal(failed.status, 409);
+  await waitForGatewayCondition(() => en.events.filter((event) => event.type === "language-status").length >= 2);
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.deepEqual(en.events.filter((event) => event.type === "language-status").map(({ status }) => status), ["preparing", "ready"],
+    "a lane that was ready is told ready again");
+  assert.deepEqual(ko.events.filter((event) => event.type === "language-status").map(({ status, code }) => ({ status, code })), [
+    { status: "unavailable", code: "LANGUAGE_COOLDOWN" },
+    { status: "preparing", code: undefined },
+  ], "a lane in cooldown is not promoted to ready by the failed switch");
+  assert.equal(pipelines[0].closed, 0);
+});
+
+test("a retiring pipeline that will not close marks every lane unavailable for viewers before the session is dropped (admin switch)", async (context) => {
+  const pipelines = [];
+  const gateway = createEngineSwitchGateway({ pipelines });
+  await new Promise((resolve) => gateway.server.listen(0, "127.0.0.1", resolve));
+  context.after(async () => gateway.close());
+  const { port } = gateway.server.address();
+  const url = `ws://127.0.0.1:${port}/live`;
+  const host = await connectHost(url);
+  context.after(() => host.terminate());
+  await startHostSocket(host, SESSION_ID, ["ko", "en"]);
+  const { viewer, events } = await subscribeViewer(url, "en", "cleanup-switch");
+  context.after(() => viewer.terminate());
+  pipelines[0].close = async () => { throw new Error("CLOSE_FAILED"); };
+
+  const hostClosed = once(host, "close");
+  const failed = await postEngine(port, SESSION_ID, signAdminToken("gateway-secret"), { engine: FLASH_37_ENGINE });
+  assert.equal(failed.status, 409);
+  assert.deepEqual(failed.json, { result: "failed", code: "PIPELINE_CLEANUP_FAILED" });
+  await hostClosed;
+  await waitForGatewayCondition(() => events.some((event) => event.type === "language-status" && event.status === "unavailable"));
+  assert.deepEqual(events.filter((event) => event.type === "language-status").map(({ status, code }) => ({ status, code })), [
+    { status: "preparing", code: undefined },
+    { status: "ready", code: undefined },
+    { status: "unavailable", code: "PIPELINE_CLEANUP_FAILED" },
+  ]);
+  assert.match(gateway.metrics.render(), /realtime_noel_host_sessions 0\b/u);
+});
+
+test("a retiring pipeline that will not close marks every lane unavailable for viewers before the session is dropped (host update)", async (context) => {
+  const pipelines = [];
+  const gateway = createEngineSwitchGateway({ pipelines });
+  await new Promise((resolve) => gateway.server.listen(0, "127.0.0.1", resolve));
+  context.after(async () => gateway.close());
+  const { port } = gateway.server.address();
+  const url = `ws://127.0.0.1:${port}/live`;
+  const host = await connectHost(url);
+  context.after(() => host.terminate());
+  await startHostSocket(host, SESSION_ID, ["ko", "en"]);
+  const { viewer, events } = await subscribeViewer(url, "en", "cleanup-update");
+  context.after(() => viewer.terminate());
+  pipelines[0].close = async () => { throw new Error("CLOSE_FAILED"); };
+
+  const reply = nextJsonMatching(host, (message) => message.type === "updated" || message.type === "error");
+  host.send(JSON.stringify({
+    type: "update", sessionId: SESSION_ID, version: 1,
+    sessionType: "presentation", outputMode: "captions", languages: ["ko", "en"], glossaryText: "새 용어집",
+  }));
+  const error = await reply;
+  assert.equal(error.type, "error");
+  assert.equal(error.code, "PIPELINE_CLEANUP_FAILED");
+  await waitForGatewayCondition(() => events.some((event) => event.type === "language-status" && event.status === "unavailable"));
+  assert.deepEqual(events.filter((event) => event.type === "language-status").map(({ status, code }) => ({ status, code })), [
+    { status: "ready", code: undefined },
+    { status: "unavailable", code: "PIPELINE_CLEANUP_FAILED" },
+  ]);
+  assert.equal(pipelines.length, 2);
+  assert.match(gateway.metrics.render(), /realtime_noel_host_sessions 0\b/u);
 });
