@@ -15,6 +15,8 @@ export interface ProfileMutationResult { id: string; status: ProfileStatus; role
 export interface ActiveSessionRow { id: string; status: string; languages: string[] }
 /** Row returned by `set_live_session_engine_admin_v1`; `version` is the bumped value. */
 export interface SessionEngineSwitchResult { id: string; status: string; version: number }
+/** Per-deploy outcome counters (spec §9 감사); the route derives them from the per-session results. */
+export interface EngineDeploySummary { switched: number; queued: number; failed: number }
 
 export class ConsoleStoreError extends Error {
   readonly code: string;
@@ -214,6 +216,20 @@ export class SupabaseConsoleStore {
     return mapSessionEngineSwitchRows(await this.rpc("set_live_session_engine_admin_v1", {
       p_actor_id: input.actorId, p_session_id: input.sessionId, p_engine: engine,
     }));
+  }
+
+  /**
+   * One audit row per deploy: `profile_events.engine_defaults` with
+   * `{ engine, sessionsSwitched, sessionsFailed, sessionsQueued }` (the RPC tags it
+   * `kind: "deploy"`). Separate from `setEngineDefaults` because that RPC logs its
+   * `p_engine` verbatim and also stores it - counters must never enter the stored engine.
+   */
+  async recordEngineDeploy(input: { actorId: string; engine: EngineSelection; summary: EngineDeploySummary }): Promise<void> {
+    const engine = normalizeEngineOrThrow(input.engine);
+    await this.rpcAck("record_console_deploy_v1", {
+      p_actor_id: input.actorId,
+      p_payload: { engine, sessionsSwitched: input.summary.switched, sessionsFailed: input.summary.failed, sessionsQueued: input.summary.queued },
+    });
   }
 
   async setLegacyPasswordLogin(input: { actorId: string; enabled: boolean }): Promise<void> {

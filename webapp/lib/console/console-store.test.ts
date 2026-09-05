@@ -182,3 +182,11 @@ test("setSessionEngineAsAdmin normalizes the engine, posts actor/session/engine,
   await assert.rejects(storeWith(() => json([{ id: SESSION, status: "live", version: 4 }, { id: TARGET, status: "live", version: 1 }])).store.setSessionEngineAsAdmin({ actorId: ADMIN, sessionId: SESSION, engine: DEFAULT_ENGINE_SELECTION }), (e: ConsoleStoreError) => e.code === "CONSOLE_ROW_INVALID");
   await assert.rejects(storeWith(() => json([{ id: SESSION, status: "live", version: "4" }])).store.setSessionEngineAsAdmin({ actorId: ADMIN, sessionId: SESSION, engine: DEFAULT_ENGINE_SELECTION }), (e: ConsoleStoreError) => e.code === "CONSOLE_ROW_INVALID");
 });
+
+test("recordEngineDeploy posts the deploy counters next to the engine as p_payload and requires a true ack", async () => {
+  const { store, calls } = storeWith(() => json(true));
+  await store.recordEngineDeploy({ actorId: ADMIN, engine: DEFAULT_ENGINE_SELECTION, summary: { switched: 2, queued: 1, failed: 3 } });
+  assert.equal(calls[0].url, "https://project.supabase.test/rest/v1/rpc/record_console_deploy_v1");
+  assert.deepEqual(body(calls[0]), { p_actor_id: ADMIN, p_payload: { engine: DEFAULT_ENGINE_SELECTION, sessionsSwitched: 2, sessionsFailed: 3, sessionsQueued: 1 } });
+  await assert.rejects(storeWith(() => json(false)).store.recordEngineDeploy({ actorId: ADMIN, engine: DEFAULT_ENGINE_SELECTION, summary: { switched: 0, queued: 0, failed: 0 } }), (e: ConsoleStoreError) => e.code === "CONSOLE_WRITE_FAILED" && e.status === 503);
+});
