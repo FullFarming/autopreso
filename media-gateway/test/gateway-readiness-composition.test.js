@@ -30,7 +30,8 @@ for (const sessionType of ["meeting", "presentation"]) {
     const requests = [], pipelineSettings = [];
     let providerStarts = 0;
     let status = "preparing";
-    const sourceModel = "gemini-3.6-flash";
+    // A stored legacy source pin is one of the two Live ids (a flash id was never a source; Task 4 fix M1).
+    const sourceModel = "gemini-3.5-live-translate-preview";
     const summaryModel = "gemini-3.6-flash";
     const languages = ["en", "ko"];
     const authorizer = new SupabaseHostAuthorizer({ baseUrl: "https://fixture.invalid", serviceRoleKey: "fixture",
