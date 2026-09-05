@@ -275,11 +275,11 @@ test("polish prompt bounds both draft and source transcript data", () => {
   assert.equal(userData.source.length, captionPolishContract.maximumInputCharacters);
 });
 
-test("Gemini 3.7 polish uses a fixed low-thinking budget and ignores caller generation overrides", async () => {
+test("Gemini 3.6 polish uses a fixed low-thinking budget and ignores caller generation overrides", async () => {
   const calls = [];
   await generateGeminiText({
     apiKey: ["test", "security", "marker"].join("-"),
-    model: "gemini-3.7-flash",
+    model: "gemini-3.6-flash",
     system: "fixed system",
     prompt: "fixed prompt",
     thinkingLevel: "high",
@@ -294,7 +294,7 @@ test("Gemini 3.7 polish uses a fixed low-thinking budget and ignores caller gene
       calls.push({ url, init });
       return {
         ok: true,
-        json: async () => ({ candidates: [{ content: { parts: [{ text: "safe" }] } }] }),
+        json: async () => ({ candidates: [{ finishReason: "STOP", content: { parts: [{ text: "safe" }] } }] }),
       };
     },
   });
@@ -321,12 +321,12 @@ test("Gemini polish provider body contains no participant identity or credential
   let capturedBody = "";
   await generateGeminiText({
     apiKey: ["test", "security", "marker"].join("-"),
-    model: "gemini-3.7-flash",
+    model: "gemini-3.6-flash",
     system: "654321",
     prompt: hostilePrompt,
     fetchImpl: async (_url, init) => {
       capturedBody = init.body;
-      return { ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text: "safe" }] } }] }) };
+      return { ok: true, json: async () => ({ candidates: [{ finishReason: "STOP", content: { parts: [{ text: "safe" }] } }] }) };
     },
   });
 

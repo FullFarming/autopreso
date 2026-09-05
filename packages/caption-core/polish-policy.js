@@ -294,7 +294,7 @@ export function evaluateCaptionPolish(policy, {
 }
 
 /**
- * @param {{translatedText?: unknown, sourceText?: unknown, targetLanguage?: unknown, tone?: unknown, glossary?: unknown, domain?: unknown}} [request]
+ * @param {{translatedText?: unknown, sourceText?: unknown, targetLanguage?: unknown, tone?: unknown, glossary?: unknown, domain?: unknown, required?: boolean}} [request]
  * @param {{defaultDomain?: unknown}} [defaults]
  */
 export function preparePolishRequest({
@@ -304,6 +304,7 @@ export function preparePolishRequest({
   tone,
   glossary = "",
   domain: requestedDomain = "",
+  required = false,
 } = {}, { defaultDomain = "" } = {}) {
   const originalText = translatedText;
   const text = String(translatedText ?? "").trim();
@@ -311,14 +312,14 @@ export function preparePolishRequest({
   const target = String(targetLanguage ?? "").trim();
   const domain = String(requestedDomain ?? "").trim() || String(defaultDomain ?? "").trim();
   const selectedGlossary = selectRelevantGlossary(glossary, { sourceText: source, translatedText: text });
-  const shouldRecoverPlaceholder = isEllipsisPlaceholder(text) && source.length >= MIN_POLISH_CHARS;
+  const shouldRecoverPlaceholder = isEllipsisPlaceholder(text) && source.length >= (required ? 1 : MIN_POLISH_CHARS);
   const shouldRecoverWrongLanguage = source.length >= MIN_POLISH_CHARS
     && text.length >= MIN_POLISH_CHARS
     && !isOutputInTargetLanguage(text, target);
   const shouldRecoverAnomaly = hasTranslationAnomaly(text, source);
   const recoverFromSource = shouldRecoverPlaceholder || shouldRecoverWrongLanguage || shouldRecoverAnomaly;
-  if (tone !== "business" && !String(glossary ?? "").trim() && !domain && !recoverFromSource) return null;
-  if (text.length < MIN_POLISH_CHARS && !recoverFromSource) return null;
+  if (!required && tone !== "business" && !String(glossary ?? "").trim() && !domain && !recoverFromSource) return null;
+  if (!required && text.length < MIN_POLISH_CHARS && !recoverFromSource) return null;
   return {
     originalText,
     recoverFromSource,
@@ -351,6 +352,7 @@ export function createSubtitlePolisher({ generateText, model, timeoutMs = DEFAUL
    * @param {{
    *   translatedText?: unknown,
    *   signal?: AbortSignal,
+   *   required?: boolean,
    *   sourceText?: unknown,
    *   targetLanguage?: unknown,
    *   tone?: unknown,
@@ -358,38 +360,87 @@ export function createSubtitlePolisher({ generateText, model, timeoutMs = DEFAUL
    *   domain?: unknown,
    * }} [args]
    */
-  async function polish({ translatedText, signal, ...options } = {}) {
-    const prepared = preparePolishRequest({ translatedText, ...options });
+  async function polish({ translatedText, signal, required = false, ...options } = {}) {
+    if (signal?.aborted) {
+      if (required) throw createTranslationFailure(getSubtitleTranslationFailureReason(signal.reason));
+      return translatedText;
+    }
+    if (required && !String(options.sourceText ?? "").trim()) throw createTranslationFailure("TRANSLATION_EMPTY");
+    const prepared = preparePolishRequest({ translatedText, ...options, required });
     if (!prepared) return translatedText;
-    if (typeof generateText !== "function" || !model) return translatedText;
+    if (typeof generateText !== "function" || !model) {
+      if (required) throw createTranslationFailure("TRANSLATION_CONFIG_ERROR");
+      return translatedText;
+    }
 
     const controller = new AbortController();
-    const onAbort = () => controller.abort();
-    if (signal) {
-      if (signal.aborted) return translatedText;
-      signal.addEventListener("abort", onAbort);
-    }
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    let rejectCancellation;
+    const cancellation = new Promise((_, reject) => { rejectCancellation = reject; });
+    const onAbort = () => {
+      controller.abort(signal?.reason ?? new DOMException("Translation cancelled", "AbortError"));
+      rejectCancellation(controller.signal.reason);
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+    const timer = setTimeout(() => {
+      controller.abort(new DOMException("Translation deadline exceeded", "TimeoutError"));
+      rejectCancellation(controller.signal.reason);
+    }, timeoutMs);
 
     try {
-      const result = await generateText({
+      const result = await Promise.race([generateText({
         model,
         system: prepared.system,
         prompt: prepared.prompt,
         abortSignal: controller.signal,
-      });
+      }), cancellation]);
+      if (controller.signal.aborted) throw controller.signal.reason;
       const polished = String(result?.text ?? "").trim();
+      if (required && (!polished || isEllipsisPlaceholder(polished))) throw createTranslationFailure("TRANSLATION_EMPTY");
       return polished || translatedText;
     } catch (error) {
+      if (required) throw createTranslationFailure(getSubtitleTranslationFailureReason(error));
       log.warn?.(`[subtitle] tone polish failed, using raw translation: ${safePolishErrorIdentifier(error)}`);
       return translatedText;
     } finally {
       clearTimeout(timer);
-      if (signal) signal.removeEventListener("abort", onAbort);
+      signal?.removeEventListener("abort", onAbort);
     }
   }
 
   return { polish };
+}
+
+const TRANSLATION_FAILURE_REASONS = new Set([
+  "TRANSLATION_TIMEOUT", "TRANSLATION_CANCELLED", "TRANSLATION_EMPTY", "TRANSLATION_AUTH_FAILED",
+  "TRANSLATION_RATE_LIMITED", "TRANSLATION_PROVIDER_UNAVAILABLE", "TRANSLATION_INVALID_RESPONSE",
+  "TRANSLATION_BLOCKED", "TRANSLATION_TRUNCATED", "TRANSLATION_NETWORK_ERROR", "TRANSLATION_CONFIG_ERROR",
+  "TRANSLATION_LANGUAGE_MISMATCH", "TRANSLATION_SOURCE_ECHO", "TRANSLATION_FAILED",
+]);
+
+/** @param {unknown} error */
+export function getSubtitleTranslationFailureReason(error) {
+  if (!error || typeof error !== "object") return "TRANSLATION_FAILED";
+  const code = "code" in error ? error.code : null;
+  if (typeof code === "string" && TRANSLATION_FAILURE_REASONS.has(code)) return code;
+  if (("name" in error && error.name === "TimeoutError") || code === "GEMINI_TEXT_TIMEOUT") return "TRANSLATION_TIMEOUT";
+  if (("name" in error && error.name === "AbortError") || code === "GEMINI_TEXT_ABORTED") return "TRANSLATION_CANCELLED";
+  if (code === "GEMINI_TEXT_HTTP_ERROR") {
+    const status = "status" in error ? error.status : null;
+    if (status === 401 || status === 403) return "TRANSLATION_AUTH_FAILED";
+    if (status === 429) return "TRANSLATION_RATE_LIMITED";
+    return "TRANSLATION_PROVIDER_UNAVAILABLE";
+  }
+  const providerReasons = {
+    GEMINI_TEXT_EMPTY: "TRANSLATION_EMPTY", GEMINI_TEXT_NETWORK_ERROR: "TRANSLATION_NETWORK_ERROR",
+    GEMINI_TEXT_INVALID_RESPONSE: "TRANSLATION_INVALID_RESPONSE", GEMINI_TEXT_BLOCKED: "TRANSLATION_BLOCKED",
+    GEMINI_TEXT_TRUNCATED: "TRANSLATION_TRUNCATED",
+  };
+  return typeof code === "string" && Object.hasOwn(providerReasons, code) ? providerReasons[code] : "TRANSLATION_FAILED";
+}
+
+/** @param {string} code */
+function createTranslationFailure(code) {
+  return Object.assign(new Error(code), { code });
 }
 
 function safePolishErrorIdentifier(error) {

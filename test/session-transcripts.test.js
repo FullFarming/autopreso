@@ -988,3 +988,59 @@ test("a language tab shows whichever side of a turn is in that language", async 
   // A line with nothing in that language is skipped, not mislabelled.
   assert.equal(transcriptTextForLanguage({ sourceText: "只有中文", sourceLanguage: "zh", targetLanguage: "zh" }, "en"), "");
 });
+
+test("Live Call reimport preserves completed summary, call identity and source-only lines", async () => {
+  const storageDir = await makeStorageDir();
+  const transcripts = createSessionTranscripts({ storageDir, persistDelayMs: 0 });
+  await transcripts.begin({ sessionId: "live-backfill", kind: "live-call", liveSessionId: "backfill" });
+  await transcripts.recordLine({ translatedText: "An English translation", targetLanguage: "en" });
+  await transcripts.end();
+  await transcripts.summarize("live-backfill", async () => ({ text: '{"title":"Saved","overview":"Saved recap"}' }));
+  await transcripts.importSession({ id: "live-backfill", startedAt: "2026-09-01T00:00:00Z", endedAt: "2026-09-01T00:01:00Z",
+    lines: [{ sourceText: "실제로 발언한 원문", translatedText: "" }, { sourceText: "", translatedText: "An English translation", targetLanguage: "en" }], summary: null });
+  const restored = await createSessionTranscripts({ storageDir }).get("live-backfill");
+  assert.equal(restored.meta.kind, "live-call");
+  assert.equal(restored.meta.liveSessionId, "backfill");
+  assert.equal(restored.summary.title, "Saved");
+  assert.equal(restored.lines[0].translatedText, "");
+  assert.equal(restored.lines[1].sourceText, "");
+});
+
+test("Live Call import never starts a second local paid summary while remote recap is pending", async () => {
+  let calls = 0;
+  const { httpServer, url } = await startServer({ host: "127.0.0.1", port: 0,
+    transcriptsDir: await makeStorageDir(), env: { GEMINI_API_KEY: "synthetic" },
+    subtitleSummaryGenerateText: async () => { calls += 1; return { text: '{"title":"Unexpected"}' }; } });
+  try {
+    const response = await fetch(`${url}/api/subtitles/sessions/import`, { method: "POST", headers: sameOriginHeaders(url, { "content-type": "application/json" }),
+      body: JSON.stringify({ id: "live-import", lines: [{ sourceText: "원문" }], summary: null }) });
+    assert.equal(response.status, 200);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(calls, 0);
+    assert.equal((await response.json()).data.kind, "live-call");
+  } finally { await new Promise((resolve) => httpServer.close(resolve)); }
+});
+
+test("canonical import preserves 8000-character originals and rejects oversized archives without truncation", async () => {
+  const transcripts = createSessionTranscripts({ storageDir: await makeStorageDir() });
+  const text = "원문\n".repeat(2000);
+  await transcripts.importSession({ id: "live-long", ownerHostId: "host-owner", lines: [{ sourceText: text, sourceSeq: 7, id: "original-seven", utteranceKey: "authoritative-source:7" }] });
+  const saved = await transcripts.get("live-long");
+  assert.equal(saved.lines[0].sourceText, text);
+  assert.equal(saved.lines[0].sourceSeq, 7);
+  assert.equal(saved.lines[0].id, "original-seven");
+  assert.equal(saved.meta.ownerHostId, "host-owner");
+  assert.equal(await transcripts.importSession({ id: "live-long", lines: Array.from({ length: 20001 }, () => ({ sourceText: "a" })) }), null);
+  assert.equal((await transcripts.get("live-long")).lines[0].sourceText, text);
+});
+
+
+test("canonical import uses source-ledger Unicode codepoint and byte limits", async () => {
+  const transcripts = createSessionTranscripts({ storageDir: await makeStorageDir() });
+  const text = "𠮷".repeat(5000);
+  assert.ok(await transcripts.importSession({ id: "live-unicode", lines: [{ sourceText: text }] }));
+  assert.equal((await transcripts.get("live-unicode")).lines[0].sourceText, text);
+  assert.equal(await transcripts.importSession({ id: "live-unicode", lines: [{ sourceText: "𠮷".repeat(6001) }] }), null);
+  assert.equal(await transcripts.importSession({ id: "live-unicode", lines: [{ sourceText: "a".repeat(8001) }] }), null);
+  assert.equal((await transcripts.get("live-unicode")).lines[0].sourceText, text);
+});

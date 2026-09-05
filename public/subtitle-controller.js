@@ -11,6 +11,8 @@ import { mountSystemLanguageButton } from "./system-language-button.js";
 import { SYSTEM_LANGUAGE_STORAGE_KEY } from "./system-language.js";
 
 const DEFAULT_SUBTITLE = {
+  inputMode: "system_mic",
+  micDeviceId: "",
   translationLanguages: ["en", "ko"],
   outputMode: "captions",
   translationFontSize: 38,
@@ -47,6 +49,8 @@ const translationHealth = {
 };
 let lastRenderedHealthState = "";
 let isLiveActionStatusLocked = false;
+const translationInputHealth = new Map();
+let translationInputConfiguration = "";
 
 initLanguage();
 applyDocumentLanguage(document);
@@ -321,18 +325,47 @@ function setControllerText(text) {
   lastRenderedHealthState = "";
 }
 
+function resetTranslationHealthEvents() {
+  translationInputHealth.clear();
+  translationHealth.lastEventAt = null;
+  translationHealth.lastCaptionAt = null;
+  translationHealth.signalSinceAt = null;
+  translationHealth.lastInputStatus = "";
+  translationHealth.pipelineStatus = "";
+  lastRenderedHealthState = "";
+}
+
+function refreshTranslationInputHealth(now) {
+  const configuration = JSON.stringify([settings.inputMode, settings.micDeviceId ?? ""]);
+  if (configuration !== translationInputConfiguration) {
+    translationInputConfiguration = configuration;
+    resetTranslationHealthEvents();
+  }
+  const sources = new Set(settings.inputMode === "system_mic" ? ["mic", "system"]
+    : settings.inputMode === "mic" ? ["mic"] : settings.inputMode === "system" ? ["system"] : []);
+  for (const [source, input] of translationInputHealth) {
+    if (!sources.has(source) || now - input.observedAt > TRANSLATION_EVENT_STALE_MS) translationInputHealth.delete(source);
+  }
+  const inputs = [...translationInputHealth.values()];
+  const signals = inputs.filter(input => input.status === "signal");
+  translationHealth.lastInputStatus = signals.length > 0 ? "signal" : inputs.length > 0 ? "waiting" : "";
+  translationHealth.signalSinceAt = signals.length > 0 ? Math.min(...signals.map(input => input.signalSinceAt)) : null;
+  return sources;
+}
+
 function noteTranslationHealthEvent(message) {
   if (!message || typeof message.type !== "string") return;
   const now = Date.now();
+  const configuredSources = refreshTranslationInputHealth(now);
   if (message.type === "subtitle:input-status") {
+    if (!configuredSources.has(message.source) || !["signal", "waiting", "silent", "idle"].includes(message.status)) return;
+    const previous = translationInputHealth.get(message.source);
+    // 2026-09-01 fix: 한 입력의 무음이 다른 입력의 연속 신호를 덮어쓰지 않도록 따로 만료시킨다.
+    translationInputHealth.set(message.source, {
+      status: message.status, observedAt: now,
+      signalSinceAt: message.status === "signal" ? previous?.status === "signal" ? previous.signalSinceAt : now : null,
+    });
     translationHealth.lastEventAt = now;
-    const nextInputStatus = String(message.status ?? "");
-    if (nextInputStatus === "signal" && translationHealth.lastInputStatus !== "signal") {
-      translationHealth.signalSinceAt = now;
-    } else if (nextInputStatus !== "signal") {
-      translationHealth.signalSinceAt = null;
-    }
-    translationHealth.lastInputStatus = nextInputStatus;
   } else if (message.type === "subtitle:partial" || message.type === "subtitle:committed") {
     translationHealth.lastEventAt = now;
     translationHealth.lastCaptionAt = now;
@@ -340,6 +373,8 @@ function noteTranslationHealthEvent(message) {
   } else if (message.type === "subtitle:status") {
     translationHealth.lastEventAt = now;
     translationHealth.pipelineStatus = String(message.status ?? "");
+  } else if (message.type === "subtitle:stopped" || message.type === "subtitle:started") {
+    resetTranslationHealthEvents();
   } else {
     return;
   }
@@ -391,7 +426,9 @@ function translationHealthDetail(state, now = Date.now()) {
 function renderTranslationHealth(now = Date.now()) {
   if (isLiveActionStatusLocked) return;
   if (!translationHealth.isLive || !liveCallStatus || !healthLabel) return;
-  if (translationHealth.mediaWaiting) {
+  refreshTranslationInputHealth(now);
+  if (translationHealth.mediaWaiting && translationHealth.socketState === "open"
+    && translationHealth.bridgeState !== "failed") {
     setControllerStatus("controller.waitingForParticipants", "waiting");
     return;
   }
@@ -416,14 +453,7 @@ function syncLiveBridgeStatus(state) {
   translationHealth.bridgeState = String(state?.bridge?.state ?? "idle");
   // A new call must earn its own healthy state; a recent event from the prior
   // session would otherwise make dead audio look healthy for several seconds.
-  if (!wasLive && translationHealth.isLive) {
-    translationHealth.lastEventAt = null;
-    translationHealth.lastCaptionAt = null;
-    translationHealth.signalSinceAt = null;
-    translationHealth.lastInputStatus = "";
-    translationHealth.pipelineStatus = "";
-    lastRenderedHealthState = "";
-  }
+  if (wasLive !== translationHealth.isLive) resetTranslationHealthEvents();
   renderTranslationHealth();
 }
 
@@ -460,6 +490,7 @@ function renderEnginePill(engine) {
 }
 if (window.realtimeNoelDesktop?.getLiveCallState && liveCallGroup && goLiveButton && endLiveCallButton && liveCallStatus) {
   let isEndingLiveCall = false;
+  let isGoingLive = false;
   // Elapsed "now playing" timer: ticks only while live, renders next to End.
   let liveStartedAtMs = null;
   let elapsedTimer = null;
@@ -487,9 +518,10 @@ if (window.realtimeNoelDesktop?.getLiveCallState && liveCallGroup && goLiveButto
   const syncLiveCall = async () => {
     try {
       const state = await window.realtimeNoelDesktop.getLiveCallState();
+      syncLiveBridgeStatus(state);
       liveCallGroup.hidden = !state?.armed;
       if (state?.armed) {
-        goLiveButton.disabled = Boolean(state.live);
+        goLiveButton.disabled = isGoingLive || Boolean(state.live);
         goLiveButton.dataset.i18n = state.live && state.mediaWaiting
           ? "controller.waitingForParticipants" : state.live ? "controller.live" : "controller.goLive";
         goLiveButton.textContent = t(goLiveButton.dataset.i18n);
@@ -501,7 +533,6 @@ if (window.realtimeNoelDesktop?.getLiveCallState && liveCallGroup && goLiveButto
         endLiveCallButton.disabled = isEndingLiveCall;
         if (state.live && state.liveStartedAt) setLiveElapsed(state.liveStartedAt);
         if (!state.live) stopLiveElapsed();
-        syncLiveBridgeStatus(state);
       } else {
         translationHealth.isLive = false;
         translationHealth.bridgeState = "idle";
@@ -511,8 +542,7 @@ if (window.realtimeNoelDesktop?.getLiveCallState && liveCallGroup && goLiveButto
         setControllerStatus("controller.captionsReady");
       }
     } catch {
-      translationHealth.isLive = false;
-      translationHealth.bridgeState = "idle";
+      syncLiveBridgeStatus(null);
       liveCallGroup.hidden = true;
       stopLiveElapsed();
     }
@@ -535,6 +565,9 @@ if (window.realtimeNoelDesktop?.getLiveCallState && liveCallGroup && goLiveButto
     }
   });
   goLiveButton.addEventListener("click", async () => {
+    // 2026-08-31 fix: 상태 조회가 완료돼도 진행 중인 시작 요청의 잠금을 유지한다.
+    if (isGoingLive) return;
+    isGoingLive = true;
     isLiveActionStatusLocked = true;
     goLiveButton.disabled = true;
     goLiveButton.setAttribute("aria-busy", "true");
@@ -546,6 +579,7 @@ if (window.realtimeNoelDesktop?.getLiveCallState && liveCallGroup && goLiveButto
     } catch {
       setControllerStatus("controller.goLiveFailed");
     } finally {
+      isGoingLive = false;
       isLiveActionStatusLocked = false;
       goLiveButton.removeAttribute("aria-busy");
       void syncLiveCall();

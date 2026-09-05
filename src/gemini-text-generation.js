@@ -2,6 +2,57 @@ import { redactGeminiSensitiveText } from "../packages/caption-core/index.js";
 
 const GEMINI_TEXT_API_BASE = "https://generativelanguage.googleapis.com/v1beta/models";
 
+/** @type {Readonly<Record<string, string>>} */
+const GEMINI_TEXT_FAILURE_MESSAGES = Object.freeze({
+  GEMINI_TEXT_HTTP_ERROR: "Gemini text generation failed",
+  GEMINI_TEXT_TIMEOUT: "Gemini text generation timed out.",
+  GEMINI_TEXT_ABORTED: "Gemini text generation was cancelled.",
+  GEMINI_TEXT_NETWORK_ERROR: "Gemini text transport failed.",
+  GEMINI_TEXT_INVALID_RESPONSE: "Gemini text response was invalid.",
+  GEMINI_TEXT_BLOCKED: "Gemini text response was blocked.",
+  GEMINI_TEXT_TRUNCATED: "Gemini text response was incomplete.",
+  GEMINI_TEXT_EMPTY: "Gemini text response was empty.",
+});
+
+export class GeminiTextGenerationError extends Error {
+  /** @param {string} code @param {number} [status] */
+  constructor(code, status) {
+    const safeCode = Object.hasOwn(GEMINI_TEXT_FAILURE_MESSAGES, code) ? code : "GEMINI_TEXT_INVALID_RESPONSE";
+    const safeStatus = safeCode === "GEMINI_TEXT_HTTP_ERROR" && Number.isInteger(status) && status >= 100 && status <= 599
+      ? status : undefined;
+    super(`${GEMINI_TEXT_FAILURE_MESSAGES[safeCode]}${safeStatus === undefined ? "" : `: HTTP ${safeStatus}`}`);
+    this.name = "GeminiTextGenerationError";
+    this.code = safeCode;
+    this.status = safeStatus;
+  }
+}
+
+/** @param {AbortSignal | undefined} signal */
+function throwIfTextAborted(signal) {
+  if (!signal?.aborted) return;
+  throw new GeminiTextGenerationError(signal.reason?.name === "TimeoutError" ? "GEMINI_TEXT_TIMEOUT" : "GEMINI_TEXT_ABORTED");
+}
+
+/** @param {unknown} error @param {AbortSignal | undefined} signal */
+function safeTextTransportFailure(error, signal) {
+  throwIfTextAborted(signal);
+  if (error instanceof GeminiTextGenerationError) return error;
+  return new GeminiTextGenerationError(error instanceof TypeError ? "GEMINI_TEXT_NETWORK_ERROR" : "GEMINI_TEXT_INVALID_RESPONSE");
+}
+
+/** @param {Response} response @param {AbortSignal | undefined} signal */
+async function rejectFailedHttpResponse(response, signal) {
+  if (response.ok && !signal?.aborted) return;
+  // 2026-08-31 fix: Release unread error bodies before a permitted summary attempt opens another connection.
+  try { await response.body?.cancel(); }
+  catch {
+    throwIfTextAborted(signal);
+    throw new GeminiTextGenerationError("GEMINI_TEXT_INVALID_RESPONSE");
+  }
+  throwIfTextAborted(signal);
+  throw new GeminiTextGenerationError("GEMINI_TEXT_HTTP_ERROR", response.status);
+}
+
 /**
  * @typedef {{
  *   apiKey?: unknown,
@@ -51,32 +102,40 @@ export async function generateGeminiStructuredJson({
 /** @param {GeminiTextOptions} [options] */
 export async function streamGeminiText({ apiKey, model, system = "", prompt = "", abortSignal, fetchImpl = globalThis.fetch, onPartial } = {}) {
   const { key, modelId } = validateGeminiTextOptions({ apiKey, model, fetchImpl });
-  const response = await fetchImpl(`${GEMINI_TEXT_API_BASE}/${encodeURIComponent(modelId)}:streamGenerateContent?alt=sse`, {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      "x-goog-api-key": key,
-    },
-    signal: abortSignal,
-    body: JSON.stringify(buildGenerateContentBody({
-      system,
-      prompt,
-      generationConfig: {
-        thinkingConfig: { thinkingLevel: "low" },
-        maxOutputTokens: 2048,
+  throwIfTextAborted(abortSignal);
+  let response;
+  try {
+    response = await fetchImpl(`${GEMINI_TEXT_API_BASE}/${encodeURIComponent(modelId)}:streamGenerateContent?alt=sse`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-goog-api-key": key,
       },
-    })),
-  });
-
-  if (!response.ok) {
-    throw new Error(`Gemini text generation failed: HTTP ${response.status}`);
-  }
+      signal: abortSignal,
+      body: JSON.stringify(buildGenerateContentBody({
+        system,
+        prompt,
+        generationConfig: {
+          thinkingConfig: { thinkingLevel: "low" },
+          maxOutputTokens: 2048,
+        },
+      })),
+    });
+  } catch (error) { throw safeTextTransportFailure(error, abortSignal); }
+  await rejectFailedHttpResponse(response, abortSignal);
 
   let text = "";
-  for await (const chunkText of readSseTextChunks(response.body)) {
-    text += chunkText;
-    if (typeof onPartial === "function") onPartial(text);
+  try {
+    for await (const chunkText of readSseTextChunks(response.body)) {
+      throwIfTextAborted(abortSignal);
+      text += chunkText;
+      if (typeof onPartial === "function") onPartial(text);
+    }
+  } catch (error) {
+    throw safeTextTransportFailure(error, abortSignal);
   }
+  throwIfTextAborted(abortSignal);
+  if (!text.trim()) throw new GeminiTextGenerationError("GEMINI_TEXT_EMPTY");
   return { text: text.trim() };
 }
 
@@ -104,41 +163,39 @@ async function generateGeminiTextRequest({
   },
 } = {}) {
   const { key, modelId } = validateGeminiTextOptions({ apiKey, model, fetchImpl });
-
-  const response = await fetchImpl(`${GEMINI_TEXT_API_BASE}/${encodeURIComponent(modelId)}:generateContent`, {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      "x-goog-api-key": key,
-    },
-    signal: abortSignal,
-    body: JSON.stringify(buildGenerateContentBody({ system, prompt, generationConfig })),
-  });
-
-  if (!response.ok) {
-    const failure = new Error(`Gemini text generation failed: HTTP ${response.status}`);
-    // @ts-expect-error status rides along for fallback routing.
-    failure.status = response.status;
-    throw failure;
+  throwIfTextAborted(abortSignal);
+  let response;
+  try {
+    response = await fetchImpl(`${GEMINI_TEXT_API_BASE}/${encodeURIComponent(modelId)}:generateContent`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-goog-api-key": key,
+      },
+      signal: abortSignal,
+      body: JSON.stringify(buildGenerateContentBody({ system, prompt, generationConfig })),
+    });
+  } catch (error) { throw safeTextTransportFailure(error, abortSignal); }
+  await rejectFailedHttpResponse(response, abortSignal);
+  let body;
+  try { body = await response.json(); }
+  catch {
+    throwIfTextAborted(abortSignal);
+    throw new GeminiTextGenerationError("GEMINI_TEXT_INVALID_RESPONSE");
   }
-
-  const body = await response.json();
-  const text = extractTextFromResponseBody(body).trim();
-  return { text: text || "" };
+  throwIfTextAborted(abortSignal);
+  const text = extractTextFromResponseBody(body, true).trim();
+  if (!text) throw new GeminiTextGenerationError("GEMINI_TEXT_EMPTY");
+  return { text };
 }
 
-// 2026-08-31 outage: generativelanguage intermittently answered gemini-3.7-flash
-// with 503 UNAVAILABLE ("high demand"), empty-body 404s, and >25s hangs while
-// gemini-3.6-flash stayed healthy the whole time. These statuses are provider
-// availability noise, not caller mistakes, so they may move to the next model.
-const TRANSIENT_GEMINI_TEXT_STATUSES = new Set([404, 408, 429, 500, 502, 503, 504]);
+// 2026-08-31 fix: Only summary availability failures may try another model; quota and configuration failures must stop.
+const TRANSIENT_GEMINI_TEXT_STATUSES = new Set([408, 500, 502, 503, 504]);
 const DEFAULT_PER_ATTEMPT_TIMEOUT_MS = 2_800;
 
 /**
- * One attempt per model, first success wins. This is availability routing for
- * latency-bound caption work, NOT a blind retry: a non-transient failure
- * (auth, bad request) is identical on every model and rethrows immediately,
- * and the caller's abort ends the whole chain.
+ * Summary-only availability routing: one attempt per distinct model.
+ * Caption callers use generateGeminiText directly for exactly one request.
  *
  * @param {GeminiTextOptions & {models?: readonly unknown[], perAttemptTimeoutMs?: number}} [options]
  */
@@ -155,11 +212,11 @@ export async function generateGeminiTextWithModelFallback({
   if (modelIds.length === 0) throw new Error("Gemini text model is required.");
   let lastFailure = null;
   for (const modelId of modelIds) {
-    if (abortSignal?.aborted) break;
+    throwIfTextAborted(abortSignal);
     const attemptController = new AbortController();
-    const abortAttempt = () => attemptController.abort();
+    const abortAttempt = () => attemptController.abort(abortSignal?.reason);
     abortSignal?.addEventListener("abort", abortAttempt, { once: true });
-    const attemptTimer = setTimeout(abortAttempt, perAttemptTimeoutMs);
+    const attemptTimer = setTimeout(() => attemptController.abort(new DOMException("Text generation deadline exceeded", "TimeoutError")), perAttemptTimeoutMs);
     try {
       return await generateGeminiTextRequest({
         apiKey, model: modelId, system, prompt, fetchImpl,
@@ -167,12 +224,12 @@ export async function generateGeminiTextWithModelFallback({
       });
     } catch (error) {
       lastFailure = error;
-      const status = error && typeof error === "object" ? /** @type {{status?: unknown}} */ (error).status : undefined;
-      const isTransientStatus = typeof status === "number" && TRANSIENT_GEMINI_TEXT_STATUSES.has(status);
-      const isAttemptTimeout = attemptController.signal.aborted && !abortSignal?.aborted;
-      const isNetworkFailure = status === undefined && !(abortSignal?.aborted);
+      throwIfTextAborted(abortSignal);
+      if (!(error instanceof GeminiTextGenerationError)) throw error;
+      const isTransientStatus = error.code === "GEMINI_TEXT_HTTP_ERROR" && TRANSIENT_GEMINI_TEXT_STATUSES.has(error.status);
+      const isAttemptTimeout = error.code === "GEMINI_TEXT_TIMEOUT";
+      const isNetworkFailure = error.code === "GEMINI_TEXT_NETWORK_ERROR";
       if (!isTransientStatus && !isAttemptTimeout && !isNetworkFailure) throw error;
-      if (abortSignal?.aborted) throw error;
     } finally {
       clearTimeout(attemptTimer);
       abortSignal?.removeEventListener("abort", abortAttempt);
@@ -227,18 +284,37 @@ function extractTextFromSseEvent(event) {
   let text = "";
   for (const line of lines) {
     if (line === "[DONE]") continue;
-    text += extractTextFromResponseBody(JSON.parse(line));
+    let body;
+    try { body = JSON.parse(line); }
+    catch { throw new GeminiTextGenerationError("GEMINI_TEXT_INVALID_RESPONSE"); }
+    text += extractTextFromResponseBody(body);
   }
   return text;
 }
 
-/** @param {unknown} body */
-function extractTextFromResponseBody(body) {
-  if (!body || typeof body !== "object" || !("candidates" in body) || !Array.isArray(body.candidates)) return "";
-  const content = body.candidates[0]?.content;
+/** @param {unknown} body @param {boolean} [isFinal] */
+function extractTextFromResponseBody(body, isFinal = false) {
+  if (!body || typeof body !== "object") throw new GeminiTextGenerationError("GEMINI_TEXT_INVALID_RESPONSE");
+  if ("promptFeedback" in body && body.promptFeedback && typeof body.promptFeedback === "object"
+    && "blockReason" in body.promptFeedback && body.promptFeedback.blockReason
+    && body.promptFeedback.blockReason !== "BLOCK_REASON_UNSPECIFIED") throw new GeminiTextGenerationError("GEMINI_TEXT_BLOCKED");
+  if (!("candidates" in body) || !Array.isArray(body.candidates)) throw new GeminiTextGenerationError("GEMINI_TEXT_INVALID_RESPONSE");
+  const candidate = body.candidates[0];
+  if (!candidate) return "";
+  if (candidate.finishReason === "MAX_TOKENS") throw new GeminiTextGenerationError("GEMINI_TEXT_TRUNCATED");
+  if (Array.isArray(candidate.safetyRatings) && candidate.safetyRatings.some((rating) => rating?.blocked === true)) {
+    throw new GeminiTextGenerationError("GEMINI_TEXT_BLOCKED");
+  }
+  if (candidate.finishReason !== undefined && candidate.finishReason !== "STOP") {
+    const blockedReasons = ["SAFETY", "RECITATION", "BLOCKLIST", "PROHIBITED_CONTENT", "SPII", "IMAGE_SAFETY"];
+    throw new GeminiTextGenerationError(blockedReasons.includes(candidate.finishReason) ? "GEMINI_TEXT_BLOCKED" : "GEMINI_TEXT_INVALID_RESPONSE");
+  }
+  if (isFinal && candidate.finishReason !== "STOP") throw new GeminiTextGenerationError("GEMINI_TEXT_INVALID_RESPONSE");
+  const content = candidate.content;
   if (!content || typeof content !== "object" || !("parts" in content) || !Array.isArray(content.parts)) return "";
   return content.parts.map((part) => {
     if (!part || typeof part !== "object" || !("text" in part)) return "";
+    if (part.thought !== undefined && part.thought !== false) return "";
     return typeof part.text === "string" ? part.text : "";
   }).join("");
 }

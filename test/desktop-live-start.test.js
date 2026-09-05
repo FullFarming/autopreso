@@ -240,7 +240,8 @@ test("gateway floor changes clear every Electron caption surface before the next
   assert.match(main, /function shouldBlockLiveHostAudioForFloor/u);
   assert.match(main, /floorKnown: false/u);
   assert.match(main, /isHostAudioBlocked: true/u);
-  assert.match(main, /bridge\.isHostAudioBlocked = shouldBlockLiveHostAudioForFloor/u);
+  assert.match(main, /const shouldBlockHostAudio = shouldBlockLiveHostAudioForFloor/u);
+  assert.match(main, /liveBridgeAudioAdapters\.clear\(\);\s*\}\s*bridge\.isHostAudioBlocked = shouldBlockHostAudio/u);
   assert.match(main, /webContents\.send\("live-call:floor", message\)/u);
   assert.match(preload, /onLiveCallFloor/u);
   assert.match(preload, /ipcRenderer\.on\("live-call:floor", handler\)/u);
@@ -437,17 +438,18 @@ test("Gateway disconnect clears only Gateway audio authority and leaves local Ca
   assert.doesNotMatch(closeHandler, /applyAuthoritativeLiveCallFloorSnapshot\(null\)|relayLiveCallFloorToRenderers|live-call:audio-failed|HOST_AUDIO_CAPTURE_FAILED/u);
 });
 
-test("Live Call archive preserves a finalized gateway-canonical local record", () => {
+test("Live Call archive refreshes canonical remote data before any same-owner cached read", () => {
   const main = read("electron/main.js");
-  const archive = main.slice(
-    main.indexOf("async function archiveLiveCallSession"),
-    main.indexOf("function showDashboardWindow"),
-  );
-  assert.match(archive, /api\/subtitles\/sessions\/live-/u);
-  const localCheck = archive.indexOf("payload?.ok === true");
-  const remoteTranscript = archive.indexOf("/transcript?language=");
-  assert.ok(localCheck >= 0 && remoteTranscript > localCheck,
-    "the bilingual local record must win before source-only fallback import");
+  const archive = main.slice(main.indexOf("async function archiveLiveCallSession"), main.indexOf("function showDashboardWindow"));
+  const remoteRefresh = archive.indexOf("await liveCallArchive.refresh(");
+  const cachedRead = archive.indexOf("cached?.ok === true");
+  assert.ok(remoteRefresh >= 0 && cachedRead > remoteRefresh,
+    "an existing local record cannot bypass a fresh canonical remote read");
+  assert.match(archive, /cached\.data\.meta\.ownerHostId === auth\.data\.userId/u);
+  assert.doesNotMatch(archive, /sourceText: utterance\.text|summarizeSession|attempt < 3/u);
+  const coordinator = read("src/live-call-archive.js");
+  assert.match(coordinator, /const sourceText = text\(item\.effectiveText/u);
+  assert.match(coordinator, /sourceText: "", sourceLanguage: "", translatedText:/u);
 });
 
 test("controller can be moved by pointer drag and recovered from the application menu", () => {
@@ -468,6 +470,102 @@ test("controller can be moved by pointer drag and recovered from the application
   assert.match(controllerJs, /setPointerCapture/u);
   const css = read("public/subtitle.css");
   assert.match(css, /\.controller-drag \{[^}]*-webkit-app-region: no-drag/su);
+});
+
+function mountGoLiveController() {
+  const controller = read("public/subtitle-controller.js");
+  const declarations = controller.slice(controller.indexOf("  let isEndingLiveCall = false;"), controller.indexOf('  // Elapsed "now playing" timer'));
+  const sync = controller.slice(controller.indexOf("  const syncLiveCall = async () => {"), controller.indexOf('  hostSpeakButton?.addEventListener("click"'));
+  const listener = controller.slice(controller.indexOf('  goLiveButton.addEventListener("click", async () => {'), controller.indexOf('  endLiveCallButton.addEventListener("click", async () => {'));
+  assert.ok(declarations && sync && listener);
+  /** @type {Map<string, () => Promise<void>>} */
+  const handlers = new Map();
+  /** @type {Map<string, string>} */
+  const attributes = new Map();
+  const button = {
+    disabled: false, dataset: {}, textContent: "", classList: { toggle() {} },
+    setAttribute(name, value) { attributes.set(name, value); },
+    removeAttribute(name) { attributes.delete(name); },
+    addEventListener(name, callback) { handlers.set(name, callback); },
+  };
+  const liveState = { armed: true, live: false, mediaWaiting: false, scheduledAt: "2099-01-01T00:00:00Z" };
+  /** @type {Array<{resolve: (value: {ok: boolean, code?: string}) => void, reject: (error: Error) => void}>} */
+  const pending = [];
+  /** @type {string[]} */
+  const statuses = [];
+  let requests = 0;
+  const context = {
+    isLiveActionStatusLocked: false, goLiveButton: button,
+    liveCallGroup: { hidden: false }, hostSpeakButton: { hidden: true }, endLiveCallButton: { disabled: false },
+    translationHealth: {}, setLiveElapsed() {}, stopLiveElapsed() {}, syncLiveBridgeStatus() {},
+    setControllerStatus(key) { statuses.push(key); }, setControllerText(text) { statuses.push(text); },
+    t: (key) => key,
+    window: { realtimeNoelDesktop: {
+      getLiveCallState: async () => liveState,
+      goLiveCall: () => { requests += 1; return new Promise((resolve, reject) => pending.push({ resolve, reject })); },
+    } },
+  };
+  const api = vm.runInNewContext(`${declarations}\n${sync}\n${listener}\n({ syncLiveCall });`, context);
+  const click = handlers.get("click");
+  assert.ok(click);
+  return { click, poll: api.syncLiveCall, button, attributes, liveState, statuses,
+    requests: () => requests,
+    resolve: (result) => { const request = pending.shift(); assert.ok(request); request.resolve(result); },
+    reject: () => { const request = pending.shift(); assert.ok(request); request.reject(new Error("mock IPC unavailable")); },
+  };
+}
+
+test("Go Live remains single flight through polling and double clicks before a future scheduled time", async () => {
+  const h = mountGoLiveController();
+  const first = h.click();
+  assert.equal(h.requests(), 1, "a future schedule does not delay the manual request");
+  assert.equal(h.button.disabled, true);
+  assert.equal(h.attributes.get("aria-busy"), "true");
+  await h.poll();
+  assert.equal(h.button.disabled, true, "a preparing status poll must not unlock a pending action");
+  await h.click();
+  assert.equal(h.requests(), 1, "a repeated callback must not dispatch another IPC request");
+  h.liveState.live = true;
+  h.resolve({ ok: true });
+  await first;
+  await h.poll();
+  assert.equal(h.button.disabled, true, "the authoritative live state keeps Go Live disabled");
+  assert.equal(h.attributes.has("aria-busy"), false);
+  assert.ok(h.statuses.includes("controller.liveStarted"));
+  h.liveState.live = false;
+  await h.poll();
+  assert.equal(h.button.disabled, false);
+  const next = h.click();
+  assert.equal(h.requests(), 2, "success releases the lock for a subsequent prepared call");
+  h.resolve({ ok: true });
+  await next;
+});
+
+test("Go Live false responses and rejected IPC calls release the lock for explicit retry only", async () => {
+  for (const failure of ["response", "rejection"]) {
+    const h = mountGoLiveController();
+    const first = h.click();
+    await h.poll();
+    assert.equal(h.button.disabled, true);
+    if (failure === "response") h.resolve({ ok: false, code: "LIVE_READINESS_NOT_CONFIRMED" });
+    else h.reject();
+    await first;
+    await h.poll();
+    assert.equal(h.requests(), 1, "failure and polling never retry Go Live automatically");
+    assert.equal(h.button.disabled, false);
+    assert.equal(h.attributes.has("aria-busy"), false);
+    assert.ok(h.statuses.includes(failure === "response" ? "controller.goLiveFailedCode" : "controller.goLiveFailed"));
+    const retry = h.click();
+    assert.equal(h.requests(), 2);
+    await h.poll();
+    assert.equal(h.button.disabled, true);
+    h.liveState.live = true;
+    h.resolve({ ok: true });
+    await retry;
+    await h.poll();
+    assert.equal(h.button.disabled, true);
+    assert.equal(h.attributes.has("aria-busy"), false);
+  }
 });
 
 test("desktop go-live refreshes the version and streams host PCM to the gateway", () => {
@@ -511,7 +609,7 @@ test("desktop go-live refreshes the version and streams host PCM to the gateway"
   assert.match(main, /gatewaySettings: \{/u);
   assert.match(main, /inputSource: "mic"/u);
   assert.match(main, /displayLanguage: sanitizeLiveCaptionDisplayLanguage\(config\.displayLanguage\)/u);
-  assert.match(main, /shouldDisplayLiveCaption\(message, armedSession\.displayLanguage\)/u);
+  assert.match(main, /shouldDisplayLiveCaption\(message, armedSession\.displayLanguage, "gateway"\)/u);
   assert.match(main, /body: toLiveCallApiInput\(input\)/u);
   assert.match(main, /start-registered", async \(event, sessionId, options\)/u);
   // The webapp /start route, the gateway host lease, and this intent all have

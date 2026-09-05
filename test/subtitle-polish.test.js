@@ -333,3 +333,42 @@ test("polish skips trivial or empty text without calling the model", async () =>
   assert.equal(await polisher.polish({ translatedText: "  ", targetLanguage: "ko", tone: "business" }), "  ");
   assert.equal(calls.length, 0);
 });
+
+test("required initial translation bypasses optional polish skipping and accepts one-character sources", async () => {
+  const { fn, calls } = recordingGenerateText("Yes.");
+  const polisher = createSubtitlePolisher({ generateText: fn, model: "fixture" });
+  assert.equal(await polisher.polish({ translatedText: "…", sourceText: "네", targetLanguage: "en", tone: "natural", required: true }), "Yes.");
+  assert.equal(calls.length, 1);
+});
+
+test("required translation distinguishes safe provider failures and empty responses without copying provider text", async () => {
+  for (const [failure, expected] of [
+    [Object.assign(new Error("sensitive provider detail"), { code: "GEMINI_TEXT_HTTP_ERROR", status: 401 }), "TRANSLATION_AUTH_FAILED"],
+    [Object.assign(new Error("sensitive provider detail"), { code: "GEMINI_TEXT_HTTP_ERROR", status: 429 }), "TRANSLATION_RATE_LIMITED"],
+    [Object.assign(new Error("sensitive provider detail"), { code: "GEMINI_TEXT_HTTP_ERROR", status: 503 }), "TRANSLATION_PROVIDER_UNAVAILABLE"],
+    [Object.assign(new Error("sensitive provider detail"), { code: "GEMINI_TEXT_BLOCKED" }), "TRANSLATION_BLOCKED"],
+    [null, "TRANSLATION_EMPTY"],
+  ]) {
+    let calls = 0;
+    const polisher = createSubtitlePolisher({ model: "fixture", generateText: async () => { calls++; if (failure) throw failure; return { text: "" }; } });
+    await assert.rejects(polisher.polish({ translatedText: "…", sourceText: "테스트 문장", targetLanguage: "en", required: true }), error => error.code === expected && !error.message.includes("sensitive"));
+    assert.equal(calls, 1);
+  }
+});
+
+test("required translation deadline aborts provider work even when it never settles", async () => {
+  let providerSignal;
+  const polisher = createSubtitlePolisher({ model: "fixture", timeoutMs: 10,
+    generateText: async ({ abortSignal }) => { providerSignal = abortSignal; return new Promise(() => {}); } });
+  await assert.rejects(polisher.polish({ translatedText: "…", sourceText: "테스트 문장", targetLanguage: "en", required: true }), { code: "TRANSLATION_TIMEOUT" });
+  assert.equal(providerSignal.aborted, true);
+  assert.equal(providerSignal.reason.name, "TimeoutError");
+});
+
+test("required translation rejects an already cancelled request before paid work", async () => {
+  const controller = new AbortController(); controller.abort();
+  let calls = 0;
+  const polisher = createSubtitlePolisher({ model: "fixture", generateText: async () => { calls++; return { text: "Never" }; } });
+  await assert.rejects(polisher.polish({ translatedText: "…", sourceText: "테스트", targetLanguage: "en", required: true, signal: controller.signal }), { code: "TRANSLATION_CANCELLED" });
+  assert.equal(calls, 0);
+});
