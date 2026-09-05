@@ -18263,6 +18263,875 @@ grant execute on function public.replace_live_session_glossary_pins_v2(uuid, tex
 grant execute on function public.read_live_session_pinned_glossaries_v2(uuid)
   to service_role;
 
+-- supabase/migrations/202609010001_live_independent_translation_capture.sql
+
+-- 2026-09-01 feat: Direct Live translation commits independently of the 3.7
+-- source ledger. Capture windows describe accepted PCM for a generation, not
+-- exact sentence alignment. Existing rows stay NULL; no provenance is guessed.
+
+alter table public.live_utterances
+  add column if not exists translation_capture jsonb,
+  add column if not exists translation_event_hash bytea;
+
+do $$
+begin
+  if not exists (select 1 from pg_catalog.pg_constraint
+    where conrelid = 'public.live_utterances'::regclass
+      and conname = 'live_utterances_independent_translation_check') then
+    alter table public.live_utterances add constraint live_utterances_independent_translation_check check (
+      (translation_capture is null and translation_event_hash is null)
+      or (translation_capture is not null and translation_event_hash is not null
+        and jsonb_typeof(translation_capture) = 'object' and octet_length(translation_capture::text) <= 2048
+        and octet_length(translation_event_hash) = 32
+        and authoritative_source_id is null and source_text is null and source_language is null
+        and source_started_at is null and origin is null and participant_id is null
+        and translation_status = 'translated')
+    );
+  end if;
+end;
+$$;
+
+comment on column public.live_utterances.translation_capture is
+  'Independent Live translation generation/capture epoch and approximate generation PCM window. Never an exact source-utterance or sentence alignment.';
+comment on column public.live_utterances.translation_event_hash is
+  'SHA-256 of the original independent durable event, used solely to reject conflicting same-sequence replay. NULL for earlier writers.';
+
+create or replace function public.persist_independent_live_translation_v1(
+  p_session_id uuid, p_language text, p_event jsonb
+)
+returns boolean language plpgsql security definer set search_path = ''
+as $$
+declare
+  capture jsonb;
+  event_seq bigint;
+  event_hash bytea;
+  existing_row public.live_utterances%rowtype;
+  event_speaker_id text;
+  capture_started_at timestamptz;
+  capture_ended_at timestamptz;
+  stored boolean;
+  changed integer;
+  uuid_pattern constant text := '^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$';
+  instant_pattern constant text := '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,6})?Z$';
+begin
+  -- Lock order matches every media writer: session first, then its records.
+  perform 1 from public.live_sessions target where target.id = p_session_id
+    and target.status = 'live' and target.archive_deleted_at is null
+    and target.expires_at > statement_timestamp() and p_language = any(target.languages)
+    for update;
+  if not found then return false; end if;
+
+  if p_event is null or jsonb_typeof(p_event) is distinct from 'object'
+    or octet_length(p_event::text) > 65536
+    or jsonb_typeof(p_event -> 'seq') is distinct from 'number'
+    or (p_event ->> 'seq') !~ '^[1-9][0-9]{0,15}$'
+    or (p_event ->> 'seq')::numeric > 9007199254740991
+    or p_event ->> 'type' is distinct from 'caption'
+    or p_event ->> 'sessionId' is distinct from p_session_id::text
+    or p_event ->> 'language' is distinct from p_language
+    or p_event -> 'isFinal' is distinct from 'true'::jsonb
+    or p_event ->> 'translationStatus' is distinct from 'translated'
+    or exists (select 1 from jsonb_each(p_event) field
+      where field.key in ('sourceText','sourceLanguage','sourceStartedAt','origin','authoritativeSourceId','languageObservation')
+        and field.value <> 'null'::jsonb)
+  then raise exception using errcode='P0001', message='INVALID_INDEPENDENT_TRANSLATION'; end if;
+
+  capture := p_event -> 'translationCapture';
+  if jsonb_typeof(capture) is distinct from 'object'
+    or not (capture ?& array['kind','streamGeneration','captureEpoch','captureStartedAt','captureEndedAt','finalization'])
+    or (capture - array['kind','streamGeneration','captureEpoch','captureStartedAt','captureEndedAt','finalization']) <> '{}'::jsonb
+    or capture ->> 'kind' is distinct from 'independent-live-translation'
+    or capture ->> 'finalization' is distinct from 'application-sentence-boundary'
+    or coalesce(capture ->> 'streamGeneration','') !~* uuid_pattern
+    or coalesce(capture ->> 'captureEpoch','') !~* uuid_pattern
+    or coalesce(capture ->> 'captureEndedAt','') !~ instant_pattern
+    or jsonb_typeof(capture -> 'captureStartedAt') not in ('string','null')
+    or (capture -> 'captureStartedAt' <> 'null'::jsonb and (capture ->> 'captureStartedAt') !~ instant_pattern)
+  then raise exception using errcode='P0001', message='INVALID_INDEPENDENT_TRANSLATION_CAPTURE'; end if;
+  capture_started_at := (capture ->> 'captureStartedAt')::timestamptz;
+  capture_ended_at := (capture ->> 'captureEndedAt')::timestamptz;
+  event_seq := (p_event ->> 'seq')::bigint;
+  if capture_started_at > capture_ended_at
+    or p_event ->> 'sourceEndedAt' is distinct from capture ->> 'captureEndedAt'
+    or p_event ->> 'utteranceKey' is distinct from 'lt:' || (capture ->> 'streamGeneration') || ':' || event_seq::text
+  then raise exception using errcode='P0001', message='INVALID_INDEPENDENT_TRANSLATION_CAPTURE'; end if;
+
+  event_speaker_id := p_event -> 'speaker' ->> 'speakerId';
+  if event_speaker_id like 'participant:%' and not exists (
+    select 1 from public.live_participants participant where participant.session_id = p_session_id
+      and 'participant:' || participant.id::text = event_speaker_id
+  ) then raise exception using errcode='P0001', message='INDEPENDENT_TRANSLATION_PARTICIPANT_INVALID'; end if;
+
+  event_hash := pg_catalog.sha256(pg_catalog.convert_to(p_event::text, 'UTF8'));
+  select * into existing_row from public.live_utterances target
+    where target.session_id = p_session_id and target.language = p_language and target.seq = event_seq;
+  if found then
+    if existing_row.translation_capture is distinct from capture
+      or existing_row.translation_event_hash is distinct from event_hash
+    then raise exception using errcode='P0001', message='INDEPENDENT_TRANSLATION_REPLAY_CONFLICT'; end if;
+    return true;
+  end if;
+
+  -- The unchanged pre-source overload owns strict speaker/event validation,
+  -- sequential lane advancement and atomic snapshot+utterance persistence.
+  -- Participant ID and source start remain NULL so a generation-wide window
+  -- cannot inflate a participant's utterance count or speaking duration.
+  stored := public.persist_live_final_caption_if_active(
+    p_session_id, p_language, p_event - 'translationCapture', event_seq, p_event ->> 'text',
+    event_speaker_id, p_event -> 'speaker' ->> 'label', null::timestamptz,
+    (p_event ->> 'sourceEndedAt')::timestamptz, (p_event ->> 'emittedAt')::timestamptz,
+    null::uuid, null::text, null::text, null::text, p_event ->> 'utteranceKey', 'translated'::text
+  );
+  if not stored then raise exception using errcode='P0001', message='INVALID_INDEPENDENT_TRANSLATION'; end if;
+
+  update public.live_utterances set translation_capture = capture, translation_event_hash = event_hash
+    where session_id = p_session_id and language = p_language and seq = event_seq;
+  get diagnostics changed = row_count;
+  if changed <> 1 then raise exception using errcode='P0001', message='INDEPENDENT_TRANSLATION_COMMIT_FAILED'; end if;
+  update public.live_snapshots set captions = jsonb_build_array((captions -> 0)
+      || jsonb_build_object('translationCapture', capture))
+    where session_id = p_session_id and language = p_language and last_seq = event_seq;
+  get diagnostics changed = row_count;
+  if changed <> 1 then raise exception using errcode='P0001', message='INDEPENDENT_TRANSLATION_COMMIT_FAILED'; end if;
+  return true;
+end;
+$$;
+
+create or replace function public.persist_independent_live_translation_v1_fenced_v1(
+  p_epoch integer, p_owner_id uuid, p_session_id uuid, p_language text, p_event jsonb
+)
+returns boolean language plpgsql security definer set search_path = ''
+as $$
+begin
+  perform public.assert_live_media_write_epoch_v1(p_session_id, p_epoch, p_owner_id);
+  return public.persist_independent_live_translation_v1(p_session_id, p_language, p_event);
+end;
+$$;
+
+revoke all on function public.persist_independent_live_translation_v1(uuid,text,jsonb)
+  from public, anon, authenticated;
+revoke all on function public.persist_independent_live_translation_v1_fenced_v1(integer,uuid,uuid,text,jsonb)
+  from public, anon, authenticated;
+grant execute on function public.persist_independent_live_translation_v1(uuid,text,jsonb) to service_role;
+grant execute on function public.persist_independent_live_translation_v1_fenced_v1(integer,uuid,uuid,text,jsonb) to service_role;
+
+-- Rollback is application-first: stop using the independent entrypoint and
+-- retain these nullable fields and RPCs. No existing writer, ACL or RLS policy
+-- is replaced, and neither canonical originals nor historical rows are changed.
+
+-- supabase/migrations/202609010002_live_host_source_snapshot.sql
+
+-- 2026-09-01 feat: Read the canonical original ledger from the host live view.
+-- New read-only owner RPC; no table grants, participant policies or terminal
+-- audit RPCs change. Paging, corrections and known gaps share one SQL snapshot.
+
+create or replace function public.read_owned_live_source_snapshot_v1(
+  p_session_id uuid, p_host_id text,
+  p_after_source_seq bigint default 0, p_limit integer default 200
+)
+returns jsonb language plpgsql stable security definer set search_path = ''
+as $$
+declare
+  recording_gaps jsonb;
+  source_rows jsonb;
+  last_source_seq bigint;
+  next_source_seq bigint;
+  has_next boolean;
+  estimated_bytes bigint;
+begin
+  if p_after_source_seq is null or p_after_source_seq < 0 or p_after_source_seq > 9007199254740991
+    or p_limit is null or p_limit < 1 or p_limit > 500 then
+    raise exception using errcode = '22023', message = 'INVALID_SOURCE_SNAPSHOT_INPUT';
+  end if;
+  if p_host_id is null or char_length(p_host_id) not between 1 and 256 then
+    raise exception using errcode='42501',message='SOURCE_FORBIDDEN';
+  end if;
+  perform 1 from public.live_sessions target where target.id=p_session_id
+    and target.host_id=p_host_id and target.archive_deleted_at is null;
+  if not found then
+    raise exception using errcode='42501',message='SOURCE_FORBIDDEN';
+  end if;
+  -- The owner can inspect captured originals during a call and afterwards.
+  -- Participant grant, revocation and six-hour checks remain in their own RPC.
+  recording_gaps := public.read_owned_live_recording_gaps_v1(p_session_id,p_host_id) -> 'recordingGaps';
+
+  select coalesce(max(source.source_seq),0) into last_source_seq
+    from public.live_source_utterances source where source.session_id=p_session_id;
+  if last_source_seq > 9007199254740991 then
+    raise exception using errcode='P0001',message='SOURCE_SNAPSHOT_TOO_LARGE';
+  end if;
+  select coalesce(sum(octet_length(to_jsonb(coalesce(correction.corrected_text,source.normalized_text))::text)+2048),0)
+    into estimated_bytes from (select * from public.live_source_utterances target
+      where target.session_id=p_session_id and target.source_seq>p_after_source_seq
+      order by target.source_seq limit p_limit) source
+    left join lateral (select row.corrected_text from public.live_source_utterance_corrections row
+      where row.source_utterance_id=source.id and row.session_id=p_session_id order by row.revision desc limit 1) correction on true;
+  if estimated_bytes + octet_length(recording_gaps::text) > 12*1024*1024 then
+    raise exception using errcode='P0001',message='SOURCE_SNAPSHOT_TOO_LARGE';
+  end if;
+
+  select coalesce(jsonb_agg(jsonb_build_object(
+    'type','source','sessionId',source.session_id,'sourceUtteranceId',source.id,'sourceSeq',source.source_seq,
+    'utteranceKey',source.utterance_key,'text',coalesce(correction.corrected_text,source.normalized_text),
+    'sourceLanguage',source.source_language,'languageObservation',source.language_observation,
+    'speaker',jsonb_build_object('role',source.speaker_role,'label',case source.speaker_role
+      when 'host' then '발표자' when 'participant' then '참여자' else '화자 미상' end),
+    'isFinal',true,'sourceStartedAt',source.source_started_at,'sourceEndedAt',source.source_ended_at,
+    'emittedAt',source.provider_committed_at
+  ) order by source.source_seq),'[]'::jsonb),max(source.source_seq) into source_rows,next_source_seq
+    from (select * from public.live_source_utterances target
+      where target.session_id=p_session_id and target.source_seq>p_after_source_seq
+      order by target.source_seq limit p_limit) source
+    left join lateral (select row.corrected_text from public.live_source_utterance_corrections row
+      where row.source_utterance_id=source.id and row.session_id=p_session_id order by row.revision desc limit 1) correction on true;
+  has_next := next_source_seq is not null and next_source_seq < last_source_seq;
+  return jsonb_build_object('sessionId',p_session_id,'sources',source_rows,'lastSourceSeq',last_source_seq,
+    'hasNextPage',has_next,'nextAfterSourceSeq',case when has_next then next_source_seq else null end,
+    'recordsExpiresAt',null,'recordingGaps',recording_gaps);
+end;
+$$;
+revoke all on function public.read_owned_live_source_snapshot_v1(uuid,text,bigint,integer)
+  from public,anon,authenticated,service_role;
+grant execute on function public.read_owned_live_source_snapshot_v1(uuid,text,bigint,integer) to service_role;
+
+
+-- supabase/migrations/202609010003_live_source_recording_gaps.sql
+
+-- 2026-09-01 fix: Preserve only known failed source capture windows. Translation
+-- remains live; no original text or unobserved whole-call interval is invented.
+alter table public.live_media_recording_gaps
+  drop constraint if exists live_media_recording_gaps_reason_check;
+alter table public.live_media_recording_gaps
+  add constraint live_media_recording_gaps_reason_check
+  check (reason in ('no_viewers','host_unavailable','media_failed','source_recording_failed'));
+
+create or replace function public.record_live_source_gap_v1(
+  p_session_id uuid, p_segment_id uuid, p_started_at timestamptz, p_ended_at timestamptz,
+  p_epoch integer default null, p_owner_id uuid default null
+)
+returns jsonb language plpgsql security definer set search_path = ''
+as $$
+declare
+  existing_gap public.live_media_recording_gaps%rowtype;
+  stored_epoch integer := coalesce(p_epoch, 0);
+  inserted_count integer;
+begin
+  if p_session_id is null or p_segment_id is null or p_started_at is null or p_ended_at is null
+    or not isfinite(p_started_at) or not isfinite(p_ended_at)
+    or p_started_at > p_ended_at or p_ended_at-p_started_at > interval '60 seconds'
+    or p_ended_at > statement_timestamp()+interval '30 seconds'
+    or (p_epoch is null) is distinct from (p_owner_id is null)
+    or p_epoch < 1
+  then raise exception using errcode='P0001', message='INVALID_SOURCE_RECORDING_GAP'; end if;
+
+  -- Session then runtime is the same lock order used by caption/source writers.
+  perform 1 from public.live_sessions target where target.id=p_session_id
+    and target.status='live' and target.archive_deleted_at is null
+    and target.expires_at>statement_timestamp() for update;
+  if not found then raise exception using errcode='P0001', message='MEDIA_SESSION_ENDED'; end if;
+  if p_epoch is not null then
+    perform public.assert_live_media_write_epoch_v1(p_session_id,p_epoch,p_owner_id);
+  elsif exists(select 1 from public.live_session_runtime target where target.session_id=p_session_id) then
+    raise exception using errcode='P0001', message='MEDIA_WRITE_EPOCH_CONFLICT';
+  end if;
+
+  insert into public.live_media_recording_gaps(id,session_id,epoch,started_at,ended_at,reason)
+    values(p_segment_id,p_session_id,stored_epoch,p_started_at,p_ended_at,'source_recording_failed')
+    on conflict(id) do nothing;
+  get diagnostics inserted_count = row_count;
+  select * into existing_gap from public.live_media_recording_gaps target where target.id=p_segment_id;
+  if existing_gap.session_id is distinct from p_session_id or existing_gap.epoch is distinct from stored_epoch
+    or existing_gap.started_at is distinct from p_started_at or existing_gap.ended_at is distinct from p_ended_at
+    or existing_gap.reason is distinct from 'source_recording_failed'
+  then raise exception using errcode='P0001', message='SOURCE_GAP_IDEMPOTENCY_CONFLICT'; end if;
+  return jsonb_build_object('id',existing_gap.id,'sessionId',existing_gap.session_id,
+    'startedAt',existing_gap.started_at,'endedAt',existing_gap.ended_at,'reason',existing_gap.reason,
+    'idempotent',inserted_count=0);
+end;
+$$;
+revoke all on function public.record_live_source_gap_v1(uuid,uuid,timestamptz,timestamptz,integer,uuid)
+  from public,anon,authenticated,service_role;
+grant execute on function public.record_live_source_gap_v1(uuid,uuid,timestamptz,timestamptz,integer,uuid) to service_role;
+
+-- The same participant authorization and six-hour limit also guard gap recovery.
+create or replace function public.read_participant_live_source_snapshot_v1(
+  p_session_id uuid, p_user_id text, p_grant_id uuid default null,
+  p_after_source_seq bigint default 0, p_limit integer default 200
+)
+returns jsonb language plpgsql stable security definer set search_path = ''
+as $$
+declare
+  session_row public.live_sessions%rowtype;
+  records_expire_at timestamptz;
+  source_rows jsonb;
+  recording_gaps jsonb;
+  last_source_seq bigint;
+  next_source_seq bigint;
+  has_next boolean;
+  estimated_bytes bigint;
+begin
+  if p_after_source_seq is null or p_after_source_seq < 0 or p_after_source_seq > 9007199254740991
+    or p_limit is null or p_limit < 1 or p_limit > 500 then
+    raise exception using errcode = '22023', message = 'INVALID_SOURCE_SNAPSHOT_INPUT';
+  end if;
+  select * into session_row from public.live_sessions target
+    where target.id=p_session_id and target.archive_deleted_at is null;
+  if not found or not exists(select 1 from public.live_participants member
+    where member.session_id=p_session_id and member.user_id=p_user_id and member.records_revoked_at is null) then
+    raise exception using errcode='42501',message='SOURCE_FORBIDDEN';
+  end if;
+  if session_row.status in ('stopped','failed') then
+    if session_row.ended_at is null then
+      raise exception using errcode='P0001',message='RECAP_NOT_READY';
+    end if;
+    records_expire_at := session_row.ended_at + interval '6 hours';
+    if records_expire_at <= statement_timestamp() then
+      raise exception using errcode='P0001',message='RECAP_EXPIRED';
+    end if;
+  elsif session_row.status in ('preparing','live','paused') and session_row.expires_at > statement_timestamp() then
+    if not exists(select 1 from public.viewer_grants grant_row where grant_row.id=p_grant_id
+      and grant_row.session_id=p_session_id and grant_row.user_id=p_user_id
+      and grant_row.revoked_at is null and grant_row.expires_at > statement_timestamp()) then
+      raise exception using errcode='42501',message='SOURCE_FORBIDDEN';
+    end if;
+  else
+    raise exception using errcode='42501',message='SOURCE_FORBIDDEN';
+  end if;
+
+  if (select count(*) from public.live_media_recording_gaps target where target.session_id=p_session_id) > 12000 then
+    raise exception using errcode='P0001',message='SOURCE_SNAPSHOT_TOO_LARGE';
+  end if;
+  select coalesce(jsonb_agg(jsonb_build_object('id',target.id,'startedAt',target.started_at,
+    'endedAt',target.ended_at,'reason',target.reason) order by target.started_at,target.id),'[]'::jsonb)
+    into recording_gaps from public.live_media_recording_gaps target where target.session_id=p_session_id;
+
+  select coalesce(max(source.source_seq),0) into last_source_seq
+    from public.live_source_utterances source where source.session_id=p_session_id;
+  if last_source_seq > 9007199254740991 then
+    raise exception using errcode='P0001',message='SOURCE_SNAPSHOT_TOO_LARGE';
+  end if;
+  select coalesce(sum(octet_length(to_jsonb(coalesce(correction.corrected_text,source.normalized_text))::text)+2048),0)
+    into estimated_bytes from (select * from public.live_source_utterances target
+      where target.session_id=p_session_id and target.source_seq>p_after_source_seq
+      order by target.source_seq limit p_limit) source
+    left join lateral (select row.corrected_text from public.live_source_utterance_corrections row
+      where row.source_utterance_id=source.id and row.session_id=p_session_id order by row.revision desc limit 1) correction on true;
+  if estimated_bytes > 12*1024*1024 then
+    raise exception using errcode='P0001',message='SOURCE_SNAPSHOT_TOO_LARGE';
+  end if;
+
+  select coalesce(jsonb_agg(jsonb_build_object(
+    'type','source','sessionId',source.session_id,'sourceUtteranceId',source.id,'sourceSeq',source.source_seq,
+    'utteranceKey',source.utterance_key,'text',coalesce(correction.corrected_text,source.normalized_text),
+    'sourceLanguage',source.source_language,'languageObservation',source.language_observation,
+    'speaker',jsonb_build_object('role',source.speaker_role,'label',case source.speaker_role
+      when 'host' then '발표자' when 'participant' then '참여자' else '화자 미상' end),
+    'isFinal',true,'sourceStartedAt',source.source_started_at,'sourceEndedAt',source.source_ended_at,
+    'emittedAt',source.provider_committed_at
+  ) order by source.source_seq),'[]'::jsonb),max(source.source_seq) into source_rows,next_source_seq
+    from (select * from public.live_source_utterances target
+      where target.session_id=p_session_id and target.source_seq>p_after_source_seq
+      order by target.source_seq limit p_limit) source
+    left join lateral (select row.corrected_text from public.live_source_utterance_corrections row
+      where row.source_utterance_id=source.id and row.session_id=p_session_id order by row.revision desc limit 1) correction on true;
+  has_next := next_source_seq is not null and next_source_seq < last_source_seq;
+  return jsonb_build_object('sessionId',p_session_id,'sources',source_rows,'lastSourceSeq',last_source_seq,
+    'hasNextPage',has_next,'nextAfterSourceSeq',case when has_next then next_source_seq else null end,
+    'recordsExpiresAt',records_expire_at,'recordingGaps',recording_gaps);
+end;
+$$;
+revoke all on function public.read_participant_live_source_snapshot_v1(uuid,text,uuid,bigint,integer)
+  from public,anon,authenticated,service_role;
+grant execute on function public.read_participant_live_source_snapshot_v1(uuid,text,uuid,bigint,integer) to service_role;
+
+
+-- supabase/migrations/202609010004_live_input_source_provenance.sql
+
+-- 2026-09-01 feat: Live input transcription shares the existing translation
+-- connection. Keep its application/provider finalization evidence separate from
+-- old provider-final rows, without guessing timing or source/translation links.
+alter table public.live_source_utterances add column if not exists source_provenance jsonb;
+
+create or replace function public.live_input_source_provenance_valid_v1(p_value jsonb)
+returns boolean language sql immutable set search_path = ''
+as $$
+  select coalesce(jsonb_typeof(p_value)='object' and octet_length(p_value::text)<=1024
+    and p_value ?& array['kind','streamGeneration','captureEpoch','finalization']
+    and (p_value-array['kind','streamGeneration','captureEpoch','finalization'])='{}'::jsonb
+    and p_value->>'kind'='live-input-transcription'
+    and p_value->>'streamGeneration' ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
+    and p_value->>'captureEpoch' ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
+    and p_value->>'finalization' in ('provider-finished','application-quiet-boundary','application-drain-boundary','application-length-boundary'),false);
+$$;
+revoke all on function public.live_input_source_provenance_valid_v1(jsonb) from public,anon,authenticated,service_role;
+
+do $$ begin
+  if not exists(select 1 from pg_catalog.pg_constraint where conrelid='public.live_source_utterances'::regclass
+    and conname='live_source_input_provenance_check') then
+    alter table public.live_source_utterances add constraint live_source_input_provenance_check check (
+      source_provenance is null or (
+        public.live_input_source_provenance_valid_v1(source_provenance)
+        and stt_provider='gemini-live-input-transcription'
+        and stt_model is not distinct from 'gemini-3.5-live-translate-preview'
+        and source_started_at is null));
+  end if;
+end; $$;
+comment on column public.live_source_utterances.source_provenance is
+  'NULL for legacy provider finals. Live input records state observed provider-finished or an explicit application quiet/drain/length boundary; capture epochs are not word alignment.';
+comment on column public.live_source_utterances.provider_committed_at is
+  'Source acceptance time. Legacy provider-final time; Live input records use application commit time, with finalization evidence in source_provenance.';
+
+create or replace function public.persist_authoritative_live_source_utterance_v3(
+  p_session_id uuid,
+  p_utterance_key text,
+  p_raw_text text,
+  p_normalized_text text,
+  p_source_language text,
+  p_speaker_role text,
+  p_speaker_label text,
+  p_speaker_name text,
+  p_speaker_department text,
+  p_speaker_job_title text,
+  p_participant_id uuid,
+  p_source_started_at timestamptz,
+  p_source_ended_at timestamptz,
+  p_provider_committed_at timestamptz,
+  p_stt_provider text,
+  p_stt_model text,
+  p_translation_model text,
+  p_pipeline_config_fingerprint text,
+  p_language_observation jsonb,
+  p_source_provenance jsonb
+)
+returns jsonb language plpgsql security definer set search_path = ''
+as $$
+declare result jsonb; stored_provenance jsonb; changed integer;
+begin
+  if not public.live_input_source_provenance_valid_v1(p_source_provenance)
+    or p_stt_provider is distinct from 'gemini-live-input-transcription'
+    or p_stt_model is distinct from 'gemini-3.5-live-translate-preview'
+    or p_source_started_at is not null
+  then raise exception using errcode='22023',message='INVALID_LIVE_SOURCE_PROVENANCE'; end if;
+  perform 1 from public.live_sessions target where target.id=p_session_id
+    and target.status='live' and target.archive_deleted_at is null and target.expires_at>statement_timestamp() for update;
+  if not found then raise exception using errcode='P0001',message='SESSION_NOT_LIVE'; end if;
+  result := public.persist_authoritative_live_source_utterance_v2(p_session_id, p_utterance_key, p_raw_text, p_normalized_text, p_source_language, p_speaker_role, p_speaker_label, p_speaker_name, p_speaker_department, p_speaker_job_title, p_participant_id, p_source_started_at, p_source_ended_at, p_provider_committed_at, p_stt_provider, p_stt_model, p_translation_model, p_pipeline_config_fingerprint, p_language_observation);
+  if result->>'idempotent'='true' then
+    select source.source_provenance into stored_provenance from public.live_source_utterances source
+      where source.id=(result->>'sourceUtteranceId')::uuid and source.session_id=p_session_id;
+    if stored_provenance is distinct from p_source_provenance then
+      raise exception using errcode='P0001',message='SOURCE_UTTERANCE_IDEMPOTENCY_CONFLICT';
+    end if;
+  else
+    update public.live_source_utterances source set source_provenance=p_source_provenance
+      where source.id=(result->>'sourceUtteranceId')::uuid and source.session_id=p_session_id and source.source_provenance is null;
+    get diagnostics changed = row_count;
+    if changed<>1 then raise exception using errcode='P0001',message='SOURCE_UTTERANCE_IDEMPOTENCY_CONFLICT'; end if;
+  end if;
+  return result;
+end;
+$$;
+revoke all on function public.persist_authoritative_live_source_utterance_v3(uuid, text, text, text, text, text, text, text, text, text, uuid, timestamptz, timestamptz, timestamptz, text, text, text, text, jsonb, jsonb) from public,anon,authenticated,service_role;
+grant execute on function public.persist_authoritative_live_source_utterance_v3(uuid, text, text, text, text, text, text, text, text, text, uuid, timestamptz, timestamptz, timestamptz, text, text, text, text, jsonb, jsonb) to service_role;
+
+create or replace function public.persist_authoritative_live_source_utterance_v3_fenced_v1(
+  p_epoch integer, p_owner_id uuid,
+  p_session_id uuid,
+  p_utterance_key text,
+  p_raw_text text,
+  p_normalized_text text,
+  p_source_language text,
+  p_speaker_role text,
+  p_speaker_label text,
+  p_speaker_name text,
+  p_speaker_department text,
+  p_speaker_job_title text,
+  p_participant_id uuid,
+  p_source_started_at timestamptz,
+  p_source_ended_at timestamptz,
+  p_provider_committed_at timestamptz,
+  p_stt_provider text,
+  p_stt_model text,
+  p_translation_model text,
+  p_pipeline_config_fingerprint text,
+  p_language_observation jsonb,
+  p_source_provenance jsonb
+)
+returns jsonb language plpgsql security definer set search_path = ''
+as $$
+begin
+  perform public.assert_live_media_write_epoch_v1(p_session_id,p_epoch,p_owner_id);
+  return public.persist_authoritative_live_source_utterance_v3(p_session_id, p_utterance_key, p_raw_text, p_normalized_text, p_source_language, p_speaker_role, p_speaker_label, p_speaker_name, p_speaker_department, p_speaker_job_title, p_participant_id, p_source_started_at, p_source_ended_at, p_provider_committed_at, p_stt_provider, p_stt_model, p_translation_model, p_pipeline_config_fingerprint, p_language_observation, p_source_provenance);
+end;
+$$;
+revoke all on function public.persist_authoritative_live_source_utterance_v3_fenced_v1(integer,uuid,uuid, text, text, text, text, text, text, text, text, text, uuid, timestamptz, timestamptz, timestamptz, text, text, text, text, jsonb, jsonb) from public,anon,authenticated,service_role;
+grant execute on function public.persist_authoritative_live_source_utterance_v3_fenced_v1(integer,uuid,uuid, text, text, text, text, text, text, text, text, text, uuid, timestamptz, timestamptz, timestamptz, text, text, text, text, jsonb, jsonb) to service_role;
+
+
+-- supabase/migrations/202609010005_live_summary_configuration_retry.sql
+
+-- 2026-09-01 fix: Missing server configuration may be corrected before an
+-- explicit summary request. Preserve the existing three-attempt claim/token
+-- guard; do not change existing job rows or schedule provider requests.
+alter table public.live_summary_generation_jobs
+  drop constraint if exists live_summary_generation_jobs_retry_error_check;
+alter table public.live_summary_generation_jobs
+  add constraint live_summary_generation_jobs_retry_error_check check (
+    retryable=false or error_code in (
+      'SUMMARY_NOT_CONFIGURED','SUMMARY_TIMEOUT','SUMMARY_PROVIDER_RATE_LIMITED',
+      'SUMMARY_PROVIDER_UNAVAILABLE','SUMMARY_INCOMPLETE','UTTERANCES_READ_FAILED',
+      'PARTICIPANT_ACTIVITY_READ_FAILED'));
+
+create or replace function public.fail_live_summary_generation(
+  p_session_id uuid,
+  p_language text,
+  p_generation_token uuid,
+  p_error_code text
+)
+returns boolean
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+  affected_count integer;
+  transient_error boolean;
+begin
+  if p_session_id is null
+    or p_generation_token is null
+    or public.live_language_valid(p_language) is not true
+    or p_error_code is null
+    or char_length(p_error_code) not between 1 and 120
+    or p_error_code <> btrim(p_error_code)
+    or p_error_code ~ '[[:cntrl:]]'
+  then
+    return false;
+  end if;
+
+  transient_error := p_error_code in (
+    'SUMMARY_NOT_CONFIGURED',
+    'SUMMARY_TIMEOUT',
+    'SUMMARY_PROVIDER_RATE_LIMITED',
+    'SUMMARY_PROVIDER_UNAVAILABLE',
+    'SUMMARY_INCOMPLETE',
+    'UTTERANCES_READ_FAILED',
+    'PARTICIPANT_ACTIVITY_READ_FAILED'
+  );
+
+  update public.live_summary_generation_jobs as job_row
+  set status = 'failed',
+      error_code = p_error_code,
+      retryable = transient_error and job_row.attempt_count < 3,
+      next_retry_at = case
+        when transient_error and job_row.attempt_count < 3
+          then statement_timestamp()
+        else null
+      end,
+      completed_at = null,
+      failed_at = statement_timestamp(),
+      updated_at = statement_timestamp()
+  where job_row.session_id = p_session_id
+    and job_row.language = p_language
+    and job_row.generation_token = p_generation_token
+    and job_row.status = 'running'
+    and job_row.lease_expires_at > statement_timestamp();
+
+  GET DIAGNOSTICS affected_count = ROW_COUNT;
+  return affected_count = 1;
+end;
+$$;
+revoke all on function public.fail_live_summary_generation(uuid,text,uuid,text) from public,anon,authenticated,service_role;
+grant execute on function public.fail_live_summary_generation(uuid,text,uuid,text) to service_role;
+
+-- supabase/migrations/202609020001_live_summary_generic_failure_retry.sql
+
+-- 2026-09-02 fix: A generic summary failure must not become a permanent dead
+-- end, and a session with no recorded speech is an empty record rather than a
+-- failure. Three changes, no data loss:
+--   1. The generic catch-all codes join the transient list so the existing
+--      three-attempt claim/token guard can reclaim them automatically.
+--   2. read_live_summary_generation_status reports 'empty' for NO_UTTERANCES so
+--      the API can present an empty state instead of a generic failure.
+--   3. reset_live_summary_generation_v1 lets the owning host clear an
+--      exhausted or permanently failed job so the next claim proceeds. The RPC
+--      is repeatable: host resets are bounded by the per-host-session summary rate limit
+--      the API route enforces, not by this function.
+-- Existing job rows are never rewritten by this migration.
+
+alter table public.live_summary_generation_jobs
+  drop constraint if exists live_summary_generation_jobs_retry_error_check;
+alter table public.live_summary_generation_jobs
+  add constraint live_summary_generation_jobs_retry_error_check check (
+    retryable=false or error_code in (
+      'SUMMARY_NOT_CONFIGURED','SUMMARY_TIMEOUT','SUMMARY_PROVIDER_RATE_LIMITED',
+      'SUMMARY_PROVIDER_UNAVAILABLE','SUMMARY_INCOMPLETE','UTTERANCES_READ_FAILED',
+      'PARTICIPANT_ACTIVITY_READ_FAILED','SUMMARY_FAILED','SUMMARY_READY_MISSING',
+      'SUMMARY_COMPLETE_FAILED','SUMMARY_HOST_RESET'));
+
+-- An explicit host reset returns the lane to "no attempt spent" so the next
+-- claim allocates attempt one again. Only zero is newly permitted; the upper
+-- bound of three stays, so the attempt budget is still bounded.
+alter table public.live_summary_generation_jobs
+  drop constraint if exists live_summary_generation_jobs_attempt_count_check;
+alter table public.live_summary_generation_jobs
+  add constraint live_summary_generation_jobs_attempt_count_check check (
+    attempt_count between 0 and 3
+  );
+
+create or replace function public.fail_live_summary_generation(
+  p_session_id uuid,
+  p_language text,
+  p_generation_token uuid,
+  p_error_code text
+)
+returns boolean
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+  affected_count integer;
+  transient_error boolean;
+begin
+  if p_session_id is null
+    or p_generation_token is null
+    or public.live_language_valid(p_language) is not true
+    or p_error_code is null
+    or char_length(p_error_code) not between 1 and 120
+    or p_error_code <> btrim(p_error_code)
+    or p_error_code ~ '[[:cntrl:]]'
+  then
+    return false;
+  end if;
+
+  -- NO_UTTERANCES stays non-transient on purpose: an empty record is not a
+  -- failure to retry, and the read RPC reports it as 'empty'.
+  transient_error := p_error_code in (
+    'SUMMARY_NOT_CONFIGURED',
+    'SUMMARY_TIMEOUT',
+    'SUMMARY_PROVIDER_RATE_LIMITED',
+    'SUMMARY_PROVIDER_UNAVAILABLE',
+    'SUMMARY_INCOMPLETE',
+    'UTTERANCES_READ_FAILED',
+    'PARTICIPANT_ACTIVITY_READ_FAILED',
+    'SUMMARY_FAILED',
+    'SUMMARY_READY_MISSING',
+    'SUMMARY_COMPLETE_FAILED'
+  );
+
+  update public.live_summary_generation_jobs as job_row
+  set status = 'failed',
+      error_code = p_error_code,
+      retryable = transient_error and job_row.attempt_count < 3,
+      next_retry_at = case
+        when transient_error and job_row.attempt_count < 3
+          then statement_timestamp()
+        else null
+      end,
+      completed_at = null,
+      failed_at = statement_timestamp(),
+      updated_at = statement_timestamp()
+  where job_row.session_id = p_session_id
+    and job_row.language = p_language
+    and job_row.generation_token = p_generation_token
+    and job_row.status = 'running'
+    and job_row.lease_expires_at > statement_timestamp();
+
+  GET DIAGNOSTICS affected_count = ROW_COUNT;
+  return affected_count = 1;
+end;
+$$;
+
+create or replace function public.read_live_summary_generation_status(
+  p_session_id uuid,
+  p_language text
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+  job_status text;
+  job_error_code text;
+  job_attempt_count integer;
+  job_lease_expires_at timestamptz;
+  job_retryable boolean;
+begin
+  if p_session_id is null
+    or public.live_language_valid(p_language) is not true
+  then
+    return jsonb_build_object('ok', false, 'code', 'INVALID_SUMMARY_GENERATION_INPUT');
+  end if;
+
+  if exists (
+    select 1
+    from public.live_meeting_summaries as summary_row
+    where summary_row.session_id = p_session_id
+      and summary_row.language = p_language
+  ) then
+    return jsonb_build_object('ok', true, 'status', 'ready');
+  end if;
+
+  select
+    job_row.status,
+    job_row.error_code,
+    job_row.attempt_count,
+    job_row.lease_expires_at,
+    job_row.retryable
+  into
+    job_status,
+    job_error_code,
+    job_attempt_count,
+    job_lease_expires_at,
+    job_retryable
+  from public.live_summary_generation_jobs as job_row
+  where job_row.session_id = p_session_id
+    and job_row.language = p_language;
+
+  if job_status is null then
+    return jsonb_build_object('ok', true, 'status', 'missing');
+  end if;
+
+  if job_status = 'succeeded' then
+    return jsonb_build_object('ok', false, 'code', 'SUMMARY_READY_MISSING');
+  end if;
+
+  if job_status = 'running' then
+    if job_lease_expires_at > statement_timestamp() then
+      return jsonb_build_object('ok', true, 'status', 'running');
+    end if;
+    if job_attempt_count >= 3 then
+      return jsonb_build_object('ok', true, 'status', 'exhausted');
+    end if;
+    return jsonb_build_object('ok', true, 'status', 'retryable_failed');
+  end if;
+
+  if job_status = 'failed' then
+    -- An empty record outranks every failure classification: there is nothing
+    -- to summarize, so no attempt count and no retry advice applies.
+    if job_error_code = 'NO_UTTERANCES' then
+      return jsonb_build_object('ok', true, 'status', 'empty');
+    end if;
+    if job_attempt_count >= 3
+      or job_error_code = 'SUMMARY_MAX_ATTEMPTS_EXCEEDED'
+    then
+      return jsonb_build_object('ok', true, 'status', 'exhausted');
+    end if;
+    if job_retryable is true then
+      return jsonb_build_object('ok', true, 'status', 'retryable_failed');
+    end if;
+    return jsonb_build_object('ok', true, 'status', 'permanent_failed');
+  end if;
+
+  return jsonb_build_object('ok', false, 'code', 'SUMMARY_GENERATION_STATE_INVALID');
+end;
+$$;
+
+-- Host-owned recovery for a job that no automatic claim can reach any more
+-- (attempts exhausted, or a failure the fail RPC classified as permanent).
+-- A stored summary is never touched, a running lease is never stolen, and the
+-- reset only makes the job claimable again - it never generates anything.
+create or replace function public.reset_live_summary_generation_v1(
+  p_session_id uuid,
+  p_language text,
+  p_host_id text
+)
+returns boolean
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+  affected_count integer;
+begin
+  if p_session_id is null
+    or public.live_language_valid(p_language) is not true
+    or p_host_id is null
+    or length(p_host_id) not between 1 and 256
+  then
+    return false;
+  end if;
+
+  if not exists (
+    select 1
+    from public.live_sessions as session_row
+    where session_row.id = p_session_id
+      and session_row.host_id = p_host_id
+      and session_row.status in ('stopped', 'failed')
+  ) then
+    return false;
+  end if;
+
+  if exists (
+    select 1
+    from public.live_meeting_summaries as summary_row
+    where summary_row.session_id = p_session_id
+      and summary_row.language = p_language
+  ) then
+    return false;
+  end if;
+
+  -- One session-language lane serializes reset against claim, matching the
+  -- claim RPC's advisory lock so a reset cannot interleave with a reclaim.
+  perform pg_catalog.pg_advisory_xact_lock(
+    pg_catalog.hashtextextended(p_session_id::text || ':' || p_language, 0)
+  );
+
+  -- live_summary_generation_jobs_state_check forbids a failed row without an
+  -- error code, so the reset records itself as the reason instead of erasing
+  -- one: the job history still says why the lane became claimable again.
+  update public.live_summary_generation_jobs as job_row
+  set status = 'failed',
+      error_code = 'SUMMARY_HOST_RESET',
+      attempt_count = 0,
+      retryable = true,
+      next_retry_at = statement_timestamp(),
+      lease_expires_at = statement_timestamp(),
+      completed_at = null,
+      failed_at = statement_timestamp(),
+      updated_at = statement_timestamp()
+  where job_row.session_id = p_session_id
+    and job_row.language = p_language
+    and (
+      -- Empty is terminal; a new POST re-evaluates the utterances, a reset must not.
+      (job_row.status = 'failed'
+        and job_row.error_code <> 'NO_UTTERANCES'
+        and (job_row.attempt_count >= 3 or job_row.retryable is not true))
+      -- A crashed worker leaves 'running' with an expired lease; at the attempt
+      -- cap no claim can recover it either. A live lease is never stolen.
+      or (job_row.status = 'running'
+        and job_row.lease_expires_at <= statement_timestamp()
+        and job_row.attempt_count >= 3)
+    );
+
+  GET DIAGNOSTICS affected_count = ROW_COUNT;
+  return affected_count = 1;
+end;
+$$;
+
+revoke all on function public.fail_live_summary_generation(uuid, text, uuid, text)
+  from public, anon, authenticated, service_role;
+revoke all on function public.read_live_summary_generation_status(uuid, text)
+  from public, anon, authenticated, service_role;
+revoke all on function public.reset_live_summary_generation_v1(uuid, text, text)
+  from public, anon, authenticated, service_role;
+
+grant execute on function public.fail_live_summary_generation(uuid, text, uuid, text)
+  to service_role;
+grant execute on function public.read_live_summary_generation_status(uuid, text)
+  to service_role;
+grant execute on function public.reset_live_summary_generation_v1(uuid, text, text)
+  to service_role;
+
+-- Verification (development project only): fail a job with SUMMARY_FAILED and
+-- confirm read status reports retryable_failed and claim allocates attempt two;
+-- exhaust three attempts, confirm 'exhausted', then call
+-- reset_live_summary_generation_v1 as the owning host and confirm the next
+-- claim allocates attempt one again; exhaust and reset a second time to confirm
+-- the RPC is repeatable. A non-owner host id, and a NO_UTTERANCES lane, must
+-- return false and leave attempt_count untouched.
+
 -- supabase/migrations/202609020002_auth_profiles_desktop_codes.sql
 
 -- 2026-09-02 auth: Supabase Auth becomes the identity provider. Profiles carry the
