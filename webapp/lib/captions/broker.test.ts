@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { ManagedCaptionSession } from "./store";
-import { CaptionBroker, CaptionBrokerError } from "./broker";
+import { CaptionBroker, CaptionBrokerError, RENEWAL_GRACE_MS } from "./broker";
 const soniox = {stt:{provider:"soniox",model:"stt-rt-v5",languageMode:"auto"},translation:{provider:"soniox",model:"stt-rt-v5"},summary:{provider:"gemini",model:"gemini-3.6-flash"}};
 const gemini = {...soniox,stt:{provider:"gemini",model:"gemini-3.5-transcribe-live",languageMode:"auto"},translation:{provider:"gemini",model:"gemini-3.6-flash"}};
 function fixture() {
@@ -102,4 +102,17 @@ test("an expired ticket may revoke its own session but stopped sessions never re
   await assert.rejects(f.broker.stop("user-b",{ticket:session.ticket}));
   assert.deepEqual(await f.broker.stop("user-a",{ticket:session.ticket}),{stopped:true});
   await assert.rejects(f.broker.renew("user-a",{ticket:session.ticket}),(error:CaptionBrokerError)=>error.code==="CAPTION_SESSION_STOPPED");
+});
+
+test("an expired ticket renews within the 24 hour grace window and is gone for good after it",async()=>{
+  const f=fixture();const session=await f.broker.start("user-a",{languages:["ko","en"]});
+  assert.equal(RENEWAL_GRACE_MS,24*60*60_000);
+  f.setNow(Date.parse(session.expiresAt)+RENEWAL_GRACE_MS-60_000);
+  const resumed=await f.broker.renew("user-a",{ticket:session.ticket});assert.equal(resumed.sessionId,session.sessionId);
+  f.setNow(Date.parse(session.expiresAt)+RENEWAL_GRACE_MS+60_000);
+  await assert.rejects(f.broker.renew("user-a",{ticket:session.ticket}),(error:CaptionBrokerError)=>error.code==="CAPTION_SESSION_EXPIRED"&&error.status===410);
+  const again=await f.broker.renew("user-a",{ticket:resumed.ticket});assert.equal(again.sessionId,session.sessionId,"a renewed ticket carries its own fresh 6 h window and restarts the grace clock");
+  f.setNow(Date.parse(again.expiresAt)+RENEWAL_GRACE_MS+1);
+  await assert.rejects(f.broker.renew("user-a",{ticket:again.ticket}),(error:CaptionBrokerError)=>error.code==="CAPTION_SESSION_EXPIRED");
+  assert.deepEqual(await f.broker.stop("user-a",{ticket:session.ticket}),{stopped:true},"the owner can still end it");
 });

@@ -7,6 +7,8 @@ import { engineSelectionKey, normalizeEngineSelection } from "../../../packages/
 import type { EngineSelection } from "../live/model-preferences";
 
 const TICKET_TTL_MS = 6 * 60 * 60 * 1000;
+/** Mirrors renew_managed_caption_session_v1: an expired ticket resumes for 24 h, then the session is gone for good. */
+export const RENEWAL_GRACE_MS = 24 * 60 * 60 * 1000;
 const language = z.string().refine((value) => CAPTION_LANGUAGE_CODES.includes(value));
 const languages = z.array(language).min(1).max(3).refine((value) => new Set(value).size === value.length);
 const ticketInput = z.object({ ticket: z.string().min(1).max(8192) }).strict();
@@ -99,6 +101,7 @@ export class CaptionBroker {
   }
   async renew(hostId: string, body: unknown) {
     const input = parse(ticketInput, body); const claims = this.verify(input.ticket, hostId, true);
+    if (this.now() > claims.expiresAt + RENEWAL_GRACE_MS) throw new CaptionBrokerError("만료된 자막 세션은 24시간 안에만 다시 이어갈 수 있습니다. 자막을 새로 시작해 주세요.", "CAPTION_SESSION_EXPIRED", 410);
     await this.limit(hostId, "renew");
     const expiresAt = await this.dependencies.sessions.renew(claims.sessionId, hostId);
     if (!expiresAt) throw this.stopped();

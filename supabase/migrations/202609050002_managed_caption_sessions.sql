@@ -65,12 +65,24 @@ declare deadline timestamptz;
 begin
   -- Fresh host authentication can restore a finite access window after sleep.
   -- Expired provider credentials stay invalid; the durable active state is authoritative.
+  -- Renewal has a 24 hour grace window past the last access deadline: a laptop
+  -- that slept overnight resumes, but a session nobody ended cannot be revived
+  -- months later with a stale pinned assignment revision.
   update public.managed_caption_sessions s
   set access_renewed_at=statement_timestamp(),access_expires_at=statement_timestamp()+interval '6 hours'
   where s.id=p_session_id and s.host_id=p_host_id and s.status='active'
+    and statement_timestamp() <= s.access_expires_at + interval '24 hours'
     and exists(select 1 from public.profiles p where p.host_id=s.host_id and p.status='approved')
   returning s.access_expires_at into deadline;
-  if deadline is null then raise exception 'CAPTION_SESSION_FORBIDDEN' using errcode = '42501'; end if;
+  if deadline is null then
+    if exists(select 1 from public.managed_caption_sessions s
+      where s.id=p_session_id and s.host_id=p_host_id and s.status='active'
+        and statement_timestamp() > s.access_expires_at + interval '24 hours'
+        and exists(select 1 from public.profiles p where p.host_id=s.host_id and p.status='approved')) then
+      raise exception 'CAPTION_SESSION_EXPIRED' using errcode = '42501';
+    end if;
+    raise exception 'CAPTION_SESSION_FORBIDDEN' using errcode = '42501';
+  end if;
   return deadline;
 end;
 $$;

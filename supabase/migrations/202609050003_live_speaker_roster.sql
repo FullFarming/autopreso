@@ -1,12 +1,12 @@
 -- 2026-09-05 feat: Preserve each speaker identity version independently of the current roster.
-create table public.live_speaker_rosters (
+create table if not exists public.live_speaker_rosters (
  session_id uuid primary key references public.live_sessions(id) on delete cascade,
  revision integer not null default 0 check(revision >= 0),
  applied_revision integer not null default 0 check(applied_revision between 0 and revision),
  active_onsite_speaker_id uuid,
  speakers jsonb not null default '[]'::jsonb check(jsonb_typeof(speakers)='array' and jsonb_array_length(speakers)<=30)
 );
-create table public.live_speaker_photos (
+create table if not exists public.live_speaker_photos (
  id uuid primary key,
  session_id uuid not null references public.live_sessions(id) on delete cascade,
  content_type text not null check(content_type in ('image/jpeg','image/png','image/webp')),
@@ -14,7 +14,7 @@ create table public.live_speaker_photos (
  size_bytes integer not null check(size_bytes between 1 and 262144),
  check(octet_length(decode(image_base64,'base64'))=size_bytes)
 );
-create table public.live_speaker_profile_versions (
+create table if not exists public.live_speaker_profile_versions (
  session_id uuid not null references public.live_sessions(id) on delete cascade, speaker_id uuid not null,
  version integer not null check(version>0), profile jsonb not null,
  primary key(session_id,speaker_id,version)
@@ -24,7 +24,7 @@ alter table public.live_speaker_photos enable row level security;
 alter table public.live_speaker_profile_versions enable row level security;
 revoke all on public.live_speaker_rosters, public.live_speaker_photos, public.live_speaker_profile_versions from public, anon, authenticated, service_role;
 
-create function public.get_live_speaker_roster_gateway_v1(p_session_id uuid)
+create or replace function public.get_live_speaker_roster_gateway_v1(p_session_id uuid)
 returns jsonb language plpgsql stable security definer set search_path='' as $$
 declare r public.live_speaker_rosters%rowtype;
 begin
@@ -32,14 +32,14 @@ begin
  select * into r from public.live_speaker_rosters where session_id=p_session_id;
  return jsonb_build_object('sessionId',p_session_id,'revision',coalesce(r.revision,0),'appliedRevision',coalesce(r.applied_revision,0),'activeOnsiteSpeakerId',r.active_onsite_speaker_id,'speakers',coalesce(r.speakers,'[]'::jsonb));
 end $$;
-create function public.get_live_speaker_roster_v1(p_session_id uuid,p_host_id text)
+create or replace function public.get_live_speaker_roster_v1(p_session_id uuid,p_host_id text)
 returns jsonb language plpgsql stable security definer set search_path='' as $$
 begin
  if not exists(select 1 from public.live_sessions where id=p_session_id and host_id=p_host_id) then raise exception 'SPEAKER_ROSTER_FORBIDDEN'; end if;
  return public.get_live_speaker_roster_gateway_v1(p_session_id);
 end $$;
 
-create function public.replace_live_speaker_roster_v1(p_session_id uuid,p_host_id text,p_expected_revision integer,p_speakers jsonb,p_active_onsite_speaker_id uuid)
+create or replace function public.replace_live_speaker_roster_v1(p_session_id uuid,p_host_id text,p_expected_revision integer,p_speakers jsonb,p_active_onsite_speaker_id uuid)
 returns jsonb language plpgsql security definer set search_path='' as $$
 declare current_status text; r public.live_speaker_rosters%rowtype; s jsonb; previous jsonb; normalized jsonb; result jsonb:='[]'; selected_speaker_id uuid; participant_id uuid; photo_id uuid; next_version integer;
 begin
@@ -76,7 +76,7 @@ begin
  return public.get_live_speaker_roster_gateway_v1(p_session_id);
 end $$;
 
-create function public.ack_live_speaker_roster_v1(p_session_id uuid,p_revision integer)
+create or replace function public.ack_live_speaker_roster_v1(p_session_id uuid,p_revision integer)
 returns jsonb language plpgsql security definer set search_path='' as $$
 declare r public.live_speaker_rosters%rowtype;
 begin
@@ -90,7 +90,7 @@ begin
  return public.get_live_speaker_roster_gateway_v1(p_session_id);
 end $$;
 
-create function public.create_live_speaker_photo_v1(p_session_id uuid,p_host_id text,p_photo_id uuid,p_content_type text,p_bytes_base64 text)
+create or replace function public.create_live_speaker_photo_v1(p_session_id uuid,p_host_id text,p_photo_id uuid,p_content_type text,p_bytes_base64 text)
 returns jsonb language plpgsql security definer set search_path='' as $$
 declare current_status text; bytes bytea;
 begin
@@ -103,7 +103,7 @@ begin
  insert into public.live_speaker_photos(id,session_id,content_type,image_base64,size_bytes) values(p_photo_id,p_session_id,p_content_type,p_bytes_base64,octet_length(bytes));
  return jsonb_build_object('photoAssetId',p_photo_id);
 end $$;
-create function public.get_live_speaker_photo_v1(p_session_id uuid,p_photo_id uuid)
+create or replace function public.get_live_speaker_photo_v1(p_session_id uuid,p_photo_id uuid)
 returns jsonb language sql stable security definer set search_path='' as $$
  select jsonb_build_object('contentType',content_type,'bytesBase64',image_base64) from public.live_speaker_photos where session_id=p_session_id and id=p_photo_id;
 $$;

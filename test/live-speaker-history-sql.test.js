@@ -36,8 +36,13 @@ await db.exec(recapSql.match(/create or replace function public\.read_participan
 await db.exec(`create function persist_live_snapshot_if_active(p_session_id uuid,p_language text,p_event jsonb) returns boolean language plpgsql as $$begin insert into public.live_snapshots(session_id,language,last_seq,captions) values(p_session_id,p_language,(p_event->>'seq')::bigint,jsonb_build_array(p_event)) on conflict(session_id,language) do update set last_seq=excluded.last_seq,captions=excluded.captions;return true;end $$;`);
 await db.exec(`create function persist_live_utterance_if_active(p_session_id uuid,p_language text,p_seq bigint,p_text text,p_speaker_label text,p_speaker_name text,p_source_started_at timestamptz,p_source_ended_at timestamptz,p_emitted_at timestamptz,p_participant_id uuid,p_source_text text,p_source_language text,p_origin text,p_utterance_key text,p_translation_status text) returns boolean language plpgsql as $$begin insert into public.live_utterances(session_id,language,seq,speaker_label,speaker_name) values(p_session_id,p_language,p_seq,p_speaker_label,p_speaker_name) on conflict do nothing;return true;end $$;`);
 const atomic=await readMigration('20260726064308_atomic_live_final_caption.sql');await db.exec(atomic);
-await db.exec(await readMigration('202609050003_live_speaker_roster.sql'));
-await db.exec(await readMigration('202609050004_speaker_profile_history.sql'));
+for(const file of ['202609050003_live_speaker_roster.sql','202609050004_speaker_profile_history.sql']){
+  const sql=await readMigration(file);
+  assert.doesNotMatch(sql,/drop table|drop column|truncate|delete from|grant select/i,file);
+  // Both are unapplied in production: a second run must be a no-op, not a failure.
+  await db.exec(sql);await db.exec(sql);
+}
+assert.equal((await db.query("select count(*)::int as n from pg_proc where proname like '%before_speaker_profile' or proname like '%_before_profile'")).rows[0].n,4,'the renamed originals exist exactly once after two runs');
 const id='00000000-0000-4000-8000-000000000001',sid='00000000-0000-4000-8000-000000000002';
 await db.query("insert into live_sessions(id,host_id,status,expires_at) values($1,'host','live',now()+interval '1 hour')",[id]);
 const profile={id:sid,version:1,displayName:'민지',company:'회사',department:'부서',photoAssetId:null};

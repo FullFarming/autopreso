@@ -1,7 +1,7 @@
 -- 2026-09-05 feat: Persist the identity selected at the audio boundary, never the latest profile.
-alter table public.live_source_utterances add column speaker_profile jsonb, add column speaker_attribution text check(speaker_attribution is null or speaker_attribution='unresolved');
-alter table public.live_utterances add column speaker_profile jsonb, add column speaker_attribution text check(speaker_attribution is null or speaker_attribution='unresolved');
-create function public.assert_live_speaker_profile_v1(p_session_id uuid,p_profile jsonb,p_attribution text)
+alter table public.live_source_utterances add column if not exists speaker_profile jsonb, add column if not exists speaker_attribution text check(speaker_attribution is null or speaker_attribution='unresolved');
+alter table public.live_utterances add column if not exists speaker_profile jsonb, add column if not exists speaker_attribution text check(speaker_attribution is null or speaker_attribution='unresolved');
+create or replace function public.assert_live_speaker_profile_v1(p_session_id uuid,p_profile jsonb,p_attribution text)
 returns void language plpgsql stable security definer set search_path='' as $$
 begin
  if p_attribution is not null and p_attribution<>'unresolved' then raise exception 'SPEAKER_PROFILE_INVALID'; end if;
@@ -224,7 +224,7 @@ $$;
 revoke all on function public.persist_authoritative_live_source_utterance_v4(uuid, text, text, text, text, text, text, text, text, text, uuid, timestamptz, timestamptz, timestamptz, text, text, text, text, jsonb, jsonb, text, jsonb) from public,anon,authenticated,service_role;
 grant execute on function public.persist_authoritative_live_source_utterance_v4(uuid, text, text, text, text, text, text, text, text, text, uuid, timestamptz, timestamptz, timestamptz, text, text, text, text, jsonb, jsonb, text, jsonb) to service_role;
 
-create function public.persist_authoritative_live_source_utterance_v4_fenced_v1(p_epoch integer,p_owner_id uuid,
+create or replace function public.persist_authoritative_live_source_utterance_v4_fenced_v1(p_epoch integer,p_owner_id uuid,
   p_session_id uuid,
   p_utterance_key text,
   p_raw_text text,
@@ -414,9 +414,13 @@ revoke all on function public.read_participant_live_source_snapshot_v1(uuid,text
 grant execute on function public.read_participant_live_source_snapshot_v1(uuid,text,uuid,bigint,integer) to service_role;
 
 -- 2026-09-05 fix: Authorize custom identity before delegating to the existing caption sanitizer.
-alter function public.persist_live_snapshot_if_active(uuid,text,jsonb) rename to persist_live_snapshot_if_active_before_speaker_profile;
+do $$ begin
+  if not exists (select 1 from pg_proc p join pg_namespace n on n.oid=p.pronamespace where n.nspname='public' and p.proname='persist_live_snapshot_if_active_before_speaker_profile') then
+    alter function public.persist_live_snapshot_if_active(uuid,text,jsonb) rename to persist_live_snapshot_if_active_before_speaker_profile;
+  end if;
+end $$;
 revoke all on function public.persist_live_snapshot_if_active_before_speaker_profile(uuid,text,jsonb) from public,anon,authenticated,service_role;
-create function public.persist_live_snapshot_if_active(p_session_id uuid,p_language text,p_event jsonb)
+create or replace function public.persist_live_snapshot_if_active(p_session_id uuid,p_language text,p_event jsonb)
 returns boolean language plpgsql security definer set search_path='' as $$
 declare stored boolean; clean_event jsonb; existing jsonb; additions jsonb;
 begin
@@ -436,9 +440,13 @@ begin
 end $$;
 revoke all on function public.persist_live_snapshot_if_active(uuid,text,jsonb) from public,anon,authenticated,service_role;
 grant execute on function public.persist_live_snapshot_if_active(uuid,text,jsonb) to service_role;
-alter function public.persist_live_final_caption_if_active(uuid, text, jsonb, bigint, text, text, text, timestamptz, timestamptz, timestamptz, uuid, text, text, text, text, text) rename to persist_live_final_caption_before_speaker_profile;
+do $$ begin
+  if not exists (select 1 from pg_proc p join pg_namespace n on n.oid=p.pronamespace where n.nspname='public' and p.proname='persist_live_final_caption_before_speaker_profile') then
+    alter function public.persist_live_final_caption_if_active(uuid, text, jsonb, bigint, text, text, text, timestamptz, timestamptz, timestamptz, uuid, text, text, text, text, text) rename to persist_live_final_caption_before_speaker_profile;
+  end if;
+end $$;
 revoke all on function public.persist_live_final_caption_before_speaker_profile(uuid, text, jsonb, bigint, text, text, text, timestamptz, timestamptz, timestamptz, uuid, text, text, text, text, text) from public,anon,authenticated,service_role;
-create function public.persist_live_final_caption_if_active(
+create or replace function public.persist_live_final_caption_if_active(
   p_session_id uuid,
   p_language text,
   p_event jsonb,
@@ -470,9 +478,13 @@ end $$;
 revoke all on function public.persist_live_final_caption_if_active(uuid, text, jsonb, bigint, text, text, text, timestamptz, timestamptz, timestamptz, uuid, text, text, text, text, text) from public,anon,authenticated,service_role;
 grant execute on function public.persist_live_final_caption_if_active(uuid, text, jsonb, bigint, text, text, text, timestamptz, timestamptz, timestamptz, uuid, text, text, text, text, text) to service_role;
 
-alter function public.read_owned_authoritative_live_transcript_v1(text, uuid, bigint, integer) rename to read_owned_authoritative_live_transcript_v1_before_profile;
+do $$ begin
+  if not exists (select 1 from pg_proc p join pg_namespace n on n.oid=p.pronamespace where n.nspname='public' and p.proname='read_owned_authoritative_live_transcript_v1_before_profile') then
+    alter function public.read_owned_authoritative_live_transcript_v1(text, uuid, bigint, integer) rename to read_owned_authoritative_live_transcript_v1_before_profile;
+  end if;
+end $$;
 revoke all on function public.read_owned_authoritative_live_transcript_v1_before_profile(text, uuid, bigint, integer) from public,anon,authenticated,service_role;
-create function public.read_owned_authoritative_live_transcript_v1(
+create or replace function public.read_owned_authoritative_live_transcript_v1(
   p_host_id text,
   p_session_id uuid,
   p_after_source_seq bigint default 0,
@@ -509,9 +521,13 @@ $$;
 revoke all on function public.read_owned_authoritative_live_transcript_v1(text, uuid, bigint, integer) from public,anon,authenticated,service_role;
 grant execute on function public.read_owned_authoritative_live_transcript_v1(text, uuid, bigint, integer) to service_role;
 
-alter function public.read_participant_live_source_transcript_v1(uuid, text, bigint, integer) rename to read_participant_live_source_transcript_v1_before_profile;
+do $$ begin
+  if not exists (select 1 from pg_proc p join pg_namespace n on n.oid=p.pronamespace where n.nspname='public' and p.proname='read_participant_live_source_transcript_v1_before_profile') then
+    alter function public.read_participant_live_source_transcript_v1(uuid, text, bigint, integer) rename to read_participant_live_source_transcript_v1_before_profile;
+  end if;
+end $$;
 revoke all on function public.read_participant_live_source_transcript_v1_before_profile(uuid, text, bigint, integer) from public,anon,authenticated,service_role;
-create function public.read_participant_live_source_transcript_v1(
+create or replace function public.read_participant_live_source_transcript_v1(
   p_session_id uuid, p_user_id text,
   p_after_source_seq bigint default 0, p_limit integer default 200
 ) returns table(

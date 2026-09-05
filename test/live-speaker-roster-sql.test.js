@@ -4,11 +4,13 @@ import { pathToFileURL } from 'node:url';
 import test from 'node:test';
 const read = () => readFile(new URL('../supabase/migrations/202609050003_live_speaker_roster.sql', import.meta.url), 'utf8');
 test('speaker roster exposes service-only additive immutable profile storage', async () => {
- const sql=await read(); assert.match(sql,/live_speaker_profile_versions/);assert.match(sql,/for update/);assert.match(sql,/enable row level security/);assert.match(sql,/SPEAKER_ROSTER_CONFLICT/);assert.doesNotMatch(sql,/drop table|drop column/i);
+ const sql=await read(); assert.match(sql,/live_speaker_profile_versions/);assert.match(sql,/for update/);assert.match(sql,/enable row level security/);assert.match(sql,/SPEAKER_ROSTER_CONFLICT/);assert.doesNotMatch(sql,/drop table|drop column|truncate|delete from|grant select/i);
+ assert.doesNotMatch(sql,/create table public\.(?!.*if not exists)|^create function/im,'0003 is unapplied in production and must be re-runnable: create table if not exists / create or replace function');
 });
 test('roster CAS, ownership, immutable versions, participant boundaries and terminal guards', {skip: !process.env.NOVA_PGLITE_MODULE}, async(t)=>{
  const {PGlite}=await import(pathToFileURL(process.env.NOVA_PGLITE_MODULE).href);const db=new PGlite();t.after(()=>db.close());
  await db.exec(`create role anon;create role authenticated;create role service_role;create table live_sessions(id uuid primary key,host_id text,status text);create table live_participants(id uuid primary key,session_id uuid);`);await db.exec(await read());
+ await db.exec(await read()); // idempotent: a second apply is a no-op
  const id='00000000-0000-4000-8000-000000000001', sid='00000000-0000-4000-8000-000000000002',pid='00000000-0000-4000-8000-000000000003';
  await db.query("insert into live_sessions values($1,'owner','preparing')",[id]);
  const get=async()=> (await db.query('select get_live_speaker_roster_v1($1,$2) as state',[id,'owner'])).rows[0].state;

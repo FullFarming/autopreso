@@ -10,6 +10,8 @@ test('managed caption metadata is service-only and bootstrap mirrored', async ()
   assert.ok(bootstrap.includes(`-- supabase/migrations/${name}\n\n${sql}`));
   assert.match(sql,/enable row level security/);
   assert.match(sql,/interval '6 hours'/);
+  assert.match(sql,/statement_timestamp\(\) <= s\.access_expires_at \+ interval '24 hours'/,'renewal grace window');
+  assert.doesNotMatch(sql,/drop table|drop column|truncate|delete from|grant select/i);
   assert.doesNotMatch(sql,/audio|transcript/);
 });
 test('caption authority pins assignment, denies cross-owner/revoked/expired use and makes stop terminal', {skip:!process.env.NOVA_PGLITE_MODULE},async(t)=>{
@@ -52,6 +54,11 @@ test('caption authority pins assignment, denies cross-owner/revoked/expired use 
   await db.query('select renew_managed_caption_session_v1($1,$2)',[second,'owner']);
   const restored=(await db.query('select * from read_managed_caption_session_v1($1,$2)',[second,'owner'])).rows[0];
   assert.deepEqual(restored.engine,engine);assert.equal(restored.assignment_revision,'3');
+  await db.query("update managed_caption_sessions set access_expires_at=now()-interval '23 hours' where id=$1",[second]);
+  await db.query('select renew_managed_caption_session_v1($1,$2)',[second,'owner']);
+  await db.query("update managed_caption_sessions set access_expires_at=now()-interval '25 hours' where id=$1",[second]);
+  await assert.rejects(db.query('select renew_managed_caption_session_v1($1,$2)',[second,'owner']),/CAPTION_SESSION_EXPIRED/);
+  assert.equal((await db.query('select * from read_managed_caption_session_v1($1,$2)',[second,'owner'])).rows.length,0);
   await db.query("update managed_caption_sessions set access_expires_at=now()-interval '7 hours' where id=$1",[second]);
   await db.exec("update profiles set status='disabled' where host_id='owner'");
   await assert.rejects(db.query('select renew_managed_caption_session_v1($1,$2)',[second,'owner']),/FORBIDDEN/);
