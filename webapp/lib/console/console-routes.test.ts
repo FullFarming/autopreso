@@ -32,7 +32,7 @@ const routeSource = (name: string) => readFileSync(new URL(`../../app/api/${name
 // --- (a) source pins ---------------------------------------------------------
 
 test("every console route is force-dynamic, guards with requireAdmin, and checks the origin before mutating", () => {
-  for (const [name, mutating] of [["console/users", "PATCH"], ["console/sessions", null], ["console/engine-defaults", "PUT"], ["console/settings", "PUT"]] as const) {
+  for (const [name, mutating] of [["console/users", "PATCH"], ["console/users/[id]/active-sessions", null], ["console/sessions", null], ["console/engine-defaults", "PUT"], ["console/settings", "PUT"]] as const) {
     const source = routeSource(name);
     assert.match(source, /import \{ requireAdmin \} from "@\/lib\/auth\/require-admin"/u, name);
     assert.match(source, /await requireAdmin\(request\)/u, name);
@@ -44,6 +44,11 @@ test("every console route is force-dynamic, guards with requireAdmin, and checks
     }
   }
   assert.match(routeSource("console/users"), /\.refine\(/u, "PATCH users must accept exactly one of status/role");
+  // I3: the count endpoint derives the host id from the profile row, never from the query or body.
+  const activeSessions = routeSource("console/users/[id]/active-sessions");
+  assert.match(activeSessions, /readProfileById\(/u);
+  assert.match(activeSessions, /listActiveSessionsForHost\(target\.hostId\)/u);
+  assert.doesNotMatch(activeSessions, /searchParams|hostId: string \}|readBoundedJsonBody/u, "no client-supplied host id");
 });
 
 test("the legacy login route refuses when the console switch is off and live-config carries engineDefaults", () => {
@@ -67,7 +72,7 @@ class TestResponse {
   constructor(body: unknown, status = 200, headers?: HeadersInit) { this.body = body; this.status = status; this.headers = new Headers(headers); }
 }
 
-type Handler = (request: unknown) => Promise<TestResponse>;
+type Handler = (request: unknown, context?: unknown) => Promise<TestResponse>;
 
 // `lib/security/api-response.ts` imports the bare specifier `next/server`, which Node's ESM
 // resolver cannot load outside Next (no exports map), so anything that touches it is
@@ -105,7 +110,11 @@ const consoleRoute = loadTranspiled(readFileSync(new URL("./console-route.ts", i
 interface PushCall { gatewayUrl: string; sessionId: string; engine: unknown; token: string }
 const pushCalls: PushCall[] = [];
 const mintCalls: Array<{ hostId: string; sessionId: string }> = [];
-let pushOutcome: (sessionId: string) => { result: "switched" | "queued" | "failed"; code?: string } = () => ({ result: "switched" });
+let pushOutcome: (sessionId: string, attempt: number) => { result: "switched" | "queued" | "failed"; code?: string } = () => ({ result: "switched" });
+let mintFails = false;
+/** Cooldown waits the deploy asked for (I1 retry); the harness never really sleeps. */
+const sleeps: number[] = [];
+const pushAttempts = new Map<string, number>();
 const TOKEN_FIXTURE_PREFIX = "tok-fixture-";
 const engineDeploy = loadTranspiled(readFileSync(new URL("./engine-deploy.ts", import.meta.url), "utf8"), {
   "../../../packages/caption-core/caption-engine-catalog.js": captionEngineCatalog,
@@ -113,14 +122,25 @@ const engineDeploy = loadTranspiled(readFileSync(new URL("./engine-deploy.ts", i
     ...liveAuth,
     createAdminGatewayToken: async ({ hostId, sessionId }: { hostId: string; sessionId: string }) => {
       mintCalls.push({ hostId, sessionId });
+      if (mintFails) throw new Error("no signing secret");
       return { token: `${TOKEN_FIXTURE_PREFIX}${sessionId}`, claims: {} };
     },
   },
   "../live/gateway-engine-push": {
-    pushEngineToGateway: async (args: PushCall) => { pushCalls.push(args); return pushOutcome(args.sessionId); },
+    pushEngineToGateway: async (args: PushCall) => {
+      pushCalls.push(args);
+      const attempt = (pushAttempts.get(args.sessionId) ?? 0) + 1;
+      pushAttempts.set(args.sessionId, attempt);
+      return pushOutcome(args.sessionId, attempt);
+    },
   },
   "./console-store": consoleStore,
 });
+type DeployArgs = Parameters<typeof import("./engine-deploy").deployEngineToHostSessions>[0];
+const engineDeployForRoutes = {
+  ...engineDeploy,
+  deployEngineToHostSessions: (args: DeployArgs) => (engineDeploy.deployEngineToHostSessions as (a: DeployArgs) => unknown)({ ...args, sleep: async (ms: number) => { sleeps.push(ms); } }),
+};
 
 function loadRoute(name: string, overrides: Record<string, unknown> = {}): Record<"GET" | "PATCH" | "PUT" | "POST", Handler> {
   return loadTranspiled(routeSource(name), {
@@ -131,7 +151,7 @@ function loadRoute(name: string, overrides: Record<string, unknown> = {}): Recor
     "@/lib/console/session-summary": sessionSummary,
     "@/lib/console/console-store": consoleStore,
     "@/lib/console/engine-defaults": engineDefaults,
-    "@/lib/console/engine-deploy": engineDeploy,
+    "@/lib/console/engine-deploy": engineDeployForRoutes,
     "@/lib/security/bounded-json-body": boundedJsonBody,
     "@/lib/security/csrf": csrf,
     "@/lib/security/live-topic-validation": liveTopicValidation,
@@ -169,11 +189,16 @@ interface FakeStore {
   failWith: ConsoleStoreError | null;
   /** When set, `recordEngineDeploy` throws it (the audit row is best-effort; the switch results still answer). */
   auditFailure: ConsoleStoreError | null;
+  /** What `set_profile_voice_provider_v3` reports: `false` = the stored provider already matched (I1 no-op). */
+  voiceProviderChanged: boolean;
+  /** `readProfileById` answer; `null` = unknown profile. */
+  profile: { id: string; status: string; role: string; hostId: string; voiceProvider: string; voiceProviderRevision: string } | null;
 }
 
 function installFakeStore(overrides: Partial<Pick<FakeStore, "settings" | "sessions" | "activeSessions" | "switchResults">> = {}): FakeStore {
   const fake: FakeStore = {
-    calls: [], failWith: null, auditFailure: null,
+    calls: [], failWith: null, auditFailure: null, voiceProviderChanged: true,
+    profile: { id: TARGET_UUID, status: "approved", role: "host", hostId: TARGET_HOST_ID, voiceProvider: "soniox", voiceProviderRevision: "1" },
     settings: overrides.settings ?? { legacyPasswordLoginEnabled: true, engine: null, engineUpdatedAt: null, engineUpdatedByEmail: null },
     sessions: overrides.sessions ?? [],
     activeSessions: overrides.activeSessions ?? [],
@@ -194,14 +219,15 @@ function installFakeStore(overrides: Partial<Pick<FakeStore, "settings" | "sessi
       case "listProfiles": return [{ ...ADMIN, id: TARGET_UUID, hostId: TARGET_UUID, email: "b@x.io", role: "host", status: "pending", createdAt: "2026-09-02T00:00:00+00:00", lastLoginAt: null, approvedAt: null }];
       case "countPending": return 1;
       case "setProfileStatus": return { id: TARGET_UUID, status: (args as { status: string }).status, role: "host" };
-      case "setProfileVoiceProvider": return { id: TARGET_UUID, status: "approved", role: "host", hostId: TARGET_HOST_ID, provider: (args as { provider: string }).provider, revision: "2" };
+      case "setProfileVoiceProvider": return { id: TARGET_UUID, status: "approved", role: "host", hostId: TARGET_HOST_ID, provider: (args as { provider: string }).provider, revision: fake.voiceProviderChanged ? "2" : "1", changed: fake.voiceProviderChanged };
+      case "readProfileById": return fake.profile;
       case "setProfileRole": return { id: TARGET_UUID, status: "approved", role: (args as { role: string }).role };
       case "listSessions": return fake.sessions;
       case "readSettings": return fake.settings;
       default: return undefined;
     }
   };
-  const store = Object.fromEntries(["listProfiles", "countPending", "setProfileStatus", "setProfileRole", "setProfileVoiceProvider", "listSessions", "readSettings", "setLegacyPasswordLogin", "listActiveSessionsForHost", "setSessionEngineAsAdmin", "recordEngineDeploy"].map((m) => [m, record(m)]));
+  const store = Object.fromEntries(["listProfiles", "countPending", "setProfileStatus", "setProfileRole", "setProfileVoiceProvider", "listSessions", "readSettings", "setLegacyPasswordLogin", "listActiveSessionsForHost", "setSessionEngineAsAdmin", "recordEngineDeploy", "readProfileById"].map((m) => [m, record(m)]));
   __setConsoleStoreForTests(store as unknown as SupabaseConsoleStore);
   return fake;
 }
@@ -216,6 +242,9 @@ async function withEnvironment(run: () => Promise<void>) {
   delete process.env.NEXT_PUBLIC_LIVE_GATEWAY_URL;
   pushCalls.length = 0;
   mintCalls.length = 0;
+  sleeps.length = 0;
+  pushAttempts.clear();
+  mintFails = false;
   pushOutcome = () => ({ result: "switched" });
   try { await run(); } finally {
     __setConsoleStoreForTests(null);
@@ -342,7 +371,7 @@ test("GET /api/console/sessions maps range to since and computes the summary fro
   });
 });
 
-test("GET /api/console/engine-defaults returns the normalized selection with a key-availability catalog; PUT is retired with 410", async () => {
+test("GET /api/console/engine-defaults returns the key-availability catalog only (M3: no misleading global engine); PUT is retired with 410", async () => {
   await withEnvironment(async () => {
     process.env.GEMINI_API_KEY = "set";
     delete process.env.SONIOX_API_KEY;
@@ -352,18 +381,13 @@ test("GET /api/console/engine-defaults returns the normalized selection with a k
     const result = await route.GET(request("/api/console/engine-defaults"));
     assert.equal(result.status, 200);
     const { data } = bodyOf(result);
-    assert.deepEqual(data?.engine, stored);
-    assert.equal(data?.updatedAt, "2026-09-03T00:00:00+00:00");
-    assert.equal(data?.updatedByEmail, "admin@x.io");
+    assert.deepEqual(Object.keys(data ?? {}), ["catalog"], "the retired engine_defaults value is not surfaced as if it decided anything");
     const catalog = data?.catalog as { stt: Array<{ provider: string; available: boolean; requiredApiKey: string }>; defaults: unknown };
     assert.deepEqual(catalog.defaults, DEFAULT_ENGINE_SELECTION);
     assert.equal(catalog.stt.find((e) => e.provider === "gemini")?.available, true);
     assert.equal(catalog.stt.find((e) => e.provider === "soniox")?.available, false);
     assert.doesNotMatch(JSON.stringify(data), /"set"/u, "the catalog carries booleans, never key values");
-
-    // Garbage in the singleton falls back to the catalog default instead of failing the page.
-    fake.settings = { ...fake.settings, engine: { stt: { provider: "gemini", model: "nope" } } };
-    assert.deepEqual(bodyOf(await route.GET(request("/api/console/engine-defaults"))).data?.engine, DEFAULT_ENGINE_SELECTION);
+    assert.equal(fake.calls.length, 0, "the catalog needs no store read");
 
     // D1 retired the global engine: the value decides nothing, so a PUT is refused after the same guards
     // (origin, admin) and never reaches the store or a session.
@@ -485,6 +509,7 @@ test("PATCH voiceProvider writes the profile, then switches each of that user's 
         { sessionId: SESSION_C, result: "failed", code: "MEDIA_DRAINING" },
       ],
       summary: { switched: 1, queued: 1, failed: 1 },
+      changed: true,
     });
     // Order: profile write, that host's sessions (never the global list), one admin RPC per session carrying the profile revision, then the audit row.
     assert.deepEqual(fake.calls[0], { method: "setProfileVoiceProvider", args: { actorId: ADMIN_UUID, profileId: TARGET_UUID, provider: "gemini" } });
@@ -518,32 +543,33 @@ test("PATCH voiceProvider with no running session still answers the full shape a
     const fake = installFakeStore();
     const result = await loadRoute("console/users", adminModule()).PATCH(assignRequest("soniox"));
     assert.equal(result.status, 200);
-    assert.deepEqual(bodyOf(result).data, { id: TARGET_UUID, status: "approved", role: "host", voiceProvider: "soniox", results: [], summary: { switched: 0, queued: 0, failed: 0 } });
+    assert.deepEqual(bodyOf(result).data, { id: TARGET_UUID, status: "approved", role: "host", voiceProvider: "soniox", results: [], summary: { switched: 0, queued: 0, failed: 0 }, changed: true });
     assert.deepEqual(fake.calls.map((c) => c.method), ["setProfileVoiceProvider", "listActiveSessionsForHost", "recordEngineDeploy"]);
     assert.deepEqual((fake.calls.at(-1)?.args as { engine: unknown }).engine, SONIOX_ASSIGNED);
     assert.equal(pushCalls.length, 0);
   });
 });
 
-test("an unreachable gateway leaves failed rows but the DB writes (profile and every session) have already happened", async () => {
+test("I2: an unreachable gateway is a queued row (the DB is written; the host lease re-pins on reconnect), never failed", async () => {
   await withEnvironment(async () => {
     const fake = installFakeStore({ activeSessions: [{ id: SESSION_A, status: "live", languages: ["ko", "en"] }, { id: SESSION_B, status: "live", languages: ["en"] }] });
     pushOutcome = () => ({ result: "failed", code: "GATEWAY_UNREACHABLE" });
     const result = await loadRoute("console/users", adminModule()).PATCH(assignRequest("gemini"));
     assert.equal(result.status, 200, "a gateway outage is a per-session result, not a request failure");
     const { data } = bodyOf(result);
-    assert.deepEqual(data?.results, [{ sessionId: SESSION_A, result: "failed", code: "GATEWAY_UNREACHABLE" }, { sessionId: SESSION_B, result: "failed", code: "GATEWAY_UNREACHABLE" }]);
-    assert.deepEqual(data?.summary, { switched: 0, queued: 0, failed: 2 });
+    assert.deepEqual(data?.results, [{ sessionId: SESSION_A, result: "queued", code: "GATEWAY_UNREACHABLE" }, { sessionId: SESSION_B, result: "queued", code: "GATEWAY_UNREACHABLE" }]);
+    assert.deepEqual(data?.summary, { switched: 0, queued: 2, failed: 0 });
     assert.equal(methodsOf(fake, "setProfileVoiceProvider").length, 1);
     assert.equal(methodsOf(fake, "setSessionEngineAsAdmin").length, 2, "both session records carry the new engine even though no gateway confirmed");
-    assert.equal(pushCalls.length, 2);
+    assert.equal(pushCalls.length, 2, "a transport failure is not retried - only the cooldown 429 is");
+    assert.deepEqual(sleeps, []);
 
-    // No gateway configured at all: same DB writes, LIVE_GATEWAY_URL_MISSING rows, nothing pushed or minted.
+    // No gateway configured at all: same DB writes, LIVE_GATEWAY_URL_MISSING queued rows, nothing pushed or minted.
     delete process.env.LIVE_GATEWAY_URL;
     pushCalls.length = 0; mintCalls.length = 0;
     const unconfigured = installFakeStore({ activeSessions: [{ id: SESSION_A, status: "live", languages: ["ko", "en"] }] });
     const missing = await loadRoute("console/users", adminModule()).PATCH(assignRequest("gemini"));
-    assert.deepEqual(bodyOf(missing).data?.results, [{ sessionId: SESSION_A, result: "failed", code: "LIVE_GATEWAY_URL_MISSING" }]);
+    assert.deepEqual(bodyOf(missing).data?.results, [{ sessionId: SESSION_A, result: "queued", code: "LIVE_GATEWAY_URL_MISSING" }]);
     assert.equal(methodsOf(unconfigured, "setSessionEngineAsAdmin").length, 1);
     assert.equal(pushCalls.length, 0);
     assert.equal(mintCalls.length, 0);
@@ -590,6 +616,99 @@ test("the catalog language guard runs before any session write: 1-3 distinct lan
     assert.deepEqual(methodsOf(fake, "setSessionEngineAsAdmin").map((c) => (c.args as { sessionId: string }).sessionId), [SESSION_A], "refused sessions are never written");
     assert.deepEqual(pushCalls.map((c) => c.sessionId), [SESSION_A]);
     assert.deepEqual(pushCalls[0].engine, SONIOX_ASSIGNED);
+  });
+});
+
+test("I1: PATCH with the provider the profile already holds writes nothing else - no session RPC, no push, no audit row - and answers changed: false", async () => {
+  await withEnvironment(async () => {
+    const fake = installFakeStore({ activeSessions: [{ id: SESSION_A, status: "live", languages: ["ko", "en"] }, { id: SESSION_B, status: "live", languages: ["ko"] }] });
+    fake.voiceProviderChanged = false;
+    const result = await loadRoute("console/users", adminModule()).PATCH(assignRequest("soniox"));
+    assert.equal(result.status, 200);
+    assert.deepEqual(bodyOf(result).data, { id: TARGET_UUID, status: "approved", role: "host", voiceProvider: "soniox", results: [], summary: { switched: 0, queued: 0, failed: 0 }, changed: false });
+    assert.deepEqual(fake.calls.map((c) => c.method), ["setProfileVoiceProvider"], "the profile RPC is the only store call");
+    assert.equal(pushCalls.length, 0);
+    assert.equal(mintCalls.length, 0);
+  });
+});
+
+test("I1: a 429 ENGINE_SWITCH_RATE_LIMITED push waits the gateway cooldown once and retries; success is switched, a second 429 is queued", async () => {
+  await withEnvironment(async () => {
+    installFakeStore({ activeSessions: [{ id: SESSION_A, status: "live", languages: ["ko", "en"] }, { id: SESSION_B, status: "live", languages: ["ko", "en"] }, { id: SESSION_C, status: "live", languages: ["ko"] }] });
+    pushOutcome = (sessionId, attempt) => {
+      if (sessionId === SESSION_A) return attempt === 1 ? { result: "failed", code: "ENGINE_SWITCH_RATE_LIMITED" } : { result: "switched" };
+      if (sessionId === SESSION_B) return { result: "failed", code: "ENGINE_SWITCH_RATE_LIMITED" };
+      return { result: "switched" };
+    };
+    const result = await loadRoute("console/users", adminModule()).PATCH(assignRequest("gemini"));
+    const { data } = bodyOf(result);
+    assert.deepEqual(data?.results, [
+      { sessionId: SESSION_A, result: "switched" },
+      { sessionId: SESSION_B, result: "queued", code: "ENGINE_SWITCH_RATE_LIMITED" },
+      { sessionId: SESSION_C, result: "switched" },
+    ]);
+    assert.deepEqual(data?.summary, { switched: 2, queued: 1, failed: 0 });
+    assert.deepEqual(Object.fromEntries(pushAttempts), { [SESSION_A]: 2, [SESSION_B]: 2, [SESSION_C]: 1 }, "exactly one retry per rate-limited session");
+    assert.deepEqual(sleeps, [2200, 2200], "each retry waits the 2 s gateway cooldown plus margin");
+    // The retry carries a fresh session-bound token; the same token is never reused after a wait.
+    assert.equal(mintCalls.filter((c) => c.sessionId === SESSION_A).length, 2);
+  });
+});
+
+test("I2: transport-class push outcomes are queued with their code; gateway verdicts on the request itself stay failed", async () => {
+  await withEnvironment(async () => {
+    const SESSION_D = "00000000-0000-4000-8000-0000000000a4", SESSION_E = "00000000-0000-4000-8000-0000000000a5";
+    installFakeStore({ activeSessions: [SESSION_A, SESSION_B, SESSION_C, SESSION_D, SESSION_E].map((id) => ({ id, status: "live", languages: ["ko", "en"] })) });
+    const outcomes: Record<string, { result: "switched" | "queued" | "failed"; code?: string }> = {
+      [SESSION_A]: { result: "failed", code: "GATEWAY_TIMEOUT" },
+      [SESSION_B]: { result: "failed", code: "GATEWAY_HTTP_503" },
+      [SESSION_C]: { result: "failed", code: "GATEWAY_HTTP_400" },
+      [SESSION_D]: { result: "failed", code: "MEDIA_DRAINING" },
+      [SESSION_E]: { result: "failed", code: "GATEWAY_SHUTTING_DOWN" },
+    };
+    pushOutcome = (sessionId) => outcomes[sessionId];
+    const result = await loadRoute("console/users", adminModule()).PATCH(assignRequest("gemini"));
+    assert.deepEqual(bodyOf(result).data?.results, [
+      { sessionId: SESSION_A, result: "queued", code: "GATEWAY_TIMEOUT" },
+      { sessionId: SESSION_B, result: "queued", code: "GATEWAY_HTTP_503" },
+      { sessionId: SESSION_C, result: "failed", code: "GATEWAY_HTTP_400" },
+      { sessionId: SESSION_D, result: "failed", code: "MEDIA_DRAINING" },
+      { sessionId: SESSION_E, result: "queued", code: "GATEWAY_SHUTTING_DOWN" },
+    ]);
+    assert.deepEqual(bodyOf(result).data?.summary, { switched: 0, queued: 3, failed: 2 });
+    assert.deepEqual(sleeps, []);
+
+    // No admin token can be minted (signing secret missing): the DB write stands, the row is queued.
+    mintFails = true; pushCalls.length = 0;
+    const fake = installFakeStore({ activeSessions: [{ id: SESSION_A, status: "live", languages: ["ko", "en"] }] });
+    const unsigned = await loadRoute("console/users", adminModule()).PATCH(assignRequest("gemini"));
+    assert.deepEqual(bodyOf(unsigned).data?.results, [{ sessionId: SESSION_A, result: "queued", code: "ADMIN_TOKEN_UNAVAILABLE" }]);
+    assert.equal(methodsOf(fake, "setSessionEngineAsAdmin").length, 1);
+    assert.equal(pushCalls.length, 0);
+  });
+});
+
+test("I3: GET /api/console/users/[id]/active-sessions counts that profile's preparing/live sessions from the server-side host id", async () => {
+  await withEnvironment(async () => {
+    const fake = installFakeStore({ activeSessions: [{ id: SESSION_A, status: "live", languages: ["ko", "en"] }, { id: SESSION_B, status: "preparing", languages: ["ja"] }] });
+    const route = loadRoute("console/users/[id]/active-sessions", adminModule());
+    const get = (id: string) => route.GET(request(`/api/console/users/${id}/active-sessions`), { params: Promise.resolve({ id }) });
+    const result = await get(TARGET_UUID);
+    assert.equal(result.status, 200);
+    assert.equal(result.headers.get("cache-control"), "private, no-store");
+    assert.deepEqual(bodyOf(result).data, { count: 2, sessions: [{ id: SESSION_A, status: "live", languages: ["ko", "en"] }, { id: SESSION_B, status: "preparing", languages: ["ja"] }] });
+    assert.deepEqual(fake.calls.map((c) => c.method), ["readProfileById", "listActiveSessionsForHost"]);
+    assert.deepEqual(fake.calls[0].args, { actorId: ADMIN_UUID, profileId: TARGET_UUID });
+    assert.equal(fake.calls[1].args, TARGET_HOST_ID, "the host id comes from the profile row");
+
+    assert.equal((await get("not-a-uuid")).status, 400);
+    fake.profile = null;
+    const unknown = await get(TARGET_UUID);
+    assert.equal(unknown.status, 404);
+    assert.equal(bodyOf(unknown).code, "PROFILE_NOT_FOUND");
+    const denied = await loadRoute("console/users/[id]/active-sessions", adminModule("host")).GET(request(`/api/console/users/${TARGET_UUID}/active-sessions`), { params: Promise.resolve({ id: TARGET_UUID }) });
+    assert.equal(denied.status, 403);
+    assert.equal(bodyOf(denied).code, "ADMIN_REQUIRED");
   });
 });
 

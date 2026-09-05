@@ -46,11 +46,13 @@ export async function GET(request: NextRequest) {
 /**
  * `PATCH /api/console/users { profileId, status? | role? | voiceProvider?, reason? }`.
  * `status`/`role` answer `{ id, status, role }`. `voiceProvider` (D1, operator-only) writes the
- * profile first (authoritative, persists for future sessions), then switches every
- * `preparing|live` session of that user immediately - admin RPC per session with the new
- * assignment revision, then the gateway push - and answers
- * `{ id, status, role, voiceProvider, results: [{ sessionId, result, code? }], summary }`.
- * Per-session failures are rows, not errors; the deploy audit row is best-effort.
+ * profile first (authoritative, persists for future sessions), then - only when the RPC reports
+ * the provider actually `changed` - switches every `preparing|live` session of that user
+ * immediately: admin RPC per session with the new assignment revision, then the gateway push.
+ * Answers `{ id, status, role, voiceProvider, results: [{ sessionId, result, code? }], summary, changed }`;
+ * an unchanged provider (I1) answers `results: [], summary: 0/0/0, changed: false` and touches no
+ * session (re-pushing an identical engine only appended history, bumped versions and tripped the
+ * gateway's switch cooldown). Per-session failures are rows, not errors; the audit row is best-effort.
  */
 export async function PATCH(request: NextRequest) {
   try {
@@ -61,18 +63,22 @@ export async function PATCH(request: NextRequest) {
     const { profileId, status, role, reason, voiceProvider } = parsed.data;
     const store = getConsoleStore();
     if (voiceProvider) {
-      const changed = await store.setProfileVoiceProvider({ actorId: profile.id, profileId, provider: voiceProvider });
-      const engine = engineSelectionForVoiceProvider(changed.provider);
+      const assigned = await store.setProfileVoiceProvider({ actorId: profile.id, profileId, provider: voiceProvider });
+      const identity = { id: assigned.id, status: assigned.status, role: assigned.role, voiceProvider: assigned.provider };
+      if (!assigned.changed) {
+        return apiSuccess({ ...identity, results: [], summary: { switched: 0, queued: 0, failed: 0 }, changed: false }, { headers: privateNoStoreHeaders() });
+      }
+      const engine = engineSelectionForVoiceProvider(assigned.provider);
       const { results, summary } = await deployEngineToHostSessions({
-        store, actorId: profile.id, actorHostId, hostId: changed.hostId, engine, assignmentRevision: changed.revision, gatewayUrl: readDeployGatewayUrl(),
+        store, actorId: profile.id, actorHostId, hostId: assigned.hostId, engine, assignmentRevision: assigned.revision, gatewayUrl: readDeployGatewayUrl(),
       });
       try {
-        await store.recordEngineDeploy({ actorId: profile.id, engine, summary, target: { profileId: changed.id, hostId: changed.hostId, voiceProvider: changed.provider, revision: changed.revision } });
+        await store.recordEngineDeploy({ actorId: profile.id, engine, summary, target: { profileId: assigned.id, hostId: assigned.hostId, voiceProvider: assigned.provider, revision: assigned.revision } });
       } catch {
         // The assignment itself is already logged by the RPC (`kind: "user_assignment"`); the
         // counters row must not turn a completed switch into an error the operator would retry.
       }
-      return apiSuccess({ id: changed.id, status: changed.status, role: changed.role, voiceProvider: changed.provider, results, summary }, { headers: privateNoStoreHeaders() });
+      return apiSuccess({ ...identity, results, summary, changed: true }, { headers: privateNoStoreHeaders() });
     }
     const result = status
       ? await store.setProfileStatus({ actorId: profile.id, profileId, status, reason })

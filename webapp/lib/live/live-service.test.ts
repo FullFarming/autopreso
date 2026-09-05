@@ -27,9 +27,11 @@ import {
 import type { CreateGlossaryPresetInput } from "../glossary-presets/schema";
 import type { GlossaryPreset } from "../glossary-presets/types";
 import { fingerprintGlossaryDocumentV1 } from "../../../packages/caption-core/index.js";
-import { DEFAULT_ENGINE_SELECTION } from "../../../packages/caption-core/caption-engine-catalog.js";
-import { readStoredEngineDefaults } from "../console/engine-defaults";
-import { readLiveModelPreferences } from "./model-preferences";
+import { DEFAULT_ENGINE_SELECTION, normalizeEngineSelection } from "../../../packages/caption-core/caption-engine-catalog.js";
+import { type EngineSelection, readLiveModelPreferences } from "./model-preferences";
+
+// Fixture normalizer: the catalog's own validation, the same one the console store applies.
+const readStoredEngineDefaults = (value: unknown): EngineSelection => normalizeEngineSelection(value) as EngineSelection;
 
 // Spec §9: the console's global engine is the ONLY Live Call engine. The detailed
 // authority matrix (admin vs host, legacy input, history) lives in model-preferences.test.ts.

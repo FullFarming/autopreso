@@ -51,11 +51,6 @@ export function countActiveSessions(rows: readonly Pick<ConsoleSessionSummaryRow
   return rows.reduce((count, row) => count + (row.status === "preparing" || row.status === "live" ? 1 : 0), 0);
 }
 
-/** D1: a per-user engine change switches only that host's running sessions - the number the confirm dialog quotes. */
-export function countActiveSessionsForHost(rows: readonly { hostId: string; status: string }[], hostId: string): number {
-  return countActiveSessions(rows.filter((row) => row.hostId === hostId));
-}
-
 /** Provider brand names are not translated; an unset assignment reads as the D2 default. */
 export function voiceProviderLabel(provider: string | undefined): string {
   return provider === "gemini" ? "Gemini" : "Soniox";
@@ -87,7 +82,9 @@ export function sessionModeLabelKey(mode: string): string {
   return mode === "meeting" ? "회의" : "발표";
 }
 
-const DEPLOY_RESULT_LABEL_KEYS: Readonly<Record<string, string>> = Object.freeze({ switched: "전환됨", queued: "대기열", failed: "실패" });
+// `queued` is not a limbo state: the session record already carries the new engine and the host
+// re-pins it on its next reconnect (I2), so the label says when it applies instead of "waiting".
+const DEPLOY_RESULT_LABEL_KEYS: Readonly<Record<string, string>> = Object.freeze({ switched: "전환됨", queued: "호스트 재접속 시 적용됩니다", failed: "실패" });
 
 /** Per-session deploy outcome (spec §9). Anything the client does not recognise is shown as 실패 rather than a blank pill. */
 export function deployResultLabelKey(result: string): string {

@@ -315,15 +315,17 @@ interface LegacySessionSettingsInput {
 }
 
 /**
- * Spec §9 (2026-09-04): the admin console's global engine is the only Live Call
- * engine. Routes pass the resolved global default plus whether the caller is an
- * admin; the service is the authority, not the client.
+ * D1 (2026-09-05): the Live Call engine is assigned PER USER by the operator
+ * (`profiles.voice_provider`). Routes pass the host's resolved assignment
+ * (`resolveHostEngineAssignment(hostId)` → engine + revision); the service is the
+ * authority, not the client. Hosts cannot choose an engine.
  */
 export interface EngineAuthorityOptions {
-  /** `resolveEngineDefaultsOrFallback()`; absent only for direct callers (tests) - then the client's engine stands. */
+  /** The host's assigned engine (`engineSelectionForVoiceProvider`); absent only for direct callers (tests) - then the client's engine stands. */
   engineDefaults?: EngineSelection;
+  /** `profiles.voice_provider_revision` at the time of the read; pinned on the record so the console's immediate switch and the host agree. */
   assignmentRevision?: string;
-  /** Admins (the console deploy path) may set an explicit engine. */
+  /** Admins acting through the console (a path that pins its own engine) may set an explicit engine. */
   isAdmin?: boolean;
 }
 export type CreateServiceOptions = EngineAuthorityOptions;
@@ -334,13 +336,14 @@ function readRequestedEngine(value: unknown): EngineSelection | undefined {
 }
 
 /**
- * - nothing requested -> `fallback` (the global default on create, the current engine on update)
- * - admin request -> honoured
- * - non-admin request -> REPLACED by the global default (not rejected: server authority)
+ * - nothing requested -> `fallback` (the host's assignment on create, the current engine on update)
+ * - a per-user assignment was resolved (`assignmentRevision` present) -> that assignment, whoever asks
+ * - admin request without an assignment -> honoured
+ * - non-admin request -> REPLACED by the assignment, or the catalog default (not rejected: server authority)
  */
-// Spec §9: only an admin's request is honoured. A non-admin's engine is
-// replaced by the console's global engine, or — when no defaults resolved —
-// by the catalog default; it is never the requested engine (Task 4 fix M3).
+// D1: the operator's per-user assignment wins over anything the client sent; a
+// non-admin's engine is never the requested one (Task 4 fix M3 kept the
+// replace-not-reject rule).
 function resolveEngineAuthority(requested: EngineSelection | undefined, options: EngineAuthorityOptions, fallback: EngineSelection): EngineSelection {
   if (requested === undefined) return fallback;
   if (options.assignmentRevision !== undefined) return options.engineDefaults ?? fallback;

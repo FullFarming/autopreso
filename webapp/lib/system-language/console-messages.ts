@@ -104,6 +104,7 @@ const entries: readonly (readonly [string, string, string])[] = [
   ["코드", "Code", "コード"],
   ["전환됨", "Switched", "切り替え済み"],
   ["대기열", "Queued", "待機中"],
+  ["호스트 재접속 시 적용됩니다", "Applies when the host reconnects", "ホストの再接続時に適用されます"],
   ["지원하지 않는 엔진 조합입니다.", "Unsupported engine combination.", "サポートされていないエンジンの組み合わせです。"],
   ["엔진 제공자 값이 올바르지 않습니다.", "The engine provider value is not valid.", "エンジン提供者の値が正しくありません。"],
   ["전역 엔진 기본값은 더 이상 사용하지 않습니다. 사용자 탭에서 사용자별 엔진을 바꾸세요.", "The global engine default is retired. Change per-user engines in the Users tab.", "グローバルなエンジン既定値は廃止されました。ユーザータブでユーザー別のエンジンを変更してください。"],

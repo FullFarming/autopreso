@@ -3,27 +3,21 @@ import test from "node:test";
 import { DEFAULT_ENGINE_SELECTION } from "../../../packages/caption-core/caption-engine-catalog.js";
 import { LiveSecurityConfigurationError } from "../security/config";
 import { ConsoleStoreError, SupabaseConsoleStore, __setConsoleStoreForTests, type ConsoleSettings } from "./console-store";
-import {
-  CONSOLE_SETTINGS_FALLBACK, consoleSettingsCache, createConsoleSettingsCache,
-  readStoredEngineDefaults, resolveEngineDefaults,
-} from "./engine-defaults";
+import { readFileSync } from "node:fs";
+import * as engineDefaultsModule from "./engine-defaults";
+import { CONSOLE_SETTINGS_FALLBACK, consoleSettingsCache, createConsoleSettingsCache } from "./engine-defaults";
 
 const settings = (engine: unknown): ConsoleSettings => ({ legacyPasswordLoginEnabled: false, engine, engineUpdatedAt: "2026-09-03T00:00:00+00:00", engineUpdatedByEmail: "a@x.io" });
 
-test("readStoredEngineDefaults(null) is the catalog default and a valid Gemini selection round-trips", () => {
-  assert.deepEqual(readStoredEngineDefaults(null), DEFAULT_ENGINE_SELECTION);
-  assert.deepEqual(readStoredEngineDefaults(undefined), DEFAULT_ENGINE_SELECTION);
-  const gemini = { stt: { provider: "gemini", model: "gemini-3.5-transcribe-live", languageMode: "auto" }, translation: { provider: "gemini", model: "gemini-3.7-flash" }, summary: { provider: "gemini", model: "gemini-3.7-flash" } };
-  assert.deepEqual(readStoredEngineDefaults(gemini), gemini);
-  // A partial stored object is completed from the defaults (stt languageMode, missing roles).
-  assert.deepEqual(readStoredEngineDefaults({ stt: gemini.stt, translation: { provider: "gemini", model: "gemini-3.5-flash-lite" } }), {
-    ...DEFAULT_ENGINE_SELECTION, stt: gemini.stt, translation: { provider: "gemini", model: "gemini-3.5-flash-lite" },
-  });
-});
-
-test("garbage stored values fall back to the default without throwing", () => {
-  for (const garbage of ["gemini", 42, [], { stt: { provider: "gemini", model: "nope" } }, { bogus: true }, { stt: { provider: "soniox", model: "stt-rt-v5", languageMode: "fr" } }]) {
-    assert.deepEqual(readStoredEngineDefaults(garbage), DEFAULT_ENGINE_SELECTION, JSON.stringify(garbage));
+test("M3: the retired global-engine resolvers are gone; the module exports only the per-user assignment path and the settings cache", () => {
+  assert.deepEqual(Object.keys(engineDefaultsModule).sort(), [
+    "CONSOLE_SETTINGS_FALLBACK", "captionEngineAvailability", "consoleSettingsCache", "createConsoleSettingsCache", "engineSelectionForVoiceProvider", "resolveHostEngineAssignment",
+  ]);
+  const source = readFileSync(new URL("./engine-defaults.ts", import.meta.url), "utf8");
+  assert.doesNotMatch(source, /resolveEngineDefaults|readStoredEngineDefaults|isAdminRequest/u);
+  // Nothing in the app resolves an engine from the stored console settings any more.
+  for (const path of ["../../app/api/live-config/route.ts", "../../app/api/live-sessions/route.ts", "../../app/api/console/engine-defaults/route.ts", "../live/service.ts"]) {
+    assert.doesNotMatch(readFileSync(new URL(path, import.meta.url), "utf8"), /resolveEngineDefaults|readStoredEngineDefaults|isAdminRequest|settings\.engine\b/u, path);
   }
 });
 
@@ -54,7 +48,7 @@ test("the cache returns the fail-open fallback when Supabase is unconfigured and
   await assert.rejects(cold.get(), (e: ConsoleStoreError) => e.code === "CONSOLE_STORE_UNAVAILABLE");
 });
 
-test("the module singleton reads through getConsoleStore(), the store seam invalidates it, and resolveEngineDefaults normalizes the stored engine", async () => {
+test("the module singleton reads through getConsoleStore() and the store seam invalidates it", async () => {
   const fake = new SupabaseConsoleStore({
     fetchFn: async () => new Response(JSON.stringify([{ legacy_password_login_enabled: false, engine: { stt: { provider: "gemini", model: "gemini-3.5-transcribe-live", languageMode: "auto" }, translation: { provider: "gemini", model: "gemini-3.7-flash" } }, engine_updated_at: null, engine_updated_by_email: null }]), { status: 200 }),
     getServerAccess: () => ({ url: "https://project.supabase.test", credential: { key: "fixture-secret", kind: "secret" as const } }),
@@ -63,7 +57,6 @@ test("the module singleton reads through getConsoleStore(), the store seam inval
     __setConsoleStoreForTests(fake);
     const value = await consoleSettingsCache.get();
     assert.equal(value.legacyPasswordLoginEnabled, false);
-    assert.deepEqual(await resolveEngineDefaults(), { ...DEFAULT_ENGINE_SELECTION, stt: { provider: "gemini", model: "gemini-3.5-transcribe-live", languageMode: "auto" }, translation: { provider: "gemini", model: "gemini-3.7-flash" } });
     const broken = new SupabaseConsoleStore({ fetchFn: async () => new Response("{}", { status: 500 }), getServerAccess: fake["getServerAccess"] });
     __setConsoleStoreForTests(broken);
     // Swapping the store dropped the memo: the broken store is consulted and, with no previous value, its error surfaces.

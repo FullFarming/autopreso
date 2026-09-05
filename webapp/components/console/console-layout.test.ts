@@ -90,10 +90,12 @@ test("D1: the engine page has no global engine control; per-user engines are swi
   assert.match(engine, /method: "PUT"/u);
   assert.match(engine, /finally \{[^}]*setIsLegacyConfirmOpen\(false\)/u);
 
-  // Users: the voiceProvider select opens a confirm that counts this host's running sessions from the all-time session list.
+  // Users: the voiceProvider select opens a confirm that quotes the exact count from the per-profile endpoint (I3),
+  // never a client-side filter of the all-time session list.
   assert.match(users, /voiceProvider/u);
-  assert.match(users, /console\/sessions\?range=all/u);
-  assert.match(users, /countActiveSessionsForHost\(/u);
+  assert.match(users, /`\/api\/console\/users\/\$\{row\.id\}\/active-sessions`/u);
+  assert.match(users, /activeCount = data\.count/u);
+  assert.doesNotMatch(users, /console\/sessions\?range=all|countActiveSessionsForHost/u);
   assert.equal(users.match(/<ConfirmDialog/gu)?.length, 2, "disable confirm + engine switch confirm");
   assert.match(users, /t\("이 사용자의 진행 중인 세션 \{count\}개가 즉시 전환됩니다\. 다음 세션부터도 이 엔진을 사용합니다\.", \{ count: /u);
   assert.match(users, /t\("진행 중인 세션 수를 확인할 수 없습니다\. 이 사용자의 진행 중인 세션은 모두 즉시 전환됩니다\."\)/u);
@@ -104,6 +106,9 @@ test("D1: the engine page has no global engine control; per-user engines are swi
   assert.match(users, /deployResultLabelKey\(/u);
   assert.match(users, /deployCodeLabelKey\(/u);
   assert.match(users, /finally \{[^}]*setVoiceTarget\(null\)/u, "the engine confirm closes on failure too");
+  // I2: a queued row tells the operator when it applies (the DB is written; the host converges on reconnect).
+  assert.match(users, /deployResultLabelKey\(entry\.result\)/u);
+  for (const language of ["ko", "en", "ja"] as const) assert.ok(consoleMessages[language]["호스트 재접속 시 적용됩니다"], language);
   // The old "next session engine" framing is gone from both panels.
   assert.doesNotMatch(users, /다음 세션 엔진/u);
   assert.doesNotMatch(engine, /다음 세션부터 적용됩니다|다음 세션 설정/u);

@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useId, useRef, useState } from "react";
 
 import { useSystemLanguage, useSystemText } from "@/components/system-language/SystemLanguageProvider";
-import type { ConsoleProfileRow, ConsoleSessionRow, EngineDeploySummary, VoiceProvider } from "@/lib/console/console-store";
+import type { ActiveSessionRow, ConsoleProfileRow, EngineDeploySummary, VoiceProvider } from "@/lib/console/console-store";
 import { SYSTEM_LOCALES } from "@/lib/system-language";
 import { consoleMessages } from "@/lib/system-language/console-messages";
 
@@ -11,16 +11,17 @@ import { ConfirmDialog } from "./ConfirmDialog";
 import { consoleErrorKey, consoleFetch } from "./console-client";
 import { useConsolePending } from "./ConsoleShell";
 import {
-  buildRejectReason, countActiveSessionsForHost, deployCodeLabelKey, deployResultLabelKey, emptyStateKey, formatConsoleDate, REJECT_REASON_LABEL_KEYS, rejectReasons, statusLabelKey, voiceProviderLabel,
+  buildRejectReason, deployCodeLabelKey, deployResultLabelKey, emptyStateKey, formatConsoleDate, REJECT_REASON_LABEL_KEYS, rejectReasons, statusLabelKey, voiceProviderLabel,
   type ProfileFilter, type RejectReason,
 } from "./console-model";
 
 interface UsersResponse { profiles: ConsoleProfileRow[]; pendingCount: number }
-interface SessionsResponse { sessions: ConsoleSessionRow[] }
+/** `GET /api/console/users/[id]/active-sessions`: the exact sessions a switch of this profile would touch. */
+interface ActiveSessionsResponse { count: number; sessions: ActiveSessionRow[] }
 type PatchBody = { profileId: string; status: "approved" | "rejected" | "disabled"; reason?: string } | { profileId: string; role: "host" | "admin" };
 /** `PATCH { voiceProvider }` answer (D1): the profile plus what happened to each of that user's running sessions. */
 interface VoiceAssignmentResult { sessionId: string; result: "switched" | "queued" | "failed"; code?: string }
-interface VoiceAssignmentResponse { id: string; status: string; role: string; voiceProvider: VoiceProvider; results: VoiceAssignmentResult[]; summary: EngineDeploySummary }
+interface VoiceAssignmentResponse { id: string; status: string; role: string; voiceProvider: VoiceProvider; results: VoiceAssignmentResult[]; summary: EngineDeploySummary; changed: boolean }
 interface VoiceAssignmentOutcome { voiceProvider: VoiceProvider; results: VoiceAssignmentResult[]; summary: EngineDeploySummary }
 /** The pending engine switch: `activeCount` is `null` while the session list loads and `"unknown"` when it could not be read. */
 interface VoiceTarget { row: ConsoleProfileRow; voiceProvider: VoiceProvider; activeCount: number | null | "unknown" }
@@ -90,15 +91,16 @@ export function UsersPanel() {
 
   /**
    * The select is controlled by the server row, so a cancelled confirm simply re-renders the old
-   * value. The confirm quotes how many of this host's sessions are running (all-time list, filtered
-   * client-side); a failed count still allows the switch with the "every running session" copy.
+   * value. The confirm quotes the exact number of this user's running sessions from the per-profile
+   * endpoint (the server resolves the host id from the profile row); a failed count still allows
+   * the switch with the "every running session" copy.
    */
   async function openVoiceConfirm(row: ConsoleProfileRow, voiceProvider: VoiceProvider) {
     setVoiceTarget({ row, voiceProvider, activeCount: null });
     let activeCount: number | "unknown" = "unknown";
     try {
-      const data = await consoleFetch<SessionsResponse>("/api/console/sessions?range=all");
-      activeCount = countActiveSessionsForHost(data.sessions, row.hostId);
+      const data = await consoleFetch<ActiveSessionsResponse>(`/api/console/users/${row.id}/active-sessions`);
+      activeCount = data.count;
     } catch {
       activeCount = "unknown";
     }

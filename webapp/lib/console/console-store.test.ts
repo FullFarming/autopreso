@@ -137,11 +137,11 @@ test("listActiveSessionsForHost posts { p_host_id } to list_live_session_ids_for
   await assert.rejects(storeWith(() => json({ id: SESSION })).store.listActiveSessionsForHost(TARGET), (e: ConsoleStoreError) => e.code === "CONSOLE_ROW_INVALID");
 });
 
-test("setSessionEngineAsAdmin normalizes the engine, posts actor/session/engine/revision to the v2 RPC, maps the row, and returns null for no match", async () => {
+test("setSessionEngineAsAdmin normalizes the engine, posts actor/session/engine/revision to the v3 RPC (revision inside the byte budget), maps the row, and returns null for no match", async () => {
   const engine = { stt: { provider: "soniox", model: "stt-rt-v5", languageMode: "ko" }, translation: { provider: "soniox", model: "stt-rt-v5" }, summary: { provider: "gemini", model: "gemini-3.7-flash" } };
   const { store, calls } = storeWith(() => json([{ id: SESSION, status: "live", version: 4 }]));
   assert.deepEqual(await store.setSessionEngineAsAdmin({ actorId: ADMIN, sessionId: SESSION, engine, assignmentRevision: "7" }), { id: SESSION, status: "live", version: 4 });
-  assert.equal(calls[0].url, "https://project.supabase.test/rest/v1/rpc/set_live_session_engine_admin_v2");
+  assert.equal(calls[0].url, "https://project.supabase.test/rest/v1/rpc/set_live_session_engine_admin_v3");
   assert.deepEqual(body(calls[0]), { p_actor_id: ADMIN, p_session_id: SESSION, p_engine: engine, p_assignment_revision: "7" });
   // without a revision the stored one is left alone (null, not undefined - PostgREST needs the key)
   const bare = storeWith(() => json([{ id: SESSION, status: "live", version: 5 }]));
@@ -189,18 +189,58 @@ test("recordEngineDeploy posts the deploy counters next to the engine and the ta
   await assert.rejects(storeWith(() => json(false)).store.recordEngineDeploy({ actorId: ADMIN, engine: DEFAULT_ENGINE_SELECTION, summary: { switched: 0, queued: 0, failed: 0 }, target: { profileId: TARGET, hostId: "noel", voiceProvider: "soniox", revision: "1" } }), (e: ConsoleStoreError) => e.code === "CONSOLE_WRITE_FAILED" && e.status === 503);
 });
 
-test("setProfileVoiceProvider posts to the v2 RPC and maps the profile identity next to the assignment", async () => {
-  const { store, calls } = storeWith(() => json([{ id: TARGET, status: "approved", role: "host", host_id: "noel", provider: "gemini", revision: 3 }]));
+test("M5: recordEngineDeploy bounds the audit payload before it leaves the process - hostId ≤ 128 chars, provider from the enum", async () => {
+  const { store, calls } = storeWith(() => json(true));
+  const target = { profileId: TARGET, hostId: "h".repeat(128), voiceProvider: "soniox" as const, revision: "1" };
+  await store.recordEngineDeploy({ actorId: ADMIN, engine: DEFAULT_ENGINE_SELECTION, summary: { switched: 0, queued: 0, failed: 0 }, target });
+  assert.equal(calls.length, 1, "128 chars is the inclusive limit");
+  for (const bad of [
+    { ...target, hostId: "h".repeat(129) },
+    { ...target, hostId: "" },
+    { ...target, voiceProvider: "whisper" as never },
+    { ...target, revision: "0" },
+    { ...target, profileId: "not-a-uuid" },
+  ]) {
+    const refused = storeWith(() => json(true));
+    await assert.rejects(refused.store.recordEngineDeploy({ actorId: ADMIN, engine: DEFAULT_ENGINE_SELECTION, summary: { switched: 0, queued: 0, failed: 0 }, target: bad }), (e: ConsoleStoreError) => e.code === "DEPLOY_PAYLOAD_INVALID" && e.status === 400, JSON.stringify(bad));
+    assert.equal(refused.calls.length, 0, "refused locally, no request");
+  }
+});
+
+test("readProfileById posts actor/profile to read_profile_admin_v1, maps the row, and returns null for an unknown id", async () => {
+  const { store, calls } = storeWith(() => json([{ id: TARGET, status: "approved", role: "host", host_id: "noel", voice_provider: "gemini", voice_provider_revision: 4 }]));
+  assert.deepEqual(await store.readProfileById({ actorId: ADMIN, profileId: TARGET }), { id: TARGET, status: "approved", role: "host", hostId: "noel", voiceProvider: "gemini", voiceProviderRevision: "4" });
+  assert.equal(calls[0].url, "https://project.supabase.test/rest/v1/rpc/read_profile_admin_v1");
+  assert.deepEqual(body(calls[0]), { p_actor_id: ADMIN, p_profile_id: TARGET });
+  assert.equal(await storeWith(() => json([])).store.readProfileById({ actorId: ADMIN, profileId: TARGET }), null);
+  for (const rows of [
+    [{ id: TARGET, status: "approved", role: "host", voice_provider: "gemini", voice_provider_revision: 4 }],
+    [{ id: TARGET, status: "approved", role: "host", host_id: "", voice_provider: "gemini", voice_provider_revision: 4 }],
+    [{ id: TARGET, status: "approved", role: "host", host_id: "noel", voice_provider: "gemini", voice_provider_revision: 4 }, { id: ADMIN, status: "approved", role: "admin", host_id: "x", voice_provider: "soniox", voice_provider_revision: 1 }],
+    { id: TARGET },
+  ]) {
+    await assert.rejects(storeWith(() => json(rows)).store.readProfileById({ actorId: ADMIN, profileId: TARGET }), (e: ConsoleStoreError) => e.code === "CONSOLE_ROW_INVALID", JSON.stringify(rows));
+  }
+  await assert.rejects(storeWith(() => json({ message: "ACTOR_NOT_ADMIN", code: "42501" }, 403)).store.readProfileById({ actorId: ADMIN, profileId: TARGET }), (e: ConsoleStoreError) => e.code === "ACTOR_NOT_ADMIN" && e.status === 403);
+});
+
+test("setProfileVoiceProvider posts to the v3 RPC and maps the profile identity, the assignment, and whether anything changed", async () => {
+  const { store, calls } = storeWith(() => json([{ id: TARGET, status: "approved", role: "host", host_id: "noel", provider: "gemini", revision: 3, changed: true }]));
   assert.deepEqual(await store.setProfileVoiceProvider({ actorId: ADMIN, profileId: TARGET, provider: "gemini" }), {
-    id: TARGET, status: "approved", role: "host", hostId: "noel", provider: "gemini", revision: "3",
+    id: TARGET, status: "approved", role: "host", hostId: "noel", provider: "gemini", revision: "3", changed: true,
   });
-  assert.equal(calls[0].url, "https://project.supabase.test/rest/v1/rpc/set_profile_voice_provider_v2");
+  assert.equal(calls[0].url, "https://project.supabase.test/rest/v1/rpc/set_profile_voice_provider_v3");
   assert.deepEqual(body(calls[0]), { p_actor_id: ADMIN, p_profile_id: TARGET, p_provider: "gemini" });
+  // I1: an unchanged provider is reported, not guessed - the route skips the deploy on `changed: false`.
+  const unchanged = await storeWith(() => json([{ id: TARGET, status: "approved", role: "host", host_id: "noel", provider: "gemini", revision: 3, changed: false }])).store.setProfileVoiceProvider({ actorId: ADMIN, profileId: TARGET, provider: "gemini" });
+  assert.equal(unchanged.changed, false);
   for (const row of [
-    { id: TARGET, status: "approved", role: "host", provider: "gemini", revision: 3 },
-    { id: TARGET, status: "approved", role: "host", host_id: "noel", provider: "whisper", revision: 3 },
-    { id: TARGET, status: "approved", role: "host", host_id: "noel", provider: "gemini", revision: "abc" },
-    { id: TARGET, status: "unknown", role: "host", host_id: "noel", provider: "gemini", revision: 3 },
+    { id: TARGET, status: "approved", role: "host", provider: "gemini", revision: 3, changed: true },
+    { id: TARGET, status: "approved", role: "host", host_id: "noel", provider: "gemini", revision: 3 },
+    { id: TARGET, status: "approved", role: "host", host_id: "noel", provider: "gemini", revision: 3, changed: "yes" },
+    { id: TARGET, status: "approved", role: "host", host_id: "noel", provider: "whisper", revision: 3, changed: true },
+    { id: TARGET, status: "approved", role: "host", host_id: "noel", provider: "gemini", revision: "abc", changed: true },
+    { id: TARGET, status: "unknown", role: "host", host_id: "noel", provider: "gemini", revision: 3, changed: true },
   ]) {
     await assert.rejects(storeWith(() => json([row])).store.setProfileVoiceProvider({ actorId: ADMIN, profileId: TARGET, provider: "gemini" }), (e: ConsoleStoreError) => e.code === "CONSOLE_ROW_INVALID", JSON.stringify(row));
   }

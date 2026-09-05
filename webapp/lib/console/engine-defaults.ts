@@ -1,4 +1,4 @@
-import { DEFAULT_ENGINE_SELECTION, captionEngineCatalogForClient, normalizeEngineSelection } from "../../../packages/caption-core/caption-engine-catalog.js";
+import { captionEngineCatalogForClient, normalizeEngineSelection } from "../../../packages/caption-core/caption-engine-catalog.js";
 import { LiveSecurityConfigurationError } from "../security/config";
 import type { EngineRoleSelection, EngineSelection, SttEngineSelection } from "../live/model-preferences";
 import { __onConsoleStoreSwapped, getConsoleStore, type ConsoleSettings } from "./console-store";
@@ -6,15 +6,6 @@ import { __onConsoleStoreSwapped, getConsoleStore, type ConsoleSettings } from "
 // The engine types live with the session's `modelPreferences` (lib/live/model-preferences.ts)
 // so the client-side Live Call code can import them without pulling the console store in.
 export type { EngineRoleSelection, EngineSelection, SttEngineSelection };
-
-/** Stored engine defaults re-validated against the catalog; anything unreadable is the catalog default. */
-export function readStoredEngineDefaults(value: unknown): EngineSelection {
-  try {
-    return normalizeEngineSelection(value ?? DEFAULT_ENGINE_SELECTION) as EngineSelection;
-  } catch {
-    return normalizeEngineSelection(DEFAULT_ENGINE_SELECTION) as EngineSelection;
-  }
-}
 
 /**
  * Catalog view for clients (`/api/live-config.captionEngines`): every entry with
@@ -27,7 +18,11 @@ export function captionEngineAvailability(environment: Readonly<Record<string, s
   });
 }
 
-/** What an unconfigured or unmigrated project behaves like: legacy login stays on, no engine override. */
+/**
+ * What an unconfigured or unmigrated project behaves like: legacy login stays on. The `engine*`
+ * fields are the retired global engine_defaults (D1: engines are per user); they are still read
+ * because `read_console_settings_v1` returns them, but nothing resolves an engine from them.
+ */
 export const CONSOLE_SETTINGS_FALLBACK: Readonly<ConsoleSettings> = Object.freeze({
   legacyPasswordLoginEnabled: true, engine: null, engineUpdatedAt: null, engineUpdatedByEmail: null,
 });
@@ -68,24 +63,9 @@ export function createConsoleSettingsCache(opts: { read: () => Promise<ConsoleSe
   };
 }
 
-/** Module singleton (60 s). Route handlers that write settings must call `invalidate()` afterwards. */
+/** Module singleton (60 s; the legacy-login switch). Route handlers that write settings must call `invalidate()` afterwards. */
 export const consoleSettingsCache: ConsoleSettingsCache = createConsoleSettingsCache({ read: () => getConsoleStore().readSettings() });
 __onConsoleStoreSwapped(() => consoleSettingsCache.invalidate());
-
-/** Global engine defaults as the catalog-validated selection (never throws on stored garbage). */
-export async function resolveEngineDefaults(): Promise<EngineSelection> {
-  return readStoredEngineDefaults((await consoleSettingsCache.get()).engine);
-}
-
-/**
- * Same, but a cold console outage (store configured yet unreachable, nothing memoized) yields the
- * catalog default instead of throwing: engine defaults are advisory, and neither go-live
- * (`/api/live-config`) nor session creation may be blocked by the console being down.
- */
-export async function resolveEngineDefaultsOrFallback(): Promise<EngineSelection> {
-  try { return await resolveEngineDefaults(); }
-  catch { return readStoredEngineDefaults(null); }
-}
 
 /**
  * The one mapping from a profile's `voice_provider` to a Live Call engine (D2: Soniox

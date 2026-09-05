@@ -3,7 +3,6 @@ import test from "node:test";
 
 import {
   countActiveSessions,
-  countActiveSessionsForHost,
   deployCodeLabelKey,
   deployResultLabelKey,
   formatConsoleDate,
@@ -47,17 +46,6 @@ test("countActiveSessions is the number a deploy will switch immediately: prepar
   assert.equal(countActiveSessions([]), 0);
 });
 
-test("countActiveSessionsForHost counts only that host's preparing/live sessions - what a per-user switch will touch", () => {
-  const rows = [
-    { hostId: "a", status: "live" }, { hostId: "a", status: "preparing" }, { hostId: "a", status: "ended" },
-    { hostId: "b", status: "live" }, { hostId: "b", status: "paused" },
-  ];
-  assert.equal(countActiveSessionsForHost(rows, "a"), 2);
-  assert.equal(countActiveSessionsForHost(rows, "b"), 1);
-  assert.equal(countActiveSessionsForHost(rows, "c"), 0);
-  assert.equal(countActiveSessionsForHost([], "a"), 0);
-});
-
 test("voiceProviderLabel shows the brand names and never falls through to a raw value", () => {
   assert.equal(voiceProviderLabel("soniox"), "Soniox");
   assert.equal(voiceProviderLabel("gemini"), "Gemini");
@@ -71,8 +59,8 @@ test("label keys map every status to a message key and never fall through to raw
   assert.deepEqual([...rejectReasons], ["unverified", "duplicate", "other"]);
 });
 
-test("deploy result labels never fall through: an unknown result reads as 실패, a known code maps to console copy, an unknown code stays raw", () => {
-  assert.deepEqual(["switched", "queued", "failed", "exploded"].map(deployResultLabelKey), ["전환됨", "대기열", "실패", "실패"]);
+test("deploy result labels never fall through: queued says when it applies (I2), an unknown result reads as 실패, a known code maps to console copy, an unknown code stays raw", () => {
+  assert.deepEqual(["switched", "queued", "failed", "exploded"].map(deployResultLabelKey), ["전환됨", "호스트 재접속 시 적용됩니다", "실패", "실패"]);
   assert.equal(deployCodeLabelKey("ENGINE_INVALID"), "지원하지 않는 엔진 조합입니다.");
   assert.equal(deployCodeLabelKey("CONSOLE_STORE_UNAVAILABLE"), "콘솔 저장소에 연결할 수 없습니다.");
   // A gateway code the console does not know is shown verbatim so the operator can still search for it.
