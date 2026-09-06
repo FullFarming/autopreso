@@ -167,6 +167,12 @@ export class SupabaseLivePublisher {
         }
         // Language evidence is stored once on the linked authoritative source.
         delete durableEvent.languageObservation;
+        // 2026-09-06 incident: the snapshot validator rejects any event key outside its
+        // allowlist and answers `false` (a 200), so these two wire-only keys silently
+        // dropped EVERY final since the authoritative link shipped. The link itself is
+        // the p_authoritative_source_id column below; sourceSequence lives on that row.
+        delete durableEvent.authoritativeSourceId;
+        delete durableEvent.sourceSequence;
         // Producing-model provenance rides on the live event for the host and
         // metrics; the durable row records it on the authoritative source.
         delete durableEvent.translationModel;

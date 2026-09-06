@@ -78,3 +78,19 @@ test("the repair migration is additive, mirrored byte-for-byte into the bootstra
   }
   assert.match(sql, /p_authoritative_source_id uuid\s*\)/u, "the 17-argument overload is the one the gateway calls");
 });
+
+test("202609060002 strips the wire-only provenance keys before the durable snapshot validator and is mirrored", async () => {
+  const name = "202609060002_live_final_caption_wire_keys.sql";
+  const [sql, bootstrap] = await Promise.all([
+    readFile(new URL(`../supabase/migrations/${name}`, import.meta.url), "utf8"),
+    readFile(bootstrapUrl, "utf8"),
+  ]);
+  assert.doesNotMatch(sql, /\bdrop\s+(column|table|type|function)\b|\btruncate\b/iu);
+  assert.ok(bootstrap.includes(`-- supabase/migrations/${name}\n\n${sql}`));
+  const block = sql.match(/create or replace function public\.persist_live_final_caption_if_active\([\s\S]*?\s\$\$;/iu)?.[0];
+  assert.ok(block);
+  assert.match(block, /p_authoritative_source_id uuid\s*\)/u);
+  assert.match(block, /#variable_conflict use_column/u);
+  assert.match(block, /p_event - array\['authoritativeSourceId', 'sourceSequence'\]::text\[\]/u);
+  assert.deepEqual(findAliasCollisions(block), []);
+});

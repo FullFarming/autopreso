@@ -91,3 +91,43 @@ test("publisher persists each final through the atomic durable RPC", async () =>
   });
   assert.equal(rpcCalls.length, before);
 });
+
+// 2026-09-06 incident: every Live Call since the authoritative-source link shipped recorded
+// source rows but ZERO captions. The pipeline puts `authoritativeSourceId` and `sourceSequence`
+// on the caption event for the host/viewer wire, and the adapter forwarded them inside
+// `p_event`. The snapshot validator (persist_live_snapshot_if_active_20260725) rejects any
+// top-level key outside its allowlist and returns false — silently, as a 200 — so the atomic
+// final never stored. The link itself travels as `p_authoritative_source_id`; the durable
+// event must not repeat it.
+test("durable final events carry the authoritative link only as p_authoritative_source_id, never as event keys", async () => {
+  const rpcCalls = [];
+  const publisher = new SupabaseLivePublisher({
+    baseUrl: "https://example.supabase.co",
+    supabaseApiKey: "secret-key",
+    supabaseKeyType: "secret",
+    eventFanout: async () => {},
+    audioFanout: async () => {},
+    async fetchFn(url, init) {
+      rpcCalls.push({ url, init });
+      return new Response("true", { status: 200, headers: { "Content-Type": "application/json" } });
+    },
+  });
+  const sourceId = "3fa6cc83-17f3-43a9-ab63-6191ebb46a70";
+  await publisher.publish("session-1", "en", {
+    type: "caption", seq: 1, sessionId: "session-1", language: "en",
+    speaker: { speakerId: "speaker-1", label: "Speaker 1", colorToken: "speaker-teal", voiceName: null, voiceStatus: "disabled", lastSeenAt: "2026-09-06T06:00:24.000Z" },
+    text: "Can you hear what I am saying?", isFinal: true,
+    sourceText: "지금 얘기하는 게 잘 들리나요?", sourceLanguage: "ko", translationStatus: "translated",
+    authoritativeSourceId: sourceId, sourceSequence: 1, utteranceKey: "stt-v1:abc",
+    sourceStartedAt: "2026-09-06T06:00:16.410Z", sourceEndedAt: "2026-09-06T06:00:24.210Z", emittedAt: "2026-09-06T06:00:24.500Z",
+  });
+  const call = rpcCalls.find((entry) => entry.url.endsWith("/rest/v1/rpc/persist_live_final_caption_if_active"));
+  assert.ok(call, "final persisted through the atomic RPC");
+  const payload = JSON.parse(call.init.body);
+  assert.equal(payload.p_authoritative_source_id, sourceId);
+  assert.equal(payload.p_utterance_key, "stt-v1:abc");
+  assert.equal(Object.hasOwn(payload.p_event, "authoritativeSourceId"), false, "link is a column, not an event key");
+  assert.equal(Object.hasOwn(payload.p_event, "sourceSequence"), false, "sourceSequence is derivable from the linked source row");
+  // The wire event handed to viewers keeps both keys (LiveViewer's source ledger reads them).
+  assert.equal(payload.p_event.utteranceKey, "stt-v1:abc");
+});
