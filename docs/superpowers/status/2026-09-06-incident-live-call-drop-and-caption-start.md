@@ -34,7 +34,7 @@
 - 고착 세션 `42d1acbd…`를 웹앱과 같은 RPC `terminate_live_session`으로 종료(`stopped`, version 5).
 - Vercel 프로덕션 재배포(65b816a): `/speakers` 익명 401(모듈 로드 정상), `/login` 200.
 - DMG 재빌드·재설치: `/Applications/NOVA.app`(65b816a). 이전 설치는 `NOVA.app.bak-20260906-broken-4c2cbbf`, 9/1 빌드는 `NOVA.app.bak-20260906`.
-- 게이트웨이: 코드 변경 없음. 단, 운영 리비전 `nova-20260905`는 hardening 브랜치(ec128de) 시점 이미지라 통합 HEAD와 11개 파일 차이가 있어, HEAD(65b816a) 이미지(Cloud Build 6a475b83, digest f4bcb2ba…)를 리비전 `realtime-noel-media-gateway-head-20260906`(태그 `head-review`, 0% 트래픽, `/health` 200)으로 준비했다. 전환: `gcloud run services update-traffic realtime-noel-media-gateway --region asia-northeast3 --project gen-lang-client-0321430669 --to-revisions realtime-noel-media-gateway-head-20260906=100`.
+- 게이트웨이: 코드 변경 없음. (정정 2026-09-06 저녁: 운영 리비전 `nova-20260905`는 Cloud Build 소스 해시로 확인한 결과 통합 트리와 동일한 코드였다. `head-20260906` 리비전은 불필요했다. 이후 자막 미기록 수정으로 `wirekeys-20260906`이 100% 트래픽을 받는다 — `2026-09-06-live-call-recording-and-soniox-verification.md` 참조.) 전환: `gcloud run services update-traffic realtime-noel-media-gateway --region asia-northeast3 --project gen-lang-client-0321430669 --to-revisions realtime-noel-media-gateway-head-20260906=100`.
 
 ### D. (후속 보고 01:00 KST) 캡션 시작 시 "liveWorkspaceUrl is not defined"
 B를 고쳐 진짜 오류가 드러났다. 관리형 자막 콜백(`managedCaptionRequest`, `startCaptionSession` 등)이 모듈 최상위에 있으면서 앱 준비 핸들러 안의 지역 상수 `liveWorkspaceUrl`을 자유 변수로 참조했고, 로컬 서버는 그 상수가 선언되기 전에 콜백을 넘겨받았다. 즉 패키지 앱에서 로컬 자막 시작은 항상 ReferenceError였다(Electron 전용 코드라 단위 테스트가 없었음). 수정 6b03915: URL을 먼저 해석해 `startDesktopServer(settingsStore, liveWorkspaceUrl)`로 넘기고, 콜백을 `createManagedCaptionCallbacks(workspaceUrl)` 팩토리로 바꿈. `test/desktop-managed-caption-callbacks.test.js`가 콜백 소스를 vm으로 실행해 start/stop을 구동한다. DMG 재빌드·재설치 완료(00:59 KST).
