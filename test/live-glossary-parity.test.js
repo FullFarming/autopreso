@@ -39,3 +39,15 @@ test("gateway glossary corrections behave exactly like the desktop subtitle pass
     );
   }
 });
+
+test("Caption Only and Gateway enforce the same exact deterministic correction after final polish", () => {
+  const polishedDraft = "We visited 힐튼 가든 인 with Kushiman and Wakefield Korea.";
+  const expected = "We visited Hilton Garden Inn with Cushman & Wakefield Korea.";
+  const input = {
+    glossary: GLOSSARY,
+    targetLanguage: "en",
+    sourceText: "쿠시먼앤드웨이크필드 코리아와 힐튼 가든 인을 방문했습니다.",
+  };
+  assert.equal(desktopApply(polishedDraft, input), expected);
+  assert.equal(gatewayApply(polishedDraft, input), expected);
+});

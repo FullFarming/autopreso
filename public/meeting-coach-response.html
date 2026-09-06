@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="ko" data-theme="dark">
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>NOVA Response Coach</title>
+    <link rel="stylesheet" href="/nova-core.css" />
+    <link rel="stylesheet" href="/meeting-coach.css" />
+  </head>
+  <body>
+    <main class="coach-shell" aria-labelledby="response-title">
+      <header class="coach-topbar">
+        <div class="coach-title-group">
+          <span class="coach-wordmark" aria-label="NOVA">NOVA</span>
+          <span class="coach-title-rule" aria-hidden="true"></span>
+          <h1 id="response-title" class="coach-title">실시간 응답 코치</h1>
+          <span id="coach-status" class="coach-status" role="status" aria-live="polite">연결 확인</span>
+        </div>
+        <div class="coach-actions">
+          <span id="ready-state" class="coach-badge">다음 질문 대기</span>
+          <button id="arrange-windows" type="button" class="coach-button secondary">창 정렬</button>
+        </div>
+      </header>
+      <section class="coach-main response">
+        <section class="response-workspace">
+          <section class="coach-panel recommendation-stage" aria-labelledby="automatic-title">
+            <div class="coach-panel-header">
+              <span id="automatic-title" class="coach-label">추천 답변</span>
+              <span id="automatic-state" class="coach-badge is-warn">대기</span>
+            </div>
+            <div class="response-question" aria-label="현재 질문과 한국어" aria-live="polite">
+              <strong>현재 질문</strong>
+              <p id="latest-question" class="primary">질문 대기 중</p>
+              <p id="latest-question-ko">한국어 대기 중</p>
+            </div>
+            <div id="automatic-list" class="answer-list" aria-live="polite"></div>
+            <div id="suggestion-actions" class="suggestion-actions" role="group" aria-label="추천 답변 행동" hidden>
+              <button type="button" id="use-suggestion" class="coach-button">이 답변 사용</button>
+              <button type="button" id="copy-suggestion" class="coach-button secondary">복사</button>
+              <button type="button" id="regenerate-answer" class="coach-button secondary">다시 생성</button>
+            </div>
+          </section>
+          <aside class="response-rail" aria-label="응답 코치 보조 영역">
+            <details id="evidence-details" class="coach-panel evidence-disclosure">
+              <summary>근거 <span id="evidence-summary">확인 대기</span></summary>
+              <div class="evidence-body">
+                <ul id="source-list" class="source-list" aria-label="검증 출처"></ul>
+              </div>
+            </details>
+            <section class="coach-panel manual-panel" aria-labelledby="manual-title">
+              <div class="coach-panel-header">
+                <span id="manual-title" class="coach-label">직접 요청</span>
+                <span id="manual-state" class="coach-badge is-warn">대기</span>
+              </div>
+              <div id="manual-list" class="answer-list" aria-live="polite"></div>
+            </section>
+          </aside>
+        </section>
+        <form id="composer-form" class="coach-panel coach-composer" autocomplete="off">
+          <div class="chip-row" role="group" aria-label="요청 유형">
+            <button type="button" class="coach-chip" data-action="translate" aria-pressed="false">번역</button>
+            <button type="button" class="coach-chip" data-action="english-answer" aria-pressed="false">영어 답변</button>
+            <button type="button" class="coach-chip" data-action="shorter" aria-pressed="false">더 짧게</button>
+            <button type="button" class="coach-chip" data-action="polite" aria-pressed="false">공손하게</button>
+          </div>
+          <div class="composer-row">
+            <label class="sr-only" for="coach-composer">요청 입력</label>
+            <textarea id="coach-composer" placeholder="요청 입력"></textarea>
+            <button class="coach-button" type="submit">요청</button>
+          </div>
+        </form>
+      </section>
+    </main>
+    <script type="module" src="/meeting-coach-response.js"></script>
+  </body>
+</html>

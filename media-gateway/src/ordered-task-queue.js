@@ -5,6 +5,10 @@ export class OrderedTaskQueue {
   #stateWaiters = [];
   #isBackpressured = false;
 
+  /**
+   * @param {{maxPending?: number, maxWaiting?: number, taskTimeoutMs?: number,
+   * admissionTimeoutMs?: number, onBackpressureChange?: (isBackpressured: boolean) => void}} [options]
+   */
   constructor({
     maxPending = 32,
     maxWaiting = maxPending,

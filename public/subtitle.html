@@ -10,27 +10,24 @@
       // runs from subtitle-i18n.js once the module scripts evaluate.
       try {
         const stored = localStorage.getItem("realtime-noel-ui-language");
-        const lang = stored === "en" || stored === "ko" ? stored : "ko";
+        const lang = stored === "en" || stored === "ko" || stored === "ja" ? stored : "ko";
         document.documentElement.lang = lang;
         document.documentElement.dataset.uiLang = lang;
       } catch { /* storage optional */ }
     </script>
-    <link rel="preconnect" href="https://fonts.googleapis.com" />
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-    <link
-      href="https://fonts.googleapis.com/css2?family=EB+Garamond:wght@400;500&family=Inter:wght@400;500;600&family=Noto+Sans+KR:wght@400;500;700&display=swap"
-      rel="stylesheet"
-    />
+    <link rel="stylesheet" href="nova-core.css" />
     <link rel="stylesheet" href="subtitle.css" />
+    <link rel="stylesheet" href="subtitle-speakers.css" />
+    <link rel="stylesheet" href="subtitle-controls.css" />
+    <link rel="stylesheet" href="system-language-button.css" />
   </head>
   <body class="subtitle-dashboard-body">
     <div class="subtitle-app-shell">
       <aside class="subtitle-app-rail" data-i18n-aria="app.railLabel" aria-label="NOVA 작업 공간">
         <strong data-i18n="app.name">NOVA</strong>
-        <nav>
+        <nav data-i18n-aria="nav.primary" aria-label="주요 기능">
           <a class="is-current" href="#caption-workspace" data-workspace-nav="captions" aria-current="page"><img src="icons/radio.svg" alt="" aria-hidden="true" /><span data-i18n="nav.captions">자막</span></a>
           <a href="#live-call-page" data-workspace-nav="livecall"><img src="icons/users.svg" alt="" aria-hidden="true" /><span data-i18n="nav.livecall">Live Call</span></a>
-          <a href="#records-page" data-workspace-nav="records"><img src="icons/file-text.svg" alt="" aria-hidden="true" /><span data-i18n="nav.records">기록</span></a>
           <a href="#settings-page" data-workspace-nav="settings"><img src="icons/settings.svg" alt="" aria-hidden="true" /><span data-i18n="nav.settings">설정</span></a>
         </nav>
         <p class="app-credit" data-i18n="app.credit">Realtime by Noel</p>
@@ -43,10 +40,6 @@
         </div>
         <div class="workspace-hero-tools">
           <span id="connection-status" class="status-pill" role="status" aria-live="polite" data-i18n="status.connecting">연결 중</span>
-          <div id="workspace-language-toggle" class="theme-switch lang-switch" role="group" data-i18n-aria="lang.group" aria-label="앱 언어">
-            <button type="button" data-language-choice="ko" class="is-active" aria-pressed="true" data-i18n-aria="lang.ko" data-i18n-title="lang.ko" aria-label="한국어" title="한국어">KO</button>
-            <button type="button" data-language-choice="en" aria-pressed="false" data-i18n-aria="lang.en" data-i18n-title="lang.en" aria-label="English" title="English">EN</button>
-          </div>
           <div id="workspace-theme-toggle" class="theme-switch" role="group" data-i18n-aria="theme.group" aria-label="화면 테마">
             <button type="button" data-theme-choice="dark" class="is-active" aria-pressed="true" data-i18n-aria="theme.dark" data-i18n-title="theme.dark" aria-label="다크 테마" title="다크 테마">
               <svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor" aria-hidden="true"><path d="M13.5 9.6A6 6 0 0 1 6.4 2.5 6 6 0 1 0 13.5 9.6Z"/></svg>
@@ -55,6 +48,7 @@
               <svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor" aria-hidden="true"><circle cx="8" cy="8" r="3.4"/><path d="M8 0.6v2.2M8 13.2v2.2M0.6 8h2.2M13.2 8h2.2M2.7 2.7l1.6 1.6M11.7 11.7l1.6 1.6M13.3 2.7l-1.6 1.6M4.3 11.7l-1.6 1.6" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>
             </button>
           </div>
+          <div id="workspace-system-language" class="system-language"></div>
         </div>
       </section>
 
@@ -75,15 +69,23 @@
 
               <div class="service-strip" data-i18n-aria="status.modelConnection" aria-label="모델 연결 상태">
                 <span id="realtime-api-status" role="status" aria-live="polite" data-i18n="status.realtimeChecking">실시간 자막 확인 중</span>
-                <span id="topic-model-status" data-i18n="status.topicModelStandby">Gemma: 대기</span>
+                <span id="topic-model-status" data-i18n="status.topicModelStandby" hidden>Gemma: 대기</span>
               </div>
 
+              <div class="caption-core-controls">
               <section class="cfg-section" aria-labelledby="cfg-languages-title">
                 <div class="cfg-heading">
-                  <h2 id="cfg-languages-title"><i data-cfg-ordinal></i><span data-i18n="cfg.languages">자막 언어</span></h2>
+                  <h2 id="cfg-languages-title"><span data-i18n="cfg.languages">자막 언어</span></h2>
                 </div>
                 <div class="language-targets" role="group" aria-labelledby="language-targets-label">
                   <span class="language-targets-label sr-only" id="language-targets-label" data-i18n="cfg.languagesLabel">자막 언어</span>
+                  <div class="lang-select" data-lang-select="subtitle">
+                    <button type="button" class="lang-select-trigger" id="subtitle-language-trigger"
+                      aria-haspopup="true" aria-expanded="false" aria-controls="subtitle-language-panel">
+                      <span class="lang-select-summary">English · 한국어</span>
+                    </button>
+                    <div class="lang-select-panel" id="subtitle-language-panel" hidden>
+                      <label class="language-search-field">언어 검색<input type="search" data-language-search autocomplete="off" /></label>
                   <div class="language-pills">
                     <label class="lang-pill">
                       <input name="translationLanguages" type="checkbox" value="en" />
@@ -98,87 +100,77 @@
                       <span>日本語</span>
                     </label>
                   </div>
+                    </div>
+                  </div>
                   <!-- Empty by default; used only for the minimum-selection flash. -->
                   <span class="language-targets-hint" id="language-targets-hint" hidden></span>
                 </div>
               </section>
 
-              <!-- Hidden for now: at this stage only translated captions are
-                   produced, so the only remaining choice is captions and a
-                   one-option control is noise. The radio stays in the DOM so the
-                   form keeps reporting the mode; nothing here was deleted. -->
-              <section class="cfg-section" aria-labelledby="pt-output-title" hidden>
-                <div class="cfg-heading">
-                  <h2><i data-cfg-ordinal></i><span data-i18n="cfg.outputMode">출력 방식</span></h2>
+              <section class="cfg-section" aria-labelledby="caption-display-mode-title">
+                <div class="cfg-heading"><h2 id="caption-display-mode-title" data-i18n="cfg.displayMode">표시 방식</h2></div>
+                <div class="seg-toggle" role="radiogroup" aria-labelledby="caption-display-mode-title">
+                  <label class="seg-option"><input type="radio" name="displayMode" value="translation_only" checked /><span data-i18n="displayMode.translationOnly">번역만 표시</span></label>
+                  <label class="seg-option"><input type="radio" name="displayMode" value="translation_source" /><span data-i18n="displayMode.translationSource">원문과 선택한 모든 언어 동시 표시</span></label>
                 </div>
-                <section class="pt-output-group" aria-labelledby="pt-output-title">
-                  <div class="pt-output-heading">
-                    <div>
-                      <span class="pt-output-kicker" data-i18n="output.kicker">로컬 재생</span>
-                      <h2 id="pt-output-title" data-i18n="output.ptTitle">PT 출력</h2>
-                    </div>
-                    <span data-i18n="output.systemDefault">시스템 기본 출력</span>
-                  </div>
-                  <div class="pt-output-options seg-toggle" role="radiogroup" data-i18n-aria="output.modeLabel" aria-label="PT 출력 방식">
-                    <label class="seg-option">
-                      <input name="outputMode" type="radio" value="captions" checked />
-                      <span data-i18n="output.captions">자막</span>
-                    </label>
-                  </div>
-                  <div id="pt-playback-options" class="pt-playback-options" hidden>
-                    <section class="pt-voice-methods" aria-labelledby="pt-voice-method-title">
-                      <div class="pt-voice-method-heading">
-                        <h3 id="pt-voice-method-title" data-i18n="output.voiceEngine">통역 음성 엔진</h3>
-                      </div>
-                      <div class="pt-output-options seg-toggle" role="radiogroup" data-i18n-aria="output.voiceEngine" aria-label="통역 음성 엔진">
-                        <label class="seg-option">
-                          <input name="voiceProvider" type="radio" value="gemini" checked />
-                          <span data-i18n="output.geminiVoice">Gemini 음성</span>
-                        </label>
-                        <label class="seg-option">
-                          <input name="voiceProvider" type="radio" value="openai" aria-describedby="pt-openai-voice-help" />
-                          <span data-i18n="output.openaiRealtime">OpenAI Realtime</span>
-                        </label>
-                      </div>
-                      <!-- Only populated when the chosen voice language has no
-                           OpenAI Realtime voice (a state message, not a blurb). -->
-                      <p id="pt-openai-voice-help" class="pt-output-help"></p>
-                    </section>
-                    <label>
-                      <span data-i18n="output.audioLanguage">통역 음성 언어</span>
-                      <select name="audioLanguage" data-i18n-aria="output.audioLanguageLabel" aria-label="재생할 통역 음성 언어">
-                        <option value="en">English</option>
-                        <option value="ko">한국어</option>
-                      </select>
-                    </label>
-                    <label class="pt-volume-field">
-                      <span><span data-i18n="output.volume">통역 음량</span> <output id="audio-volume-value" for="audio-volume">80%</output></span>
-                      <input id="audio-volume" name="audioVolume" type="range" min="0" max="1" step="0.05" value="0.8" data-i18n-aria="output.volumeLabel" aria-label="통역 음성 재생 음량" />
-                    </label>
-                  </div>
-                </section>
+                <p class="cfg-hint" data-i18n="displayMode.hint">기본은 인입 언어의 반대편 번역만 보여줍니다. 한국어로 말하면 영어만, 영어로 말하면 한국어만 나옵니다.</p>
               </section>
 
+              <section class="cfg-section" aria-labelledby="caption-display-title">
+                <div class="cfg-heading"><h2 id="caption-display-title">표시 화면</h2></div>
+                <button type="button" id="caption-display-trigger" aria-haspopup="dialog" aria-expanded="false" aria-controls="caption-display-panel">화면 선택</button>
+                <div id="caption-display-panel" class="nova-display-popover" popover="auto" role="dialog" aria-labelledby="caption-display-title">
+                  <div id="caption-display-options"></div>
+                  <button type="button" data-refresh-displays>새로고침</button>
+                  <p id="caption-display-status" role="status"></p>
+                </div>
+              </section>
+              </div>
+              <input name="outputMode" type="hidden" value="captions" />
+
+              <details id="caption-details" class="caption-details">
+                <summary>세부 설정</summary>
+                <div class="caption-details-body">
               <section class="cfg-section" aria-labelledby="cfg-glossary-title">
                 <div class="cfg-heading">
-                  <h2 id="cfg-glossary-title"><i data-cfg-ordinal></i><span data-i18n="cfg.glossary">용어집</span></h2>
+                  <h2 id="cfg-glossary-title"><span data-i18n="cfg.glossary">용어집</span></h2>
                 </div>
-                <label class="control-field">
-                  <span data-i18n="glossary.preset">용어집 프리셋</span>
-                  <select name="glossaryPreset">
-                    <option value="" data-i18n="glossary.presetCustom">직접 입력</option>
-                  </select>
-                </label>
-                <button id="manage-glossaries" type="button" class="secondary compact" data-workspace-nav="settings" data-i18n="glossary.manage">용어집 관리</button>
+                <fieldset id="glossary-session-selection" class="glossary-selection" aria-describedby="glossary-selection-status">
+                <legend data-i18n="glossary.selection.legend">세션에 사용할 용어집</legend>
+                  <div class="lang-select" data-lang-select="glossary">
+                    <button type="button" class="lang-select-trigger" id="glossary-select-trigger"
+                      aria-haspopup="dialog" aria-expanded="false" aria-controls="glossary-select-panel">
+                      <span class="lang-select-summary">공통 비즈니스</span>
+                      <output id="glossary-selection-count" class="glossary-selection-count" aria-live="polite">1/5</output>
+                    </button>
+                    <dialog class="lang-select-panel glossary-select-panel" id="glossary-select-panel" aria-labelledby="glossary-select-title" hidden>
+                      <header class="glossary-modal-heading"><h2 id="glossary-select-title">세션 용어집</h2><button type="button" data-glossary-select-close>닫기</button></header>
+                      <div class="glossary-modal-body">
+                        <label class="glossary-modal-search">용어집 검색<input id="glossary-selection-search" type="search" autocomplete="off" /></label>
+                      <section aria-labelledby="glossary-selection-builtins-title">
+                      <h3 id="glossary-selection-builtins-title" data-i18n="glossary.selection.builtins">내장 용어집</h3>
+                        <div id="glossary-selection-builtins" class="glossary-selection-options"></div>
+                      </section>
+                      <section aria-labelledby="glossary-selection-users-title">
+                      <h3 id="glossary-selection-users-title" data-i18n="glossary.selection.users">내 용어집</h3>
+                        <div id="glossary-selection-users" class="glossary-selection-options"></div>
+                      </section>
+                      </div>
+                      <footer class="glossary-modal-footer"><button type="button" data-glossary-select-close>완료</button></footer>
+                    </dialog>
+                  </div>
+                  <p id="glossary-selection-status" class="glossary-selection-status" role="status" aria-live="polite">적용할 때 번역 충돌을 확인합니다.</p>
+                </fieldset>
+
               </section>
 
               <section class="cfg-section" aria-labelledby="cfg-appearance-title">
                 <div class="cfg-heading">
-                  <h2 id="cfg-appearance-title"><i data-cfg-ordinal></i><span data-i18n="cfg.appearance">표시 설정</span></h2>
+                  <h2 id="cfg-appearance-title"><span data-i18n="cfg.appearance">표시 설정</span></h2>
                 </div>
                 <label class="placement-offset">
                   <span data-i18n="appearance.opacity">배경 투명도</span>
-                  <input name="opacity" type="range" min="0.2" max="1" step="0.01" data-i18n-aria="appearance.opacityLabel" aria-label="자막 배경 불투명도" />
+                  <input name="opacity" type="range" min="0" max="1" step="0.01" data-i18n-aria="appearance.opacityLabel" aria-label="자막 배경 불투명도" />
                   <output id="opacity-value">92%</output>
                 </label>
                 <label class="control-stack">
@@ -196,7 +188,7 @@
 
               <section id="subtitle-placement" class="subtitle-placement cfg-section" data-i18n-aria="position.groupLabel" aria-label="언어별 자막 위치">
                 <div class="cfg-heading placement-head">
-                  <h2 class="placement-title"><i data-cfg-ordinal></i><span data-i18n="cfg.position">자막 위치</span></h2>
+                  <h2 class="placement-title"><span data-i18n="cfg.position">자막 위치</span></h2>
                 </div>
                 <div class="placement-rows">
                   <div class="placement-row" data-lang="en" hidden>
@@ -231,13 +223,15 @@
                 </label>
               </section>
 
+                </div>
+              </details>
               <div id="subtitle-error" class="subtitle-error" hidden></div>
 
-              <section class="preview-panel" hidden>
-                <div class="preview-label" data-i18n="preview.label">현재 자막</div>
+              <section class="preview-panel caption-task-preview" aria-labelledby="caption-preview-label">
+                <div id="caption-preview-label" class="preview-label" data-i18n="preview.label">현재 자막</div>
                 <div id="subtitle-preview" class="subtitle-preview translation-only" data-i18n-aria="preview.regionLabel" aria-label="현재 자막">
                   <div class="source-line" hidden></div>
-                  <div class="translation-line" data-i18n="preview.sample">번역 자막</div>
+                  <div class="translation-line" data-i18n="preview.sample">안녕하세요. 오늘 회의의 핵심 내용을 실시간으로 번역합니다.</div>
                 </div>
               </section>
             </section>
@@ -247,7 +241,7 @@
                  They sat under Records, where they described nothing the page was
                  about -- a record's own lines are its transcript and its topics
                  are its summary chapters. -->
-            <section class="history-panel workspace-panel">
+            <section class="history-panel workspace-panel" hidden>
               <div class="panel-heading">
                 <span data-i18n="history.topics">주제</span>
                 <span class="panel-heading-actions">
@@ -259,7 +253,7 @@
               <div id="topic-list" class="topic-list" aria-live="polite"></div>
             </section>
 
-            <section id="translation-log-panel" class="translation-log-panel workspace-panel">
+            <section id="translation-log-panel" class="translation-log-panel workspace-panel" hidden>
               <div class="panel-heading">
                 <span data-i18n="history.committed">확정된 자막</span>
                 <strong id="translation-count">0</strong>
@@ -271,18 +265,19 @@
 
         <!-- ══════════════ PAGE · LIVE CALL ══════════════ -->
         <div class="workspace-page" data-workspace-page="livecall" id="live-call-page" data-i18n-aria="live.pageLabel" aria-label="Live Call 예약">
+          <div class="live-record-actions"><a href="#records-page" data-workspace-nav="records" class="secondary compact">기록 · 요약</a></div>
           <div class="workspace-single">
             <section class="command-panel workspace-panel">
-              <section class="cfg-section" aria-labelledby="live-draft-details-title">
+              <section class="cfg-section live-draft-group" aria-labelledby="live-draft-details-title">
                 <div class="cfg-heading">
-                  <h2 id="live-draft-details-title"><i>1</i><span data-i18n="live.sessionDetails">세션 정보</span></h2>
+                  <h2 id="live-draft-details-title"><span data-i18n="live.sessionDetails">세션 정보</span></h2>
                 </div>
                 <label>
                   <span data-i18n="live.title">제목</span>
                   <input name="liveDraftTitle" type="text" maxlength="100" data-i18n-placeholder="live.titlePlaceholder" placeholder="타운홀 Q&amp;A" autocomplete="off" />
                 </label>
                 <div class="live-draft-cover">
-                  <span id="live-draft-cover-rules" data-i18n="live.coverRules">커버 이미지 (선택) · 정사각형 · JPEG, PNG, WebP · 최대 5MB</span>
+                  <span id="live-draft-cover-rules">커버 이미지 (선택) · 16:9 · JPEG, PNG, WebP · 최대 20MB</span>
                   <div class="live-draft-cover-row">
                     <button id="live-draft-cover-button" type="button" class="secondary compact" aria-describedby="live-draft-cover-rules live-draft-cover-status" data-i18n="live.coverUpload">이미지 업로드</button>
                     <input id="live-draft-cover" type="file" accept="image/jpeg,image/png,image/webp" data-i18n-aria="live.coverChoose" aria-label="Live Call 커버 이미지 선택" hidden />
@@ -290,15 +285,9 @@
                   </div>
                   <span id="live-draft-cover-status" class="live-draft-cover-status" role="status" aria-live="polite" data-i18n="live.coverNone">선택된 이미지 없음</span>
                 </div>
-              </section>
-
-              <section class="cfg-section" aria-labelledby="live-draft-schedule-title">
-                <div class="cfg-heading">
-                  <h2 id="live-draft-schedule-title"><i>2</i><span data-i18n="live.schedule">일정</span></h2>
-                </div>
-                <div class="two-column">
+                <div class="two-column live-draft-schedule" aria-labelledby="live-draft-schedule-title">
                   <label>
-                    <span data-i18n="live.startDate">시작 날짜 (비우면 바로 시작)</span>
+                    <span id="live-draft-schedule-title" data-i18n="live.startDate">시작 날짜 (비우면 바로 시작)</span>
                     <input name="liveDraftDate" type="date" />
                   </label>
                   <label>
@@ -308,31 +297,44 @@
                 </div>
               </section>
 
-              <section class="cfg-section" aria-labelledby="live-draft-language-title">
+              <section class="cfg-section live-draft-group" aria-labelledby="live-draft-language-title">
                 <div class="cfg-heading">
-                  <h2 id="live-draft-language-title"><i>3</i><span data-i18n="live.language">언어</span></h2>
+                  <h2 id="live-draft-language-title"><span data-i18n="live.access">입장 · 정원</span></h2>
                 </div>
-                <div id="live-draft-languages" class="live-draft-languages" aria-live="polite"></div>
-                <div class="live-display-language" role="note">
-                  <p data-i18n="live.captionLanguagePolicy">화면: 말한 언어의 반대 언어 한 줄 · 웹 기록: 영어·한국어 모두</p>
+                <div class="live-draft-participation">
+                  <div>
+                    <span class="live-draft-field-label" data-i18n="live.language">언어</span>
+                    <div class="lang-select" data-lang-select="live-call">
+                      <button type="button" class="lang-select-trigger" id="live-call-language-trigger"
+                        aria-haspopup="true" aria-expanded="false" aria-controls="live-call-language-panel">
+                        <span class="lang-select-summary" data-i18n="live.languagesInherit">자막 언어와 동일</span>
+                      </button>
+                      <div class="lang-select-panel" id="live-call-language-panel" hidden>
+                      <label class="language-search-field">언어 검색<input type="search" data-language-search autocomplete="off" /></label>
+                        <div class="language-pills live-call-language-pills"></div>
+                        <button type="button" class="lang-select-clear" id="live-call-language-clear" data-i18n="live.languagesClear">자막 언어와 동일하게 (선택 해제)</button>
+                      </div>
+                    </div>
+                    <div id="live-draft-languages" class="live-draft-languages" aria-live="polite"></div>
+                  </div>
+                  <label>
+                    <span data-i18n="live.capacity">참가 정원 (최대 200)</span>
+                    <input name="liveDraftCapacity" type="number" min="2" max="200" step="1" value="200" />
+                  </label>
+                  <label class="live-draft-speaking">
+                    <span data-i18n="live.speaking">참여자 발언</span>
+                    <input name="liveDraftSpeaking" type="checkbox" role="switch" />
+                    <small data-i18n="live.speakingHint">끄면 참여자는 번역 자막 시청만 할 수 있어요</small>
+                  </label>
                 </div>
               </section>
 
-              <section class="cfg-section" aria-labelledby="live-draft-access-title">
-                <div class="cfg-heading">
-                  <h2 id="live-draft-access-title"><i>4</i><span data-i18n="live.access">입장 · 정원</span></h2>
-                </div>
-                <label>
-                  <span data-i18n="live.capacity">참가 정원 (최대 50)</span>
-                  <input name="liveDraftCapacity" type="number" min="2" max="50" step="1" value="50" />
-                </label>
-              </section>
+              <section id="live-speaker-roster" aria-label="발언자 관리"></section>
 
               <section class="live-handoff" aria-labelledby="live-workspace-title">
                 <div class="live-handoff-copy">
-                  <span class="live-handoff-kicker" data-i18n="live.handoffKicker">선택 · LIVE CALL</span>
+                  <span data-i18n="live.handoffKicker" hidden>선택 · LIVE CALL</span>
                   <h2 id="live-workspace-title" data-i18n="live.handoffTitle">게스트와 자막 공유</h2>
-                  <span class="live-handoff-flow" data-i18n="live.handoffFlow">세션 생성 → QR·코드 공유 → Live Call 시작</span>
                 </div>
                 <div class="live-handoff-action">
                   <button id="schedule-live-call" type="button" class="accent" data-i18n="live.start">Live Call 시작</button>
@@ -344,7 +346,7 @@
 
               <section class="cfg-section" aria-labelledby="live-registered-title">
                 <div class="cfg-heading">
-                  <h2 id="live-registered-title"><i>5</i><span data-i18n="live.registered">등록된 세션</span></h2>
+                  <h2 id="live-registered-title"><span data-i18n="live.registered">등록된 세션</span></h2>
                 </div>
                 <div id="live-registered-list" class="live-registered-list" aria-live="polite"></div>
                 <button id="refresh-registered-sessions" type="button" class="secondary compact" data-i18n="live.refreshRegistered">등록된 세션 새로고침</button>
@@ -355,11 +357,36 @@
 
         <!-- ══════════════ PAGE · RECORDS ══════════════ -->
         <div class="workspace-page" data-workspace-page="records" id="records-page" data-i18n-aria="records.pageLabel" aria-label="자막 기록">
+          <div class="live-record-actions"><a href="#live-call-page" data-workspace-nav="livecall" class="secondary compact">Live Call</a></div>
           <!-- Records as a calendar: Live Call meetings sit at their real start
                time, month / week / day, anchored on today. Clicking a meeting
                opens the existing detail subview (원문 + 요약). Caption-only
                sessions have no meeting time, so they stay in a separate list. -->
           <section id="session-records-panel" class="workspace-panel records-cal-panel">
+            <div class="records-filter-bar" role="search" data-i18n-aria="records.filtersLabel" aria-label="기록 필터">
+              <label class="records-filter-field records-filter-search" for="records-search">
+                <span data-i18n="records.search">기록 검색</span>
+                <input id="records-search" type="search" autocomplete="off" data-i18n-placeholder="records.searchPlaceholder" data-i18n-aria="records.search" placeholder="제목 또는 세션 ID" aria-label="기록 검색" />
+              </label>
+              <div class="records-filter-selects">
+                <label class="records-filter-field" for="records-type-filter">
+                  <span data-i18n="records.type">유형</span>
+                  <select id="records-type-filter" data-i18n-aria="records.type" aria-label="유형">
+                    <option value="all" data-i18n="records.type.all">전체</option>
+                    <option value="captions" data-i18n="records.type.captions">자막</option>
+                    <option value="live-call" data-i18n="records.type.liveCall">Live Call</option>
+                  </select>
+                </label>
+                <label class="records-filter-field" for="records-status-filter">
+                  <span data-i18n="records.status">상태</span>
+                  <select id="records-status-filter" data-i18n-aria="records.status" aria-label="상태">
+                    <option value="all" data-i18n="records.status.all">전체</option>
+                    <option value="completed" data-i18n="records.status.completed">완료</option>
+                    <option value="in-progress" data-i18n="records.status.inProgress">진행 중</option>
+                  </select>
+                </label>
+              </div>
+            </div>
             <div class="records-cal-toolbar">
               <div class="records-cal-nav">
                 <button id="records-cal-prev" type="button" class="records-cal-step" data-i18n-aria="records.prevPeriod" aria-label="이전 기간">
@@ -372,19 +399,19 @@
               </div>
               <h3 id="records-cal-period" class="records-cal-period" aria-live="polite"></h3>
               <div class="records-cal-views" role="group" data-i18n-aria="records.viewGroup" aria-label="보기 단위">
-                <button type="button" data-records-view="month" class="is-selected" aria-pressed="true" data-i18n="records.month">월</button>
-                <button type="button" data-records-view="week" aria-pressed="false" data-i18n="records.week">주</button>
-                <button type="button" data-records-view="day" aria-pressed="false" data-i18n="records.day">일</button>
+                <button type="button" data-records-view="month" class="is-selected" aria-pressed="true" tabindex="0" data-i18n="records.month">월</button>
+                <button type="button" data-records-view="week" aria-pressed="false" tabindex="-1" data-i18n="records.week">주</button>
+                <button type="button" data-records-view="day" aria-pressed="false" tabindex="-1" data-i18n="records.day">일</button>
               </div>
               <button id="refresh-session-records" type="button" class="records-cal-step" data-i18n-aria="records.refresh" aria-label="새로고침">
                 <svg viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" aria-hidden="true"><path d="M13.4 6.4A5.6 5.6 0 1 0 13.9 9"/><path d="M13.6 2.6v3.8H9.8" stroke-linejoin="round"/></svg>
               </button>
             </div>
-            <div id="records-cal-grid" class="records-cal-grid" aria-live="polite"></div>
-            <div id="session-records-status" class="records-cal-status" role="status" aria-live="polite"></div>
+            <div id="records-cal-grid" class="records-cal-grid"></div>
+            <div id="session-records-status" class="records-cal-status" role="status" aria-live="polite" aria-atomic="true"></div>
             <details id="records-local-sessions" class="records-local">
               <summary data-i18n="records.captionSessions">자막 세션</summary>
-              <div id="session-records-list" class="records-local-list" aria-live="polite"></div>
+              <div id="session-records-list" class="records-local-list"></div>
             </details>
           </section>
 
@@ -398,18 +425,29 @@
               <button id="session-detail-export" type="button" class="secondary compact" data-i18n="records.export">Excel</button>
             </div>
             <div id="session-detail-audio" class="session-record-audio"></div>
-            <div class="session-detail-columns">
-              <section class="session-detail-column" data-i18n-aria="records.transcriptLabel" aria-label="원문 기록">
-                <div class="session-detail-tabs" role="tablist" data-i18n-aria="records.transcriptLangLabel" aria-label="원문 언어">
-                  <button type="button" role="tab" data-transcript-lang="en" class="is-selected" aria-selected="true">EN</button>
-                  <button type="button" role="tab" data-transcript-lang="ko" aria-selected="false">KO</button>
-                </div>
-                <div id="session-detail-transcript" class="session-record-detail" role="tabpanel"></div>
-              </section>
-              <section class="session-detail-column" data-i18n-aria="records.summaryLabel" aria-label="AI 요약">
-                <h3 data-i18n="records.summary">AI 요약</h3>
+            <div class="session-detail-view-tabs" role="tablist" data-i18n-aria="records.detailViewLabel" aria-label="기록 보기">
+              <button id="session-detail-tab-summary" type="button" role="tab" data-record-detail-tab="summary" class="is-selected" aria-selected="true" aria-controls="session-detail-panel-summary" tabindex="0" data-i18n="records.summary">AI 요약</button>
+              <button id="session-detail-tab-transcript" type="button" role="tab" data-record-detail-tab="transcript" aria-selected="false" aria-controls="session-detail-panel-transcript" tabindex="-1" data-i18n="records.transcript">원문</button>
+              <button id="session-detail-tab-coach" type="button" role="tab" data-record-detail-tab="coach" aria-selected="false" aria-controls="session-detail-panel-coach" tabindex="-1" data-i18n="records.coach">Coach</button>
+              <button id="session-detail-tab-participants" type="button" role="tab" data-record-detail-tab="participants" aria-selected="false" aria-controls="session-detail-panel-participants" tabindex="-1" data-i18n="live.participant">참가자</button>
+            </div>
+            <div class="session-detail-panels session-detail-columns">
+              <section id="session-detail-panel-summary" class="session-detail-panel" role="tabpanel" aria-labelledby="session-detail-tab-summary" data-record-detail-panel="summary">
                 <div id="session-detail-summary" class="session-record-detail"></div>
                 <button id="session-detail-generate-summary" type="button" class="secondary compact" data-i18n="records.generateSummary" hidden>AI 요약 생성</button>
+              </section>
+              <section id="session-detail-panel-transcript" class="session-detail-panel" role="tabpanel" aria-labelledby="session-detail-tab-transcript" data-record-detail-panel="transcript" hidden>
+                <div class="session-detail-tabs" role="tablist" data-i18n-aria="records.transcriptLangLabel" aria-label="원문 언어">
+                  <button id="session-transcript-tab-en" type="button" role="tab" data-transcript-lang="en" class="is-selected" aria-selected="true" aria-controls="session-detail-transcript" tabindex="0">EN</button>
+                  <button id="session-transcript-tab-ko" type="button" role="tab" data-transcript-lang="ko" aria-selected="false" aria-controls="session-detail-transcript" tabindex="-1">KO</button>
+                </div>
+                <div id="session-detail-transcript" class="session-record-detail" role="tabpanel" aria-labelledby="session-transcript-tab-en"></div>
+              </section>
+              <section id="session-detail-panel-coach" class="session-detail-panel" role="tabpanel" aria-labelledby="session-detail-tab-coach" data-record-detail-panel="coach" hidden>
+                <div id="session-detail-coach" class="session-detail-coach"></div>
+              </section>
+              <section id="session-detail-panel-participants" class="session-detail-panel" role="tabpanel" aria-labelledby="session-detail-tab-participants" data-record-detail-panel="participants" hidden>
+                <div id="session-detail-participants" class="session-detail-participants"></div>
               </section>
             </div>
           </section>
@@ -420,9 +458,14 @@
         <div class="workspace-page" data-workspace-page="settings" id="settings-page" data-i18n-aria="settings.pageLabel" aria-label="앱 설정">
           <div class="workspace-single">
             <section class="command-panel workspace-panel">
+              <div class="settings-view-tabs" role="tablist" aria-label="설정 범위">
+                <button id="settings-tab-general" type="button" role="tab" data-settings-view="general" class="is-selected" aria-selected="true" aria-controls="settings-panel-general" tabindex="0" data-i18n="page.settings.title">설정</button>
+                <button id="settings-tab-advanced" type="button" role="tab" data-settings-view="advanced" aria-selected="false" aria-controls="settings-panel-advanced" tabindex="-1" data-i18n="settings.drawerAdvanced">고급</button>
+              </div>
+              <div id="settings-panel-general" class="settings-view-panel" role="tabpanel" aria-labelledby="settings-tab-general" data-settings-panel="general">
               <section class="cfg-section" aria-labelledby="cfg-audio-title">
                 <div class="cfg-heading">
-                  <h2 id="cfg-audio-title"><i data-cfg-ordinal></i><span data-i18n="cfg.audioInput">오디오 입력</span></h2>
+                  <h2 id="cfg-audio-title"><span data-i18n="cfg.audioInput">오디오 입력</span></h2>
                 </div>
                 <div class="quick-grid">
                   <label class="control-field input-mode-field">
@@ -478,40 +521,66 @@
 
               <section id="live-host-login-section" class="cfg-section" aria-labelledby="cfg-host-login-title" hidden>
                 <div class="cfg-heading">
-                  <h2 id="cfg-host-login-title"><i data-cfg-ordinal></i><span data-i18n="cfg.hostAuthorization">Live Call 호스트 인증</span></h2>
+                  <h2 id="cfg-host-login-title"><span data-i18n="cfg.hostAuthorization">Live Call 호스트 인증</span></h2>
                 </div>
-                <div class="two-column">
-                  <label>
-                    <span data-i18n="settings.hostId">호스트 ID</span>
-                    <input name="liveHostId" type="text" autocomplete="off" />
-                  </label>
-                  <label>
-                    <span data-i18n="settings.hostName">표시 이름</span>
-                    <input name="liveHostName" type="text" autocomplete="off" />
-                  </label>
+                <div>
+                  <p data-i18n="settings.currentHostAccount">현재 계정</p>
+                  <p id="live-host-account" class="field-status">로그인 상태를 확인하고 있어요.</p>
+                  <p class="field-status" data-i18n="settings.hostSharedLoginHelp">웹과 같은 계정으로 로그인합니다. 로그아웃하면 앱이 다시 시작됩니다.</p>
                 </div>
-                <label>
-                  <span data-i18n="settings.hostPassword">호스트 비밀번호</span>
-                  <span class="password-field">
-                    <input name="liveHostPassword" type="password" autocomplete="off" data-i18n-placeholder="settings.hostPasswordPlaceholder" placeholder="저장된 비밀번호는 표시되지 않습니다" />
-                    <button id="live-host-password-reveal" type="button" class="password-reveal" aria-pressed="false" data-i18n-aria="settings.revealLabel" aria-label="비밀번호 표시" data-i18n="settings.reveal">표시</button>
-                  </span>
-                </label>
                 <div class="key-row">
-                  <button id="save-live-host-login" type="button" class="secondary compact" aria-describedby="live-host-login-status" data-i18n="settings.saveHostAuthorization">호스트 인증 저장</button>
-                  <span id="live-host-login-status" class="field-status" role="status" aria-live="polite" data-i18n="settings.authorizationRequired">인증 필요</span>
+                  <button id="open-live-host-login" type="button" class="secondary compact" aria-describedby="live-host-login-status" data-i18n="settings.hostSignIn">로그인</button>
+                  <button id="logout-live-host-session" type="button" class="secondary compact" aria-describedby="live-host-login-status" data-i18n="settings.hostSignOut" hidden>로그아웃</button>
+                  <button id="open-live-console" type="button" class="secondary compact" aria-describedby="live-host-login-status" data-i18n="settings.openConsole" hidden>콘솔</button>
                 </div>
+                <p id="live-host-login-status" class="field-status" role="status" aria-live="polite" data-i18n="settings.hostSessionChecking">로그인 상태를 확인하고 있어요.</p>
               </section>
+              </div>
 
+              <div id="settings-panel-advanced" class="settings-view-panel" role="tabpanel" aria-labelledby="settings-tab-advanced" data-settings-panel="advanced" hidden>
               <section class="cfg-section" aria-labelledby="cfg-advanced-title">
                 <div class="cfg-heading">
-                  <h2 id="cfg-advanced-title"><i data-cfg-ordinal></i><span data-i18n="cfg.engineGlossary">엔진 · 용어집</span></h2>
+                  <h2 id="cfg-advanced-title"><span data-i18n="cfg.engineGlossary">엔진 · 용어집</span></h2>
                 </div>
+                <div class="settings-panel" role="group" aria-labelledby="caption-models-heading" data-engine-assignment="readonly">
+                  <h3 id="caption-models-heading">배정된 자막 엔진</h3>
+                  <output id="caption-engine-label" aria-live="polite">확인 중</output>
+                  <p id="caption-engine-status" class="field-status" data-caption-engine-status role="status" aria-live="polite">관리자가 배정하며 다음 세션부터 적용됩니다.</p>
+                </div>
+                <section class="glossary-management" aria-label="용어집 관리">
+                <div class="control-field glossary-preset-field">
+                  <label for="glossary-preset" data-i18n="glossary.preset">용어집 프리셋</label>
+                  <select id="glossary-preset" name="glossaryPreset" aria-describedby="glossary-preset-help glossary-preset-status">
+                    <option value="custom" data-i18n="glossary.presetCustom">직접 입력</option>
+                    <optgroup id="glossary-preset-builtins" label="내장 프리셋"></optgroup>
+                    <optgroup id="glossary-preset-users" label="동기화 프리셋"></optgroup>
+                  </select>
+                  <p id="glossary-preset-help" class="field-help sr-only" data-i18n="glossary.presetCustomHelp">직접 입력</p>
+                </div>
+                <div class="glossary-preset-actions">
+                  <button id="create-glossary-preset" type="button" class="secondary compact" aria-expanded="false" aria-controls="glossary-preset-editor" data-i18n="glossary.create">프리셋 등록</button>
+                  <button id="update-glossary-preset" type="button" class="secondary compact" data-i18n="glossary.update" hidden>변경 저장</button>
+                  <button id="delete-glossary-preset" type="button" class="secondary compact" data-i18n="glossary.delete" hidden>삭제</button>
+                  <button id="confirm-delete-glossary-preset" type="button" class="accent compact" data-i18n="glossary.deleteConfirmAction" hidden>삭제 확인</button>
+                  <button id="cancel-delete-glossary-preset" type="button" class="secondary compact" data-i18n="common.cancel" hidden>취소</button>
+                  <button id="manage-glossaries" type="button" class="secondary compact" data-workspace-nav="settings" data-i18n="glossary.manage">용어집 편집</button>
+                </div>
+                <section id="glossary-preset-editor" class="glossary-preset-editor" aria-labelledby="glossary-preset-editor-title" hidden>
+                  <h3 id="glossary-preset-editor-title" data-i18n="glossary.createTitle">현재 용어집을 프리셋으로 등록</h3>
+                  <label for="glossary-preset-name" data-i18n="glossary.name">프리셋 이름</label>
+                  <input id="glossary-preset-name" name="glossaryPresetName" type="text" maxlength="80" autocomplete="off" required data-i18n-placeholder="glossary.namePlaceholder" placeholder="예) 한국 CRE 주간 회의" />
+                  <div class="glossary-preset-editor-actions">
+                    <button id="save-glossary-preset" type="button" class="accent" data-i18n="glossary.save">등록</button>
+                    <button id="cancel-glossary-preset" type="button" class="secondary" data-i18n="common.cancel">취소</button>
+                  </div>
+                </section>
+                <p id="glossary-preset-status" class="glossary-preset-status" role="status" aria-live="polite"></p>
+                </section>
                 <details class="settings-drawer">
                   <summary data-i18n="settings.drawerAdvanced">고급</summary>
                   <div class="settings-panel">
                     <label>
-                      <span data-i18n="settings.openaiKey">OpenAI API key</span>
+                      <span data-i18n="settings.openaiKey">OpenAI 음성 인식 API key</span>
                       <div class="key-row">
                         <input name="openaiKey" type="password" autocomplete="off" placeholder="sk-..." />
                         <button id="save-openai-key" type="button" class="secondary compact" data-i18n="settings.saveKey">키 저장</button>
@@ -520,16 +589,7 @@
                     </label>
 
                     <label>
-                      <span data-i18n="settings.openaiKey2">OpenAI API key 2</span>
-                      <div class="key-row">
-                        <input name="openaiSecondaryKey" type="password" autocomplete="off" placeholder="sk-... (separate Project)" />
-                        <button id="save-openai-secondary-key" type="button" class="secondary compact" data-i18n="settings.saveKey2">키 2 저장</button>
-                      </div>
-                      <span id="openai-secondary-key-status" class="field-status" data-i18n="key.unregistered">미등록</span>
-                    </label>
-
-                    <label>
-                      <span data-i18n="settings.geminiKey">Gemini API key (Live Translate)</span>
+                      <span data-i18n="settings.geminiKey">Gemini API key</span>
                       <div class="key-row">
                         <input name="geminiKey" type="password" autocomplete="off" placeholder="AIza..." />
                         <button id="save-gemini-key" type="button" class="secondary compact" data-i18n="settings.saveKey">키 저장</button>
@@ -546,9 +606,18 @@
                       <span id="gemini-secondary-key-status" class="field-status" data-i18n="key.geminiSecondaryHint">미등록</span>
                     </label>
 
+                    <label>
+                      <span data-i18n="keys.soniox">Soniox API 키</span>
+                      <div class="key-row">
+                        <input name="sonioxKey" type="password" autocomplete="off" placeholder="soniox..." />
+                        <button id="save-soniox-key" type="button" class="secondary compact" data-i18n="keys.saveSoniox">Soniox 키 저장</button>
+                      </div>
+                      <span id="soniox-key-status" class="field-status" data-i18n="key.unregistered">미등록</span>
+                    </label>
+
                     <input name="translationProvider" type="hidden" value="gemini" />
                     <div class="pt-output-help" role="note">
-                      <strong data-i18n="output.engineNote">자막 엔진</strong> · <span data-i18n="output.engineNoteValue">Gemini 고정</span>
+                      <strong data-i18n="output.engineNote">자막 엔진</strong> · <span>관리자 배정</span>
                     </div>
 
                     <label class="glossary-field">
@@ -560,7 +629,7 @@
 
                     <label class="glossary-field">
                       <span data-i18n="glossary.terms">전문용어집</span>
-                      <textarea name="glossary" rows="6" maxlength="16000"
+                      <textarea name="glossary" rows="6" maxlength="40000"
                         data-i18n-placeholder="glossary.termsPlaceholder"
                         placeholder="예) operator -> 운영사"></textarea>
                     </label>
@@ -581,7 +650,6 @@
                       </select>
                     </label>
 
-                    <input name="displayMode" type="hidden" value="translation_only" />
                     <input name="position" type="hidden" value="bottom-center" />
 
                     <div class="font-size-grid">
@@ -617,6 +685,7 @@
                   </div>
                 </details>
               </section>
+              </div>
             </section>
           </div>
         </div>
@@ -647,6 +716,37 @@
         </div>
       </form>
       </main>
+    </div>
+    <div id="glossary-detail-overlay" class="glossary-detail-overlay" hidden>
+      <dialog id="glossary-detail-dialog" class="glossary-detail-dialog" aria-modal="true" aria-labelledby="glossary-detail-title">
+        <div class="glossary-detail-heading">
+          <h2 id="glossary-detail-title">용어집</h2>
+          <button id="glossary-detail-close" type="button" class="secondary compact" data-i18n="common.close">닫기</button>
+        </div>
+        <div class="glossary-detail-body">
+        <p id="glossary-detail-meta" class="glossary-detail-meta"></p>
+        <div class="glossary-detail-toolbar">
+          <input id="glossary-detail-search" aria-label="용어 검색" type="search" autocomplete="off"
+            data-i18n-placeholder="glossary.detailSearch" placeholder="용어 검색" />
+          <div id="glossary-detail-languages" class="glossary-detail-languages" role="group" aria-label="언어별 보기"></div>
+        </div>
+        <ul id="glossary-detail-terms" class="glossary-detail-terms" aria-live="polite"></ul>
+        <p id="glossary-detail-more" class="glossary-detail-more" hidden></p>
+        <section class="glossary-detail-custom" aria-labelledby="glossary-detail-custom-title">
+          <h3 id="glossary-detail-custom-title" data-i18n="glossary.detailCustomTitle">커스텀 용어 추가</h3>
+          <p class="field-help" data-i18n="glossary.detailCustomHint">내 로컬 용어집(직접 입력)에 추가되어 다음 세션부터 적용됩니다.</p>
+          <div class="glossary-detail-custom-row">
+            <input id="glossary-custom-source" aria-label="원문 용어" type="text" maxlength="240" autocomplete="off"
+              data-i18n-placeholder="glossary.detailCustomSource" placeholder="원문 용어" />
+            <input id="glossary-custom-target" aria-label="번역" type="text" maxlength="240" autocomplete="off"
+              data-i18n-placeholder="glossary.detailCustomTarget" placeholder="번역" />
+            <button id="glossary-custom-save" type="button" class="accent compact" data-i18n="glossary.detailCustomSave">저장</button>
+          </div>
+          <p id="glossary-custom-status" role="status" aria-live="polite"></p>
+        </section>
+        </div>
+        <footer class="glossary-modal-footer"><button type="button" id="glossary-detail-done">완료</button></footer>
+      </dialog>
     </div>
     <script type="module" src="subtitle-workspace.js"></script>
     <script type="module" src="subtitle-dashboard.js"></script>

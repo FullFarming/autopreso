@@ -1,0 +1,91 @@
+import { captionEngineCatalogForClient, normalizeEngineSelection } from "../../../packages/caption-core/caption-engine-catalog.js";
+import { LiveSecurityConfigurationError } from "../security/config";
+import type { EngineRoleSelection, EngineSelection, SttEngineSelection } from "../live/model-preferences";
+import { __onConsoleStoreSwapped, getConsoleStore, type ConsoleSettings } from "./console-store";
+
+// The engine types live with the session's `modelPreferences` (lib/live/model-preferences.ts)
+// so the client-side Live Call code can import them without pulling the console store in.
+export type { EngineRoleSelection, EngineSelection, SttEngineSelection };
+
+/**
+ * Catalog view for clients (`/api/live-config.captionEngines`): every entry with
+ * `available` = whether this server holds that provider's key. Booleans only -
+ * key values never leave the server.
+ */
+export function captionEngineAvailability(environment: Readonly<Record<string, string | undefined>> = process.env): ReturnType<typeof captionEngineCatalogForClient> {
+  return captionEngineCatalogForClient({
+    hasApiKeys: { gemini: Boolean(environment.GEMINI_API_KEY), soniox: Boolean(environment.SONIOX_API_KEY) },
+  });
+}
+
+/**
+ * What an unconfigured or unmigrated project behaves like: legacy login stays on. The `engine*`
+ * fields are the retired global engine_defaults (D1: engines are per user); they are still read
+ * because `read_console_settings_v1` returns them, but nothing resolves an engine from them.
+ */
+export const CONSOLE_SETTINGS_FALLBACK: Readonly<ConsoleSettings> = Object.freeze({
+  legacyPasswordLoginEnabled: true, engine: null, engineUpdatedAt: null, engineUpdatedByEmail: null,
+});
+
+const DEFAULT_TTL_MS = 60_000;
+
+export interface ConsoleSettingsCache { get(): Promise<ConsoleSettings>; invalidate(): void }
+
+export function createConsoleSettingsCache(opts: { read: () => Promise<ConsoleSettings>; ttlMs?: number; now?: () => number }): ConsoleSettingsCache {
+  const ttl = opts.ttlMs ?? DEFAULT_TTL_MS;
+  const now = opts.now ?? Date.now;
+  let entry: { value: ConsoleSettings; expiresAt: number } | null = null;
+  let inflight: Promise<ConsoleSettings> | null = null;
+  const refresh = async (): Promise<ConsoleSettings> => {
+    try {
+      const value = await opts.read();
+      entry = { value, expiresAt: now() + ttl };
+      return value;
+    } catch (error) {
+      // No Supabase server credentials: there is no console to consult, so behave as before the
+      // console existed. Cached for the TTL so a request storm does not re-evaluate the env each time.
+      if (error instanceof LiveSecurityConfigurationError) {
+        entry = { value: CONSOLE_SETTINGS_FALLBACK, expiresAt: now() + ttl };
+        return CONSOLE_SETTINGS_FALLBACK;
+      }
+      // Store outage: keep serving the last known settings instead of failing every login.
+      if (entry) return entry.value;
+      throw error;
+    }
+  };
+  return {
+    async get() {
+      if (entry && entry.expiresAt > now()) return entry.value;
+      inflight ??= refresh().finally(() => { inflight = null; });
+      return inflight;
+    },
+    invalidate() { entry = null; },
+  };
+}
+
+/** Module singleton (60 s; the legacy-login switch). Route handlers that write settings must call `invalidate()` afterwards. */
+export const consoleSettingsCache: ConsoleSettingsCache = createConsoleSettingsCache({ read: () => getConsoleStore().readSettings() });
+__onConsoleStoreSwapped(() => consoleSettingsCache.invalidate());
+
+/**
+ * The one mapping from a profile's `voice_provider` to a Live Call engine (D2: Soniox
+ * recognition + own translation by default; Gemini Transcribe → Flash is the alternative).
+ * Pure, so the console's immediate switch and the host's session start pin the same engine.
+ */
+export function engineSelectionForVoiceProvider(provider: "soniox" | "gemini"): EngineSelection {
+  return normalizeEngineSelection({
+    stt: provider === "soniox"
+      ? { provider: "soniox", model: "stt-rt-v5", languageMode: "auto" }
+      : { provider: "gemini", model: "gemini-3.5-transcribe-live", languageMode: "auto" },
+    translation: provider === "soniox"
+      ? { provider: "soniox", model: "stt-rt-v5" }
+      : { provider: "gemini", model: "gemini-3.6-flash" },
+    summary: { provider: "gemini", model: "gemini-3.6-flash" },
+  }) as EngineSelection;
+}
+
+/** A fresh server lookup at each new session; an unavailable policy never changes providers. */
+export async function resolveHostEngineAssignment(hostId: string): Promise<{ engine: EngineSelection; assignmentRevision: string }> {
+  const assignment = await getConsoleStore().readHostVoiceAssignment(hostId);
+  return { engine: engineSelectionForVoiceProvider(assignment.provider), assignmentRevision: assignment.revision };
+}

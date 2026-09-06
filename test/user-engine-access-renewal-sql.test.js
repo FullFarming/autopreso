@@ -1,0 +1,78 @@
+import assert from 'node:assert/strict';
+import { readFile } from 'node:fs/promises';
+import test from 'node:test';
+import { pathToFileURL } from 'node:url';
+const filename = '202609050001_user_engine_access_renewal.sql';
+const read = (name) => readFile(new URL(`../supabase/migrations/${name}`, import.meta.url), 'utf8');
+test('assignment and renewal RPCs remain service-only and bounded', async () => {
+  const sql = await read(filename);
+  for (const fn of ['read_host_voice_assignment_v1','set_profile_voice_provider_v1','list_profiles_admin_v2','renew_live_viewer_access_v1','renew_live_session_access_v1']) {
+    assert.match(sql, new RegExp(`revoke all on function public\\.${fn}\\([^;]*from public, anon, authenticated, service_role;`));
+  }
+  const bootstrap = await readFile(new URL('../supabase/bootstrap-new-project.sql', import.meta.url), 'utf8');
+  assert.ok(bootstrap.includes(`-- supabase/migrations/${filename}\n\n${sql}`));
+  assert.match(sql, /interval '15 minutes'/);
+  assert.match(sql, /grant_row\.expires_at > statement_timestamp\(\)/);
+  assert.doesNotMatch(sql, /update public\.live_sessions[\s\S]*set event_metadata/);
+});
+test('engine changes preserve sessions and access renewal rejects stale identities', {skip: !process.env.NOVA_PGLITE_MODULE}, async (t) => {
+  const { PGlite } = await import(pathToFileURL(process.env.NOVA_PGLITE_MODULE).href);
+  const db = new PGlite(); t.after(() => db.close());
+  await db.exec(`create schema auth; create role anon; create role authenticated; create role service_role;
+    create table auth.users(id uuid primary key); create function auth.uid() returns uuid language sql as 'select null::uuid';
+    create table live_sessions(id uuid primary key, host_id text, status text, archive_deleted_at timestamptz, version integer default 1, access_window_started_at timestamptz default now(), scheduled_at timestamptz, expires_at timestamptz, updated_at timestamptz, event_metadata jsonb, admission_state text, admission_open_until timestamptz, admission_code_hmac text default repeat('b',64), admission_generation bigint default 0);
+    create table live_session_invites(session_id uuid,expires_at timestamptz,revoked_at timestamptz);
+    create function public.set_live_session_engine_admin_v1(uuid,uuid,jsonb) returns void language sql as 'select';
+    grant execute on function public.set_live_session_engine_admin_v1(uuid,uuid,jsonb) to service_role;
+    create table viewer_grants(id uuid primary key, session_id uuid, user_id text, device_hash text, revoked_at timestamptz, expires_at timestamptz);
+    create function public.assert_console_admin_v1(p_actor_id uuid) returns void language plpgsql as $$ begin if not exists(select 1 from public.profiles where id=p_actor_id and status='approved' and role='admin') then raise exception 'ACTOR_NOT_ADMIN'; end if; end $$;`);
+  await db.exec(await read('202609020002_auth_profiles_desktop_codes.sql'));
+  const admin='00000000-0000-4000-8000-000000000001', user='00000000-0000-4000-8000-000000000002', session='00000000-0000-4000-8000-000000000003', grant='00000000-0000-4000-8000-000000000004';
+  for(const id of [admin,user]) await db.query('insert into auth.users values($1)',[id]);
+  await db.query("insert into profiles(id,email,host_id,status,role) values($1,'admin@test.invalid','noel','approved','admin'),($2,'user@test.invalid','user','approved','host')",[admin,user]);
+  await db.exec(await read(filename)); await db.exec(await read(filename));
+  const persistence = await read('202608310001_live_session_persistence.sql');
+  const triggerFunction = persistence.match(/create or replace function public\.enforce_stable_live_admission\(\)[\s\S]*?\n\$\$;/u)?.[0];
+  assert.ok(triggerFunction);
+  await db.exec(triggerFunction);
+  await db.exec('create trigger stable_admission before insert or update on live_sessions for each row execute function enforce_stable_live_admission()');
+  assert.equal((await db.query("select has_function_privilege('service_role','public.set_live_session_engine_admin_v1(uuid,uuid,jsonb)','EXECUTE') as allowed")).rows[0].allowed,false);
+  assert.equal((await db.query("select * from read_host_voice_assignment_v1('user')")).rows[0].provider,'soniox');
+  await db.query("insert into live_sessions(id,host_id,status,expires_at,event_metadata) values($1,'user','live',now()+interval '10 minutes','{\"engine\":\"soniox\"}')",[session]);
+  await assert.rejects(db.query('select * from set_profile_voice_provider_v1($1,$2,$3)',[user,user,'gemini']),/ACTOR_NOT_ADMIN/);
+  assert.equal(Number((await db.query('select * from set_profile_voice_provider_v1($1,$2,$3)',[admin,user,'gemini'])).rows[0].revision),2);
+  assert.equal(Number((await db.query('select * from set_profile_voice_provider_v1($1,$2,$3)',[admin,user,'gemini'])).rows[0].revision),2);
+  assert.deepEqual((await db.query('select event_metadata from live_sessions')).rows[0].event_metadata,{engine:'soniox'});
+  await db.query("update live_sessions set admission_state='open', admission_open_until=expires_at");
+  await db.query('insert into live_session_invites select id,expires_at,null from live_sessions');
+  await assert.rejects(db.query('select renew_live_session_access_v1($1,$2,1)',[session,'other']),/FORBIDDEN/);
+  assert.equal((await db.query('select renew_live_session_access_v1($1,$2,1) as version',[session,'user'])).rows[0].version,2);
+  assert.equal((await db.query('select admission_open_until = expires_at as carried from live_sessions')).rows[0].carried,true);
+  assert.equal((await db.query('select i.expires_at = s.expires_at as carried from live_session_invites i join live_sessions s on s.id=i.session_id')).rows[0].carried,true);
+  for (const scenario of ['paused', 'shorter', 'expired', 'revoked']) {
+    await db.query("update live_sessions set version=10, expires_at=now()+interval '10 minutes', admission_state='open', admission_open_until=now()+interval '10 minutes', status='live'");
+    await db.query("update live_session_invites set revoked_at=null, expires_at=now()+interval '10 minutes'");
+    if(scenario==='paused') await db.query("update live_sessions set admission_state='paused'");
+    if(scenario==='shorter') await db.query("update live_sessions set admission_open_until=now()+interval '5 minutes'");
+    if(scenario==='expired') await db.query("update live_sessions set admission_open_until=now()-interval '1 minute'");
+    if(scenario==='revoked') await db.query("update live_session_invites set revoked_at=now()");
+    await db.query('select renew_live_session_access_v1($1,$2,10)',[session,'user']);
+    assert.equal((await db.query("select expires_at < now()+interval '1 hour' as unchanged from live_session_invites")).rows[0].unchanged,true,scenario);
+  }
+  await db.query('update live_sessions set version=2');
+  await db.query("insert into viewer_grants values($1,$2,'viewer',$3,null,now()+interval '5 minutes')",[grant,session,'a'.repeat(64)]);
+  await assert.rejects(db.query('select renew_live_viewer_access_v1($1,$2,$3)',[session,grant,'other']),/FORBIDDEN/);
+  await db.query('select renew_live_viewer_access_v1($1,$2,$3)',[session,grant,'viewer']);
+  assert.equal((await db.query('select expires_at > now()+interval \'5 hours\' as renewed from viewer_grants')).rows[0].renewed,true);
+  await db.query("update viewer_grants set revoked_at=now()");
+  await assert.rejects(db.query('select renew_live_viewer_access_v1($1,$2,$3)',[session,grant,'viewer']),/FORBIDDEN/);
+  await db.query("update viewer_grants set revoked_at=null, expires_at=now()-interval '1 second'");
+  await assert.rejects(db.query('select renew_live_viewer_access_v1($1,$2,$3)',[session,grant,'viewer']),/FORBIDDEN/);
+  await db.query("update profiles set status='disabled' where host_id='user'");
+  await assert.rejects(db.query('select renew_live_session_access_v1($1,$2,2)',[session,'user']),/FORBIDDEN/);
+  assert.equal((await db.query("select * from read_host_voice_assignment_v1('user')")).rows.length,0);
+  await db.query("update profiles set status='approved' where host_id='user'");
+  await db.query("update live_sessions set status='stopped'");
+  await assert.rejects(db.query('select renew_live_session_access_v1($1,$2,2)',[session,'user']),/FORBIDDEN/);
+  await assert.rejects(db.query('select renew_live_viewer_access_v1($1,$2,$3)',[session,grant,'viewer']),/FORBIDDEN/);
+});

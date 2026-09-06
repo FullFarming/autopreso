@@ -18,7 +18,7 @@ function assertLocalized(key, { en, ko } = {}) {
 
 test("host page exposes Presentation and Meeting without legacy Townhall or PTT UI", async () => {
   const [page, dashboard] = await Promise.all([
-    read("webapp/app/page.tsx"),
+    read("webapp/app/admin/page.tsx"),
     read("webapp/components/live/LiveHostDashboard.tsx"),
   ]);
 
@@ -27,17 +27,19 @@ test("host page exposes Presentation and Meeting without legacy Townhall or PTT 
   assert.match(dashboard, /presentation/);
   assert.match(dashboard, /meeting/);
   assert.doesNotMatch(dashboard, /townhall/i);
-  assert.match(dashboard, /languages\.length >= 3/);
+  assert.match(dashboard, /<LanguagePicker[^>]*maxSelection=\{3\}/);
 });
 
-test("host wizard offers canonical output modes and Meeting audio consent", async () => {
+test("host setup keeps canonical output modes and secondary settings disclosed", async () => {
   const dashboard = await read("webapp/components/live/LiveHostDashboard.tsx");
 
-  assert.match(dashboard, /translated audio/);
-  assert.match(dashboard, /guest chooses to play it/);
-  assert.match(dashboard, /SESSION_LANGUAGE_HELP\[sessionType\]/);
-  assert.match(dashboard, /presentation: "English is the default translation language/);
-  assert.match(dashboard, /meeting: "Meeting provides speaker-aware captions/);
+  assert.match(dashboard, /title: "발표", stateLabel: "1인 발표"/);
+  assert.match(dashboard, /title: "회의", stateLabel: "발표자 구분"/);
+  assert.doesNotMatch(dashboard, /guest chooses to play it/);
+  assert.match(dashboard, /<LanguagePicker label=\{t\("세션 언어"\)\}/);
+  assert.match(dashboard, /<details className="live-setup-advanced">/);
+  assert.match(dashboard, /<summary>\{t\("고급 설정"\)\}<\/summary>/);
+  assert.match(dashboard, /<strong>\{t\("스테이지 커버"\)\}<\/strong>/);
   assert.match(dashboard, /value: "captions"/);
   // Translated-audio delivery is hidden at this stage: only captions cross to
   // participants, get recorded on the host, and flow in real time. The contract
@@ -46,31 +48,27 @@ test("host wizard offers canonical output modes and Meeting audio consent", asyn
   assert.doesNotMatch(dashboard, /value: "captions_audio"/);
   assert.doesNotMatch(dashboard, /value: "audio"/);
   assert.match(dashboard, /useState<LiveOutputMode>\("captions"\)/);
-  assert.match(dashboard, /Speaker-aware translated audio/);
+  assert.doesNotMatch(dashboard, /translated audio/iu);
 });
 
-test("live UI separates fixed Gemini captions from a real Presentation audio provider toggle", async () => {
-  const [dashboard, viewer, extensionHtml, extensionJs] = await Promise.all([
+test("live UI keeps host Gemini settings while participants remain captions-only", async () => {
+  const [dashboard, viewer, viewerSurface, extensionHtml, extensionJs] = await Promise.all([
     read("webapp/components/live/LiveHostDashboard.tsx"),
     read("webapp/components/live/LiveViewer.tsx"),
+    read("webapp/components/live/quality/ViewerLiveSurface.tsx"),
     read("chrome-extension/sidepanel.html"),
     read("chrome-extension/sidepanel.js"),
   ]);
 
-  assert.match(dashboard, /Fast live captions/);
-  assert.match(dashboard, /OpenAI Realtime audio/);
-  assert.match(dashboard, /Optimized for one presenter/);
-  assert.match(dashboard, /Speaker-aware translated audio/);
-  assert.match(dashboard, /Long uninterrupted speech may add delay/);
-  assert.match(dashboard, /role="radiogroup" aria-label="Translated audio engine"/);
-  assert.match(dashboard, /Gemini audio/);
-  assert.match(dashboard, /OpenAI Realtime/);
-  assert.match(dashboard, /Caption engine/);
-  assert.match(dashboard, /Gemini fixed/);
-  assert.match(dashboard, /disabled=\{sessionType === "meeting" \|\| !isOpenAIVoiceLanguageSupported\}/);
-  assert.match(dashboard, /Meeting uses Gemini audio to keep one stable voice for each speaker/);
-  assert.match(viewer, /live-viewer-delivery-method/);
-  assert.match(viewer, /Current delivery/);
+  assert.match(dashboard, /빠른 실시간 자막/);
+  assert.match(dashboard, /status: "1인 발표"/);
+  assert.doesNotMatch(dashboard, /translated audio|Gemini fixed|Long uninterrupted speech may add delay/iu);
+  assert.match(dashboard, /GEMINI_VOICE_PROVIDER = "gemini" as const/);
+  assert.doesNotMatch(dashboard, /Translated audio engine|OpenAI Realtime|isOpenAIVoiceLanguageSupported|setVoiceProvider/);
+  assert.match(viewer, /ViewerReadingFeed/);
+  assert.doesNotMatch(viewer, /LanguageSelector/);
+  assert.match(viewerSurface, /TranslationLaneTabs/);
+  assert.doesNotMatch(viewer, /Translated audio|Audio On|Audio Off|isInterpretationAudioEnabled/);
   assert.match(extensionHtml, /id="viewer-output-state"/);
   assert.match(extensionJs, /빠른 실시간 자막/);
   assert.match(extensionJs, /안정적인 AI 음성/);
@@ -78,17 +76,20 @@ test("live UI separates fixed Gemini captions from a real Presentation audio pro
 });
 
 test("host capacity and glossary controls expose product constraints", async () => {
-  const dashboard = await read("webapp/components/live/LiveHostDashboard.tsx");
+  const [dashboard, glossaryChecklist] = await Promise.all([
+    read("webapp/components/live/LiveHostDashboard.tsx"),
+    read("webapp/components/live/glossary/GlossarySessionChecklist.tsx"),
+  ]);
 
-  assert.match(dashboard, /type="range" min=\{1\} max=\{50\}/);
-  assert.match(dashboard, /Limit entry from 1 to 50 guests/);
+  assert.match(dashboard, /type="range" min=\{1\} max=\{200\}/);
+  assert.match(dashboard, /최대 참여자 · 1명에서 200명까지/);
   assert.match(dashboard, /general_cre/);
-  assert.match(dashboard, /Hotel/);
-  assert.match(dashboard, /F&B/);
-  assert.match(dashboard, /disabled=\{sessionType === "presentation"\}/);
-  assert.match(dashboard, /presentation streaming model does not support glossary instructions/);
-  assert.match(dashboard, /Apply base phrases and the selected industry glossary/);
-  assert.match(dashboard, /Not applied · Meeting only/);
+  assert.match(glossaryChecklist, /호텔/);
+  assert.match(glossaryChecklist, /F&B/);
+  assert.match(dashboard, /disabled=\{sessionType !== "meeting"\}/);
+  assert.match(dashboard, /미팅 세션에서만 켤 수 있어요/);
+  assert.match(glossaryChecklist, /필요한 분야를 함께 선택하세요/);
+  assert.match(dashboard, /참여자 발언/);
 });
 
 test("host sends canonical session settings through REST and gateway", async () => {
@@ -97,10 +98,14 @@ test("host sends canonical session settings through REST and gateway", async () 
     read("webapp/components/live/live-audio-client.ts"),
   ]);
 
-  assert.match(dashboard, /body: JSON\.stringify\(\{ title, scheduledAt: currentSchedule\.scheduledAt, sessionType, languages, outputMode, voiceProvider, maxViewers, glossaryPack \}\)/);
+  const createSessionBody = dashboard.match(/body: JSON\.stringify\(\{[\s\S]*?participantSpeakingEnabled,\s*\}\)/u)?.[0] ?? "";
+  for (const setting of ["title", "scheduledAt", "sessionType", "languages", "outputMode", "voiceProvider", "maxViewers", "glossaryPack"]) {
+    assert.match(createSessionBody, new RegExp(`\\b${setting}\\b`, "u"));
+  }
   assert.match(dashboard, /sessionType: previousSession\.sessionType/);
   assert.match(dashboard, /outputMode: previousSession\.outputMode/);
-  assert.match(dashboard, /voiceProvider: previousSession\.voiceProvider/);
+  assert.doesNotMatch(dashboard, /voiceProvider: previousSession\.voiceProvider/);
+  assert.match(dashboard, /voiceProvider: GEMINI_VOICE_PROVIDER/);
   assert.match(dashboard, /maxViewers: previousSession\.maxViewers/);
   assert.match(dashboard, /glossaryPack: previousSession\.glossaryPack/);
   assert.match(dashboard, /version: restoredSession\.version/);
@@ -110,25 +115,28 @@ test("host sends canonical session settings through REST and gateway", async () 
   assert.match(audioClient, /maxViewers: number/);
   assert.match(audioClient, /glossaryPack: GlossaryPack/);
   const createSessionBlock = dashboard.match(/const createSession = useCallback[\s\S]*?const stopBroadcast/u)?.[0] ?? "";
-  assert.match(createSessionBlock, /JSON\.stringify\(\{ title, scheduledAt: currentSchedule\.scheduledAt, sessionType, languages, outputMode, voiceProvider, maxViewers, glossaryPack \}\)/);
+  assert.match(createSessionBlock, /body: JSON\.stringify\(\{[\s\S]*?participantSpeakingEnabled,\s*\}\)/u);
   assert.doesNotMatch(createSessionBlock, /JSON\.stringify\([\s\S]*inputSource/u,
     "capture-only inputSource must not be sent to the strict persisted-session API");
 });
 
-test("host gateway contract sends the optimistic session version on start, update, and reconnect", async () => {
+test("host gateway keeps legacy activation immutable and uses fresh settings for demand wakes", async () => {
   const audioClient = await read("webapp/components/live/live-audio-client.ts");
 
   assert.match(audioClient, /interface AudioClientOptions\s*\{[\s\S]*?version:\s*number;/u);
   assert.match(audioClient, /interface LiveAudioSettings\s*\{[\s\S]*?version:\s*number;/u);
   assert.match(audioClient, /let currentSettings: LiveAudioSettings = \{\s*version: options\.version,/u);
-  assert.match(audioClient, /type: "start",\s*sessionId: options\.sessionId,\s*version: settings\.version,/u);
+  assert.match(audioClient, /type: isManualRestart \? "restart" : "start",\s*sessionId: options\.sessionId,\s*version: isManualRestart \|\| demandEnabled \|\| activationKey === null \? settings\.version : activationVersion,/u);
+  assert.match(audioClient, /hasReadinessActivation \? \{ activationKey \} : \{\}/u);
+  assert.match(audioClient, /hasReadinessActivation = activationKey !== null && \(!isManualRestart \|\| settings\.sessionStatus === "preparing"\)/u);
   assert.match(audioClient, /type: "update",\s*sessionId: options\.sessionId,\s*version: settings\.version,/u);
   assert.match(audioClient, /currentSettings = \{\s*version: settings\.version,/u);
-  assert.match(audioClient, /openSocket\(options, credentials, currentSettings/u);
+  assert.match(audioClient, /openSocket\(options, credentials, currentSettings, activationVersion, activationKey/u);
+  assert.match(audioClient, /const activationVersion = options\.version/u);
   assert.match(audioClient, /Number\.isSafeInteger\(version\)/u);
 });
 
-test("speaker legend and viewer surfaces expose non-color voice state and audio provenance", async () => {
+test("host exposes caption health while the participant surface stays captions-only", async () => {
   const [dashboard, viewer, panel] = await Promise.all([
     read("webapp/components/live/LiveHostDashboard.tsx"),
     read("webapp/components/live/LiveViewer.tsx"),
@@ -136,25 +144,26 @@ test("speaker legend and viewer surfaces expose non-color voice state and audio 
   ]);
 
   assert.doesNotMatch(dashboard, /음역 ·/);
-  assert.match(dashboard, /Analyzing voice/);
-  assert.match(dashboard, /Voice ready/);
-  assert.match(dashboard, /Unavailable/);
-  assert.match(viewer, /getSpeakerVoiceStatus/);
-  assert.match(viewer, /Audio ·/);
-  assert.match(viewer, /Translated audio/);
+  assert.match(dashboard, /HostAiHealthDisclosure/u);
+  assert.match(dashboard, /원문 자막/u);
+  assert.match(dashboard, /주제 분류/u);
+  assert.doesNotMatch(dashboard, /Analyzing voice|Voice ready|Audio ·/u);
+  assert.match(viewer, /CaptionEntry/);
+  assert.doesNotMatch(viewer, /getSpeakerVoiceStatus|Audio ·|Translated audio/);
   assert.match(panel, /자막 모드에서는 AI 합성 음성을 사용하지 않습니다/);
   assert.match(panel, /Meeting의 AI 합성 통역 음성/);
 });
 
 test("viewer and Chrome derive output display from canonical outputMode", async () => {
-  const [viewer, panel, panelScript] = await Promise.all([
+  const [viewer, viewerContract, panel, panelScript] = await Promise.all([
     read("webapp/components/live/LiveViewer.tsx"),
+    read("webapp/components/live/viewer-controller-contract.ts"),
     read("chrome-extension/sidepanel.html"),
     read("chrome-extension/sidepanel.js"),
   ]);
 
-  assert.match(viewer, /isLiveOutputMode/);
-  assert.match(viewer, /outputMode: snapshot\.session\.outputMode/);
+  assert.match(viewerContract, /value\.session\.outputMode/);
+  assert.match(viewerContract, /outputMode: snapshot\.session\.outputMode/);
   assert.match(viewer, /realtime-noel-viewer-state/);
   assert.match(panel, /viewer-output-state/);
   assert.match(panelScript, /realtime-noel-viewer-state/);
@@ -162,7 +171,7 @@ test("viewer and Chrome derive output display from canonical outputMode", async 
   assert.match(panelScript, /outputMode === "captions_audio"/);
 });
 
-test("viewer uses one gateway socket for captions, control events, and interpretation audio", async () => {
+test("viewer uses one gateway socket for captions and control events with demand fencing", async () => {
   const viewer = await read("webapp/components/live/LiveViewer.tsx");
 
   assert.doesNotMatch(viewer, /RealtimeChannel|channelRef|\.channel\(|realtime\.setAuth/);
@@ -170,7 +179,7 @@ test("viewer uses one gateway socket for captions, control events, and interpret
   assert.match(viewer, /parseBroadcastEvent\(event\.payload \?\? event\.event\)/);
   assert.match(viewer, /hasConnected/);
   assert.match(viewer, /snapshot\?language=/);
-  assert.match(viewer, /type: "subscribe",\s*sessionId: currentViewer\.session\.id,\s*language: nextLanguage,\s*lastSeq: getLastSeq\(nextLanguage\)/);
+  assert.match(viewer, /type: "subscribe",\s*sessionId: currentViewer\.session\.id,[\s\S]{0,200}language: nextLanguage,[\s\S]{0,200}lastSeq: getLastSeq\(nextLanguage\)/);
 });
 
 test("host hot-swap compensates the API version and fails closed when restoration fails", async () => {
@@ -187,6 +196,20 @@ test("host hot-swap compensates the API version and fails closed when restoratio
   assert.doesNotMatch(dashboard, /session \? "Ready"/);
 });
 
+test("host pause and resume retain the gateway client instead of terminal stop", async () => {
+  const dashboard = await read("webapp/components/live/LiveHostDashboard.tsx");
+  const pauseBlock = dashboard.match(/const pauseSession = useCallback[\s\S]*?const resumeSession/u)?.[0] ?? "";
+  const resumeBlock = dashboard.match(/const resumeSession = useCallback[\s\S]*?\/\*\* Host session recovery/u)?.[0] ?? "";
+  assert.doesNotMatch(pauseBlock, /stopBroadcast/u);
+  assert.match(pauseBlock, /\/pause/u);
+  assert.match(pauseBlock, /await client\.pause\(\)/u);
+  assert.equal(pauseBlock.indexOf("await client.pause()") < pauseBlock.indexOf("/pause"), true);
+  assert.match(pauseBlock, /didPauseMedia[\s\S]*await client\.resume\(\)/u);
+  assert.match(resumeBlock, /\/resume/u);
+  assert.match(resumeBlock, /audioClientRef\.current\.resume\(\)/u);
+  assert.doesNotMatch(resumeBlock, /stopBroadcast/u);
+});
+
 test("host fail-close keeps the restored DB version when gateway compensation cannot resync", async () => {
   const dashboard = await read("webapp/components/live/LiveHostDashboard.tsx");
 
@@ -199,14 +222,17 @@ test("host fail-close keeps the restored DB version when gateway compensation ca
   assert.match(dashboard, /version: restoredSession\.version/);
 });
 
-test("gateway language status listener is persistent before start and dashboard never blankets ready", async () => {
+test("gateway language status listener is persistent before start and cleaned up exactly once", async () => {
   const [dashboard, audioClient] = await Promise.all([
     read("webapp/components/live/LiveHostDashboard.tsx"),
     read("webapp/components/live/live-audio-client.ts"),
   ]);
 
-  assert.match(audioClient, /await authenticated;\s*attachPersistentListeners\(socket\);\s*const started/s);
-  assert.match(audioClient, /attachedSockets\.has\(candidate\)/);
+  assert.match(audioClient, /await authenticated;\s*detachPersistentListeners = attachPersistentListeners\(socket\);\s*const started/s);
+  assert.match(audioClient, /const socketListenerDisposers = new WeakMap<WebSocket, \(\) => void>\(\)/);
+  assert.match(audioClient, /candidate\.removeEventListener\("message", handleMessage\);\s*candidate\.removeEventListener\("close", handleClose\);\s*socketListenerDisposers\.delete\(candidate\)/s);
+  assert.match(audioClient, /detachPreviousListeners\?\.\(\);\s*if \(previous && previous\.readyState !== WebSocket\.CLOSING/s);
+  assert.doesNotMatch(audioClient, /attachedSockets/);
   assert.doesNotMatch(dashboard, /languageStatusMap\([^\n]+,\s*"ready"\)/);
   assert.match(dashboard, /onLanguageStatus/);
 });
@@ -249,11 +275,17 @@ test("desktop subtitle workspace starts Live Call without a web workspace launch
     read("public/subtitle-workspace.js"),
   ]);
   assert.match(html, /id="schedule-live-call"[^>]*data-i18n="live\.start"/);
-  assertLocalized("live.start", { en: /Start Live Call/ });
+  assertLocalized("live.start", { en: /^Start$/ });
   assert.doesNotMatch(html, /id="open-meeting-mode"|data-open-live-workspace|>Open Live Call</);
   assert.doesNotMatch(script, /open-meeting-mode|data-open-live-workspace|openLiveWorkspace|realtime-noel-web\.vercel\.app/);
   assert.match(workspace, /await bridge\.startLiveCall\(draft\)/);
   assert.match(workspace, /coverImage: liveDraftCoverData/);
+});
+
+test("desktop rail excludes retired meeting launchers", async () => {
+  const [html, dashboard] = await Promise.all([read("public/subtitle.html"), read("public/subtitle-dashboard.js")]);
+  assert.doesNotMatch(html, /id="open-(meeting-prep|live-coach|live-interpreter)"/u);
+  assert.doesNotMatch(dashboard, /initializeMeetingCoachLaunch|initializeLiveInterpreterLaunch/u);
 });
 
 test("desktop and mobile watch routes share the same viewer component", async () => {
@@ -268,11 +300,12 @@ test("desktop and mobile watch routes share the same viewer component", async ()
   assert.match(mobile, /compact/);
 });
 
-test("viewer routes preserve QR fragments while correcting iPhone and iPad surfaces", async () => {
-  const [viewer, routing, routingTest] = await Promise.all([
+test("viewer routes preserve reusable QR fragments while correcting iPhone and iPad surfaces", async () => {
+  const [viewer, routing, routingTest, admissionLink] = await Promise.all([
     read("webapp/components/live/LiveViewer.tsx"),
     read("webapp/components/live/viewer-surface-routing.ts"),
     read("webapp/components/live/viewer-surface-routing.test.ts"),
+    read("webapp/components/live/admission-link.ts"),
   ]);
 
   assert.match(routing, /pathname === "\/m\/watch" && isIpadUserAgent/u);
@@ -280,38 +313,41 @@ test("viewer routes preserve QR fragments while correcting iPhone and iPad surfa
   assert.match(routing, /`\$\{target\}\$\{search\}\$\{hash\}`/u);
   assert.match(routingTest, /opaque%2Btoken%3D/u);
   const redirectIndex = viewer.indexOf("window.location.replace(buildViewerSurfaceUrl");
-  const consumeIndex = viewer.indexOf("const inviteToken = takeInviteTokenFromHash()");
-  assert.ok(redirectIndex >= 0 && consumeIndex > redirectIndex,
-    "surface correction must run before the QR fragment is consumed");
-  assert.match(viewer, /if \(getViewerSurfaceRedirect\([\s\S]*?\)\) return;[\s\S]*?takeInviteTokenFromHash\(\)/u);
+  const readIndex = viewer.indexOf("const admissionLink = parseAdmissionLinkHash(window.location.hash)");
+  assert.ok(redirectIndex >= 0 && readIndex > redirectIndex,
+    "surface correction must run before the reusable QR fragment is read");
+  assert.match(viewer, /if \(getViewerSurfaceRedirect\([\s\S]*?\)\) return;[\s\S]*?parseAdmissionLinkHash\(window\.location\.hash\)/u);
+  assert.match(admissionLink, /canonicalHash: `#invite=\$\{inviteToken\}`/u);
+  assert.match(admissionLink, /canonicalHash: `#code=\$\{accessCode\}`/u);
+  assert.match(viewer, /window\.location\.search\}\$\{admissionLink\.canonicalHash\}/u);
 });
 
-test("mobile viewer reconnects once on foreground and keeps full history accessible", async () => {
-  const [viewer, recovery, feed, css] = await Promise.all([
+test("mobile viewer reconnects once on foreground and keeps full caption history accessible", async () => {
+  const [viewer, recovery, viewport, css] = await Promise.all([
     read("webapp/components/live/LiveViewer.tsx"),
     read("webapp/components/live/foreground-recovery.ts"),
-    read("webapp/components/live/MeetingTurnFeed.tsx"),
-    read("webapp/app/globals.css"),
+    read("webapp/components/live/translation/TranslationViewport.tsx"),
+    read("webapp/components/live/translation/translation.module.css"),
   ]);
 
   assert.match(recovery, /if \(state\.inFlight\) return state\.inFlight/u);
   assert.match(viewer, /document\.addEventListener\("visibilitychange"/u);
   assert.match(viewer, /window\.addEventListener\("pageshow"/u);
   assert.match(viewer, /window\.addEventListener\("online"/u);
-  assert.match(viewer, /disconnectGateway\(\);[\s\S]*?const recoveryGeneration = audioConnectionGenerationRef\.current/u);
-  assert.match(viewer, /expectedConnectionGeneration !== audioConnectionGenerationRef\.current\) return/u);
-  assert.match(feed, /turns\.map\(/u, "the complete transcript must remain in the DOM");
-  assert.match(css, /content-visibility: auto/u);
-  assert.match(css, /contain-intrinsic-size: auto 96px/u);
-  assert.match(css, /\.live-viewer-shell\.is-compact \.live-language-switch button \{ min-width: 44px; min-height: 44px;/u);
-  assert.match(css, /\.live-viewer-shell\.is-compact \.live-language-switch button:focus-visible[\s\S]*?outline: 2px solid var\(--nova-blue\)/u);
+  assert.match(viewer, /disconnectGateway\(\);[\s\S]*?const recoveryGeneration = gatewayConnectionGenerationRef\.current/u);
+  assert.match(viewer, /expectedConnectionGeneration !== gatewayConnectionGenerationRef\.current\) return/u);
+  assert.match(viewport, /Children\.count\(children\)/u, "the complete transcript must remain in the DOM");
+  assert.match(viewport, /className=\{styles\.feed\}/u);
+  assert.match(css, /\.selectLabel select[\s\S]*?min-height:\s*44px/u);
+  assert.match(css, /:focus-visible[\s\S]*?outline:\s*2px solid var\(--nova-system-default\)/u);
 });
 
 test("speaker captions never identify a speaker by color alone", async () => {
   const component = await read("webapp/components/live/SpeakerCaption.tsx");
   const css = await read("webapp/app/globals.css");
 
-  assert.match(component, /speaker\.label/);
+  assert.match(component, /speaker\.name\?\.trim\(\)/);
+  assert.doesNotMatch(component, /speaker\.name\?\.trim\(\) \|\| speaker\.label/);
   assert.match(component, /aria-label/);
   assert.match(component, /live-speaker-dot/);
   assert.match(component, /live-speaker-line/);
@@ -336,24 +372,21 @@ test("host, viewer, and Chrome expose the same approved language set with three-
   }
   assert.match(dashboard, /LANGUAGE_CODES\.map/);
   assert.match(dashboard, /LANGUAGE_LABELS/);
-  assert.match(dashboard, /languages\.length >= 3/);
+  assert.match(dashboard, /<LanguagePicker[^>]*maxSelection=\{3\}/);
   assert.match(viewer, /languageLabel/);
-  assert.match(css, /--font-sans: "Pretendard"/);
+  assert.match(css, /--nova-font: "Pretendard"/);
   assert.match(extensionCss, /font-family: "Pretendard"/);
 });
 
 test("owned user-visible surfaces carry the current product name", async () => {
   const paths = [
-    "public/index.html", "public/app.js", "public/starter-elements.js",
     "public/subtitle.html", "public/subtitle-controller.html", "public/subtitle-overlay.html",
     "public/subtitle-dashboard.js", "electron/main.js", "webapp/components/usePipOverlay.ts",
     "chrome-extension/manifest.json", "chrome-extension/sidepanel.html",
   ];
   const sources = await Promise.all(paths.map(read));
   const joined = sources.join("\n");
-  // The desktop subtitle product is NOVA. The whiteboard pages (index.html /
-  // app.js) are a separate product and keep their own name, and the webapp is a
-  // separately deployed guest surface -- neither is renamed here.
+  // Canvas assets live in the independent realtime-noel-canvas repository.
   assert.match(joined, /NOVA/);
   assert.doesNotMatch(joined, /Realtime_Noel|AutoPreso|Auto Preso/);
 });
@@ -361,8 +394,11 @@ test("owned user-visible surfaces carry the current product name", async () => {
 test("web chrome uses a restrained flat canvas and Pretendard without decorative orb gradients", async () => {
   const css = await read("webapp/app/globals.css");
 
-  assert.match(css, /--canvas:\s*#f5f5f7/i);
-  assert.match(css, /--font-sans:\s*"Pretendard"/);
+  assert.match(css, /--nova-web-background:\s*#15151a/i);
+  assert.match(css, /--nova-web-text:\s*#ffffff/i);
+  assert.match(css, /--nova-web-action:\s*#0071e3/i);
+  assert.match(css, /--canvas:\s*var\(--nova-web-background\)/i);
+  assert.match(css, /--nova-font:\s*"Pretendard"/);
   assert.match(css, /\.lg-bg\s*\{[^}]*background:\s*var\(--canvas\)/s);
   assert.doesNotMatch(css, /radial-gradient|lg-bg-drift/);
   assert.doesNotMatch(css, /\.glass(?:-strong|-pill)?\s*\{[^}]*backdrop-filter:/s);
@@ -386,66 +422,51 @@ test("Chrome extension is MV3, narrow-permission, and packaged-code only", async
   assert.match(panelScript, /postMessage/);
 });
 
-test("Chrome 114 uses a muted canvas video PiP fallback and QR entry stays minimal", async () => {
+test("participant viewer removes PiP media playback and keeps QR entry minimal", async () => {
   const viewer = await read("webapp/components/live/LiveViewer.tsx");
 
-  assert.match(viewer, /captureStream/);
-  assert.match(viewer, /requestPictureInPicture/);
-  assert.match(viewer, /video\.muted = true/);
+  assert.doesNotMatch(viewer, /captureStream|requestPictureInPicture|documentPictureInPicture|createPortal/);
   assert.match(viewer, /live-join-wordmark/);
 });
 
-test("Meeting audio surfaces disclose AI synthetic interpretation before user-gesture playback", async () => {
+test("Meeting participant surface omits AI audio playback while Chrome keeps its disclosure", async () => {
   const [viewer, panel] = await Promise.all([
     read("webapp/components/live/LiveViewer.tsx"),
     read("chrome-extension/sidepanel.html"),
   ]);
 
-  assert.match(viewer, /Translated audio/);
-  assert.match(viewer, /aria-pressed=\{isInterpretationAudioEnabled\}/);
-  assert.match(viewer, /aria-label=\{isInterpretationAudioEnabled \? "Translated audio is on" : "Turn translated audio on"\}/);
+  assert.doesNotMatch(viewer, /Translated audio|isInterpretationAudioEnabled|enableInterpretationAudio/);
   assert.match(panel, /AI 합성 통역 음성/);
 });
 
-test("interpretation WebAudio queue keeps long speech and restarts only its bounded playback queue", async () => {
+test("participant viewer contains no interpretation WebAudio queue", async () => {
   const viewer = await read("webapp/components/live/LiveViewer.tsx");
 
-  assert.match(viewer, /projectedQueueDuration = queueAhead \+ buffer\.duration \/ playbackRate/);
-  assert.doesNotMatch(viewer, /projectedQueueDuration > 3/);
-  assert.match(viewer, /MAX_INTERPRETATION_QUEUE_SECONDS\s*=\s*30/);
-  assert.match(viewer, /MAX_INTERPRETATION_PLAYBACK_RATE\s*=\s*1\.6/);
-  assert.match(viewer, /getAdaptiveInterpretationPlaybackRate/);
-  assert.match(viewer, /source\.playbackRate\.value = playbackRate/);
-  assert.match(viewer, /buffer\.duration \/ playbackRate/);
-  assert.match(viewer, /MAX_INTERPRETATION_QUEUE_BYTES/);
-  assert.match(viewer, /restartQueue/);
-  assert.match(viewer, /scheduledSourcesRef/);
-  assert.match(viewer, /audioPendingSocketRef/);
-  assert.match(viewer, /pendingSocket\?\.close/);
-  assert.match(viewer, /source\.stop\(\)/);
-  assert.match(viewer, /audioConnectionGenerationRef\.current \+= 1/);
-  assert.match(viewer, /window\.clearTimeout\(audioReconnectTimerRef\.current\)/);
-  assert.match(viewer, /window\.clearTimeout\(audioProactiveTimerRef\.current\)/);
-  assert.match(viewer, /clearInterpretationAudio\(\)/);
+  assert.doesNotMatch(viewer, /AudioContext|decodeAudioChunk|projectedQueueDuration|playbackRate/u);
+  assert.doesNotMatch(viewer, /scheduledSourcesRef|audioPendingSocketRef|restartQueue|clearInterpretationAudio/u);
 });
 
-test("gateway slow-consumer close automatically reconnects without clearing the selected language", async () => {
-  const viewer = await read("webapp/components/live/LiveViewer.tsx");
-
-  assert.match(viewer, /if \(event\.code === 4408 \|\| event\.reason\.includes\("SLOW_CONSUMER"\)\) \{[\s\S]{0,500}restartInterpretationAudio\(\)[\s\S]{0,500}scheduleReconnect\(\)/);
-  assert.doesNotMatch(viewer, /합성 통역 음성이 3초 이상 지연/);
-  assert.match(viewer, /Audio restored/);
-  assert.match(viewer, /event\.type === "audio-control"/);
-  assert.match(viewer, /minimumAudioSeqRef\.current = Math\.max\(minimumAudioSeqRef\.current, event\.seq\)/);
-  assert.match(viewer, /event\.header\.seq <= minimumAudioSeqRef\.current \|\| event\.header\.seq <= lastAudioSeqRef\.current/);
-  assert.match(viewer, /className="live-connection-state" role="status" aria-live="polite"/);
-});
-
-test("viewer keeps one stable partial row and archives only final captions after the snapshot floor", async () => {
-  const [viewer, speaker, captionFeed] = await Promise.all([
+test("gateway close reconciles authoritative status before reconnecting without clearing the selected language", async () => {
+  const [viewer, lifecycle] = await Promise.all([
     read("webapp/components/live/LiveViewer.tsx"),
-    read("webapp/components/live/SpeakerCaption.tsx"),
+    read("webapp/components/live/viewer-gateway-lifecycle.ts"),
+  ]);
+
+  assert.match(viewer, /resolveViewerGatewayStatus\(currentViewer, generation\)[\s\S]{0,300}decision === "reconnect"[\s\S]{0,200}scheduleReconnect\(\)/);
+  assert.match(viewer, /decision === "wait"[\s\S]{0,160}waitForAuthoritativeStatus\(\)/);
+  assert.match(lifecycle, /status === "live" \|\| status === "paused"[\s\S]{0,100}return "reconnect"/);
+  assert.match(lifecycle, /return "wait"/,
+    "status failures and non-live states must wait for the Vercel poll rather than wake Cloud Run");
+  assert.doesNotMatch(viewer, /audio-control|minimumAudioSeqRef|lastAudioSeqRef/);
+  assert.match(viewer, /statusLabel=\{sessionStatus === "live" \? undefined : t\(lifecycleLabel\)\}/);
+});
+
+test("viewer keeps one seq-keyed shared caption entry from partial through final", async () => {
+  const [viewer, entry, captionFeed, css] = await Promise.all([
+    read("webapp/components/live/LiveViewer.tsx"),
+    read("webapp/components/live/translation/CaptionEntry.tsx"),
     read("webapp/lib/live/caption-feed.ts"),
+    read("webapp/app/globals.css"),
   ]);
 
   // 2026-07-26 fix: Timeline identity and ordering are shared by snapshot,
@@ -453,24 +474,24 @@ test("viewer keeps one stable partial row and archives only final captions after
   // the feed module rather than as a private Viewer implementation detail.
   assert.match(captionFeed, /export function mergeCaptionTimeline/);
   assert.match(viewer, /mergeLanguageCaptionCache/);
-  assert.match(viewer, /key=\{`final-\$\{caption\.seq\}`\}/);
-  assert.match(viewer, /key=\{`partial-\$\{captionLaneKey\(caption\)\}`\}/);
-  // Finals and partials are split out of displayCaptions, not the raw record.
-  // Web history shows only canonical source/translation pairs and hides failed,
-  // malformed, and same-language echo captions.
   assert.match(viewer, /const displayCaptions = useMemo\(\(\) => captions\.filter\(isDisplayableCaption\), \[captions\]\)/);
-  assert.match(captionFeed, /if \(caption\.origin === "source"\) return caption\.language === caption\.sourceLanguage/u);
+  assert.match(viewer, /key=\{`\$\{caption\.language\}-\$\{caption\.seq\}`\}/);
+  assert.doesNotMatch(viewer, /key=\{`final-|key=\{`partial-|live-caption-current/u);
+  // Target histories remain language-bound while native speech is retained.
+  assert.match(
+    captionFeed,
+    /caption\.origin === "source" \|\| caption\.translationStatus === "verbatim"/u,
+  );
   assert.match(captionFeed, /incoming\.filter\(\(event\) => event\.language === language\)/u);
-  assert.match(viewer, /const finalCaptions = displayCaptions\.filter\(\(caption\) => caption\.isFinal\)/);
-  assert.match(viewer, /const partialCaptions = displayCaptions\.filter\(\(caption\) => !caption\.isFinal\)/);
-  assert.match(viewer, /<MeetingTurnFeed captions=\{displayCaptions\}/);
+  assert.doesNotMatch(viewer, /const finalCaptions|const partialCaptions/u);
+  assert.match(viewer, /<CaptionEntry/u);
   assert.match(viewer, /event\.seq <= getLastSeq\(event\.language\)/);
-  assert.match(viewer, /if \(event\.language === languageRef\.current\) setCaptions/u);
+  assert.match(viewer, /mergeLanguageCaptionCache\(captionsByLanguageRef.current, event.language, \[event\]\);\s*replaceCaptionCache\(nextCache\)/u);
   assert.match(viewer, /setCaptionSnapshot\(snapshot\)/);
-  assert.match(viewer, /aria-relevant="additions"/);
-  assert.match(viewer, /aria-live="off"/);
-  assert.match(speaker, />Listening</);
-  assert.doesNotMatch(speaker, /인식 중/);
+  assert.match(viewer, /finalAnnouncement=\{latestFinal\?\.text\}/);
+  assert.match(entry, /data-caption-state=\{state\}/);
+  assert.doesNotMatch(entry, /인식 중/);
+  assert.doesNotMatch(css, /\.live-caption-card\.is-active\s*\{[^}]*transform:/su);
 });
 
 test("the live UI consumes the lossless language cache and append-only partial tail", async () => {
@@ -481,16 +502,20 @@ test("the live UI consumes the lossless language cache and append-only partial t
     read("webapp/app/globals.css"),
   ]);
 
-  // 2026-07-26 fix: These checks bind the tested 5,000-event data contract to
+  // 2026-07-27 fix: These checks bind the tested 12,000-event data contract to
   // the actual screen path. A green cache-only test is insufficient if the
   // language selector clears that cache or the feed remounts partial text.
-  assert.match(captionFeed, /const COMMITTED_CAPTION_LIMIT = 5_000/u);
+  assert.match(captionFeed, /const COMMITTED_CAPTION_LIMIT = 12_000/u);
   assert.doesNotMatch(captionFeed, /CAPTION_WINDOW_SIZE|slice\(-200\)/u);
   assert.match(viewer, /const captionsByLanguageRef = useRef<Record<string, CaptionEvent\[\]>>\(\{\}\)/u);
-  assert.match(viewer, /setCaptions\(getCachedLanguageCaptions\(captionsByLanguageRef\.current, nextLanguage\)\)/u);
+  assert.match(viewer, /const selectedLaneInputs = useMemo<CaptionLaneInput\[\]>\(/u);
+  assert.match(viewer, /const events = captionsByLanguage\[selectedLane.language\] \?\? \[\]/u);
+  assert.match(viewer, /\[captionsByLanguage, selectedLane\]/u);
+  assert.match(viewer, /captionsByLanguageRef.current = nextCache;\s*setCaptionsByLanguage\(nextCache\)/u);
+  assert.doesNotMatch(viewer, /setCaptions\(/u);
   assert.match(viewer, /mergeLanguageCaptionCache\(captionsByLanguageRef\.current, event\.language, \[event\]\)/u);
-  assert.match(feed, /pendingText=\{livePartialBelongsToLastTurn/u);
-  assert.match(feed, /className="live-turn-text is-recent is-pending" data-caption-state="updating"/u);
+  assert.match(feed, /key=\{`caption-\$\{caption\.seq\}`\}/u);
+  assert.match(feed, /caption\.isFinal \? "" : "is-pending"/u);
   assert.doesNotMatch(feed, /live-turn-card\.is-collapsed|collapsedTurnKeys/u);
 
   // DESIGN.md §8.2: pending text keeps its layout and uses the semantic system
@@ -506,7 +531,7 @@ test("desktop Live workspace exposes only the local Start action", async () => {
   ]);
 
   assert.match(html, /id="schedule-live-call"[^>]*data-i18n="live\.start"/);
-  assertLocalized("live.start", { en: /Start Live Call/ });
+  assertLocalized("live.start", { en: /^Start$/ });
   assert.doesNotMatch(html, /id="open-meeting-mode"|data-open-live-workspace|>Open Live Call</);
   assert.doesNotMatch(script, /openLiveWorkspace|window\.open\("https:\/\/realtime-noel-web\.vercel\.app\//);
   assert.match(workspace, /t\("live\.stageUp", \{ code: result\.admissionCode/);
@@ -514,33 +539,40 @@ test("desktop Live workspace exposes only the local Start action", async () => {
   assert.match(workspace, /result\?\.code === "HOST_LOGIN_REQUIRED"/);
 });
 
-test("host creates mobile fragment-only invite links and exposes QR, persistent code, viewers, and status", async () => {
-  const dashboard = await read("webapp/components/live/LiveHostDashboard.tsx");
+test("host creates mobile fragment-only invite links and exposes access plus live inspector status", async () => {
+  const [dashboard, hostSurface] = await Promise.all([
+    read("webapp/components/live/LiveHostDashboard.tsx"),
+    read("webapp/components/live/host-surface.ts"),
+  ]);
 
   assert.match(dashboard, /fetch\(`\/api\/live-sessions\/\$\{session\.id\}\/invites`/);
   assert.match(dashboard, /body: JSON\.stringify\(\{ action: "create" \}\)/);
   assert.match(dashboard, /\/m\/watch#invite=\$\{encodeURIComponent\(inviteResult\.inviteToken\)\}/);
   assert.doesNotMatch(dashboard, /\/m\/watch\?invite=/);
-  assert.match(dashboard, /navigator\.clipboard\.writeText\(invite\.url\)/);
-  assert.match(dashboard, /Copy link/);
-  assert.match(dashboard, /Invite by email/);
+  assert.match(dashboard, /shareHostInvitation\(mode, buildHostInviteShareText\(\{/u);
+  assert.match(dashboard, /url: currentInvite\.url,[\s\S]{0,120}admissionCode: currentInvite\.admissionCode/u);
+  assert.match(hostSurface, /input\.url,[\s\S]{0,120}`인증 코드: \$\{input\.admissionCode\}`/u);
+  assert.match(dashboard, /링크·인증코드 복사/);
+  assert.match(dashboard, /이메일로 초대/);
   assert.match(dashboard, /mailto:/);
-  assert.match(dashboard, /Guest QR/);
-  assert.match(dashboard, /6-digit access code/);
-  assert.match(dashboard, /invite\.admissionCode/);
-  assert.match(dashboard, /Valid until the host ends this session/);
-  assert.match(dashboard, /Guests/);
-  assert.match(dashboard, /Guest access/);
-  assert.match(dashboard, /Status/);
+  assert.match(dashboard, /참여자 QR/);
+  assert.match(dashboard, /6자리 인증 코드/);
+  assert.match(dashboard, /currentInvite\.admissionCode/);
+  assert.match(dashboard, /입장 유효 시간:/);
+  assert.match(dashboard, /t\("참여자 · \{present\}\/\{total\}", \{ present: participants\.filter\(\(participant\) => participant\.isPresent\)\.length, total: participants\.length \}\)/);
+  assert.match(dashboard, /참여자 입장/);
+  const liveSurface = await read("webapp/components/live/quality/HostLiveSurface.tsx");
+  assert.match(liveSurface, /className="live-host-current-status"[^>]*role="status"/);
 });
 
 test("every host invite path adopts the returned optimistic session version before Start Live", async () => {
   const dashboard = await read("webapp/components/live/LiveHostDashboard.tsx");
 
   assert.match(dashboard, /interface InviteResult \{[\s\S]*version: number;/);
-  assert.equal((dashboard.match(/readResponse<InviteResult>/g) ?? []).length, 4);
-  assert.equal((dashboard.match(/version: inviteResult\.version/g) ?? []).length, 4);
-  assert.equal((dashboard.match(/admissionOpenUntil: inviteResult\.expiresAt/g) ?? []).length, 4);
+  assert.equal((dashboard.match(/readResponse<InviteResult>/g) ?? []).length, 3);
+  assert.equal((dashboard.match(/version: inviteResult\.version/g) ?? []).length, 3);
+  assert.equal((dashboard.match(/admissionOpenUntil: inviteResult\.admissionOpenUntil/g) ?? []).length, 3);
+  assert.match(dashboard, /body: JSON\.stringify\(\{ action: "read-if-open" \}\)/);
   assert.match(dashboard, /setSession\(\(current\) => current\?\.id === next\.id[\s\S]{0,180}version: inviteResult\.version/);
   assert.match(dashboard, /body: JSON\.stringify\(\{ version: session\.version \}\)/);
 });
@@ -551,41 +583,47 @@ test("host renders an offline QR invitation with accessible fallback", async () 
   assert.match(dashboard, /import QRCode from "qrcode"/);
   assert.match(dashboard, /QRCode\.toDataURL\(value/);
   assert.match(dashboard, /errorCorrectionLevel: "M"/);
-  assert.match(dashboard, /alt="NOVA guest invite QR code"/);
-  assert.match(dashboard, /The QR code could not be created\. Copy the invite link instead\./);
-  assert.match(dashboard, /<InviteQrCode value=\{invite\.url\} \/>/);
+  assert.match(dashboard, /alt=\{t\("NOVA 참여자 초대 QR 코드"\)\}/);
+  assert.match(dashboard, /QR 코드를 만들지 못했습니다\. 초대 링크를 복사해 주세요\./);
+  assert.match(dashboard, /<InviteQrCode value=\{currentInvite\.url\} \/>/);
 });
 
-test("approved mobile live design supports profile identity and QR or access-code entry", async () => {
+test("approved mobile live design supports email identity and QR or access-code entry", async () => {
   const [viewer, dashboard, css] = await Promise.all([
     read("webapp/components/live/LiveViewer.tsx"),
     read("webapp/components/live/LiveHostDashboard.tsx"),
     read("webapp/app/globals.css"),
   ]);
 
-  assert.match(viewer, />Your name</);
-  assert.match(viewer, />Department</);
-  assert.match(viewer, />Job title</);
-  assert.match(viewer, />6-digit access code</);
-  assert.match(viewer, /"Join live"/);
-  assert.match(viewer, /id="live-admission-code"/);
+  assert.match(viewer, />\{t\("이메일"\)\}</);
+  assert.match(viewer, /<summary>\{t\("선택 정보"\)\}<\/summary>/);
+  assert.match(viewer, />\{t\("회사"\)\}</);
+  assert.match(viewer, />\{t\("부서"\)\}</);
+  assert.match(viewer, />\{t\("직급"\)\}</);
+  assert.match(viewer, />\{t\("6자리 인증 코드"\)\}</);
+  assert.match(viewer, /"라이브 참여"/);
+  assert.match(viewer, /id="live-access-code" name="accessCode"/);
   assert.doesNotMatch(viewer, /내 언어로 함께 듣기/);
   // The control now discloses a slider rather than incrementing, so the label
   // names the thing it adjusts instead of promising a direction.
-  assert.match(viewer, /aria-label="Caption text size"/);
-  assert.match(viewer, />\s*Aa\s*</);
-  assert.match(viewer, /aria-label="Leave meeting"/);
-  assert.match(viewer, />Leave</);
+  assert.match(viewer, />\{t\("자막 글자 크기"\)\}</);
+  assert.doesNotMatch(viewer, /<LanguageSelector/);
+  assert.match(viewer, /<ViewerLiveSurface/);
+  assert.match(viewer, /<ControlDrawer/);
+  assert.match(viewer, />\{t\("세션 나가기"\)\}</);
   assert.match(viewer, /\/leave`/);
   assert.doesNotMatch(viewer, /🎙/u);
-  assert.match(dashboard, /Session title/);
-  assert.match(dashboard, /Date/);
-  assert.match(dashboard, /Start time/);
+  assert.doesNotMatch(viewer, /live-join-methods|Invite link/u);
+  assert.match(dashboard, /세션 제목/);
+  assert.match(dashboard, /날짜/);
+  assert.match(dashboard, /시작 시간/);
   assert.match(dashboard, /title,\s*scheduledAt/);
-  assert.match(dashboard, /"Start Live"/);
-  assert.match(dashboard, /\/start`/);
-  assert.match(dashboard, /const startedSession = session\.status === "live"/);
-  assert.match(dashboard, /setSession\(startedSession\)/);
+  assert.match(dashboard, />\s*\{t\("라이브 시작"\)\}\s*</);
+  assert.match(dashboard, /createScheduledGatewayStartTransport/);
+  assert.match(dashboard, /transport\.prepare\(activeSession\.id, activeSession\.version\)/);
+  assert.match(dashboard, /connectBroadcastWithRecovery\(transportSession, activation, isManualRestart \? "restart" : "start"\)/);
+  assert.match(dashboard, /mergePolledHostSession\(current, authoritative\)/);
+  assert.doesNotMatch(dashboard, /setSession\(transportSession\)/);
   // Caption text size is a continuous scale on a CSS custom property, applied on
   // BOTH routes. The old `.is-text-large`/`.is-text-largest` classes had CSS only
   // under `.is-compact`, so the control did nothing on desktop /watch.
@@ -608,57 +646,49 @@ test("join canvas keeps readable dark contrast on desktop and mobile viewports",
   assert.doesNotMatch(css, /\.live-viewer-shell\.is-join\s*\{[^}]*background:\s*var\(--canvas\)/s);
 });
 
-test("participant Speak is a copy-free full-width bar button that records in place", async () => {
+test("participant speaking controls are capability-gated while demo stays captions-only", async () => {
   const [viewer, demo, css] = await Promise.all([
     read("webapp/components/live/LiveViewer.tsx"),
     read("webapp/app/m/watch/demo/page.tsx"),
     read("webapp/app/globals.css"),
   ]);
 
-  assert.match(viewer, /function SpeakControlIcon/);
-  assert.match(viewer, /className="live-speak-microphone"/);
-  assert.match(viewer, /className="live-speak-button-waves"/);
-  // The mic button fills the whole bottom bar as one press target (no helper
-  // copy). Speaking animates only the button — never a full-screen overlay —
-  // so the caption feed stays visible; tapping while speaking stops the turn.
-  assert.doesNotMatch(viewer, /live-floor-indicator/);
-  assert.doesNotMatch(viewer, /live-speak-modal/);
-  assert.match(viewer, /onClick=\{\(\) => void \(speakState === "speaking" \? endSpeaking\(true\) : toggleSpeak\(\)\)\}/);
-  assert.match(viewer, /if \(speakStateRef\.current !== "idle"\) return;/);
-  assert.match(viewer, /if \(speakStateRef\.current !== "starting"\) \{[\s\S]{0,260}type: "speak-end"/);
-  assert.match(viewer, /prepareSpeakCapture\(\)/);
-  assert.match(viewer, /captureError instanceof SpeakCaptureError[\s\S]{0,100}captureError\.message/);
-  assert.match(demo, /<SpeakControlIcon state="speaking" \/>/);
-  assert.match(demo, /className="live-speak-button is-speaking"/);
-  assert.doesNotMatch(demo, />Speak</);
-  assert.match(css, /\.live-speak-button\s*\{[^}]*min-width:\s*44px[^}]*min-height:\s*44px/s);
-  assert.match(css, /\.live-speak-button:focus-visible\s*\{[^}]*outline:\s*2px solid var\(--brand-blue\)/s);
-  assert.match(css, /\.live-speak-bar \.live-speak-button\s*\{[^}]*width:\s*100%/s);
-  assert.doesNotMatch(css, /\.live-speak-modal/);
-  assert.match(css, /\.live-speak-button\.is-speaking\s*\{[^}]*animation:\s*live-speak-recording/s);
+  assert.match(viewer, /TranslationViewport/u);
+  assert.match(viewer, /viewer\.session\.participantSpeakingEnabled === true/u);
+  assert.match(viewer, /prepareSpeakCapture/u);
+  assert.match(viewer, /canUseSpeakingFloor/u);
+  const participantButton = await read("webapp/components/live/ParticipantSpeakButton.tsx");
+  assert.match(viewer, /canUseSpeakingFloor && <div className="viewer-microphone-slot">\s*<ParticipantSpeakButton state=\{speakState\}/u);
+  assert.match(demo, /previewState !== "denied" && <div className="viewer-microphone-slot">/u);
+  assert.match(participantButton, /aria-pressed=\{state !== "idle"\}/u);
+  assert.match(demo, /ViewerReadingFeed/u);
+  assert.doesNotMatch(demo, /SpeakControl|floorHolder|getUserMedia|prepareSpeakCapture/u);
+  assert.match(demo, /실제 마이크는 사용하지 않아요/u);
+  assert.match(css, /\.live-viewer-stage > \[data-translation-state\] \{ min-height: 70vh;/u);
 });
 
-test("meeting captions keep a speaker-attributed live sheet and append final turns", async () => {
+test("meeting captions keep one seq-keyed speaker article through partial and final", async () => {
   const [feed, css] = await Promise.all([
     read("webapp/components/live/MeetingTurnFeed.tsx"),
     read("webapp/app/globals.css"),
   ]);
 
-  // Caption text lives ONLY in the main record: the in-progress utterance is
-  // the newest speaker-attributed paragraph, and the mic-button sheet is a
-  // floor indicator with no caption text (no duplication).
-  assert.match(feed, /className="live-turn-card is-live" data-caption-state="updating"/);
-  assert.match(feed, /speakerMetaLine\(livePartial\.speaker\)/);
+  // Caption text lives only in the main record: the in-progress utterance is
+  // the newest speaker-attributed paragraph, with no duplicate media surface.
+  assert.match(feed, /key=\{`caption-\$\{caption\.seq\}`\}/);
+  assert.match(feed, /turn\.captions\.map/);
+  assert.doesNotMatch(feed, /livePartial|pendingText/u);
   assert.doesNotMatch(feed, /live-now-text/);
   assert.match(feed, /turns\.map/);
   assert.match(feed, /floorHolder[\s\S]{0,400}is speaking/);
-  // Scroll durability: content growth of ANY kind (partials, new paragraphs,
-  // Aa text-size reflow) re-pins the newest line into view, and the sticky
-  // Speak bar never hides the record's tail.
+  // Scroll durability: content growth of any kind (partials, new paragraphs,
+  // Aa text-size reflow) re-pins the newest line into view, while captions-only
+  // mobile spacing keeps the record's tail above the safe area.
   assert.match(feed, /new ResizeObserver/);
   assert.match(feed, /live-turn-scroll-content/);
-  assert.match(css, /\.live-turn-scroll\s*\{[^}]*padding-bottom:\s*calc\(84px \+ env\(safe-area-inset-bottom\)\)/s);
-  assert.match(css, /@keyframes live-turn-in/);
+  assert.match(css, /\.live-turn-scroll\s*\{[^}]*padding-bottom:\s*calc\(24px \+ env\(safe-area-inset-bottom\)\)/s);
+  assert.doesNotMatch(css, /\.live-speak-(?:bar|button)/u);
+  assert.doesNotMatch(css, /@keyframes live-turn-in|animation:\s*live-turn-in/u);
   // Reference-app reading treatment: only the two most recently completed
   // sentences render at full strength; older sentences dim.
   assert.match(feed, /globalIndex >= turnOffsets\.total - 2/);
@@ -666,43 +696,38 @@ test("meeting captions keep a speaker-attributed live sheet and append final tur
   assert.match(css, /\.live-turn-card p \.live-turn-text\.is-recent\s*\{[^}]*opacity:\s*1/s);
 });
 
-test("caption controls sit below the title and no audio control is surfaced", async () => {
+test("caption language stays direct while secondary controls live in the drawer", async () => {
   const [viewer, demo, css] = await Promise.all([
     read("webapp/components/live/LiveViewer.tsx"),
     read("webapp/app/m/watch/demo/page.tsx"),
     read("webapp/app/globals.css"),
   ]);
 
-  // Live Call is caption-first, so the translated-audio toggle is gated to
-  // audio-only sessions, where it is the entire product. A caption session never
-  // shows it; an `outputMode: "audio"` session still must, or it is unusable.
-  assert.match(viewer, /\{outputMode === "audio" && \(/u);
-  const audioGate = viewer.indexOf('{outputMode === "audio" && (');
-  const audioLabel = viewer.indexOf('{isInterpretationAudioEnabled ? "Audio On" : "Audio Off"}');
-  assert.ok(audioGate >= 0 && audioLabel > audioGate, "the audio toggle must be behind the audio-only gate");
+  assert.doesNotMatch(viewer, /Audio On|Audio Off|isInterpretationAudioEnabled/u);
   assert.doesNotMatch(demo, /Audio On|Audio Off/u);
 
-  for (const source of [viewer, demo]) {
-    // Order: title (ViewerSessionContext) THEN the controls THEN the stage, so
-    // the controls sit immediately above where captions begin.
-    const title = source.indexOf("<ViewerSessionContext");
-    const controls = source.indexOf('className="live-caption-controls"');
-    assert.ok(title >= 0 && controls > title, "caption controls must render below the session title");
-    // They must no longer live in the top toolbar.
-    const toolbarEnd = source.indexOf("</header>");
-    assert.ok(controls > toolbarEnd, "caption controls must be outside the top toolbar");
-    assert.match(source, /className="live-language-switch"/u);
-  }
+  const viewerSurface = await read("webapp/components/live/quality/ViewerLiveSurface.tsx");
+  assert.match(viewerSurface, /<TranslationLaneTabs/u);
+  assert.match(demo, /<TranslationLaneTabs/u);
+  assert.doesNotMatch(viewer, /<LanguageSelector/u);
+  assert.equal((viewerSurface.match(/<TranslationLaneTabs/gu) ?? []).length, 1);
+  assert.match(viewer, /buildTranslationLanes/u);
+  assert.match(viewer, /projectCaptionLane/u);
 
-  // Text size is an icon that discloses a slider, not a 3-step cycle.
-  assert.match(viewer, /aria-expanded=\{isTextSizeOpen\}\s+aria-controls="live-caption-scale"/u);
+  assert.match(viewer, /<ControlDrawer iconOnly triggerLabel=\{t\("더보기"\)\} title=\{t\("세션 제어"\)\}>/u);
+  assert.match(demo, /<ControlDrawer iconOnly triggerLabel=\{t\("더보기"\)\} title=\{t\("미리보기 제어"\)\}>/u);
+  for (const surface of [viewer, demo]) {
+    assert.equal((surface.match(/<SystemLanguageButton compact/gu) ?? []).length, 1);
+    assert.match(surface, /<SystemLanguageButton compact \/>[\s\S]*<ControlDrawer iconOnly/u);
+  }
+  assert.match(demo, /ariaLabel=\{t\("자막 언어"\)\}/u);
   assert.match(viewer, /type="range"/u);
-  assert.match(viewer, /setCaptionScale\(Number\(event\.target\.value\)\)/u);
+  assert.match(viewer, /setCaptionScale\(Number\(event\.currentTarget\.value\)\)/u);
   assert.doesNotMatch(viewer, /captionTextSize/u);
-  assert.match(css, /\.live-text-size-slider\.is-open \{ display: inline-flex/u);
+  assert.match(css, /\.live-viewer-text-scale input \{ min-height: 44px;/u);
 });
 
-test("the in-progress sentence extends the current paragraph instead of standing alone", async () => {
+test("the in-progress sentence finalizes in the same keyed paragraph node", async () => {
   const feed = await read("webapp/components/live/MeetingTurnFeed.tsx");
 
   // The partial used to render as its own <article class="live-turn-card is-live">
@@ -710,12 +735,10 @@ test("the in-progress sentence extends the current paragraph instead of standing
   // the paragraph above, so the reader watched text get written separately and
   // then jump into the record — the reported "따로 적혔다가 다시 기록에 붙여지는"
   // behaviour. A live transcript must only ever grow at its tail.
-  assert.match(feed, /pendingText/u, "the live text must be handed to the current paragraph");
-  // Same speaker -> the partial is the tail of that speaker's existing paragraph.
-  assert.match(feed, /livePartialBelongsToLastTurn|belongsToLastTurn/u);
-  // A partial from a DIFFERENT speaker still opens its own paragraph, which is
-  // correct: that is a new turn, not a continuation.
-  assert.match(feed, /<article className="live-turn-card is-live"/u);
+  assert.match(feed, /key=\{`caption-\$\{caption\.seq\}`\}/u);
+  assert.match(feed, /caption\.isFinal \? "" : "is-pending"/u);
+  assert.match(feed, /data-caption-state=\{hasPartial \? "updating" : "final"\}/u);
+  assert.doesNotMatch(feed, /pendingText|livePartialBelongsToLastTurn/u);
 });
 
 test("the LIVE feed never folds a speaker paragraph", async () => {
@@ -740,17 +763,16 @@ test("the LIVE feed never folds a speaker paragraph", async () => {
   // The paragraph body and its speaker header stay — only the control is gone,
   // and the header must no longer be a button.
   assert.match(feed, /<p className="live-turn-body">/u);
-  assert.match(feed, /<strong>\{turn\.speakerLabel\}<\/strong>/u);
+  assert.match(feed, /<SpeakerIdentity profile=\{turn\.speakerProfile\} sessionId=\{turn\.sessionId\} fallback=\{turn\.speakerLabel\}/u);
 
-  // The in-progress paragraph is still rendered inside the record.
-  const liveCard = feed.match(/<article className="live-turn-card is-live"[\s\S]*?<\/article>/u);
-  assert.ok(liveCard, "the live partial card must remain present");
+  // The in-progress paragraph stays in the same canonical record.
+  assert.match(feed, /className=\{`live-turn-card \$\{hasPartial \? "is-live" : ""\}`\}/u);
 });
 
 test("meeting timestamps use a deterministic fixed KST clock", async () => {
   const [feed, minutes] = await Promise.all([
     read("webapp/components/live/MeetingTurnFeed.tsx"),
-    read("webapp/components/live/MeetingMinutes.tsx"),
+    read("webapp/components/live/meeting-minutes-model.ts"),
   ]);
   const turnMatch = feed.match(/export function formatTurnTime\(iso: string\): string \{\n([\s\S]*?)\n\}/u);
   const minuteMatch = minutes.match(/export function formatMinuteTime\(iso: string\): string \{\n([\s\S]*?)\n\}/u);
@@ -774,31 +796,130 @@ test("meeting timestamps use a deterministic fixed KST clock", async () => {
 });
 
 test("viewer lifecycle never combines waiting and live, and announces the host-ended record", async () => {
-  const [viewer, css] = await Promise.all([
+  const [viewer, minutes, css, viewerSurface, viewerLane] = await Promise.all([
     read("webapp/components/live/LiveViewer.tsx"),
+    read("webapp/components/live/MeetingMinutes.tsx"),
     read("webapp/app/globals.css"),
+    read("webapp/components/live/quality/ViewerLiveSurface.tsx"),
+    read("webapp/components/live/quality/ViewerTopicLane.tsx"),
   ]);
 
-  assert.match(viewer, /sessionStatus=\{sessionStatus\}/);
-  assert.match(viewer, /sessionStatus === "live"[\s\S]{0,100}\? "Live now"[\s\S]{0,100}sessionStatus === "paused" \? "Paused by host" : "Live unavailable"/);
-  assert.match(viewer, /className="live-session-ended-banner" role="status" aria-live="assertive"/);
-  assert.match(viewer, />Live session ended</);
-  assert.match(viewer, />The host ended the call\. Your meeting record is below\.</);
+  assert.match(viewer, /\{isSessionEnded \? \([\s\S]*\) : sessionStatus === "preparing" \? \([\s\S]*<ViewerLiveSurface/u);
+  assert.match(viewer, /sessionStatus === "live"[\s\S]{0,100}\? "실시간"[\s\S]{0,100}sessionStatus === "paused" \? "호스트가 일시 정지함" : "라이브를 사용할 수 없음"/);
+  assert.match(viewer, /className="live-session-ended-screen" role="status"[\s\S]{0,160}<strong>\{t\("라이브 세션이 종료되었습니다"\)\}<\/strong>/u);
+  assert.doesNotMatch(viewer, /live-session-ended-banner/);
+  const endedRecordStart = viewer.indexOf("{isSessionEnded ? (");
+  const endedRecordEnd = viewer.indexOf(') : sessionStatus === "preparing"', endedRecordStart);
+  const endedRecordSource = viewer.slice(endedRecordStart, endedRecordEnd);
+  assert.doesNotMatch(endedRecordSource + minutes, />Live session ended<|>The meeting has ended<|The host ended the call\. Your meeting record is below\./);
+  assert.match(minutes, /role="tablist" aria-label=\{t\("회의 기록"\)\}/);
+  assert.match(minutes, /aria-controls="live-minutes-panel-summary"/);
+  assert.match(minutes, /aria-controls="live-minutes-panel-transcript"/);
+  assert.match(minutes, /activeTab === "summary" \? \(/);
+  assert.doesNotMatch(minutes, /hidden=\{/);
+  assert.doesNotMatch(minutes, /fetch\(/);
+  assert.match(viewerLane, /const viewportState = sessionStatus === "paused" \? "paused" : sessionStatus === "live" \? "live" : "disconnected"/u);
+  assert.match(viewerLane, /<TranslationViewport state=\{viewportState\}/u);
+  assert.match(viewerSurface, /<TranslationLaneTabs/u);
   assert.match(viewer, /function isRecordingStatusEvent/);
-  assert.match(viewer, /event\.type === "recording-status"[\s\S]{0,120}setError\(event\.message\)/);
-  assert.match(viewer, /\{!isSessionEnded && \(\s*<footer className="live-viewer-footer"/u,
-    "the ended record must not share its final compact grid row with the live footer");
-  assert.match(css, /\.live-viewer-shell\.is-compact\s*\{[^}]*grid-template-rows:/s);
-  assert.match(css, /\.live-viewer-shell\.is-compact \.live-viewer-footer\s*\{[^}]*min-height:\s*0/s);
-  assert.match(css, /\.live-viewer-shell\.is-compact \.live-minutes\s*\{[^}]*scrollbar-color:\s*var\(--nova-hairline-strong\) #000[^}]*scrollbar-width:\s*thin/s,
+  assert.match(viewer, /event\.type === "recording-status"[\s\S]{0,220}실시간 자막/u);
+  assert.doesNotMatch(viewer, /setError\(event\.message\)/u);
+  assert.doesNotMatch(viewer, /live-viewer-footer/u,
+    "secondary live metadata belongs in the drawer, not a competing footer row");
+  assert.match(css, /\.live-viewer-shell\.is-compact \.live-minutes\s*\{[^}]*scrollbar-color:\s*var\(--nova-hairline-strong\) var\(--nova-web-background\)[^}]*scrollbar-width:\s*thin/s,
     "a long ended record must not expose the browser's light scrollbar gutter");
-  assert.match(css, /\.live-viewer-shell\.is-compact \.live-minutes::\-webkit-scrollbar-track\s*\{[^}]*background:\s*#000/s);
+  assert.match(css, /\.live-viewer-shell\.is-compact \.live-minutes::\-webkit-scrollbar-track\s*\{[^}]*background:\s*var\(--nova-web-background\)/s);
   assert.doesNotMatch(css, /\.live-viewer-shell\.is-compact \.live-minutes\s*\{[^}]*scrollbar-width:\s*none/s,
     "the ended transcript must retain a visible scroll affordance");
 });
 
+test("ended minutes keep one accessible loading state across polling gaps and stop with retry", async () => {
+  const [viewer, minutes, skeleton, css] = await Promise.all([
+    read("webapp/components/live/LiveViewer.tsx"),
+    read("webapp/components/live/MeetingMinutes.tsx"),
+    read("webapp/components/live/SummarySkeleton.tsx"),
+    read("webapp/app/globals.css"),
+  ]);
+
+  assert.match(viewer, /type SummaryPollingState/u);
+  assert.doesNotMatch(viewer, /type MinutesPollingState/u);
+  assert.match(viewer, /setMinutesPollingState\("polling"\)/u);
+  assert.match(viewer, /setMinutesPollingState\("exhausted"\)/u);
+  assert.match(viewer, /isLoading=\{isMinutesLoading \|\| minutesPollingState === "polling"\}/u);
+  assert.match(viewer, /<ParticipantMeetingMinutes/u);
+  assert.match(minutes, /<RecapStatePanel isBusy=\{isSummaryPolling\}>/u);
+  // The generating state is the summary-card skeleton; it owns the live region.
+  assert.match(minutes, /<SummarySkeleton/u);
+  assert.match(skeleton, /role="status" aria-live="polite"/u);
+  assert.match(skeleton, /className="live-summary-skeleton" aria-hidden="true"/u);
+  assert.doesNotMatch(minutes, /live-minutes-loading-dots/u);
+  assert.match(minutes, /formatElapsedTime/u);
+  assert.doesNotMatch(minutes, /ETA|remaining|about \d/u);
+  assert.match(minutes, /회의 요약 생성이 예상보다 오래 걸리고 있습니다\./u);
+  assert.match(minutes, /"다시 생성"/u);
+  assert.match(minutes, /기록된 발언이 없어 요약을 만들 수 없습니다\./u);
+  assert.match(css, /\.live-minutes-elapsed \{[^}]*font-variant-numeric:\s*tabular-nums/s);
+  assert.match(css, /@keyframes live-summary-shimmer/u);
+  assert.match(css, /prefers-reduced-motion: reduce[\s\S]*\.live-summary-skeleton span::after[\s\S]*animation: none/u);
+});
+
+test("host and shared viewer minutes expose the same automatic summary states without regeneration UI", async () => {
+  const [dashboard, hostSummaryLifecycle, viewer, minutes] = await Promise.all([
+    read("webapp/components/live/LiveHostDashboard.tsx"),
+    read("webapp/components/live/useHostSummaryLifecycle.ts"),
+    read("webapp/components/live/LiveViewer.tsx"),
+    read("webapp/components/live/MeetingMinutes.tsx"),
+  ]);
+
+  assert.match(hostSummaryLifecycle, /startSummaryPollLoop/u);
+  assert.match(hostSummaryLifecycle, /method: "GET"[\s\S]{0,120}cache: "no-store"/u);
+  assert.match(dashboard, /<MeetingMinutes/u);
+  assert.match(dashboard, /minutesPollingState=\{hostSummaryPollingState\}/u);
+  assert.match(dashboard, /minutesPollingStartedAt=\{hostSummaryPollingStartedAt\}/u);
+  // Every failure class polling cannot clear may issue one reset-and-claim POST.
+  assert.match(hostSummaryLifecycle, /!shouldResetSummaryGeneration\(summaryFailureCode\)/u);
+  assert.match(hostSummaryLifecycle, /export const SUMMARY_RESET_FAILURE_CODES/u);
+  assert.doesNotMatch(dashboard, /Create summary again|Create AI summary|generateSummaries/u);
+
+  assert.match(viewer, /startSummaryPollLoop/u);
+  const summaryPolling = await read("webapp/components/live/meeting-summary-polling.ts");
+  assert.match(summaryPolling, /type SummaryPollingState = "idle" \| "polling" \| "exhausted" \| "failed"/u);
+  assert.match(summaryPolling, /getSummaryPollDelayMilliseconds/u);
+  assert.match(summaryPolling, /onError/u);
+});
+
+test("approved Stage keeps prelive access, live translations, and a clean completion state", async () => {
+  const [stage, css] = await Promise.all([
+    read("webapp/components/live/LiveStageView.tsx"),
+    read("webapp/app/globals.css"),
+  ]);
+
+  assert.match(stage, /className="live-stage-grid"[\s\S]*className="live-stage-session"[\s\S]*className="live-stage-access"/);
+  assert.match(stage, /participants\.slice\(0, 5\)/);
+  assert.match(stage, /overflowCount > 0[\s\S]*>\+\{overflowCount\}</);
+  assert.match(stage, /isCountingDown \? \([\s\S]*className="live-stage-ring"/);
+  assert.doesNotMatch(stage, /className="live-stage-ring"[\s\S]{0,220}Waiting for host/);
+  assert.match(stage, /function StageLoader/);
+  assert.match(stage, /coverState === "loading"/);
+  assert.match(stage, /className="live-stage-manual-url"/);
+  assert.match(stage, /new URL\("\/watch", window\.location\.origin\)/);
+  assert.doesNotMatch(stage, /live-stage-manual-url[\s\S]{0,180}invite\.url/u,
+    "the manual URL must never disclose the opaque QR invite token");
+  assert.match(stage, /\{isPrelive && currentInvite && \(/u);
+  assert.match(stage, /<TranslationViewport[\s\S]*recentSpeeches\.map[\s\S]*<CaptionEntry/u);
+  assert.match(stage, /className="live-stage-complete"/u);
+  assert.doesNotMatch(stage, /is-faded-out|aria-hidden=\{!isPrelive\}/u);
+  assert.match(css, /\.live-stage-frame \{[^}]*aspect-ratio: 16 \/ 9/s);
+  assert.match(css, /\.live-stage-grid \{[^}]*grid-template-columns:/s);
+  assert.match(css, /\.live-stage-cover \{[^}]*object-fit: cover[^}]*object-position: center/s);
+  assert.match(css, /\.live-stage-loader i \{[^}]*animation: live-stage-load/s);
+  assert.match(css, /\.live-stage-translation \{[^}]*grid-template-rows:\s*auto minmax\(0, 1fr\)/s);
+  assert.match(css, /\.live-stage-complete \{[^}]*place-content:\s*center/s);
+  assert.doesNotMatch(css, /\.live-stage-access\.is-faded-out/u);
+});
+
 test("meeting minutes group by participant identity while preserving the display label", async () => {
-  const minutes = await read("webapp/components/live/MeetingMinutes.tsx");
+  const minutes = await read("webapp/components/live/meeting-minutes-model.ts");
   const start = minutes.indexOf("export function groupTranscript");
   const end = minutes.indexOf("\n\nexport function formatMinuteTime", start);
   assert.ok(start >= 0 && end > start, "groupTranscript must remain independently testable");
@@ -849,14 +970,18 @@ test("live meeting turns use speaker IDs rather than colliding display labels", 
   ];
   const turns = groupCaptionsIntoTurns(captions);
 
-  assert.deepEqual(turns.map((turn) => ({ identity: turn.speakerIdentity, label: turn.speakerLabel, text: turn.texts.join(" ") })), [
+  assert.deepEqual(turns.map((turn) => ({
+    identity: turn.speakerIdentity,
+    label: turn.speakerLabel,
+    text: turn.captions.map((caption) => caption.text).join(" "),
+  })), [
     { identity: "a", label: "Alex", text: "one two" },
     { identity: "b", label: "Alex", text: "three" },
     { identity: "host", label: "Host", text: "four five" },
   ]);
 });
 
-test("production meeting feed accumulates sentences by consecutive speaker and ignores partial fragments", async () => {
+test("production meeting feed accumulates canonical seq captions by consecutive speaker", async () => {
   const feed = await read("webapp/components/live/MeetingTurnFeed.tsx");
   const start = feed.indexOf("export function groupCaptionsIntoTurns");
   const end = feed.indexOf("/** True when two separate groupings", start);
@@ -884,15 +1009,21 @@ test("production meeting feed accumulates sentences by consecutive speaker and i
 
   assert.deepEqual(groupCaptionsIntoTurns(captions).map((turn) => ({
     speaker: turn.speakerIdentity,
-    texts: turn.texts,
+    captions: turn.captions,
   })), [
-    { speaker: "host", texts: ["Host sentence one.", "Host sentence two."] },
-    { speaker: "p1", texts: ["Participant sentence.", "Participant sentence two."] },
-    { speaker: "host", texts: ["Host returns."] },
+    { speaker: "host", captions: [
+      { seq: 1, text: "Host sentence one.", isFinal: true },
+      { seq: 2, text: "Host sentence two.", isFinal: true },
+    ] },
+    { speaker: "p1", captions: [
+      { seq: 3, text: "Participant sentence.", isFinal: true },
+      { seq: 4, text: "Participant sentence two.", isFinal: true },
+    ] },
+    { speaker: "host", captions: [{ seq: 5, text: "Host returns.", isFinal: true }] },
   ]);
 });
 
-test("live web surfaces use English copy without emoji", async () => {
+test("participant topic surfaces use approved Korean copy without emoji", async () => {
   const sources = await Promise.all([
     "LiveHostDashboard.tsx",
     "LiveViewer.tsx",
@@ -900,17 +1031,42 @@ test("live web surfaces use English copy without emoji", async () => {
     "SpeakerCaption.tsx",
     "MeetingMinutes.tsx",
     "MeetingSummaryCard.tsx",
+    "ViewerReadingFeed.tsx",
+    "ParticipantMeetingMinutes.tsx",
+    "ViewerRecapRequest.tsx",
     "connection-resilience.ts",
     "live-audio-client.ts",
   ].map((name) => read(`webapp/components/live/${name}`)));
   sources.push(await read("webapp/app/m/watch/demo/page.tsx"));
+  sources.push(await read("webapp/components/live/viewer-controller-contract.ts"));
   const source = sources.join("\n");
+  const approvedKoreanMessages = [
+    "올바른 이메일 주소를 입력해 주세요.",
+    "회사명은 100자 이하로 입력해 주세요.",
+    "부서는 80자 이하로 입력해 주세요.",
+    "직급은 100자 이하로 입력해 주세요.",
+    "호스트가 공유한 6자리 인증코드를 입력해 주세요.",
+    "참여자 연결이 설정되지 않았습니다.",
+    "QR 초대가 유효하지 않거나 만료되었습니다.",
+    "라이브콜에 참여할 수 없습니다. 잠시 후 다시 시도해 주세요.",
+    "참여 인원이 가득 찼습니다.",
+    "참여가 마감되었거나 QR 초대가 만료되었습니다.",
+    "라이브콜에 참여할 수 없습니다. 입력 정보를 확인해 주세요.",
+    "원문",
+    "번역 중",
+    "AI 요약",
+    "발언 원문 펼치기",
+    "요약·원문 받기",
+    "마케팅 수신 동의는 포함되지 않아요.",
+  ];
+  for (const message of approvedKoreanMessages) {
+    assert.match(source, new RegExp(message, "u"));
+  }
 
-  assert.doesNotMatch(source, /["'`][^"'`\n]*[가-힣][^"'`\n]*["'`]/u);
   assert.doesNotMatch(source, /[\u{1F300}-\u{1FAFF}]/u);
 });
 
-test("approved live layouts keep mobile context and desktop rail structure", async () => {
+test("approved live layouts keep mobile context and translation-first host structure", async () => {
   const [viewer, demo, dashboard, css] = await Promise.all([
     read("webapp/components/live/LiveViewer.tsx"),
     read("webapp/app/m/watch/demo/page.tsx"),
@@ -919,13 +1075,21 @@ test("approved live layouts keep mobile context and desktop rail structure", asy
   ]);
 
   assert.match(viewer, /ViewerSessionContext title=\{viewer\.session\.title\} scheduledAt=\{viewer\.session\.scheduledAt\}/);
-  assert.match(demo, /Q2 2026 Earnings Call/);
-  assert.match(demo, /2026-07-23T14:00:00\+09:00/);
+  assert.match(demo, /2026년 2분기 실적 발표/);
+  assert.match(demo, /2026-08-31T13:30:00\+09:00/);
+  assert.match(demo, /buildTranslationLanes\(null, \["ko", "en"\]\)/u);
+  assert.match(demo, /projectCaptionLane\(inputs, selectedLane\)/u);
+  assert.match(demo, /previewState === "empty"/u);
+  assert.match(demo, /previewState === "degraded"/u);
   assert.match(css, /\.live-viewer-shell\.is-compact \.live-viewer-toolbar \{[^}]*flex-wrap: nowrap/s);
-  assert.match(css, /\.live-viewer-stage:has\(\.live-now-sheet\) \+ \.live-speak-bar/);
+  assert.match(css, /\.live-viewer-restoring\s*\{[^}]*min-height:\s*100dvh/s);
+  assert.doesNotMatch(css, /\.live-speak-(?:bar|button)/u);
   assert.match(dashboard, /className="live-host-rail"/);
-  assert.match(dashboard, /className="live-setup-mobile-access"/);
-  assert.match(dashboard, /"Create Session"/);
+  const hostLiveSurface = await read("webapp/components/live/quality/HostLiveSurface.tsx");
+  assert.match(hostLiveSurface, /className="live-host-translation-composition"/);
+  assert.match(hostLiveSurface, /className="live-host-inspector"/);
+  assert.doesNotMatch(dashboard, /className="live-setup-mobile-access"/);
+  assert.match(dashboard, /"세션 만들기"/);
   assert.match(dashboard, /placeholder="YYYY-MM-DD"/);
   assert.match(dashboard, /placeholder="HH:MM"/);
   assert.doesNotMatch(dashboard, /type="date"/);
@@ -934,30 +1098,57 @@ test("approved live layouts keep mobile context and desktop rail structure", asy
 
 test("viewer schedule formatting is deterministic across browser engines and hydration", async () => {
   const viewer = await read("webapp/components/live/LiveViewer.tsx");
-  const functionMatch = viewer.match(/export function formatSessionSchedule\(scheduledAt: string \| null\): string \{\n([\s\S]*?)\n\}/u);
+  const functionMatch = viewer.match(/export function formatSessionSchedule\(scheduledAt: string \| null, systemLanguage: SystemLanguage = "ko"\): string \{\n([\s\S]*?)\n\}/u);
 
   assert.ok(functionMatch, "formatSessionSchedule must remain independently testable");
   assert.doesNotMatch(functionMatch[0], /toLocaleString|toLocaleDateString|toLocaleTimeString|Intl\./);
-  const formatSessionSchedule = new Function("scheduledAt", functionMatch[1]);
+  const scheduleMessages = {
+    ko: { "지금 시작": "지금 시작" },
+    en: { "지금 시작": "Starting now" },
+    ja: { "지금 시작": "まもなく開始" },
+  };
+  const formatSystemText = (messages, language, key) => {
+    assert.equal(messages, scheduleMessages);
+    assert.equal(key, "지금 시작");
+    return messages[language][key];
+  };
+  const evaluateSchedule = new Function("scheduledAt", "systemLanguage = 'ko'", "formatSystemText", "viewerMessages", functionMatch[1]);
+  const formatSessionSchedule = (scheduledAt, language) => evaluateSchedule(scheduledAt, language, formatSystemText, scheduleMessages);
 
-  assert.equal(formatSessionSchedule(null), "Live now");
-  assert.equal(formatSessionSchedule("invalid"), "Live now");
-  assert.equal(formatSessionSchedule("2026-07-23T05:00:00.000Z"), "Jul 23 · 2:00 PM");
-  assert.equal(formatSessionSchedule("2026-07-23T14:00:00+09:00"), "Jul 23 · 2:00 PM");
-  assert.equal(formatSessionSchedule("2026-07-23T15:00:00.000Z"), "Jul 24 · 12:00 AM");
-  assert.equal(formatSessionSchedule("2026-07-24T03:05:00.000Z"), "Jul 24 · 12:05 PM");
+  assert.equal(formatSessionSchedule(null), "지금 시작");
+  assert.equal(formatSessionSchedule("invalid"), "지금 시작");
+  assert.equal(formatSessionSchedule("2026-07-23T05:00:00.000Z"), "7월 23일 · 14:00");
+  assert.equal(formatSessionSchedule("2026-07-23T14:00:00+09:00"), "7월 23일 · 14:00");
+  assert.equal(formatSessionSchedule("2026-07-23T15:00:00.000Z"), "7월 24일 · 00:00");
+  assert.equal(formatSessionSchedule("2026-07-24T03:05:00.000Z"), "7월 24일 · 12:05");
+  assert.equal(formatSessionSchedule("2026-07-23T15:00:00.000Z", "en"), "7/24 · 00:00 KST");
+  assert.equal(formatSessionSchedule("2026-07-23T15:00:00.000Z", "ja"), "7月24日 · 00:00");
+  for (const language of ["ko", "en", "ja"]) {
+    assert.equal(formatSessionSchedule(null, language), scheduleMessages[language]["지금 시작"]);
+    assert.equal(formatSessionSchedule("invalid", language), scheduleMessages[language]["지금 시작"]);
+  }
 });
 
-test("login surface is English-only", async () => {
-  const login = await read("webapp/app/(login)/login/page.tsx");
+test("login surface localizes NOVA system labels while preserving credential field contracts", async () => {
+  // 2026-09-03 auth: the login page renders <LoginCard /> (Supabase Auth + legacy id login in one card).
+  const [page, login, controls] = await Promise.all([
+    read("webapp/app/(login)/login/page.tsx"),
+    read("webapp/components/auth/LoginCard.tsx"),
+    read("webapp/components/ui/FormControls.tsx"),
+  ]);
 
-  assert.match(login, /Live translated captions for your team/);
-  assert.match(login, />Display name</);
-  assert.match(login, />User ID</);
-  assert.match(login, />Password</);
-  assert.match(login, /"Sign in"/);
-  assert.match(login, /Internal access only/);
-  assert.doesNotMatch(login, /["'`][^"'`\n]*[가-힣][^"'`\n]*["'`]/u);
+  assert.match(page, /<LoginCard \/>/u);
+  assert.doesNotMatch(login, /라이브 콜을 시작하고 운영합니다/);
+  assert.match(login, /id="login-identifier" name="identifier" label=\{t\(mode === "signup" \? "email" : "identifier"\)\}/u);
+  assert.match(login, /autoComplete=\{mode === "signup" \? "email" : "username"\}/u);
+  assert.match(login, /id="login-password" name="password" label=\{t\("password"\)\} type=\{showPassword \? "text" : "password"\}/u);
+  assert.match(login, /autoComplete=\{mode === "signup" \? "new-password" : "current-password"\}/u);
+  assert.match(login, /<FormButton type="submit"[^>]*data-auth-action="submit"/u);
+  assert.match(login, /<FormError>\{error\}<\/FormError>/u);
+  assert.match(controls, /role="alert"/u);
+  assert.match(login, /aria-label=\{t\(mode === "signup" \? "signUp" : "signInFormLabel"\)\}/u);
+  assert.match(login, /href="\/watch">\{t\("participantEntry"\)\}/u);
+  assert.doesNotMatch(login, /label="Display name"|label="Password"|>Sign in|Internal access only/);
 });
 
 test("host preserves an opened admission window when invite-link creation fails", async () => {
@@ -981,8 +1172,9 @@ test("legacy host admission helper can close without exposing a code control", a
   assert.doesNotMatch(dashboard, />공유 인증번호</);
 });
 
-test("host polls viewer count and status without overlapping or overwriting edits", async () => {
+test("host polls session state without overlapping requests or overwriting edit fields", async () => {
   const dashboard = await read("webapp/components/live/LiveHostDashboard.tsx");
+  const hostSurface = await read("webapp/components/live/host-surface.ts");
 
   assert.match(dashboard, /window\.setInterval\([^,]+, 5_000\)/s);
   assert.match(dashboard, /isRequestPending/);
@@ -990,60 +1182,120 @@ test("host polls viewer count and status without overlapping or overwriting edit
   assert.match(dashboard, /window\.clearInterval\(timer\)/);
   assert.match(dashboard, /requestController\?\.abort\(\)/);
   assert.match(dashboard, /method: "GET"/);
-  assert.match(dashboard, /viewerCount: latest\.viewerCount, status: latest\.status/);
-  assert.match(dashboard, /`\$\{session\.viewerCount\} joined · \$\{formatSessionStatus\(session\.status\)\}`/);
+  assert.match(dashboard, /mergePolledHostSession\(current, latest\)/);
+  assert.match(hostSurface, /if \(!current \|\| current\.id !== latest\.id\) return current;/u,
+    "a late response from another session must not overwrite the active session");
+  assert.match(hostSurface, /\.\.\.latest,[\s\S]{0,120}languages: \[\.\.\.latest\.languages\]/u,
+    "polling must merge the latest server settings and clone its language list");
+  assert.match(hostSurface, /version: latest\.version/);
+  assert.match(dashboard, /GatewayConnectionStatus state=\{hostConnectionState\}/u);
+  assert.match(dashboard, /\{t\("\{count\}명 참여", \{ count: session\.viewerCount \}\)\} · \{t\(formatSessionStatus\(session\.status\)\)\}/u);
   assert.doesNotMatch(dashboard, /setSession\(latest\)/);
 });
 
-test("viewer requires identity fields and accepts exactly one opaque invite or 6-digit access code", async () => {
-  const viewer = await read("webapp/components/live/LiveViewer.tsx");
+test("viewer requires email and derives invite versus code entry from the URL", async () => {
+  const [viewer, viewerContract, consentFields, admissionLink] = await Promise.all([
+    read("webapp/components/live/LiveViewer.tsx"),
+    read("webapp/components/live/viewer-controller-contract.ts"),
+    read("webapp/components/live/consent/ParticipantConsentFields.tsx"),
+    read("webapp/components/live/admission-link.ts"),
+  ]);
 
   assert.match(viewer, /window\.location\.hash/);
-  assert.match(viewer, /inviteTokenPattern/);
-  assert.match(viewer, /history\.replaceState\(null, "", `\$\{window\.location\.pathname\}\$\{window\.location\.search\}`\)/);
-  assert.match(viewer, /normalizeDisplayName\(displayName\)/);
-  assert.match(viewer, /\.normalize\("NFC"\)\.trim\(\)/);
-  assert.match(viewer, /admissionCode: normalizedAdmissionCode/);
+  assert.match(admissionLink, /inviteTokenPattern\.test\(inviteToken\)/);
+  assert.match(viewer, /history\.replaceState\(null, "", `\$\{window\.location\.pathname\}\$\{window\.location\.search\}\$\{admissionLink\.canonicalHash\}`\)/);
+  assert.match(viewer, /normalizeEmail\(email\)/);
+  assert.match(viewerContract, /\.normalize\("NFC"\)\.trim\(\)/);
+  assert.match(viewer, /accessCode: normalizedAdmissionCode/);
+  assert.match(viewer, /email: normalizedEmail/);
+  assert.match(viewer, /company: normalizedCompany/);
   assert.match(viewer, /department: normalizedDepartment/);
   assert.match(viewer, /jobTitle: normalizedJobTitle/);
   assert.match(viewer, /inviteToken: pendingInviteToken/);
-  assert.match(viewer, /id="live-display-name"/);
+  assert.match(viewer, /id="live-email" name="email"/);
+  assert.match(viewer, /id="live-company" name="company"/);
   assert.match(viewer, /id="live-department"/);
   assert.match(viewer, /id="live-job-title"/);
-  assert.match(viewer, /id="live-admission-code"/);
-  assert.match(viewer, /Your name/);
-  assert.match(viewer, /Join live/);
-  assert.match(viewer, /CAPACITY_REACHED/);
-  assert.match(viewer, /INVITE_EXPIRED/);
+  assert.match(viewer, /id="live-access-code" name="accessCode"/);
+  assert.match(viewer, />\{t\("이메일"\)\}</);
+  assert.match(viewer, /const hasValidProfile = \/\^\\S\+@\\S\+\\\.\\S\+\$\/u\.test\(normalizeEmail\(email\)\)/);
+  assert.doesNotMatch(viewer, /hasValidProfile[\s\S]{0,180}normalizeProfileField\(department\)/u);
+  assert.match(viewer, /const isInviteJoin = Boolean\(pendingInviteToken\)/);
+  assert.doesNotMatch(viewer, /joinMethod|live-join-methods/u);
+  assert.match(viewer, /<summary>\{t\("선택 정보"\)\}<\/summary>/);
+  assert.doesNotMatch(viewer, /id="live-department"[\s\S]{0,350}required/u);
+  assert.doesNotMatch(viewer, /id="live-job-title"[\s\S]{0,350}required/u);
+  assert.match(viewer, /setEmail\(result\.self\.email\)/u);
+  assert.match(viewer, /setSummaryDeliveryConsent\(result\.self\.summaryConsent\)/u);
+  assert.match(consentFields, /name="privacyConsent"[^>]*required/u);
+  assert.match(consentFields, /name="summaryDeliveryConsent"/u);
+  assert.match(consentFields, /name="marketingConsent"/u);
+  assert.match(viewer, /id="live-display-name" name="displayName"[\s\S]{0,450}required/u);
+  assert.match(viewer, /displayName: normalizedDisplayName/u);
+  assert.match(viewer, /라이브 참여/);
+  assert.match(viewerContract, /CAPACITY_REACHED/);
+  assert.match(viewerContract, /INVITE_EXPIRED/);
   assert.match(viewer, /autoComplete="one-time-code"/);
   assert.match(viewer, /replace\(\/\\D\/gu, ""\)\.slice\(0, 6\)/);
   assert.doesNotMatch(viewer, /realtime-noel-viewer-join/);
   assert.doesNotMatch(viewer, /window\.addEventListener\("message"/);
+  assert.doesNotMatch(viewerContract, /viewerToken/u);
+  const parentMessage = viewer.match(/window\.parent\.postMessage\(\{[\s\S]*?\}, "\*"\)/u)?.[0] ?? "";
+  assert.match(parentMessage, /sessionType[\s\S]*outputMode/u);
+  assert.doesNotMatch(parentMessage, /email|displayName|company|department|jobTitle|token|ticket/iu);
 });
 
-test("host keeps captions primary and displays participant identity plus speaking activity", async () => {
-  const [dashboard, hostClient, css] = await Promise.all([
+test("viewer refresh restores from cookie-only non-sensitive context without redeeming again", async () => {
+  const [viewer, recovery, recoveryHook] = await Promise.all([
+    read("webapp/components/live/LiveViewer.tsx"),
+    read("webapp/components/live/viewer-session-recovery.ts"),
+    read("webapp/components/live/useViewerRecovery.ts"),
+  ]);
+
+  assert.match(recoveryHook, /viewerRestorePromiseRef/u,
+    "StrictMode must share one in-flight restoration and caption subscription");
+  assert.match(viewer, /fetch\(\s*`\/api\/live-sessions\/\$\{stored\.sessionId\}\/viewer-session`,\s*\{ method: "GET", cache: "no-store" \}/u);
+  assert.match(viewer, /if \(!isViewerJoinData\(result\)\)/u);
+  assert.match(viewer, /if \(result\.session\.id !== stored\.sessionId\)/u);
+  assert.match(viewer, /if \(isRestoringViewer\)[\s\S]*라이브 세션으로 돌아가는 중입니다/u,
+    "the join form must not flash while cookie restoration is unresolved");
+  assert.match(viewer, /persistSession: false/u);
+  assert.doesNotMatch(recovery, /email|viewerToken|viewerGatewayTicket|ticket|company|department|jobTitle|summaryConsent/u);
+  assert.doesNotMatch(viewer, /localStorage\.(?:setItem|getItem)\([^\n]*(?:email|displayName|company|department|jobTitle|token|ticket)/iu);
+  assert.doesNotMatch(viewer, /sessionStorage/iu);
+  assert.doesNotMatch(viewer, /interface ViewerState[\s\S]{0,160}accessToken:/u);
+});
+
+test("host keeps translations primary and displays host-only participant identity plus consent", async () => {
+  const [dashboard, hostClient, css, liveSurface] = await Promise.all([
     read("webapp/components/live/LiveHostDashboard.tsx"),
     read("webapp/components/live/live-audio-client.ts"),
     read("webapp/app/globals.css"),
+    read("webapp/components/live/quality/HostLiveSurface.tsx"),
   ]);
 
   assert.match(dashboard, /\/participants`/);
   assert.match(dashboard, /Promise\.all/);
-  assert.match(dashboard, />Live captions</);
-  assert.match(dashboard, />Participants and speaking activity</);
-  assert.match(dashboard, />Department</);
-  assert.match(dashboard, />Job title</);
-  assert.match(dashboard, /utteranceCount/);
-  assert.match(dashboard, /speakingSeconds/);
-  assert.match(dashboard, /Pause captions/);
-  assert.match(dashboard, /Resume captions/);
-  assert.match(dashboard, />Restart caption engine</);
-  assert.match(dashboard, />End session</);
+  assert.match(liveSurface, /<TranslationViewport/);
+  assert.match(liveSurface, /<CaptionEntry/);
+  assert.doesNotMatch(dashboard, /<LanguageSelector/);
+  assert.match(liveSurface, /<HostAiHealthDisclosure rows=\{aiHealthRows\}/u);
+  assert.match(liveSurface, /<TranslationToolbar/);
+  assert.match(dashboard, /t\("참여자 · \{present\}\/\{total\}", \{ present: participants\.filter\(\(participant\) => participant\.isPresent\)\.length, total: participants\.length \}\)/);
+  assert.match(dashboard, /resolveHostParticipantPresentation\(participant\)/);
+  assert.match(dashboard, />\{t\("부서"\)\}</);
+  assert.match(dashboard, />\{t\("직급"\)\}</);
+  assert.match(dashboard, />\{t\("요약 이메일"\)\}</);
+  assert.match(dashboard, /presentation\.hasSummaryConsent/);
+  assert.match(liveSurface, /자막 일시 정지/);
+  assert.match(liveSurface, /자막 계속/);
+  assert.match(dashboard, />\{t\("자막 다시 시작"\)\}</);
+  assert.match(liveSurface, />\{t\("세션 종료…"\)\}</);
   assert.match(hostClient, /type: "restart"/);
-  assert.match(hostClient, /waitForMessage\(socket, "restarted"\)/);
-  assert.match(css, /\.live-host-caption-stage/);
-  assert.match(css, /\.live-participant-table/);
+  assert.match(hostClient, /waitForStartedMessage\(socket, 5_000, "restarted"\)/);
+  assert.match(css, /\.live-host-translation-primary\s*\{[^}]*min-height:\s*60vh/s);
+  assert.match(css, /\.live-participant-list/);
+  assert.match(css, /\.live-participant-row/);
 });
 
 test("Chrome viewer passes the required normalized display name without credentials", async () => {
@@ -1059,53 +1311,28 @@ test("Chrome viewer passes the required normalized display name without credenti
   assert.match(panel, /아이디와 비밀번호 없이 이름과 인증번호로 참여합니다/);
 });
 
-test("desktop local PT output separates fixed Gemini captions from conditional audio providers", async () => {
+test("desktop local output is captions-only with no translated-audio playback lane", async () => {
   const [html, css, dashboard] = await Promise.all([
     read("public/subtitle.html"),
     read("public/subtitle.css"),
     read("public/subtitle-dashboard.js"),
   ]);
 
-  assert.match(html, /class="pt-output-group"/);
-  assert.match(html, /name="outputMode"[^>]+value="captions"[^>]+checked/);
-  assert.doesNotMatch(html, /name="outputMode"[^>]+value="audio"/);
-  assert.match(html, /aria-labelledby="pt-output-title" hidden/);
-  // The desktop PT output is captions OR interpreted audio; the mixed mode is
-  // retired. (The Live Call session mode in webapp/ still has its own values,
-  // constrained by an applied Supabase CHECK -- a separate change.)
-  assert.doesNotMatch(html, /value="captions_audio"/);
-  assert.match(html, /name="audioLanguage"/);
-  assert.match(html, /name="audioVolume"[^>]+type="range"/);
-  assert.match(html, /name="voiceProvider"[^>]+value="gemini"[^>]+checked/);
-  assert.match(html, /name="voiceProvider"[^>]+value="openai"/);
-  assert.match(html, /OpenAI Realtime/);
-  // 2026-07-25 declutter, extended by the NOVA i18n pass: every explanatory
-  // helper sentence is gone. The Gemini-fixed fact survives as a compact note
-  // (label + value), not as a sentence.
+  assert.match(html, /<input name="outputMode" type="hidden" value="captions"\s*\/?>/);
+  assert.doesNotMatch(html, /pt-output-group|pt-playback-options|audioLanguage|audioVolume|voiceProvider/);
   assert.doesNotMatch(html, /자막 엔진은 Gemini 고정이며/);
   assert.doesNotMatch(html, /pt-voice-method-help/);
-  assert.match(html, /data-i18n="output\.engineNote"[\s\S]{0,80}data-i18n="output\.engineNoteValue"/);
+  assert.match(html, /data-i18n="output\.engineNote"[\s\S]{0,80}관리자 배정/);
   assertLocalized("output.engineNote", { ko: /자막 엔진/ });
   assertLocalized("output.engineNoteValue", { ko: /Gemini 고정/ });
-  assert.match(html, /data-i18n="output\.systemDefault"/);
-  assertLocalized("output.systemDefault", { ko: /시스템 기본 출력/ });
   assert.doesNotMatch(html, /pt-output-routing-help/);
-  assert.match(css, /\.pt-output-group/);
-  assert.match(css, /\.pt-output-options/);
+  assert.doesNotMatch(css, /\.pt-output-group|\.pt-playback-options/);
   assert.match(dashboard, /outputMode: "captions"/);
-  assert.match(dashboard, /audioLanguage: "en"/);
-  assert.match(dashboard, /audioVolume: 0\.8/);
-  assert.match(dashboard, /voiceProvider: "gemini"/);
-  assert.match(dashboard, /OPENAI_REALTIME_TRANSLATION_LANGUAGES/);
-  assert.match(dashboard, /openAIInput\.disabled = !isOpenAISupported/);
-  assert.match(dashboard, /createSubtitleAudioPlayer/);
-  assert.match(dashboard, /subtitle:translated-audio/);
-  assert.match(dashboard, /subtitle:audio-control/);
-  assert.match(dashboard, /message\.targetLanguage !== state\.settings\.audioLanguage/);
-  assert.match(dashboard, /state\.settings\.voiceProvider === "openai"/);
-  assert.match(dashboard, /Gemini Live:[\s\S]*OpenAI voice/);
-  assert.match(dashboard, /"start\.audio"/);
-  assertLocalized("start.audio", { ko: /통역 음성만 시작/ });
+  assert.doesNotMatch(dashboard, /OPENAI_REALTIME_TRANSLATION_LANGUAGES/);
+  assert.doesNotMatch(dashboard, /openAIInput\.disabled|selectedVoiceProvider/);
+  assert.doesNotMatch(dashboard, /subtitle-audio-player|subtitle:translated-audio|subtitle:audio-control/);
+  assert.doesNotMatch(dashboard, /form\.elements\.(?:audioLanguage|audioVolume|voiceProvider)|\b(?:audioLanguage|audioVolume|voiceProvider)\s*:|start\.audio/);
+  assert.match(dashboard, /RETIRED_SUBTITLE_SETTING_KEYS/);
 });
 
 test("desktop Live Call draft always issues QR and code, validates local cover data, and keeps authorization inline", async () => {
@@ -1124,13 +1351,14 @@ test("desktop Live Call draft always issues QR and code, validates local cover d
   assert.match(html, /id="live-draft-cover-rules"/);
   assert.match(html, /id="live-draft-cover-status"[^>]*role="status"[^>]*aria-live="polite"/);
   assert.doesNotMatch(html, /name="liveDisplayLanguage"/);
-  assert.match(html, /data-i18n="live\.captionLanguagePolicy"/);
+  assert.doesNotMatch(html, /data-i18n="live\.captionLanguagePolicy"/);
+  assert.match(html, /id="live-draft-languages"[^>]*aria-live="polite"/);
   assert.match(html, /id="live-host-login-status"[^>]*role="status"[^>]*aria-live="polite"/);
   assert.doesNotMatch(html, /id="open-meeting-mode"|name="liveHostWorkspaceUrl"|Open Live Call/);
   assert.match(css, /\.live-draft-cover-status\.is-error/);
 
   assert.doesNotMatch(workspace, /liveDraftAccess|liveHostWorkspaceUrl|openLiveWorkspace/);
-  assert.match(workspace, /const MAX_COVER_IMAGE_BYTES = 5 \* 1024 \* 1024/);
+  assert.match(workspace, /const MAX_COVER_IMAGE_BYTES = 20 \* 1024 \* 1024/);
   assert.match(workspace, /new Set\(\["image\/jpeg", "image\/png", "image\/webp"\]\)/);
   assert.match(workspace, /await file\.arrayBuffer\(\)/);
   assert.match(workspace, /function hasValidCoverImageSignature\(bytes, contentType\)/);
@@ -1139,30 +1367,30 @@ test("desktop Live Call draft always issues QR and code, validates local cover d
   assert.match(workspace, /size: file\.size/);
   assert.match(workspace, /base64: window\.btoa\(binary\)/);
   assert.match(workspace, /coverImage: liveDraftCoverData/);
+  assert.match(html, /최대 20MB/);
+  assertLocalized("live.coverTooLarge", { en: /20MB/, ko: /20MB/ });
+  assertLocalized("live.err.COVER_UPLOAD_NETWORK_FAILED", { en: /network connection/, ko: /네트워크 연결/ });
+  assertLocalized("live.err.COVER_UPLOAD_RATE_LIMITED", { en: /Too many cover uploads/, ko: /요청이 너무 많습니다/ });
+  assertLocalized("live.err.COVER_FINALIZE_CONFLICT", { en: /Another cover was saved first/, ko: /다른 커버가 먼저 저장/ });
   assert.doesNotMatch(workspace, /liveDisplayLanguage|displayLanguage/u);
   assert.match(workspace, /startRegisteredLiveCall\(sessionId\)/);
   assert.match(workspace, /result\?\.code === "HOST_LOGIN_REQUIRED"/);
   assert.match(workspace, /t\("live\.hostLoginRequired"\)/);
-  assertLocalized("live.hostLoginRequired", { en: /Open Settings and save the host authorization/ });
+  assertLocalized("live.hostLoginRequired", { en: /Open Settings and sign in/ });
   assert.doesNotMatch(workspace, /Sign in once in the Live workspace window|login page|login screen/i);
 });
 
-test("host authorization save reports the workspace verification outcome instead of a local-only saved state", async () => {
+test("desktop account controls use the shared web sign-in and preserve explicit live start", async () => {
   const workspace = await read("public/subtitle-workspace.js");
-
-  // Start Live Call distinguishes "nothing saved" from "workspace rejected the
-  // saved credentials" so re-saving the same values is never prescribed as the fix.
   assert.match(workspace, /HOST_LOGIN_REJECTED/);
   assert.match(workspace, /t\("live\.hostLoginRejected"\)/);
-  assertLocalized("live.hostLoginRejected", { en: /rejected the saved host ID\/password/ });
-
-  // Saving verifies against the workspace and surfaces the real outcome.
-  assert.match(workspace, /result\.verified/);
-  assert.match(workspace, /HOST_LOGIN_VERIFICATION_KEYS/);
-  assert.match(workspace, /NETWORK_UNAVAILABLE/);
-  assert.match(workspace, /LOGIN_RATE_LIMITED/);
-  assert.match(workspace, /HOST_CREDENTIAL_ENCRYPTION_UNAVAILABLE/);
-
+  assertLocalized("live.hostLoginRejected", { en: /Open Settings and sign in again/ });
+  assert.match(workspace, /await bridge\.getHostSession\(\)/);
+  assert.match(workspace, /await bridge\.openHostLogin\(\)/);
+  assert.match(workspace, /await bridge\.logoutHostSession\(\)/);
+  assert.match(workspace, /settings\.hostSessionUnavailable/);
+  assert.match(workspace, /LIVE_SESSION_ACTIVE/);
+  assert.doesNotMatch(workspace, /saveLiveHostLogin|liveHostPassword|pendingLiveCallRetry|startLiveCallButton\?\.click\(\)/);
 });
 
 test("viewer captions label the host as Host and participants by their identity", async () => {
@@ -1177,13 +1405,14 @@ test("viewer captions label the host as Host and participants by their identity"
   assert.doesNotMatch(viewer, /\?\? "Presenter"/);
 });
 
-test("Stage authorization failure returns the host to Electron Settings", async () => {
+test("Stage authorization failure returns the companion to host login", async () => {
   const stage = await read("webapp/components/live/LiveStageView.tsx");
 
   assert.match(stage, /opened directly by Electron[\s\S]{0,80}as a full-screen Stage overlay/);
-  assert.match(stage, /Host authorization is required for this Stage overlay\./);
-  assert.match(stage, /Return to NOVA Settings, save Host Authorization, then start Live Call again\./);
-  assert.doesNotMatch(stage, /Sign in as the host on this browser|separate named window|host dashboard/);
+  assert.match(stage, /이 회의를 준비한 호스트 계정으로 로그인해 주세요\./);
+  assert.match(stage, /href="\/login"/);
+  assert.match(stage, /clearHostState\(\);\s*setError\("auth"\)/);
+  assert.doesNotMatch(stage, /Return to NOVA Settings, save Host Authorization/);
 });
 
 test("armed controller can explicitly end Live Call without coupling caption controls", async () => {
@@ -1206,34 +1435,20 @@ test("armed controller can explicitly end Live Call without coupling caption con
   assert.doesNotMatch(controllerJs, /sendControl\(\{ command: "(?:restart|stop)" \}\)[\s\S]{0,120}endLiveCall/);
 });
 
-test("controller is a one-row mini-player: brand/drag zone, transport, adjust, window clusters", async () => {
-  const [html, css, main] = await Promise.all([
-    read("public/subtitle-controller.html"),
-    read("public/subtitle.css"),
-    read("electron/main.js"),
-  ]);
-  // Brand zone doubles as the drag handle and shows the status line + VU bar.
-  assert.match(html, /id="controller-drag"[^>]*class="controller-drag mp-brand"/);
-  assert.match(html, /id="controller-live-call-status"[^>]*class="mp-status"[^>]*role="status"/);
-  assert.match(html, /id="controller-vu-fill"/);
-  // Transport: Restart/Stop icons + big Go-Live + elapsed timer readout.
-  assert.match(html, /mp-transport"[^>]*data-i18n-aria="controller\.captionEngine"[\s\S]{0,1200}controller-restart/);
-  assertLocalized("controller.captionEngine", { en: /Caption engine/ });
-  assert.match(html, /id="controller-go-live"[^>]*>Go-Live</);
-  assert.match(html, /id="controller-elapsed"/);
-  // Adjust + window clusters exist; language preset row stays gone.
-  assert.match(html, /mp-adjust"[^>]*data-i18n-aria="controller\.appearance"/);
-  assert.match(html, /mp-window"[^>]*data-i18n-aria="controller\.appControls"[\s\S]{0,900}controller-quit/);
-  assertLocalized("controller.appearance", { en: /Subtitle appearance/ });
-  assertLocalized("controller.appControls", { en: /App controls/ });
-  assert.doesNotMatch(html, /data-controller-languages=/);
-  assert.match(css, /\.subtitle-controller-body \.controller-cluster \{/);
-  assert.match(css, /@keyframes mp-live-pulse/);
-  // Mini-player bar: initial window height well under the old 248px; the
-  // fit-height IPC then hugs the real content height.
-  const heightMatch = main.match(/const height = (\d+);(?=[\s\S]{0,900}controllerWindow = new BrowserWindow)/u);
-  assert.ok(heightMatch, "controller window height constant not found");
-  assert.ok(Number(heightMatch[1]) <= 120, `controller window height ${heightMatch[1]} should be ≤ 120`);
+test("controller keeps four primary actions in one pill with accessible separate popovers", async () => {
+  const [html, css, controller] = await Promise.all([read("public/subtitle-controller.html"), read("public/subtitle-controller-refined.css"), read("public/subtitle-controller.js")]);
+  for (const name of ["mic", "caption", "output"]) {
+    assert.match(html, new RegExp(`data-controller-popover="controller-${name}-popover"`));
+    assert.match(html, new RegExp(`id="controller-${name}-popover"[^>]*role="dialog"`));
+  }
+  assert.match(html, /id="controller-stop"/u);
+  assert.match(html, /id="controller-end-live-call"/u);
+  assert.match(html, /id="controller-drag"/u);
+  assert.match(html, /id="controller-live-call-status"[^>]*role="status"/u);
+  assert.match(css, /controller-bar \{ display:flex/u);
+  assert.match(css, /outline:2px solid #0071e3/u);
+  assert.match(controller, /event.key === "Escape"/u);
+  assert.match(controller, /appearanceSender.flush\(\)/u);
 });
 
 test("controller window hugs its content and shows live signal + elapsed time", async () => {
@@ -1247,7 +1462,7 @@ test("controller window hugs its content and shows live signal + elapsed time", 
   assert.match(controllerJs, /fitControllerHeight/);
   assert.match(preload, /fitControllerHeight: \(height, width\) => ipcRenderer\.send\("subtitle-controller:fit-height", height, width\)/);
   assert.match(main, /ipcMain\.on\("subtitle-controller:fit-height"/);
-  assert.match(main, /Math\.min\(240, Math\.max\(64, height\)\)/);
+  assert.match(main, /Math\.min\(target\.workArea\.height - 24, Math\.max\(64, height\)\)/);
   // The console hugs its content WIDTH too. A fixed width left slack that the
   // right-hand cluster was pushed across, so the clusters no longer pin apart.
   assert.match(css, /\.caption-controller-window \{[^}]*width: max-content/u);
@@ -1260,8 +1475,82 @@ test("controller window hugs its content and shows live signal + elapsed time", 
   assert.match(controllerJs, /updateVuMeter/);
   // Elapsed timer starts from the go-live stamp exposed by get-state.
   assert.match(main, /liveStartedAt: liveCallSession\.liveStartedAt \?\? null/);
-  assert.match(main, /armedSession\.liveStartedAt = new Date\(\)\.toISOString\(\)/);
+  assert.match(main, /armedSession\.liveStartedAt = typeof currentSession\.data\.startedAt === "string"/);
   assert.match(controllerJs, /state\.liveStartedAt/);
+});
+
+test("floating controller announces operator-only translation health without overlay error copy", async () => {
+  const [html, controllerJs, css, overlay] = await Promise.all([
+    read("public/subtitle-controller.html"),
+    read("public/subtitle-controller.js"),
+    read("public/subtitle.css"),
+    read("public/subtitle-overlay.js"),
+  ]);
+
+  assert.match(html, /id="controller-live-call-status"[^>]*role="status"[^>]*aria-live="polite"[^>]*aria-atomic="true"/u);
+  assert.match(html, /id="controller-health-detail"[^>]*aria-hidden="true"/u,
+    "the one-second elapsed counter must not cause repeated screen-reader announcements");
+  assert.match(controllerJs, /function syncLiveBridgeStatus\(state\)/u);
+  assert.match(controllerJs, /TRANSLATION_EVENT_STALE_MS = 5_000/u);
+  assert.match(controllerJs, /message\.type === "subtitle:input-status"/u);
+  assert.match(controllerJs, /message\.type === "subtitle:partial" \|\| message\.type === "subtitle:committed"/u);
+  assert.match(controllerJs, /translationHealth\.socketState !== "open"/u);
+  assert.match(controllerJs, /\["connecting", "reconnecting"\]\.includes\(translationHealth\.bridgeState\)/u);
+  assert.match(controllerJs, /now - translationHealth\.lastEventAt > TRANSLATION_EVENT_STALE_MS/u);
+  assert.match(controllerJs, /window\.setInterval\(\(\) => renderTranslationHealth\(\), 1_000\)/u);
+  assert.match(controllerJs, /if \(isLiveActionStatusLocked\) return/u,
+    "polling must not overwrite an in-progress Go-Live, Host Speak, or End status");
+  assert.match(controllerJs, /goLiveButton\.setAttribute\("aria-busy", "true"\)/u);
+  assert.match(controllerJs, /goLiveButton\.removeAttribute\("aria-busy"\)/u);
+  assertLocalized("controller.health.healthy", { en: /^Translation healthy$/, ko: /^번역 정상$/ });
+  assertLocalized("controller.health.waiting", { en: /^Translation waiting$/, ko: /^번역 대기$/ });
+  assertLocalized("controller.health.recovering", { en: /^Recovering translation$/, ko: /^복구 중$/ });
+  assertLocalized("controller.health.disconnected", { en: /^Translation disconnected$/, ko: /^연결 끊김$/ });
+  assert.match(css, /\.mp-status\[data-connection-state="healthy"\][^}]*var\(--nova-status-ok\)/u);
+  assert.match(css, /\.mp-status\[data-connection-state="disconnected"\][^}]*var\(--nova-status-error\)/u);
+  assert.match(css, /\.mp-status-detail[^}]*font-variant-numeric: tabular-nums/u);
+  assert.doesNotMatch(overlay, /controller\.health|Translation healthy|번역 정상|자막 다시 시작/u,
+    "operational health belongs to the controller, never the audience overlay");
+  assert.match(css, /transition: color var\(--nova-dur-rapid\) var\(--nova-ease-out\)/u);
+  assert.match(css, /@media \(prefers-reduced-motion: reduce\)[\s\S]*--nova-dur-rapid: 1ms/u);
+});
+
+test("controller health distinguishes healthy, waiting, stale recovery, and disconnection", async () => {
+  const controllerJs = await read("public/subtitle-controller.js");
+  const healthStateSource = controllerJs.slice(
+    controllerJs.indexOf("function translationHealthState"),
+    controllerJs.indexOf("function translationHealthDetail"),
+  );
+  const evaluate = new Function(
+    "translationHealth",
+    "now",
+    "TRANSLATION_EVENT_STALE_MS",
+    "TRANSLATION_ACTIVE_CAPTION_MS",
+    `${healthStateSource}; return translationHealthState(now);`,
+  );
+  const now = 20_000;
+  const base = {
+    socketState: "open",
+    bridgeState: "connected",
+    lastEventAt: now - 1_000,
+    lastCaptionAt: now - 1_000,
+    signalSinceAt: now - 2_000,
+    lastInputStatus: "signal",
+    pipelineStatus: "listening",
+  };
+
+  assert.equal(evaluate(base, now, 5_000, 3_000), "healthy");
+  assert.equal(evaluate({ ...base, lastCaptionAt: null, signalSinceAt: now - 1_000 }, now, 5_000, 3_000), "waiting",
+    "the first signal gets a grace window instead of an immediate failure");
+  assert.equal(evaluate({ ...base, lastCaptionAt: null, signalSinceAt: now - 3_001 }, now, 5_000, 3_000), "recovering",
+    "continuous signal without any translated output becomes a recovery state");
+  assert.equal(evaluate({ ...base, lastCaptionAt: now - 3_001, signalSinceAt: now - 5_000 }, now, 5_000, 3_000), "recovering",
+    "a prior caption cannot mask a later output stall during continuous speech");
+  assert.equal(evaluate({ ...base, lastInputStatus: "silent" }, now, 5_000, 3_000), "waiting");
+  assert.equal(evaluate({ ...base, lastEventAt: now - 5_001 }, now, 5_000, 3_000), "recovering");
+  assert.equal(evaluate({ ...base, bridgeState: "reconnecting" }, now, 5_000, 3_000), "recovering");
+  assert.equal(evaluate({ ...base, socketState: "closed" }, now, 5_000, 3_000), "disconnected");
+  assert.equal(evaluate({ ...base, bridgeState: "failed" }, now, 5_000, 3_000), "disconnected");
 });
 
 test("subtitle vertical-gap control is wired controller → server → dashboard", async () => {
@@ -1273,26 +1562,249 @@ test("subtitle vertical-gap control is wired controller → server → dashboard
   assert.match(controllerJs, /command: "offset", delta: -8/);
   assert.match(controllerJs, /command: "offset", delta: 8/);
   // Server allowlists the new command so it broadcasts to overlay + dashboard.
-  assert.match(serverJs, /"stop", "restart", "font", "offset", "position", "languages", "opacity"/);
+  assert.match(serverJs, /normalizeSubtitleControllerCommand/);
   // Dashboard applies it against the persisted verticalOffset setting.
   assert.match(dashboardJs, /message\.command === "offset"/);
   assert.match(dashboardJs, /function adjustControllerVerticalOffset\(delta\)/);
   assert.match(dashboardJs, /form\.elements\.verticalOffset/);
 });
 
-test("desktop floating controller exposes audio provider only for audio output", async () => {
+test("desktop floating controller cannot switch the fixed Gemini provider", async () => {
   const [html, js] = await Promise.all([
     read("public/subtitle-controller.html"),
     read("public/subtitle-controller.js"),
   ]);
 
-  assert.match(html, /id="controller-voice-provider"[^>]+hidden/);
-  assert.match(html, /role="radiogroup"[^>]+aria-label="통역 음성 엔진"/);
-  assert.match(html, /data-controller-voice-provider="gemini"/);
-  assert.match(html, /data-controller-voice-provider="openai"/);
-  assert.match(js, /settings\.outputMode === "captions"/);
-  assert.match(js, /command: "voice-provider"/);
-  assert.match(js, /ariaChecked/);
+  assert.doesNotMatch(html, /controller-voice-provider|data-controller-voice-provider|통역 음성 엔진/);
+  assert.doesNotMatch(js, /command: "voice-provider"|data-controller-voice-provider/);
+});
+
+test("participant floor silently gates every Electron host-audio path until Host Speak reclaims it", async () => {
+  const [main, dashboard, controllerHtml, controllerJs, overlayHtml] = await Promise.all([
+    read("electron/main.js"),
+    read("public/subtitle-dashboard.js"),
+    read("public/subtitle-controller.html"),
+    read("public/subtitle-controller.js"),
+    read("public/subtitle-overlay.html"),
+  ]);
+
+  const floorHandler = main.slice(
+    main.indexOf('message.type === "floor"'),
+    main.indexOf('message.type === "error"'),
+  );
+  const floorRendererRelay = main.slice(
+    main.indexOf("function relayLiveCallFloorToRenderers"),
+    main.indexOf("// The controller polls live-call:get-state"),
+  );
+  const gatewayAudioPath = main.slice(
+    main.indexOf('ipcMain.on("live-call:audio-frame"'),
+    main.indexOf('ipcMain.handle("live-call:end"'),
+  );
+  const liveBridgeCapture = dashboard.slice(
+    dashboard.indexOf("async function startLiveCallMicCapture"),
+    dashboard.indexOf("function requestLocalSubtitlePreflight"),
+  );
+  const floorGate = dashboard.slice(
+    dashboard.indexOf("function applyLiveCallFloorGate"),
+    dashboard.indexOf("function stopLiveCallAudioBridge"),
+  );
+
+  // A participant floor is an audio boundary, not merely an overlay repaint:
+  // main must close the gateway path before relaying the event to renderers.
+  assert.match(floorHandler, /shouldBlockLiveHostAudioForFloor/u);
+  assert.match(floorHandler, /isHostAudioBlocked/u);
+  assert.ok(
+    floorHandler.search(/isHostAudioBlocked/u) < floorHandler.indexOf("relayLiveCallFloorToRenderers"),
+    "the host gate must close before any renderer can process the participant floor",
+  );
+  assert.match(floorRendererRelay, /\[dashboardWindow,\s*\.\.\.overlayWindows\.values\(\)\]/u);
+  assert.match(floorRendererRelay, /webContents\.send\("live-call:floor", message\)/u);
+  assert.doesNotMatch(floorRendererRelay, /controllerWindow/u);
+  // The gateway half is host PCM, and a participant floor closes it before any
+  // resampling. The local caption TEXT is never forwarded — the gateway
+  // translates the same audio itself for the web app.
+  assert.match(gatewayAudioPath, /if \(!bridge\.floorKnown \|\| bridge\.isHostAudioBlocked\) return;/u);
+  assert.ok(
+    gatewayAudioPath.indexOf("bridge.isHostAudioBlocked") < gatewayAudioPath.indexOf("adaptCaptionPcmForGateway"),
+    "a blocked host must not reach the resampler at all",
+  );
+  assert.doesNotMatch(main, /type: "host-caption"|relayLiveCallHostCaption|onLiveCallLocalCaption/u);
+
+  // The renderer has one Live Call capture path. The floor signal gates it
+  // before IPC, and cannot start a second local subtitle producer.
+  assert.match(dashboard, /onLiveCallFloor/u);
+  assert.match(dashboard, /applyLiveCallFloorGate/u);
+  // One capture, two sinks: the local server keeps the screen captions alive
+  // through a participant turn while main gates the gateway half.
+  assert.match(dashboard, /forwardLiveCallHostAudioPacket/u);
+  assert.match(dashboard, /type: "subtitle:audio"/u);
+  assert.match(dashboard, /sendLiveCallAudioFrame/u);
+  assert.doesNotMatch(floorGate, /startLocalLiveCallFallback|restoreGatewayCaptionProducer|requestSubtitleStart|subtitle:audio/u);
+  assert.doesNotMatch(dashboard, /async function startLocalLiveCallFallback|async function restoreGatewayCaptionProducer/u);
+
+  // No new floor UI competes with captions. The existing explicit Host Speak
+  // button remains the sole host override and the overlay stays caption-only.
+  assert.match(controllerHtml, /id="controller-host-speak"/u);
+  assert.match(controllerJs, /window\.realtimeNoelDesktop\.hostSpeak\(\)/u);
+  assert.doesNotMatch(controllerHtml, /participant-floor|floor-warning|floor-modal/u);
+  assert.doesNotMatch(overlayHtml, /button|participant-floor|floor-warning/u);
+});
+
+test("explicit caption stop and Live Call end clear every visible subtitle surface without erasing records", async () => {
+  const [main, dashboard, overlay, server] = await Promise.all([
+    read("electron/main.js"),
+    read("public/subtitle-dashboard.js"),
+    read("public/subtitle-overlay.js"),
+    read("src/server.js"),
+  ]);
+
+  const stopSubtitles = dashboard.slice(
+    dashboard.indexOf("async function stopSubtitles"),
+    dashboard.indexOf("// Rebuild the running session's translation channels"),
+  );
+  const clearActiveSurface = dashboard.slice(
+    dashboard.indexOf("function clearActiveSubtitleSurface"),
+    dashboard.indexOf("async function reconnectLiveCallTranslation"),
+  );
+  const liveFloorListener = dashboard.slice(
+    dashboard.indexOf("function applyLiveCallFloorGate"),
+    dashboard.indexOf("function stopLiveCallAudioBridge"),
+  );
+  const rendererRelay = main.slice(
+    main.indexOf("function relayLiveCallFloorToRenderers"),
+    main.indexOf("// The controller polls live-call:get-state"),
+  );
+  const endLiveCall = main.slice(
+    main.indexOf('ipcMain.handle("live-call:end"'),
+    main.indexOf('ipcMain.handle("subtitle-overlay:get-enabled"'),
+  );
+  const serverStop = server.slice(
+    server.indexOf('if (message.type === "subtitle:stop")'),
+    server.indexOf("await transcriptRecordTail"),
+  );
+  const overlayTerminalListener = overlay.slice(
+    overlay.indexOf("function handleLiveCallFloorBoundary"),
+    overlay.indexOf("// Re-render every lane in a zone"),
+  );
+  const clearOverlay = overlay.slice(
+    overlay.indexOf("function clearSubtitle()"),
+    overlay.indexOf("function clearSubtitleLane"),
+  );
+  const clearSpeakerMetadata = overlay.slice(
+    overlay.indexOf("function clearLiveLaneRuntime"),
+    overlay.indexOf("// When the spoken (source) language switches"),
+  );
+
+  // Stop is a visible terminal boundary, regardless of whether the server is
+  // available to echo an idle status. It clears both committed and partial
+  // preview text but deliberately leaves the Records model untouched.
+  assert.match(stopSubtitles, /clearActiveSubtitleSurface\(\)/u);
+  assert.match(clearActiveSurface, /previewStatusTimer/u);
+  assert.match(clearActiveSurface, /translation-line[^\n]*\.textContent = ""/u);
+  assert.match(clearActiveSurface, /source-line[^\n]*\.textContent = ""/u);
+  assert.match(clearActiveSurface, /classList\.remove\("partial"\)/u);
+  assert.doesNotMatch(clearActiveSurface, /state\.history|renderHistory|sessionRecords/u);
+
+  // Gateway-backed Live Calls keep the local realtime manager cold, so the
+  // accepted stop itself must still publish the same idle boundary used by
+  // Caption-only. That gives every overlay one shared terminal clear path.
+  assert.match(serverStop, /broadcastSubtitleMessage\(\{\s*type: "subtitle:status",\s*status: "idle"/u);
+  assert.match(dashboard, /message\.type === "subtitle:status"[\s\S]{0,800}message\.status === "idle"[\s\S]{0,200}clearActiveSubtitleSurface\(\)/u);
+
+  // Live End cannot wait for the dashboard's polling interval. Main sends an
+  // exact-session terminal signal through the existing floor channel; the
+  // dashboard stops its caption session and the overlay clears immediately.
+  assert.match(endLiveCall, /type: "live-call-ended"/u);
+  assert.match(endLiveCall, /relayLiveCallFloorToRenderers/u);
+  assert.match(rendererRelay, /webContents\.send\("live-call:floor", message\)/u);
+  assert.match(liveFloorListener, /floor\?\.type === "live-call-ended"/u);
+  assert.match(liveFloorListener, /floor\.sessionId/u);
+  assert.match(liveFloorListener, /activeLiveFloorSessionId/u);
+  assert.match(liveFloorListener, /stopSubtitles\(\)/u);
+  assert.match(overlayTerminalListener, /floor\?\.type === "live-call-ended"/u);
+  assert.match(overlayTerminalListener, /floor\.sessionId !== activeLiveCallSessionId/u);
+  assert.match(overlayTerminalListener, /clearSubtitle\(\)/u);
+
+  // A full overlay clear also clears the Live speaker row; hiding text alone
+  // would leave stale accessibility/metadata state behind.
+  assert.match(clearOverlay, /clearLiveLaneRuntime\(lane\)/u);
+  assert.match(clearSpeakerMetadata, /speakerLabel\.hidden = true/u);
+  assert.match(clearSpeakerMetadata, /speakerLabel\.textContent = ""/u);
+
+  // Reconnect is not termination. Existing captions stay visible while the
+  // transport recovers instead of flashing an empty overlay.
+  const reconnect = dashboard.slice(
+    dashboard.indexOf("async function recoverLiveCaptionSocket"),
+    dashboard.indexOf("function requestSubtitleStart"),
+  );
+  assert.doesNotMatch(reconnect, /clearActiveSubtitleSurface|live-call-ended|stopSubtitles/u);
+});
+
+test("the selected desktop overlay recovers Live Call captions from one canonical visible timeline", async () => {
+  const [main, overlay, channels, css] = await Promise.all([
+    read("electron/main.js"),
+    read("public/subtitle-overlay.js"),
+    read("src/subtitle-channels.js"),
+    read("public/subtitle.css"),
+  ]);
+
+  const gatewayCaptionHandler = main.slice(
+    main.indexOf("bridge.captionRelay = createLiveCaptionIpcRelay"),
+    main.indexOf('socket.on("open"'),
+  );
+  const snapshotHandler = overlay.slice(
+    overlay.indexOf('if (message.type === "subtitle:snapshot")'),
+    overlay.indexOf("// The server already filters subscribed channels"),
+  );
+
+  // Gateway captions enter the dashboard once and then the local subtitle hub
+  // fans out one ordered stream. The selected overlay never gets a second raw
+  // Gateway path that could disagree with the web transcript.
+  assert.match(gatewayCaptionHandler, /dashboardWindow\.webContents\.send\("live-call:caption", caption\)/u);
+  assert.doesNotMatch(gatewayCaptionHandler, /overlayWindows|eachOverlayWindow/u);
+
+  // A connected overlay retains a short roll-up (N + N+1). Therefore a newly
+  // selected or recovered display cannot receive only the latest event (N+1):
+  // the snapshot must carry the same bounded, seq-ordered visible Live Call
+  // timeline and the renderer must replace its Live model from that snapshot.
+  assert.match(channels, /LIVE_CALL_DISPLAY_HISTORY_LIMIT/u);
+  assert.match(channels, /liveCallDisplayTimeline/u);
+  assert.match(channels, /source === "live-call"/u);
+  assert.match(channels, /sort\(\(left, right\) => left\.seq - right\.seq\)/u);
+  assert.match(snapshotHandler, /replaceLiveCallSubtitleSnapshot\(message\)/u);
+
+  // Live Call direction time is stamped once in the canonical hub so selecting
+  // another display cannot re-evaluate the same language switch differently.
+  // Caption-only keeps its existing local timing fallback and visual behaviour.
+  assert.match(channels, /now = Date\.now/u);
+  assert.match(channels, /displayTimestamp: now\(\)/u);
+  const directionGate = overlay.slice(
+    overlay.indexOf("function acceptDirection"),
+    overlay.indexOf("// ── Live Call speaker identity"),
+  );
+  assert.match(directionGate, /message\.source === "live-call"/u);
+  assert.match(directionGate, /message\.displayTimestamp/u);
+  assert.match(directionGate, /Date\.now\(\)/u);
+
+  // This is a state-consistency fix only. The overlay remains caption-only and
+  // Caption-only keeps its existing line budget and styling path.
+  assert.match(overlay, /lane\.isLiveCall \? Math\.min\(3, Math\.max\(2, sharedLimit\)\) : sharedLimit/u);
+  assert.match(overlay, /setProperty\("--subtitle-max-width", `\$\{settings\.maxWidth\}px`\)/u);
+  assert.match(css, /\.subtitle-box\s*\{[^}]*88vw/su);
+});
+
+test("floating controller selects caption screens individually with an internal controller location", async () => {
+  const [html, controller, preload, main, relay] = await Promise.all([read("public/subtitle-controller.html"), read("public/subtitle-controller.js"), read("electron/preload.js"), read("electron/main.js"), read("src/live-caption-ipc-relay.js")]);
+  assert.match(html, /id="controller-display-options"/u);
+  assert.match(html, /id="controller-display-location"/u);
+  assert.match(controller, /input.type = "checkbox"/u);
+  assert.match(controller, /selectOverlayDisplays\(ids\)/u);
+  assert.doesNotMatch(controller, /\.innerHTML\s*=/u);
+  assert.match(preload, /subtitle-overlay:select-displays/u);
+  assert.match(main, /overlayDisplayIds: displayIds/u);
+  assert.match(main, /resolveControllerDisplay/u);
+  assert.match(relay, /display.internal === true/u);
+  assert.match(controller, /fitControllerHeight\(height, width\)/u);
 });
 
 // ---- Meeting feed rendering cost over a multi-hour call (2026-07-25) ----
@@ -1323,20 +1835,14 @@ test("meeting turn cards are memoised on identity-stable turns", async () => {
   // index in the parent; passing the global counters into each card would
   // change a prop on all of them and defeat the memo.
   assert.match(feed, /recentFromIndex=\{turnRecentFrom\[turnIndex\]\}/u);
-  assert.match(feed, /textIndex >= recentFromIndex/u);
+  assert.match(feed, /captionIndex >= recentFromIndex/u);
   // The card now takes only primitives and identity-stable objects — no
   // callback prop at all — which is the strongest possible form of the
   // stability the fold's useCallback used to provide.
   assert.doesNotMatch(feed, /onToggle/u);
-  // pendingText is a string, so the card still takes only primitives and
-  // identity-stable objects — no callback prop — and memo can bail out on every
-  // paragraph except the newest one.
-  assert.match(feed, /const MeetingTurnCard = memo\(function MeetingTurnCard\(\{ turn, recentFromIndex, pendingText = "" \}/u);
-
-  // Scanning back for the in-progress line beats filtering thousands of
-  // captions on every streaming update.
-  assert.doesNotMatch(feed, /captions\.filter/u);
-  assert.match(feed, /for \(let index = captions\.length - 1; index >= 0; index -= 1\)/u);
+  assert.match(feed, /const MeetingTurnCard = memo\(function MeetingTurnCard\(\{ turn, recentFromIndex \}/u);
+  assert.match(feed, /turn\.captions\.some\(\(caption\) => !caption\.isFinal\)/u);
+  assert.doesNotMatch(feed, /pendingText|livePartial/u);
 });
 
 test("scroll pinning keeps its forced layout off the per-caption path", async () => {
@@ -1360,27 +1866,32 @@ test("scroll pinning keeps its forced layout off the per-caption path", async ()
   assert.match(feed, /const scrollToLatest = useCallback[\s\S]{0,240}feed\.scrollTop = feed\.scrollHeight/u);
 });
 
-test("meeting feed animations are compositor-only and respect reduced motion", async () => {
+test("streaming meeting captions do not replay entry animations", async () => {
   const css = await read("webapp/app/globals.css");
 
-  // Nothing in the feed may animate a layout property; height/top/margin/width
-  // in a keyframe block would relayout the whole record every frame.
-  for (const name of ["live-turn-in", "live-audio-bar", "live-overlay-in"]) {
-    const block = css.match(new RegExp(`@keyframes ${name} \\{[\\s\\S]*?\\n?\\}\\s*\\n`, "u"));
-    assert.ok(block, `@keyframes ${name} must stay present`);
-    assert.doesNotMatch(block[0], /(?:^|[;{\s])(?:height|width|top|left|bottom|right|margin|padding|font-size)\s*:/u);
-    assert.match(block[0], /transform|opacity/u);
-  }
-
-  // Reduced motion has to cover the paragraph entry animation, not only the
-  // fold chevron: the entry animation is the one that fires on every new turn.
-  const reduced = css.match(/@media \(prefers-reduced-motion: reduce\) \{\s*\n\s*\.live-turn-card \{[\s\S]*?\n\}/u);
-  assert.ok(reduced, "the feed needs a reduced-motion block");
-  assert.match(reduced[0], /\.live-turn-card \{ animation: none; \}/u);
+  assert.doesNotMatch(css, /@keyframes live-turn-in|animation:\s*live-turn-in/u);
+  assert.doesNotMatch(css, /@keyframes live-overlay-in|live-speaker-change-overlay/u);
 
   // will-change measured no benefit here (959 vs 960 frames over 8s, worse p95)
   // and hundreds of permanently promoted cards is a compositor-memory leak, so
   // the feed must not declare it.
   const feedCss = css.slice(css.indexOf("/* Earnings-call style meeting feed */"), css.indexOf("/* Speaking-floor bar */"));
   assert.doesNotMatch(feedCss, /will-change/u);
+
+  // Streaming caption text can update many times a second. Animating its
+  // contrast on every partial/final transition makes the words look unstable
+  // and compounds compositor work over a two-hour session.
+  assert.match(css, /\.live-turn-card p \.live-turn-text \{ opacity: \.42; transition: none; \}/u);
+});
+
+
+test("controller distinguishes an armed waiting room from active live media", async () => {
+  const source = await read("public/subtitle-controller.js");
+  const assignment = source.match(/goLiveButton.dataset.i18n = ([^;]+);/u)?.[1];
+  assert.ok(assignment);
+  const label = new Function("state", `return (${assignment});`);
+  assert.equal(label({ live: true, mediaWaiting: true }), "controller.waitingForParticipants");
+  assert.equal(label({ live: true, mediaWaiting: false }), "controller.live");
+  assert.equal(label({ live: false, mediaWaiting: true }), "controller.goLive");
+  assertLocalized("controller.waitingForParticipants", { en: /^Waiting for participants$/, ko: /^참여자를 기다리고 있어요$/ });
 });

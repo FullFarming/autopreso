@@ -156,10 +156,70 @@ test("connection limiter enforces total, per-client, and attempt-token limits wi
   releaseB();
 });
 
+test("default connection limits admit a host, 200 enterprise-NAT viewers, and reconnect headroom after grant promotion", () => {
+  const limiter = new GatewayConnectionLimiter();
+  const releases = [];
+  const host = limiter.acquire("shared-enterprise-ip");
+  assert.equal(typeof host, "function");
+  releases.push(host);
+  for (let index = 0; index < 200; index += 1) {
+    const release = limiter.acquire("shared-enterprise-ip");
+    assert.equal(typeof release, "function", `viewer ${index + 1}`);
+    assert.equal(release.promote(index.toString(16).padStart(64, "0")), true);
+    releases.push(release);
+  }
+  const reconnect = limiter.acquire("shared-enterprise-ip");
+  assert.equal(typeof reconnect, "function");
+  assert.equal(reconnect.promote("0".repeat(64)), true);
+  releases.push(reconnect);
+  const duplicate = limiter.acquire("shared-enterprise-ip");
+  assert.equal(typeof duplicate, "function");
+  assert.equal(duplicate.promote("0".repeat(64)), false, "one grant gets only one reconnect overlap");
+  duplicate();
+  releases.forEach((release) => release());
+});
+
+test("default connection limiter preserves a hard 256-socket pre-authentication ceiling", () => {
+  const limiter = new GatewayConnectionLimiter();
+  const releases = Array.from({ length: 256 }, (_, index) => limiter.acquire(`client-${index}`));
+  assert.equal(releases.every((release) => typeof release === "function"), true);
+  assert.equal(limiter.acquire("client-overflow"), null);
+  releases.forEach((release) => release());
+});
+
+test("one unauthenticated IP remains bounded below the global socket ceiling", () => {
+  const limiter = new GatewayConnectionLimiter();
+  const releases = Array.from({ length: 224 }, () => limiter.acquire("attacker-ip"));
+  assert.equal(releases.every((release) => typeof release === "function"), true);
+  assert.equal(limiter.acquire("attacker-ip"), null);
+  releases.forEach((release) => release());
+});
+
 test("metrics reject injected names and non-finite values", () => {
   const metrics = new GatewayMetrics();
   metrics.increment("connections_total");
   assert.throws(() => metrics.increment("bad\nmetric"), /INVALID_METRIC/u);
   assert.throws(() => metrics.set("host_sessions", Number.POSITIVE_INFINITY), /INVALID_METRIC/u);
   assert.equal(metrics.render(), "realtime_noel_connections_total 1\n");
+});
+
+test("browser-origin WEB HOST upgrades are a supported production path (contract)", () => {
+  // The webapp host dashboard connects as HOST from the browser: the upgrade
+  // carries the webapp Origin and NO bearer header (browsers cannot set one).
+  // Tightening this path to require the desktop-main marker would silently
+  // kill the shipped web host (live-audio-client.ts) — this test pins it.
+  const policy = readGatewaySecurityPolicy({
+    NODE_ENV: "production",
+    LIVE_GATEWAY_ALLOWED_ORIGINS: "https://portal.example.com",
+    LIVE_GATEWAY_METRICS_TOKEN: "m".repeat(32),
+  });
+  const dependencies = { gatewaySecret: "gateway-secret", viewerSecret: "viewer-secret" };
+  assert.equal(
+    isAllowedWebSocketUpgrade(request({ origin: "https://portal.example.com" }), policy, dependencies),
+    true,
+    "an allowlisted browser origin upgrades without desktop-main headers - HOST auth happens post-upgrade",
+  );
+  // The trusted non-browser lane stays independent: no Origin + no marker is
+  // still rejected, so the web-host contract does not loosen desktop rules.
+  assert.equal(isAllowedWebSocketUpgrade(request({}), policy, dependencies), false);
 });

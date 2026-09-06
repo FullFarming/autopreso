@@ -2,10 +2,25 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  buildParticipantEntryUrl,
   buildViewerSurfaceUrl,
   getViewerSurfaceRedirect,
   isIpadUserAgent,
 } from "./viewer-surface-routing";
+
+test("participant entry has a fixed local destination and preserves only one language selection", () => {
+  assert.equal(buildParticipantEntryUrl({}), "/watch");
+  assert.equal(buildParticipantEntryUrl({ language: "ko" }), "/watch?language=ko");
+  assert.equal(buildParticipantEntryUrl({ language: ["ko", "en"] }), "/watch");
+  assert.equal(buildParticipantEntryUrl({ next: "https://evil.test", redirect: "//evil.test", invite: "private-token" }), "/watch");
+  const maliciousLanguage = "//evil.test/#invite=secret&next=/admin";
+  const destination = new URL(buildParticipantEntryUrl({ language: maliciousLanguage }), "https://nova.test");
+  assert.equal(destination.origin, "https://nova.test");
+  assert.equal(destination.pathname, "/watch");
+  assert.equal(destination.searchParams.get("language"), maliciousLanguage);
+  assert.equal(destination.hash, "");
+  assert.equal(destination.searchParams.has("next"), false);
+});
 
 const IPHONE_USER_AGENT = "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 Mobile/15E148";
 const IPAD_USER_AGENT = "Mozilla/5.0 (iPad; CPU OS 18_0 like Mac OS X) AppleWebKit/605.1.15 Mobile/15E148";

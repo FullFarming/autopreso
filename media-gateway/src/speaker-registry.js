@@ -17,7 +17,13 @@ export class SpeakerRemapError extends Error {
 export class SpeakerRegistry {
   #byProviderLabel = new Map();
 
-  constructor({ sessionType, outputMode, mode, voiceOutputMode, now = Date.now }) {
+  constructor({
+    sessionType = undefined,
+    outputMode = undefined,
+    mode = undefined,
+    voiceOutputMode = undefined,
+    now = Date.now,
+  } = {}) {
     const settings = normalizeSpeakerSettings({ sessionType, outputMode, mode, voiceOutputMode });
     this.sessionType = settings.sessionType;
     this.outputMode = settings.outputMode;
@@ -99,7 +105,12 @@ function hasAudioOutput(outputMode) {
   return outputMode === "captions_audio" || outputMode === "audio";
 }
 
-function normalizeSpeakerSettings({ sessionType, outputMode, mode, voiceOutputMode }) {
+function normalizeSpeakerSettings({
+  sessionType = undefined,
+  outputMode = undefined,
+  mode = undefined,
+  voiceOutputMode = undefined,
+} = {}) {
   const normalizedSessionType = sessionType ?? (mode === "presentation" ? "presentation" : "meeting");
   const normalizedOutputMode = outputMode
     ?? (mode === "townhall" || voiceOutputMode === "fixed_voice" || voiceOutputMode === "auto_voice" ? "audio" : "captions");

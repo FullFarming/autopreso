@@ -34,6 +34,291 @@ project. The core sequence is:
    identity fields through the v3 RPC overloads. Valid utterance start/end
    pairs also accumulate per-participant speaking seconds for recap analytics;
    negative or longer-than-one-hour segments are ignored.
+9. `202609020001_live_summary_generic_failure_retry.sql` lets a generic
+   summary failure be retried, reports a session with no speech as `empty`,
+   and adds the host-only summary `reset` RPC (⑥).
+10. `202609020002_auth_profiles_desktop_codes.sql` makes Supabase Auth the host
+    identity provider: `profiles` (approval `status`, `role`, and the `host_id`
+    string the `rnw_session` cookie carries), append-only `profile_events`,
+    one-shot `desktop_login_codes`, RLS, and the service-role RPCs
+    `upsert_profile_on_login_v1`, `read_profile_by_host_id_v1`,
+    `issue_desktop_login_code_v1`, and `consume_desktop_login_code_v1`. See
+    "Authentication 설정" below.
+11. `202609020003_console_rpcs.sql` adds the admin console tables
+    `engine_defaults` (no longer decides anything since D1, kept for history)
+    and `console_settings` plus the admin-only RPCs for signup approval, roles,
+    session aggregates, and the legacy password-login switch
+    (`set_legacy_password_login_v1`). It depends on `profiles` from the
+    previous migration.
+12. `202609020004_live_session_engine_admin.sql` adds
+    `set_live_session_engine_admin_v1` (replaces a `preparing`/`live`
+    session's `event_metadata.modelPreferences.engine` and appends an
+    `engineHistory` entry with `reason: 'admin'`; history is capped at 8
+    entries and trimmed oldest-first while the metadata body exceeds 3800
+    bytes) and `list_live_session_ids_admin_v1`. Neither writes
+    `profile_events`.
+13. `202609020005_console_deploy_audit.sql` adds `record_console_deploy_v1`,
+    the per-change audit row in `profile_events.engine_defaults` (now written
+    per user assignment change with the target profile and revision).
+14. `202609050001_user_engine_access_renewal.sql` adds
+    `profiles.voice_provider` (`soniox` | `gemini`, default `soniox`) and
+    `voice_provider_revision`, `set_profile_voice_provider_v1`,
+    `read_host_voice_assignment_v1`, `list_profiles_admin_v2`, and the
+    host/viewer access-renewal RPCs (`renew_live_session_access_v1`,
+    `renew_live_viewer_access_v1`). Existing profiles become Soniox revision 1;
+    running sessions are not rewritten. **Depends on `202609020002`–`0005`**
+    (`profiles`, `profile_events`, the console guard, the admin session RPC),
+    so those five must be applied first.
+15. `202609050002_managed_caption_sessions.sql` adds `managed_caption_sessions`
+    for the server-issued local-caption credentials (Soniox temporary keys /
+    Gemini short-lived tokens): register, renew (24 h grace past
+    `access_expires_at`, then `CAPTION_SESSION_EXPIRED`), stop. No transcript
+    text is stored.
+16. `202609050003_live_speaker_roster.sql` adds the host speaker roster:
+    `live_speaker_rosters`, immutable `live_speaker_profile_versions` and
+    `live_speaker_photos`, with revision-guarded replace/ack RPCs.
+17. `202609050004_speaker_profile_history.sql` adds nullable `speaker_profile` /
+    `speaker_attribution` to source and caption rows and the v4 source RPCs
+    that pin the identity captured at the audio boundary. Existing rows stay
+    NULL.
+18. `202609050005_regrant_session_engine_admin.sql` (decision D1) re-grants
+    `set_live_session_engine_admin_v1` to `service_role` (0001 had revoked it)
+    and adds `set_live_session_engine_admin_v2` (also pins
+    `modelPreferences.assignmentRevision`), `list_live_session_ids_for_host_admin_v1`,
+    and `set_profile_voice_provider_v2` (returns the profile identity, logs
+    `effective = 'immediate'`). Must follow `202609050001`.
+
+`202609050003` and `202609050004` are idempotent (`if not exists` /
+`create or replace` / do-block-guarded renames) and the PGlite tests apply each
+twice; `202609050005` is additive and re-runnable. Order is load-bearing:
+`202609020002`–`202609020005` before `202609050001`, and `202609050001` before
+`202609050005`. Never run `bootstrap-new-project.sql` against an existing
+production database.
+
+## Deployment region policy and current audit
+
+The accepted primary deployment regions for live customer data are:
+
+- preferred: Supabase Northeast Asia (Seoul), AWS `ap-northeast-2`;
+- accepted alternative: Supabase Southeast Asia (Singapore), AWS
+  `ap-southeast-1`.
+
+Use a **specific** region when creating a project. Do not rely on the general
+`APAC` region if an exact residency location is required. Provider region codes
+are not interchangeable: Supabase Seoul is `ap-northeast-2`, Google Cloud Run
+Seoul is `asia-northeast3`, and Vercel Seoul is `icn1`.
+
+Read-only audit on 2026-08-28:
+
+| Component | Observed location | Status |
+| --- | --- | --- |
+| Production Cloud Run gateway | Seoul, `asia-northeast3` | accepted |
+| Vercel Functions | Seoul, `icn1` | accepted; repository and dashboard override agree |
+| Repository-linked Supabase project | Seoul, `ap-northeast-2` | accepted, but this alone does not prove it is the production target |
+| Dashboard project named `Realtime noel` | Sydney, `ap-southeast-2` | not accepted by this policy |
+| Gemini Developer API | global `generativelanguage.googleapis.com` endpoint | not region-pinned; no Seoul/Singapore residency guarantee |
+
+The repository link, local environment, Vercel production secrets, Cloud Run
+secret references, and the Supabase project receiving production requests must
+all identify the same project before any migration or schema push. Do not infer
+that relationship from a dashboard project name. The current repository link
+points at the Seoul project, while the separate Sydney project shows recent
+requests and a later migration. Treat that mismatch as a cutover blocker until
+the exact production project is reconciled without printing secret values.
+
+There is currently no configured Cloud Speech-to-Text regional resource in the
+runtime. If Cloud Speech V2 is introduced, create the recognizer and client
+endpoint in an approved region and verify model/language availability there.
+Moving Cloud Run or Supabase does not regionalize Gemini Developer API traffic.
+A strict in-region AI-processing requirement needs a separately approved Vertex
+AI regional design and per-model availability check.
+
+## Supabase region changes
+
+A hosted Supabase project is bound to its selected region at the infrastructure
+level. Its region cannot be changed in place, and `supabase link` only changes
+the CLI target; it does not move data. To move from Sydney to Seoul or
+Singapore, create a new project in the selected specific region and migrate to
+it.
+
+Do not use **Restore to a New Project** as a cross-region shortcut. Supabase's
+physical-backup clone feature deliberately creates the clone in the same region
+as the source. For a cross-region move, use a logical dump/restore and migrate
+non-database resources separately.
+
+Official references:
+
+- region change: <https://supabase.com/docs/guides/troubleshooting/change-project-region-eWJo5Z>
+- available regions: <https://supabase.com/docs/guides/platform/regions>
+- project-to-project migration: <https://supabase.com/docs/guides/platform/migrating-within-supabase>
+- CLI backup and restore: <https://supabase.com/docs/guides/platform/migrating-within-supabase/backup-restore>
+- physical-backup clone limitations: <https://supabase.com/docs/guides/platform/clone-project>
+- Auth user migration: <https://supabase.com/docs/guides/troubleshooting/migrating-auth-users-between-projects>
+- Edge Function regional invocation: <https://supabase.com/docs/guides/functions/regional-invocation>
+
+## Approved cross-region migration runbook
+
+Do not run this procedure during a live event. The old project and the new
+project must never accept production writes at the same time unless an approved
+dual-write and reconciliation design exists.
+
+### 1. Reconcile the source and destination
+
+Record, without copying keys into logs or documentation:
+
+- the source project ref, name, region, plan, Postgres version, and compute size;
+- the target project ref and exact Seoul or Singapore region;
+- migration history from `supabase migration list --linked`;
+- database size, row counts, Auth user count, Storage object count and bytes;
+- enabled extensions, Realtime publications, Database Webhooks, cron jobs,
+  Edge Functions, Auth providers, redirect URLs, email templates, and secrets;
+- the Supabase ref used by Vercel Production and each Cloud Run revision.
+
+The source project for a production migration is the project actually receiving
+production reads and writes, not automatically the project currently stored in
+`supabase/.temp/project-ref`.
+
+### 2. Create and prepare the target project
+
+Create a new Supabase project in one exact region:
+
+```text
+Preferred: Northeast Asia (Seoul), ap-northeast-2
+Alternative: Southeast Asia (Singapore), ap-southeast-1
+```
+
+Before restore, enable the required extensions and Database Webhooks. Keep the
+target application credentials out of the repository and configure them only in
+approved secret stores. Do not enable client traffic yet.
+
+### 3. Freeze and back up the source
+
+1. Block new live-session creation and wait for active sessions to finish.
+2. Put the application into maintenance/read-only mode.
+3. Take a final logical dump using securely supplied source and target database
+   URLs. Do not place database passwords in committed scripts or shell history.
+4. Preserve roles, schema, data, and `supabase_migrations` history.
+
+Supabase's official logical backup sequence is:
+
+```sh
+supabase db dump --db-url "$OLD_DB_URL" -f roles.sql --role-only
+supabase db dump --db-url "$OLD_DB_URL" -f schema.sql
+supabase db dump --db-url "$OLD_DB_URL" -f data.sql --use-copy --data-only \
+  -x "storage.buckets_vectors" -x "storage.vector_indexes"
+
+supabase db dump --db-url "$OLD_DB_URL" -f history_schema.sql \
+  --schema supabase_migrations
+supabase db dump --db-url "$OLD_DB_URL" -f history_data.sql \
+  --use-copy --data-only --schema supabase_migrations
+```
+
+Restore with a current PostgreSQL client and fail on the first error:
+
+```sh
+psql --single-transaction --variable ON_ERROR_STOP=1 \
+  --file roles.sql \
+  --file schema.sql \
+  --command 'SET session_replication_role = replica' \
+  --file data.sql \
+  --file history_schema.sql \
+  --file history_data.sql \
+  --dbname "$NEW_DB_URL"
+```
+
+Follow the current official guide if Supabase changes this command sequence.
+Never execute a repository migration manually on top of an already restored
+copy of the same migration.
+
+### 4. Recreate resources that a database restore does not complete
+
+A project database dump is not a full hosted-project clone. Recreate and verify:
+
+- Auth providers, redirect URLs, email/SMS settings, templates, CAPTCHA, and
+  API keys;
+- Realtime publications and Realtime project settings;
+- Edge Functions, their secrets, and any explicitly selected invocation region;
+- Database extensions, Webhooks, network restrictions, read replicas, and log
+  drains;
+- scheduled cleanup, including `cleanup_expired_live_state()` and
+  `verify_live_cleanup_schedule()`;
+- Storage objects and bucket configuration.
+
+The database restore can include Auth users and password hashes, but Auth
+settings and keys still require manual configuration. Decide explicitly whether
+to preserve signing-key continuity or force users to sign in again. A new JWT
+secret invalidates existing sessions. Never copy signing secrets into this file.
+
+The private `live-covers` bucket must remain private, preserve its 20 MiB limit
+and JPEG/PNG/WebP MIME allowlist, and have every object copied separately.
+Database rows in the `storage` schema are not proof that the underlying object
+bytes were migrated. Compare source and target object count, path, size, and a
+sample of content hashes.
+
+### 5. Reconcile migration history before any push
+
+Link the target only after recording the previous link and receiving approval:
+
+```sh
+supabase link --project-ref <new-development-or-target-project-ref>
+supabase migration list --linked
+supabase db push --linked --dry-run
+```
+
+For a full logical restore, the expected dry run is empty after migration
+history is restored. If it is not empty, stop and reconcile missing or divergent
+versions. Do not repair history or run additive SQL until the mismatch is
+explained and approved.
+
+### 6. Validate the target before cutover
+
+In addition to the schema checks below, verify:
+
+- expected table and critical row counts, Auth user count, and Storage object
+  count/bytes;
+- RLS, grants, service-role-only RPCs, and direct-client denial;
+- Realtime publication membership and a full subscribe/unsubscribe exercise;
+- Auth sign-in, anonymous viewer admission, token refresh, and redirect URLs;
+- signed upload, signed read, move, and delete for `live-covers`;
+- cleanup cron and retention behavior;
+- one complete host/viewer session, duplicate join, revoke, expiry, reconnect,
+  stop, recap, and cleanup flow;
+- a 200-viewer staging test without creating provider sessions per viewer.
+
+### 7. Cut over as one approved change
+
+Update all of the following atomically and redeploy before removing maintenance
+mode:
+
+- Vercel Production and applicable Preview values:
+  `NEXT_PUBLIC_SUPABASE_URL`,
+  `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY`,
+  temporary `NEXT_PUBLIC_SUPABASE_ANON_KEY` fallback,
+  `SUPABASE_URL`, `SUPABASE_SECRET_KEY`, and
+  `LIVE_ALLOWED_SUPABASE_REF`;
+- corresponding Cloud Run Supabase URL/ref and Secret Manager references;
+- Auth site URL and redirect allowlist;
+- any provider webhooks or external callback URLs tied to the old project.
+
+A Vercel deployment is required because `NEXT_PUBLIC_*` values are embedded at
+build time. A Cloud Run environment or secret-reference change creates a new
+revision. Both are remote production mutations and require explicit approval of
+the exact project, region, service, revision, traffic target, and rollback
+point.
+
+### 8. Roll back safely
+
+Keep the old project intact and read-only through the observation window. If the
+new project has accepted no production writes, rollback may switch all
+environments to the old project and redeploy. Once the new project accepts
+writes, rollback requires a reverse delta migration or explicit reconciliation;
+it is not an environment-variable-only operation.
+
+Do not delete the Sydney project, rotate away its only recovery credentials, or
+run destructive down migrations until the Seoul/Singapore target has passed the
+observation window and backup restore has been tested.
+
+## Schema migration apply procedure
 
 Before an approved apply, use the linked-project migration history and dry run:
 
@@ -60,7 +345,7 @@ Then verify:
    `SUPABASE_SERVICE_ROLE_KEY` is temporary fallback only;
 4. `cleanup_expired_live_state()` is scheduled and
    `verify_live_cleanup_schedule()` returns true;
-5. admission, invite, 50-viewer concurrency, duplicate join, revoke, expiry,
+5. admission, invite, 200-viewer concurrency, duplicate join, revoke, expiry,
    and language-removal tests pass before any production migration.
 6. `live_languages_valid(array['en', 'ja', 'zh-Hans'])` returns true, while
    duplicate, uppercase, empty, and four-language arrays return false. Generic
@@ -77,9 +362,12 @@ Then verify:
    only `session_id`, anonymous `user_id`, and a 30-day expiry; cleanup removes
    expired grants, utterances, and summaries.
 9. Opening admission twice with the same deterministic code HMAC returns the
-   current version, while a different HMAC fails. Pause, restart, and host
-   configuration updates preserve `admission_generation` and the code HMAC;
-   only explicit stop or session expiry closes the admission lifetime.
+    current version, while a different HMAC fails. Pause, restart, and host
+    configuration updates preserve `admission_generation` and the code HMAC;
+    explicit stop closes the admission lifetime. After the persistence migration,
+    access expiry denies admission without deleting the saved call or its code.
+    Renewing host access does not extend the admission deadline; reopening
+    admission requires a separate explicit host action with the current version.
 10. `redeem_live_admission_v3` and `redeem_live_invite_v3` both create the same
     retained participant identity. `read_live_participant_roster` rejects a
     non-owner host and returns no participant after its 30-day retention
@@ -98,3 +386,317 @@ hosted Supabase `realtime` schema to exist.
 Rollback is application-first: stop live session creation and leave the
 additive tables/functions in place. A destructive down migration is
 intentionally not included.
+
+## Saved Live Call persistence
+
+`202608310001_live_session_persistence.sql` separates a saved call from its
+finite access window. Browser navigation, app closure, and access expiry do not
+change `preparing`, `live`, or `paused` into a terminal status. The host must
+explicitly cancel or end the call. Closing the host connection still releases
+microphone/provider resources; retaining a database row does not keep audio
+capture or a paid translation pipeline running.
+
+| Schema surface | Change and existing-row behavior |
+| --- | --- |
+| `live_sessions.access_window_started_at` | New non-null timestamp. Existing rows use their original `created_at`; new rows use the current statement timestamp. Backfill does not alter status, schedule, code, or expiry. |
+| Session expiry constraint | Keeps a maximum six-hour access window after the later of its anchor or scheduled start. The deadline is not a retention deadline. |
+| Schedule constraint and `update_live_session` | Explicit edits accept schedules within 30 days from the edit, including for old retained calls. An unchanged overdue schedule remains valid. |
+| `renew_live_session_access_v1(uuid, text, integer)` | Service-role-only, owner/version/active-state checked, row locked. Returns the current version if unexpired; otherwise updates the access anchor/deadline and increments the version once. |
+| `enforce_stable_live_admission` | Keeps the code and generation stable. Access renewal preserves the prior admission deadline; explicit admission opening can set a new deadline. |
+| `cleanup_expired_live_state()` | Returns zero terminated calls. Expired/revoked grants and invites still expire; orphan speaking-floor state is cleared. Durable session, participant, transcript, and summary records remain. |
+| `cleanup_expired_live_glossary_documents()` | Session glossary pins and agenda sections follow explicit archive purge, including terminal calls kept as records. Only old inactive document versions referenced by neither singular nor multiple session pins are removed. |
+
+Apply the migration only after explicit approval, in filename order, before
+deploying callers of the new renewal RPC. Existing terminal or soft-deleted
+sessions are never automatically revived. The host restoration endpoint uses
+an owner-scoped lookup that includes expired active sessions; participant reads,
+gateway tokens, viewer grants, and invite redemption retain their expiry checks.
+Restoration must happen before editing an expired call, because the existing
+event-update wrapper still requires a current access window.
+
+Before an approved deployment, verify in a disposable development database:
+
+1. Seed preparing/live/paused calls older than six hours, including a schedule
+   older than 30 days. Cleanup leaves status, title, schedule, session ID, and
+   admission code/generation unchanged while expiring grants and invites.
+   Run glossary cleanup as well: old agenda sections and referenced document
+   versions remain, including documents selected through multiple glossary pins.
+2. Renewal by another host, with an old version, for a stopped/failed call, or
+   for a soft-deleted archive is rejected. Concurrent renewals with the same
+   expired version yield one increment and one conflict.
+3. Renewal preserves an expired admission deadline and a paused admission
+   state. A subsequent explicit admission-open call with the returned version
+   uses the same code and opens the new finite deadline.
+4. Editing a retained call keeps an unchanged past schedule; a deliberate new
+   date is validated relative to the edit time, not the original creation time.
+5. Explicit cancellation still terminates the call, revokes access, and creates
+   its archive. Token expiration never becomes an implicit renewal trigger.
+
+Rollback is application-first. Leave the additive anchor, RPC, and persistence
+cleanup installed; do not restore an old cleanup function that would suddenly
+terminate all retained calls. No destructive down migration or terminal-row
+backfill is provided. The existing explicit archive-delete and delayed-purge
+workflow remains unchanged.
+
+## Recap requests, six-hour records, and participant demand (2026-08-31)
+
+Apply these local migrations in order **before** deploying their callers. They
+have not been applied to a remote database by this task:
+
+1. `202608310002_live_recap_requests_and_record_access.sql`: adds nullable
+   `live_participants.records_revoked_at`, private `live_recap_requests`, and
+   recording-gap evidence used by source reads and workbook snapshots.
+   Existing members have no explicit revocation; existing summary-only consent
+   does not become a new request. The explicit recap action records
+   `summary_delivery` with notice `summary-original-email-v2`, leaving marketing
+   unchanged. One session/member request is durable and repeated clicks do not
+   rewrite the original time or silently reaccept a withdrawn consent.
+2. `202608310003_live_media_demand_leases.sql`: adds private runtime, viewer
+   presence, and host-source generation tables. Existing calls
+   have no runtime row and remain on their legacy path. An authenticated host
+   start creates the runtime; no migration starts or stops a call.
+3. `202608310004_live_media_write_epoch_fences.sql`: adds fenced source/final
+   caption RPCs and permits the first authorized preparing-session viewer only
+   when a current host source, explicit start intent, and matching pending
+   connection exist. Ordinary future scheduled calls remain unauthorized.
+
+The new participant access RPC reads retained membership after live-grant
+cleanup. A deleted archive, explicit records revocation, missing actual end,
+or server time at/after `ended_at + interval '6 hours'` is rejected. Legacy
+authenticated recap SELECT policies use the same deadline. A long-lived
+read-only cookie is identity evidence, never an extension of this deadline.
+Host-owned archives retain their existing independent retention policy.
+
+`request_live_recap_v1`, `read_live_recap_request_v1`,
+`read_owned_live_recap_requests_v1`, and `read_owned_live_record_export_v1`
+return camel-case JSON. Access and participant source RPCs return typed table
+rows. Export is a STABLE single-statement snapshot, not a combination of HTTP
+pages: all participants, authoritative effective source text, stored summary
+languages, and explicit requests are included. More than 10,000 participants,
+12,000 source rows, 12,000 recording gaps, 10,000 requests, or 14 summary languages fails explicitly;
+it never returns a silently truncated workbook input. No provider metadata or
+raw internal source fields are exposed by the participant source RPC.
+Before JSON aggregation, the database also rejects an estimated export payload
+over 12 MiB, including escaped source text and conservative row overhead.
+Participant and host `read_*_live_recording_gaps_v1` RPCs return
+`{recordingGaps:[{id,startedAt,endedAt,reason}]}` independently of source rows.
+An empty transcript can therefore still show known collection gaps, and a
+missing gap end remains null instead of being replaced by a guessed time.
+
+**No email is sent by these migrations.** A request is neither verified email
+ownership nor a sent/delivered receipt. Sending and the verification required
+by a future sender are separate work. Request cancellation is derived from
+the current purpose-specific consent, explicit records revocation, or an
+address change; archived evidence is preserved.
+
+Demand must remain disabled until all web, Electron, and gateway callers are
+deployed together and locally validated. The protocol uses 45-second pending,
+connected, host-source, and owner leases; clients renew every 15 seconds or
+sooner. Last connected-viewer departure starts a 30-second grace period.
+Pending ticket requests do not extend that period. Generations and gateway
+owners are fenced at the SQL boundary; released host generations are permanent
+tombstones so delayed heartbeats cannot reopen the microphone. A failed media
+runtime requires explicit host start/retry. Idle media never changes meeting
+status or its actual end. Provider final writes remain allowed during a
+bounded drain for the current owner/epoch only.
+An actual terminal meeting transition retires its leases and closes open gaps
+only when the stored actual end is known; an idle transition never ends a call.
+
+All new tables use RLS and have no direct client/service-role table grants.
+Only narrow SECURITY DEFINER RPCs are available to service_role; the sole
+authenticated helper derives its identity from `auth.uid()` for RLS. No
+client-supplied host/user ID is itself authentication: API callers must obtain
+these IDs from verified credentials. Apply migrations before enabling
+`LIVE_PARTICIPANT_DEMAND_ENABLED`; disabling that application flag does not
+delete stored consent, transcript, or runtime evidence.
+
+Local SQL verification (no linked Supabase target or remote credentials):
+
+```sh
+npm install --prefix /tmp/nova-schema-validation --no-audit --no-fund @electric-sql/pglite
+NOVA_PGLITE_MODULE=/tmp/nova-schema-validation/node_modules/@electric-sql/pglite/dist/index.js node --test test/live-recap-demand-sql.integration.test.js
+```
+
+The optional PGlite harness executes the new SQL against a minimal fixture of
+the referenced existing tables and the actual existing consent RPC. It checks
+authorization, six-hour boundaries, RLS, request idempotency, export limits,
+first-viewer wake, owner/epoch conflicts, stale source heartbeats, and explicit
+failure recovery. It is **not** proof of hosted Supabase migration application,
+multi-process race timing, Cloud Run scale-to-zero, or mail delivery. The
+regular test run still checks closed SQL entrypoints without this optional
+local dependency. Roll back callers first and retain additive data; do not
+reinstall legacy 30-day participant SELECT policies as a rollback shortcut.
+
+### Canonical participant source snapshots (202608310005)
+
+Apply `202608310005_live_canonical_source_snapshots.sql` after the preceding
+recap/demand migrations and before deploying the matching gateway and web
+readers. It adds nullable `live_source_utterances.language_observation`; old
+rows remain null and no transcript, identity, consent, or language evidence is
+backfilled. The v2 writer stores new observations atomically with the existing
+source identity and sequence; replay requires identical evidence. The prior
+writer stays available for old callers. Both writer generations retain the
+existing source ledger, and the new fenced writer requires the current owner.
+
+The participant snapshot RPC reads the same ledger for all language tabs. Live
+access requires a valid bound viewer grant plus nonrevoked durable membership;
+terminal access uses membership and actual `ended_at + 6 hours`, independent of
+expired or cleaned live grants. Speaker labels are neutral, and provider raw
+payloads and participant identity snapshots are excluded. A separate bounded,
+service-only projection restores language observations on translated-caption
+recovery. Neither reader creates a provider connection or changes demand.
+
+Run the optional local PostgreSQL integration with
+`NOVA_PGLITE_MODULE=/path/to/pglite/dist/index.js node --test test/live-canonical-source-sql.integration.test.js`.
+It exercises real v2 persistence, unchanged replay, conflicting observation,
+stale media epoch, private projections, role grants, revocation, and six-hour
+expiry; this is not a hosted-database or paid-provider validation. Roll back
+application callers first and retain the additive column and rows.
+
+## Authentication 설정
+
+Migrations `202609020002` through `202609020005` make Supabase Auth the
+identity provider for hosts and add the admin console; `202609050001` and
+`202609050005` add the per-user engine assignment the console manages. The browser signs in with Google or email/password (PKCE)
+and posts the access token to `POST /api/auth/exchange`; the server verifies it
+against `GET /auth/v1/user`, upserts `profiles` through
+`upsert_profile_on_login_v1`, and issues the existing `rnw_session` cookie only
+when `profiles.status = 'approved'`. The cookie subject is `profiles.host_id`,
+never the raw auth UUID: emails listed in `ADMIN_BOOTSTRAP_EMAILS` become
+approved admins on first login and inherit the first `ADMIN_USER_IDS` entry as
+their `host_id`, so their existing `live_sessions` rows stay owned; every other
+profile gets `host_id = id::text`. `requireHost` re-reads the status through
+`read_profile_by_host_id_v1` behind a 60-second cache, so rejecting or
+disabling a profile locks that host out within a minute, and a UUID host id
+with no profile row is rejected rather than treated as legacy. The legacy
+`ADMIN_USER_IDS` / `ADMIN_PASSWORD_HASH` login keeps working until
+`set_legacy_password_login_v1` turns it off from the console.
+
+`profiles` intentionally has **no** `grant select ... to authenticated`. The
+`profiles_self_select` policy exists but is inert until a browser-side read is
+ever needed; every read today goes through service-role RPCs.
+
+Dashboard steps, performed by the project owner. Never paste client secrets,
+API keys, deep-link codes, or `state` values into chat, commits, or this file.
+
+1. Google Cloud Console: create an OAuth 2.0 client (Web application) and add
+   the Supabase callback `https://<project-ref>.supabase.co/auth/v1/callback`
+   to its authorized redirect URIs.
+2. Supabase Dashboard → Authentication → Providers: enable Google and enter
+   that client ID and secret.
+3. Authentication → URL Configuration: add
+   `https://realtime-noel-web.vercel.app/auth/callback` to the redirect
+   allowlist and keep email confirmation enabled. Desktop logins return through
+   the same page (`?client=desktop&state=...`), which then hands the browser
+   off to `nova://auth/callback?code&state`.
+4. Vercel: set `ADMIN_BOOTSTRAP_EMAILS` (comma-separated) for Production and
+   any Preview environment that should accept those admins.
+
+Deploy order: apply `202609020001`–`202609020005`, then
+`202609050001`–`202609050005`, by hand in filename order → deploy the media
+gateway first (it must accept 1–3-language Soniox sessions before the webapp
+creates them) → deploy the
+webapp with legacy login still enabled → confirm the first Google login of a
+bootstrap admin creates an approved `profiles` row → ship the desktop DMG that
+registers the `nova` scheme (`electron/main.js` registers it only when
+`app.isPackaged` or `NOVA_DEV_DEEP_LINK=1`) → disable legacy login from the
+console once stable. Password reset currently lands on `/auth/callback` and
+exchanges the recovery session like a login; there is no "set a new password"
+screen yet. Rollback is application-first: redeploy the previous webapp and
+leave the additive tables in place.
+
+### Admin console
+
+`/console` (`/console/users`, `/console/sessions`, `/console/engine`) is
+reachable only by `role = 'admin'` profiles; the guard runs in the Next.js
+server layout (`requireAdminFromCookieValue`), and every read and write goes
+through service-role RPCs. The console does three things: signup approval and
+roles (`set_profile_status_v1` / `set_profile_role_v1`; the last admin cannot
+be demoted or disabled and nobody can change their own row - both enforced in
+SQL), session aggregates (`list_sessions_admin_v1`), and **per-user engine
+assignment** (decision D1, 2026-09-05).
+
+The Live Call engine is assigned per user on `profiles.voice_provider`
+(`soniox` = Soniox recognition + its own translation, the default;
+`gemini` = Gemini Transcribe Live → Flash). Only the operator (a global admin)
+changes it, from the user row in `/console/users`; hosts see their engine
+read-only in the web dashboard and the desktop app, and the server pins the
+caller's current assignment (and its `voice_provider_revision` as
+`modelPreferences.assignmentRevision`) when a session is created. A change is
+an **immediate switch**: `PATCH /api/console/users { voiceProvider }` →
+`set_profile_voice_provider_v2` (bumps the revision only on a change, logs
+`effective = 'immediate'`) → for each of that host's `preparing`/`live`
+sessions (`list_live_session_ids_for_host_admin_v1`)
+`set_live_session_engine_admin_v2` with the new revision → gateway
+`POST /internal/sessions/:id/engine` with a 60-second `ADMIN` gateway token.
+The gateway opens the new pipeline, closes the old one once it is ready
+(caption `seq` continues), and tells the host via `engine-status`. The console
+shows a confirm dialog quoting how many running sessions will switch, then a
+per-session table: `switched` (the gateway swapped it), `queued` (cold session,
+the DB value applies on the next activation; expected, not an error), or
+`failed` with a code (the old pipeline keeps running). Each change leaves a
+`profile_events` `user_assignment` row from the RPC plus a best-effort
+`record_console_deploy_v1` row carrying the target profile, provider and
+revision.
+
+The global `engine_defaults` deploy is retired: `PUT /api/console/engine-defaults`
+answers 410 `ENGINE_DEFAULTS_RETIRED` (the GET catalog stays), and
+`/console/engine` is an information card that links to `/console/users`.
+
+Operator steps after the first admin login: open `/console/users` (the
+bootstrap admin row must be `approved` / `admin`, and each row shows its
+engine), change one test user's engine and confirm the result table reports
+`queued` or `switched`, never 5xx. Turn off legacy password login
+(`set_legacy_password_login_v1`, the 계정 section of `/console/engine`) only
+after Google login is confirmed; from then on `/api/login` answers
+`LEGACY_LOGIN_DISABLED` (403).
+
+Local SQL verification without a linked project:
+
+```sh
+NOVA_PGLITE_MODULE=/path/to/pglite/dist/index.js node --test test/auth-profiles-sql.test.js test/console-rpcs-sql.test.js test/live-session-engine-admin-sql.test.js test/console-deploy-audit-sql.test.js test/regrant-session-engine-admin-sql.test.js
+```
+
+## 2026-09-05: 사용자별 엔진과 연속 세션 접근
+
+`202609050001_user_engine_access_renewal.sql`은 기존 마이그레이션 다음에 적용합니다. 운영 DB에는 자동 적용하지 않습니다. 신규 프로젝트 bootstrap에도 동일 SQL이 포함됩니다.
+
+- 기존 및 신규 `profiles`는 `voice_provider = soniox`, `voice_provider_revision = 1`로 초기화됩니다. 기존 세션의 엔진과 기록은 변경하지 않습니다.
+- 관리자는 사용자 배정을 바꿉니다(콘솔은 `202609050005`의 `set_profile_voice_provider_v2`를 호출하며, D1에 따라 그 사용자의 진행 중 세션에도 즉시 적용됩니다 — 이 파일의 "다음 세션부터" 회수는 `202609050005`가 되돌립니다). 서버는 새 세션을 만들 때 `read_host_voice_assignment_v1` 결과를 세션에 고정하며, 재연결 시 이를 유지해야 합니다. `list_profiles_admin_v2`는 배정 정보를 함께 반환합니다.
+- 라이브 상태에서 기존 접근 만료 시각과 일치하는 아직 열린 입장 창·미철회 초대만 접근 연장과 함께 연장합니다. 짧게 설정한 입장 창, 준비/일시정지 상태, 만료 또는 철회된 초대는 그대로 둡니다.
+- 호스트 인증 후 `renew_live_session_access_v1`을 호출하면 남은 접근 시간이 15분 이하일 때 6시간의 유한 접근 창을 갱신합니다. 종료/삭제된 세션, 다른 호스트, 비활성 프로필은 갱신되지 않습니다.
+- 서버에서 유효한 참가자 쿠키를 검증한 뒤 `renew_live_viewer_access_v1(session_id, grant_id, user_id)`로 해당 참가자의 유효한 접근만 갱신합니다. 반환값은 만료 시각이며 쿠키/미디어 토큰도 함께 재발급해야 합니다. 만료되거나 철회된 참가자 권한은 복구하지 않습니다.
+- 호스트가 돌아오지 않아 접근 창이 만료되면 유료 미디어와 접근은 중단할 수 있지만, 저장된 제품 세션은 종료하지 않습니다. 기존 cleanup의 실제 종료 기준을 유지합니다.
+- `noel` 관리자 구성은 서버에서 자격 증명을 확인한 뒤 실제 Supabase Auth 사용자를 생성/확인하고 기존 bootstrap profile RPC로 연결합니다. 비밀번호를 SQL이나 저장소에 넣지 않습니다.
+
+롤백 시 기존 마이그레이션을 수정하거나 컬럼을 삭제하지 마세요. 직전 애플리케이션으로 되돌리되 사용자별 배정 경로와 15분 접근 갱신 계약의 호환성을 먼저 확인해야 합니다.
+
+## 2026-09-05: 로컬 캡션 서버 권한
+
+`202609050002_managed_caption_sessions.sql`을 사용자 엔진 마이그레이션 다음에 적용합니다. 새 `managed_caption_sessions`에는 세션 식별자·소유자·배정 엔진/버전·언어·상태·유한 접근 만료만 저장하며 원문·번역문·음성은 저장하지 않습니다. 기존 사용자/라이브콜 데이터는 변경하지 않습니다.
+
+서버는 시작 시 승인된 프로필의 최신 배정과 비교해 세션을 등록하고, 임시 키 발급·번역·접근 갱신마다 활성 상태와 소유자를 재검증합니다. 로컬 캡션 종료는 `stop_managed_caption_session_v1`으로 기록하며 반복 종료는 같은 성공 결과입니다. 종료된 세션의 예전 서명 티켓으로 다시 키를 받거나 접근을 연장할 수 없습니다. 연결 교체는 기존 세션 ID를 유지하고, 6시간 접근은 만료 전에 갱신합니다. 네트워크 장기 단절로 접근이 만료되면 기존 자격으로 키 발급·번역을 계속하지 않습니다. 복귀 시 유효한 호스트 인증 및 승인 상태를 새로 확인하고, 서명·소유자가 확인된 세션을 갱신한 뒤 같은 엔진 배정으로 복구합니다. 종료된 세션은 복구하지 않습니다.
+
+모든 RPC는 service role 전용이며 테이블 직접 접근·클라이언트 접근은 차단합니다. 기존 행이 없는 새 테이블이므로 백필은 없습니다. 롤백 시 테이블/상태는 보존하고 이전 stateless broker로 되돌리지 마세요. 이전 티켓을 다시 허용하면 종료 후 재사용 방지가 사라집니다.
+
+## 2026-09-05: 호스트 발언자 명단·회사·부서·사진
+
+`202609050003_live_speaker_roster.sql`을 기존 마이그레이션 뒤에 적용합니다. 새 `live_speaker_rosters`(현재 명단), `live_speaker_profile_versions`(불변 프로필 버전), `live_speaker_photos`(불변 사진)만 추가하며 기존 행 백필은 없습니다. 명단이 없는 세션을 조회하면 revision/appliedRevision 0, 빈 명단을 반환합니다. 운영 적용은 별도 승인 후 수행합니다.
+
+- 호스트 소유권을 검증한 서버만 `get_live_speaker_roster_v1`과 `replace_live_speaker_roster_v1`을 호출합니다. 교체는 세션 행 잠금과 expectedRevision 비교로 동시에 수정한 두 요청 중 하나만 허용합니다. 최대 30명, 이름 40자, 회사·부서 각각 80자이며 연결 참여자·사진은 같은 세션이어야 합니다.
+- 프로필 ID별 이름·회사·부서·사진·연결 참여자 변경 시 서버가 version을 증가시켜 새 불변 행을 생성합니다. 삭제된 명단 항목의 과거 버전·사진은 그대로 남습니다. 준비 중에는 즉시 적용 완료 처리하고, 진행 중에는 게이트웨이가 오디오 경계를 반영한 뒤 `ack_live_speaker_roster_v1`으로 appliedRevision을 갱신합니다.
+- `create_live_speaker_photo_v1`은 호스트 소유권과 종료 상태를 검사하고 PNG/JPEG/WebP 256KiB 이하의 새 사진만 저장합니다. 서버에서 실제 이미지 디코딩·정규화 후 호출해야 합니다. 사진 조회 RPC는 service role 전용이며 호출 API가 호스트·참여자 접근권을 별도로 검증해야 합니다.
+- 모든 테이블 직접 접근과 익명·로그인 클라이언트 RPC 실행은 차단하며 service role에 지정 RPC 실행만 허용합니다. 종료/실패 세션은 명단·사진 쓰기를 거부합니다.
+
+롤백은 이전 애플리케이션으로 전환하고 새 테이블/프로필/사진을 보존하는 방식입니다. 영구 삭제 정책은 별도 정리 작업에 통합해야 하며 이 마이그레이션에서 과거 기록을 삭제하지 않습니다. 로컬 SQL 검증: `NOVA_PGLITE_MODULE=/path/to/pglite/dist/index.js node --test test/live-speaker-roster-sql.test.js`.
+
+`202609050004_speaker_profile_history.sql`은 명단 마이그레이션 바로 뒤에 적용합니다. 원문·번역 행에 nullable `speaker_profile`·`speaker_attribution`을 추가하므로 기존 기록은 NULL을 유지합니다. source v4 RPC는 오디오 시점의 6개 필드 프로필을 불변 버전 행과 대조하고, 기존 원문/캡션 RPC의 인증·상태·순서·멱등성 검사를 유지합니다. `unresolved`는 프로필 없는 미확정 화자에만 허용합니다. 같은 기록 키에 다른 프로필을 덮어쓰면 충돌로 거부합니다. 기존 원문 조회 함수는 권한 검사 함수를 보존한 래퍼로 바뀌며 두 추가 컬럼을 반환합니다. 호스트·참여자 재접속 스냅샷에도 프로필을 복원합니다.
+
+새 명단·사진·버전은 부모 세션의 기존 영구 삭제 시점에만 함께 정리됩니다. 명단 수정·프로필 삭제는 과거 버전·사진을 삭제하지 않습니다. 롤백 시 RPC와 컬럼은 유지하고 애플리케이션부터 되돌립니다. `test/live-speaker-full-migrations-sql.test.js`는 격리된 PGlite에서 전체 순서의 애플리케이션 마이그레이션과 실제 원문·캡션·기록 RPC를 검증합니다. Supabase의 auth/realtime/storage 및 pg_cron은 로컬 플랫폼 대역이며, 실제 클라우드 스케줄·이미지 스토리지는 이 검사에 포함되지 않습니다.
+
+`202609050005_regrant_session_engine_admin.sql`은 `202609050001` 뒤에 적용합니다(결정 D1, 2026-09-05). 엔진 배정은 사용자별(`profiles.voice_provider`, 기본 soniox)이며 운영자(전역 관리자)만 바꾸고, 변경은 그 사용자의 진행 중(preparing|live) 세션에 **즉시** 적용되고 다음 세션에도 유지됩니다. 이를 위해 `202609050001`이 회수한 `set_live_session_engine_admin_v1`의 service_role 실행 권한을 다시 부여하고, 세션 레코드에 배정 revision을 함께 기록하는 `set_live_session_engine_admin_v2(actor, session, engine, revision)`, 호스트 범위의 진행 중 세션 목록 `list_live_session_ids_for_host_admin_v1(host_id)`, 프로필 식별자를 함께 돌려주고 `effective = 'immediate'`로 감사 기록을 남기는 `set_profile_voice_provider_v2`를 추가합니다. 콘솔 `PATCH /api/console/users { voiceProvider }`가 이 세 RPC를 순서대로(프로필 → 세션 목록 → 세션별 RPC → 게이트웨이 `POST /internal/sessions/:id/engine`) 호출합니다. 삭제·변경되는 객체는 없으며 재실행 가능합니다. 로컬 SQL 검증: `NOVA_PGLITE_MODULE=/path/to/pglite/dist/index.js node --test test/regrant-session-engine-admin-sql.test.js`.
+
+
+`202609060001_live_source_transcript_variable_conflict.sql`은 `202608220001` 뒤 어디에나 적용할 수 있으며 가장 마지막에 적용합니다(2026-09-06 장애 수정). `202608220001`의 세 함수(`persist_authoritative_live_source_utterance_v1`, 17인자 `persist_live_final_caption_if_active`, `append_owned_live_source_correction_v1`)가 행 변수(`source_row`, `session_row`, `participant_row`)와 같은 이름을 테이블 별칭으로 써서 PL/pgSQL이 `alias.column` 참조를 42702(ambiguous)로 거부했습니다. 운영에서는 게이트웨이의 최종 자막 저장이 매번 400으로 실패해 호스트 소켓이 끊기고 Live Call을 종료할 수 없었습니다. `202608150007`과 같은 정책으로 `#variable_conflict use_column`만 추가하며 본문은 그대로입니다. 삭제·변경되는 객체는 없고 재실행 가능합니다. 루트 테스트 `test/live-plpgsql-variable-conflict-policy.test.js`가 bootstrap의 최종 정의 전체에 이 정책을 강제합니다.
+
+`202609060002_live_final_caption_wire_keys.sql`은 `202609060001` 뒤에 적용합니다(2026-09-06 장애 수정 2). 게이트웨이의 최종 자막 이벤트에는 뷰어용 키 `authoritativeSourceId`·`sourceSequence`가 들어 있는데, 스냅샷 기본 검증기(`persist_live_snapshot_if_active_20260725`)는 허용 목록 밖의 키가 있으면 예외 없이 `false`를 돌려주므로 원문은 저장되고 자막·스냅샷은 한 건도 저장되지 않았습니다. 17인자 `persist_live_final_caption_if_active`가 두 키를 `p_event`에서 제거한 뒤 위임합니다(링크는 이미 `p_authoritative_source_id`로 받습니다). 게이트웨이 어댑터도 같은 키를 내보내지 않도록 고쳤습니다(이중 방어). 삭제·변경되는 객체는 없고 재실행 가능합니다.

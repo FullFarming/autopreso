@@ -3,6 +3,11 @@ import fs from "node:fs";
 import test from "node:test";
 import vm from "node:vm";
 
+import {
+  resolveOverlayDisplays,
+  resolveSelectedOverlayDisplay,
+} from "../src/live-caption-ipc-relay.js";
+
 const mainSource = fs.readFileSync(new URL("../electron/main.js", import.meta.url), "utf8");
 const preloadSource = fs.readFileSync(new URL("../electron/preload.js", import.meta.url), "utf8");
 
@@ -98,7 +103,7 @@ test("Stage navigation permits only the exact session path and origin", () => {
   assert.equal(isExactLiveStageUrl("javascript:alert(1)", "https://live.example.test", "/stage/one"), false);
 
   const isAllowedOrigin = vm.runInNewContext(
-    `${sourceBetween("function isAllowedOrigin", "function createNoopTranscription")}; isAllowedOrigin`,
+    `${sourceBetween("function isAllowedOrigin", "// Boot must never reject silently.")}; isAllowedOrigin`,
     { URL },
   );
   const allowed = new Set(["http://127.0.0.1:3210", "https://live.example.test"]);
@@ -320,7 +325,7 @@ test("dashboard, controller and overlay windows all get renderer recovery", () =
   assert.match(dashboard, /stopLiveGatewayBridge\("dashboard renderer lost"\)/u);
   assert.match(dashboard, /HOST_AUDIO_RENDERER_LOST/u);
   assert.match(dashboard, /notifyLiveBridgeFailure\(/u);
-  const overlay = sourceBetween("function createOverlayWindowForDisplay", "// Reconcile one overlay window");
+  const overlay = sourceBetween("function createOverlayWindowForDisplay", "function isCurrentOverlayWindow");
   assert.match(overlay, /attachRendererRecovery\(window/u);
   assert.match(overlay, /did-finish-load/u, "a recovered overlay must be shown; ready-to-show fires only once");
   const controller = sourceBetween("function createControllerWindow", "function createOverlayWindowForDisplay");
@@ -340,9 +345,9 @@ test("dashboard, controller and overlay windows all get renderer recovery", () =
 
 /**
  * @param {{ displays: { id: number, bounds: { x: number, y: number, width: number, height: number } }[],
- *           overlayEnabled?: boolean, isQuitting?: boolean }} options
+ *           overlayEnabled?: boolean, overlaysMuted?: boolean, isQuitting?: boolean }} options
  */
-function loadOverlayWindows({ displays, overlayEnabled = true, isQuitting = false }) {
+function loadOverlayWindows({ displays, overlayEnabled = true, overlaysMuted = false, isQuitting = false }) {
   const created = [];
   let nextId = 1;
   function FakeOverlayWindow(options) {
@@ -393,11 +398,27 @@ function loadOverlayWindows({ displays, overlayEnabled = true, isQuitting = fals
   }
   const context = {
     BrowserWindow: FakeOverlayWindow,
-    screen: { getAllDisplays: () => displays },
+    screen: {
+      getAllDisplays: () => displays,
+      getPrimaryDisplay: () => displays[0],
+    },
+    // The overlay window set is derived from the shared pure resolvers, so the
+    // sandbox gets the real ones rather than a second copy of the rule.
+    resolveOverlayDisplays,
+    resolveSelectedOverlayDisplay,
+    overlayAllDisplays: false,
+    selectedOverlayDisplayIds: null,
+    preferredOverlayDisplayId: "",
+    selectedOverlayDisplayId: "",
     overlayWindows: new Map(),
     interactiveOverlayIds: new Set(),
     overlayEnabled,
+    // Momentary caption hide. The watchdog gates on it, so the harness has to
+    // supply it or maintainOverlayWindow throws on a bare reference.
+    overlaysMuted,
     isQuitting,
+    isDesktopAuthenticated: true,
+    isHostLogoutPending: false,
     overlayUrl: "http://127.0.0.1:3210",
     OVERLAY_TOP_LEVEL: "screen-saver",
     // Recovery and top-level re-assertion are covered by their own tests.
@@ -482,4 +503,95 @@ test("a live hover claim is still honoured by the watchdog", () => {
   overlay.context.interactiveOverlayIds.add(window.id);
   overlay.maintainOverlayWindow();
   assert.equal(window.ignoreMouse.at(-1), false);
+});
+
+// Momentary caption hide, for playing a video mid-session. What matters is what
+// it does NOT do: it must not persist, must not destroy the overlay windows, and
+// must not be the overlayEnabled setting wearing a different name.
+test("hiding captions momentarily is visibility-only and never persisted", () => {
+  const source = fs.readFileSync(new URL("../electron/main.js", import.meta.url), "utf8");
+  const start = source.indexOf('ipcMain.handle("subtitle-overlay:set-muted"');
+  assert.notEqual(start, -1, "the mute IPC must exist");
+  const handler = source.slice(start, source.indexOf('ipcMain.handle("subtitle-overlay:get-muted"', start));
+
+  // Persisting it would survive a restart with nothing on screen explaining why.
+  assert.doesNotMatch(handler, /settingsStore\.save/u, "a momentary hide must not be written to settings");
+  // Destroying the windows reloads the renderer and throws away what is on screen;
+  // that is the overlayEnabled setting's job, not this one's.
+  assert.doesNotMatch(handler, /destroyOverlayWindow/u, "a momentary hide must not destroy the overlay windows");
+  assert.match(handler, /isAllowedOrigin/u, "the renderer origin is checked like every other overlay IPC");
+  assert.match(handler, /window\.hide\(\)/u);
+
+  // The 1s watchdog re-shows any hidden overlay, so without this gate the hide is
+  // undone within a second.
+  const watchdog = source.slice(
+    source.indexOf("function maintainOverlayWindow"),
+    source.indexOf("function reassertOverlayTop"),
+  );
+  assert.match(watchdog, /!overlayEnabled \|\| overlaysMuted/u, "the watchdog must respect the mute");
+
+  // Turning the overlay setting back on must clear a stale mute, or the setting
+  // looks broken.
+  const setEnabled = source.slice(
+    source.indexOf('ipcMain.handle("subtitle-overlay:set-enabled"'),
+    source.indexOf('ipcMain.handle("subtitle-overlay:set-interactive"'),
+  );
+  assert.match(setEnabled, /overlaysMuted = false/u);
+
+  // In-memory only: there is no read of a persisted mute anywhere.
+  assert.doesNotMatch(source, /subtitle:\s*\{\s*overlaysMuted/u);
+});
+
+test("the controller surfaces the caption hide with a visible state and no HTML sink", () => {
+  const html = fs.readFileSync(new URL("../public/subtitle-controller.html", import.meta.url), "utf8");
+  const js = fs.readFileSync(new URL("../public/subtitle-controller.js", import.meta.url), "utf8");
+  const preload = fs.readFileSync(new URL("../electron/preload.js", import.meta.url), "utf8");
+
+  assert.match(html, /id="controller-mute-captions"/u);
+  assert.match(preload, /setOverlaysMuted: \(muted\) => ipcRenderer\.invoke\("subtitle-overlay:set-muted"/u);
+  // Both icons ship in the markup and a class picks one: innerHTML is forbidden
+  // in this codebase and pinned by other tests.
+  assert.match(html, /id="controller-mute-captions"[^>]*aria-pressed="false"/u);
+  assert.doesNotMatch(js, /\.innerHTML\s*=/u);
+  // A forgotten mute is indistinguishable from broken captions, so the button
+  // paints its state rather than only firing the IPC.
+  assert.match(js, /classList\.toggle\("is-muted"/u);
+  assert.match(js, /aria-pressed/u);
+  // Paint from what the main process reports: a rejected origin check returns the
+  // unchanged value, and an optimistic paint would then lie.
+  assert.match(js, /await window\.realtimeNoelDesktop\.setOverlaysMuted\(next\)/u);
+});
+
+test("registered sessions can be deleted from the workspace list", () => {
+  const workspaceJs = fs.readFileSync(new URL("../public/subtitle-workspace.js", import.meta.url), "utf8");
+  const i18n = fs.readFileSync(new URL("../public/subtitle-i18n.js", import.meta.url), "utf8");
+  const i18nJa = fs.readFileSync(new URL("../public/subtitle-i18n-ja.js", import.meta.url), "utf8");
+
+  // Main process: a dedicated IPC that ends a registered (preparing) session
+  // through the webapp DELETE route, with the same guards as start-registered.
+  const handler = sourceBetween('ipcMain.handle("live-call:delete-registered"', 'ipcMain.handle("glossary-presets:list"');
+  assert.match(handler, /isAllowedOrigin\(event\.sender\.getURL\(\), new Set\(\[localAppOrigin\]\)\)/u);
+  assert.match(handler, /liveCallEnabled !== true/u);
+  // Deleting the session that is currently armed would strand the live
+  // controller; the workspace must route that through 세션 폐기 instead.
+  assert.match(handler, /LIVE_CALL_ALREADY_ARMED/u);
+  assert.match(handler, /SESSION_NOT_PREPARING/u);
+  assert.match(handler, /method: "DELETE"/u);
+
+  // Preload bridge.
+  assert.match(preloadSource, /deleteRegisteredLiveCall: \(sessionId\) => ipcRenderer\.invoke\("live-call:delete-registered", sessionId\)/u);
+
+  // Workspace list: every registered row renders a delete button that asks for
+  // an explicit second click before ending the registration, then refreshes.
+  assert.match(workspaceJs, /deleteRegisteredSession\(session\.id, deleteButton\)/u);
+  assert.match(workspaceJs, /bridge\.deleteRegisteredLiveCall\(sessionId\)/u);
+  assert.match(workspaceJs, /live\.registeredDeleteConfirm/u);
+  assert.match(workspaceJs, /refreshRegisteredSessions\(\{ quiet: true \}\)/u);
+  assert.doesNotMatch(workspaceJs, /\.innerHTML\s*=/u);
+
+  // Copy exists in every catalog the workspace loads.
+  for (const key of ["live.registeredDelete", "live.registeredDeleteConfirm", "live.registeredDeleted", "live.registeredDeleteFailed"]) {
+    assert.ok(i18n.split(`"${key}"`).length >= 3, `${key} needs en + ko entries in subtitle-i18n.js`);
+    assert.match(i18nJa, new RegExp(`"${key.replace(/\./gu, "\\.")}"`, "u"), `${key} missing in subtitle-i18n-ja.js`);
+  }
 });

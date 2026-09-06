@@ -137,11 +137,6 @@ export function toGeminiLanguageCode(language: LanguageCode): string {
   return canonical ? codes[canonical] : "";
 }
 
-export function toOpenAITranslationLanguageCode(language: LanguageCode): string {
-  const canonical = normalizeLanguageCode(language);
-  return canonical === "zh-Hans" || canonical === "zh-Hant" ? "zh" : canonical;
-}
-
 export function resolveLanguageEvidence(
   text: unknown,
   providerCode?: unknown,

@@ -1,5 +1,7 @@
+import { initSubtitleControls, mountCaptionDisplayPicker } from "./subtitle-controls.js";
+import { mountSpeakerRoster } from "./subtitle-speakers.js";
 // Workspace chrome for the desktop dashboard: page routing between
-// Captions / Live Call / Records / Settings,
+// Captions / Live Call (including records) / Settings,
 // the footer Restart control, and the local Live Call draft. This file owns
 // presentation glue only — all caption/session logic stays in
 // subtitle-dashboard.js, which binds by element id and keeps working
@@ -11,12 +13,14 @@
 import {
   applyDocumentLanguage,
   applyTranslations,
-  changeLanguage,
-  getLanguage,
   initLanguage,
+  readStoredLanguage,
+  setLanguage,
   subscribe,
   t,
 } from "./subtitle-i18n.js";
+import { mountSystemLanguageButton } from "./system-language-button.js";
+import { SYSTEM_LANGUAGE_STORAGE_KEY } from "./system-language.js";
 
 const PAGE_TITLE_KEYS = {
   captions: "page.captions.title",
@@ -42,12 +46,14 @@ applyTranslations(document);
 
 function activatePage(page) {
   if (!PAGE_TITLE_KEYS[page] || !main) return;
+  const focusedPage = document.activeElement?.closest?.("[data-workspace-page]");
   main.dataset.activePage = page;
   for (const section of pages) {
     section.classList.toggle("is-active", section.dataset.workspacePage === page);
   }
   for (const link of navLinks) {
-    const isCurrent = link.dataset.workspaceNav === page && link.closest("nav");
+    const railPage = page === "records" ? "livecall" : page;
+    const isCurrent = link.dataset.workspaceNav === railPage && link.closest("nav");
     link.classList.toggle("is-current", Boolean(isCurrent));
     if (link.closest("nav")) {
       if (isCurrent) link.setAttribute("aria-current", "page");
@@ -57,6 +63,10 @@ function activatePage(page) {
   if (pageTitle) {
     pageTitle.dataset.i18n = PAGE_TITLE_KEYS[page];
     pageTitle.textContent = t(PAGE_TITLE_KEYS[page]);
+  }
+  if (focusedPage && focusedPage.dataset.workspacePage !== page && pageTitle) {
+    pageTitle.tabIndex = -1;
+    pageTitle.focus();
   }
   // The caption session footer only makes sense on the captions page.
   if (footer) footer.hidden = page !== "captions";
@@ -120,7 +130,7 @@ restartButton?.addEventListener("click", () => {
 // ── Live Call draft: local persistence + cover preview ────────────────────
 
 const DRAFT_FIELDS = ["liveDraftTitle", "liveDraftDate", "liveDraftTime", "liveDraftCapacity"];
-const MAX_COVER_IMAGE_BYTES = 5 * 1024 * 1024;
+const MAX_COVER_IMAGE_BYTES = 20 * 1024 * 1024;
 const ALLOWED_COVER_IMAGE_TYPES = new Set(["image/jpeg", "image/png", "image/webp"]);
 
 function restoreLiveDraft() {
@@ -245,17 +255,24 @@ coverInput?.addEventListener("change", async () => {
 });
 
 
-// ── Live Call follows the caption configuration ────────────────────────────
-// Live Call is an optional layer ON TOP of captions: its languages mirror the
-// caption subtitle languages (spoken language is auto-detected, viewers pick
-// their own display language on the web).
+// ── Live Call language selection ────────────────────────────────────────────
+// Live Call has its own language dropdown (name="liveCallTranslationLanguages").
+// When nothing is selected there, it inherits the caption subtitle languages —
+// the pre-split behavior (spoken language is auto-detected, viewers pick their
+// own display language on the web).
 
 const LANGUAGE_MIRROR_LABELS = { en: "English", ko: "한국어", ja: "日本語" };
+
+function selectedLiveCallLanguages() {
+  const explicit = [...document.querySelectorAll('input[name="liveCallTranslationLanguages"]:checked')].map((input) => input.value);
+  if (explicit.length) return explicit;
+  return [...document.querySelectorAll('input[name="translationLanguages"]:checked')].map((input) => input.value);
+}
 
 function syncLiveDraftLanguages() {
   const container = document.getElementById("live-draft-languages");
   if (!container) return;
-  const selected = [...document.querySelectorAll('input[name="translationLanguages"]:checked')].map((input) => input.value);
+  const selected = selectedLiveCallLanguages();
   container.replaceChildren(...(selected.length ? selected : ["en", "ko"]).map((code) => {
     const chip = document.createElement("span");
     chip.className = "live-draft-language-chip";
@@ -272,6 +289,11 @@ syncLiveDraftLanguages();
 // ── One-button Live Call start: session + invite are created by the main
 // process with the stored host cookies; the stage overlay window (countdown
 // + QR + access code) opens instead of the dashboard web page. ────────────
+
+const speakerRoster = mountSpeakerRoster(document.getElementById("live-speaker-roster"), window.realtimeNoelDesktop);
+let pendingSpeakerStart = null;
+let pendingSpeakerRegistration = null;
+let isSpeakerSessionCreating = false;
 
 const startLiveCallButton = document.getElementById("schedule-live-call");
 const liveWorkspaceStatus = document.getElementById("live-workspace-status");
@@ -290,17 +312,15 @@ function liveDraftScheduledAt() {
   return Number.isFinite(stamp) ? new Date(stamp).toISOString() : null;
 }
 
-// When Start fails on host sign-in, remember it: a later successful save in
-// Settings returns here and retries automatically instead of making the user
-// re-navigate and press Start again.
-let pendingLiveCallRetry = false;
-
 startLiveCallButton?.addEventListener("click", async () => {
   const bridge = window.realtimeNoelDesktop;
   if (!bridge?.startLiveCall) {
     setLiveStatus(t("live.desktopOnly"));
     return;
   }
+  if (isSpeakerSessionCreating) return;
+  if (pendingSpeakerRegistration) { setLiveStatus("등록한 세션의 발언자 저장을 먼저 완료해 주세요."); return; }
+  isSpeakerSessionCreating = true;
   startLiveCallButton.disabled = true;
   startLiveCallButton.setAttribute("aria-busy", "true");
   setLiveStatus(t("live.creating"));
@@ -313,16 +333,23 @@ startLiveCallButton?.addEventListener("click", async () => {
     const draft = {
       title: fieldValue("liveDraftTitle"),
       scheduledAt: liveDraftScheduledAt(),
-      maxViewers: Number.parseInt(fieldValue("liveDraftCapacity"), 10) || 50,
-      languages: [...document.querySelectorAll('input[name="translationLanguages"]:checked')].map((input) => input.value),
+      maxViewers: Number.parseInt(fieldValue("liveDraftCapacity"), 10) || 200,
+      participantSpeakingEnabled: Boolean(document.querySelector('input[name="liveDraftSpeaking"]')?.checked),
+      languages: selectedLiveCallLanguages(),
       coverImage: liveDraftCoverData,
     };
-    const result = await bridge.startLiveCall(draft);
+    const result = pendingSpeakerStart || await bridge.startLiveCall(draft);
+    if (result?.ok && result.sessionId && speakerRoster) {
+      pendingSpeakerStart = result;
+      await speakerRoster.persistForSession(result.sessionId);
+      pendingSpeakerStart = null;
+    }
     if (result?.code === "HOST_LOGIN_REQUIRED" || result?.code === "HOST_LOGIN_REJECTED") {
       const authorizationMessage = result.code === "HOST_LOGIN_REJECTED"
         ? t("live.hostLoginRejected")
         : t("live.hostLoginRequired");
-      pendingLiveCallRetry = true;
+      hostAccountId = "";
+      setHostLoginNotice("settings.hostSignedOut", true);
       setLiveStatus(authorizationMessage);
       if (hostLoginSection) hostLoginSection.hidden = false;
       if (hostLoginStatus) {
@@ -332,10 +359,9 @@ startLiveCallButton?.addEventListener("click", async () => {
       }
       activatePage("settings");
       hostLoginSection?.scrollIntoView({ behavior: "smooth", block: "center" });
-      form?.elements?.liveHostId?.focus();
+      openHostLoginButton?.focus();
       return;
     }
-    if (result?.ok) pendingLiveCallRetry = false;
     setLiveStatus(result?.ok
       ? t("live.stageUp", { code: result.admissionCode ?? "?" })
       : liveCallFailureMessage(result?.code, "live.startFailed"));
@@ -344,6 +370,7 @@ startLiveCallButton?.addEventListener("click", async () => {
     setLiveStatus(message);
     if (selectedCover) setCoverStatus(message, true);
   } finally {
+    isSpeakerSessionCreating = false;
     startLiveCallButton.disabled = false;
     startLiveCallButton.removeAttribute("aria-busy");
   }
@@ -388,8 +415,9 @@ async function collectLiveDraft() {
   return {
     title: fieldValue("liveDraftTitle"),
     scheduledAt: liveDraftScheduledAt(),
-    maxViewers: Number.parseInt(fieldValue("liveDraftCapacity"), 10) || 50,
-    languages: [...document.querySelectorAll('input[name="translationLanguages"]:checked')].map((input) => input.value),
+    maxViewers: Number.parseInt(fieldValue("liveDraftCapacity"), 10) || 200,
+    participantSpeakingEnabled: Boolean(document.querySelector('input[name="liveDraftSpeaking"]')?.checked),
+    languages: selectedLiveCallLanguages(),
     coverImage: liveDraftCoverData,
   };
 }
@@ -430,10 +458,57 @@ function renderRegisteredSessions(sessions, statusText = "") {
     startButton.className = "accent compact";
     startButton.textContent = t("live.registeredStart");
     startButton.addEventListener("click", () => { void startRegisteredSession(session.id, startButton); });
-    row.append(meta, startButton);
+    const deleteButton = document.createElement("button");
+    deleteButton.type = "button";
+    deleteButton.className = "compact live-registered-delete";
+    deleteButton.textContent = t("live.registeredDelete");
+    // Two-click confirm: the first click only re-labels the button, so a slip
+    // never ends a registration; the confirm state resets on the next render.
+    deleteButton.addEventListener("click", () => {
+      if (deleteButton.dataset.confirming !== "true") {
+        deleteButton.dataset.confirming = "true";
+        deleteButton.textContent = t("live.registeredDeleteConfirm");
+        return;
+      }
+      void deleteRegisteredSession(session.id, deleteButton);
+    });
+    const speakersButton = document.createElement("button");
+    speakersButton.type = "button";
+    speakersButton.textContent = "발언자 관리";
+    speakersButton.addEventListener("click", async () => {
+      try {
+        await speakerRoster?.loadSession(session.id);
+        document.getElementById("live-speaker-roster")?.scrollIntoView({ block: "center", behavior: "smooth" });
+      } catch (error) { setLiveStatus(error.message); }
+    });
+    row.append(meta, speakersButton, startButton, deleteButton);
     rows.push(row);
   }
   registeredSessionList.replaceChildren(...rows);
+}
+
+async function deleteRegisteredSession(sessionId, button) {
+  const bridge = window.realtimeNoelDesktop;
+  if (!bridge?.deleteRegisteredLiveCall) return;
+  button.disabled = true;
+  button.setAttribute("aria-busy", "true");
+  try {
+    const result = await bridge.deleteRegisteredLiveCall(sessionId);
+    setLiveStatus(result?.ok
+      ? t("live.registeredDeleted")
+      : liveCallFailureMessage(result?.code, "live.registeredDeleteFailed"));
+    if (result?.ok) {
+      void refreshRegisteredSessions({ quiet: true });
+      return;
+    }
+  } catch {
+    setLiveStatus(t("live.registeredDeleteFailed", { code: "unknown" }));
+  } finally {
+    button.disabled = false;
+    button.removeAttribute("aria-busy");
+    delete button.dataset.confirming;
+    button.textContent = t("live.registeredDelete");
+  }
 }
 
 async function refreshRegisteredSessions({ quiet = false } = {}) {
@@ -464,7 +539,10 @@ async function startRegisteredSession(sessionId, button) {
     setLiveStatus(result?.ok
       ? t("live.stageUp", { code: result.admissionCode ?? "?" })
       : liveCallFailureMessage(result?.code, "live.registeredStartFailed"));
-    if (result?.ok) void refreshRegisteredSessions({ quiet: true });
+    if (result?.ok) {
+      void refreshRegisteredSessions({ quiet: true });
+      await speakerRoster?.loadSession(sessionId);
+    }
   } finally {
     button.disabled = false;
     button.removeAttribute("aria-busy");
@@ -477,12 +555,20 @@ registerLiveCallButton?.addEventListener("click", async () => {
     setLiveStatus(t("live.desktopOnly"));
     return;
   }
+  if (isSpeakerSessionCreating) return;
+  if (pendingSpeakerStart) { setLiveStatus("생성한 세션의 발언자 저장을 먼저 완료해 주세요."); return; }
+  isSpeakerSessionCreating = true;
   registerLiveCallButton.disabled = true;
   registerLiveCallButton.setAttribute("aria-busy", "true");
   setLiveStatus(t("live.registering"));
   try {
     const draft = await collectLiveDraft();
-    const result = await bridge.registerLiveCall(draft);
+    const result = pendingSpeakerRegistration || await bridge.registerLiveCall(draft);
+    if (result?.ok && result.sessionId && speakerRoster) {
+      pendingSpeakerRegistration = result;
+      await speakerRoster.persistForSession(result.sessionId);
+      pendingSpeakerRegistration = null;
+    }
     setLiveStatus(result?.ok
       ? t("live.registered.ok", { title: result.title || t("live.registeredNoTitle") })
       : liveCallFailureMessage(result?.code, "live.registerFailed"));
@@ -490,6 +576,7 @@ registerLiveCallButton?.addEventListener("click", async () => {
   } catch (error) {
     setLiveStatus(error instanceof Error ? error.message : t("live.registerFailedPlain"));
   } finally {
+    isSpeakerSessionCreating = false;
     registerLiveCallButton.disabled = false;
     registerLiveCallButton.removeAttribute("aria-busy");
   }
@@ -499,105 +586,142 @@ refreshRegisteredButton?.addEventListener("click", () => { void refreshRegistere
 if (window.realtimeNoelDesktop?.listRegisteredLiveCalls) void refreshRegisteredSessions({ quiet: true });
 
 
-// ── Live Call host authorization (desktop only): credentials stay in the
-// main process and are never exposed to the participant workspace. ─────────
+// ── Shared host session ──────────────────────────────────────────────────
 
 const hostLoginSection = document.getElementById("live-host-login-section");
 const hostLoginStatus = document.getElementById("live-host-login-status");
+const hostAccount = document.getElementById("live-host-account");
+const openHostLoginButton = document.getElementById("open-live-host-login");
+const logoutHostSessionButton = document.getElementById("logout-live-host-session");
+const openConsoleButton = document.getElementById("open-live-console");
+let hostAccountId = "";
+// Role of the verified session ("admin" | "host" | "legacy"); only admins see
+// the console button. The main process re-checks the role on `console:open`.
+let hostAccountRole = "";
+let hostLoginNotice = { key: "settings.hostSessionChecking", values: undefined, isError: false };
+let hostSessionRequest = null;
+let isHostSessionActionPending = false;
 
-function setHostLoginStatus(message, isError) {
-  if (!hostLoginStatus) return;
-  delete hostLoginStatus.dataset.i18n;
-  hostLoginStatus.textContent = message;
-  hostLoginStatus.classList.toggle("is-error", Boolean(isError));
+function renderHostLoginStatus() {
+  if (hostAccount) hostAccount.textContent = hostAccountId || t("settings.hostSignedOut");
+  if (hostLoginStatus) {
+    delete hostLoginStatus.dataset.i18n;
+    hostLoginStatus.textContent = t(hostLoginNotice.key, hostLoginNotice.values);
+    hostLoginStatus.classList.toggle("is-error", hostLoginNotice.isError);
+  }
+  if (openHostLoginButton) openHostLoginButton.hidden = Boolean(hostAccountId);
+  if (logoutHostSessionButton) logoutHostSessionButton.hidden = !hostAccountId;
+  if (openConsoleButton) openConsoleButton.hidden = !(hostAccountId && hostAccountRole === "admin" && window.realtimeNoelDesktop?.openConsole);
+  for (const button of [openHostLoginButton, logoutHostSessionButton, openConsoleButton]) {
+    if (!button) continue;
+    button.disabled = isHostSessionActionPending;
+    if (isHostSessionActionPending) button.setAttribute("aria-busy", "true");
+    else button.removeAttribute("aria-busy");
+  }
 }
 
-// Section ordinals are generated, not written into the markup: the host-login
-// section is hidden unless the desktop bridge is present, and hard-coded numbers
-// made Settings read "1, 3" with a hole where section 2 used to be.
+function setHostLoginNotice(key, isError = false, values) {
+  hostLoginNotice = { key, isError, values };
+  renderHostLoginStatus();
+}
+
+// Hidden desktop-only sections must not leave gaps in the settings ordinals.
 function renumberConfigSections() {
   for (const page of document.querySelectorAll("[data-workspace-page]")) {
     let ordinal = 0;
     for (const marker of page.querySelectorAll("[data-cfg-ordinal]")) {
       const section = marker.closest("section");
-      if (section?.hidden) {
-        marker.textContent = "";
-        continue;
-      }
+      if (section?.hidden) { marker.textContent = ""; continue; }
       ordinal += 1;
       marker.textContent = String(ordinal);
     }
   }
 }
-
 renumberConfigSections();
 
-async function refreshHostLoginStatus() {
+function acceptHostSession(result) {
+  if (result?.ok && typeof result.data?.userId === "string" && result.data.userId) {
+    hostAccountId = result.data.userId;
+    hostAccountRole = result.data.role === "admin" ? "admin" : result.data.role === "host" ? "host" : "legacy";
+    setHostLoginNotice("settings.hostSessionReady");
+    return true;
+  }
+  if (result?.code === "HOST_LOGIN_REQUIRED" || result?.code === "HOST_LOGIN_REJECTED") {
+    hostAccountId = "";
+    hostAccountRole = "";
+    setHostLoginNotice("settings.hostSignedOut", true);
+  } else if (result?.code === "RATE_LIMITED" && Number.isSafeInteger(result.retryAfterSeconds) && result.retryAfterSeconds > 0) {
+    setHostLoginNotice("hostSession.rateLimited", true, { seconds: result.retryAfterSeconds });
+  } else {
+    // A transport failure is not evidence that the previously known account signed out.
+    setHostLoginNotice("settings.hostSessionUnavailable", true);
+  }
+  return false;
+}
+
+function refreshHostLoginStatus() {
   const bridge = window.realtimeNoelDesktop;
-  if (!bridge?.getLiveHostLoginStatus || !hostLoginSection) return;
+  if (!bridge?.getHostSession || !hostLoginSection || isHostSessionActionPending) return Promise.resolve();
+  if (hostSessionRequest) return hostSessionRequest;
   hostLoginSection.hidden = false;
-  // Revealing a section shifts every ordinal after it.
   renumberConfigSections();
-  try {
-    const status = await bridge.getLiveHostLoginStatus();
-    if (!status?.ok) return;
-    if (form?.elements?.liveHostId && !form.elements.liveHostId.value) form.elements.liveHostId.value = status.hostId;
-    if (form?.elements?.liveHostName && !form.elements.liveHostName.value) form.elements.liveHostName.value = status.hostName;
-    setHostLoginStatus(status.hasLogin ? t("settings.authorized") : t("settings.authorizationRequired"), !status.hasLogin);
-  } catch {
-    // Bridge unavailable: leave the section as-is.
-  }
+  hostSessionRequest = (async () => {
+    try { acceptHostSession(await bridge.getHostSession()); }
+    catch { setHostLoginNotice("settings.hostSessionUnavailable", true); }
+  })().finally(() => { hostSessionRequest = null; });
+  return hostSessionRequest;
 }
 
-const HOST_LOGIN_VERIFICATION_KEYS = {
-  HOST_LOGIN_REJECTED: "settings.hostRejected",
-  NETWORK_UNAVAILABLE: "settings.hostNetworkUnavailable",
-  LOGIN_RATE_LIMITED: "settings.hostRateLimited",
-  NO_STORED_LOGIN: "settings.hostNoStoredLogin",
-};
-
-function hostLoginSaveResultMessage(result) {
-  if (!result?.ok) {
-    return result?.code === "HOST_CREDENTIAL_ENCRYPTION_UNAVAILABLE"
-      ? t("settings.hostKeychainUnavailable")
-      : t("settings.hostSaveFailed");
-  }
-  if (!result.hasLogin) return t(HOST_LOGIN_VERIFICATION_KEYS.NO_STORED_LOGIN);
-  if (result.verified) return t("settings.authorizedVerified");
-  const key = HOST_LOGIN_VERIFICATION_KEYS[result.verificationCode];
-  return key ? t(key) : t("settings.hostVerifyFailed", { code: result.verificationCode ?? "unknown" });
-}
-
-const saveHostLoginButton = document.getElementById("save-live-host-login");
-saveHostLoginButton?.addEventListener("click", async () => {
+openHostLoginButton?.addEventListener("click", async () => {
   const bridge = window.realtimeNoelDesktop;
-  if (!bridge?.saveLiveHostLogin) return;
-  saveHostLoginButton.disabled = true;
-  saveHostLoginButton.setAttribute("aria-busy", "true");
-  setHostLoginStatus(t("settings.savingHostAuthorization"), false);
+  if (!bridge?.openHostLogin || isHostSessionActionPending) return;
+  isHostSessionActionPending = true;
+  setHostLoginNotice("settings.hostSigningIn");
   try {
-    const result = await bridge.saveLiveHostLogin({
-      hostId: fieldValue("liveHostId"),
-      hostName: fieldValue("liveHostName"),
-      hostPassword: fieldValue("liveHostPassword"),
-    });
-    if (form?.elements?.liveHostPassword) form.elements.liveHostPassword.value = "";
-    const isVerified = Boolean(result?.ok && result.hasLogin && result.verified);
-    setHostLoginStatus(hostLoginSaveResultMessage(result), !isVerified);
-    // The host came here from a failed Start Live Call: finish their errand
-    // for them — go back to the Live Call page and retry automatically.
-    if (isVerified && pendingLiveCallRetry) {
-      pendingLiveCallRetry = false;
-      activatePage("livecall");
-      setLiveStatus(t("live.hostVerifiedRetry"));
-      startLiveCallButton?.click();
+    await hostSessionRequest;
+    const result = await bridge.openHostLogin();
+    if (result?.code === "LOGIN_CANCELLED") setHostLoginNotice("settings.hostLoginCancelled");
+    else if (result?.code === "LIVE_SESSION_ACTIVE") setHostLoginNotice("settings.hostLogoutLive", true);
+    else acceptHostSession(result);
+  } catch { setHostLoginNotice("settings.hostSessionUnavailable", true); }
+  finally { isHostSessionActionPending = false; renderHostLoginStatus(); }
+});
+
+logoutHostSessionButton?.addEventListener("click", async () => {
+  const bridge = window.realtimeNoelDesktop;
+  if (!bridge?.logoutHostSession || isHostSessionActionPending) return;
+  isHostSessionActionPending = true;
+  setHostLoginNotice("settings.hostSigningOut");
+  try {
+    await hostSessionRequest;
+    const result = await bridge.logoutHostSession();
+    if (result?.ok) {
+      hostAccountId = "";
+      hostAccountRole = "";
+      setHostLoginNotice("settings.hostSignedOut");
+    } else setHostLoginNotice(result?.code === "LIVE_SESSION_ACTIVE" ? "settings.hostLogoutLive" : "settings.hostSessionUnavailable", true);
+  } catch { setHostLoginNotice("settings.hostSessionUnavailable", true); }
+  finally { isHostSessionActionPending = false; renderHostLoginStatus(); }
+});
+
+openConsoleButton?.addEventListener("click", async () => {
+  const bridge = window.realtimeNoelDesktop;
+  if (!bridge?.openConsole || isHostSessionActionPending) return;
+  isHostSessionActionPending = true;
+  renderHostLoginStatus();
+  try {
+    const result = await bridge.openConsole();
+    if (!result?.ok) {
+      // The main process is the authority on the role: a refusal means the
+      // button was stale, so drop it rather than offering the same click again.
+      if (result?.code === "ADMIN_REQUIRED" || result?.code === "HOST_LOGIN_REQUIRED") hostAccountRole = "";
+      setHostLoginNotice("settings.consoleOpenFailed", true);
     }
-  } catch {
-    setHostLoginStatus(t("settings.hostSaveFailed"), true);
-  } finally {
-    saveHostLoginButton.disabled = false;
-    saveHostLoginButton.removeAttribute("aria-busy");
-  }
+  } catch { setHostLoginNotice("settings.consoleOpenFailed", true); }
+  finally { isHostSessionActionPending = false; renderHostLoginStatus(); }
+});
+window.addEventListener("focus", () => {
+  if (document.visibilityState === "visible") void refreshHostLoginStatus();
 });
 void refreshHostLoginStatus();
 
@@ -624,63 +748,24 @@ themeSwitch?.addEventListener("click", (event) => {
 });
 try { applyTheme(localStorage.getItem(THEME_STORAGE_KEY) === "light" ? "light" : "dark"); } catch { applyTheme("dark"); }
 
-// ── App language: same switch component as the theme control, sitting next to
-// it. The renderer owns the setting; the main process is told over IPC so the
-// application menu follows. ────────────────────────────────────────────────
-
-const languageSwitch = document.getElementById("workspace-language-toggle");
-
-function syncLanguageSwitch() {
-  const current = getLanguage();
-  languageSwitch?.querySelectorAll("[data-language-choice]").forEach((button) => {
-    const isActive = button.dataset.languageChoice === current;
-    button.classList.toggle("is-active", isActive);
-    button.setAttribute("aria-pressed", String(isActive));
-  });
-}
-
-function publishLanguageToMainProcess() {
-  const setter = window.realtimeNoelDesktop?.setUiLanguage;
-  if (typeof setter !== "function") return;
-  try {
-    void Promise.resolve(setter(getLanguage())).catch(() => {});
-  } catch {
-    // The bridge is optional (browser preview).
-  }
-}
-
-languageSwitch?.addEventListener("click", (event) => {
-  const choice = event.target?.closest?.("[data-language-choice]")?.dataset?.languageChoice;
-  if (!choice) return;
-  changeLanguage(choice);
+window.addEventListener("storage", (event) => {
+  if (event.key !== SYSTEM_LANGUAGE_STORAGE_KEY && event.key !== null) return;
+  if (event.storageArea && event.storageArea !== window.localStorage) return;
+  setLanguage(readStoredLanguage());
 });
 
 subscribe(() => {
   applyDocumentLanguage(document);
   applyTranslations(document);
-  syncLanguageSwitch();
   syncOverlayChip();
   syncLiveDraftLanguages();
+  renderHostLoginStatus();
   renderRegisteredSessions(registeredSessionsSnapshot.sessions, registeredSessionsSnapshot.statusText);
   activatePage(main?.dataset.activePage ?? "captions");
-  publishLanguageToMainProcess();
 });
-syncLanguageSwitch();
-publishLanguageToMainProcess();
-
-// ── Password reveal: host sign-in password visibility toggle ───────────────
-
-const hostPasswordReveal = document.getElementById("live-host-password-reveal");
-hostPasswordReveal?.addEventListener("click", () => {
-  const field = form?.elements?.liveHostPassword;
-  if (!field) return;
-  const reveal = field.type === "password";
-  field.type = reveal ? "text" : "password";
-  hostPasswordReveal.dataset.i18n = reveal ? "settings.hide" : "settings.reveal";
-  hostPasswordReveal.dataset.i18nAria = reveal ? "settings.hideLabel" : "settings.revealLabel";
-  hostPasswordReveal.textContent = t(hostPasswordReveal.dataset.i18n);
-  hostPasswordReveal.setAttribute("aria-pressed", String(reveal));
-  hostPasswordReveal.setAttribute("aria-label", t(hostPasswordReveal.dataset.i18nAria));
-});
+mountSystemLanguageButton(document.getElementById("workspace-system-language"));
 
 activatePage("captions");
+
+initSubtitleControls();
+mountCaptionDisplayPicker(window.realtimeNoelDesktop);

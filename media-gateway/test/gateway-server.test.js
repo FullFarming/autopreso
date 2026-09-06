@@ -1,28 +1,85 @@
 import assert from "node:assert/strict";
-import { createHmac } from "node:crypto";
+import { createHmac, randomUUID } from "node:crypto";
 import { once } from "node:events";
+import { connect as netConnect } from "node:net";
 import test from "node:test";
 
 import { WebSocket } from "ws";
 
 import { createGatewayServer } from "../src/gateway-server.js";
+import { DEFAULT_ENGINE_SELECTION, engineSelectionKey } from "../../packages/caption-core/index.js";
 
-function signHostToken(secret, { now = Date.now(), expiresInSeconds = 900 } = {}) {
+const SESSION_ID = "11111111-1111-4111-8111-111111111111";
+const SESSION_TWO_ID = "11111111-1111-4111-8111-111111111112";
+
+function fixtureUuid(seed) {
+  const digest = createHmac("sha256", "fixture-uuid").update(seed).digest("hex");
+  return `${digest.slice(0, 8)}-${digest.slice(8, 12)}-4${digest.slice(13, 16)}-8${digest.slice(17, 20)}-${digest.slice(20, 32)}`;
+}
+
+function signHostToken(secret, { now = Date.now(), expiresInSeconds = 900, sessionId = SESSION_ID } = {}) {
   const nowSeconds = Math.floor(now / 1_000);
-  const claims = { role: "HOST", sub: "host-1", sessionId: "session-1", aud: "media-gateway", iat: nowSeconds, exp: nowSeconds + expiresInSeconds };
+  const claims = { role: "HOST", sub: "host-1", sessionId, aud: "media-gateway", iat: nowSeconds, exp: nowSeconds + expiresInSeconds };
   const encoded = Buffer.from(JSON.stringify(claims)).toString("base64url");
   return `${encoded}.${createHmac("sha256", secret).update(encoded).digest("hex")}`;
 }
 
+async function authenticateHostSocket(url, token, options = {}) {
+  const webSocket = new WebSocket(url, options);
+  await once(webSocket, "open");
+  const authenticated = nextJsonMatching(webSocket, (message) => message.type === "authenticated");
+  webSocket.send(JSON.stringify({ type: "authenticate", token }));
+  assert.equal((await authenticated).role, "HOST");
+  return webSocket;
+}
+
+async function startHostSocket(webSocket, sessionId, languages) {
+  const started = nextJsonMatching(webSocket, (message) => message.type === "started");
+  const floor = nextJsonMatching(webSocket, (message) => message.type === "floor");
+  webSocket.send(JSON.stringify({
+    type: "start",
+    sessionId,
+    version: 1,
+    sessionType: "presentation",
+    outputMode: "captions",
+    languages,
+  }));
+  assert.equal((await started).sessionId, sessionId);
+  assert.equal((await floor).sessionId, sessionId);
+}
+
 function signViewerToken(secret, grantId, { now = Date.now(), expiresInMilliseconds = 60_000 } = {}) {
-  const claims = { role: "VIEWER", grantId, sessionId: "session-1", userId: grantId, issuedAt: now, expiresAt: now + expiresInMilliseconds };
+  const nowSeconds = Math.floor(now / 1_000);
+  const claims = {
+    role: "VIEWER",
+    sub: fixtureUuid(`viewer-${grantId}`),
+    grantId: fixtureUuid(`grant-${grantId}`),
+    sessionId: SESSION_ID,
+    aud: "live-gateway-viewer",
+    jti: randomUUID(),
+    iat: nowSeconds,
+    exp: nowSeconds + Math.ceil(expiresInMilliseconds / 1_000),
+  };
   const encoded = Buffer.from(JSON.stringify(claims)).toString("base64url");
   return `${encoded}.${createHmac("sha256", secret).update(encoded).digest("hex")}`;
 }
 
 async function nextJson(webSocket) {
-  const [data] = await once(webSocket, "message");
-  return JSON.parse(data.toString("utf8"));
+  // `engine-status` rides alongside every start/update ACK; callers of this
+  // helper want the ACK itself. Tests that pin engine-status filter for it.
+  return nextJsonMatching(webSocket, (message) => message.type !== "engine-status");
+}
+
+function nextJsonMatching(webSocket, predicate) {
+  return new Promise((resolve) => {
+    const onMessage = (data) => {
+      const message = JSON.parse(data.toString("utf8"));
+      if (!predicate(message)) return;
+      webSocket.off("message", onMessage);
+      resolve(message);
+    };
+    webSocket.on("message", onMessage);
+  });
 }
 
 async function connectHost(url) {
@@ -34,11 +91,377 @@ async function connectHost(url) {
   return webSocket;
 }
 
+async function waitForGatewayCondition(check) {
+  const deadline = Date.now() + 1_000;
+  while (!check()) {
+    assert.ok(Date.now() < deadline, "gateway condition did not settle");
+    await new Promise((resolve) => setTimeout(resolve, 2));
+  }
+}
+
+for (const pendingStage of ["factory", "start"]) {
+  test(`closing a host during pending ${pendingStage} aborts and closes the late candidate without ownership`, { timeout: 3_000 }, async (context) => {
+    let release;
+    let entered = false;
+    let signal;
+    const gate = new Promise((resolve) => { release = resolve; });
+    const pipeline = {
+      closed: 0,
+      async start() { if (pendingStage === "start") { entered = true; await gate; } },
+      async tick() {},
+      async close() { this.closed += 1; },
+    };
+    const gateway = createGatewayServer({
+      gatewaySecret: "gateway-secret", viewerSecret: "viewer-secret", hostReconnectGraceMilliseconds: 0,
+      hostAuthorizer: { async authorize() { return true; } },
+      viewerAuthorizer: { async authorizeBatch(rows) { return new Map(rows.map(({ key }) => [key, true])); } },
+      async pipelineFactory(_message, _previous, _onEvent, options) {
+        signal = options.signal;
+        if (pendingStage === "factory") { entered = true; await gate; }
+        return pipeline;
+      },
+    });
+    await new Promise((resolve) => gateway.server.listen(0, "127.0.0.1", resolve));
+    context.after(async () => { release(); await gateway.close(); });
+    const host = await connectHost(`ws://127.0.0.1:${gateway.server.address().port}/live`);
+    context.after(() => host.terminate());
+    host.send(JSON.stringify({ type: "start", sessionId: SESSION_ID, version: 1,
+      sessionType: "presentation", outputMode: "captions", languages: ["en"] }));
+    await waitForGatewayCondition(() => entered);
+    host.close();
+    await waitForGatewayCondition(() => gateway.metrics.render().includes("realtime_noel_connection_cleanups_total 1"));
+    assert.equal(signal.aborted, true, "the socket lifetime must cancel provider preparation immediately");
+    release();
+    await waitForGatewayCondition(() => pipeline.closed === 1);
+    assert.doesNotMatch(gateway.metrics.render(), /realtime_noel_host_sessions [1-9]/u);
+  });
+}
+
+test("a host closing during reattach authorization cannot steal the retained pipeline or cancel its grace expiry", { timeout: 3_000 }, async (context) => {
+  let release;
+  let entered = false;
+  let signal;
+  const gate = new Promise((resolve) => { release = resolve; });
+  const pipeline = { closed: 0, async start() {}, async tick() {}, async close() { this.closed += 1; } };
+  const gateway = createGatewayServer({
+    gatewaySecret: "gateway-secret", viewerSecret: "viewer-secret", hostReconnectGraceMilliseconds: 300,
+    hostAuthorizer: { async authorize(_claims, _settings, options) {
+      if (options.compareVersion === false) { signal = options.signal; entered = true; await gate; }
+      return true;
+    } },
+    viewerAuthorizer: { async authorizeBatch(rows) { return new Map(rows.map(({ key }) => [key, true])); } },
+    async pipelineFactory() { return pipeline; },
+  });
+  await new Promise((resolve) => gateway.server.listen(0, "127.0.0.1", resolve));
+  context.after(async () => { release(); await gateway.close(); });
+  const url = `ws://127.0.0.1:${gateway.server.address().port}/live`;
+  const first = await connectHost(url);
+  context.after(() => first.terminate());
+  await startHostSocket(first, SESSION_ID, ["en"]);
+  first.close();
+  await waitForGatewayCondition(() => gateway.metrics.render().includes("realtime_noel_host_grace_detachments_total 1"));
+  const second = await connectHost(url);
+  context.after(() => second.terminate());
+  second.send(JSON.stringify({ type: "start", sessionId: SESSION_ID, version: 1,
+    sessionType: "presentation", outputMode: "captions", languages: ["en"] }));
+  await waitForGatewayCondition(() => entered);
+  second.close();
+  await waitForGatewayCondition(() => gateway.metrics.render().includes("realtime_noel_connection_cleanups_total 2"));
+  assert.equal(signal.aborted, true);
+  release();
+  await waitForGatewayCondition(() => pipeline.closed === 1);
+  assert.doesNotMatch(gateway.metrics.render(), /realtime_noel_host_reattaches_total [1-9]/u);
+});
+
+test("source fanout reaches each authorized subscribed viewer once across language switches and only the owned host", { timeout: 3_000 }, async (context) => {
+  let clock = Date.now();
+  let allowed = true;
+  let factoryCalls = 0;
+  let sourcePipeline;
+  let pipelineGeneration;
+  const gateway = createGatewayServer({
+    now: () => clock, gatewaySecret: "gateway-secret", viewerSecret: "viewer-secret",
+    hostAuthorizer: { async authorize() { return true; } },
+    viewerAuthorizer: { async authorizeBatch(rows) { return new Map(rows.map(({ key }) => [key, allowed])); } },
+    async pipelineFactory(_settings, _previous, _emit, options) {
+      pipelineGeneration = options.pipelineGeneration;
+      factoryCalls += 1;
+      sourcePipeline = { isPaused: false, async start() {}, async tick() {}, async close() {} };
+      return sourcePipeline;
+    },
+  });
+  await new Promise((resolve) => gateway.server.listen(0, "127.0.0.1", resolve));
+  context.after(() => gateway.close());
+  const url = `ws://127.0.0.1:${gateway.server.address().port}/live`;
+  const owner = await connectHost(url);
+  const unownedHost = await connectHost(url);
+  context.after(() => owner.terminate());
+  context.after(() => unownedHost.terminate());
+  await startHostSocket(owner, SESSION_ID, ["ko", "en"]);
+  const viewers = [];
+  for (const [index, language] of ["ko", "en", null].entries()) {
+    const viewer = new WebSocket(url);
+    viewers.push(viewer);
+    context.after(() => viewer.terminate());
+    await once(viewer, "open");
+    let reply = nextJson(viewer);
+    viewer.send(JSON.stringify({ type: "authenticate", token: signViewerToken("viewer-secret", `source-${index}`, { now: clock }) }));
+    await reply;
+    if (language) {
+      reply = nextJsonMatching(viewer, (message) => message.type === "subscribed");
+      viewer.send(JSON.stringify({ type: "subscribe", sessionId: SESSION_ID, language }));
+      await reply;
+    }
+  }
+  const seen = new Map([owner, unownedHost, ...viewers].map((socket) => [socket, []]));
+  for (const [socket, messages] of seen) socket.on("message", (data) => messages.push(JSON.parse(data.toString())));
+  const emitSource = (event, metadata = {}) => gateway.broadcastSourceEvent(event, { pipelineGeneration, ...metadata });
+  const source = { type: "source", sessionId: SESSION_ID, sourceUtteranceId: fixtureUuid("source-one"),
+    sourceSeq: 1, utteranceKey: "source-one", text: "2026", sourceLanguage: "und", isFinal: true };
+  for (const draft of [
+    { type: "source-draft", sessionId: SESSION_ID, generation: fixtureUuid("draft"), revision: 1, text: "검토 중", sourceLanguage: "ko" },
+    { type: "source-draft-clear", sessionId: SESSION_ID, generation: fixtureUuid("draft"), revision: 2 },
+    { type: "source-status", sessionId: SESSION_ID, status: "unavailable", code: "SOURCE_RECORDING_UNAVAILABLE" },
+  ]) {
+    await emitSource(draft);
+    await waitForGatewayCondition(() => seen.get(viewers[1]).length === 1);
+    assert.deepEqual(seen.get(viewers[0]), [{ type: "live-event", payload: draft }]);
+    assert.deepEqual(seen.get(owner), [draft]);
+    for (const messages of seen.values()) messages.length = 0;
+  }
+  await emitSource(source, { pipelineGeneration: fixtureUuid("stale-pipeline") });
+  await gateway.broadcastSourceEvent(source);
+  sourcePipeline.isPaused = true;
+  await emitSource(source);
+  sourcePipeline.isPaused = false;
+  await emitSource(source, { mediaFence: { epoch: 99, ownerId: fixtureUuid("wrong-owner") } });
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.ok([...seen.values()].every((messages) => messages.length === 0), "paused and mismatched owner events cannot escape");
+  await emitSource(source);
+  await waitForGatewayCondition(() => seen.get(viewers[1]).length === 1);
+  for (const viewer of viewers.slice(0, 2)) assert.deepEqual(seen.get(viewer), [{ type: "live-event", payload: source }]);
+  assert.deepEqual(seen.get(owner), [source]);
+  assert.deepEqual(seen.get(unownedHost), []);
+  assert.deepEqual(seen.get(viewers[2]), []);
+  const switched = nextJsonMatching(viewers[0], (message) => message.type === "subscribed");
+  viewers[0].send(JSON.stringify({ type: "subscribe", sessionId: SESSION_ID, language: "en" }));
+  await switched;
+  for (const messages of seen.values()) messages.length = 0;
+  await emitSource({ ...source, sourceSeq: 2 });
+  await waitForGatewayCondition(() => seen.get(viewers[1]).length === 1);
+  assert.equal(seen.get(viewers[0]).length, 1, "language switching must not duplicate source delivery");
+  for (const messages of seen.values()) messages.length = 0;
+  await emitSource({ ...source, sessionId: SESSION_TWO_ID });
+  assert.ok([...seen.values()].every((messages) => messages.length === 0));
+  allowed = false;
+  clock += 5_000;
+  await emitSource({ ...source, sourceSeq: 3 });
+  await waitForGatewayCondition(() => seen.get(viewers[0]).some((message) => message.code === "GRANT_REVOKED"));
+  assert.ok(viewers.every((viewer) => !seen.get(viewer).some((message) => message.payload?.type === "source")));
+  assert.equal(factoryCalls, 1, "reads and language changes cannot allocate providers");
+});
+
+test("demand mode cannot create a provider for a host without a connected viewer", { timeout: 2_000 }, async (context) => {
+  let created = 0;
+  const runtime = { sessionId: SESSION_ID, epoch: 1, state: "waking", hostSourceReady: true,
+    connectedCount: 0, wakeDeadline: new Date(Date.now() + 45_000).toISOString() };
+  const gateway = createGatewayServer({
+    gatewaySecret: "gateway-secret", viewerSecret: "viewer-secret", hostStartTimeoutMilliseconds: 20,
+    mediaDemandStore: { async read() { return runtime; }, async transition() { return runtime; } },
+    viewerAuthorizer: { async authorizeBatch(requests) { return new Map(requests.map(({ key }) => [key, true])); } },
+    hostAuthorizer: { async authorize() { return true; } },
+    async pipelineFactory() { created += 1; throw new Error("UNEXPECTED_PROVIDER"); },
+  });
+  await new Promise((resolve) => gateway.server.listen(0, "127.0.0.1", resolve));
+  context.after(() => gateway.close());
+  const host = await connectHost(`ws://127.0.0.1:${gateway.server.address().port}/live`);
+  context.after(() => host.terminate());
+  const error = nextJsonMatching(host, (message) => message.type === "error");
+  host.send(JSON.stringify({ type: "start", sessionId: SESSION_ID, version: 1, sessionType: "presentation", outputMode: "captions", languages: ["en"] }));
+  assert.equal((await error).code, "MEDIA_START_TIMEOUT");
+  assert.equal(created, 0);
+});
+
+test("demand mode starts once for a connected viewer then idles without ending the meeting", { timeout: 2_000 }, async (context) => {
+  let now = Date.now();
+  let runtime = { sessionId: SESSION_ID, epoch: 1, state: "waking", hostSourceReady: true,
+    connectedCount: 0, wakeDeadline: new Date(now + 45_000).toISOString(), idleAfter: null };
+  const events = [];
+  const gateway = createGatewayServer({
+    now: () => now, gatewaySecret: "gateway-secret", viewerSecret: "viewer-secret", mediaDemandPollMilliseconds: 5,
+    mediaDemandStore: {
+      async read() { return runtime; },
+      async transition(_session, _epoch, _owner, action) {
+        if (action === "connect") runtime = { ...runtime, connectedCount: 1 };
+        if (action === "ready") runtime = { ...runtime, state: "active" };
+        if (action === "disconnect") runtime = { ...runtime, connectedCount: 0, idleAfter: new Date(now + 30_000).toISOString() };
+        events.push(action); return runtime;
+      },
+    },
+    viewerAuthorizer: { async authorizeBatch(requests) { return new Map(requests.map(({ key }) => [key, true])); } },
+    hostAuthorizer: { async authorize() { return true; } },
+    async pipelineFactory(_settings, _previous, _emit, options) {
+      assert.equal(options.requireDurableSeed, true);
+      return { async start() { events.push("provider-start"); }, async tick() {}, async acceptAudio() {},
+        async gracefulDrain() { events.push("drain-finals"); }, async close() { events.push("provider-close"); },
+        async completeTopicsOnSessionEnd() { events.push("meeting-ended"); } };
+    },
+  });
+  await new Promise((resolve) => gateway.server.listen(0, "127.0.0.1", resolve));
+  context.after(() => gateway.close());
+  const url = `ws://127.0.0.1:${gateway.server.address().port}/live`;
+  const viewer = new WebSocket(url); context.after(() => viewer.terminate()); await once(viewer, "open");
+  let response = nextJsonMatching(viewer, (message) => message.type === "authenticated");
+  viewer.send(JSON.stringify({ type: "authenticate", token: signViewerToken("viewer-secret", "demand-viewer") })); await response;
+  response = nextJsonMatching(viewer, (message) => message.type === "subscribed");
+  viewer.send(JSON.stringify({ type: "subscribe", sessionId: SESSION_ID, language: "en", epoch: 1, connectionId: randomUUID() })); await response;
+  const host = await connectHost(url); context.after(() => host.terminate());
+  await startHostSocket(host, SESSION_ID, ["en"]);
+  assert.equal(events.filter((event) => event === "provider-start").length, 1);
+  const idle = nextJsonMatching(host, (message) => message.type === "media-idle");
+  viewer.close(); await once(viewer, "close");
+  await new Promise((resolve) => setTimeout(resolve, 5)); now += 30_001;
+  assert.equal((await idle).reason, "no_audience");
+  assert.equal(events.includes("meeting-ended"), false);
+  assert.ok(events.indexOf("drain-finals") < events.indexOf("provider-close"));
+});
+
+test("browser HOST receives every configured caption and session status without widening desktop mirroring", async (context) => {
+  const hostEventEmitters = new Map();
+  const gateway = createGatewayServer({
+    gatewaySecret: "gateway-secret",
+    viewerSecret: "viewer-secret",
+    securityPolicy: {
+      allowedOrigins: new Set(["https://portal.example.com"]),
+      allowTrustedNonBrowser: true,
+      allowLoopbackWithoutOrigin: false,
+      metricsToken: "",
+    },
+    viewerAuthorizer: { async authorize() { return true; }, async authorizeBatch(requests) { return new Map(requests.map(({ key }) => [key, true])); } },
+    hostAuthorizer: { async authorize() { return true; } },
+    async pipelineFactory(settings, _previous, onHostEvent) {
+      hostEventEmitters.set(settings.sessionId, onHostEvent);
+      return {
+        async start() {}, async tick() {}, async acceptAudio() {},
+        async endAudioStream() {}, async pause() {}, async close() {},
+      };
+    },
+  });
+  await new Promise((resolve) => gateway.server.listen(0, "127.0.0.1", resolve));
+  context.after(async () => gateway.close());
+  const url = `ws://127.0.0.1:${gateway.server.address().port}/live`;
+
+  const browserToken = signHostToken("gateway-secret", { sessionId: SESSION_ID });
+  const browserHost = await authenticateHostSocket(url, browserToken, { origin: "https://portal.example.com" });
+  context.after(() => browserHost.terminate());
+  await startHostSocket(browserHost, SESSION_ID, ["ko", "en"]);
+
+  const desktopToken = signHostToken("gateway-secret", { sessionId: SESSION_TWO_ID });
+  const desktopHost = await authenticateHostSocket(url, desktopToken, {
+    headers: {
+      authorization: `Bearer ${desktopToken}`,
+      "x-realtime-noel-client": "desktop-main",
+    },
+  });
+  context.after(() => desktopHost.terminate());
+  await startHostSocket(desktopHost, SESSION_TWO_ID, ["ko", "en"]);
+
+  const browserMessages = [];
+  const desktopMessages = [];
+  browserHost.on("message", (data) => browserMessages.push(JSON.parse(data.toString("utf8"))));
+  desktopHost.on("message", (data) => desktopMessages.push(JSON.parse(data.toString("utf8"))));
+
+  const sourceCaption = nextJsonMatching(browserHost, (message) => message.type === "caption" && message.language === "ko");
+  await gateway.broadcastEvent(SESSION_ID, "ko", {
+    type: "caption", sessionId: SESSION_ID, language: "ko", seq: 1,
+    utteranceKey: "utterance-1", text: "원문", isFinal: true,
+  });
+  await sourceCaption;
+  const translatedCaption = nextJsonMatching(browserHost, (message) => message.type === "caption" && message.language === "en");
+  await gateway.broadcastEvent(SESSION_ID, "en", {
+    type: "caption", sessionId: SESSION_ID, language: "en", seq: 1,
+    utteranceKey: "utterance-1", text: "Translation", isFinal: true,
+  });
+  await translatedCaption;
+  await gateway.broadcastEvent(SESSION_ID, "ja", {
+    type: "caption", sessionId: SESSION_ID, language: "ja", seq: 1,
+    utteranceKey: "utterance-1", text: "未設定", isFinal: true,
+  });
+  await gateway.broadcastEvent(SESSION_TWO_ID, "ko", {
+    type: "caption", sessionId: SESSION_TWO_ID, language: "ko", seq: 1,
+    utteranceKey: "utterance-2", text: "desktop must not mirror host speech", isFinal: true,
+  });
+  const pausedStatus = nextJsonMatching(browserHost, (message) => message.type === "session-status" && message.status === "paused");
+  browserHost.send(JSON.stringify({ type: "pause" }));
+  await pausedStatus;
+
+  assert.deepEqual(
+    browserMessages.filter((message) => message.type === "caption").map(({ language, text }) => ({ language, text })),
+    [{ language: "ko", text: "원문" }, { language: "en", text: "Translation" }],
+  );
+  assert.equal(browserMessages.some((message) => message.type === "session-status" && message.status === "paused"), true);
+  assert.equal(desktopMessages.some((message) => message.type === "caption"), false);
+
+  browserHost.terminate();
+  await once(browserHost, "close");
+  await new Promise((resolve) => setImmediate(resolve));
+  const desktopReattach = await authenticateHostSocket(url, browserToken, {
+    headers: {
+      authorization: `Bearer ${browserToken}`,
+      "x-realtime-noel-client": "desktop-main",
+    },
+  });
+  context.after(() => desktopReattach.terminate());
+  await startHostSocket(desktopReattach, SESSION_ID, ["ko", "en"]);
+  const participantPartial = nextJsonMatching(
+    desktopReattach,
+    (message) => message.type === "caption" && message.text === "participant partial",
+  );
+  hostEventEmitters.get(SESSION_ID)({
+    type: "caption", sessionId: SESSION_ID, language: "ko", seq: 1,
+    utteranceKey: "participant-1", text: "participant partial", isFinal: false,
+    speaker: { speakerId: "participant:1" }, translationStatus: "translated",
+  });
+  assert.equal((await participantPartial).text, "participant partial");
+});
+
+test("viewer cannot subscribe to a language outside the active host configuration", async (context) => {
+  const gateway = createGatewayServer({
+    gatewaySecret: "gateway-secret",
+    viewerSecret: "viewer-secret",
+    viewerAuthorizer: { async authorize() { return true; }, async authorizeBatch(requests) { return new Map(requests.map(({ key }) => [key, true])); } },
+    hostAuthorizer: { async authorize() { return true; } },
+    async pipelineFactory() {
+      return {
+        async start() {}, async tick() {}, async acceptAudio() {},
+        async endAudioStream() {}, async close() {},
+      };
+    },
+  });
+  await new Promise((resolve) => gateway.server.listen(0, "127.0.0.1", resolve));
+  context.after(async () => gateway.close());
+  const url = `ws://127.0.0.1:${gateway.server.address().port}/live`;
+  const host = await connectHost(url);
+  context.after(() => host.terminate());
+  await startHostSocket(host, SESSION_ID, ["ko"]);
+
+  const viewer = new WebSocket(url);
+  context.after(() => viewer.terminate());
+  await once(viewer, "open");
+  const authenticated = nextJsonMatching(viewer, (message) => message.type === "authenticated");
+  viewer.send(JSON.stringify({ type: "authenticate", token: signViewerToken("viewer-secret", "grant-1") }));
+  await authenticated;
+  const rejected = nextJson(viewer);
+  viewer.send(JSON.stringify({ type: "subscribe", sessionId: SESSION_ID, language: "en" }));
+  assert.equal((await rejected).code, "INVALID_SUBSCRIPTION");
+  assert.equal(gateway.subscriberCount(SESSION_ID, "en"), 0);
+});
+
 test("public /health aliases local /healthz with the same no-store JSON contract", async (context) => {
   const gateway = createGatewayServer({
     gatewaySecret: "gateway-secret",
     viewerSecret: "viewer-secret",
-    viewerAuthorizer: { async authorize() { return true; } },
+    viewerAuthorizer: { async authorize() { return true; }, async authorizeBatch(requests) { return new Map(requests.map(({ key }) => [key, true])); } },
     hostAuthorizer: { async authorize() { return true; } },
     async pipelineFactory() { throw new Error("UNUSED"); },
   });
@@ -53,6 +476,29 @@ test("public /health aliases local /healthz with the same no-store JSON contract
     assert.equal(response.headers.get("cache-control"), "no-store");
     assert.deepEqual(await response.json(), { ok: true });
   }
+
+  for (const method of ["HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]) {
+    for (const path of ["/health", "/healthz"]) {
+      const response = await fetch(`http://127.0.0.1:${address.port}${path}`, { method });
+      assert.equal(response.status, 404, `${method} ${path} must not enter the health handler`);
+      assert.equal(await response.text(), "");
+    }
+  }
+
+  for (const path of [
+    "/health?details=true",
+    "/healthz?details=true",
+    "/health/",
+    "/healthz/",
+    "/healthcheck",
+    "/healthz-extra",
+    "/%68ealth",
+    "/health%3Fdetails=true",
+  ]) {
+    const response = await fetch(`http://127.0.0.1:${address.port}${path}`);
+    assert.equal(response.status, 404, `GET ${path} must not enter the health handler`);
+    assert.equal(await response.text(), "");
+  }
 });
 
 test("host can hot-swap a prepared pipeline and explicitly end an audio turn", async (context) => {
@@ -60,7 +506,7 @@ test("host can hot-swap a prepared pipeline and explicitly end an audio turn", a
   const gateway = createGatewayServer({
     gatewaySecret: "gateway-secret",
     viewerSecret: "viewer-secret",
-    viewerAuthorizer: { async authorize() { return true; } },
+    viewerAuthorizer: { async authorize() { return true; }, async authorizeBatch(requests) { return new Map(requests.map(({ key }) => [key, true])); } },
     hostAuthorizer: { async authorize() { return true; } },
     async pipelineFactory(settings) {
       const pipeline = {
@@ -92,10 +538,11 @@ test("host can hot-swap a prepared pipeline and explicitly end an audio turn", a
   webSocket.send(JSON.stringify({ type: "authenticate", token: signHostToken("gateway-secret") }));
   assert.equal((await received).type, "authenticated");
 
-  received = nextJson(webSocket);
+  const startedMessage = nextJsonMatching(webSocket, (message) => message.type === "started");
+  const startedFloor = nextJsonMatching(webSocket, (message) => message.type === "floor");
   webSocket.send(JSON.stringify({
     type: "start",
-    sessionId: "session-1",
+    sessionId: SESSION_ID,
     sessionType: "presentation",
     outputMode: "captions_audio",
     maxViewers: 24,
@@ -103,17 +550,19 @@ test("host can hot-swap a prepared pipeline and explicitly end an audio turn", a
     version: 1,
     languages: ["en"],
   }));
-  const started = await received;
+  const started = await startedMessage;
   assert.equal(started.type, "started");
   assert.equal(started.sessionType, "presentation");
-  assert.equal(started.outputMode, "captions_audio");
+  assert.equal(started.outputMode, "captions");
   assert.equal(started.maxViewers, 24);
   assert.equal(started.glossaryPack, "hotel");
+  assert.equal((await startedFloor).holder, null);
 
-  received = nextJson(webSocket);
+  const updatedMessage = nextJsonMatching(webSocket, (message) => message.type === "updated");
+  const updatedFloor = nextJsonMatching(webSocket, (message) => message.type === "floor");
   webSocket.send(JSON.stringify({
     type: "update",
-    sessionId: "session-1",
+    sessionId: SESSION_ID,
     sessionType: "meeting",
     outputMode: "audio",
     maxViewers: 16,
@@ -121,12 +570,13 @@ test("host can hot-swap a prepared pipeline and explicitly end an audio turn", a
     version: 1,
     languages: ["ko", "en"],
   }));
-  const updated = await received;
+  const updated = await updatedMessage;
   assert.equal(updated.type, "updated");
-  assert.equal(updated.outputMode, "audio");
+  assert.equal(updated.outputMode, "captions");
+  assert.equal((await updatedFloor).holder, null);
   assert.equal(pipelines[0].closed, 1);
 
-  received = nextJson(webSocket);
+  received = nextJsonMatching(webSocket, (message) => message.type === "audio-stream-ended");
   webSocket.send(JSON.stringify({ type: "audioStreamEnd" }));
   assert.equal((await received).type, "audio-stream-ended");
   assert.equal(pipelines[1].ended, 1);
@@ -142,7 +592,7 @@ test("host translation restart rebuilds the pipeline without ending the live cal
   const gateway = createGatewayServer({
     gatewaySecret: "gateway-secret",
     viewerSecret: "viewer-secret",
-    viewerAuthorizer: { async authorize() { return true; } },
+    viewerAuthorizer: { async authorize() { return true; }, async authorizeBatch(requests) { return new Map(requests.map(({ key }) => [key, true])); } },
     hostAuthorizer: {
       async authorize(_claims, _settings, options) {
         authorizationOptions.push(options);
@@ -168,51 +618,62 @@ test("host translation restart rebuilds the pipeline without ending the live cal
   const host = await connectHost(`ws://127.0.0.1:${gateway.server.address().port}/live`);
   context.after(() => host.terminate());
 
-  let received = nextJson(host);
+  const started = nextJsonMatching(host, (message) => message.type === "started");
+  const startedFloor = nextJsonMatching(host, (message) => message.type === "floor");
   host.send(JSON.stringify({
     type: "start",
-    sessionId: "session-1",
+    sessionId: SESSION_ID,
     sessionType: "meeting",
     outputMode: "captions",
     version: 2,
     languages: ["ko", "en"],
   }));
-  assert.equal((await received).type, "started");
+  assert.equal((await started).type, "started");
+  assert.equal((await startedFloor).holder, null);
 
-  received = nextJson(host);
+  const restartedMessage = nextJsonMatching(host, (message) => message.type === "restarted");
+  const restartedFloor = nextJsonMatching(host, (message) => message.type === "floor");
   host.send(JSON.stringify({
     type: "restart",
-    sessionId: "session-1",
+    sessionId: SESSION_ID,
     sessionType: "meeting",
     outputMode: "captions",
     version: 2,
     languages: ["ko", "en"],
   }));
-  const restarted = await received;
+  const restarted = await restartedMessage;
   assert.equal(restarted.type, "restarted");
-  assert.equal(restarted.sessionId, "session-1");
+  assert.equal(restarted.sessionId, SESSION_ID);
+  assert.equal((await restartedFloor).holder, null);
   assert.equal(pipelines.length, 2);
   assert.equal(pipelines[0].closed, 1);
   assert.equal(pipelines[1].closed, 0);
   assert.ok(authorizationOptions.every((options) => options.requireLive === true));
 });
 
-test("gateway starts translation only after the database session is live", async (context) => {
-  const authorizationOptions = [];
+test("gateway starts a preparing host candidate then commits readiness before ACK", async (context) => {
+  const events = [];
+  const activationKey = "11111111-1111-4111-8111-111111111111";
   const gateway = createGatewayServer({
     gatewaySecret: "gateway-secret",
     viewerSecret: "viewer-secret",
-    viewerAuthorizer: { async authorize() { return true; } },
+    viewerAuthorizer: { async authorize() { return true; }, async authorizeBatch(requests) { return new Map(requests.map(({ key }) => [key, true])); } },
     hostAuthorizer: {
       async authorize(_claims, _settings, options) {
-        authorizationOptions.push(options);
-        return options.requireLive === true;
+        events.push(["authorize", options]);
+        return options.readinessStart === true
+          ? { readinessMode: "activate", pinnedGlossaryFingerprint: `sha256:${"b".repeat(64)}` }
+          : options.requireLive === true;
+      },
+      async activate(_claims, activation, { signal }) {
+        events.push(["activate", activation, signal]);
+        return { sessionId: SESSION_ID, status: "live", version: 3 };
       },
     },
     async pipelineFactory(settings) {
       return {
         voiceOutputMode: settings.voiceOutputMode,
-        async start() {},
+        async start() { events.push(["candidate-start"]); },
         async tick() {},
         async acceptAudio() {},
         async endAudioStream() {},
@@ -227,18 +688,162 @@ test("gateway starts translation only after the database session is live", async
   const received = nextJson(host);
   host.send(JSON.stringify({
     type: "start",
-    sessionId: "session-1",
+    sessionId: SESSION_ID,
     version: 2,
+    activationKey,
     mode: "presentation",
     voiceOutputMode: "captions",
     languages: ["en"],
   }));
-  assert.equal((await received).type, "started");
-  assert.equal(authorizationOptions.length >= 2, true);
-  assert.equal(authorizationOptions[0].requireLive, true);
-  assert.equal(authorizationOptions[0].compareVersion, true);
-  assert.equal(authorizationOptions[1].requireLive, true);
-  assert.equal(authorizationOptions[1].compareVersion, true);
+  const reply = await received;
+  assert.equal(reply.type, "started", JSON.stringify(reply));
+  assert.equal(reply.version, 3);
+  assert.equal(events[0][0], "authorize");
+  assert.equal(events[0][1].readinessStart, true);
+  assert.equal(events[1][0], "candidate-start");
+  assert.equal(events[2][0], "activate");
+  assert.equal(events[2][1].activationKey, activationKey);
+  assert.match(events[2][1].gatewaySettingsFingerprint, /^sha256:[a-f0-9]{64}$/u);
+
+  const replayed = nextJsonMatching(host, (message) => message.type === "started");
+  host.send(JSON.stringify({
+    type: "start", sessionId: SESSION_ID, version: 2, activationKey,
+    mode: "presentation", voiceOutputMode: "captions", languages: ["en"],
+  }));
+  assert.equal((await replayed).version, 3);
+  assert.equal(events.filter(([name]) => name === "candidate-start").length, 1);
+  assert.equal(events.filter(([name]) => name === "activate").length, 1);
+});
+
+test("an explicit restart can activate a preparing session after provider failure without allowing automatic retries", async (context) => {
+  let status = "preparing";
+  let version = 2;
+  const candidates = [];
+  const activations = [];
+  const gateway = createGatewayServer({
+    gatewaySecret: "gateway-secret", viewerSecret: "viewer-secret",
+    viewerAuthorizer: { async authorizeBatch(requests) { return new Map(requests.map(({ key }) => [key, true])); } },
+    hostAuthorizer: {
+      async authorize(_claims, settings, options) {
+        if (settings.version !== version || settings.languages.join(",") !== "en") return false;
+        if (options.readinessStart) return { sessionStatus: status, readinessMode: status === "preparing" ? "activate" : "resume-live", pinnedGlossaryFingerprint: null };
+        return status === "live";
+      },
+      async activate(_claims, activation) {
+        activations.push(activation);
+        status = "live";
+        version += 1;
+        return { sessionId: SESSION_ID, status, version };
+      },
+    },
+    async pipelineFactory(_settings, _previous, _emit, options) {
+      const candidate = {
+        options, closed: 0,
+        async start() { if (candidates[0] === this) throw new Error("PROVIDER_START_FAILED"); },
+        async tick() {}, async close() { this.closed += 1; },
+      };
+      candidates.push(candidate);
+      return candidate;
+    },
+  });
+  await new Promise((resolve) => gateway.server.listen(0, "127.0.0.1", resolve));
+  context.after(() => gateway.close());
+  const host = await connectHost(`ws://127.0.0.1:${gateway.server.address().port}/live`);
+  context.after(() => host.terminate());
+  const activationKey = fixtureUuid("preparing-explicit-restart");
+  async function request(overrides = {}) {
+    const reply = nextJsonMatching(host, (message) => ["error", "started", "restarted"].includes(message.type));
+    host.send(JSON.stringify({ type: "start", sessionId: SESSION_ID, version: 2, activationKey,
+      sessionType: "presentation", outputMode: "captions", languages: ["en"], ...overrides }));
+    return reply;
+  }
+  assert.equal((await request()).requiresManualRestart, true);
+  assert.equal(status, "preparing");
+  assert.equal(candidates[0].closed, 1);
+  const freshActivationKey = fixtureUuid("fresh-http-start-intent");
+  assert.equal((await request({ activationKey: freshActivationKey })).code, "PIPELINE_RESTART_REQUIRED");
+  assert.equal((await request({ type: "restart", activationKey: undefined })).code, "SESSION_REVOKED");
+  assert.equal((await request({ type: "restart", activationKey: "not-a-uuid" })).code, "INVALID_ACTIVATION_KEY");
+  assert.equal((await request({ type: "restart", activationKey: [freshActivationKey] })).code, "INVALID_ACTIVATION_KEY");
+  assert.equal((await request({ type: "restart", version: 1, activationKey: freshActivationKey })).code, "SESSION_REVOKED");
+  assert.equal(candidates.length, 1);
+  const restarted = await request({ type: "restart", activationKey: freshActivationKey });
+  assert.equal(restarted.type, "restarted", JSON.stringify(restarted));
+  assert.equal(restarted.version, 3);
+  assert.equal(status, "live");
+  assert.equal(candidates.length, 2);
+  assert.equal(candidates[1].options.requireDurableSeed, true);
+  assert.equal(candidates[1].options.recoveryReason, undefined, "preparing rooms cannot use the live-only reconciliation RPC");
+  assert.equal(activations.length, 1);
+  assert.equal(activations[0].activationKey, freshActivationKey);
+});
+
+test("readiness CAS failure closes the candidate exactly once without a started ACK", async (context) => {
+  const candidate = {
+    closed: 0,
+    async start() {}, async tick() {}, async acceptAudio() {}, async endAudioStream() {},
+    async close() { this.closed += 1; },
+  };
+  const gateway = createGatewayServer({
+    gatewaySecret: "gateway-secret", viewerSecret: "viewer-secret",
+    viewerAuthorizer: { async authorize() { return true; }, async authorizeBatch(requests) { return new Map(requests.map(({ key }) => [key, true])); } },
+    hostAuthorizer: {
+      async authorize(_claims, _settings, options) {
+        return options.readinessStart === true ? { readinessMode: "activate", pinnedGlossaryFingerprint: null } : false;
+      },
+      async activate() { throw new Error("GATEWAY_READINESS_CONFLICT"); },
+    },
+    async pipelineFactory() { return candidate; },
+  });
+  await new Promise((resolve) => gateway.server.listen(0, "127.0.0.1", resolve));
+  context.after(async () => gateway.close());
+  const host = await connectHost(`ws://127.0.0.1:${gateway.server.address().port}/live`);
+  context.after(() => host.terminate());
+  const reply = nextJson(host);
+  host.send(JSON.stringify({
+    type: "start", sessionId: SESSION_ID, version: 2,
+    activationKey: "11111111-1111-4111-8111-111111111111",
+    sessionType: "meeting", outputMode: "captions", languages: ["ko"],
+  }));
+  assert.equal((await reply).code, "GATEWAY_READINESS_CONFLICT");
+  assert.equal(candidate.closed, 1);
+});
+
+test("a live database session rebuilds a lost gateway pipeline without readiness CAS", async (context) => {
+  let activateCalls = 0;
+  let pipelineStarts = 0;
+  const gateway = createGatewayServer({
+    gatewaySecret: "gateway-secret", viewerSecret: "viewer-secret",
+    viewerAuthorizer: { async authorize() { return true; }, async authorizeBatch(requests) { return new Map(requests.map(({ key }) => [key, true])); } },
+    hostAuthorizer: {
+      async authorize(_claims, _settings, options) {
+        if (options.readinessStart) return { readinessMode: "resume-live", pinnedGlossaryFingerprint: null };
+        return options.requireLive === true;
+      },
+      async activate() { activateCalls += 1; throw new Error("CAS_MUST_NOT_RUN"); },
+    },
+    async pipelineFactory() {
+      return {
+        async start() { pipelineStarts += 1; }, async tick() {}, async acceptAudio() {},
+        async endAudioStream() {}, async close() {},
+      };
+    },
+  });
+  await new Promise((resolve) => gateway.server.listen(0, "127.0.0.1", resolve));
+  context.after(async () => gateway.close());
+  const host = await connectHost(`ws://127.0.0.1:${gateway.server.address().port}/live`);
+  context.after(() => host.terminate());
+  const reply = nextJsonMatching(host, (message) => message.type === "started" || message.type === "error");
+  host.send(JSON.stringify({
+    type: "start", sessionId: SESSION_ID, version: 8,
+    activationKey: "22222222-2222-4222-8222-222222222222",
+    sessionType: "meeting", outputMode: "captions", languages: ["ko"],
+  }));
+  const started = await reply;
+  assert.equal(started.type, "started", JSON.stringify(started));
+  assert.equal(started.version, 8);
+  assert.equal(pipelineStarts, 1);
+  assert.equal(activateCalls, 0);
 });
 
 test("a reconnecting host replaces ownership without closing the old pipeline twice", async (context) => {
@@ -246,7 +851,7 @@ test("a reconnecting host replaces ownership without closing the old pipeline tw
   const gateway = createGatewayServer({
     gatewaySecret: "gateway-secret",
     viewerSecret: "viewer-secret",
-    viewerAuthorizer: { async authorize() { return true; } },
+    viewerAuthorizer: { async authorize() { return true; }, async authorizeBatch(requests) { return new Map(requests.map(({ key }) => [key, true])); } },
     hostAuthorizer: { async authorize() { return true; } },
     async pipelineFactory() {
       const pipeline = {
@@ -275,14 +880,14 @@ test("a reconnecting host replaces ownership without closing the old pipeline tw
   first.send(JSON.stringify({ type: "authenticate", token: signHostToken("gateway-secret") }));
   assert.equal((await received).type, "authenticated");
   received = nextJson(first);
-  first.send(JSON.stringify({ type: "start", sessionId: "session-1", mode: "presentation", voiceOutputMode: "captions", version: 1, languages: ["en"] }));
+  first.send(JSON.stringify({ type: "start", sessionId: SESSION_ID, mode: "presentation", voiceOutputMode: "captions", version: 1, languages: ["en"] }));
   assert.equal((await received).type, "started");
 
   received = nextJson(second);
   second.send(JSON.stringify({ type: "authenticate", token: signHostToken("gateway-secret") }));
   assert.equal((await received).type, "authenticated");
   received = nextJson(second);
-  second.send(JSON.stringify({ type: "start", sessionId: "session-1", mode: "meeting", voiceOutputMode: "captions", version: 1, languages: ["ko"] }));
+  second.send(JSON.stringify({ type: "start", sessionId: SESSION_ID, mode: "meeting", voiceOutputMode: "captions", version: 1, languages: ["ko"] }));
   assert.equal((await received).type, "started");
   await new Promise((resolve) => setImmediate(resolve));
 
@@ -291,12 +896,12 @@ test("a reconnecting host replaces ownership without closing the old pipeline tw
   assert.equal(pipelines[1].closed, 0);
 });
 
-test("a grace-reattached host receives canonical captions from the preserved pipeline", async (context) => {
+test("a grace-reattached host flushes canonical buffered captions from the preserved pipeline", { timeout: 5_000 }, async (context) => {
   let emitHostEvent;
   const gateway = createGatewayServer({
     gatewaySecret: "gateway-secret",
     viewerSecret: "viewer-secret",
-    viewerAuthorizer: { async authorize() { return true; } },
+    viewerAuthorizer: { async authorize() { return true; }, async authorizeBatch(requests) { return new Map(requests.map(({ key }) => [key, true])); } },
     hostAuthorizer: { async authorize() { return true; } },
     hostReconnectGraceMilliseconds: 45_000,
     async pipelineFactory(_settings, _previous, onHostEvent) {
@@ -312,25 +917,105 @@ test("a grace-reattached host receives canonical captions from the preserved pip
   const first = await connectHost(url);
   let received = nextJson(first);
   first.send(JSON.stringify({
-    type: "start", sessionId: "session-1", version: 1,
+    type: "start", sessionId: SESSION_ID, version: 1,
     sessionType: "meeting", outputMode: "captions", languages: ["ko"],
   }));
   assert.equal((await received).type, "started");
   first.terminate();
   await once(first, "close");
+  await new Promise((resolve) => setImmediate(resolve));
+
+  emitHostEvent({ type: "caption", seq: 3, language: "ko", utteranceKey: "u-3", text: "초안", isFinal: false });
+  emitHostEvent({ type: "caption", seq: 1, language: "ko", utteranceKey: "u-1", text: "첫 확정", isFinal: true });
+  emitHostEvent({ type: "caption", seq: 3, language: "ko", utteranceKey: "u-3", text: "최신 초안", isFinal: false });
+  emitHostEvent({ type: "caption", seq: 2, language: "ko", utteranceKey: "u-2", text: "둘째 확정", isFinal: true });
+  emitHostEvent({ type: "caption", seq: 2, language: "ko", utteranceKey: "u-2", text: "늦은 초안", isFinal: false });
 
   const second = await connectHost(url);
   context.after(() => second.terminate());
-  received = nextJson(second);
+  const flushedCaptions = new Promise((resolve) => {
+    const captions = [];
+    const onMessage = (data) => {
+      const message = JSON.parse(data.toString("utf8"));
+      if (message.type !== "caption") return;
+      captions.push(message);
+      if (captions.length === 3) {
+        second.off("message", onMessage);
+        resolve(captions);
+      }
+    };
+    second.on("message", onMessage);
+  });
+  const reattachedStarted = nextJsonMatching(second, (message) => message.type === "started");
+  const reattachedFloor = nextJsonMatching(second, (message) => message.type === "floor");
   second.send(JSON.stringify({
-    type: "start", sessionId: "session-1", version: 2,
+    type: "start", sessionId: SESSION_ID, version: 2,
     sessionType: "meeting", outputMode: "captions", languages: ["ko"],
   }));
-  assert.equal((await received).type, "started");
+  assert.equal((await reattachedStarted).type, "started");
+  assert.equal((await reattachedFloor).holder, null);
 
-  received = nextJson(second);
-  emitHostEvent({ type: "caption", seq: 1, language: "ko", text: "재연결 후 자막", isFinal: true });
-  assert.equal((await received).text, "재연결 후 자막");
+  const buffered = await flushedCaptions;
+  assert.deepEqual(buffered.map(({ seq, text, isFinal }) => ({ seq, text, isFinal })), [
+    { seq: 1, text: "첫 확정", isFinal: true },
+    { seq: 2, text: "둘째 확정", isFinal: true },
+    { seq: 3, text: "최신 초안", isFinal: false },
+  ]);
+
+  const liveCaption = nextJsonMatching(second, (message) => message.type === "caption" && message.seq === 4);
+  emitHostEvent({ type: "caption", seq: 4, language: "ko", text: "재연결 후 자막", isFinal: true });
+  assert.equal((await liveCaption).text, "재연결 후 자막");
+});
+
+test("a replacement pipeline never inherits a detached pipeline's caption buffer", { timeout: 5_000 }, async (context) => {
+  const emitters = [];
+  const gateway = createGatewayServer({
+    gatewaySecret: "gateway-secret",
+    viewerSecret: "viewer-secret",
+    viewerAuthorizer: { async authorize() { return true; }, async authorizeBatch(requests) { return new Map(requests.map(({ key }) => [key, true])); } },
+    hostAuthorizer: { async authorize() { return true; } },
+    hostReconnectGraceMilliseconds: 45_000,
+    async pipelineFactory(_settings, _previous, onHostEvent) {
+      emitters.push(onHostEvent);
+      return {
+        async start() {}, async tick() {}, async acceptAudio() {}, async endAudioStream() {}, async close() {},
+      };
+    },
+  });
+  await new Promise((resolve) => gateway.server.listen(0, "127.0.0.1", resolve));
+  context.after(async () => gateway.close());
+  const url = `ws://127.0.0.1:${gateway.server.address().port}/live`;
+  const first = await connectHost(url);
+  const firstStarted = nextJsonMatching(first, (message) => message.type === "started");
+  const firstFloor = nextJsonMatching(first, (message) => message.type === "floor");
+  first.send(JSON.stringify({
+    type: "start", sessionId: SESSION_ID, version: 1,
+    sessionType: "meeting", outputMode: "captions", languages: ["ko"],
+  }));
+  assert.equal((await firstStarted).type, "started");
+  assert.equal((await firstFloor).holder, null);
+  first.terminate();
+  await once(first, "close");
+  await new Promise((resolve) => setImmediate(resolve));
+  emitters[0]({ type: "caption", seq: 1, language: "ko", text: "폐기할 이전 자막", isFinal: true });
+
+  const replacement = await connectHost(url);
+  context.after(() => replacement.terminate());
+  const replacementStarted = nextJsonMatching(replacement, (message) => message.type === "started");
+  const replacementFloor = nextJsonMatching(replacement, (message) => message.type === "floor");
+  replacement.send(JSON.stringify({
+    type: "start", sessionId: SESSION_ID, version: 2,
+    sessionType: "presentation", outputMode: "captions", languages: ["en"],
+  }));
+  assert.equal((await replacementStarted).type, "started");
+  assert.equal((await replacementFloor).holder, null);
+  assert.equal(emitters.length, 2);
+
+  const received = nextJsonMatching(replacement, (message) => message.type === "caption");
+  emitters[1]({ type: "caption", seq: 1, language: "en", text: "new pipeline", isFinal: true });
+  const caption = await received;
+  assert.equal(caption.text, "new pipeline");
+  assert.equal(caption.language, "en");
 });
 
 test("a failed replacement candidate is closed while the active host remains owned", async (context) => {
@@ -338,7 +1023,7 @@ test("a failed replacement candidate is closed while the active host remains own
   const gateway = createGatewayServer({
     gatewaySecret: "gateway-secret",
     viewerSecret: "viewer-secret",
-    viewerAuthorizer: { async authorize() { return true; } },
+    viewerAuthorizer: { async authorize() { return true; }, async authorizeBatch(requests) { return new Map(requests.map(({ key }) => [key, true])); } },
     hostAuthorizer: { async authorize() { return true; } },
     async pipelineFactory() {
       const pipeline = {
@@ -368,10 +1053,10 @@ test("a failed replacement candidate is closed while the active host remains own
     assert.equal((await authenticated).type, "authenticated");
   }
   let received = nextJson(first);
-  first.send(JSON.stringify({ type: "start", sessionId: "session-1", mode: "presentation", voiceOutputMode: "captions", version: 1, languages: ["en"] }));
+  first.send(JSON.stringify({ type: "start", sessionId: SESSION_ID, mode: "presentation", voiceOutputMode: "captions", version: 1, languages: ["en"] }));
   assert.equal((await received).type, "started");
   received = nextJson(second);
-  second.send(JSON.stringify({ type: "start", sessionId: "session-1", mode: "meeting", voiceOutputMode: "captions", version: 1, languages: ["ko"] }));
+  second.send(JSON.stringify({ type: "start", sessionId: SESSION_ID, mode: "meeting", voiceOutputMode: "captions", version: 1, languages: ["ko"] }));
   assert.equal((await received).code, "CANDIDATE_START_FAILED");
 
   await new Promise((resolve) => setImmediate(resolve));
@@ -390,7 +1075,7 @@ test("concurrent host starts serialize prepare and leave no orphan pipeline", as
   const gateway = createGatewayServer({
     gatewaySecret: "gateway-secret",
     viewerSecret: "viewer-secret",
-    viewerAuthorizer: { async authorize() { return true; } },
+    viewerAuthorizer: { async authorize() { return true; }, async authorizeBatch(requests) { return new Map(requests.map(({ key }) => [key, true])); } },
     hostAuthorizer: { async authorize() { return true; } },
     async pipelineFactory() {
       let release;
@@ -423,8 +1108,8 @@ test("concurrent host starts serialize prepare and leave no orphan pipeline", as
   }
   const firstStarted = nextJson(first);
   const secondStarted = nextJson(second);
-  first.send(JSON.stringify({ type: "start", sessionId: "session-1", mode: "presentation", voiceOutputMode: "captions", version: 1, languages: ["en"] }));
-  second.send(JSON.stringify({ type: "start", sessionId: "session-1", mode: "meeting", voiceOutputMode: "captions", version: 1, languages: ["ko"] }));
+  first.send(JSON.stringify({ type: "start", sessionId: SESSION_ID, mode: "presentation", voiceOutputMode: "captions", version: 1, languages: ["en"] }));
+  second.send(JSON.stringify({ type: "start", sessionId: SESSION_ID, mode: "meeting", voiceOutputMode: "captions", version: 1, languages: ["ko"] }));
   while (pipelines.length < 1) await new Promise((resolve) => setImmediate(resolve));
   assert.equal(pipelines.length, 1);
   releases[0]();
@@ -444,7 +1129,7 @@ test("host operation queue rejects overflow without creating an orphan candidate
   const gateway = createGatewayServer({
     gatewaySecret: "gateway-secret",
     viewerSecret: "viewer-secret",
-    viewerAuthorizer: { async authorize() { return true; } },
+    viewerAuthorizer: { async authorize() { return true; }, async authorizeBatch(requests) { return new Map(requests.map(({ key }) => [key, true])); } },
     hostAuthorizer: { async authorize() { return true; } },
     maxQueuedHostOperations: 1,
     async pipelineFactory() {
@@ -465,7 +1150,7 @@ test("host operation queue rejects overflow without creating an orphan candidate
   const hosts = await Promise.all([0, 1, 2].map(() => connectHost(`ws://127.0.0.1:${port}/live`)));
   for (const host of hosts) context.after(() => host.terminate());
   const replies = hosts.map((host) => nextJson(host));
-  for (const host of hosts) host.send(JSON.stringify({ type: "start", sessionId: "session-1", mode: "presentation", voiceOutputMode: "captions", version: 1, languages: ["en"] }));
+  for (const host of hosts) host.send(JSON.stringify({ type: "start", sessionId: SESSION_ID, mode: "presentation", voiceOutputMode: "captions", version: 1, languages: ["en"] }));
 
   assert.equal((await replies[2]).code, "HOST_OPERATION_QUEUE_FULL");
   assert.equal(pipelines.length, 1);
@@ -482,7 +1167,7 @@ test("host start hard deadline closes a stalled candidate", async (context) => {
   const gateway = createGatewayServer({
     gatewaySecret: "gateway-secret",
     viewerSecret: "viewer-secret",
-    viewerAuthorizer: { async authorize() { return true; } },
+    viewerAuthorizer: { async authorize() { return true; }, async authorizeBatch(requests) { return new Map(requests.map(({ key }) => [key, true])); } },
     hostAuthorizer: { async authorize() { return true; } },
     hostStartTimeoutMilliseconds: 1_234,
     setTimeoutFn(callback, delay) {
@@ -506,7 +1191,7 @@ test("host start hard deadline closes a stalled candidate", async (context) => {
   const host = await connectHost(`ws://127.0.0.1:${gateway.server.address().port}/live`);
   context.after(() => host.terminate());
   const reply = nextJson(host);
-  host.send(JSON.stringify({ type: "start", sessionId: "session-1", mode: "presentation", voiceOutputMode: "captions", version: 1, languages: ["en"] }));
+  host.send(JSON.stringify({ type: "start", sessionId: SESSION_ID, mode: "presentation", voiceOutputMode: "captions", version: 1, languages: ["en"] }));
   while (!candidate) await new Promise((resolve) => setImmediate(resolve));
   const startTimer = timers.find((timer) => timer.delay === 1_234 && !timer.cancelled);
   assert.ok(startTimer);
@@ -524,7 +1209,7 @@ test("host factory hard deadline closes a candidate that resolves after timeout"
   const gateway = createGatewayServer({
     gatewaySecret: "gateway-secret",
     viewerSecret: "viewer-secret",
-    viewerAuthorizer: { async authorize() { return true; } },
+    viewerAuthorizer: { async authorize() { return true; }, async authorizeBatch(requests) { return new Map(requests.map(({ key }) => [key, true])); } },
     hostAuthorizer: { async authorize() { return true; } },
     hostStartTimeoutMilliseconds: 2_345,
     setTimeoutFn(callback, delay) {
@@ -548,7 +1233,7 @@ test("host factory hard deadline closes a candidate that resolves after timeout"
   const host = await connectHost(`ws://127.0.0.1:${gateway.server.address().port}/live`);
   context.after(() => host.terminate());
   const reply = nextJson(host);
-  host.send(JSON.stringify({ type: "start", sessionId: "session-1", mode: "presentation", voiceOutputMode: "captions", version: 1, languages: ["en"] }));
+  host.send(JSON.stringify({ type: "start", sessionId: SESSION_ID, mode: "presentation", voiceOutputMode: "captions", version: 1, languages: ["en"] }));
   let startTimer = timers.find((timer) => timer.delay === 2_345 && !timer.cancelled);
   while (!startTimer) {
     await new Promise((resolve) => setImmediate(resolve));
@@ -568,7 +1253,7 @@ test("shutdown aborts running and queued host operations without waiting for sta
   const gateway = createGatewayServer({
     gatewaySecret: "gateway-secret",
     viewerSecret: "viewer-secret",
-    viewerAuthorizer: { async authorize() { return true; } },
+    viewerAuthorizer: { async authorize() { return true; }, async authorizeBatch(requests) { return new Map(requests.map(({ key }) => [key, true])); } },
     hostAuthorizer: { async authorize() { return true; } },
     maxQueuedHostOperations: 1,
     async pipelineFactory(_message, _previous, _event, { signal }) {
@@ -587,8 +1272,8 @@ test("shutdown aborts running and queued host operations without waiting for sta
   const { port } = gateway.server.address();
   const first = await connectHost(`ws://127.0.0.1:${port}/live`);
   const second = await connectHost(`ws://127.0.0.1:${port}/live`);
-  first.send(JSON.stringify({ type: "start", sessionId: "session-1", mode: "presentation", voiceOutputMode: "captions", version: 1, languages: ["en"] }));
-  second.send(JSON.stringify({ type: "start", sessionId: "session-1", mode: "meeting", voiceOutputMode: "captions", version: 1, languages: ["ko"] }));
+  first.send(JSON.stringify({ type: "start", sessionId: SESSION_ID, mode: "presentation", voiceOutputMode: "captions", version: 1, languages: ["en"] }));
+  second.send(JSON.stringify({ type: "start", sessionId: SESSION_ID, mode: "meeting", voiceOutputMode: "captions", version: 1, languages: ["ko"] }));
   while (candidates.length < 1) await new Promise((resolve) => setImmediate(resolve));
 
   await gateway.close();
@@ -615,14 +1300,14 @@ test("a failed pipeline close is shared concurrently and retried on shutdown", a
   const gateway = createGatewayServer({
     gatewaySecret: "gateway-secret",
     viewerSecret: "viewer-secret",
-    viewerAuthorizer: { async authorize() { return true; } },
+    viewerAuthorizer: { async authorize() { return true; }, async authorizeBatch(requests) { return new Map(requests.map(({ key }) => [key, true])); } },
     hostAuthorizer: { async authorize() { return true; } },
     async pipelineFactory() { return pipeline; },
   });
   await new Promise((resolve) => gateway.server.listen(0, "127.0.0.1", resolve));
   const host = await connectHost(`ws://127.0.0.1:${gateway.server.address().port}/live`);
   let reply = nextJson(host);
-  host.send(JSON.stringify({ type: "start", sessionId: "session-1", mode: "presentation", voiceOutputMode: "captions", version: 1, languages: ["en"] }));
+  host.send(JSON.stringify({ type: "start", sessionId: SESSION_ID, mode: "presentation", voiceOutputMode: "captions", version: 1, languages: ["en"] }));
   assert.equal((await reply).type, "started");
   host.close();
   await once(host, "close");
@@ -639,7 +1324,7 @@ test("gateway shutdown closes each owned host pipeline exactly once", async () =
   const gateway = createGatewayServer({
     gatewaySecret: "gateway-secret",
     viewerSecret: "viewer-secret",
-    viewerAuthorizer: { async authorize() { return true; } },
+    viewerAuthorizer: { async authorize() { return true; }, async authorizeBatch(requests) { return new Map(requests.map(({ key }) => [key, true])); } },
     hostAuthorizer: { async authorize() { return true; } },
     async pipelineFactory() {
       const pipeline = {
@@ -663,7 +1348,7 @@ test("gateway shutdown closes each owned host pipeline exactly once", async () =
   host.send(JSON.stringify({ type: "authenticate", token: signHostToken("gateway-secret") }));
   assert.equal((await received).type, "authenticated");
   received = nextJson(host);
-  host.send(JSON.stringify({ type: "start", sessionId: "session-1", mode: "presentation", voiceOutputMode: "captions", version: 1, languages: ["en"] }));
+  host.send(JSON.stringify({ type: "start", sessionId: SESSION_ID, mode: "presentation", voiceOutputMode: "captions", version: 1, languages: ["en"] }));
   assert.equal((await received).type, "started");
 
   await gateway.close();
@@ -674,6 +1359,67 @@ test("gateway shutdown closes each owned host pipeline exactly once", async () =
   assert.match(gateway.metrics.render(), /realtime_noel_connection_cleanups_total 1/);
 });
 
+test("host teardown releases Gemini session resources exactly once before later shutdown", async () => {
+  const releasedSessionIds = [];
+  const gateway = createGatewayServer({
+    gatewaySecret: "gateway-secret",
+    viewerSecret: "viewer-secret",
+    viewerAuthorizer: { async authorize() { return true; }, async authorizeBatch(requests) { return new Map(requests.map(({ key }) => [key, true])); } },
+    hostAuthorizer: { async authorize() { return true; } },
+    hostReconnectGraceMilliseconds: 0,
+    async releaseGeminiSession(sessionId) { releasedSessionIds.push(sessionId); },
+    async pipelineFactory() {
+      return {
+        async start() {}, async tick() {}, async acceptAudio() {}, async endAudioStream() {}, async close() {},
+      };
+    },
+  });
+  await new Promise((resolve) => gateway.server.listen(0, "127.0.0.1", resolve));
+  const host = await connectHost(`ws://127.0.0.1:${gateway.server.address().port}/live`);
+  let reply = nextJson(host);
+  host.send(JSON.stringify({ type: "start", sessionId: SESSION_ID, mode: "presentation", voiceOutputMode: "captions", version: 1, languages: ["en"] }));
+  assert.equal((await reply).type, "started");
+
+  host.close();
+  await once(host, "close");
+  while (releasedSessionIds.length === 0) await new Promise((resolve) => setImmediate(resolve));
+  await gateway.close();
+
+  assert.deepEqual(releasedSessionIds, [SESSION_ID]);
+});
+
+test("Gemini session release failure is observed without blocking shutdown cleanup", async () => {
+  let releaseCalls = 0;
+  const gateway = createGatewayServer({
+    gatewaySecret: "gateway-secret",
+    viewerSecret: "viewer-secret",
+    viewerAuthorizer: { async authorize() { return true; }, async authorizeBatch(requests) { return new Map(requests.map(({ key }) => [key, true])); } },
+    hostAuthorizer: { async authorize() { return true; } },
+    async releaseGeminiSession() {
+      releaseCalls += 1;
+      throw new Error("provider detail must not be logged");
+    },
+    async pipelineFactory() {
+      return {
+        closed: 0,
+        async start() {}, async tick() {}, async acceptAudio() {}, async endAudioStream() {},
+        async close() { this.closed += 1; },
+      };
+    },
+  });
+  await new Promise((resolve) => gateway.server.listen(0, "127.0.0.1", resolve));
+  const host = await connectHost(`ws://127.0.0.1:${gateway.server.address().port}/live`);
+  let reply = nextJson(host);
+  host.send(JSON.stringify({ type: "start", sessionId: SESSION_ID, mode: "presentation", voiceOutputMode: "captions", version: 1, languages: ["en"] }));
+  assert.equal((await reply).type, "started");
+
+  await gateway.close();
+
+  assert.equal(releaseCalls, 1);
+  assert.match(gateway.metrics.render(), /realtime_noel_gemini_session_release_failures_total 1/);
+  assert.doesNotMatch(gateway.metrics.render(), /provider detail/u);
+});
+
 test("gateway shutdown rejects an in-flight candidate before atomic swap", async () => {
   let releaseStart;
   let candidate;
@@ -681,7 +1427,7 @@ test("gateway shutdown rejects an in-flight candidate before atomic swap", async
   const gateway = createGatewayServer({
     gatewaySecret: "gateway-secret",
     viewerSecret: "viewer-secret",
-    viewerAuthorizer: { async authorize() { return true; } },
+    viewerAuthorizer: { async authorize() { return true; }, async authorizeBatch(requests) { return new Map(requests.map(({ key }) => [key, true])); } },
     hostAuthorizer: { async authorize() { return true; } },
     async pipelineFactory() {
       candidate = {
@@ -703,7 +1449,7 @@ test("gateway shutdown rejects an in-flight candidate before atomic swap", async
   await once(host, "open");
   host.send(JSON.stringify({ type: "authenticate", token: signHostToken("gateway-secret") }));
   while (!messages.some((message) => message.type === "authenticated")) await new Promise((resolve) => setImmediate(resolve));
-  host.send(JSON.stringify({ type: "start", sessionId: "session-1", mode: "presentation", voiceOutputMode: "captions", version: 1, languages: ["en"] }));
+  host.send(JSON.stringify({ type: "start", sessionId: SESSION_ID, mode: "presentation", voiceOutputMode: "captions", version: 1, languages: ["en"] }));
   while (!candidate) await new Promise((resolve) => setImmediate(resolve));
 
   const closing = gateway.close();
@@ -718,7 +1464,7 @@ test("heartbeat terminates a stale WebSocket and records liveness metrics", asyn
   const gateway = createGatewayServer({
     gatewaySecret: "gateway-secret",
     viewerSecret: "viewer-secret",
-    viewerAuthorizer: { async authorize() { return true; } },
+    viewerAuthorizer: { async authorize() { return true; }, async authorizeBatch(requests) { return new Map(requests.map(({ key }) => [key, true])); } },
     hostAuthorizer: { async authorize() { return true; } },
     async pipelineFactory() { throw new Error("unused"); },
     heartbeatIntervalMilliseconds: 10,
@@ -740,7 +1486,7 @@ test("HOST connection closes visibly when its signed token expires", async (cont
   const gateway = createGatewayServer({
     gatewaySecret: "gateway-secret",
     viewerSecret: "viewer-secret",
-    viewerAuthorizer: { async authorize() { return true; } },
+    viewerAuthorizer: { async authorize() { return true; }, async authorizeBatch(requests) { return new Map(requests.map(({ key }) => [key, true])); } },
     hostAuthorizer: { async authorize() { return true; } },
     async pipelineFactory() { throw new Error("unused"); },
     now: () => fixedNow,
@@ -768,16 +1514,21 @@ test("HOST connection closes visibly when its signed token expires", async (cont
   await once(host, "close");
 });
 
-test("VIEWER connection closes visibly at the signed grant expiry", async (context) => {
-  const fixedNow = Date.UTC(2026, 6, 19);
+test("VIEWER ticket expiry is only an admission deadline after authentication", async (context) => {
+  let clock = Date.UTC(2026, 6, 19);
   const timers = [];
   const gateway = createGatewayServer({
     gatewaySecret: "gateway-secret",
     viewerSecret: "viewer-secret",
-    viewerAuthorizer: { async authorize() { return true; } },
+    viewerAuthorizer: { async authorize() { return true; }, async authorizeBatch(requests) { return new Map(requests.map(({ key }) => [key, true])); } },
     hostAuthorizer: { async authorize() { return true; } },
-    async pipelineFactory() { throw new Error("unused"); },
-    now: () => fixedNow,
+    async pipelineFactory() {
+      return {
+        async start() {}, async tick() {}, async acceptAudio() {},
+        async endAudioStream() {}, async close() {},
+      };
+    },
+    now: () => clock,
     setTimeoutFn(callback, delay) {
       const timer = { callback, delay, cancelled: false };
       timers.push(timer);
@@ -788,21 +1539,27 @@ test("VIEWER connection closes visibly at the signed grant expiry", async (conte
   await new Promise((resolve) => gateway.server.listen(0, "127.0.0.1", resolve));
   context.after(async () => gateway.close());
   const address = gateway.server.address();
-  const viewer = new WebSocket(`ws://127.0.0.1:${address.port}/live`);
+  const url = `ws://127.0.0.1:${address.port}/live`;
+  const host = await authenticateHostSocket(url, signHostToken("gateway-secret", { now: clock }));
+  context.after(() => host.terminate());
+  await startHostSocket(host, SESSION_ID, ["ko"]);
+
+  const viewer = new WebSocket(url);
   context.after(() => viewer.terminate());
   await once(viewer, "open");
   let received = nextJson(viewer);
   viewer.send(JSON.stringify({
     type: "authenticate",
-    token: signViewerToken("viewer-secret", "viewer-expiry", { now: fixedNow, expiresInMilliseconds: 15_000 }),
+    token: signViewerToken("viewer-secret", "viewer-expiry", { now: clock, expiresInMilliseconds: 15_000 }),
   }));
   assert.equal((await received).type, "authenticated");
-  const expiryTimer = timers.find((timer) => timer.delay === 15_000 && !timer.cancelled);
-  assert.ok(expiryTimer);
+  assert.equal(timers.some((timer) => timer.delay === 15_000 && !timer.cancelled), false);
+
+  clock += 16_000;
   received = nextJson(viewer);
-  expiryTimer.callback();
-  assert.deepEqual(await received, { type: "error", code: "TOKEN_EXPIRED", message: "게이트웨이 인증이 만료되었습니다." });
-  await once(viewer, "close");
+  viewer.send(JSON.stringify({ type: "subscribe", sessionId: SESSION_ID, language: "ko" }));
+  assert.equal((await received).type, "subscribed");
+  assert.equal(viewer.readyState, WebSocket.OPEN);
 });
 
 test("VIEWER reauthorization is single-flight and a hung check times out", async (context) => {
@@ -818,9 +1575,15 @@ test("VIEWER reauthorization is single-flight and a hung check times out", async
         if (authorizeCalls === 1) return true;
         return new Promise(() => {});
       },
+      async authorizeBatch(requests) {
+        authorizeCalls += 1;
+        if (authorizeCalls === 1) return new Map(requests.map(({ key }) => [key, true]));
+        return new Promise(() => {});
+      },
     },
     async pipelineFactory() { throw new Error("unused"); },
     viewerAuthorizeTimeoutMilliseconds: 2_500,
+    viewerAuthorizationBatchWindowMilliseconds: 0,
     setTimeoutFn(callback, delay) {
       const timer = { callback, delay, cancelled: false };
       timers.push(timer);
@@ -828,7 +1591,7 @@ test("VIEWER reauthorization is single-flight and a hung check times out", async
     },
     clearTimeoutFn(timer) { timer.cancelled = true; },
     setReauthorizeIntervalFn(callback, delay) {
-      assert.equal(delay, 2_500);
+      assert.ok(delay >= 4_000 && delay < 5_000, "grant-specific jitter must preserve the five-second revocation SLA");
       intervalCallback = callback;
       return { interval: true };
     },
@@ -844,7 +1607,7 @@ test("VIEWER reauthorization is single-flight and a hung check times out", async
   viewer.send(JSON.stringify({ type: "authenticate", token: signViewerToken("viewer-secret", "single-flight") }));
   assert.equal((await received).type, "authenticated");
   received = nextJson(viewer);
-  viewer.send(JSON.stringify({ type: "subscribe", sessionId: "session-1", language: "ko" }));
+  viewer.send(JSON.stringify({ type: "subscribe", sessionId: SESSION_ID, language: "ko" }));
   assert.equal((await received).type, "subscribed");
 
   intervalCallback();
@@ -859,41 +1622,58 @@ test("VIEWER reauthorization is single-flight and a hung check times out", async
   await once(viewer, "close");
 });
 
-test("a slow Townhall viewer is failed visibly while another viewer still receives audio", async (context) => {
-  let viewerCheck = 0;
+test("VIEWER subscriptions receive captions and status without translated audio or audio backpressure", async (context) => {
+  let slowConsumerChecks = 0;
   const gateway = createGatewayServer({
     gatewaySecret: "gateway-secret",
     viewerSecret: "viewer-secret",
-    viewerAuthorizer: { async authorize() { return true; } },
+    viewerAuthorizer: { async authorize() { return true; }, async authorizeBatch(requests) { return new Map(requests.map(({ key }) => [key, true])); } },
     hostAuthorizer: { async authorize() { return true; } },
     async pipelineFactory() { throw new Error("unused"); },
-    slowConsumerPredicate() { viewerCheck += 1; return viewerCheck === 1; },
+    slowConsumerPredicate() { slowConsumerChecks += 1; return false; },
   });
   await new Promise((resolve) => gateway.server.listen(0, "127.0.0.1", resolve));
   context.after(async () => gateway.close());
   const address = gateway.server.address();
   const url = `ws://127.0.0.1:${address.port}/live`;
-  const slow = new WebSocket(url);
-  const fast = new WebSocket(url);
-  context.after(() => slow.terminate());
-  context.after(() => fast.terminate());
-  await Promise.all([once(slow, "open"), once(fast, "open")]);
-  for (const [viewer, grantId] of [[slow, "slow"], [fast, "fast"]]) {
-    let received = nextJson(viewer);
-    viewer.send(JSON.stringify({ type: "authenticate", token: signViewerToken("viewer-secret", grantId) }));
-    assert.equal((await received).type, "authenticated");
-    received = nextJson(viewer);
-    viewer.send(JSON.stringify({ type: "subscribe", sessionId: "session-1", language: "ko" }));
-    assert.equal((await received).type, "subscribed");
-  }
-  const slowError = nextJson(slow);
-  const fastAudio = once(fast, "message");
-  await gateway.broadcastAudio("session-1", "ko", Buffer.from([1, 2, 3, 4]));
-  assert.equal((await slowError).code, "SLOW_CONSUMER");
-  const [audio, isBinary] = await fastAudio;
-  assert.equal(isBinary, true);
-  assert.deepEqual(Buffer.from(audio), Buffer.from([1, 2, 3, 4]));
-  assert.match(gateway.metrics.render(), /realtime_noel_slow_consumers_terminated_total 1/);
+  const viewer = new WebSocket(url);
+  context.after(() => viewer.terminate());
+  await once(viewer, "open");
+  let received = nextJson(viewer);
+  viewer.send(JSON.stringify({ type: "authenticate", token: signViewerToken("viewer-secret", "caption-only") }));
+  assert.equal((await received).type, "authenticated");
+  received = nextJson(viewer);
+  viewer.send(JSON.stringify({ type: "subscribe", sessionId: SESSION_ID, language: "ko" }));
+  assert.equal((await received).type, "subscribed");
+
+  const messages = [];
+  let resolveEvents;
+  const eventsReceived = new Promise((resolve) => { resolveEvents = resolve; });
+  viewer.on("message", (data, isBinary) => {
+    messages.push({ data, isBinary });
+    if (messages.length === 2) resolveEvents();
+  });
+  await gateway.broadcastEvent(SESSION_ID, "ko", {
+    type: "caption", sessionId: SESSION_ID, language: "ko", text: "번역 자막", isFinal: true,
+  });
+  await gateway.broadcastEvent(SESSION_ID, "ko", {
+    type: "session-status", sessionId: SESSION_ID, status: "live",
+  });
+  await eventsReceived;
+  assert.deepEqual(messages.map(({ data, isBinary }) => ({
+    isBinary,
+    type: isBinary ? null : JSON.parse(data.toString("utf8")).payload.type,
+  })), [
+    { isBinary: false, type: "caption" },
+    { isBinary: false, type: "session-status" },
+  ]);
+
+  assert.equal(gateway.broadcastAudio, undefined, "translated audio has no gateway fanout surface");
+  assert.equal(slowConsumerChecks, 2, "caption and status delivery run the JSON backpressure checks");
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(messages.some(({ isBinary }) => isBinary), false);
+  assert.equal(viewer.readyState, WebSocket.OPEN);
+  assert.doesNotMatch(gateway.metrics.render(), /realtime_noel_slow_consumers_terminated_total 1/u);
 });
 
 test("HOST start is denied before pipeline creation when the database configuration differs", async (context) => {
@@ -901,7 +1681,7 @@ test("HOST start is denied before pipeline creation when the database configurat
   const gateway = createGatewayServer({
     gatewaySecret: "gateway-secret",
     viewerSecret: "viewer-secret",
-    viewerAuthorizer: { async authorize() { return true; } },
+    viewerAuthorizer: { async authorize() { return true; }, async authorizeBatch(requests) { return new Map(requests.map(({ key }) => [key, true])); } },
     hostAuthorizer: { async authorize() { return false; } },
     async pipelineFactory() { factoryCalls += 1; throw new Error("must not run"); },
   });
@@ -911,7 +1691,7 @@ test("HOST start is denied before pipeline creation when the database configurat
   context.after(() => host.terminate());
   const reply = nextJson(host);
   host.send(JSON.stringify({
-    type: "start", sessionId: "session-1", version: 3,
+    type: "start", sessionId: SESSION_ID, version: 3,
     mode: "presentation", voiceOutputMode: "captions", languages: ["en"],
   }));
   assert.equal((await reply).code, "SESSION_REVOKED");
@@ -928,7 +1708,7 @@ test("HOST configuration is checked again after provider startup before atomic o
   const gateway = createGatewayServer({
     gatewaySecret: "gateway-secret",
     viewerSecret: "viewer-secret",
-    viewerAuthorizer: { async authorize() { return true; } },
+    viewerAuthorizer: { async authorize() { return true; }, async authorizeBatch(requests) { return new Map(requests.map(({ key }) => [key, true])); } },
     hostAuthorizer: { async authorize() { authorizeCalls += 1; return authorizeCalls === 1; } },
     async pipelineFactory() { return candidate; },
   });
@@ -938,7 +1718,7 @@ test("HOST configuration is checked again after provider startup before atomic o
   context.after(() => host.terminate());
   const reply = nextJson(host);
   host.send(JSON.stringify({
-    type: "start", sessionId: "session-1", version: 3,
+    type: "start", sessionId: SESSION_ID, version: 3,
     mode: "presentation", voiceOutputMode: "captions", languages: ["en"],
   }));
   assert.equal((await reply).code, "SESSION_REVOKED");
@@ -956,7 +1736,7 @@ test("HOST lease closes the pipeline within the five-second audit interval", asy
   const gateway = createGatewayServer({
     gatewaySecret: "gateway-secret",
     viewerSecret: "viewer-secret",
-    viewerAuthorizer: { async authorize() { return true; } },
+    viewerAuthorizer: { async authorize() { return true; }, async authorizeBatch(requests) { return new Map(requests.map(({ key }) => [key, true])); } },
     hostAuthorizer: { async authorize(_claims, _settings, options) { authorizeCalls += 1; return options.compareVersion; } },
     setHostLeaseIntervalFn(callback, delay) { assert.equal(delay, 2_500); leaseCallback = callback; return { lease: true }; },
     clearHostLeaseIntervalFn() {},
@@ -966,16 +1746,18 @@ test("HOST lease closes the pipeline within the five-second audit interval", asy
   context.after(async () => gateway.close());
   const host = await connectHost(`ws://127.0.0.1:${gateway.server.address().port}/live`);
   context.after(() => host.terminate());
-  let received = nextJson(host);
+  const started = nextJsonMatching(host, (message) => message.type === "started");
+  const floorSnapshot = nextJsonMatching(host, (message) => message.type === "floor");
   host.send(JSON.stringify({
-    type: "start", sessionId: "session-1", version: 1,
+    type: "start", sessionId: SESSION_ID, version: 1,
     mode: "presentation", voiceOutputMode: "captions", languages: ["en"],
   }));
-  assert.equal((await received).type, "started");
+  assert.equal((await started).type, "started");
+  assert.equal((await floorSnapshot).holder, null);
   assert.equal(typeof leaseCallback, "function");
-  received = nextJson(host);
+  const revoked = nextJsonMatching(host, (message) => message.code === "SESSION_REVOKED");
   leaseCallback();
-  assert.equal((await received).code, "SESSION_REVOKED");
+  assert.equal((await revoked).code, "SESSION_REVOKED");
   await once(host, "close");
   assert.equal(authorizeCalls, 3);
   // The client close event and the server's async close handler are independent
@@ -994,7 +1776,7 @@ test("a hung HOST lease is aborted within the remaining half of the five-second 
   const gateway = createGatewayServer({
     gatewaySecret: "gateway-secret",
     viewerSecret: "viewer-secret",
-    viewerAuthorizer: { async authorize() { return true; } },
+    viewerAuthorizer: { async authorize() { return true; }, async authorizeBatch(requests) { return new Map(requests.map(({ key }) => [key, true])); } },
     hostAuthorizer: {
       async authorize(_claims, _settings, { compareVersion }) {
         authorizeCalls += 1;
@@ -1020,19 +1802,21 @@ test("a hung HOST lease is aborted within the remaining half of the five-second 
   context.after(async () => gateway.close());
   const host = await connectHost(`ws://127.0.0.1:${gateway.server.address().port}/live`);
   context.after(() => host.terminate());
-  let received = nextJson(host);
+  const started = nextJsonMatching(host, (message) => message.type === "started");
+  const floorSnapshot = nextJsonMatching(host, (message) => message.type === "floor");
   host.send(JSON.stringify({
-    type: "start", sessionId: "session-1", version: 1,
+    type: "start", sessionId: SESSION_ID, version: 1,
     mode: "presentation", voiceOutputMode: "captions", languages: ["en"],
   }));
-  assert.equal((await received).type, "started");
+  assert.equal((await started).type, "started");
+  assert.equal((await floorSnapshot).holder, null);
   leaseCallback();
   while (authorizeCalls < 3) await new Promise((resolve) => setImmediate(resolve));
   const leaseTimeout = timers.find((timer) => timer.delay === 2_500 && !timer.cancelled);
   assert.ok(leaseTimeout, "2.5초 주기와 2.5초 제한의 합이 최대 5초여야 합니다.");
-  received = nextJson(host);
+  const revoked = nextJsonMatching(host, (message) => message.code === "SESSION_REVOKED");
   leaseTimeout.callback();
-  assert.equal((await received).code, "SESSION_REVOKED");
+  assert.equal((await revoked).code, "SESSION_REVOKED");
 });
 
 test("an aborted old HOST lease cannot close a successfully swapped pipeline", async (context) => {
@@ -1042,7 +1826,7 @@ test("an aborted old HOST lease cannot close a successfully swapped pipeline", a
   const gateway = createGatewayServer({
     gatewaySecret: "gateway-secret",
     viewerSecret: "viewer-secret",
-    viewerAuthorizer: { async authorize() { return true; } },
+    viewerAuthorizer: { async authorize() { return true; }, async authorizeBatch(requests) { return new Map(requests.map(({ key }) => [key, true])); } },
     hostAuthorizer: {
       async authorize(_claims, _settings, { signal, compareVersion }) {
         authorizationCalls += 1;
@@ -1069,21 +1853,23 @@ test("an aborted old HOST lease cannot close a successfully swapped pipeline", a
   context.after(async () => gateway.close());
   const host = await connectHost(`ws://127.0.0.1:${gateway.server.address().port}/live`);
   context.after(() => host.terminate());
-  let received = nextJson(host);
+  const started = nextJsonMatching(host, (message) => message.type === "started");
+  const initialFloor = nextJsonMatching(host, (message) => message.type === "floor");
   host.send(JSON.stringify({
-    type: "start", sessionId: "session-1", version: 1,
+    type: "start", sessionId: SESSION_ID, version: 1,
     mode: "presentation", voiceOutputMode: "captions", languages: ["en"],
   }));
-  assert.equal((await received).type, "started");
+  assert.equal((await started).type, "started");
+  assert.equal((await initialFloor).holder, null);
   leaseCallbacks[0]();
   while (authorizationCalls < 3) await new Promise((resolve) => setImmediate(resolve));
 
-  received = nextJson(host);
+  const updated = nextJsonMatching(host, (message) => message.type === "updated");
   host.send(JSON.stringify({
-    type: "update", sessionId: "session-1", version: 2,
+    type: "update", sessionId: SESSION_ID, version: 2,
     mode: "meeting", voiceOutputMode: "captions", languages: ["ko"],
   }));
-  assert.equal((await received).type, "updated");
+  assert.equal((await updated).type, "updated");
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(host.readyState, WebSocket.OPEN);
   assert.deepEqual(pipelines.map((pipeline) => pipeline.closed), [1, 0]);
@@ -1096,7 +1882,13 @@ test("viewer delivery is local and revalidates a stale grant immediately before 
     gatewaySecret: "gateway-secret",
     viewerSecret: "viewer-secret",
     now: () => clock,
-    viewerAuthorizer: { async authorize() { authorizeCalls += 1; return authorizeCalls < 2; } },
+    viewerAuthorizer: {
+      async authorize() { authorizeCalls += 1; return authorizeCalls < 2; },
+      async authorizeBatch(requests) {
+        authorizeCalls += 1;
+        return new Map(requests.map(({ key }) => [key, authorizeCalls < 2]));
+      },
+    },
     hostAuthorizer: { async authorize() { return true; } },
     async pipelineFactory() { throw new Error("unused"); },
   });
@@ -1109,23 +1901,776 @@ test("viewer delivery is local and revalidates a stale grant immediately before 
   viewer.send(JSON.stringify({ type: "authenticate", token: signViewerToken("viewer-secret", "fanout", { now: clock }) }));
   assert.equal((await received).type, "authenticated");
   received = nextJson(viewer);
-  viewer.send(JSON.stringify({ type: "subscribe", sessionId: "session-1", language: "ko" }));
+  viewer.send(JSON.stringify({ type: "subscribe", sessionId: SESSION_ID, language: "ko" }));
   assert.equal((await received).type, "subscribed");
 
   received = nextJson(viewer);
-  await gateway.broadcastEvent("session-1", "ko", { type: "caption", seq: 1, text: "공유 자막" });
+  await gateway.broadcastEvent(SESSION_ID, "ko", { type: "caption", seq: 1, text: "공유 자막" });
   assert.deepEqual(await received, {
     type: "live-event",
     payload: { type: "caption", seq: 1, text: "공유 자막" },
   });
   const legend = { type: "speaker-legend", speakers: [{ speakerId: "speaker-1", voiceStatus: "ready" }] };
   received = nextJson(viewer);
-  await gateway.broadcastEvent("session-1", "ko", legend);
+  await gateway.broadcastEvent(SESSION_ID, "ko", legend);
   assert.deepEqual(await received, { type: "live-event", payload: legend });
 
   clock += 5_000;
   received = nextJson(viewer);
-  await gateway.broadcastEvent("session-1", "ko", { type: "caption", seq: 2, text: "차단" });
+  await gateway.broadcastEvent(SESSION_ID, "ko", { type: "caption", seq: 2, text: "차단" });
   assert.equal((await received).code, "GRANT_REVOKED");
   assert.equal(authorizeCalls, 2);
+});
+
+test("host handover with the SAME activation key reattaches warm; a different key restarts cold", { timeout: 5_000 }, async (context) => {
+  const pipelines = [];
+  const gateway = createGatewayServer({
+    gatewaySecret: "gateway-secret",
+    viewerSecret: "viewer-secret",
+    viewerAuthorizer: { async authorize() { return true; }, async authorizeBatch(requests) { return new Map(requests.map(({ key }) => [key, true])); } },
+    hostAuthorizer: {
+      async authorize(_claims, _settings, options) {
+        if (options.readinessStart) return { readinessMode: "resume-live", pinnedGlossaryFingerprint: null };
+        return true;
+      },
+      // The gateway records state.activationKey only for readiness-capable
+      // authorizers (production Supabase authorizer is one). resume-live never
+      // invokes activate, so the stub only needs to exist.
+      async activate() { throw new Error("CAS_MUST_NOT_RUN"); },
+    },
+    async pipelineFactory() {
+      const pipeline = {
+        closed: 0,
+        async start() {}, async tick() {}, async acceptAudio() {},
+        async endAudioStream() {}, async close() { this.closed += 1; },
+      };
+      pipelines.push(pipeline);
+      return pipeline;
+    },
+  });
+  await new Promise((resolve) => gateway.server.listen(0, "127.0.0.1", resolve));
+  context.after(async () => gateway.close());
+  const url = `ws://127.0.0.1:${gateway.server.address().port}/live`;
+  const activationKey = "33333333-3333-4333-8333-333333333333";
+  const settings = {
+    sessionId: SESSION_ID, version: 4,
+    sessionType: "presentation", outputMode: "captions", languages: ["ko", "en"],
+  };
+
+  // Web host activates the session with the server-owned activation key.
+  const webHost = await connectHost(url);
+  context.after(() => webHost.terminate());
+  let reply = nextJsonMatching(webHost, (message) => message.type === "started" || message.type === "error");
+  webHost.send(JSON.stringify({ type: "start", activationKey, ...settings }));
+  assert.equal((await reply).type, "started");
+  assert.equal(pipelines.length, 1);
+
+  // Desktop takeover presents the SAME key it read from the session API: the
+  // gateway reattaches the live pipeline and 4410s the web socket.
+  const webHostClosed = once(webHost, "close");
+  const desktopHost = await connectHost(url);
+  context.after(() => desktopHost.terminate());
+  reply = nextJsonMatching(desktopHost, (message) => message.type === "started" || message.type === "error");
+  desktopHost.send(JSON.stringify({ type: "start", activationKey, ...settings, version: 5 }));
+  assert.equal((await reply).type, "started");
+  const [closeCode] = await webHostClosed;
+  assert.equal(closeCode, 4410, "the replaced host learns it was taken over");
+  assert.equal(pipelines.length, 1, "same-key handover must keep the live pipeline warm");
+  assert.equal(pipelines[0].closed, 0);
+
+  // A takeover with a DIFFERENT key cannot prove epoch identity: cold restart.
+  const strangerHost = await connectHost(url);
+  context.after(() => strangerHost.terminate());
+  reply = nextJsonMatching(strangerHost, (message) => message.type === "started" || message.type === "error");
+  strangerHost.send(JSON.stringify({
+    type: "start", activationKey: "44444444-4444-4444-8444-444444444444", ...settings, version: 5,
+  }));
+  assert.equal((await reply).type, "started");
+  assert.equal(pipelines.length, 2, "a mismatched key must build a fresh pipeline");
+});
+
+function independentCaptionFixture(seq = 1) {
+  return { type: "caption", sessionId: SESSION_ID, language: "en", seq, isFinal: true,
+    text: "Synthetic late final.", translationCapture: {
+      kind: "independent-live-translation", streamGeneration: fixtureUuid("stream"),
+      captureEpoch: fixtureUuid("capture"), captureStartedAt: null,
+      captureEndedAt: "2026-09-01T00:00:00.000Z", finalization: "application-sentence-boundary",
+    } };
+}
+
+test("late independent final rejects obsolete generations and old direct host callbacks", { timeout: 3_000 }, async (context) => {
+  const pipelines = [];
+  const gateway = createGatewayServer({ gatewaySecret: "gateway-secret", viewerSecret: "viewer-secret",
+    hostAuthorizer: { async authorize() { return true; } },
+    viewerAuthorizer: { async authorizeBatch(rows) { return new Map(rows.map(({ key }) => [key, true])); } },
+    async pipelineFactory(_settings, _previous, emit, options) {
+      const pipeline = { generation: options.pipelineGeneration, emit, isPaused: false,
+        async start() {}, async tick() {}, async close() {} };
+      pipelines.push(pipeline); return pipeline;
+    },
+  });
+  await new Promise((resolve) => gateway.server.listen(0, "127.0.0.1", resolve));
+  context.after(() => gateway.close());
+  const url = `ws://127.0.0.1:${gateway.server.address().port}/live`;
+  const host = await connectHost(url); context.after(() => host.terminate());
+  await startHostSocket(host, SESSION_ID, ["en"]);
+  const viewer = new WebSocket(url); context.after(() => viewer.terminate());
+  await once(viewer, "open");
+  let ack = nextJsonMatching(viewer, (message) => message.type === "authenticated");
+  viewer.send(JSON.stringify({ type: "authenticate", token: signViewerToken("viewer-secret", "late-independent") })); await ack;
+  ack = nextJsonMatching(viewer, (message) => message.type === "subscribed");
+  viewer.send(JSON.stringify({ type: "subscribe", sessionId: SESSION_ID, language: "en" })); await ack;
+  const seen = [], hostSeen = [];
+  viewer.on("message", (raw) => seen.push(JSON.parse(raw.toString())));
+  host.on("message", (raw) => hostSeen.push(JSON.parse(raw.toString())));
+  const caption = independentCaptionFixture();
+  for (const metadata of [{}, { pipelineGeneration: fixtureUuid("obsolete-pipeline"), mediaFence: null },
+    { pipelineGeneration: pipelines[0].generation, mediaFence: { epoch: 1, ownerId: fixtureUuid("wrong-owner") } }]) {
+    await gateway.broadcastEvent(SESSION_ID, "en", caption, metadata);
+  }
+  pipelines[0].isPaused = true;
+  await gateway.broadcastEvent(SESSION_ID, "en", caption, { pipelineGeneration: pipelines[0].generation });
+  pipelines[0].emit(caption);
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(seen.some((message) => message.payload?.type === "caption"), false);
+  assert.equal(hostSeen.some((message) => message.type === "caption"), false);
+  pipelines[0].isPaused = false;
+  await gateway.broadcastEvent(SESSION_ID, "en", caption, { pipelineGeneration: pipelines[0].generation });
+  await waitForGatewayCondition(() => seen.some((message) => message.payload?.isFinal));
+  ack = nextJsonMatching(host, (message) => message.type === "updated");
+  host.send(JSON.stringify({ type: "update", sessionId: SESSION_ID, version: 2,
+    sessionType: "meeting", outputMode: "captions", languages: ["en"] })); await ack;
+  assert.equal(pipelines.length, 2);
+  hostSeen.length = 0; seen.length = 0;
+  pipelines[0].emit(independentCaptionFixture(2));
+  await gateway.broadcastEvent(SESSION_ID, "en", independentCaptionFixture(2), { pipelineGeneration: pipelines[0].generation });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(seen.some((message) => message.payload?.type === "caption"), false);
+  assert.equal(hostSeen.some((message) => message.type === "caption"), false);
+  pipelines[1].emit(independentCaptionFixture(2));
+  await waitForGatewayCondition(() => hostSeen.some((message) => message.type === "caption"));
+});
+
+for (const pendingStage of ["authorization", "replay"]) {
+  test(`independent live events buffered during ${pendingStage} cannot escape after stop`, { timeout: 3_000 }, async (context) => {
+    let clock = Date.now(), generation, shouldBlock = false, entered = false, release, stopped = false;
+    const pending = new Promise((resolve) => { release = resolve; });
+    const gateway = createGatewayServer({ now: () => clock, gatewaySecret: "gateway-secret", viewerSecret: "viewer-secret",
+      hostAuthorizer: { async authorize() { return true; } },
+      viewerAuthorizer: { async authorizeBatch(rows) {
+        if (pendingStage === "authorization" && shouldBlock) { entered = true; await pending; }
+        return new Map(rows.map(({ key }) => [key, true]));
+      } },
+      async replayUtterances() { entered = true; await pending; return []; },
+      async pipelineFactory(_settings, _previous, _emit, options) {
+        generation = options.pipelineGeneration;
+        return { isPaused: false, isStopped: false, async start() {}, async tick() {},
+          async close() { this.isStopped = true; stopped = true; } };
+      },
+    });
+    await new Promise((resolve) => gateway.server.listen(0, "127.0.0.1", resolve));
+    context.after(() => { release(); return gateway.close(); });
+    const url = `ws://127.0.0.1:${gateway.server.address().port}/live`;
+    const host = await connectHost(url); context.after(() => host.terminate());
+    await startHostSocket(host, SESSION_ID, ["en"]);
+    const viewer = new WebSocket(url); context.after(() => viewer.terminate()); await once(viewer, "open");
+    let ack = nextJsonMatching(viewer, (message) => message.type === "authenticated");
+    viewer.send(JSON.stringify({ type: "authenticate", token: signViewerToken("viewer-secret", `pending-${pendingStage}`, { now: clock }) })); await ack;
+    ack = nextJsonMatching(viewer, (message) => message.type === "subscribed");
+    viewer.send(JSON.stringify({ type: "subscribe", sessionId: SESSION_ID, language: "en",
+      ...(pendingStage === "replay" ? { lastSeq: 0 } : {}) })); await ack;
+    const seen = []; viewer.on("message", (raw) => seen.push(JSON.parse(raw.toString())));
+    shouldBlock = true;
+    if (pendingStage === "authorization") clock += 6_000;
+    const delivery = gateway.broadcastEvent(SESSION_ID, "en", independentCaptionFixture(), { pipelineGeneration: generation });
+    await waitForGatewayCondition(() => entered);
+    if (pendingStage === "replay") await delivery;
+    ack = nextJsonMatching(host, (message) => message.type === "stopped");
+    host.send(JSON.stringify({ type: "stop" }));
+    await waitForGatewayCondition(() => stopped);
+    release(); await delivery; await ack;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(seen.some((message) => message.payload?.type === "caption"), false);
+  });
+}
+
+// ── Task 5: admin-triggered engine switch (POST /internal/sessions/:id/engine) + engine-status ──
+
+const ENGINE_FIXTURE_KEYS = { GEMINI_API_KEY: "fixture-key" };
+const FLASH_37_ENGINE = {
+  stt: { provider: "gemini", model: "gemini-3.5-transcribe-live", languageMode: "auto" },
+  translation: { provider: "gemini", model: "gemini-3.7-flash" },
+  summary: { provider: "gemini", model: "gemini-3.6-flash" },
+};
+
+function signAdminToken(secret, { now = Date.now(), expiresInSeconds = 60, sessionId = SESSION_ID, sub = "admin-1", role = "ADMIN" } = {}) {
+  const nowSeconds = Math.floor(now / 1_000);
+  const claims = { role, sub, sessionId, aud: "media-gateway", iat: nowSeconds, exp: nowSeconds + expiresInSeconds };
+  const encoded = Buffer.from(JSON.stringify(claims)).toString("base64url");
+  return `${encoded}.${createHmac("sha256", secret).update(encoded).digest("hex")}`;
+}
+
+async function postEngine(port, sessionId, token, body, { method = "POST", headers = {} } = {}) {
+  const response = await fetch(`http://127.0.0.1:${port}/internal/sessions/${sessionId}/engine`, {
+    method,
+    headers: {
+      "content-type": "application/json",
+      ...(token === null ? {} : { authorization: `Bearer ${token}` }),
+      ...headers,
+    },
+    body: method === "GET" ? undefined : (typeof body === "string" ? body : JSON.stringify(body)),
+  });
+  const text = await response.text();
+  return { status: response.status, cacheControl: response.headers.get("cache-control"), json: text ? JSON.parse(text) : null };
+}
+
+function createEngineSwitchGateway({ pipelines, startBehaviour = () => undefined, now, factoryFailure = null } = {}) {
+  let gateway;
+  gateway = createGatewayServer({
+    gatewaySecret: "gateway-secret",
+    viewerSecret: "viewer-secret",
+    ...(now ? { now } : {}),
+    engineKeyEnvironment: ENGINE_FIXTURE_KEYS,
+    viewerAuthorizer: {
+      async authorize() { return true; },
+      async authorizeBatch(requests) { return new Map(requests.map(({ key }) => [key, true])); },
+      async authorizeSpeaking() { return true; },
+    },
+    hostAuthorizer: { async authorize() { return true; } },
+    floorController: { async take() { return { ok: true, displayName: "Guest" }; }, async release() { return true; } },
+    async pipelineFactory(settings, previous, onHostEvent) {
+      if (factoryFailure && pipelines.length >= 1) throw factoryFailure();
+      const pipeline = {
+        settings,
+        previous,
+        onHostEvent,
+        lastSequences: { ko: 40 + pipelines.length, en: 41 + pipelines.length },
+        closed: 0,
+        floorSpeaker: undefined,
+        async start() {
+          await startBehaviour(pipeline, pipelines.length);
+          // Production LiveMediaPipeline.start() publishes `ready` per lane
+          // through the publisher fanout; the fake mirrors that contract.
+          for (const language of settings.languages) {
+            await gateway.broadcastEvent(settings.sessionId, language, { type: "language-status", sessionId: settings.sessionId, language, status: "ready" });
+          }
+        },
+        async tick() {},
+        async acceptAudio() {},
+        setFloorSpeaker(speaker) { this.floorSpeaker = speaker; },
+        async close() { this.closed += 1; },
+      };
+      pipelines.push(pipeline);
+      return pipeline;
+    },
+  });
+  return gateway;
+}
+
+async function subscribeViewer(url, language, seed) {
+  const viewer = new WebSocket(url);
+  await once(viewer, "open");
+  let received = nextJson(viewer);
+  viewer.send(JSON.stringify({ type: "authenticate", token: signViewerToken("viewer-secret", seed) }));
+  assert.equal((await received).type, "authenticated");
+  received = nextJson(viewer);
+  viewer.send(JSON.stringify({ type: "subscribe", sessionId: SESSION_ID, language }));
+  assert.equal((await received).type, "subscribed");
+  const events = [];
+  viewer.on("message", (data) => { events.push(JSON.parse(data.toString("utf8")).payload); });
+  return { viewer, events };
+}
+
+test("internal engine endpoint fails closed on token, method, size, body, and engine validation before touching any pipeline", async (context) => {
+  const pipelines = [];
+  const gateway = createEngineSwitchGateway({ pipelines });
+  await new Promise((resolve) => gateway.server.listen(0, "127.0.0.1", resolve));
+  context.after(async () => gateway.close());
+  const { port } = gateway.server.address();
+  const now = Date.now();
+
+  const unauthorized = [
+    ["missing bearer", null],
+    ["HOST-signed token", signHostToken("gateway-secret")],
+    ["HOST role claim signed as admin", signAdminToken("gateway-secret", { role: "HOST" })],
+    ["viewer-secret signature", signAdminToken("viewer-secret")],
+    ["expired", signAdminToken("gateway-secret", { now: now - 120_000 })],
+    ["over-long lifetime", signAdminToken("gateway-secret", { expiresInSeconds: 61 })],
+    ["cross-session", signAdminToken("gateway-secret", { sessionId: SESSION_TWO_ID })],
+  ];
+  for (const [label, token] of unauthorized) {
+    const response = await postEngine(port, SESSION_ID, token, { engine: FLASH_37_ENGINE });
+    assert.equal(response.status, 401, `${label} must be refused`);
+    assert.deepEqual(response.json, { result: "failed", code: "ADMIN_TOKEN_INVALID" }, label);
+    assert.equal(response.cacheControl, "no-store");
+  }
+  const notUuid = await postEngine(port, "not-a-session", signAdminToken("gateway-secret"), { engine: FLASH_37_ENGINE });
+  assert.equal(notUuid.status, 404);
+  for (const method of ["GET", "PUT", "PATCH", "DELETE"]) {
+    const response = await postEngine(port, SESSION_ID, signAdminToken("gateway-secret"), { engine: FLASH_37_ENGINE }, { method });
+    assert.equal(response.status, 405, `${method} must not switch engines`);
+  }
+  const oversized = await postEngine(port, SESSION_ID, signAdminToken("gateway-secret"), JSON.stringify({ engine: FLASH_37_ENGINE, pad: "x".repeat(17 * 1_024) }));
+  assert.equal(oversized.status, 413);
+  assert.deepEqual(oversized.json, { result: "failed", code: "PAYLOAD_TOO_LARGE" });
+  const malformed = await postEngine(port, SESSION_ID, signAdminToken("gateway-secret"), "{not json");
+  assert.equal(malformed.status, 400);
+  assert.deepEqual(malformed.json, { result: "failed", code: "INVALID_ENGINE_BODY" });
+  const forged = await postEngine(port, SESSION_ID, signAdminToken("gateway-secret"), { engine: { ...FLASH_37_ENGINE, stt: { provider: "gemini", model: "gemini-3.5-live-translate-preview" } } });
+  assert.equal(forged.status, 400);
+  assert.deepEqual(forged.json, { result: "failed", code: "ENGINE_SELECTION_INVALID" });
+  const soniox = { stt: { provider: "soniox", model: "stt-rt-v5", languageMode: "auto" }, translation: { provider: "soniox", model: "stt-rt-v5" }, summary: { provider: "gemini", model: "gemini-3.6-flash" } };
+  const keyless = await postEngine(port, SESSION_ID, signAdminToken("gateway-secret"), { engine: soniox });
+  assert.equal(keyless.status, 400);
+  assert.deepEqual(keyless.json, { result: "failed", code: "ENGINE_KEY_MISSING" });
+  assert.equal(pipelines.length, 0, "validation failures never reach the pipeline factory");
+
+  // A session this gateway does not hold: the DB value applies at next activation.
+  const cold = await postEngine(port, SESSION_ID, signAdminToken("gateway-secret"), { engine: FLASH_37_ENGINE });
+  assert.equal(cold.status, 200);
+  assert.deepEqual(cold.json, { result: "queued" });
+  assert.equal(pipelines.length, 0);
+});
+
+test("admin engine switch on a live session replaces the pipeline with seq continuity and notifies host and viewers", async (context) => {
+  const pipelines = [];
+  let clock = Date.now();
+  const gateway = createEngineSwitchGateway({ pipelines, now: () => clock });
+  await new Promise((resolve) => gateway.server.listen(0, "127.0.0.1", resolve));
+  context.after(async () => gateway.close());
+  const { port } = gateway.server.address();
+  const url = `ws://127.0.0.1:${port}/live`;
+
+  const host = await connectHost(url);
+  context.after(() => host.terminate());
+  const hostMessages = [];
+  host.on("message", (data) => { hostMessages.push(JSON.parse(data.toString("utf8"))); });
+  await startHostSocket(host, SESSION_ID, ["ko", "en"]);
+  const startStatuses = hostMessages.filter((message) => message.type === "engine-status");
+  assert.deepEqual(startStatuses.map(({ role, provider, model, status }) => ({ role, provider, model, status })), [
+    // D2 (2026-09-05): the catalog default is Soniox recognition + translation.
+    { role: "stt", provider: "soniox", model: "stt-rt-v5", status: "connecting" },
+    { role: "translation", provider: "soniox", model: "stt-rt-v5", status: "connecting" },
+    { role: "stt", provider: "soniox", model: "stt-rt-v5", status: "ready" },
+    { role: "translation", provider: "soniox", model: "stt-rt-v5", status: "ready" },
+  ], "normal start reports connecting then ready for both roles");
+  assert.ok(startStatuses.every((message) => message.sessionId === SESSION_ID && message.code === undefined));
+  assert.ok(hostMessages.findIndex((message) => message.type === "started") > hostMessages.findIndex((message) => message.status === "ready"),
+    "ready precedes the started ACK because start() has resolved by then");
+  hostMessages.length = 0;
+
+  const { viewer, events } = await subscribeViewer(url, "en", "engine-viewer");
+  context.after(() => viewer.terminate());
+
+  const switched = await postEngine(port, SESSION_ID, signAdminToken("gateway-secret", { now: clock }), { engine: FLASH_37_ENGINE });
+  assert.equal(switched.status, 200);
+  assert.deepEqual(switched.json, { result: "switched" });
+  assert.equal(pipelines.length, 2);
+  assert.equal(pipelines[0].closed, 1, "the old pipeline is closed after the new one is ready");
+  assert.equal(pipelines[1].closed, 0);
+  assert.equal(pipelines[1].previous, pipelines[0], "the factory receives the retiring pipeline so lastSequences reseed the counter (contract C1)");
+  assert.equal(pipelines[1].settings.captionConfig.engine.translation.model, "gemini-3.7-flash");
+  assert.deepEqual(pipelines[1].settings.languages, ["ko", "en"]);
+  assert.equal(pipelines[1].settings.sessionId, SESSION_ID);
+  assert.notEqual(pipelines[1].settings.captionConfigFingerprint, pipelines[0].settings.captionConfigFingerprint);
+
+  const switchStatuses = hostMessages.filter((message) => message.type === "engine-status");
+  assert.deepEqual(switchStatuses.map(({ role, model, status }) => ({ role, model, status })), [
+    { role: "stt", model: "gemini-3.5-transcribe-live", status: "connecting" },
+    { role: "translation", model: "gemini-3.7-flash", status: "connecting" },
+    { role: "stt", model: "gemini-3.5-transcribe-live", status: "ready" },
+    { role: "translation", model: "gemini-3.7-flash", status: "ready" },
+  ]);
+  await waitForGatewayCondition(() => events.filter((event) => event.type === "language-status").length >= 2);
+  assert.deepEqual(events.filter((event) => event.type === "language-status").map(({ language, status }) => ({ language, status })), [
+    { language: "en", status: "preparing" },
+    { language: "en", status: "ready" },
+  ], "viewers see preparing while the new engine opens, then ready from the new pipeline");
+  assert.match(gateway.metrics.render(), /realtime_noel_host_sessions 1/u);
+  assert.match(gateway.metrics.render(), /realtime_noel_engine_switches_total 1/u);
+  assert.equal(host.readyState, WebSocket.OPEN, "the host socket survives an admin switch");
+
+  const limited = await postEngine(port, SESSION_ID, signAdminToken("gateway-secret", { now: clock }), { engine: FLASH_37_ENGINE });
+  assert.equal(limited.status, 429);
+  assert.deepEqual(limited.json, { result: "failed", code: "ENGINE_SWITCH_RATE_LIMITED" });
+  clock += 2_000;
+  const unchanged = await postEngine(port, SESSION_ID, signAdminToken("gateway-secret", { now: clock }), { engine: FLASH_37_ENGINE });
+  assert.equal(unchanged.status, 200);
+  assert.deepEqual(unchanged.json, { result: "switched" });
+  assert.equal(pipelines.length, 2, "re-deploying the running engine is idempotent and builds no pipeline");
+
+  // Host audio after the switch reaches the NEW pipeline only.
+  let accepted = 0;
+  pipelines[1].acceptAudio = async () => { accepted += 1; };
+  pipelines[0].acceptAudio = async () => { throw new Error("old pipeline must not receive audio"); };
+  host.send(Buffer.alloc(1_280));
+  await waitForGatewayCondition(() => accepted === 1);
+});
+
+test("a failed admin engine switch keeps the old pipeline serving, reports engine-status failed, and re-announces viewers ready", async (context) => {
+  const pipelines = [];
+  const gateway = createEngineSwitchGateway({ pipelines, factoryFailure: () => new Error("STT_PROVIDER_UNAVAILABLE") });
+  await new Promise((resolve) => gateway.server.listen(0, "127.0.0.1", resolve));
+  context.after(async () => gateway.close());
+  const { port } = gateway.server.address();
+  const url = `ws://127.0.0.1:${port}/live`;
+  const host = await connectHost(url);
+  context.after(() => host.terminate());
+  await startHostSocket(host, SESSION_ID, ["ko", "en"]);
+  const hostMessages = [];
+  host.on("message", (data) => { hostMessages.push(JSON.parse(data.toString("utf8"))); });
+  const { viewer, events } = await subscribeViewer(url, "ko", "engine-viewer-fail");
+  context.after(() => viewer.terminate());
+
+  const failed = await postEngine(port, SESSION_ID, signAdminToken("gateway-secret"), { engine: FLASH_37_ENGINE });
+  assert.equal(failed.status, 409);
+  assert.deepEqual(failed.json, { result: "failed", code: "STT_PROVIDER_UNAVAILABLE" });
+  assert.equal(pipelines.length, 1);
+  assert.equal(pipelines[0].closed, 0, "the running pipeline is untouched when the replacement cannot open");
+  const statuses = hostMessages.filter((message) => message.type === "engine-status");
+  assert.deepEqual(statuses.map(({ role, status, code }) => ({ role, status, code })), [
+    { role: "stt", status: "connecting", code: undefined },
+    { role: "translation", status: "connecting", code: undefined },
+    { role: "stt", status: "failed", code: "STT_PROVIDER_UNAVAILABLE" },
+    { role: "translation", status: "failed", code: "STT_PROVIDER_UNAVAILABLE" },
+  ]);
+  await waitForGatewayCondition(() => events.filter((event) => event.type === "language-status").length >= 2);
+  assert.deepEqual(events.filter((event) => event.type === "language-status").map(({ status }) => status), ["preparing", "ready"]);
+  assert.equal(host.readyState, WebSocket.OPEN);
+  assert.match(gateway.metrics.render(), /realtime_noel_host_sessions 1/u);
+  assert.match(gateway.metrics.render(), /realtime_noel_engine_switch_failures_total 1/u);
+
+  // Host audio still flows to the surviving pipeline.
+  let accepted = 0;
+  pipelines[0].acceptAudio = async () => { accepted += 1; };
+  host.send(Buffer.alloc(1_280));
+  await waitForGatewayCondition(() => accepted === 1);
+});
+
+test("admin engine switch preserves the participant floor on the replacement pipeline", async (context) => {
+  const pipelines = [];
+  const gateway = createEngineSwitchGateway({ pipelines });
+  await new Promise((resolve) => gateway.server.listen(0, "127.0.0.1", resolve));
+  context.after(async () => gateway.close());
+  const { port } = gateway.server.address();
+  const url = `ws://127.0.0.1:${port}/live`;
+  const host = await connectHost(url);
+  context.after(() => host.terminate());
+  await startHostSocket(host, SESSION_ID, ["ko", "en"]);
+  const speaker = new WebSocket(url);
+  context.after(() => speaker.terminate());
+  await once(speaker, "open");
+  let received = nextJson(speaker);
+  speaker.send(JSON.stringify({ type: "authenticate", token: signViewerToken("viewer-secret", "floor-holder") }));
+  assert.equal((await received).type, "authenticated");
+  received = nextJson(speaker);
+  speaker.send(JSON.stringify({ type: "subscribe", sessionId: SESSION_ID, language: "en" }));
+  assert.equal((await received).type, "subscribed");
+  const speakStarted = nextJsonMatching(speaker, (message) => message.type === "speak-started");
+  speaker.send(JSON.stringify({ type: "speak-start", sessionId: SESSION_ID, displayName: "Guest" }));
+  await speakStarted;
+
+  const switched = await postEngine(port, SESSION_ID, signAdminToken("gateway-secret"), { engine: FLASH_37_ENGINE });
+  assert.deepEqual(switched.json, { result: "switched" });
+  assert.equal(pipelines[1].floorSpeaker?.displayName, "Guest", "the floor holder is re-attributed on the new pipeline");
+  assert.equal(speaker.readyState, WebSocket.OPEN, "an engine switch does not end the participant's turn");
+});
+
+// ── Post-Task-5 hardening round: engine-aware reconnect, attempt pruning, 413 hangup, lane-aware re-announce, cleanup-failure lanes ──
+
+const SESSION_THREE_ID = "11111111-1111-4111-8111-111111111113";
+
+function createReconnectGateway({ pipelines, dbEngine, authorizations }) {
+  return createGatewayServer({
+    gatewaySecret: "gateway-secret",
+    viewerSecret: "viewer-secret",
+    engineKeyEnvironment: ENGINE_FIXTURE_KEYS,
+    hostReconnectGraceMilliseconds: 45_000,
+    viewerAuthorizer: {
+      async authorize() { return true; },
+      async authorizeBatch(requests) { return new Map(requests.map(({ key }) => [key, true])); },
+    },
+    hostAuthorizer: {
+      // Mirrors the Supabase authorizer's engine-parity rule (Plan 2 Task 4):
+      // only the DB engine may run; everything else about the session is fine.
+      async authorize(_claims, settings) {
+        const engine = settings.captionConfig?.engine ?? DEFAULT_ENGINE_SELECTION;
+        const accepted = engineSelectionKey(engine) === engineSelectionKey(dbEngine.current);
+        authorizations.push({ model: engine.translation.model, accepted });
+        return accepted;
+      },
+    },
+    async pipelineFactory(settings, previous) {
+      const pipeline = {
+        settings, previous, closed: 0,
+        async start() {}, async tick() {}, async acceptAudio() {}, async close() { this.closed += 1; },
+      };
+      pipelines.push(pipeline);
+      return pipeline;
+    },
+  });
+}
+
+async function reconnectHost(url, context, startMessage) {
+  const host = await connectHost(url);
+  context.after(() => host.terminate());
+  const messages = [];
+  host.on("message", (data) => { messages.push(JSON.parse(data.toString("utf8"))); });
+  const reply = nextJsonMatching(host, (message) => message.type === "started" || message.type === "error");
+  host.send(JSON.stringify({
+    type: "start", sessionId: SESSION_ID, version: 1,
+    sessionType: "presentation", outputMode: "captions", languages: ["ko", "en"],
+    ...startMessage,
+  }));
+  return { host, messages, reply: await reply };
+}
+
+test("after an admin switch a host reconnect reattaches warm on the running engine and only rebuilds when the DB names a different engine", { timeout: 5_000 }, async (context) => {
+  const pipelines = [];
+  const authorizations = [];
+  const dbEngine = { current: DEFAULT_ENGINE_SELECTION };
+  const gateway = createReconnectGateway({ pipelines, dbEngine, authorizations });
+  await new Promise((resolve) => gateway.server.listen(0, "127.0.0.1", resolve));
+  context.after(async () => gateway.close());
+  const { port } = gateway.server.address();
+  const url = `ws://127.0.0.1:${port}/live`;
+
+  const host = await connectHost(url);
+  await startHostSocket(host, SESSION_ID, ["ko", "en"]);
+  assert.equal(pipelines.length, 1);
+  // The admin console writes the DB first, then pushes the same engine here.
+  dbEngine.current = FLASH_37_ENGINE;
+  const switched = await postEngine(port, SESSION_ID, signAdminToken("gateway-secret"), { engine: FLASH_37_ENGINE });
+  assert.deepEqual(switched.json, { result: "switched" });
+  assert.equal(pipelines.length, 2);
+  assert.equal(pipelines[0].closed, 1);
+  host.terminate();
+  await once(host, "close");
+  await new Promise((resolve) => setImmediate(resolve));
+
+  // (a) A desktop that re-pinned from the session record (906fe46) sends the
+  // running engine: identical fingerprint, plain warm reattach.
+  const repinned = await reconnectHost(url, context, {
+    captionConfig: { languages: ["ko", "en"], outputMode: "captions", glossaryPack: "general_cre", engine: FLASH_37_ENGINE },
+  });
+  assert.equal(repinned.reply.type, "started");
+  assert.equal(pipelines.length, 2, "same-engine reconnect must not rebuild");
+  assert.equal(pipelines[1].closed, 0);
+  assert.match(gateway.metrics.render(), /realtime_noel_host_reattaches_total 1\b/u);
+  repinned.host.terminate();
+  await once(repinned.host, "close");
+  await new Promise((resolve) => setImmediate(resolve));
+
+  // (b) A desktop still carrying its arm-time captionConfig (old engine, nothing
+  // else changed): the gateway authorizes the RUNNING engine against the DB and
+  // reattaches warm instead of rebuilding the old engine into SESSION_REVOKED.
+  authorizations.length = 0;
+  const stale = await reconnectHost(url, context, {});
+  assert.equal(stale.reply.type, "started", `stale-engine reconnect must reattach warm, got ${JSON.stringify(stale.reply)}`);
+  assert.equal(pipelines.length, 2, "the running pipeline keeps serving; no rebuild with the stale engine");
+  assert.equal(pipelines[1].closed, 0);
+  assert.deepEqual(authorizations, [{ model: "gemini-3.7-flash", accepted: true }],
+    "the reattach is authorized with the running (DB-accepted) engine, never the stale one");
+  const readyStatuses = stale.messages.filter((message) => message.type === "engine-status");
+  assert.deepEqual(readyStatuses.map(({ role, model, status }) => ({ role, model, status })), [
+    { role: "stt", model: "gemini-3.5-transcribe-live", status: "ready" },
+    { role: "translation", model: "gemini-3.7-flash", status: "ready" },
+  ], "the reconnecting host learns which engine is actually running");
+  assert.match(gateway.metrics.render(), /realtime_noel_host_reattach_engine_repins_total 1\b/u);
+  stale.host.terminate();
+  await once(stale.host, "close");
+  await new Promise((resolve) => setImmediate(resolve));
+
+  // (c) Stale engine AND a real settings change: not a re-pin candidate, so it is
+  // today's cold path — rebuild with the incoming config, which the DB refuses.
+  const edited = await reconnectHost(url, context, { glossaryText: "다른 용어집" });
+  assert.equal(edited.reply.type, "error");
+  assert.equal(edited.reply.code, "SESSION_REVOKED");
+  assert.equal(pipelines.length, 2);
+  assert.equal(pipelines[1].closed, 0, "a refused rebuild never touches the running pipeline");
+  edited.host.terminate();
+  await once(edited.host, "close");
+  await new Promise((resolve) => setImmediate(resolve));
+
+  // (d) The DB no longer names the running engine (this gateway is the stale
+  // side): today's behaviour — rebuild with the incoming engine, DB decides.
+  dbEngine.current = DEFAULT_ENGINE_SELECTION;
+  authorizations.length = 0;
+  const moved = await reconnectHost(url, context, {});
+  assert.equal(moved.reply.type, "started");
+  assert.equal(pipelines.length, 3, "a DB engine that differs from the running one rebuilds");
+  assert.equal(pipelines[1].closed, 1);
+  assert.equal(pipelines[2].settings.captionConfig.engine.translation.model, DEFAULT_ENGINE_SELECTION.translation.model);
+  assert.equal(authorizations[0].model, "gemini-3.7-flash");
+  assert.equal(authorizations[0].accepted, false, "the running engine is checked first and refused");
+  assert.ok(authorizations.slice(1).every((entry) => entry.model === DEFAULT_ENGINE_SELECTION.translation.model && entry.accepted));
+});
+
+test("engine switch attempts are pruned on stop and detach and stale entries are evicted after the cooldown", async (context) => {
+  const pipelines = [];
+  let clock = Date.now();
+  const gateway = createEngineSwitchGateway({ pipelines, now: () => clock });
+  await new Promise((resolve) => gateway.server.listen(0, "127.0.0.1", resolve));
+  context.after(async () => gateway.close());
+  const { port } = gateway.server.address();
+  const url = `ws://127.0.0.1:${port}/live`;
+  const attempts = () => Number(/realtime_noel_engine_switch_attempts (\d+)/u.exec(gateway.metrics.render())?.[1]);
+
+  const host = await connectHost(url);
+  context.after(() => host.terminate());
+  await startHostSocket(host, SESSION_ID, ["ko", "en"]);
+  assert.deepEqual((await postEngine(port, SESSION_ID, signAdminToken("gateway-secret", { now: clock }), { engine: FLASH_37_ENGINE })).json, { result: "switched" });
+  assert.equal(attempts(), 1);
+
+  const stopped = nextJsonMatching(host, (message) => message.type === "stopped");
+  host.send(JSON.stringify({ type: "stop", sessionId: SESSION_ID }));
+  await stopped;
+  assert.equal(attempts(), 0, "stop prunes the session's attempt entry");
+
+  const second = await connectHost(url);
+  context.after(() => second.terminate());
+  await startHostSocket(second, SESSION_ID, ["ko", "en"]);
+  const relaunched = await postEngine(port, SESSION_ID, signAdminToken("gateway-secret", { now: clock }), { engine: FLASH_37_ENGINE });
+  assert.equal(relaunched.status, 200, "a stopped session's cooldown must not survive into its next life");
+  assert.deepEqual(relaunched.json, { result: "switched" });
+  assert.equal(attempts(), 1);
+  assert.deepEqual((await postEngine(port, SESSION_TWO_ID, signAdminToken("gateway-secret", { now: clock, sessionId: SESSION_TWO_ID }), { engine: FLASH_37_ENGINE })).json, { result: "queued" });
+  assert.equal(attempts(), 2);
+
+  const detached = nextJsonMatching(second, (message) => message.type === "detached");
+  second.send(JSON.stringify({ type: "detach", sessionId: SESSION_ID }));
+  await detached;
+  assert.equal(attempts(), 1, "detach prunes the session's attempt entry");
+
+  clock += 2_000;
+  assert.deepEqual((await postEngine(port, SESSION_THREE_ID, signAdminToken("gateway-secret", { now: clock, sessionId: SESSION_THREE_ID }), { engine: FLASH_37_ENGINE })).json, { result: "queued" });
+  assert.equal(attempts(), 1, "entries older than the cooldown are evicted on the next call");
+});
+
+test("an oversized chunked engine body gets a 413 and the connection is destroyed instead of waiting for the client", { timeout: 5_000 }, async (context) => {
+  const pipelines = [];
+  const gateway = createEngineSwitchGateway({ pipelines });
+  await new Promise((resolve) => gateway.server.listen(0, "127.0.0.1", resolve));
+  context.after(async () => gateway.close());
+  const { port } = gateway.server.address();
+
+  const socket = netConnect({ host: "127.0.0.1", port });
+  context.after(() => socket.destroy());
+  await once(socket, "connect");
+  const received = [];
+  socket.on("data", (chunk) => received.push(chunk));
+  socket.write([
+    `POST /internal/sessions/${SESSION_ID}/engine HTTP/1.1`,
+    "Host: 127.0.0.1",
+    `Authorization: Bearer ${signAdminToken("gateway-secret")}`,
+    "Content-Type: application/json",
+    "Transfer-Encoding: chunked",
+    "", "",
+  ].join("\r\n"));
+  const chunk = "x".repeat(4_096);
+  for (let index = 0; index < 6; index += 1) {
+    socket.write(`${chunk.length.toString(16)}\r\n${chunk}\r\n`);
+  }
+  // No terminating chunk: a client that keeps the body open must not keep the
+  // connection (and its request slot) alive after the refusal.
+  const closed = await Promise.race([
+    once(socket, "close").then(() => true),
+    new Promise((resolve) => setTimeout(() => resolve(false), 2_000)),
+  ]);
+  const response = Buffer.concat(received).toString("utf8");
+  assert.match(response, /^HTTP\/1\.1 413 /u);
+  assert.match(response, /"code":"PAYLOAD_TOO_LARGE"/u);
+  assert.equal(closed, true, "the gateway must hang up after the 413");
+  assert.equal(pipelines.length, 0);
+});
+
+test("a failed admin engine switch re-announces ready only for lanes that were ready before the switch", async (context) => {
+  const pipelines = [];
+  const gateway = createEngineSwitchGateway({ pipelines, factoryFailure: () => new Error("STT_PROVIDER_UNAVAILABLE") });
+  await new Promise((resolve) => gateway.server.listen(0, "127.0.0.1", resolve));
+  context.after(async () => gateway.close());
+  const { port } = gateway.server.address();
+  const url = `ws://127.0.0.1:${port}/live`;
+  const host = await connectHost(url);
+  context.after(() => host.terminate());
+  await startHostSocket(host, SESSION_ID, ["ko", "en"]);
+  const ko = await subscribeViewer(url, "ko", "lane-ko");
+  context.after(() => ko.viewer.terminate());
+  const en = await subscribeViewer(url, "en", "lane-en");
+  context.after(() => en.viewer.terminate());
+
+  // The running pipeline's own transition: the ko lane is in cooldown.
+  await gateway.broadcastEvent(SESSION_ID, "ko", { type: "language-status", sessionId: SESSION_ID, language: "ko", status: "unavailable", code: "LANGUAGE_COOLDOWN" });
+  await waitForGatewayCondition(() => ko.events.some((event) => event.type === "language-status" && event.status === "unavailable"));
+
+  const failed = await postEngine(port, SESSION_ID, signAdminToken("gateway-secret"), { engine: FLASH_37_ENGINE });
+  assert.equal(failed.status, 409);
+  await waitForGatewayCondition(() => en.events.filter((event) => event.type === "language-status").length >= 2);
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.deepEqual(en.events.filter((event) => event.type === "language-status").map(({ status }) => status), ["preparing", "ready"],
+    "a lane that was ready is told ready again");
+  assert.deepEqual(ko.events.filter((event) => event.type === "language-status").map(({ status, code }) => ({ status, code })), [
+    { status: "unavailable", code: "LANGUAGE_COOLDOWN" },
+    { status: "preparing", code: undefined },
+  ], "a lane in cooldown is not promoted to ready by the failed switch");
+  assert.equal(pipelines[0].closed, 0);
+});
+
+test("a retiring pipeline that will not close marks every lane unavailable for viewers before the session is dropped (admin switch)", async (context) => {
+  const pipelines = [];
+  const gateway = createEngineSwitchGateway({ pipelines });
+  await new Promise((resolve) => gateway.server.listen(0, "127.0.0.1", resolve));
+  context.after(async () => gateway.close());
+  const { port } = gateway.server.address();
+  const url = `ws://127.0.0.1:${port}/live`;
+  const host = await connectHost(url);
+  context.after(() => host.terminate());
+  await startHostSocket(host, SESSION_ID, ["ko", "en"]);
+  const { viewer, events } = await subscribeViewer(url, "en", "cleanup-switch");
+  context.after(() => viewer.terminate());
+  pipelines[0].close = async () => { throw new Error("CLOSE_FAILED"); };
+
+  const hostClosed = once(host, "close");
+  const failed = await postEngine(port, SESSION_ID, signAdminToken("gateway-secret"), { engine: FLASH_37_ENGINE });
+  assert.equal(failed.status, 409);
+  assert.deepEqual(failed.json, { result: "failed", code: "PIPELINE_CLEANUP_FAILED" });
+  await hostClosed;
+  await waitForGatewayCondition(() => events.some((event) => event.type === "language-status" && event.status === "unavailable"));
+  assert.deepEqual(events.filter((event) => event.type === "language-status").map(({ status, code }) => ({ status, code })), [
+    { status: "preparing", code: undefined },
+    { status: "ready", code: undefined },
+    { status: "unavailable", code: "PIPELINE_CLEANUP_FAILED" },
+  ]);
+  assert.match(gateway.metrics.render(), /realtime_noel_host_sessions 0\b/u);
+});
+
+test("a retiring pipeline that will not close marks every lane unavailable for viewers before the session is dropped (host update)", async (context) => {
+  const pipelines = [];
+  const gateway = createEngineSwitchGateway({ pipelines });
+  await new Promise((resolve) => gateway.server.listen(0, "127.0.0.1", resolve));
+  context.after(async () => gateway.close());
+  const { port } = gateway.server.address();
+  const url = `ws://127.0.0.1:${port}/live`;
+  const host = await connectHost(url);
+  context.after(() => host.terminate());
+  await startHostSocket(host, SESSION_ID, ["ko", "en"]);
+  const { viewer, events } = await subscribeViewer(url, "en", "cleanup-update");
+  context.after(() => viewer.terminate());
+  pipelines[0].close = async () => { throw new Error("CLOSE_FAILED"); };
+
+  const reply = nextJsonMatching(host, (message) => message.type === "updated" || message.type === "error");
+  host.send(JSON.stringify({
+    type: "update", sessionId: SESSION_ID, version: 1,
+    sessionType: "presentation", outputMode: "captions", languages: ["ko", "en"], glossaryText: "새 용어집",
+  }));
+  const error = await reply;
+  assert.equal(error.type, "error");
+  assert.equal(error.code, "PIPELINE_CLEANUP_FAILED");
+  await waitForGatewayCondition(() => events.some((event) => event.type === "language-status" && event.status === "unavailable"));
+  assert.deepEqual(events.filter((event) => event.type === "language-status").map(({ status, code }) => ({ status, code })), [
+    { status: "ready", code: undefined },
+    { status: "unavailable", code: "PIPELINE_CLEANUP_FAILED" },
+  ]);
+  assert.equal(pipelines.length, 2);
+  assert.match(gateway.metrics.render(), /realtime_noel_host_sessions 0\b/u);
 });

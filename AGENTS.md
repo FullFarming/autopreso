@@ -5,15 +5,13 @@ This file provides guidance to coding agents when working with code in this repo
 ## Commands
 
 ```sh
-npm run dev                       # run the CLI from source (./src/cli.js)
+npm run dev                       # run NOVA from source (./src/nova-cli.js)
 npm run desktop                   # run the Electron desktop host (./scripts/start-desktop.js)
 npm run typecheck                 # tsc --noEmit
 npm test                          # node --test "test/**/*.test.js" - the root suite only
 npm run test:all                  # root suite + media-gateway + webapp test:live
 node --test test/server-startup.test.js   # run a single test file
 node --test --test-name-pattern="warmup" test/whiteboard-session.test.js  # filter by test name
-npm run build:moonshine-sidecars  # build Python -> single-binary sidecars for macOS arm64+x64
-node ./scripts/build-moonshine-sidecars.js darwin-arm64   # build only one target
 npm run dist:mac                  # electron-builder DMG (also dist:mac:x64, dist:win)
 ```
 
@@ -23,9 +21,9 @@ There is no npm workspace: the root, `media-gateway/`, and `webapp/` each have
 their own `package.json` and lockfile, so each needs its own `npm ci`.
 
 ```sh
-npm test                             # root: 739 tests (738 pass, 1 skip)
-npm --prefix media-gateway test      # 250 tests (bare `node --test`)
-npm --prefix webapp run test:live    # 104 tests (Live Call surface)
+npm test                             # root: 1537 tests (1517 pass, 20 skip - PGlite SQL tests need NOVA_PGLITE_MODULE; local-term-retrieval's lookup-budget test flakes only when the three suites run concurrently)
+npm --prefix media-gateway test      # 644 tests (bare `node --test`)
+npm --prefix webapp run test:live    # 1043 tests (Live Call surface; test:core adds 79)
 npm --prefix webapp test             # test:live + test:core - what CI runs
 ```
 
@@ -47,91 +45,22 @@ parallel jobs on Node 24 so a red X names the suite that broke: `desktop + CLI`
 
 The `--no-open` flag suppresses auto-launching the browser, which is useful when iterating from a terminal.
 
-## Product surfaces
+## Product boundary — 2026-09-05
 
-Two products share this repo, one Express server, and one settings file. Most
-current work is on the first; the `## Architecture` section and all of its
-subsections describe the second.
+This repository is NOVA only: Captions, Live Call and Settings. Canvas is an
+independent Git repository at `../realtime-noel-canvas`; never restore its entry
+page, routes, WebSocket handlers or settings to NOVA.
 
-- **Live translation subtitles** - live captions translated across the 14
-  language codes in `LIVE_TRANSLATION_LANGUAGES` (`media-gateway/src/config.js`,
-  mirrored by `SUBTITLE_LANGUAGES` in `src/subtitle-languages.js`), 1-3 per
-  session. It has two independent delivery paths: a **local** one where the
-  Electron desktop host translates its own audio in-process
-  (`src/subtitle-realtime.js` talking straight to Gemini Live / OpenAI Realtime)
-  and paints overlay windows, and **Live Call**, where a separate WebSocket
-  gateway (`media-gateway/`) runs the pipeline and a Next.js app (`webapp/`)
-  shows captions to remote participants. See "Live translation architecture"
-  below. Persistent Live Call state is in Supabase (`supabase/migrations/`).
-- **Whiteboard agent CLI** - the original product, still real. `npm run dev`
-  boots it and opens `/`, which serves `public/index.html` + `public/app.js`
-  (Excalidraw); an LLM agent edits the scene through tool calls.
-
-Both are served by the same `startServer` in `src/server.js`. The CLI opens `/`
-(whiteboard); the Electron app loads `/subtitle.html` (subtitles) and passes a
-no-op `createTranscription`. They share no session model and no pipeline - a
-change to one is very unlikely to be the fix for the other.
-
-## Architecture
-
-This section describes the **whiteboard** product: a single Node process that serves a static Excalidraw frontend, runs an STT pipeline, and orchestrates an LLM agent that edits the whiteboard via tool calls. The end-to-end loop is:
-
-```
-browser mic -> WS audio frames -> transcription provider -> turn queue ->
-runWhiteboardAgent (in src/server.js) -> tool call ops -> apply to scene ->
-broadcast whiteboard:update over WS -> frontend re-renders Excalidraw
-```
-
-### Entry points and wiring
-
-- `src/cli.js` parses args, loads `~/.config/realtime-noel/settings.json` via `settings-store.js`, resolves an agent provider, then calls `startServer`.
-- `src/server.js` is the central hub. It owns the Express + WebSocket server, mounts the static frontend in `public/`, instantiates a `WhiteboardSession`, builds a `TranscriptionManager`, and exposes `runWhiteboardAgent` / `runWhiteboardWarmupOnce` which contain the system prompt and the AI SDK `tool({...})` definitions. `server.js` is large (~1700 LOC) on purpose - keep the agent prompt, message construction, and tool schemas colocated. It also carries the subtitle product's HTTP surface (`/api/subtitles/*`, `/api/subtitle-languages`, `/api/glossary-presets`) and wires up `createSubtitleRealtimeManager`, so not everything in this file is whiteboard code.
-- `public/app.js` is the React frontend. It renders Excalidraw, handles mic capture at 24 kHz, sends audio frames over WS, periodically pushes downscaled screenshots back to the server (`whiteboard:screenshot`), and reflects server-pushed scene updates back into Excalidraw. Frontend is plain ES modules loaded via `<script type="importmap">` from esm.sh - no build step.
-- `src/session-cost.js` tracks per-session agent token usage and transcription audio seconds. `server.js` records agent usage after warmup/turn calls, records transcription audio as frames arrive, broadcasts `cost` over WS, and resets the tracker on Start Realtime_Noel and session reset.
-
-### Two-mode session model (`src/whiteboard-session.js`)
-
-The session has two modes that are NOT symmetric:
-
-- **`staging`** - client-side scratchpad. The server does not track elements in this mode; the frontend owns them. Used to seed the canvas with reference content before going live.
-- **`live`** - the server owns `state.elements` as the source of truth. Audio, screenshots, and user edits all flow into the server, which applies agent edits and broadcasts updates.
-
-Transitions: `POST /api/preso/start` builds a "staging primer" message (current scene snapshot + downscaled screenshot when staging is non-empty), extracts staging text/labels as transcription keywords, snapshots saved Agent instructions for the whole preso, resets session cost, and kicks off the warmup loop. `POST /api/preso/back-to-staging` returns to client-owned mode and clears the transcription keywords; `POST /api/session/reset` also clears them and resets session cost.
-
-Audio messages carry a browser-generated `sessionId`. `stop`, reset, back-to-staging, and Start Realtime_Noel invalidate the current session token so late audio frames, queued turns, stale tool executions, and post-turn history appends cannot mutate the next session; cost still records usage already incurred.
-
-### Warmup loop
-
-Before the user speaks, `startWarmupLoop` repeatedly fires the agent against the staging primer and the Agent instructions snapshot with exponential backoff (`DEFAULT_WARMUP_DELAYS`, max 8 attempts). Its purpose is **prompt cache priming**: after the loop ends, `agentHistory` is forced to `[warmup_user_msg, assistant("UNDERSTOOD")]` so every subsequent turn reuses the same prefix bytes. Do not change this primer-then-fixed-history pattern or the per-preso instructions snapshot without understanding the cache implications.
-
-### Transcript turn queue (`src/transcript-turn-queue.js`)
-
-Transcript chunks are gated by an `isReady` predicate, but the live session sets queue debounce to `0` because turn boundaries are decided upstream. OpenAI Realtime uses `src/openai-transcription.js` delta-quiet flushing instead of `transcription.completed` events, while Moonshine emits per-chunk commits. While a turn is running, additional chunks are buffered and concatenated for the next turn. This means the agent never has more than one in-flight turn, but it always sees the most recent burst of speech in one shot. `isTrivialTranscript` in `whiteboard-session.js` filters out filler-only chunks ("uh", "okay", etc.) so they don't trigger turns on their own.
-
-### Whiteboard edit model (`src/whiteboard-tools.js`)
-
-The agent does not see Excalidraw JSON directly; it sees a **line-numbered text view** of the scene (`formatLineNumberedWhiteboard`) and emits `replace`, `insert_after`, or `delete` operations against line numbers. `applyWhiteboardEditOperations` validates and applies them in order. When changing the agent's contract, update both the tool schema in `server.js` and this applier, and add a test in `test/whiteboard-tools.test.js`.
-
-### Agent providers (`src/agent-provider.js`, `src/codex-auth.js`)
-
-Three providers, all routed through the `@ai-sdk/openai` adapter:
-
-- **openai** - direct API key, with configurable OpenAI-compatible API base URL.
-- **codex** - reads the user's Codex CLI auth from `~/.codex/auth.json`, then talks to the ChatGPT backend with that bearer token. No API key needed.
-- **ollama** - OpenAI-compatible local endpoint (`http://localhost:11434/v1`).
-
-`reasoningEffort` is validated against the set `{none, low, medium, high, xhigh}`.
-
-### Transcription providers
-
-- **Moonshine (default, local)** - `src/moonshine-transcription.js` spawns the platform-specific binary at `@realtime-noel/moonshine-<platform>/bin/realtime-noel-moonshine` (declared as **optional** dependencies; the install just skips on unsupported platforms). The binary is built from `scripts/moonshine-sidecar.py` via PyInstaller; only macOS arm64/x64 are currently packaged.
-- **OpenAI Realtime** - `src/openai-transcription.js` opens a WSS connection to `wss://api.openai.com/v1/realtime?intent=transcription` and streams PCM frames.
-
-The active provider is hot-swappable: `applyCurrent()` in `server.js`'s `createTranscriptionManager` rebuilds the underlying instance whenever settings change, without restarting the server. Any active session context is reapplied to the new provider.
-
-### Settings store (`src/settings-store.js`)
-
-Persists to `~/.config/realtime-noel/settings.json`, including `agentInstructions` validated at 100,000 characters. The store has a `getSanitized()` method that strips API keys before sending to the frontend - always use that for outbound payloads. Env vars (`OPENAI_API_KEY`, `OPENAI_MODEL`, `OPENAI_BASE_URL`, `OLLAMA_*`, `CODEX_*`) only **seed** the file on first run; once it exists, the file wins and env vars are ignored.
+- `npm run dev -- --no-open` / `npm start`: `src/nova-cli.js`, default port 3317.
+- `/`, `/index.html`, `/subtitle`, `/subtitle.html`: NOVA captions.
+- `npm run desktop`: Electron, retaining its existing application identity.
+- `~/.config/nova/settings.json` and `transcripts/`: NOVA only. `nova-config.js`
+  imports recognized prior caption settings/records/audio once without deleting
+  the original or overwriting existing NOVA data.
+- Canvas keeps `~/.config/realtime-noel` and port 3319. Neither repository relies
+  on the other's runtime files or node_modules.
+- Public assets are explicitly allowlisted; canvas, Coach and Interpreter URLs
+  are not served. Do not expose an old surface by widening static middleware.
 
 ## Live translation architecture
 
@@ -152,6 +81,14 @@ socket (`onHostEvent`), because participant Speak audio is invisible to the
 desktop's own local engine; `electron/main.js` fans those to all renderers as
 `live-call:caption`.
 
+A session carries 1–3 unique canonical languages (`validateEngineForLanguages`
+in `packages/caption-core/caption-engine-catalog.js`). On Soniox, 1 language is
+a `one_way` stream and 2 is one `two_way` connection; 3 languages use
+`SonioxFanoutAdapter` (`media-gateway/src/engines/`): one Soniox connection per
+target language, finals aligned by time-range overlap plus normalized text,
+dead or recovering lanes skipped (fail-open to the source text), and lane
+rollovers staggered 60 s apart so no two connections renew in the same instant.
+
 - **Electron desktop host** (`electron/main.js`, `electron/preload.js`) owns the
   windows and the OS capture permissions. It boots the same `startServer` on
   `127.0.0.1:3210` (falling back to port 0 on `EADDRINUSE`) and loads its pages
@@ -168,11 +105,10 @@ desktop's own local engine; `electron/main.js` fans those to all renderers as
   `createGatewayServer` in `src/gateway-server.js` accepts exactly one WebSocket
   path, `/live`, for both host and viewer roles, and owns session lifecycle, the
   speaking floor, viewer topics, and per-language caption sequencing.
-  `src/live-media-pipeline.js` is the STT/translate/TTS pipeline; provider
-  adapters live in `google-provider-adapters.js` and
-  `openai-realtime-translation.js`; Supabase RPC wrappers in
-  `supabase-adapters.js`. Deployment and IAM constraints are in
-  `media-gateway/README.md` (Korean).
+  `src/live-media-pipeline.js` is the STT/translate/TTS pipeline; the active
+  Gemini STT/translation/TTS adapters live in `google-provider-adapters.js`;
+  Supabase RPC wrappers live in `supabase-adapters.js`. Deployment and IAM
+  constraints are in `media-gateway/README.md` (Korean).
 - **`webapp/`** is the Next.js participant app *and* the host-facing REST API the
   desktop main process calls (`/api/login`, `/api/live-sessions`,
   `.../gateway-token`, `/api/live-config` for the gateway URL).
@@ -185,20 +121,80 @@ desktop's own local engine; `electron/main.js` fans those to all renderers as
   `viewer_grants`, `live_utterances`, `live_meeting_summaries`, snapshots, and
   rate limits. Nearly everything goes through `security definer` RPCs rather
   than table writes.
+- **Host identity.** Supabase Auth is the identity provider only. The browser
+  signs in (Google or email/password, PKCE) and posts the access token to
+  `POST /api/auth/exchange`, which verifies it server-side, upserts `profiles`
+  via RPC, and issues the existing `rnw_session` cookie only for
+  `status = 'approved'`. The cookie subject is `profiles.host_id`, not the auth
+  UUID: bootstrap admins (`ADMIN_BOOTSTRAP_EMAILS`) inherit the first
+  `ADMIN_USER_IDS` entry, so `host_id` ownership queries never changed.
+  `requireHost` (`webapp/lib/auth/live-auth.ts`) re-checks approval through a
+  60 s status cache and rejects a UUID host with no profile row;
+  `/api/auth/session` reports `role`. The legacy `ADMIN_USER_IDS` password
+  login stays until the console switch. Desktop login runs Google in the system
+  browser and returns via `nova://auth/callback?code&state`, which
+  `electron/main.js` trades for the cookie at `POST /api/auth/desktop-exchange`
+  (the scheme is registered only when packaged or `NOVA_DEV_DEEP_LINK=1`).
+- **Admin console.** `/console` (`users`, `sessions`, `engine`) is admin-only:
+  the guard is `requireAdminFromCookieValue` in the server layout
+  (`webapp/app/console/layout.tsx`), not middleware, and every read/write goes
+  through service-role RPCs (`set_profile_status_v1`, `set_profile_role_v1`,
+  `list_sessions_admin_v1`, ...) - the browser never selects from `profiles`.
+  **Engine assignment is per user (decision D1, 2026-09-05).** The default is
+  Soniox (recognition + its own translation); Gemini Transcribe Live → Flash is
+  the alternative. The assignment lives on `profiles.voice_provider` (+
+  `voice_provider_revision`) and only the operator changes it, in
+  `/console/users`: `PATCH /api/console/users { voiceProvider }` →
+  `set_profile_voice_provider_v2` → `engineSelectionForVoiceProvider` (the one
+  provider→engine mapping, shared with `resolveHostEngineAssignment`) → for
+  each of that host's `preparing|live` sessions
+  (`list_live_session_ids_for_host_admin_v1`)
+  `set_live_session_engine_admin_v2` (history <= 8 entries / 3800-byte
+  `event_metadata` budget, `reason`, plus the profile's revision pinned as
+  `modelPreferences.assignmentRevision`) and gateway
+  `POST /internal/sessions/:id/engine` with a 60 s `ADMIN` gateway token; the
+  gateway swaps the pipeline (contract C1 kept) and emits `engine-status` to
+  the host. So a change applies **immediately** to running sessions and
+  persists for future ones: `POST /api/live-sessions` pins the caller's current
+  assignment and `assignmentRevision` on the session, and both host readers
+  (`electron/main.js` `readLiveCallModelPreferences`,
+  `live-audio-client.ts` `readHostModelPreferences`) accept and drop that key.
+  Hosts cannot change the engine (server authority, not an error). The
+  response is a per-session `switched|queued|failed` table (`queued` = cold
+  session, applied on next activation); each change leaves a
+  `profile_events` `user_assignment` row plus a best-effort
+  `record_console_deploy_v1` row. The global `engine_defaults` deploy is
+  retired: `PUT /api/console/engine-defaults` answers 410
+  `ENGINE_DEFAULTS_RETIRED` (GET catalog kept), `/console/engine` is an info
+  card linking to `/console/users` plus the account section, where
+  `set_legacy_password_login_v1` turns the password login into
+  `LEGACY_LOGIN_DISABLED` (403) at `/api/login`.
 
-### Why the desktop host connects from the MAIN process, not the renderer
+### Two supported HOST connection paths (do NOT tighten one to "fix" the other)
 
-Cloud Run rejects a browser WebSocket whose `Origin` is not in
-`LIVE_GATEWAY_ALLOWED_ORIGINS`, and the desktop renderer's origin is
-`http://127.0.0.1:<port>`. So the renderer never opens a gateway socket: it only
-captures the mic and pushes 1280-byte frames over `live-call:audio-frame` IPC,
-and `electron/main.js` holds the HOST socket itself. A Node client sends no
-`Origin` at all, which is the branch `isAllowedWebSocketUpgrade`
-(`media-gateway/src/gateway-security.js`) admits - but only with
-`LIVE_GATEWAY_ALLOW_TRUSTED_NON_BROWSER` enabled, the header
-`x-realtime-noel-client: desktop-main`, *and* a `Bearer` token that verifies to
-role `HOST`. Moving that socket into a renderer breaks the upgrade; adding the
-header from a renderer does not help, because a browser sends `Origin` anyway.
+The gateway upgrade (`isAllowedWebSocketUpgrade`,
+`media-gateway/src/gateway-security.js`) admits two host lanes, and both are
+production paths — `media-gateway/test/gateway-security.test.js` pins this
+contract:
+
+1. **Web host (browser)** — the webapp host dashboard connects as HOST from the
+   browser. The upgrade carries the webapp `Origin` (must be in
+   `LIVE_GATEWAY_ALLOWED_ORIGINS`); browsers cannot set bearer headers, so HOST
+   authentication happens post-upgrade via the `authenticate` message.
+   `webapp/components/live/live-audio-client.ts` owns capture, proactive token
+   refresh, and reconnects. Requiring the desktop-main marker for HOST would
+   silently kill this shipped path.
+2. **Electron desktop (main process)** — the desktop renderer's origin is
+   `http://127.0.0.1:<port>`, which is never allowlisted, so the renderer only
+   captures the mic and pushes 1280-byte frames over `live-call:audio-frame`
+   IPC while `electron/main.js` holds the HOST socket. A Node client sends no
+   `Origin`; that lane requires `LIVE_GATEWAY_ALLOW_TRUSTED_NON_BROWSER`, the
+   header `x-realtime-noel-client: desktop-main`, *and* a `Bearer` token that
+   verifies to role `HOST`.
+
+Host takeover between the two is last-wins: the gateway closes the losing
+socket with code 4410 (`REPLACED`), and warm pipeline reattach requires the
+same `activationKey` on both clients.
 
 ### Speaking floor contract (`media-gateway/src/gateway-server.js`)
 
@@ -246,31 +242,30 @@ take **without** consuming it. Both halves of that asymmetry are load-bearing:
 Change one side and you must change the other. `contract C1` is the searchable
 marker on both.
 
+## Caption display mode (2026-09-06)
+
+Local captions keep one lane per selected language, and each lane also echoes the
+original spoken in its own language (`acceptSource` in `src/subtitle-realtime.js`,
+`isSourceCaption: true`). Whether that lane is SHOWN is `subtitle.displayMode`:
+`translation_only` (default; Korean in → English only, English in → Korean only,
+three languages → two translations) or `translation_source` (the original beside
+every selected language). The filter is display-only — `isHiddenSourceCaption` in
+`public/subtitle-overlay.js` and the dashboard preview — so server broadcasts and
+Records are unchanged, and Live Call mirror lines (`source: "live-call"`) are exempt.
+The radio lives in the caption settings (`name="displayMode"`); the old load-time
+migration that discarded `translation_source` is gone, so the choice persists.
+
 ## The root-vs-`public/` frontend duplication trap
 
-`public/` is the only copy that matters. `src/server.js` serves `PUBLIC_DIR`
-(`<repo>/public`) and nothing else, and both ship manifests - npm `files` and
-electron-builder `build.files` in `package.json` - list `public/`, never the repo
-root.
-
-There are nevertheless eight root-level `subtitle-*.{js,css,html}` files that are
-currently byte-identical duplicates of their `public/` counterparts, reached by no
-server route and no ship manifest. Only three are protected by a root-vs-`public`
-byte-equality assertion:
-
-| root copy | guard |
-| --- | --- |
-| `subtitle-dashboard.js` | `test/desktop-stage-window.test.js` and `test/session-transcripts.test.js` |
-| `subtitle.html` | `test/session-transcripts.test.js` |
-| `subtitle.css` | `test/session-transcripts.test.js` |
-| `subtitle-controller.{js,html}`, `subtitle-workspace.js`, `subtitle-overlay.js`, `subtitle-audio-player.js` | **none** |
-
-Every other test reads the `public/` copy (`read("public/subtitle-controller.js")`
-and friends in `test/live-ui.test.js`, `test/desktop-live-start.test.js`, ...).
-
-Practical consequence: **edit `public/`**. If you edit a root copy, mirror it to
-`public/` or the change does nothing at runtime - and for five of the eight files
-nothing will fail to tell you.
+`public/` is the only copy that matters, and now the only copy there is.
+`src/server.js` serves `PUBLIC_DIR` (`<repo>/public`) and nothing else, and both
+ship manifests - npm `files` and electron-builder `build.files` - list
+`public/`, never the repo root. The eight root-level
+`subtitle-*.{js,css,html}` duplicates that used to sit here are deleted: editing
+one changed nothing at runtime while looking like real work, and five were
+policed by no test. `test/subtitle-frontend.test.js` now asserts each of those
+filenames exists under `public/` and does **not** exist at the repo root, so a
+stale duplicate cannot come back.
 
 ## Testing conventions
 
@@ -291,37 +286,54 @@ tests are cheap enough to keep, but do not prove runtime behaviour.
 
 Per the user's global instructions, use **TDD** for bug fixes and new features: write the failing test first.
 
-## Whiteboard agent system prompt
-
-The system prompt and tool schemas are defined inline in `src/server.js` (search for `buildWhiteboardAgentMessages` and the `tool({...})` calls). Its structure is `P1-P10` cross-cutting principles + short per-genre stubs. Do **not** append verbose "When the talk is X..." paragraphs - that bloat was already consolidated once. See `scripts/simulate-whiteboard-agent.md` for the full editing rubric and the `simulate-whiteboard-agent.js` harness used for prompt A/B experiments.
-
 ## Release process
 
-This repo uses **release-please** in **monorepo manifest mode** (`.github/workflows/release-please.yml`, `release-please-config.json`, `.release-please-manifest.json`).
-
-Only two components are tracked. `media-gateway/` and `webapp/` are `private: true`
-and are **not** release-please packages - they are deployed (Cloud Run / Vercel),
-not published, so a commit touching only those paths still bumps `realtime-noel`
-via the root component.
-
-Two components version independently:
-
-- **`realtime-noel`** (root, `.`) - the CLI npm package. Bumps on any conventional commit _except_ those touching the sidecar paths (`packages/moonshine-darwin-*`, `moonshine-sidecar.config.json`, `scripts/moonshine-sidecar.py`, `scripts/build-moonshine-sidecars.js`).
-- **`moonshine-sidecars`** (`packages/moonshine-darwin-arm64`) - the platform sidecar npm packages. Bumps **only** when commits touch the sidecar paths above. The arm64 package is the release-please anchor; its version is mirrored into `packages/moonshine-darwin-x64/package.json` and into both `optionalDependencies` entries in the root `package.json` via `extra-files`. The two sidecar packages always share one version.
-
-Workflow consequences:
-
-- A typical change to `src/`, `public/`, or `test/` only bumps realtime-noel. The publish job for the sidecar group is skipped, so CI never runs the Python/PyInstaller build path on a regular release.
-- A change to `moonshine-sidecar.config.json` (e.g. bumping `moonshineVoiceVersion`) bumps the sidecars. CI will then build the Python sidecar binaries on `macos-15` (required by recent `moonshine-voice` wheels, which target `macosx_15_0_universal2`) and publish both `@realtime-noel/moonshine-darwin-{arm64,x64}` packages.
-- A commit that touches both kinds of paths bumps both components in a single release-please PR.
-
-Other notes:
-
-- `CHANGELOG.md` and `.release-please-manifest.json` are auto-generated. Per global rules, never hand-edit them.
-- Sidecar binaries are produced by `scripts/build-moonshine-sidecars.js` and must be built on macOS (the script enforces this).
-- `scripts/prepare-release-packages.js` is now a verification step: it confirms each sidecar's `package.json` version matches the root `optionalDependencies` entry and that the binary exists. Version writing is owned by release-please's `extra-files`, not this script.
-- The published-on-npm sidecar version may lag realtime-noel; that's by design (pinning the same binary keeps users from re-downloading on every CLI patch).
+The root package is `nova`. CI runs desktop, gateway and web independently.
+Release configuration tracks NOVA only; the old Moonshine release job and
+unverified npm publishing have been removed. Generated version history files
+are retained. Publishing or deployment requires explicit user instruction.
 
 ## Project status (from README)
 
 The project is in **alpha**. The README's prominent warning is intentional - keep the rough-edges framing rather than over-promising stability when editing it.
+
+## Skill routing
+
+When the user's request matches an available skill, invoke it via the Skill tool. The
+skill has multi-step workflows, checklists, and quality gates that produce better
+results than an ad-hoc answer. When in doubt, invoke the skill. A false positive is
+cheaper than a false negative.
+
+Key routing rules:
+- Product ideas, "is this worth building", brainstorming → invoke /office-hours
+- Strategy, scope, "think bigger", "what should we build" → invoke /plan-ceo-review
+- Architecture, "does this design make sense" → invoke /plan-eng-review
+- Design system, brand, "how should this look" → invoke /design-consultation
+- Design review of a plan → invoke /plan-design-review
+- Developer experience of a plan, API/CLI/SDK design → invoke /plan-devex-review
+- "Review everything", full review pipeline → invoke /autoplan
+- Bugs, errors, "why is this broken", "this doesn't work" → invoke /investigate
+- Test the site, find bugs, "does this work" → invoke /qa (or /qa-only for report only)
+- Code review, check the diff, pre-landing review → invoke /review
+- Visual polish, design audit, "this looks off" → invoke /design-review
+- Developer experience audit, try onboarding → invoke /devex-review
+- Ship, deploy, push, create a PR → invoke /ship
+- Merge + deploy + verify → invoke /land-and-deploy
+- Configure deployment → invoke /setup-deploy
+- Post-deploy monitoring → invoke /canary
+- Update docs after shipping → invoke /document-release
+- Weekly retro, "how'd we do" → invoke /retro
+- Second opinion, codex review → invoke /codex
+- Safety mode, careful mode → invoke /careful or /guard
+- Restrict edits to a directory → invoke /freeze or /unfreeze
+- Upgrade gstack → invoke /gstack-upgrade
+- Save progress or checkpoint → invoke /context-save
+- Resume or restore context → invoke /context-restore
+- Security audit, OWASP, vulnerabilities → invoke /cso
+- Make a PDF, document, publication → invoke /make-pdf
+- Launch real browser for QA → invoke /open-gstack-browser
+- Import cookies for authenticated testing → invoke /setup-browser-cookies
+- Performance regression, page speed, benchmarks → invoke /benchmark
+- Review what gstack has learned → invoke /learn
+- Tune question sensitivity → invoke /plan-tune
+- Code quality dashboard → invoke /health

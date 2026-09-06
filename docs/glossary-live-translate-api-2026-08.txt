@@ -1,0 +1,73 @@
+[규칙]
+- 출처: NOVA Gemini 3.5 Live Translate 변경 분석 문서(2026-08-22) + Gemini 공식 문서(2026-08-27 확인).
+- 기본 어휘(스트리밍, 요약, 리허설 등)는 제외하고, 실시간 통역·음성 API 문맥에서 오역되기 쉬운 특수 용어만 수록한다.
+- 기존 팩과의 중복 금지: 토큰, 클라우드, 배포, 컨텍스트 윈도우 등 ai_ax 기존 항목은 재수록하지 않는다.
+
+[고유명사 — AI 모델·플랫폼 (한국어 = English)]
+제미나이 = Gemini
+제미나이 라이브 = Gemini Live
+제미나이 라이브 트랜슬레이트 = Gemini Live Translate
+제미나이 트랜스크라이브 = Gemini Transcribe
+제미나이 플래시 = Gemini Flash
+구글 딥마인드 = Google DeepMind
+구글 AI 스튜디오 = Google AI Studio
+클라우드 런 = Cloud Run
+클라우드 스피치 투 텍스트 = Cloud Speech-to-Text
+수파베이스 = Supabase
+라이브킷 = LiveKit
+버셀 = Vercel
+
+[AI·AX — 실시간 통역·음성 API (한국어 = English)]
+실시간 통역 = real-time interpretation
+동시통역 = simultaneous interpretation
+실시간 자막 = live captions
+번역 음성 = translated audio
+원문 자막 = source-language captions
+확정 자막 = final caption
+부분 자막 = partial caption
+미리보기 자막 = preview transcript
+중간 결과 = interim result
+발화 = utterance
+음성 인식 = speech recognition (STT)
+음성 합성 = speech synthesis (TTS)
+전문용어집 = custom glossary
+용어집 = glossary
+사용자 정의 어휘 = custom vocabulary
+언어 감지 = language detection
+코드 스위칭 = code-switching
+언어 전환 발화 = code-switching
+화자 분리 = speaker diarization
+화자 귀속 = speaker attribution
+음성 활동 감지 = voice activity detection (VAD)
+단어 오류율 = word error rate (WER)
+단어 단위 타임스탬프 = word-level timestamps
+저지연 = low latency
+샘플링 레이트 = sample rate
+청크 = chunk
+웹소켓 = WebSocket
+임시 토큰 = ephemeral token
+세션 재개 = session resumption
+컨텍스트 압축 = context window compression
+응답 모달리티 = response modality
+오디오 토큰 = audio token
+사용량 메타데이터 = usage metadata
+세션 카디널리티 = session cardinality
+팬아웃 = fan-out
+재연결 = reconnection
+콜드 스타트 = cold start
+스케일 투 제로 = scale-to-zero
+장시간 부하 테스트 = soak test
+소크 테스트 = soak test
+발언권 = speaking floor
+뷰어 = viewer
+속도 제한 = rate limit
+쿼터 = quota
+무료 등급 = free tier
+유료 등급 = paid tier
+하드 예산 = hard budget
+과금 = billing
+지원 중단 = deprecation
+정식 출시 = general availability (GA)
+공개 프리뷰 = public preview
+모델 카드 = model card
+릴리스 노트 = release notes

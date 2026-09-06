@@ -1,3 +1,4 @@
+import { GEMINI_ENGINE_SELECTION } from "../packages/caption-core/caption-engine-catalog.js";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import fs from "node:fs/promises";
@@ -11,6 +12,25 @@ import { buildTranscriptSummaryPrompt, createSessionTranscripts, parseSummaryTex
 
 async function makeStorageDir() {
   return fs.mkdtemp(path.join(os.tmpdir(), "rn-transcripts-"));
+}
+
+test("speaker profile snapshots survive local recording and archive import", async () => {
+  const storageDir = await makeStorageDir();
+  const store = createSessionTranscripts({ storageDir, persistDelayMs: 0 });
+  const profile = { id: "00000000-0000-4000-8000-000000000001", version: 1, displayName: "김민지", company: "NOVA", department: "제품팀", photoAssetId: null };
+  await store.begin({ sessionId: "speaker-snapshots" });
+  await store.recordLine({ translatedText: "Hello", speaker: profile.displayName, speakerProfile: profile });
+  profile.displayName = "변경된 이름";
+  await store.end();
+  assert.equal((await store.get("speaker-snapshots")).lines[0].speakerProfile.displayName, "김민지");
+  await store.importSession({ id: "live-speaker-import", lines: [{ sourceText: "원문", speakerProfile: profile }] });
+  const line = (await store.get("live-speaker-import")).lines[0];
+  assert.equal(line.speakerProfile.company, "NOVA");
+  assert.equal(line.speakerProfile.department, "제품팀");
+});
+
+function sameOriginHeaders(url, headers = {}) {
+  return { origin: new URL(url).origin, ...headers };
 }
 
 test("records timestamped source and translated lines inside a session", async () => {
@@ -232,6 +252,7 @@ test("caption sessions record committed lines start-to-stop and auto-summarize o
   const transcriptsDir = await makeStorageDir();
   const summaryRequests = [];
   const { httpServer, url } = await startServer({
+    resolveCaptionEngine: async () => GEMINI_ENGINE_SELECTION,
     host: "127.0.0.1",
     port: 0,
     moonshineModel: "medium",
@@ -253,7 +274,7 @@ test("caption sessions record committed lines start-to-stop and auto-summarize o
 
   let ws;
   try {
-    ws = new WebSocket(url.replace("http:", "ws:") + "/ws");
+    ws = new WebSocket(url.replace("http:", "ws:") + "/ws", { headers: { Origin: url } });
     await new Promise((resolve, reject) => {
       ws.once("open", resolve);
       ws.once("error", reject);
@@ -289,12 +310,68 @@ test("caption sessions record committed lines start-to-stop and auto-summarize o
     assert.equal(detailBody.data.lines[0].sourceText, "안녕하세요 여러분");
     assert.equal(detailBody.data.summary.title, "자동 요약");
 
-    const regenResponse = await fetch(`${url}/api/subtitles/sessions/caption-session/summary`, { method: "POST" });
+    const regenResponse = await fetch(`${url}/api/subtitles/sessions/caption-session/summary`, {
+      method: "POST",
+      headers: sameOriginHeaders(url),
+    });
     const regenBody = await regenResponse.json();
     assert.equal(regenBody.ok, true);
     assert.equal(regenBody.data.title, "자동 요약");
   } finally {
     ws?.close();
+    await new Promise((resolve) => httpServer.close(resolve));
+  }
+});
+
+test("transcript summary is unavailable without Gemini and never falls back to OpenAI", async () => {
+  const transcriptsDir = await makeStorageDir();
+  await fs.writeFile(path.join(transcriptsDir, "openai-only.json"), JSON.stringify({
+    id: "openai-only",
+    title: "OpenAI-only transcript",
+    startedAt: "2026-08-15T00:00:00.000Z",
+    endedAt: "2026-08-15T00:05:00.000Z",
+    lines: [{ at: "2026-08-15T00:01:00.000Z", sourceText: "요약 대상 발화", translatedText: "Line to summarize" }],
+    summary: null,
+  }));
+
+  let providerDispatchCount = 0;
+  const { httpServer, url } = await startServer({
+    resolveCaptionEngine: async () => GEMINI_ENGINE_SELECTION,
+    host: "127.0.0.1",
+    port: 0,
+    moonshineModel: "medium",
+    openaiApiKey: "test",
+    env: { OPENAI_API_KEY: "sk-openai-only", GEMINI_API_KEY: "" },
+    transcriptsDir,
+    fetchImpl: async (requestUrl) => {
+      providerDispatchCount += 1;
+      return {
+        ok: false,
+        status: 500,
+        json: async () => ({ error: `raw provider detail ${requestUrl}` }),
+      };
+    },
+    createTranscription: () => ({ ready: async () => {}, sendAudio: () => {}, stop: () => {}, close: () => {} }),
+  });
+
+  try {
+    const response = await fetch(`${url}/api/subtitles/sessions/openai-only/summary`, {
+      method: "POST",
+      headers: sameOriginHeaders(url),
+    });
+    const body = await response.json();
+    assert.equal(response.status, 503);
+    assert.deepEqual(body, {
+      ok: false,
+      error: "AI 요약을 사용하려면 Gemini API 키를 설정해 주세요.",
+      code: "TRANSCRIPT_SUMMARY_UNAVAILABLE",
+    });
+    assert.equal(providerDispatchCount, 0);
+    assert.equal(JSON.stringify(body).includes("sk-openai-only"), false);
+    assert.equal(JSON.stringify(body).includes("gpt"), false);
+    assert.equal(JSON.stringify(body).includes("generativelanguage.googleapis.com"), false);
+    assert.equal(JSON.stringify(body).includes("raw provider detail"), false);
+  } finally {
     await new Promise((resolve) => httpServer.close(resolve));
   }
 });
@@ -547,6 +624,7 @@ test("list filters by kind and by an inclusive time range", async () => {
 test("subtitle:start carries optional meeting identity into the record", async () => {
   const transcriptsDir = await makeStorageDir();
   const { httpServer, url } = await startServer({
+    resolveCaptionEngine: async () => GEMINI_ENGINE_SELECTION,
     host: "127.0.0.1",
     port: 0,
     moonshineModel: "medium",
@@ -559,8 +637,16 @@ test("subtitle:start carries optional meeting identity into the record", async (
 
   let ws;
   try {
-    ws = new WebSocket(url.replace("http:", "ws:") + "/ws");
+    ws = new WebSocket(url.replace("http:", "ws:") + "/ws", { headers: { Origin: url } });
     await new Promise((resolve, reject) => { ws.once("open", resolve); ws.once("error", reject); });
+    ws.send(JSON.stringify({
+      type: "subtitle:preflight",
+      requestId: "preflight-1",
+      settings: { inputMode: "mic", translationProvider: "gemini" },
+      meeting: { kind: "live-call", liveSessionId: "session-1" },
+    }));
+    const preflightAck = await waitForWebSocketMessage(ws, (message) => message.type === "subtitle:preflight-ready");
+    assert.equal(preflightAck.requestId, "preflight-1");
     ws.send(JSON.stringify({
       type: "subtitle:start",
       sessionId: "live-9",
@@ -599,6 +685,7 @@ test("subtitle:start carries optional meeting identity into the record", async (
 test("a participant's mirrored caption is recorded on the host with attribution", async () => {
   const transcriptsDir = await makeStorageDir();
   const { httpServer, url } = await startServer({
+    resolveCaptionEngine: async () => GEMINI_ENGINE_SELECTION,
     host: "127.0.0.1",
     port: 0,
     moonshineModel: "medium",
@@ -611,40 +698,55 @@ test("a participant's mirrored caption is recorded on the host with attribution"
 
   let ws;
   try {
-    ws = new WebSocket(url.replace("http:", "ws:") + "/ws");
+    ws = new WebSocket(url.replace("http:", "ws:") + "/ws", { headers: { Origin: url } });
     await new Promise((resolve, reject) => { ws.once("open", resolve); ws.once("error", reject); });
     ws.send(JSON.stringify({
       type: "subtitle:start",
+      captionProducer: "gateway",
       sessionId: "participant-record",
       settings: { inputMode: "mic", translationProvider: "gemini" },
       meeting: { kind: "live-call", liveSessionId: "sb-1", title: "Town Hall", startedAt: "2026-07-25T06:00:00.000Z" },
     }));
-    await waitForWebSocketMessage(ws, (message) => message.type === "subtitle:status" && message.status === "api_ready");
+    await new Promise((resolve) => setImmediate(resolve));
 
     // The translated lane: this is what viewers read and what the overlay shows.
     ws.send(JSON.stringify({
       type: "subtitle:live-call-caption",
+      sessionId: "sb-1",
       partial: false,
       targetLanguage: "en",
-      speaker: "김게스트 · 영업",
+      speaker: "김게스트",
+      speakerRole: "participant",
+      speakerDepartment: "영업",
+      speakerJobTitle: "Director",
       translatedText: "Our occupancy recovered in the third quarter.",
       sourceText: "3분기에 객실 점유율이 회복되었습니다",
     }));
-    await waitForWebSocketMessage(ws, (message) => message.type === "subtitle:committed");
+    const participantCaption = await waitForWebSocketMessage(ws, (message) => message.type === "subtitle:committed");
+    assert.deepEqual(participantCaption.liveCallSpeaker, {
+      role: "participant",
+      name: "김게스트",
+      department: "영업",
+      jobTitle: "Director",
+    });
 
     // The untranslated source lane is relayed record-only: it must reach the
     // record so 원문 survives, but must never be broadcast to the overlay.
     ws.send(JSON.stringify({
       type: "subtitle:live-call-caption",
+      sessionId: "sb-1",
       recordOnly: true,
       partial: false,
       targetLanguage: "ko",
-      speaker: "김게스트 · 영업",
+      speaker: "김게스트",
+      speakerRole: "participant",
+      speakerDepartment: "영업",
+      speakerJobTitle: "Director",
       translatedText: "3분기에 객실 점유율이 회복되었습니다",
     }));
 
     ws.send(JSON.stringify({ type: "subtitle:stop", sessionId: "participant-record" }));
-    await waitForWebSocketMessage(ws, (message) => message.type === "subtitle:session-summary" || message.type === "subtitle:status");
+    await new Promise((resolve) => setTimeout(resolve, 25));
 
     let record = null;
     for (let attempt = 0; attempt < 40 && !record; attempt += 1) {
@@ -656,11 +758,11 @@ test("a participant's mirrored caption is recorded on the host with attribution"
 
     const spoken = record.lines.find((line) => line.translatedText.includes("occupancy recovered"));
     assert.ok(spoken, "the translated participant turn is missing from the record");
-    assert.equal(spoken.speaker, "김게스트 · 영업", "the record must keep who said it");
+    assert.equal(spoken.speaker, "김게스트", "the record must keep who said it");
 
     const original = record.lines.find((line) => line.sourceText.includes("객실 점유율"));
     assert.ok(original, "the untranslated 원문 is missing from the record");
-    assert.equal(original.speaker, "김게스트 · 영업");
+    assert.equal(original.speaker, "김게스트");
   } finally {
     ws?.close();
     await new Promise((resolve) => httpServer.close(resolve));
@@ -671,6 +773,7 @@ test("a gateway-canonical Live Call records captions without opening the local t
   const transcriptsDir = await makeStorageDir();
   let localSocketCount = 0;
   const { httpServer, url } = await startServer({
+    resolveCaptionEngine: async () => GEMINI_ENGINE_SELECTION,
     host: "127.0.0.1",
     port: 0,
     env: {},
@@ -680,7 +783,7 @@ test("a gateway-canonical Live Call records captions without opening the local t
   });
   let ws;
   try {
-    ws = new WebSocket(url.replace("http:", "ws:") + "/ws");
+    ws = new WebSocket(url.replace("http:", "ws:") + "/ws", { headers: { Origin: url } });
     await new Promise((resolve, reject) => { ws.once("open", resolve); ws.once("error", reject); });
     ws.send(JSON.stringify({
       type: "subtitle:start",
@@ -689,54 +792,170 @@ test("a gateway-canonical Live Call records captions without opening the local t
       settings: { inputMode: "mic", translationProvider: "gemini" },
       meeting: { kind: "live-call", liveSessionId: "session-1", title: "Canonical call" },
     }));
-    ws.send(JSON.stringify({
-      type: "subtitle:live-call-caption",
-      recordOnly: true,
-      partial: false,
-      targetLanguage: "ko",
-      utteranceKey: "session-1:input:1",
-      translatedText: "안녕하세요",
-      speaker: "Host",
-    }));
-    ws.send(JSON.stringify({
+    const startAck = await waitForWebSocketMessage(ws, (message) => message.type === "subtitle:started");
+    assert.equal(startAck.sessionId, "live-session-1");
+    assert.equal(startAck.captionProducer, "gateway");
+    const attacker = new WebSocket(url.replace("http:", "ws:") + "/ws");
+    await new Promise((resolve, reject) => { attacker.once("open", resolve); attacker.once("error", reject); });
+    attacker.send(JSON.stringify({ type: "subtitle:stop", sessionId: "live-session-1" }));
+    const stopRejection = await waitForWebSocketMessage(attacker, (message) => message.code === "SUBTITLE_SESSION_MISMATCH");
+    assert.equal(stopRejection.type, "subtitle:error");
+    const stillActive = await (await fetch(new URL("/api/subtitles/sessions/live-session-1", url))).json();
+    assert.equal(stillActive.data.meta.endedAt, "", "a secondary renderer must not finalize the active record");
+    const injected = [];
+    ws.on("message", (raw) => {
+      const message = JSON.parse(raw.toString("utf8"));
+      if (message.translatedText === "Injected caption") injected.push(message);
+    });
+    attacker.send(JSON.stringify({
       type: "subtitle:live-call-caption",
       partial: false,
       targetLanguage: "en",
+      speakerRole: "host",
+      translatedText: "Injected caption",
+      speaker: "Forged participant",
+    }));
+    const rejection = await waitForWebSocketMessage(attacker, (message) => (
+      message.code === "LIVE_CALL_CAPTION_PRODUCER_MISMATCH"
+    ));
+    assert.equal(rejection.type, "subtitle:error");
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(injected.length, 0, "a non-owner loopback socket must not inject Live Call captions");
+    attacker.close();
+    ws.send(JSON.stringify({
+      type: "subtitle:live-call-caption",
+      sessionId: "different-session",
+      partial: false,
+      targetLanguage: "en",
+      translatedText: "Wrong session caption",
+    }));
+    const sessionRejection = await waitForWebSocketMessage(ws, (message) => (
+      message.code === "LIVE_CALL_CAPTION_SESSION_MISMATCH"
+    ));
+    assert.equal(sessionRejection.type, "subtitle:error");
+    ws.send(JSON.stringify({
+      type: "subtitle:live-call-caption",
+      sessionId: "session-1",
+      recordOnly: true,
+      partial: false,
+      targetLanguage: "ko",
+      speakerRole: "host",
       utteranceKey: "session-1:input:1",
+      translatedText: "안녕하세요",
+    }));
+    ws.send(JSON.stringify({
+      type: "subtitle:live-call-caption",
+      sessionId: "session-1",
+      partial: false,
+      targetLanguage: "en",
+      speakerRole: "host",
+      utteranceKey: "session-1:input:1",
+      sourceSeq: 41,
       sourceLanguage: "ko",
       sourceText: "안녕하세요",
       translatedText: "Hello.",
-      speaker: "Host",
     }));
-    await waitForWebSocketMessage(ws, (message) => message.type === "subtitle:committed");
+    const hostCaption = await waitForWebSocketMessage(ws, (message) => message.type === "subtitle:committed");
+    assert.equal(
+      hostCaption.utteranceKey,
+      "session-1:input:1",
+      "the desktop overlay must receive the canonical Live Call utterance identity",
+    );
+    assert.equal(hostCaption.sourceSeq, 41, "the gateway sequence must survive the desktop relay as fallback identity");
+    assert.deepEqual(hostCaption.liveCallSpeaker, {
+      role: "host",
+      name: "Host",
+      department: "",
+      jobTitle: "",
+    });
     ws.send(JSON.stringify({
       type: "subtitle:live-call-caption",
+      sessionId: "session-1",
       recordOnly: true,
       partial: false,
       targetLanguage: "ko",
       utteranceKey: "session-1:input:2",
       translatedText: "안녕하세요",
-      speaker: "Host",
     }));
     ws.send(JSON.stringify({
       type: "subtitle:live-call-caption",
+      sessionId: "session-1",
       partial: false,
       targetLanguage: "en",
       utteranceKey: "session-1:input:2",
       sourceLanguage: "ko",
       sourceText: "안녕하세요",
       translatedText: "Hello.",
-      speaker: "Host",
     }));
     await waitForWebSocketMessage(ws, (message) => message.type === "subtitle:committed");
+    ws.send(JSON.stringify({
+      type: "subtitle:live-call-caption",
+      sessionId: "session-1",
+      recordOnly: true,
+      partial: false,
+      targetLanguage: "ko",
+      speakerRole: "host",
+      translatedText: "키가 없는 원문",
+    }));
+    ws.send(JSON.stringify({
+      type: "subtitle:live-call-caption",
+      sessionId: "session-1",
+      partial: false,
+      targetLanguage: "en",
+      speakerRole: "host",
+      sourceLanguage: "ko",
+      translatedText: "Unkeyed translated line.",
+    }));
+    await waitForWebSocketMessage(ws, (message) => message.type === "subtitle:committed"
+      && message.translatedText === "Unkeyed translated line.");
     ws.send(JSON.stringify({ type: "subtitle:stop", sessionId: "live-session-1" }));
     await new Promise((resolve) => setTimeout(resolve, 50));
     const body = await (await fetch(new URL("/api/subtitles/sessions/live-session-1", url))).json();
     assert.equal(body.ok, true);
     assert.equal(body.data.lines[0].sourceText, "안녕하세요");
     assert.equal(body.data.lines[0].translatedText, "Hello.");
-    assert.equal(body.data.lines.length, 2, "identical text in two utterances must remain two recorded lines");
+    assert.equal(body.data.lines.length, 3, "keyed duplicates and the unkeyed FIFO pair must each remain one record");
+    assert.equal(body.data.lines[2].sourceText, "키가 없는 원문");
+    assert.equal(body.data.lines[2].translatedText, "Unkeyed translated line.");
     assert.equal(localSocketCount, 0, "the local Gemini/OpenAI producer must remain cold");
+  } finally {
+    ws?.close();
+    await new Promise((resolve) => httpServer.close(resolve));
+  }
+});
+
+test("a transcript begin failure compensates the already-opened local providers", async () => {
+  const root = await makeStorageDir();
+  const unusableStoragePath = path.join(root, "not-a-directory");
+  await fs.writeFile(unusableStoragePath, "occupied");
+  const providerSockets = [];
+  const { httpServer, url } = await startServer({
+    resolveCaptionEngine: async () => GEMINI_ENGINE_SELECTION,
+    host: "127.0.0.1",
+    port: 0,
+    env: { GEMINI_API_KEY: "AIza-test" },
+    transcriptsDir: unusableStoragePath,
+    transcriptPersistDelayMs: 0,
+    createTranscription: () => ({ ready: async () => {}, sendAudio: () => {}, stop: () => {}, close: () => {} }),
+    createSubtitleWebSocket: (socketUrl, protocols, init) => {
+      const socket = new FakeRealtimeSocket(socketUrl, init);
+      providerSockets.push(socket);
+      return socket;
+    },
+  });
+  let ws;
+  try {
+    ws = new WebSocket(url.replace("http:", "ws:") + "/ws", { headers: { Origin: url } });
+    await new Promise((resolve, reject) => { ws.once("open", resolve); ws.once("error", reject); });
+    ws.send(JSON.stringify({
+      type: "subtitle:start",
+      sessionId: "begin-failure",
+      settings: { inputMode: "mic", translationProvider: "gemini" },
+    }));
+    const error = await waitForWebSocketMessage(ws, (message) => message.code === "SUBTITLE_START_FAILED");
+    assert.equal(error.sessionId, "begin-failure");
+    assert.ok(providerSockets.length > 0);
+    assert.equal(providerSockets.every((socket) => socket.closed === true), true);
   } finally {
     ws?.close();
     await new Promise((resolve) => httpServer.close(resolve));
@@ -790,4 +1009,61 @@ test("a language tab shows whichever side of a turn is in that language", async 
   assert.equal(transcriptTextForLanguage({ sourceText: "원문만", translatedText: "" }, "en"), "원문만");
   // A line with nothing in that language is skipped, not mislabelled.
   assert.equal(transcriptTextForLanguage({ sourceText: "只有中文", sourceLanguage: "zh", targetLanguage: "zh" }, "en"), "");
+});
+
+test("Live Call reimport preserves completed summary, call identity and source-only lines", async () => {
+  const storageDir = await makeStorageDir();
+  const transcripts = createSessionTranscripts({ storageDir, persistDelayMs: 0 });
+  await transcripts.begin({ sessionId: "live-backfill", kind: "live-call", liveSessionId: "backfill" });
+  await transcripts.recordLine({ translatedText: "An English translation", targetLanguage: "en" });
+  await transcripts.end();
+  await transcripts.summarize("live-backfill", async () => ({ text: '{"title":"Saved","overview":"Saved recap"}' }));
+  await transcripts.importSession({ id: "live-backfill", startedAt: "2026-09-01T00:00:00Z", endedAt: "2026-09-01T00:01:00Z",
+    lines: [{ sourceText: "실제로 발언한 원문", translatedText: "" }, { sourceText: "", translatedText: "An English translation", targetLanguage: "en" }], summary: null });
+  const restored = await createSessionTranscripts({ storageDir }).get("live-backfill");
+  assert.equal(restored.meta.kind, "live-call");
+  assert.equal(restored.meta.liveSessionId, "backfill");
+  assert.equal(restored.summary.title, "Saved");
+  assert.equal(restored.lines[0].translatedText, "");
+  assert.equal(restored.lines[1].sourceText, "");
+});
+
+test("Live Call import never starts a second local paid summary while remote recap is pending", async () => {
+  let calls = 0;
+  const { httpServer, url } = await startServer({
+    resolveCaptionEngine: async () => GEMINI_ENGINE_SELECTION, host: "127.0.0.1", port: 0,
+    transcriptsDir: await makeStorageDir(), env: { GEMINI_API_KEY: "synthetic" },
+    subtitleSummaryGenerateText: async () => { calls += 1; return { text: '{"title":"Unexpected"}' }; } });
+  try {
+    const response = await fetch(`${url}/api/subtitles/sessions/import`, { method: "POST", headers: sameOriginHeaders(url, { "content-type": "application/json" }),
+      body: JSON.stringify({ id: "live-import", lines: [{ sourceText: "원문" }], summary: null }) });
+    assert.equal(response.status, 200);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(calls, 0);
+    assert.equal((await response.json()).data.kind, "live-call");
+  } finally { await new Promise((resolve) => httpServer.close(resolve)); }
+});
+
+test("canonical import preserves 8000-character originals and rejects oversized archives without truncation", async () => {
+  const transcripts = createSessionTranscripts({ storageDir: await makeStorageDir() });
+  const text = "원문\n".repeat(2000);
+  await transcripts.importSession({ id: "live-long", ownerHostId: "host-owner", lines: [{ sourceText: text, sourceSeq: 7, id: "original-seven", utteranceKey: "authoritative-source:7" }] });
+  const saved = await transcripts.get("live-long");
+  assert.equal(saved.lines[0].sourceText, text);
+  assert.equal(saved.lines[0].sourceSeq, 7);
+  assert.equal(saved.lines[0].id, "original-seven");
+  assert.equal(saved.meta.ownerHostId, "host-owner");
+  assert.equal(await transcripts.importSession({ id: "live-long", lines: Array.from({ length: 20001 }, () => ({ sourceText: "a" })) }), null);
+  assert.equal((await transcripts.get("live-long")).lines[0].sourceText, text);
+});
+
+
+test("canonical import uses source-ledger Unicode codepoint and byte limits", async () => {
+  const transcripts = createSessionTranscripts({ storageDir: await makeStorageDir() });
+  const text = "𠮷".repeat(5000);
+  assert.ok(await transcripts.importSession({ id: "live-unicode", lines: [{ sourceText: text }] }));
+  assert.equal((await transcripts.get("live-unicode")).lines[0].sourceText, text);
+  assert.equal(await transcripts.importSession({ id: "live-unicode", lines: [{ sourceText: "𠮷".repeat(6001) }] }), null);
+  assert.equal(await transcripts.importSession({ id: "live-unicode", lines: [{ sourceText: "a".repeat(8001) }] }), null);
+  assert.equal((await transcripts.get("live-unicode")).lines[0].sourceText, text);
 });

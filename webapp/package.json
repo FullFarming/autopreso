@@ -2,22 +2,29 @@
   "name": "realtime-noel-web",
   "version": "0.1.0",
   "private": true,
+  "engines": {
+    "node": ">=22"
+  },
   "scripts": {
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
     "typecheck": "tsc --noEmit",
     "test": "npm run test:live && npm run test:core",
-    "test:live": "node --experimental-strip-types --experimental-loader ./lib/security/test-typescript-loader.mjs --test components/live/foreground-recovery.test.ts components/live/live-audio-client.test.ts components/live/live-session-schedule.test.ts components/live/viewer-surface-routing.test.ts lib/live/caption-feed.test.ts lib/live/cover-image.test.ts lib/live/live-service.test.ts lib/live/summary.test.ts lib/live/post-session-summary.test.ts lib/live/feature-flag.test.ts lib/live/admission-code.test.ts lib/live/activity.test.ts lib/security/live-admission-store.test.ts lib/security/live-security.test.ts",
-    "test:core": "node --experimental-strip-types --experimental-loader ./lib/security/test-typescript-loader.mjs --test app/api/openai-token/route.test.ts components/live/speak-client.test.ts lib/audio.test.ts lib/channelCore.test.ts lib/engine.test.ts lib/geminiChannel.test.ts lib/languageDetect.test.ts lib/live-contract.test.ts lib/openaiChannel.test.ts lib/openaiTranslationWebRtc.test.ts"
+    "test:live": "node --experimental-strip-types --experimental-loader ./lib/security/test-typescript-loader.mjs --test components/live/admin-login-route.test.ts components/live/consent/ParticipantConsentFields.test.ts components/live/earnings/earnings-components.test.ts components/live/earnings/earnings-presentation.test.ts components/live/foreground-recovery.test.ts components/live/glossary/glossary-client.test.ts components/live/glossary/glossary-components.test.ts components/live/glossary/glossary-controller.test.ts components/live/glossary/glossary-presentation.test.ts components/live/glossary/glossary-registration.test.ts components/live/host-session-recovery.test.ts components/live/host-screen-picker.test.ts components/live/host-translation-first.test.ts components/live/live-audio-client.test.ts components/live/language-picker.test.ts components/live/live-lanes/host-live-lane-presentation.test.ts components/live/live-records-status-integration.test.ts components/live/live-session-schedule.test.ts components/live/scheduled-gateway-start.test.ts components/live/records/live-records-presentation.test.ts components/live/records/mobile-records-route.test.ts components/live/stage-login-minutes.test.ts components/live/stage-host-access.test.ts components/live/status/GatewayConnectionStatus.test.ts components/live/translation/topic-foundation.test.ts components/live/translation/translation-foundation.test.ts components/live/translation/translation-state.test.ts components/live/viewer-gateway-lifecycle.test.ts components/live/viewer-session-recovery.test.ts components/live/viewer-surface-routing.test.ts components/live/viewer-topic-composition.test.ts components/live/viewer-translation-first.test.ts lib/google-sheets/client.test.ts lib/live/caption-feed.test.ts lib/live/cover-image.test.ts lib/live/gateway-connection-state.test.ts lib/live/gateway-prewarm.test.ts lib/live/live-service.test.ts lib/live/session-restoration.test.ts lib/live/summary.test.ts lib/live/post-session-summary.test.ts lib/live/transcript-read.test.ts lib/live/topic-state.test.ts lib/live-records/live-records-service.test.ts lib/live-records/live-records-routes.test.ts lib/live-records/supabase-store.test.ts lib/live-sheet-sync/route.test.ts lib/live-sheet-sync/service.test.ts lib/live-sheet-sync/store.test.ts lib/live-sheet-sync/worker.test.ts lib/live/feature-flag.test.ts lib/live/admission-code.test.ts lib/live/activity.test.ts lib/security/glossary-selection-validation.test.ts lib/security/host-password.test.ts lib/security/live-admission-store.test.ts lib/security/live-consent-validation.test.ts lib/security/live-security.test.ts lib/security/live-topic-validation.test.ts lib/security/sheet-projection-validation.test.ts components/live/host-demand-control.test.ts components/live/records/records-client.test.ts components/live/records/records-demo.test.ts components/live/viewer-records-recovery.test.ts lib/live-recap/service.test.ts lib/live-recap/store.test.ts lib/live-recap/xlsx.test.ts lib/security/participant-record-recovery.test.ts components/live/transcript-reading-model.test.ts components/live/participant-reading-design.test.ts components/live/viewer-source-ledger.test.ts lib/live/source-contract.test.ts lib/live/source-snapshot.test.ts components/system-language/system-language.test.ts lib/system-language/viewer-messages.test.ts lib/system-language/host-messages.test.ts components/live/records/system-language-records.test.ts lib/system-language/glossary-messages.test.ts components/live/admission-link.test.ts components/live/host-invite-recovery.test.ts components/live/invite-qr-dialog.test.ts lib/security/host-session.test.ts lib/auth/host-session-client.test.ts components/auth/host-session-keeper.test.ts 'app/(login)/login/login-retry.test.ts' lib/live/glossary-pin-diagnostics.test.ts components/live/participant-controls.test.ts components/live/host-manual-start.test.ts components/live/useHostSummaryLifecycle.test.ts components/live/summary-skeleton.test.ts lib/auth/bootstrap-admins.test.ts lib/auth/profile-store.test.ts lib/auth/exchange.test.ts lib/auth/auth-routes.test.ts lib/auth/profile-status-cache.test.ts components/auth/login-card-model.test.ts components/auth/login-card-layout.test.ts lib/console/console-store.test.ts lib/console/engine-defaults.test.ts lib/auth/require-admin.test.ts components/live/host-source-ledger.test.ts lib/live/model-preferences.test.ts lib/console/console-routes.test.ts components/console/console-model.test.ts components/console/console-layout.test.ts lib/live/gateway-engine-push.test.ts lib/live/access-renewal.test.ts lib/captions/broker.test.ts lib/captions/route.test.ts lib/live/speaker-roster/speaker-roster.test.ts components/live/speaker-roster-client.test.ts components/live/speaker-profile-display.test.ts components/live/records/record-speaker-presentation.test.ts",
+    "test:core": "node --experimental-strip-types --experimental-loader ./lib/security/test-typescript-loader.mjs --test components/live/host-surface.test.ts components/live/invite-share.test.ts components/live/speak-client.test.ts lib/audio.test.ts lib/channelCore.test.ts lib/languageDetect.test.ts lib/live-contract.test.ts"
   },
   "dependencies": {
+    "@phosphor-icons/react": "^2.1.10",
     "@supabase/supabase-js": "^2.108.1",
-    "next": "^15.3.3",
+    "exceljs": "4.4.0",
+    "google-auth-library": "^11.0.2",
+    "next": "15.5.21",
     "qrcode": "1.5.4",
     "react": "^19.1.0",
     "react-dom": "^19.1.0",
-    "zod": "^4.4.3"
+    "zod": "^4.4.3",
+    "sharp": "0.35.0"
   },
   "devDependencies": {
     "@types/node": "^22.15.0",
@@ -25,13 +32,17 @@
     "@types/react": "^19.1.0",
     "@types/react-dom": "^19.1.0",
     "autoprefixer": "^10.4.20",
-    "postcss": "^8.5.3",
+    "postcss": "^8.5.23",
     "tailwindcss": "^3.4.17",
     "typescript": "^5.8.3"
   },
   "overrides": {
+    "exceljs": {
+      "uuid": "11.1.1"
+    },
     "next": {
-      "postcss": "8.5.20"
+      "postcss": "8.5.23",
+      "sharp": "0.35.0"
     }
   }
 }

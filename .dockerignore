@@ -1,0 +1,12 @@
+**
+!media-gateway/
+!media-gateway/Dockerfile
+!media-gateway/package.json
+!media-gateway/package-lock.json
+!media-gateway/src/
+!media-gateway/src/**
+!packages/
+!packages/caption-core/
+!packages/caption-core/**
+!packages/gemini-server/
+!packages/gemini-server/**

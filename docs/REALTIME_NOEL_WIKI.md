@@ -50,8 +50,7 @@ Realtime Noel은 이 문제를 다음 방향으로 해결한다.
 - macOS Electron 데스크톱 앱
 - 시스템 오디오, 마이크, 시스템+마이크 입력 모드
 - 영어와 한국어 양방향 실시간 번역
-- OpenAI Realtime Translation 기본 지원
-- Gemini Live Translation 선택 지원
+- Gemini 3.5 Live Translate 기반 단일 실시간 번역 경로
 - 항상 위 자막 오버레이
 - 다중 디스플레이 오버레이
 - 오버레이 켜기/끄기
@@ -133,19 +132,18 @@ Realtime Noel은 이 문제를 다음 방향으로 해결한다.
 
 ### 6.2 번역 provider
 
-지원 provider:
+실시간 번역 provider:
 
 | Provider | 모델 | 역할 |
 |---|---|---|
-| OpenAI | `gpt-realtime-translate` | 기본 realtime 번역 |
-| Gemini | `gemini-3.5-live-translate-preview` | Gemini Live 기반 realtime 번역 |
+| Gemini | `gemini-3.5-live-translate-preview` | 단일 realtime 번역 경로 |
 
 Provider 공통 원칙:
 
-- 번역 provider는 transport abstraction 뒤에 숨긴다.
+- 번역 transport는 Gemini Live 경로로 고정한다.
 - language lock, wrong-direction suppression, commit, polish는 provider와 무관한 공통 pipeline에서 처리한다.
-- OpenAI key와 Gemini key는 별도로 저장한다.
-- key는 설정 응답에서 제거하고 `hasOpenAIKey`, `hasGeminiKey`만 반환한다.
+- OpenAI primary key는 로컬 음성 인식·화이트보드용이며 실시간 번역에는 사용하지 않는다.
+- Gemini primary/secondary key는 설정 응답에서 제거하고 등록 여부만 반환한다.
 
 Gemini 관련 설계:
 
@@ -153,7 +151,7 @@ Gemini 관련 설계:
 - 앱의 24kHz PCM16 audio는 Gemini transport에서 16kHz로 resample한다.
 - `setupComplete`는 `api_ready` 상태로 매핑한다.
 - `goAway` 또는 close는 recoverable reconnect로 처리한다.
-- target이 일본어이고 Gemini key가 있으면 Gemini로 자동 route할 수 있다.
+- 모든 target 언어는 Gemini Live transport로 route한다.
 
 ### 6.3 영어/한국어 양방향 번역
 
@@ -391,13 +389,13 @@ Dashboard + overlay + history
 | `inputMode` | `system_mic` | 시스템 오디오 + 마이크 |
 | `languagePair` | `{ a: "en", b: "ko" }` | 영어/한국어 |
 | `displayMode` | `translation_only` | 번역 자막만 표시 |
-| `translationProvider` | `openai` | 기본 provider |
-| `model` | `gpt-realtime-translate` | OpenAI realtime 번역 모델 |
+| `translationProvider` | `gemini` | 고정 번역 provider |
+| `model` | `gemini-3.5-live-translate-preview` | realtime 번역 모델 |
 | `geminiModel` | `gemini-3.5-live-translate-preview` | Gemini Live 번역 모델 |
 | `overlayEnabled` | `true` | overlay 기본 활성화 |
 | `recordProvider` | `ollama` | 로컬 topic 분류 |
 | `tone` | `natural` | 기본 톤 |
-| `tonePolishModel` | `gpt-4o-mini` | commit polish 모델 |
+| `tonePolishModel` | `gpt-5.5` | 로컬 Caption-only 후처리 모델 |
 | `maxSubtitleLines` | `3` | overlay 최대 줄 수 |
 | `verticalOffset` | `48` | 화면 가장자리 offset |
 
@@ -497,9 +495,9 @@ macOS Privacy & Security에서 Realtime Noel의 Screen & System Audio Recording 
 주요 테스트 범위:
 
 - subtitle setting normalization
-- OpenAI Realtime session shape
-- Gemini setup message, audio resample, fragment normalization
-- provider selection
+- OpenAI Realtime transcription session shape
+- Gemini translation setup message, audio resample, fragment normalization
+- translation provider의 Gemini 고정
 - Gemini key required error
 - EN to KO, KO to EN routing
 - delayed source transcript 처리

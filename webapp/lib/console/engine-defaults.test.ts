@@ -1,0 +1,101 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+import { DEFAULT_ENGINE_SELECTION } from "../../../packages/caption-core/caption-engine-catalog.js";
+import { LiveSecurityConfigurationError } from "../security/config";
+import { ConsoleStoreError, SupabaseConsoleStore, __setConsoleStoreForTests, type ConsoleSettings } from "./console-store";
+import { readFileSync } from "node:fs";
+import * as engineDefaultsModule from "./engine-defaults";
+import { CONSOLE_SETTINGS_FALLBACK, consoleSettingsCache, createConsoleSettingsCache } from "./engine-defaults";
+
+const settings = (engine: unknown): ConsoleSettings => ({ legacyPasswordLoginEnabled: false, engine, engineUpdatedAt: "2026-09-03T00:00:00+00:00", engineUpdatedByEmail: "a@x.io" });
+
+test("M3: the retired global-engine resolvers are gone; the module exports only the per-user assignment path and the settings cache", () => {
+  assert.deepEqual(Object.keys(engineDefaultsModule).sort(), [
+    "CONSOLE_SETTINGS_FALLBACK", "captionEngineAvailability", "consoleSettingsCache", "createConsoleSettingsCache", "engineSelectionForVoiceProvider", "resolveHostEngineAssignment",
+  ]);
+  const source = readFileSync(new URL("./engine-defaults.ts", import.meta.url), "utf8");
+  assert.doesNotMatch(source, /resolveEngineDefaults|readStoredEngineDefaults|isAdminRequest/u);
+  // Nothing in the app resolves an engine from the stored console settings any more.
+  for (const path of ["../../app/api/live-config/route.ts", "../../app/api/live-sessions/route.ts", "../../app/api/console/engine-defaults/route.ts", "../live/service.ts"]) {
+    assert.doesNotMatch(readFileSync(new URL(path, import.meta.url), "utf8"), /resolveEngineDefaults|readStoredEngineDefaults|isAdminRequest|settings\.engine\b/u, path);
+  }
+});
+
+test("createConsoleSettingsCache memoizes for 60 s, dedupes concurrent reads, and invalidates", async () => {
+  let now = 0; let reads = 0;
+  const cache = createConsoleSettingsCache({ read: async () => { reads++; return settings(null); }, now: () => now });
+  await Promise.all([cache.get(), cache.get()]);
+  await cache.get();
+  assert.equal(reads, 1);
+  now = 60_001; await cache.get();
+  assert.equal(reads, 2);
+  cache.invalidate(); await cache.get();
+  assert.equal(reads, 3);
+});
+
+test("the cache returns the fail-open fallback when Supabase is unconfigured and serves the last value across an outage", async () => {
+  const unconfigured = createConsoleSettingsCache({ read: async () => { throw new LiveSecurityConfigurationError("no env"); } });
+  assert.deepEqual(await unconfigured.get(), CONSOLE_SETTINGS_FALLBACK);
+  assert.deepEqual(CONSOLE_SETTINGS_FALLBACK, { legacyPasswordLoginEnabled: true, engine: null, engineUpdatedAt: null, engineUpdatedByEmail: null });
+
+  let fail = false; let now = 0;
+  const flaky = createConsoleSettingsCache({ read: async () => { if (fail) throw new ConsoleStoreError("down", "CONSOLE_STORE_UNAVAILABLE", 503); return settings(DEFAULT_ENGINE_SELECTION); }, now: () => now });
+  assert.deepEqual(await flaky.get(), settings(DEFAULT_ENGINE_SELECTION));
+  fail = true; now = 120_000;
+  assert.deepEqual(await flaky.get(), settings(DEFAULT_ENGINE_SELECTION));
+
+  const cold = createConsoleSettingsCache({ read: async () => { throw new ConsoleStoreError("down", "CONSOLE_STORE_UNAVAILABLE", 503); } });
+  await assert.rejects(cold.get(), (e: ConsoleStoreError) => e.code === "CONSOLE_STORE_UNAVAILABLE");
+});
+
+test("the module singleton reads through getConsoleStore() and the store seam invalidates it", async () => {
+  const fake = new SupabaseConsoleStore({
+    fetchFn: async () => new Response(JSON.stringify([{ legacy_password_login_enabled: false, engine: { stt: { provider: "gemini", model: "gemini-3.5-transcribe-live", languageMode: "auto" }, translation: { provider: "gemini", model: "gemini-3.7-flash" } }, engine_updated_at: null, engine_updated_by_email: null }]), { status: 200 }),
+    getServerAccess: () => ({ url: "https://project.supabase.test", credential: { key: "fixture-secret", kind: "secret" as const } }),
+  });
+  try {
+    __setConsoleStoreForTests(fake);
+    const value = await consoleSettingsCache.get();
+    assert.equal(value.legacyPasswordLoginEnabled, false);
+    const broken = new SupabaseConsoleStore({ fetchFn: async () => new Response("{}", { status: 500 }), getServerAccess: fake["getServerAccess"] });
+    __setConsoleStoreForTests(broken);
+    // Swapping the store dropped the memo: the broken store is consulted and, with no previous value, its error surfaces.
+    await assert.rejects(consoleSettingsCache.get(), (e: ConsoleStoreError) => e.code === "CONSOLE_STORE_UNAVAILABLE");
+  } finally {
+    __setConsoleStoreForTests(null);
+  }
+});
+
+test("assigned engine resolution is user-specific and fails closed on lookup failures", async () => {
+  const { resolveHostEngineAssignment } = await import("./engine-defaults");
+  const calls: string[] = [];
+  const store = new SupabaseConsoleStore({
+    fetchFn: async (_url, init) => { calls.push(JSON.parse(String(init?.body)).p_host_id); return Response.json([{ provider: "soniox", revision: 3 }]); },
+    getServerAccess: () => ({ url: "https://project.supabase.test", credential: { key: "fixture-secret", kind: "secret" as const } }),
+  });
+  __setConsoleStoreForTests(store);
+  try {
+    const result = await resolveHostEngineAssignment("host-a");
+    assert.equal(result.engine.stt.provider, "soniox");
+    assert.equal(result.engine.translation.provider, "soniox");
+    assert.equal(result.assignmentRevision, "3");
+    assert.deepEqual(calls, ["host-a"]);
+    __setConsoleStoreForTests(new SupabaseConsoleStore({ fetchFn: async () => Response.json({}, {status:503}), getServerAccess: store["getServerAccess"] }));
+    await assert.rejects(resolveHostEngineAssignment("host-b"));
+  } finally { __setConsoleStoreForTests(null); }
+});
+
+test("engineSelectionForVoiceProvider is the pure D2 mapping both the session start and the console switch use", async () => {
+  const { engineSelectionForVoiceProvider } = await import("./engine-defaults");
+  const soniox = engineSelectionForVoiceProvider("soniox");
+  assert.deepEqual(soniox, {
+    stt: { provider: "soniox", model: "stt-rt-v5", languageMode: "auto" },
+    translation: { provider: "soniox", model: "stt-rt-v5" },
+    summary: { provider: "gemini", model: "gemini-3.6-flash" },
+  });
+  const gemini = engineSelectionForVoiceProvider("gemini");
+  assert.equal(gemini.stt.provider, "gemini");
+  assert.equal(gemini.stt.model, "gemini-3.5-transcribe-live");
+  assert.equal(gemini.translation.provider, "gemini");
+  assert.equal(gemini.summary.provider, "gemini");
+});

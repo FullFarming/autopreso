@@ -1,0 +1,62 @@
+/* Shared action metrics are opt-in; switches and content-rich choices keep their own geometry. */
+.subtitle-dashboard .nova-control,
+.speaker-editor .nova-control,
+.glossary-detail-dialog .nova-control,
+.refined-controller .nova-control {
+  box-sizing: border-box;
+  height: 44px;
+  min-height: 44px;
+  border-radius: 8px;
+  padding: 8px 12px;
+  white-space: nowrap;
+}
+.subtitle-dashboard .nova-control:focus-visible,
+.refined-controller .nova-control:focus-visible,
+.nova-help-button:focus-visible,
+.caption-details > summary:focus-visible {
+  outline: 2px solid #0071e3;
+  outline-offset: 2px;
+}
+.nova-action-pair { display: inline-flex; align-items: center; gap: 4px; min-width: 0; max-width: 100%; }
+.nova-action-pair > :first-child { min-width: 0; }
+.nova-help-button {
+  box-sizing: border-box; flex: 0 0 44px; width: 44px; height: 44px; min-height: 44px;
+  border: 1px solid var(--nova-surface-hairline); border-radius: 8px; padding: 0;
+  color: var(--nova-fg-secondary); background: transparent; cursor: pointer;
+  font: inherit;
+}
+.nova-help-popover, .nova-display-popover {
+  position: fixed; inset: auto; margin: 0; box-sizing: border-box;
+  width: min(280px, calc(100vw - 32px)); max-height: calc(100dvh - 32px);
+  overflow: auto; padding: 16px; border-radius: 8px;
+  border: 1px solid var(--nova-surface-hairline);
+  background: var(--nova-surface-float); color: var(--nova-fg-primary);
+  font-size: 13px; line-height: 1.5; white-space: normal; overflow-wrap: anywhere;
+}
+#caption-display-options label { display: flex; align-items: center; min-height: 44px; gap: 12px; }
+#caption-display-options input { flex: none; }
+#caption-display-status:empty { display: none; }
+.subtitle-dashboard .caption-core-controls { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 24px; min-width: 0; }
+.subtitle-dashboard .caption-core-controls .cfg-section { display: flex; flex-direction: column; align-items: stretch; gap: 12px; min-width: 0; }
+.caption-core-controls .nova-action-pair { display: flex; width: 100%; }
+#caption-display-trigger { flex: 1; width: 100%; overflow: hidden; text-overflow: ellipsis; text-align: left; }
+.caption-details { margin: 16px 0; min-width: 0; }
+.caption-details > summary { box-sizing: border-box; min-height: 44px; padding: 12px 0; cursor: pointer; font-weight: 600; }
+.caption-details-body { min-width: 0; }
+.subtitle-dashboard-body .subtitle-app-shell > * { min-width: 0; }
+.subtitle-dashboard-body .subtitle-dashboard { min-width: 0; max-width: calc(100% - 32px); }
+.subtitle-dashboard .seg-option, .subtitle-dashboard .lang-pill { min-height: 44px; box-sizing: border-box; }
+.subtitle-dashboard .live-handoff-action, .speaker-actions, .refined-controller .controller-popover footer { flex-wrap: wrap; }
+.refined-controller .controller-bar > button.nova-control { flex-direction: row; gap: 6px; padding: 8px; }
+.refined-controller .controller-position-grid button.nova-control { flex-direction: row; gap: 6px; }
+@media (max-width: 1120px) {
+  .subtitle-dashboard-body .workspace-footer.player-bar { display: flex; flex-wrap: wrap; gap: 12px; }
+  .subtitle-dashboard-body .player-bar-center, .subtitle-dashboard-body .player-bar-right { min-width: 0; flex-wrap: wrap; }
+}
+@media (max-width: 760px) {
+  .subtitle-dashboard .caption-core-controls { grid-template-columns: minmax(0, 1fr); gap: 0; }
+}
+.workspace-footer #start-subtitles.nova-control,
+.workspace-footer #stop-subtitles.nova-control,
+.workspace-footer #restart-subtitles.nova-control { height: 44px; min-height: 44px; border-radius: 8px; }
+.nova-action-pair:has(> [hidden]) { display: none; }

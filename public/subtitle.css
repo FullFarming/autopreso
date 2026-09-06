@@ -11,34 +11,67 @@
       (dialog 24 / sheet 28) rather than the 16 cap an earlier pass assumed.
    ─────────────────────────────────────────────────────────────────────────── */
 :root {
-  /* Surface ladder — recessed → base → layered → floating. */
-  --nova-bg-recessed: #06060a;
-  --nova-bg: #0a0a0b;
-  --nova-surface: #14141a;
-  --nova-surface-raised: #1c1c24;
-  --nova-surface-float: #2c2c35;
-  --nova-hairline: #26262f;
-  --nova-hairline-strong: #3c3c47;
+  --nova-black-1000: #000000;
+  --nova-grey-950: #0a0a0b;
+  --nova-grey-900: #15151a;
+  --nova-grey-850: #1f1f27;
+  --nova-grey-800: #2f2f3a;
+  --nova-grey-500: #6b7684;
+  --nova-grey-400: #8b95a1;
+  --nova-grey-100: #dddddd;
+  --nova-white-0: #ffffff;
+  --nova-indigo-600: #5355db;
+  --nova-indigo-500: #6566f7;
+  --nova-indigo-400: #7576ff;
+  --nova-indigo-100: #c9c9fc;
+  --nova-blue-500: #0071e3;
+  --nova-red-500: #f04452;
+  --nova-green-500: #03b26c;
+  --nova-yellow-500: #ffc342;
+
+  --nova-surface-recessed: var(--nova-black-1000);
+  --nova-surface-base: var(--nova-grey-950);
+  --nova-surface-layered: var(--nova-grey-900);
+  --nova-surface-raised: var(--nova-grey-900);
+  --nova-surface-float: var(--nova-grey-850);
+  --nova-surface-hairline: var(--nova-grey-800);
+  --nova-fg-intense: var(--nova-white-0);
+  --nova-fg-primary: var(--nova-grey-100);
+  --nova-fg-secondary: var(--nova-grey-400);
+  --nova-fg-tertiary: var(--nova-grey-500);
+  --nova-fg-disabled: var(--nova-grey-800);
+  --nova-brand-default: var(--nova-blue-500);
+  --nova-brand-hover: color-mix(in srgb, var(--nova-blue-500) 88%, var(--nova-white-0));
+  --nova-brand-pressed: color-mix(in srgb, var(--nova-blue-500) 88%, var(--nova-black-1000));
+  --nova-brand-subtle: color-mix(in srgb, var(--nova-blue-500) 16%, transparent);
+  --nova-brand-fg: var(--nova-white-0);
+  --nova-system-default: var(--nova-blue-500);
+  --nova-system-subtle: color-mix(in srgb, var(--nova-blue-500) 16%, transparent);
+  --nova-status-live: var(--nova-red-500);
+  --nova-status-live-subtle: rgba(240, 68, 82, 0.16);
+  --nova-status-ok: var(--nova-green-500);
+  --nova-status-warn: var(--nova-yellow-500);
+  --nova-status-error: var(--nova-red-500);
+
+  --nova-bg-recessed: var(--nova-surface-recessed);
+  --nova-bg: var(--nova-surface-base);
+  --nova-surface: var(--nova-surface-layered);
+  --nova-hairline: var(--nova-surface-hairline);
+  --nova-hairline-strong: var(--nova-surface-hairline);
   --nova-scrim: rgba(0, 0, 0, 0.56);
-
-  /* Text ramp — TDS dark greys, violet-biased at ~285° OKLCH (not an inversion
-     of the light ramp; Toss shifts hue between modes on purpose). */
-  --nova-text: #ffffff;
-  --nova-text-strong: #e4e4e5;
-  --nova-text-body: #c3c3c6;
-  --nova-text-muted: #9e9ea4;
-  --nova-text-subtle: #7e7e87;
-  --nova-text-disabled: #62626d;
-
-  /* Accents — TDS *dark* values, which are brighter and less saturated than the
-     light ones. Blue is the single primary and stays rationed: one primary
-     action per screen, never as decoration. */
-  --nova-blue: #3485fa;
-  --nova-blue-strong: #449bff;
-  --nova-red: #f04251;
-  --nova-green: #16bb76;
-  --nova-yellow: #ffb134;
-  --nova-purple: #ae3dd1;
+  --nova-text: var(--nova-fg-intense);
+  --nova-text-strong: var(--nova-fg-primary);
+  --nova-text-body: var(--nova-fg-primary);
+  --nova-text-muted: var(--nova-fg-secondary);
+  --nova-text-subtle: var(--nova-fg-tertiary);
+  --nova-text-disabled: var(--nova-fg-disabled);
+  --nova-blue: var(--nova-system-default);
+  --nova-blue-strong: var(--nova-system-default);
+  --nova-red: var(--nova-status-error);
+  --nova-green: var(--nova-status-ok);
+  --nova-yellow: var(--nova-status-warn);
+  --nova-purple: var(--nova-brand-default);
+  --nova-caption-plate: var(--nova-surface-recessed);
 
   /* Overlay ramp: lets one control composite over any surface. */
   --nova-overlay-100: rgba(255, 255, 255, 0.07);
@@ -96,6 +129,14 @@
   --nova-dur-quick: 350ms;
   --nova-spring-quick: cubic-bezier(0.282, 1.081, 0.338, 0.988);
   --nova-dur-color: 300ms;
+  --nova-font: "Pretendard", -apple-system, BlinkMacSystemFont, "Apple SD Gothic Neo", "Malgun Gothic", sans-serif;
+  --ui-font-family: "Pretendard", -apple-system, BlinkMacSystemFont, "Apple SD Gothic Neo", "Malgun Gothic", sans-serif;
+  --subtitle-font-family: "Pretendard", -apple-system, BlinkMacSystemFont, "Apple SD Gothic Neo", "Malgun Gothic", sans-serif;
+  --translation-font-size: 38px;
+  --source-font-size: 36px;
+  --subtitle-max-width: 1500px;
+  --subtitle-opacity: 0.92;
+  --subtitle-line-clamp: 3;
 }
 
 /* TDS components skip their effects entirely under reduced motion rather than
@@ -106,33 +147,6 @@
     --nova-dur-quick: 1ms;
     --nova-dur-color: 1ms;
   }
-}
-
-:root {
-  /* Editorial palette: ink near-black and a restrained off-white canvas.
-     Legacy --cw-* names kept; values remapped onto the editorial scale. */
-  --cw-indigo: #0c0a09;       /* ink — headings / emphasis */
-  --cw-red: #FF453A;          /* record affordance only */
-  --cw-grey: #4e4e4e;         /* body text */
-  --cw-white: #FFFFFF;
-  --cw-blue: #0a84ff;         /* action accent */
-  --cw-grey-75: #777169;
-  --cw-grey-25: #D6D3D1;      /* hairline-strong */
-  --cw-grey-12: #f5f5f5;      /* canvas */
-  --cw-blue-12: #E9F1FC;
-  --cw-dark-red: #A32D2D;
-  --cw-dark-red-12: #FCEEEC;
-  --cw-canvas-soft: #FAFAFA;
-  --cw-hairline: #E7E5E4;
-  --cw-glass: rgba(255, 255, 255, 0.62);
-  --cw-serif: "Pretendard", "Noto Sans KR", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-  --ui-font-family: "Pretendard", "Noto Sans KR", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-  --subtitle-font-family: "Inter", "Pretendard", "Noto Sans KR", Arial, Helvetica, sans-serif;
-  --translation-font-size: 38px;
-  --source-font-size: 36px;
-  --subtitle-max-width: 1500px;
-  --subtitle-opacity: 0.92;
-  --subtitle-line-clamp: 3;
 }
 
 * {
@@ -146,14 +160,15 @@
 body {
   margin: 0;
   font-family: var(--ui-font-family);
-  color: var(--cw-grey);
-  letter-spacing: 0.16px;
+  color: var(--nova-fg-secondary);
+  letter-spacing: -0.02em;
+  word-break: keep-all;
   -webkit-font-smoothing: antialiased;
 }
 
 .subtitle-dashboard-body {
   min-height: 100vh;
-  background: var(--cw-grey-12);
+  background: var(--nova-surface-base);
   background-attachment: fixed;
 }
 
@@ -173,7 +188,7 @@ body {
 
 .subtitle-hero h1 {
   margin: 0;
-  color: var(--cw-indigo);
+  color: var(--nova-caption-plate);
   font-family: var(--ui-font-family);
   font-weight: 600;
   font-size: 38px;
@@ -184,17 +199,17 @@ body {
 .subtitle-hero-kicker {
   display: block;
   margin-bottom: 4px;
-  color: var(--cw-grey-75);
+  color: var(--nova-fg-tertiary);
   font-size: 10px;
   font-weight: 700;
   letter-spacing: 0.12em;
 }
 
 .status-pill {
-  border: 1px solid var(--cw-grey-25);
+  border: 1px solid var(--nova-surface-hairline);
   border-radius: 999px;
-  background: var(--cw-white);
-  color: var(--cw-grey);
+  background: var(--nova-fg-intense);
+  color: var(--nova-fg-secondary);
   padding: 8px 12px;
   font-size: 13px;
   font-weight: 650;
@@ -202,22 +217,22 @@ body {
 }
 
 .status-pill.active {
-  border-color: var(--cw-blue);
-  background: var(--cw-blue-12);
-  color: var(--cw-indigo);
+  border-color: var(--nova-system-default);
+  background: var(--nova-system-subtle);
+  color: var(--nova-caption-plate);
 }
 
 .status-pill.error {
-  border-color: var(--cw-dark-red);
-  background: var(--cw-dark-red-12);
-  color: var(--cw-dark-red);
+  border-color: var(--nova-status-live);
+  background: var(--nova-status-live-subtle);
+  color: var(--nova-status-live);
 }
 
 .file-protocol-warning {
-  border: 1px solid var(--cw-blue);
+  border: 1px solid var(--nova-system-default);
   border-radius: 10px;
-  background: var(--cw-blue-12);
-  color: var(--cw-indigo);
+  background: var(--nova-system-subtle);
+  color: var(--nova-caption-plate);
   font-size: 13px;
   font-weight: 650;
   line-height: 1.4;
@@ -237,7 +252,7 @@ body {
 .settings-panel {
   border: 1px solid rgba(255, 255, 255, 0.7);
   border-radius: 18px;
-  background: var(--cw-glass);
+  background: var(--nova-surface-float);
   -webkit-backdrop-filter: blur(28px) saturate(150%);
   backdrop-filter: blur(28px) saturate(150%);
   box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.8), 0 12px 40px rgba(12, 10, 9, 0.08);
@@ -247,7 +262,7 @@ body {
 .command-panel {
   display: grid;
   gap: 14px;
-  border-top: 4px solid var(--cw-indigo);
+  border-top: 4px solid var(--nova-caption-plate);
 }
 
 .dashboard-grid {
@@ -267,7 +282,7 @@ body {
   display: flex;
   justify-content: space-between;
   gap: 16px;
-  color: var(--cw-grey);
+  color: var(--nova-fg-secondary);
   font-size: 12px;
   font-weight: 650;
   letter-spacing: 0.05em;
@@ -275,7 +290,7 @@ body {
 }
 
 .panel-heading strong {
-  color: var(--cw-indigo);
+  color: var(--nova-caption-plate);
   font-size: 13px;
   letter-spacing: 0;
   text-align: right;
@@ -320,7 +335,7 @@ body {
 }
 
 .language-targets-label {
-  color: var(--cw-grey);
+  color: var(--nova-fg-secondary);
   font-size: 12px;
   font-weight: 650;
   letter-spacing: 0.04em;
@@ -336,9 +351,9 @@ body {
 
 .lang-pill {
   align-items: center;
-  border: 1px solid var(--cw-grey-25);
+  border: 1px solid var(--nova-surface-hairline);
   border-radius: 999px;
-  color: var(--cw-grey);
+  color: var(--nova-fg-secondary);
   cursor: pointer;
   display: flex;
   gap: 8px;
@@ -352,7 +367,7 @@ body {
 }
 
 .lang-pill:hover {
-  border-color: var(--cw-blue);
+  border-color: var(--nova-system-default);
 }
 
 .lang-pill input {
@@ -372,13 +387,13 @@ body {
 }
 
 .lang-pill:has(input:checked) {
-  background: var(--cw-blue-12);
-  border-color: var(--cw-blue);
-  color: var(--cw-blue);
+  background: var(--nova-system-subtle);
+  border-color: var(--nova-system-default);
+  color: var(--nova-system-default);
 }
 
 .lang-pill:has(input:focus-visible) {
-  outline: 2px solid var(--cw-blue);
+  outline: 2px solid var(--nova-system-default);
   outline-offset: 2px;
 }
 
@@ -392,7 +407,7 @@ body {
 }
 
 .language-targets-hint {
-  color: var(--cw-grey-75);
+  color: var(--nova-fg-tertiary);
   font-size: 11px;
   font-weight: 650;
   letter-spacing: 0;
@@ -400,7 +415,7 @@ body {
 }
 
 .language-targets.invalid .language-targets-hint {
-  color: var(--cw-dark-red);
+  color: var(--nova-status-live);
 }
 
 @keyframes language-shake {
@@ -420,9 +435,9 @@ body {
 }
 
 .service-strip span {
-  border: 1px solid var(--cw-grey-25);
+  border: 1px solid var(--nova-surface-hairline);
   border-radius: 999px;
-  color: var(--cw-grey);
+  color: var(--nova-fg-secondary);
   font-size: 12px;
   font-weight: 650;
   line-height: 1;
@@ -430,15 +445,15 @@ body {
 }
 
 .service-strip span.active {
-  border-color: var(--cw-blue);
-  background: var(--cw-blue-12);
-  color: var(--cw-indigo);
+  border-color: var(--nova-system-default);
+  background: var(--nova-system-subtle);
+  color: var(--nova-caption-plate);
 }
 
 .service-strip span.error {
-  border-color: var(--cw-dark-red);
-  background: var(--cw-dark-red-12);
-  color: var(--cw-dark-red);
+  border-color: var(--nova-status-live);
+  background: var(--nova-status-live-subtle);
+  color: var(--nova-status-live);
 }
 
 .live-handoff {
@@ -446,7 +461,7 @@ body {
   grid-template-columns: minmax(250px, 1.25fr) minmax(330px, 1.4fr) minmax(190px, 0.7fr);
   align-items: center;
   gap: 16px;
-  border: 1px solid var(--cw-grey-25);
+  border: 1px solid var(--nova-surface-hairline);
   border-radius: 14px;
   background: rgba(255, 255, 255, 0.58);
   padding: 14px 16px;
@@ -459,7 +474,7 @@ body {
 .live-handoff-kicker {
   display: block;
   margin-bottom: 5px;
-  color: var(--cw-blue);
+  color: var(--nova-system-default);
   font-size: 10px;
   font-weight: 700;
   letter-spacing: 0.1em;
@@ -467,8 +482,8 @@ body {
 
 .live-handoff h2 {
   margin: 0;
-  color: var(--cw-indigo);
-  font-family: var(--cw-serif);
+  color: var(--nova-caption-plate);
+  font-family: var(--nova-font);
   font-size: 20px;
   font-weight: 500;
   letter-spacing: -0.2px;
@@ -477,7 +492,7 @@ body {
 
 .live-handoff-copy p {
   margin: 6px 0 0;
-  color: var(--cw-grey);
+  color: var(--nova-fg-secondary);
   font-size: 12px;
   line-height: 1.45;
 }
@@ -485,7 +500,7 @@ body {
 .live-handoff-flow {
   display: block;
   margin-top: 6px;
-  color: var(--cw-grey-75);
+  color: var(--nova-fg-tertiary);
   font-size: 10px;
   font-weight: 650;
   line-height: 1.4;
@@ -502,9 +517,9 @@ body {
 
 .live-handoff-modes li {
   min-width: 0;
-  border: 1px solid var(--cw-hairline);
+  border: 1px solid var(--nova-surface-hairline);
   border-radius: 8px;
-  background: var(--cw-canvas-soft);
+  background: var(--nova-surface-layered);
   padding: 10px;
 }
 
@@ -517,14 +532,14 @@ body {
 }
 
 .live-handoff-modes strong {
-  color: var(--cw-indigo);
+  color: var(--nova-caption-plate);
   font-size: 11px;
   font-weight: 700;
 }
 
 .live-handoff-modes span {
   margin-top: 4px;
-  color: var(--cw-grey-75);
+  color: var(--nova-fg-tertiary);
   font-size: 10px;
 }
 
@@ -543,7 +558,7 @@ body {
 
 .live-handoff-action span {
   min-height: 30px;
-  color: var(--cw-grey-75);
+  color: var(--nova-fg-tertiary);
   font-size: 10px;
   line-height: 1.4;
   text-align: center;
@@ -551,171 +566,31 @@ body {
 
 .live-handoff-action span.is-opening,
 .live-handoff-action span.is-ready {
-  color: var(--cw-blue);
+  color: var(--nova-system-default);
 }
 
 .live-handoff-action span.is-error {
-  color: var(--cw-dark-red);
+  color: var(--nova-status-live);
 }
 
 .audio-inspector {
-  border: 1px solid var(--cw-grey-25);
+  border: 1px solid var(--nova-surface-hairline);
   border-radius: 8px;
   display: grid;
   gap: 10px;
   padding: 12px;
 }
 
-.pt-output-group {
-  display: grid;
-  gap: 12px;
-  border: 1px solid var(--cw-grey-25);
-  border-radius: 14px;
-  background: var(--cw-canvas-soft);
-  padding: 14px;
-}
-
-.pt-output-heading {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 16px;
-}
-
-.pt-output-heading > div {
-  display: grid;
-  gap: 3px;
-}
-
-.pt-output-kicker,
-.pt-output-heading > span {
-  color: var(--cw-grey-75);
-  font-size: 10px;
-  font-weight: 700;
-  letter-spacing: 0.08em;
-}
-
-.pt-output-heading h2 {
+.pt-output-help {
   margin: 0;
-  color: var(--cw-indigo);
-  font-family: var(--ui-font-family);
-  font-size: 20px;
-  font-weight: 500;
-  letter-spacing: -0.2px;
-}
-
-.pt-output-options {
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-}
-
-.pt-output-options .seg-option input:disabled + span {
-  cursor: not-allowed;
-  opacity: 0.45;
-}
-
-.pt-playback-options {
-  display: grid;
-  grid-template-columns: minmax(180px, 0.7fr) minmax(240px, 1.3fr);
-  gap: 12px;
-  padding-top: 12px;
-  border-top: 1px solid var(--cw-grey-25);
-}
-
-.pt-voice-methods {
-  display: grid;
-  grid-column: 1 / -1;
-  gap: 10px;
-}
-
-.pt-voice-method-heading {
-  display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  gap: 12px;
-}
-
-.pt-voice-method-heading h3 {
-  margin: 0;
-  color: var(--cw-indigo);
-  font-size: 13px;
-  font-weight: 750;
-}
-
-.pt-voice-method-heading span {
-  color: var(--cw-grey-75);
-  font-size: 11px;
-  font-weight: 650;
-}
-
-.pt-voice-method-grid {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 10px;
-}
-
-.pt-voice-method-card {
-  display: grid;
-  align-content: start;
-  gap: 8px;
-  padding: 13px;
-  border: 1px solid var(--cw-grey-25);
-  border-radius: 8px;
-  background: var(--cw-white);
-}
-
-.pt-voice-method-card.is-current {
-  border-color: var(--cw-indigo);
-}
-
-.pt-voice-method-card > div {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-}
-
-.pt-voice-method-card strong {
-  color: var(--cw-indigo);
-  font-size: 12px;
-}
-
-.pt-voice-method-card p {
-  margin: 0;
-  color: var(--cw-grey);
-  font-size: 11px;
-  font-weight: 600;
-  line-height: 1.5;
-}
-
-.pt-method-status {
-  color: var(--cw-grey);
-  font-size: 10px;
-  font-weight: 700;
-  white-space: nowrap;
-}
-
-.pt-voice-method-card button {
-  justify-self: start;
-}
-
-.pt-volume-field > span {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-}
-
-.pt-output-help,
-.pt-output-routing-help {
-  margin: 0;
-  color: var(--cw-grey-75);
+  color: var(--nova-fg-tertiary);
   font-size: 11px;
   font-weight: 650;
   line-height: 1.45;
 }
 
 .pt-output-help.is-unavailable {
-  color: var(--cw-dark-red);
+  color: var(--nova-status-live);
 }
 
 .audio-inspector-heading {
@@ -723,7 +598,7 @@ body {
   display: flex;
   justify-content: space-between;
   gap: 12px;
-  color: var(--cw-grey);
+  color: var(--nova-fg-secondary);
   font-size: 12px;
   font-weight: 650;
   letter-spacing: 0.05em;
@@ -744,13 +619,13 @@ body {
 }
 
 .audio-meter-row strong {
-  color: var(--cw-indigo);
+  color: var(--nova-caption-plate);
   font-size: 13px;
   line-height: 1.2;
 }
 
 .audio-meter-row span {
-  color: var(--cw-grey);
+  color: var(--nova-fg-secondary);
   font-size: 12px;
   line-height: 1.25;
   overflow: hidden;
@@ -759,22 +634,22 @@ body {
 }
 
 .audio-meter {
-  background: var(--cw-grey-12);
-  border: 1px solid var(--cw-grey-25);
+  background: var(--nova-surface-layered);
+  border: 1px solid var(--nova-surface-hairline);
   border-radius: 999px;
   height: 10px;
   overflow: hidden;
 }
 
 .audio-meter-fill {
-  background: var(--cw-blue);
+  background: var(--nova-system-default);
   display: block;
   height: 100%;
   width: 0%;
 }
 
 .audio-meter-row em {
-  color: var(--cw-grey-75);
+  color: var(--nova-fg-tertiary);
   font-size: 12px;
   font-style: normal;
   font-weight: 650;
@@ -785,7 +660,7 @@ label {
   display: flex;
   flex-direction: column;
   gap: 6px;
-  color: var(--cw-grey);
+  color: var(--nova-fg-secondary);
   font-size: 12px;
   font-weight: 650;
   text-transform: uppercase;
@@ -795,10 +670,10 @@ label {
 input,
 select {
   width: 100%;
-  border: 1px solid var(--cw-grey-25);
+  border: 1px solid var(--nova-surface-hairline);
   border-radius: 8px;
-  background: var(--cw-white);
-  color: var(--cw-grey);
+  background: var(--nova-fg-intense);
+  color: var(--nova-fg-secondary);
   font: inherit;
   font-size: 14px;
   letter-spacing: 0;
@@ -807,12 +682,12 @@ select {
 }
 
 input[type="range"] {
-  accent-color: var(--cw-blue);
+  accent-color: var(--nova-system-default);
   padding: 0;
 }
 
 output {
-  color: var(--cw-grey);
+  color: var(--nova-fg-secondary);
   font-size: 13px;
   font-weight: 650;
   min-width: 42px;
@@ -822,7 +697,7 @@ output {
 input:focus,
 select:focus,
 button:focus-visible {
-  outline: 2px solid var(--cw-blue);
+  outline: 2px solid var(--nova-system-default);
   outline-offset: 2px;
 }
 
@@ -834,7 +709,7 @@ button:focus-visible {
 }
 
 .field-status {
-  color: var(--cw-grey-75);
+  color: var(--nova-fg-tertiary);
   font-size: 12px;
   font-weight: 650;
   letter-spacing: 0;
@@ -842,7 +717,7 @@ button:focus-visible {
 }
 
 .field-status.registered {
-  color: var(--cw-blue);
+  color: var(--nova-system-default);
 }
 
 .panel-heading-actions {
@@ -857,8 +732,8 @@ button:focus-visible {
   gap: 10px;
   margin-top: 12px;
   padding: 12px 14px;
-  background: var(--cw-canvas-soft);
-  border: 1px solid var(--cw-grey-25);
+  background: var(--nova-surface-layered);
+  border: 1px solid var(--nova-surface-hairline);
   border-radius: 14px;
 }
 
@@ -870,7 +745,7 @@ button:focus-visible {
 }
 
 .placement-title {
-  color: var(--cw-indigo);
+  color: var(--nova-caption-plate);
   font-size: 12px;
   font-weight: 650;
   letter-spacing: 0.04em;
@@ -878,7 +753,7 @@ button:focus-visible {
 }
 
 .placement-hint {
-  color: var(--cw-grey-75);
+  color: var(--nova-fg-tertiary);
   font-size: 11px;
   font-weight: 650;
 }
@@ -900,7 +775,7 @@ button:focus-visible {
 }
 
 .lang-chip {
-  color: var(--cw-indigo);
+  color: var(--nova-caption-plate);
   font-size: 12px;
   font-weight: 700;
   letter-spacing: 0.04em;
@@ -912,8 +787,8 @@ button:focus-visible {
   grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 2px;
   padding: 2px;
-  background: var(--cw-white);
-  border: 1px solid var(--cw-grey-25);
+  background: var(--nova-fg-intense);
+  border: 1px solid var(--nova-surface-hairline);
   border-radius: 999px;
 }
 
@@ -934,7 +809,7 @@ button:focus-visible {
 .seg-option span {
   display: block;
   border-radius: 999px;
-  color: var(--cw-grey);
+  color: var(--nova-fg-secondary);
   cursor: pointer;
   font-size: 13px;
   font-weight: 650;
@@ -946,12 +821,12 @@ button:focus-visible {
 }
 
 .seg-option input:checked + span {
-  background: var(--cw-blue);
+  background: var(--nova-system-default);
   color: #ffffff;
 }
 
 .seg-option input:focus-visible + span {
-  outline: 2px solid var(--cw-blue);
+  outline: 2px solid var(--nova-system-default);
   outline-offset: 2px;
 }
 
@@ -961,8 +836,8 @@ button:focus-visible {
   grid-template-columns: auto minmax(0, 1fr) auto;
   gap: 10px;
   padding-top: 10px;
-  border-top: 1px solid var(--cw-grey-25);
-  color: var(--cw-grey);
+  border-top: 1px solid var(--nova-surface-hairline);
+  color: var(--nova-fg-secondary);
   font-size: 12px;
   font-weight: 650;
   letter-spacing: 0;
@@ -975,7 +850,7 @@ button:focus-visible {
 
 #vertical-offset-value {
   min-width: 44px;
-  color: var(--cw-indigo);
+  color: var(--nova-caption-plate);
   text-align: right;
 }
 
@@ -1031,7 +906,7 @@ button:focus-visible {
 
 .overlay-toggle {
   align-items: center;
-  border: 1px solid var(--cw-grey-25);
+  border: 1px solid var(--nova-surface-hairline);
   border-radius: 8px;
   background: rgba(255, 255, 255, 0.58);
   display: grid;
@@ -1043,13 +918,13 @@ button:focus-visible {
 }
 
 .overlay-toggle input {
-  accent-color: var(--cw-blue);
+  accent-color: var(--nova-system-default);
   height: 18px;
   width: 18px;
 }
 
 .overlay-toggle span {
-  color: var(--cw-indigo);
+  color: var(--nova-caption-plate);
   font-size: 13px;
   font-weight: 650;
   letter-spacing: 0;
@@ -1061,10 +936,10 @@ button:focus-visible {
 
 button {
   align-items: center;
-  border: 1px solid var(--cw-indigo);
+  border: 1px solid var(--nova-caption-plate);
   border-radius: 999px;
-  background: var(--cw-indigo);
-  color: var(--cw-white);
+  background: var(--nova-caption-plate);
+  color: var(--nova-fg-intense);
   cursor: pointer;
   display: inline-flex;
   justify-content: center;
@@ -1081,13 +956,13 @@ button:hover:not(:disabled) {
 
 button.secondary {
   background: transparent;
-  color: var(--cw-indigo);
-  border-color: var(--cw-grey-25);
+  color: var(--nova-caption-plate);
+  border-color: var(--nova-surface-hairline);
 }
 
 button.secondary:hover:not(:disabled) {
   background: rgba(12, 10, 9, 0.05);
-  border-color: var(--cw-indigo);
+  border-color: var(--nova-caption-plate);
 }
 
 button.compact {
@@ -1101,7 +976,7 @@ button:disabled {
 }
 
 .preview-label {
-  color: var(--cw-grey);
+  color: var(--nova-fg-secondary);
   font-size: 12px;
   font-weight: 650;
   text-transform: uppercase;
@@ -1119,7 +994,7 @@ button:disabled {
   border: 1px solid rgba(255, 255, 255, 0.18);
   border-radius: 999px;
   box-shadow: 0 14px 36px rgba(12, 10, 9, 0.22);
-  color: var(--cw-white);
+  color: var(--nova-fg-intense);
   display: flex;
   gap: 6px;
   left: 50%;
@@ -1155,7 +1030,12 @@ button:disabled {
   /* Hugs its content: the window then resizes to this width via the fit-size
      IPC, so there is never slack for a cluster to be pushed across. */
   width: max-content;
-  max-width: 100vw;
+  /* Measure the unwrapped row even before Electron widens its transparent
+     BrowserWindow. Capping this to the initial viewport made a newly-added
+     rightmost control wrap first, so ResizeObserver could never discover the
+     real width it needed to request. Main still clamps the final window to the
+     selected display's work area. */
+  max-width: none;
   display: flex;
   align-items: center;
   gap: 10px;
@@ -1165,7 +1045,7 @@ button:disabled {
 .subtitle-controller-body .controller-body {
   flex: 0 1 auto;
   flex-direction: row;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
   align-items: center;
   gap: 8px;
   min-width: 0;
@@ -1193,11 +1073,45 @@ button:disabled {
 }
 
 .mp-status {
+  align-items: center;
   color: rgba(255, 255, 255, 0.62);
-  font-size: 10.5px;
+  display: flex;
+  font-size: var(--nova-t8);
+  gap: var(--nova-gap-4);
+  line-height: var(--nova-t8-lh);
   overflow: hidden;
   text-overflow: ellipsis;
+  transition: color var(--nova-dur-rapid) var(--nova-ease-out);
   white-space: nowrap;
+}
+
+.mp-status[data-connection-state]::before {
+  background: currentColor;
+  border-radius: var(--nova-r-pill);
+  content: "";
+  flex: 0 0 auto;
+  height: 6px;
+  width: 6px;
+}
+
+.mp-status[data-connection-state="healthy"] {
+  color: var(--nova-status-ok);
+}
+
+.mp-status[data-connection-state="waiting"],
+.mp-status[data-connection-state="recovering"] {
+  color: var(--nova-yellow);
+}
+
+.mp-status[data-connection-state="disconnected"] {
+  color: var(--nova-status-error);
+}
+
+.mp-status-detail {
+  color: var(--nova-text-muted);
+  font-variant-numeric: tabular-nums;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .mp-vu {
@@ -1272,6 +1186,24 @@ button:disabled {
 
 .mp-live-call[hidden] { display: none; }
 
+/* Read-only engine pill: which admin-deployed engine is serving, and whether it is up. */
+.mp-engine {
+  border: 1px solid rgba(255, 255, 255, 0.28);
+  border-radius: 999px;
+  color: rgba(255, 255, 255, 0.8);
+  flex: none;
+  font-size: 11px;
+  line-height: 1;
+  max-width: 180px;
+  overflow: hidden;
+  padding: 5px 9px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.mp-engine[hidden] { display: none; }
+.mp-engine[data-state="ready"] { border-color: rgba(48, 209, 88, 0.55); color: #30d158; }
+.mp-engine[data-state="failed"] { border-color: rgba(255, 69, 58, 0.6); color: #ff453a; }
+
 /* The big central Go-Live: the play button of the console. */
 .subtitle-controller-body .controller-go-live {
   border-radius: 999px;
@@ -1319,7 +1251,7 @@ button:disabled {
 .subtitle-controller-body .controller-opacity input { width: 76px; }
 .subtitle-controller-body .controller-opacity output { min-width: 30px; }
 .subtitle-controller-body .controller-gap { gap: 3px; }
-.subtitle-controller-body .mp-brand { flex-basis: 148px; }
+.subtitle-controller-body .mp-brand { flex-basis: 248px; }
 .subtitle-controller-body .controller-cluster { padding: 0 2px; }
 .subtitle-controller-body .controller-group { gap: 3px; }
 .subtitle-controller-body .mp-elapsed { min-width: 36px; }
@@ -1328,6 +1260,70 @@ button:disabled {
 .subtitle-controller-body .mp-window {
   margin-left: 0;
   flex: none;
+}
+
+.controller-display-select {
+  width: 176px;
+  height: 30px;
+  min-height: 30px;
+  border: 1px solid transparent;
+  border-radius: var(--nova-r-pill);
+  background: var(--nova-overlay-200);
+  color: var(--nova-text-strong);
+  cursor: pointer;
+  flex: none;
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1;
+  padding: 0 28px 0 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  -webkit-app-region: no-drag;
+}
+
+/* "All screens" tick: a pill that reads as checked/unchecked at a glance, so
+   the host can tell where captions are going without opening the dashboard. */
+.controller-tick {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex: none;
+  -webkit-app-region: no-drag;
+}
+
+.controller-tick-box {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 15px;
+  height: 15px;
+  border: 1.5px solid var(--nova-text-disabled);
+  border-radius: 4px;
+  color: transparent;
+  flex: none;
+}
+
+.controller-tick[aria-checked="true"] .controller-tick-box {
+  background: var(--nova-accent, #4c8dff);
+  border-color: var(--nova-accent, #4c8dff);
+  color: #fff;
+}
+
+.controller-tick[aria-checked="true"] { color: var(--nova-text-strong); }
+.controller-tick:disabled { color: var(--nova-text-disabled); cursor: default; }
+
+.controller-display-select:hover { background: var(--nova-overlay-300); }
+.controller-display-select:disabled { color: var(--nova-text-disabled); cursor: default; }
+.controller-display-select:focus-visible {
+  border-color: transparent;
+  box-shadow: none;
+  outline: 2px solid var(--nova-blue);
+  outline-offset: 2px;
+}
+
+.controller-display-select option {
+  background: var(--nova-surface-float);
+  color: var(--nova-text-strong);
 }
 
 .controller-group {
@@ -1349,12 +1345,12 @@ button:disabled {
 
 .controller-button {
   background: rgba(255, 255, 255, 0.1);
-  color: var(--cw-white);
+  color: var(--nova-fg-intense);
 }
 
 .controller-primary {
-  background: var(--cw-white);
-  color: var(--cw-indigo);
+  background: var(--nova-fg-intense);
+  color: var(--nova-caption-plate);
 }
 
 .controller-icon,
@@ -1373,7 +1369,7 @@ button:disabled {
 
 .controller-chip.active {
   background: rgba(255, 255, 255, 0.16);
-  color: var(--cw-white);
+  color: var(--nova-fg-intense);
 }
 
 .controller-readout {
@@ -1387,8 +1383,8 @@ button:disabled {
 .subtitle-preview {
   min-height: 260px;
   border-radius: 8px;
-  background: var(--cw-indigo);
-  background: rgb(from var(--cw-indigo) r g b / var(--subtitle-opacity));
+  background: var(--nova-caption-plate);
+  background: rgb(from var(--nova-caption-plate) r g b / var(--subtitle-opacity));
   display: flex;
   flex-direction: column;
   align-items: center;
@@ -1396,7 +1392,7 @@ button:disabled {
   gap: 4px;
   padding: 32px;
   text-align: center;
-  color: var(--cw-white);
+  color: var(--nova-fg-intense);
 }
 
 .translation-line {
@@ -1459,7 +1455,7 @@ button:disabled {
 }
 
 .subtitle-word.committed {
-  color: var(--cw-white);
+  color: var(--nova-fg-intense);
   opacity: 1;
 }
 
@@ -1496,7 +1492,7 @@ button:disabled {
 }
 
 .topic-item {
-  border: 1px solid var(--cw-grey-25);
+  border: 1px solid var(--nova-surface-hairline);
   border-radius: 8px;
   padding: 10px;
   display: grid;
@@ -1504,20 +1500,20 @@ button:disabled {
 }
 
 .topic-item strong {
-  color: var(--cw-indigo);
+  color: var(--nova-caption-plate);
   font-size: 15px;
   line-height: 1.25;
 }
 
 .topic-item span {
-  color: var(--cw-blue);
+  color: var(--nova-system-default);
   font-size: 12px;
   font-weight: 650;
 }
 
 .topic-item p {
   margin: 0;
-  color: var(--cw-grey);
+  color: var(--nova-fg-secondary);
   font-size: 13px;
   line-height: 1.4;
 }
@@ -1530,8 +1526,8 @@ button:disabled {
 }
 
 .translation-day {
-  border-top: 1px solid var(--cw-grey-25);
-  color: var(--cw-grey);
+  border-top: 1px solid var(--nova-surface-hairline);
+  color: var(--nova-fg-secondary);
   display: block;
   font-size: 14px;
   line-height: 1.45;
@@ -1545,7 +1541,7 @@ button:disabled {
 
 .translation-day summary {
   align-items: center;
-  color: var(--cw-indigo);
+  color: var(--nova-caption-plate);
   cursor: pointer;
   display: flex;
   font-weight: 650;
@@ -1559,7 +1555,7 @@ button:disabled {
 }
 
 .translation-day-count {
-  color: var(--cw-blue);
+  color: var(--nova-system-default);
   flex: none;
   font-size: 12px;
   font-weight: 650;
@@ -1574,28 +1570,28 @@ button:disabled {
 }
 
 .translation-record-list li {
-  color: var(--cw-grey);
+  color: var(--nova-fg-secondary);
   font-size: 14px;
   line-height: 1.45;
 }
 
 .empty-state {
-  border: 1px solid var(--cw-grey-25);
+  border: 1px solid var(--nova-surface-hairline);
   border-radius: 8px;
-  color: var(--cw-grey-75);
+  color: var(--nova-fg-tertiary);
   font-size: 13px;
   line-height: 1.45;
   padding: 12px;
 }
 
 .settings-drawer {
-  border: 1px solid var(--cw-grey-25);
+  border: 1px solid var(--nova-surface-hairline);
   border-radius: 8px;
-  background: var(--cw-white);
+  background: var(--nova-fg-intense);
 }
 
 .settings-drawer summary {
-  color: var(--cw-indigo);
+  color: var(--nova-caption-plate);
   cursor: pointer;
   font-size: 14px;
   font-weight: 650;
@@ -1609,25 +1605,25 @@ button:disabled {
 
 .settings-drawer .settings-panel {
   border: 0;
-  border-top: 1px solid var(--cw-grey-25);
+  border-top: 1px solid var(--nova-surface-hairline);
   border-radius: 0;
 }
 
 .subtitle-error {
   margin-top: 14px;
-  border: 1px solid var(--cw-dark-red);
+  border: 1px solid var(--nova-status-live);
   border-radius: 8px;
-  background: var(--cw-dark-red-12);
-  color: var(--cw-dark-red);
+  background: var(--nova-status-live-subtle);
+  color: var(--nova-status-live);
   padding: 10px 12px;
   font-size: 13px;
   line-height: 1.4;
 }
 
 .subtitle-error.notice {
-  border-color: var(--cw-blue);
-  background: var(--cw-blue-12);
-  color: var(--cw-indigo);
+  border-color: var(--nova-system-default);
+  background: var(--nova-system-subtle);
+  color: var(--nova-caption-plate);
 }
 
 .subtitle-overlay-body {
@@ -1671,18 +1667,47 @@ button:disabled {
   justify-content: flex-end;
 }
 
+.subtitle-lane {
+  display: flex;
+  width: min(var(--subtitle-max-width), 88vw);
+  max-width: min(var(--subtitle-max-width), 88vw);
+  flex-direction: column;
+  align-items: stretch;
+  gap: 8px;
+  pointer-events: none;
+}
+
+.live-call-speaker-label {
+  align-self: flex-start;
+  max-width: 100%;
+  overflow: hidden;
+  border-radius: var(--nova-r-sm);
+  background: var(--nova-overlay-300);
+  color: var(--nova-text-muted);
+  padding: 6px 12px;
+  font-family: var(--subtitle-font-family);
+  font-size: clamp(15px, calc(var(--translation-font-size) * 0.42), 22px);
+  font-weight: 600;
+  line-height: 1.35;
+  letter-spacing: -0.02em;
+  word-break: keep-all;
+  text-align: left;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .subtitle-box {
   /* Stable width (border-box ⇒ padding included) so the caption never resizes as
      words stream in and the text never overflows the right edge. 88vw leaves room
      for the zone's 5vw side padding. */
   width: min(var(--subtitle-max-width), 88vw);
   max-width: min(var(--subtitle-max-width), 88vw);
-  color: var(--cw-white);
+  color: var(--nova-fg-intense);
   text-align: center;
   padding: 14px 24px 16px;
   border-radius: 8px;
-  background: var(--cw-indigo);
-  background: rgb(from var(--cw-indigo) r g b / var(--subtitle-opacity));
+  background: var(--nova-caption-plate);
+  background: rgb(from var(--nova-caption-plate) r g b / var(--subtitle-opacity));
   text-shadow: none;
   box-shadow: none;
   display: grid;
@@ -1690,8 +1715,62 @@ button:disabled {
   transition: background 160ms ease;
 }
 
+.subtitle-lane .subtitle-box {
+  width: 100%;
+  max-width: 100%;
+}
+
+/* Live Call reserves the complete broadcast stack from the first word. The
+   signed roll offset in subtitle-overlay.js bottom-anchors short text inside
+   this fixed viewport, then moves the same word nodes upward as lines fill. */
+.subtitle-lane.is-live-call .translation-line {
+  height: calc(var(--subtitle-line-clamp, 3) * 1.18em);
+  max-height: none;
+}
+
+/* Live roll-up is positional feedback, so keep it quicker than the shared
+   Caption-only glide. The transition property remains transform-only, and the
+   reduced-motion rule below still removes it entirely. */
+.subtitle-lane.is-live-call .subtitle-flow {
+  transition-duration: 200ms;
+}
+
+.subtitle-lane.is-live-call .live-call-speaker-label {
+  height: 44px;
+  display: flex;
+  align-items: center;
+}
+
+/* `[hidden]` normally removes the label from layout. During a Live Call the
+   row remains reserved so a floor handoff cannot move the caption plate; the
+   old label is either kept with its old caption or hidden without collapsing. */
+.subtitle-lane.is-live-call .live-call-speaker-label[hidden] {
+  display: block !important;
+  visibility: hidden;
+}
+
+/* Live hypotheses revise often. Recreating only a changed tail is necessary,
+   but replaying entry fades on that tail reads as a full-caption blink. */
+.subtitle-lane.is-live-call .subtitle-word {
+  animation: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .subtitle-lane.is-live-call .subtitle-flow,
+  .subtitle-lane.is-live-call .subtitle-word {
+    transition: none;
+  }
+}
+
 .subtitle-box.partial {
-  background: rgb(from var(--cw-indigo) r g b / 0.78);
+  background: rgb(from var(--nova-caption-plate) r g b / 0.78);
+}
+
+/* Live Call revisions switch partial/final state many times per sentence. Keep
+   the user's configured plate alpha invariant across that state churn; the
+   legacy Caption-only partial treatment above remains untouched. */
+.subtitle-lane.is-live-call .subtitle-box.partial {
+  background: rgb(from var(--nova-caption-plate) r g b / var(--subtitle-opacity));
 }
 
 /* Apple-liquid refinements: panels settle in with a soft motion, controls
@@ -1712,7 +1791,7 @@ input:focus,
 select:focus,
 textarea:focus {
   outline: none;
-  border-color: var(--cw-indigo);
+  border-color: var(--nova-caption-plate);
   box-shadow: 0 0 0 3px rgba(12, 10, 9, 0.08);
 }
 @media (prefers-reduced-motion: reduce) {
@@ -1983,12 +2062,6 @@ textarea:focus {
   color: rgba(255, 255, 255, 0.72);
 }
 
-/* When the voice-provider group is hidden (caption-only), the appearance
-   cluster owns the full band; when shown it shares the row. */
-.subtitle-controller-body .controller-row-appearance #controller-voice-provider:not([hidden]) {
-  flex: 0 0 auto;
-}
-
 /* Live Call + app controls share one tidy bottom row under a hairline,
    with Hide/Quit pushed to the right edge. */
 .controller-footer-row {
@@ -2138,6 +2211,50 @@ textarea:focus {
   text-align: right;
 }
 
+/* The Electron controller opens at 1152px before fit-size runs. Keep the Live
+   Call additions on the Caption Only row within a 1280px display's 48px safe
+   margin, while retaining every operator control and its accessible name. */
+@media (max-width: 1500px) {
+  .subtitle-controller-body .caption-controller-window {
+    gap: 6px;
+    padding: 6px 8px;
+  }
+
+  .subtitle-controller-body .controller-body {
+    gap: 4px;
+  }
+
+  .subtitle-controller-body .mp-brand {
+    flex-basis: 124px;
+    padding-right: 8px;
+  }
+
+  .subtitle-controller-body .controller-opacity input {
+    width: 58px;
+  }
+
+  .subtitle-controller-body .controller-display-select {
+    width: 132px;
+    padding-inline: 10px 24px;
+  }
+
+  .subtitle-controller-body .controller-tick {
+    padding-inline: 7px;
+  }
+
+  .subtitle-controller-body .controller-tick > span:last-child {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+    border: 0;
+  }
+}
+
 .audio-meter {
   background: #f5f5f7;
 }
@@ -2149,18 +2266,6 @@ textarea:focus {
 @media (max-width: 820px) {
   .subtitle-dashboard {
     width: min(100vw - 24px, 680px);
-  }
-
-  .pt-output-options,
-  .pt-playback-options,
-  .pt-voice-method-grid {
-    grid-template-columns: 1fr;
-  }
-
-  .pt-voice-method-heading,
-  .pt-voice-method-card > div {
-    align-items: flex-start;
-    flex-direction: column;
   }
 
   .caption-player-controller {
@@ -2225,7 +2330,7 @@ textarea:focus {
 }
 
 .command-panel > .live-handoff .live-handoff-kicker {
-  color: var(--cw-grey-75);
+  color: var(--nova-fg-tertiary);
 }
 
 .controller-drag strong {
@@ -2241,36 +2346,9 @@ textarea:focus {
 
 /* ── Electron host dashboard, on the NOVA tokens ──────────────────────────────
    The DMG loads public/subtitle.html directly. Everything from here to the
-   Records calendar styles that window: rail, hero, numbered section cards, form
-   controls, footer transport, records panels. Same design system as the
-   calendar below — surface ladder for depth (never shadow), TDS list geometry
-   and type scale, blue rationed to one primary action.
-
-   LEGACY ALIAS LAYER. The base stylesheet at the top of this file was authored
-   for a light editorial theme and still owns dozens of rules that the dark
-   layers never restated. Re-pointing the legacy --cw-* names at NOVA tokens
-   fixes all of them at once, including three that resolved to near-black ink on
-   a near-black shell and were literally invisible: the EN/KO placement chips,
-   the edge-offset readout, and the System/Microphone labels in Settings.
-
-   Scoped to .subtitle-dashboard-body deliberately: the subtitle overlay and the
-   caption controller are separate documents that still need --cw-indigo to be
-   the near-black caption plate and --cw-white to be the caption ink. */
+   Records calendar styles that window: rail, hero, flat setting rows, form
+   controls, footer transport, records panels. */
 .subtitle-dashboard-body {
-  --cw-indigo: var(--nova-text);
-  --cw-grey: var(--nova-text-muted);
-  --cw-grey-75: var(--nova-text-subtle);
-  --cw-grey-25: var(--nova-hairline-strong);
-  --cw-hairline: var(--nova-hairline);
-  --cw-grey-12: var(--nova-surface-raised);
-  --cw-white: var(--nova-surface-raised);
-  --cw-canvas-soft: var(--nova-surface-raised);
-  --cw-glass: var(--nova-surface);
-  --cw-blue: var(--nova-blue);
-  --cw-blue-12: color-mix(in srgb, var(--nova-blue) 22%, var(--nova-surface));
-  --cw-dark-red: var(--nova-red);
-  --cw-dark-red-12: color-mix(in srgb, var(--nova-red) 20%, var(--nova-surface));
-
   min-height: 100vh;
   background: var(--nova-bg);
   color: var(--nova-text-body);
@@ -2306,6 +2384,44 @@ textarea:focus {
   gap: var(--nova-gap-4);
 }
 
+.rail-nav-section {
+  display: grid;
+  gap: var(--nova-gap-4);
+  min-width: 0;
+}
+
+.rail-nav-section + .rail-nav-section {
+  margin-top: var(--nova-gap-12);
+  padding-top: var(--nova-gap-12);
+  border-top: 1px solid var(--nova-hairline);
+}
+
+.rail-nav-section-label {
+  padding: 0 12px;
+  color: var(--nova-text-disabled);
+  font-size: var(--nova-t8);
+  line-height: var(--nova-t8-lh);
+  font-weight: 600;
+}
+
+.rail-nav-icon {
+  width: 20px;
+  height: 20px;
+  flex: 0 0 20px;
+  color: currentColor;
+}
+
+.rail-nav-section a,
+.rail-nav-section button {
+  min-height: 44px;
+}
+
+.rail-nav-section a:focus-visible,
+.rail-nav-section button:focus-visible {
+  outline: 2px solid var(--nova-blue);
+  outline-offset: 2px;
+}
+
 /* TDS list-row geometry: 44 min-height, radius-12 underlay, t6 label at the
    list line-height (×1.35, not the ×1.5 of prose). */
 .subtitle-app-rail nav a,
@@ -2333,8 +2449,8 @@ textarea:focus {
   width: 20px;
   height: 20px;
   flex: 0 0 20px;
-  filter: invert(1);
-  opacity: 0.52;
+  filter: none;
+  opacity: 0.72;
   transition: opacity var(--nova-dur-color) var(--nova-ease-out);
 }
 
@@ -2534,7 +2650,6 @@ textarea:focus {
 .command-panel .language-pills,
 .command-panel .seg-toggle,
 .command-panel .audio-meter-row,
-.command-panel .pt-output-options,
 .command-panel input,
 .command-panel select,
 .command-panel textarea {
@@ -2641,6 +2756,122 @@ textarea:focus {
   grid-column: auto;
 }
 
+.glossary-selection,
+.glossary-preset-field,
+.glossary-preset-editor {
+  display: grid;
+  gap: var(--nova-gap-8);
+}
+
+.glossary-selection {
+  min-width: 0;
+  margin: 0;
+  padding: var(--nova-gap-16);
+  border: 1px solid var(--nova-hairline);
+  border-radius: var(--nova-r-md);
+  background: var(--nova-surface-raised);
+  word-break: keep-all;
+}
+
+.glossary-selection legend,
+.glossary-selection h3 {
+  color: var(--nova-text);
+  font-size: var(--nova-t6);
+  font-weight: 600;
+  letter-spacing: -0.02em;
+}
+
+.glossary-selection h3 { margin: var(--nova-gap-8) 0 0; }
+.glossary-selection-heading { display: flex; align-items: center; justify-content: space-between; gap: var(--nova-gap-8); color: var(--nova-text-muted); font-size: var(--nova-t7); }
+.glossary-selection-heading output { flex: 0 0 auto; color: var(--nova-text); font-weight: 600; font-variant-numeric: tabular-nums; }
+.glossary-selection-options { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--nova-gap-8); }
+.glossary-selection-option { display: flex; min-width: 0; min-height: 44px; align-items: center; gap: var(--nova-gap-8); padding: var(--nova-gap-8) var(--nova-gap-12); border: 1px solid var(--nova-hairline); border-radius: var(--nova-r-sm); background: var(--nova-surface); cursor: pointer; }
+.glossary-selection-option input { width: 20px; height: 20px; flex: 0 0 auto; accent-color: var(--nova-system-default); }
+.glossary-selection-option input:focus-visible { outline: 2px solid var(--nova-system-default); outline-offset: 2px; }
+.glossary-selection-option span { display: grid; min-width: 0; gap: 2px; }
+.glossary-selection-option strong,
+.glossary-selection-option small { overflow-wrap: anywhere; }
+.glossary-selection-option small,
+.glossary-selection-status { color: var(--nova-text-muted); font-size: var(--nova-t7); line-height: var(--nova-t7-lh); }
+.glossary-selection-option.is-incompatible { color: var(--nova-text-disabled); cursor: not-allowed; }
+.glossary-selection-status { min-height: 20px; margin: var(--nova-gap-4) 0 0; }
+.glossary-selection-status.is-error { color: var(--nova-red); }
+
+.field-help,
+.glossary-preset-status {
+  margin: 0;
+  color: var(--nova-text-muted);
+  font-size: var(--nova-t7);
+  font-weight: 500;
+  line-height: var(--nova-t7-lh);
+  word-break: keep-all;
+}
+
+.glossary-preset-actions,
+.glossary-preset-editor-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--nova-gap-8);
+}
+
+/* These controls change or delete a reusable preset. Keep the compact visual
+   density while preserving the 44px touch target used throughout Settings. */
+.workspace-page .glossary-preset-actions button,
+.workspace-page .glossary-preset-editor-actions button {
+  flex: 0 1 auto;
+  min-height: 44px;
+}
+
+.glossary-preset-editor {
+  padding: var(--nova-gap-16);
+  border: 1px solid var(--nova-hairline);
+  border-radius: var(--nova-r-md);
+  background: var(--nova-surface-raised);
+  animation: glossary-preset-reveal var(--nova-dur-rapid) var(--nova-ease-out);
+}
+
+.glossary-preset-editor[hidden] {
+  display: none;
+}
+
+.glossary-preset-editor h3 {
+  margin: 0;
+  color: var(--nova-text);
+  font-size: var(--nova-t6);
+  font-weight: 700;
+  line-height: var(--nova-t6-lh);
+  letter-spacing: -0.02em;
+  word-break: keep-all;
+}
+
+.glossary-preset-status:empty {
+  display: none;
+}
+
+.glossary-preset-status.is-error {
+  color: var(--nova-red);
+}
+
+@keyframes glossary-preset-reveal {
+  from { opacity: 0; transform: translateY(-4px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .glossary-preset-editor {
+    animation: none;
+  }
+}
+
+@media (max-width: 520px) {
+  .glossary-selection-options { grid-template-columns: 1fr; }
+  .glossary-selection-heading { align-items: flex-start; flex-direction: column; }
+  .workspace-page .glossary-preset-actions button,
+  .workspace-page .glossary-preset-editor-actions button {
+    flex: 1 1 calc(50% - var(--nova-gap-8));
+  }
+}
+
 .cfg-heading {
   display: grid;
   gap: var(--nova-gap-4);
@@ -2691,11 +2922,11 @@ label,
 .language-targets-label,
 .language-targets-hint,
 .placement-hint,
+.cfg-hint,
 .placement-title,
 .field-status,
 output,
 .pt-output-help,
-.pt-output-routing-help,
 .workspace-page label {
   color: var(--nova-text-muted);
   font-size: var(--nova-t7);
@@ -2967,20 +3198,18 @@ button:disabled {
   opacity: 0.3;
 }
 
-/* TDS `light` fill variant: near-white plate, dark label. Used for the Live
-   Call CTA so the page keeps its emphasis without spending the blue. */
 button.accent {
   min-height: 48px;
   border: 0;
   border-radius: var(--nova-r-md);
-  background: var(--nova-text);
-  color: var(--nova-bg);
+  background: var(--nova-brand-default);
+  color: var(--nova-fg-intense);
   font-size: var(--nova-t5);
   font-weight: 600;
 }
 
 button.accent:hover:not(:disabled) {
-  background: var(--nova-text-strong);
+  background: var(--nova-brand-hover);
 }
 
 button[aria-busy="true"] {
@@ -3120,119 +3349,6 @@ button[aria-busy="true"] {
   outline-offset: 2px;
 }
 
-/* Search-and-tag picker (the live Captions control). */
-.language-tag-picker {
-  display: flex;
-  flex-direction: column;
-  gap: var(--nova-gap-8);
-}
-
-.language-chips {
-  display: flex;
-  flex-wrap: wrap;
-  gap: var(--nova-gap-8);
-  min-height: 0;
-}
-
-.language-chip {
-  display: inline-flex;
-  align-items: center;
-  gap: var(--nova-gap-4);
-  border: 0;
-  border-radius: var(--nova-r-pill);
-  background: var(--nova-surface-float);
-  color: var(--nova-text);
-  padding: 5px 6px 5px 14px;
-  font-size: var(--nova-t7);
-  font-weight: 600;
-  line-height: var(--nova-lh-list);
-}
-
-/* min-height: 0 or the global button rule inflates the whole chip to 42px. */
-.language-chip-remove {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  flex: none;
-  width: 20px;
-  height: 20px;
-  min-height: 0;
-  border: 0;
-  border-radius: var(--nova-r-pill);
-  background: transparent;
-  color: var(--nova-text-muted);
-  font-size: var(--nova-t6);
-  line-height: 1;
-  padding: 0;
-}
-
-.language-chip-remove:hover {
-  background: var(--nova-overlay-200);
-  color: var(--nova-text);
-}
-
-.language-chip.at-minimum .language-chip-remove {
-  opacity: 0.3;
-}
-
-.language-search {
-  position: relative;
-}
-
-.language-search input[type="search"] {
-  width: 100%;
-}
-
-/* TDS Dropdown panel: radius 16, no shadow — it reads as floating because it is
-   one step lighter than the card beneath it. */
-.language-suggestions {
-  position: absolute;
-  top: calc(100% + 4px);
-  left: 0;
-  right: 0;
-  margin: 0;
-  padding: var(--nova-gap-4);
-  list-style: none;
-  border: 1px solid var(--nova-hairline);
-  border-radius: var(--nova-r-lg);
-  background: var(--nova-surface-float);
-  box-shadow: none;
-  max-height: 240px;
-  overflow-y: auto;
-  z-index: 30;
-}
-
-.language-suggestion {
-  display: block;
-  width: 100%;
-  min-height: 0;
-  border: 0;
-  border-radius: var(--nova-r-row);
-  background: transparent;
-  color: var(--nova-text-body);
-  /* Left-read, not centred: the global button rule justifies content to the
-     centre and text-align alone will not undo that on a flex button. */
-  justify-content: flex-start;
-  text-align: left;
-  padding: 10px 12px;
-  font-size: var(--nova-t6);
-  font-weight: 500;
-  line-height: var(--nova-lh-list);
-  cursor: pointer;
-}
-
-.language-suggestion:hover,
-.language-suggestion:focus {
-  background: var(--nova-overlay-100);
-  color: var(--nova-text);
-}
-
-.language-suggestion-empty {
-  padding: 10px 12px;
-  color: var(--nova-text-subtle);
-  font-size: var(--nova-t7);
-}
-
 /* ── Segmented controls ───────────────────────────────────────────────────── */
 /* TDS segmented control, medium: group padding 4/5 and radius 15, item radius
    12. 15 has no token because it is the only place TDS uses it. */
@@ -3280,64 +3396,6 @@ button[aria-busy="true"] {
   outline-offset: 2px;
 }
 
-.pt-output-options {
-  grid-template-columns: none;
-}
-
-/* ── Output mode block ────────────────────────────────────────────────────── */
-.pt-output-group {
-  display: grid;
-  gap: var(--nova-gap-12);
-  border: 1px solid var(--nova-hairline);
-  border-radius: var(--nova-r-md);
-  background: var(--nova-surface-raised);
-  padding: var(--nova-gap-16);
-}
-
-.pt-output-kicker,
-.pt-output-heading > span {
-  color: var(--nova-text-subtle);
-  font-size: var(--nova-t8);
-  font-weight: 600;
-  letter-spacing: 0.08em;
-  line-height: var(--nova-t8-lh);
-}
-
-.workspace-page .pt-output-heading h2 {
-  color: var(--nova-text);
-  font-size: var(--nova-t4);
-  font-weight: 700;
-  letter-spacing: -0.01em;
-  line-height: var(--nova-t4-lh);
-}
-
-.pt-playback-options {
-  display: grid;
-  grid-template-columns: minmax(180px, 0.7fr) minmax(240px, 1.3fr);
-  gap: var(--nova-gap-12);
-  padding-top: var(--nova-gap-12);
-  border-top: 1px solid var(--nova-hairline);
-}
-
-.pt-voice-method-heading h3 {
-  margin: 0;
-  color: var(--nova-text);
-  font-size: var(--nova-t6);
-  font-weight: 600;
-  line-height: var(--nova-t6-lh);
-}
-
-.pt-voice-method-heading span {
-  color: var(--nova-text-subtle);
-  font-size: var(--nova-t7);
-  font-weight: 400;
-  line-height: var(--nova-t7-lh);
-}
-
-.pt-volume-field > span {
-  color: var(--nova-text-muted);
-}
-
 /* ── Per-language subtitle placement ──────────────────────────────────────── */
 .subtitle-placement,
 .workspace-page .subtitle-placement {
@@ -3362,7 +3420,7 @@ button[aria-busy="true"] {
 }
 
 /* This chip rendered in the ink colour of the light theme — invisible on the
-   dark shell until the alias layer above repointed --cw-indigo. Stated here so
+   dark shell until the alias layer above repointed --nova-caption-plate. Stated here so
    it does not depend on that alias. */
 .lang-chip {
   display: inline-flex;
@@ -3573,11 +3631,44 @@ button[aria-busy="true"] {
 }
 
 #live-draft-cover-preview {
-  width: 72px;
-  height: 72px;
+  width: min(240px, 42vw);
+  aspect-ratio: 16 / 9;
   border: 1px solid var(--nova-hairline);
   border-radius: var(--nova-r-row);
   object-fit: cover;
+  object-position: center;
+}
+
+.live-draft-group {
+  display: grid;
+  gap: var(--nova-gap-16);
+}
+
+.live-draft-schedule {
+  padding-top: var(--nova-gap-16);
+  border-top: 1px solid var(--nova-hairline);
+}
+
+.live-draft-participation {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(180px, 0.36fr);
+  gap: var(--nova-gap-16);
+  align-items: end;
+}
+
+.live-draft-field-label {
+  display: block;
+  margin-bottom: var(--nova-gap-8);
+  color: var(--nova-text-muted);
+  font-size: var(--nova-t7);
+  font-weight: 600;
+  line-height: var(--nova-t7-lh);
+}
+
+@media (max-width: 760px) {
+  .live-draft-participation {
+    grid-template-columns: minmax(0, 1fr);
+  }
 }
 
 .live-draft-access-note {
@@ -3703,10 +3794,49 @@ button[aria-busy="true"] {
 }
 
 /* ── Settings drawer ─────────────────────────────────────────────────────── */
+.settings-view-tabs,
+.session-detail-view-tabs,
+.session-detail-tabs {
+  display: inline-flex;
+  justify-self: start;
+  gap: 2px;
+  border-radius: var(--nova-r-pill);
+  background: var(--nova-overlay-100);
+  padding: 2px;
+}
+
+.settings-view-tabs {
+  margin: var(--nova-inset-narrow) var(--nova-inset) 0;
+}
+
+.settings-view-tabs button,
+.session-detail-view-tabs button,
+.session-detail-tabs button {
+  flex: none;
+  min-height: 44px;
+  border: 0;
+  border-radius: var(--nova-r-pill);
+  background: transparent;
+  color: var(--nova-text-muted);
+  padding: 0 var(--nova-gap-16);
+  font-size: var(--nova-t7);
+}
+
+.settings-view-tabs button.is-selected,
+.session-detail-view-tabs button.is-selected,
+.session-detail-tabs button.is-selected {
+  background: var(--nova-surface-float);
+  color: var(--nova-text);
+}
+
+.settings-view-panel {
+  display: grid;
+}
+
 .settings-drawer {
-  overflow: hidden;
-  border-radius: var(--nova-r-lg);
-  background: var(--nova-surface-raised);
+  overflow: visible;
+  border-radius: 0;
+  background: transparent;
 }
 
 .settings-drawer summary {
@@ -3723,7 +3853,7 @@ button[aria-busy="true"] {
   display: grid;
   gap: var(--nova-gap-16);
   border: 0;
-  border-top: 1px solid var(--nova-hairline);
+  border-top: 0;
   border-radius: 0;
   background: transparent;
   padding: var(--nova-inset-narrow) var(--nova-inset) var(--nova-inset);
@@ -3751,20 +3881,6 @@ button[aria-busy="true"] {
   font-size: var(--nova-t7);
   line-height: var(--nova-t7-lh);
   padding: var(--nova-gap-12) var(--nova-gap-16);
-}
-
-/* Pipeline badge: only visible while reconnecting or degraded. */
-.subtitle-status-indicator {
-  background: var(--nova-surface-float);
-  border-radius: var(--nova-r-pill);
-  color: var(--nova-yellow);
-  font-size: var(--nova-t7);
-  font-weight: 600;
-  padding: 6px 14px;
-}
-
-.subtitle-status-indicator::before {
-  background: var(--nova-yellow);
 }
 
 /* ── Records page panels (the calendar itself owns its own styling below) ─── */
@@ -4109,21 +4225,126 @@ button[aria-busy="true"] {
   to { opacity: 1; transform: none; }
 }
 
-/* The inline caption preview is redundant — captions render on the overlay and
-   on every participant screen. Kept in the DOM for the caption engine. */
+/* Captions is a task surface: configuration and a representative preview stay
+   together; records are reviewed only from the Records page. */
 .workspace-page .preview-panel {
   display: none !important;
 }
 
-/* ── Light theme: monochrome invert of the workspace shell. Media (cover
-   previews, QR imagery) is counter-inverted so photos stay true. ── */
-body.theme-light .subtitle-app-shell {
-  filter: invert(1) hue-rotate(180deg);
+[data-workspace-page="captions"] .caption-task-preview {
+  display: grid !important;
+  margin: var(--nova-gap-16) var(--nova-inset) var(--nova-inset);
+  border: 1px solid var(--nova-hairline);
+  border-radius: var(--nova-r-lg);
+  background: var(--nova-bg-recessed);
+  padding: var(--nova-inset);
 }
 
-body.theme-light .subtitle-app-shell img,
-body.theme-light .subtitle-app-shell video {
-  filter: invert(1) hue-rotate(180deg);
+/* Desktop pages preserve a 44px interaction box. The frameless controller is a
+   separate document and intentionally keeps its compact geometry. */
+.workspace-page button {
+  min-height: 44px;
+}
+
+/* ── Light theme: token swap only. No filter inversion. ── */
+:root[data-theme="light"],
+body.theme-light {
+  --nova-surface-recessed: var(--nova-white-0);
+  --nova-surface-base: #f5f5f7;
+  --nova-surface-layered: var(--nova-white-0);
+  --nova-surface-raised: var(--nova-white-0);
+  --nova-surface-float: var(--nova-white-0);
+  --nova-surface-hairline: #d2d2d7;
+  --nova-fg-intense: #000000;
+  --nova-fg-primary: #1d1d1f;
+  --nova-fg-secondary: #6b7684;
+  --nova-fg-tertiary: #8b95a1;
+  --nova-fg-disabled: #d2d2d7;
+  --nova-bg-recessed: var(--nova-surface-recessed);
+  --nova-bg: var(--nova-surface-base);
+  --nova-surface: var(--nova-surface-layered);
+  --nova-hairline: var(--nova-surface-hairline);
+  --nova-hairline-strong: var(--nova-surface-hairline);
+  --nova-text: var(--nova-fg-primary);
+  --nova-text-strong: var(--nova-fg-primary);
+  --nova-text-body: var(--nova-fg-primary);
+  --nova-text-muted: var(--nova-fg-secondary);
+  --nova-text-subtle: var(--nova-fg-tertiary);
+  --nova-text-disabled: var(--nova-fg-disabled);
+}
+
+/* ── Option 1 runtime contract: preview-centred shell, flat settings rows. ── */
+.subtitle-dashboard {
+  width: min(880px, calc(100vw - 220px - 48px));
+  padding: 24px 0 112px;
+}
+
+.subtitle-hero {
+  min-height: 56px;
+  margin-bottom: var(--nova-gap-16);
+}
+
+.workspace-page .cfg-section,
+.command-panel > .live-handoff,
+.live-handoff {
+  display: grid;
+  grid-template-columns: minmax(160px, 220px) minmax(0, 1fr);
+  align-items: center;
+  gap: var(--nova-inset);
+  min-height: 64px;
+  margin: 0;
+  border: 0;
+  border-bottom: 1px solid var(--nova-hairline);
+  border-radius: 0;
+  background: transparent;
+  padding: 14px 0;
+}
+
+.workspace-page .cfg-section:last-of-type,
+.command-panel > .live-handoff:last-of-type,
+.live-handoff:last-of-type {
+  border-bottom: 0;
+}
+
+.cfg-heading h2,
+.live-handoff h2 {
+  color: var(--nova-text);
+  font-size: var(--nova-t6);
+  font-weight: 600;
+  line-height: var(--nova-t6-lh);
+}
+
+.cfg-heading h2 i {
+  display: none;
+}
+
+.workspace-page .service-strip {
+  margin-bottom: var(--nova-gap-12);
+}
+
+[data-workspace-page="captions"] .caption-task-preview {
+  order: -1;
+  margin: 0 0 var(--nova-gap-16);
+}
+
+.subtitle-preview {
+  min-height: 320px;
+  align-items: center;
+  justify-content: center;
+  padding: 40px;
+}
+
+.subtitle-preview .translation-line {
+  text-align: center;
+}
+
+.workspace-footer,
+.workspace-footer.player-bar {
+  position: fixed;
+  right: max(24px, calc((100vw - 220px - 880px) / 2));
+  bottom: 0;
+  left: max(244px, calc(220px + ((100vw - 220px - 880px) / 2)));
+  margin: 0;
 }
 
 /* ── Responsive: this is a resizable desktop window ─────────────────────── */
@@ -4136,9 +4357,6 @@ body.theme-light .subtitle-app-shell video {
     width: min(100% - 32px, 980px);
   }
 
-  .pt-playback-options {
-    grid-template-columns: minmax(0, 1fr);
-  }
 }
 
 @media (max-width: 900px) {
@@ -4184,7 +4402,7 @@ body.theme-light .subtitle-app-shell video {
 
   .subtitle-app-rail nav a,
   .subtitle-app-rail nav button {
-    min-height: 36px;
+    min-height: 44px;
     padding: 0 10px;
     white-space: nowrap;
   }
@@ -4238,6 +4456,60 @@ body.theme-light .subtitle-app-shell video {
 
 .records-cal-panel { display: grid; gap: var(--nova-gap-12); }
 
+.records-filter-bar {
+  display: grid;
+  grid-template-columns: minmax(240px, 1fr) auto;
+  align-items: end;
+  gap: var(--nova-gap-12);
+  padding: var(--nova-gap-12) var(--nova-gap-16);
+  border: 1px solid var(--nova-hairline);
+  border-radius: var(--nova-r-lg);
+  background: var(--nova-surface);
+}
+
+.records-filter-field {
+  display: grid;
+  min-width: 0;
+  gap: var(--nova-gap-4);
+  color: var(--nova-text-muted);
+  font-size: var(--nova-t8);
+  font-weight: 600;
+  line-height: var(--nova-t8-lh);
+}
+
+.records-filter-search { min-width: 0; }
+
+.records-filter-selects {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(132px, 1fr));
+  gap: var(--nova-gap-8);
+}
+
+.records-filter-field input,
+.records-filter-field select {
+  width: 100%;
+  min-height: 44px;
+  border: 1px solid var(--nova-hairline-strong);
+  border-radius: var(--nova-r-sm);
+  background: var(--nova-surface-raised);
+  color: var(--nova-text);
+  font-family: var(--ui-font-family);
+  font-size: var(--nova-t7);
+  font-weight: 500;
+  line-height: var(--nova-t7-lh);
+}
+
+.records-filter-field input { padding: 0 var(--nova-gap-12); }
+.records-filter-field select { padding: 0 36px 0 var(--nova-gap-12); }
+.records-filter-field input::placeholder { color: var(--nova-text-disabled); }
+
+.records-filter-field input:focus-visible,
+.records-filter-field select:focus-visible {
+  outline: 2px solid var(--nova-blue);
+  outline-offset: 2px;
+  border-color: var(--nova-blue);
+}
+
 .records-cal-toolbar {
   display: flex;
   align-items: center;
@@ -4256,11 +4528,11 @@ body.theme-light .subtitle-app-shell video {
   color: var(--nova-text-body);
   cursor: pointer;
   display: inline-flex;
-  height: 30px;
+  height: 44px;
   justify-content: center;
   padding: 0;
   transition: background var(--nova-dur-color) var(--nova-ease-out);
-  width: 30px;
+  width: 44px;
 }
 .records-cal-step:hover { background: var(--nova-overlay-200); color: var(--nova-text); }
 
@@ -4273,7 +4545,7 @@ body.theme-light .subtitle-app-shell video {
   cursor: pointer;
   font-size: var(--nova-t7);
   font-weight: 600;
-  height: 30px;
+  height: 44px;
   padding: 0 12px;
   transition: background var(--nova-dur-color) var(--nova-ease-out);
 }
@@ -4304,7 +4576,7 @@ body.theme-light .subtitle-app-shell video {
   cursor: pointer;
   font-size: var(--nova-t7);
   font-weight: 600;
-  height: 26px;
+  min-height: 40px;
   padding: 0 12px;
   transition: background var(--nova-dur-color) var(--nova-ease-out), color var(--nova-dur-color) var(--nova-ease-out);
 }
@@ -4555,36 +4827,32 @@ body.theme-light .subtitle-app-shell video {
   text-transform: none;
 }
 
-.session-detail-columns {
+.session-detail-panels,
+.session-detail-panel {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
-  gap: var(--nova-gap-16);
-  margin-top: 0;
-}
-
-.session-detail-column {
-  display: grid;
-  gap: var(--nova-gap-8);
+  gap: var(--nova-gap-12);
   align-content: start;
   min-width: 0;
 }
 
-.session-detail-column h3 {
-  margin: 0;
-  color: var(--nova-text);
-  font-size: var(--nova-t6);
-  font-weight: 600;
-  line-height: var(--nova-t6-lh);
+/* Compatibility name retained for integrations that locate the detail body;
+   the approved record detail is intentionally a single tab panel, not columns. */
+.session-detail-columns {
+  grid-template-columns: minmax(0, 1fr);
 }
 
-.session-detail-column .session-record-detail {
+.settings-view-panel .settings-drawer > summary {
+  display: none;
+}
+
+.session-detail-panel .session-record-detail {
   max-height: min(58vh, 560px);
   border-top: 0;
   padding-top: 0;
 }
 
-@media (max-width: 900px) {
-  .session-detail-columns { grid-template-columns: minmax(0, 1fr); }
+.session-detail-panel > button {
+  justify-self: start;
 }
 
 .session-record-detail {
@@ -4607,6 +4875,67 @@ body.theme-light .subtitle-app-shell video {
 
 .session-record-detail p,
 .session-record-detail ul { margin: 0; }
+
+.session-detail-coach {
+  display: grid;
+  gap: var(--nova-gap-12);
+  min-width: 0;
+}
+
+.session-coach-group {
+  display: grid;
+  gap: var(--nova-gap-8);
+  padding: var(--nova-gap-16);
+  border: 1px solid var(--nova-hairline);
+  border-left: 3px solid var(--nova-text-subtle);
+  border-radius: var(--nova-r-lg);
+  background: var(--nova-surface-raised);
+}
+
+.session-coach-group.is-used { border-left-color: var(--nova-status-ok); }
+.session-coach-group.is-unused { border-left-color: var(--nova-yellow); }
+
+.session-coach-group h3 {
+  margin: 0;
+  color: var(--nova-text);
+  font-size: var(--nova-t6);
+  font-weight: 600;
+  line-height: var(--nova-t6-lh);
+}
+
+.session-coach-list {
+  display: grid;
+  gap: var(--nova-gap-4);
+  margin: 0;
+  padding-left: var(--nova-inset-narrow);
+  color: var(--nova-text-body);
+}
+
+.session-coach-entry {
+  padding: var(--nova-gap-8) 0;
+  border-bottom: 1px solid var(--nova-hairline);
+  font-size: var(--nova-t7);
+  line-height: var(--nova-lh-body);
+}
+
+.session-coach-entry:last-child { border-bottom: 0; }
+
+.session-coach-empty {
+  display: grid;
+  min-height: 96px;
+  margin: 0;
+  place-items: center;
+  border: 1px solid var(--nova-hairline);
+  border-radius: var(--nova-r-lg);
+  color: var(--nova-text-muted);
+  font-size: var(--nova-t7);
+  line-height: var(--nova-t7-lh);
+}
+
+@media (max-width: 760px) {
+  .records-filter-bar { grid-template-columns: minmax(0, 1fr); }
+  .records-filter-selects { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
 
 .session-transcript-lines {
   display: grid;
@@ -4635,10 +4964,74 @@ body.theme-light .subtitle-app-shell video {
   font-weight: 600;
 }
 
-/* Another grid-stretch case: a lone button in a one-column grid fills the
-   column unless it is told to hug its label. */
-.session-detail-column > button {
-  justify-self: start;
+.session-detail-participants {
+  display: grid;
+}
+
+.session-detail-participant {
+  display: grid;
+  grid-template-columns: 44px minmax(0, 1fr);
+  align-items: center;
+  gap: var(--nova-gap-12);
+  min-height: 64px;
+  padding: var(--nova-gap-8) var(--nova-inset);
+  position: relative;
+}
+
+.session-detail-participant::after {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  left: var(--nova-inset);
+  height: 1px;
+  background: var(--nova-hairline);
+  content: "";
+}
+
+.session-detail-participant:last-child::after {
+  display: none;
+}
+
+.session-detail-participant-avatar {
+  display: grid;
+  width: 36px;
+  height: 36px;
+  place-items: center;
+  border-radius: var(--nova-r-pill);
+  background: var(--participant-color, var(--nova-blue));
+  color: var(--nova-text);
+  font-size: var(--nova-t7);
+  font-weight: 600;
+}
+
+.session-detail-participant-avatar.color-1 { --participant-color: var(--nova-blue); }
+.session-detail-participant-avatar.color-2 { --participant-color: var(--nova-green); }
+.session-detail-participant-avatar.color-3 { --participant-color: var(--nova-purple); }
+.session-detail-participant-avatar.color-4 { --participant-color: var(--nova-yellow); color: var(--nova-bg); }
+.session-detail-participant-avatar.color-5 { --participant-color: var(--nova-red); }
+
+.session-detail-participant-copy {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.session-detail-participant-copy strong {
+  overflow: hidden;
+  color: var(--nova-text);
+  font-size: var(--nova-t6);
+  font-weight: 600;
+  line-height: var(--nova-lh-list);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.session-detail-participant-copy span,
+.session-detail-participants > p {
+  margin: 0;
+  color: var(--nova-text-muted);
+  font-size: var(--nova-t7);
+  line-height: var(--nova-t7-lh);
 }
 
 .session-record-audio { display: grid; gap: var(--nova-gap-4); }
@@ -4711,3 +5104,462 @@ body.theme-light .subtitle-app-shell video {
   line-height: var(--nova-t5-lh);
   text-transform: none;
 }
+
+/* Momentary caption hide. Both icons ship in the markup and the class picks one,
+   because innerHTML is forbidden in this codebase. Muted is deliberately loud:
+   a hide the user forgot about is indistinguishable from broken captions. */
+.subtitle-controller-body .mp-icon .mp-icon-when-muted,
+.subtitle-controller-body .mp-icon.is-muted .mp-icon-when-visible { display: none; }
+.subtitle-controller-body .mp-icon.is-muted .mp-icon-when-muted { display: block; }
+/* No colour rule here on purpose. A background override on this button would
+   not take in this region of the cascade -- not id-qualified, not class-only, not
+   even an inline !important, while the display rules directly above DO apply on
+   the same element. I could not pin the cause cheaply, so rather than leave dead
+   CSS the state is carried by the icon swap alone, which is verified working. */
+
+/* ── Language multi-select dropdowns (자막 / Live Call) ────────────────── */
+
+.lang-select {
+  position: relative;
+  min-width: 0;
+}
+
+.lang-select-trigger {
+  align-items: center;
+  background: var(--nova-surface-base, transparent);
+  border: 1px solid var(--nova-surface-hairline);
+  border-radius: 10px;
+  color: var(--nova-fg-primary);
+  cursor: pointer;
+  display: flex;
+  gap: 8px;
+  justify-content: space-between;
+  min-height: 40px;
+  padding: 8px 12px;
+  width: 100%;
+}
+
+.lang-select-trigger::after {
+  content: "▾";
+  color: var(--nova-fg-secondary);
+  flex: none;
+}
+
+.lang-select-trigger[aria-expanded="true"]::after {
+  content: "▴";
+}
+
+.lang-select-trigger:hover,
+.lang-select-trigger:focus-visible {
+  border-color: var(--nova-system-default);
+}
+
+.lang-select-summary {
+  min-width: 0;
+  overflow: hidden;
+  text-align: left;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.lang-select-panel {
+  background: var(--nova-surface-base, Canvas);
+  border: 1px solid var(--nova-surface-hairline);
+  border-radius: 12px;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.25);
+  left: 0;
+  max-height: min(300px, 60vh);
+  overflow-y: auto;
+  padding: 10px;
+  position: absolute;
+  scrollbar-color: var(--nova-surface-hairline) transparent;
+  scrollbar-width: thin;
+  top: calc(100% + 6px);
+  /* Never narrower than the trigger, never wider than the viewport: a narrow
+     trigger (Live Call column) still gets a readable panel, and the open
+     handler clamps the horizontal position so it cannot leave the screen. */
+  min-width: 100%;
+  width: min(400px, calc(100vw - 24px));
+  z-index: 30;
+}
+
+.lang-select-panel .language-pills {
+  grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+  width: 100%;
+}
+
+.lang-select-panel .lang-pill {
+  overflow: hidden;
+}
+
+.lang-select-panel .lang-pill span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.lang-select-clear {
+  background: none;
+  border: none;
+  color: var(--nova-fg-secondary);
+  cursor: pointer;
+  margin-top: 8px;
+  min-height: 36px;
+  padding: 6px 8px;
+  text-decoration: underline;
+  width: 100%;
+}
+
+.lang-select-clear:hover {
+  color: var(--nova-fg-primary);
+}
+
+/* ── Compact glossary selection + detail popup ─────────────────────────── */
+
+.glossary-selection-count {
+  color: var(--nova-fg-secondary);
+  flex: none;
+  font-variant-numeric: tabular-nums;
+}
+
+.glossary-select-panel section + section {
+  margin-top: 10px;
+}
+
+.glossary-select-panel h3 {
+  color: var(--nova-fg-secondary);
+  font-size: 12px;
+  margin: 0 0 6px;
+}
+
+.glossary-option-row {
+  align-items: center;
+  display: flex;
+  gap: 8px;
+}
+
+.glossary-option-row .glossary-selection-option {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.glossary-detail-button {
+  background: none;
+  border: none;
+  color: var(--nova-fg-secondary);
+  cursor: pointer;
+  flex: none;
+  min-height: 36px;
+  padding: 4px 6px;
+  text-decoration: underline;
+}
+
+.glossary-detail-button:hover,
+.glossary-detail-button:focus-visible {
+  color: var(--nova-fg-primary);
+}
+
+.glossary-detail-overlay {
+  align-items: center;
+  background: rgba(10, 10, 14, 0.6);
+  display: flex;
+  inset: 0;
+  justify-content: center;
+  padding: 16px;
+  position: fixed;
+  z-index: 50;
+}
+
+.glossary-detail-dialog {
+  background: var(--nova-surface, var(--nova-surface-base));
+  border: 1px solid var(--nova-surface-hairline);
+  border-radius: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  height: min(640px, calc(100vh - 48px));
+  max-width: 640px;
+  overflow: hidden;
+  padding: 20px;
+  scrollbar-color: var(--nova-surface-hairline) transparent;
+  scrollbar-width: thin;
+  width: 100%;
+}
+
+.glossary-detail-heading {
+  align-items: center;
+  display: flex;
+  gap: 12px;
+  justify-content: space-between;
+}
+
+.glossary-detail-heading h2 {
+  margin: 0;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.glossary-detail-meta {
+  color: var(--nova-fg-secondary);
+  margin: 0;
+}
+
+.glossary-detail-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.glossary-detail-toolbar input[type="search"] {
+  flex: 1 1 220px;
+  min-width: 0;
+}
+
+.glossary-detail-languages {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.glossary-detail-language-chip {
+  background: none;
+  border: 1px solid var(--nova-surface-hairline);
+  border-radius: 999px;
+  color: var(--nova-fg-secondary);
+  cursor: pointer;
+  min-height: 32px;
+  padding: 4px 12px;
+}
+
+.glossary-detail-language-chip[aria-pressed="true"] {
+  border-color: var(--nova-system-default);
+  color: var(--nova-fg-primary);
+}
+
+.glossary-detail-terms {
+  display: flex;
+  /* The list is the only flexible child: it scrolls internally so the search
+     toolbar and the custom-term form never collide with term rows. */
+  flex: 1 1 auto;
+  flex-direction: column;
+  gap: 2px;
+  list-style: none;
+  margin: 0;
+  min-height: 120px;
+  overflow-y: auto;
+  padding: 0;
+  scrollbar-color: var(--nova-surface-hairline) transparent;
+  scrollbar-width: thin;
+}
+
+.glossary-detail-heading,
+.glossary-detail-meta,
+.glossary-detail-toolbar,
+.glossary-detail-more,
+.glossary-detail-custom {
+  flex: none;
+}
+
+.glossary-detail-terms li {
+  border-bottom: 1px solid var(--nova-surface-hairline);
+  display: grid;
+  gap: 2px 12px;
+  grid-template-columns: minmax(120px, 1fr) minmax(0, 2fr);
+  overflow-wrap: anywhere;
+  padding: 8px 2px;
+}
+
+.glossary-detail-terms li small {
+  color: var(--nova-fg-secondary);
+  grid-column: 1 / -1;
+}
+
+.glossary-detail-terms .glossary-detail-empty {
+  border-bottom: none;
+  color: var(--nova-fg-secondary);
+  display: block;
+}
+
+.glossary-detail-more {
+  color: var(--nova-fg-secondary);
+  margin: 0;
+}
+
+.glossary-detail-custom {
+  border-top: 1px solid var(--nova-surface-hairline);
+  padding-top: 12px;
+}
+
+.glossary-detail-custom h3 {
+  margin: 0 0 4px;
+}
+
+.glossary-detail-custom-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.glossary-detail-custom-row input {
+  flex: 1 1 160px;
+  min-width: 0;
+}
+
+@media (max-width: 599px) {
+  .glossary-detail-terms li {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* Inside the dropdown panel the pack options are slim rows, not cards. */
+.glossary-select-panel .glossary-selection-options {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.glossary-select-panel .glossary-selection-option {
+  align-items: center;
+  border: none;
+  border-radius: 8px;
+  display: flex;
+  flex-direction: row;
+  gap: 10px;
+  justify-content: flex-start;
+  padding: 7px 8px;
+  text-align: left;
+}
+
+.glossary-select-panel .glossary-selection-option:hover {
+  background: var(--nova-surface-raised, rgba(255, 255, 255, 0.04));
+}
+
+.glossary-select-panel .glossary-selection-option input {
+  height: 16px;
+  margin: 0;
+  position: static;
+  width: 16px;
+}
+
+.glossary-select-panel .glossary-selection-option span {
+  align-items: baseline;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px 8px;
+  min-width: 0;
+}
+
+.glossary-select-panel .glossary-selection-option strong {
+  font-weight: 500;
+}
+
+.live-record-actions { display: flex; justify-content: flex-end; margin-bottom: 16px; }
+.live-record-actions a { min-height: 44px; display: inline-flex; align-items: center; }
+
+#settings-panel-advanced > .cfg-section { grid-template-columns: minmax(0, 1fr); align-items: start; }
+#settings-panel-advanced .settings-panel[data-engine-assignment="readonly"] {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: var(--nova-gap-16);
+  padding: var(--nova-inset);
+}
+#caption-engine-status { grid-column: 1 / -1; }
+#settings-panel-advanced .settings-drawer { width: 100%; min-width: 0; }
+#settings-panel-advanced .settings-drawer .settings-panel { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+#settings-panel-advanced .settings-drawer .settings-panel > * { min-width: 0; }
+@media (max-width: 767px) {
+  #settings-panel-advanced .settings-drawer .settings-panel { grid-template-columns: minmax(0, 1fr); }
+}
+
+@media (max-width: 599px) {
+  .workspace-footer,
+  .workspace-footer.player-bar {
+    position: static;
+    width: 100%;
+    grid-template-columns: minmax(0, 1fr);
+    margin-top: var(--nova-gap-16);
+  }
+  .player-bar-left,
+  .player-bar-right,
+  .player-bar .dashboard-actions.player-bar-center {
+    flex-wrap: wrap;
+    min-width: 0;
+    max-width: 100%;
+    justify-self: start;
+  }
+  .subtitle-app-rail {
+    flex-wrap: wrap;
+    overflow-x: visible;
+  }
+  .subtitle-app-rail nav {
+    width: 100%;
+    flex-wrap: wrap;
+  }
+  .subtitle-preview { padding: var(--nova-gap-16); }
+}
+
+/* 2026-09-05 feat: One preparation column and native top-layer dialogs keep
+   session controls reachable in small desktop windows. */
+[data-workspace-page="captions"] .cfg-section { grid-template-columns: minmax(0, 1fr); gap: 12px; }
+[data-workspace-page="captions"] .caption-task-preview { order: initial; }
+[data-workspace-page="captions"] .subtitle-preview { min-height: 144px; padding: 24px; }
+.subtitle-dashboard :is(button, a.secondary),
+.glossary-detail-dialog button { min-height: 44px; border-radius: 8px; }
+.subtitle-dashboard :is(input:not([type="checkbox"], [type="range"]), select, textarea) { min-width: 0; max-width: 100%; border-radius: 8px; }
+.subtitle-dashboard :is(.field-help, .field-status, .glossary-selection-status, .audio-meter-row strong, .audio-meter-row span) { overflow-wrap: anywhere; white-space: normal; }
+.audio-meter-row { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) minmax(44px, auto); }
+.audio-meter-row > *, .audio-inspector-heading > * { min-width: 0; }
+.audio-inspector-heading { flex-wrap: wrap; }
+.glossary-management { display: grid; gap: 16px; min-width: 0; }
+.glossary-preset-actions { flex-wrap: wrap; }
+
+#glossary-select-panel,
+#glossary-detail-dialog {
+  position: fixed;
+  inset: 0;
+  box-sizing: border-box;
+  width: min(640px, calc(100% - 32px));
+  min-width: 0;
+  max-width: calc(100% - 32px);
+  height: auto;
+  max-height: calc(100dvh - 32px);
+  margin: auto;
+  padding: 0;
+  border: 1px solid var(--nova-surface-hairline);
+  border-radius: 12px;
+  background: var(--nova-surface-base);
+  color: var(--nova-fg-primary);
+  overflow: hidden;
+}
+#glossary-select-panel[open], #glossary-detail-dialog[open] { display: flex; flex-direction: column; gap: 0; }
+#glossary-select-panel[hidden], #glossary-detail-dialog:not([open]) { display: none; }
+#glossary-select-panel::backdrop, #glossary-detail-dialog::backdrop { background: var(--nova-scrim, rgba(0,0,0,.56)); }
+.glossary-modal-heading, .glossary-detail-heading, .glossary-modal-footer { display: flex; flex: 0 0 auto; align-items: center; justify-content: space-between; gap: 12px; padding: 16px; }
+.glossary-modal-heading h2, .glossary-detail-heading h2 { margin: 0; min-width: 0; white-space: normal; overflow-wrap: anywhere; }
+.glossary-modal-heading button, .glossary-detail-heading button { flex: 0 0 auto; }
+.glossary-modal-footer { justify-content: flex-end; border-top: 1px solid var(--nova-surface-hairline); }
+.glossary-modal-body, .glossary-detail-body { flex: 1 1 auto; min-height: 0; overflow-y: auto; overscroll-behavior: contain; padding: 0 16px 16px; }
+.glossary-modal-search { display: grid; gap: 8px; margin-bottom: 16px; }
+.glossary-detail-body { display: block; }
+.glossary-detail-body > * + * { margin-top: 12px; }
+.glossary-detail-body .glossary-detail-terms { display: block; }
+.glossary-detail-body .glossary-detail-terms > li { min-height: min-content; }
+.glossary-detail-terms { min-height: 0; overflow: visible; }
+.glossary-detail-language-chip, .glossary-detail-button { min-height: 44px; }
+.glossary-detail-custom-row input { width: 100%; }
+.glossary-detail-overlay { background: transparent; pointer-events: none; }
+.glossary-detail-dialog { pointer-events: auto; }
+#glossary-select-panel .glossary-option-row[hidden] { display: none; }
+@media (max-width: 599px) {
+  .audio-meter-row { grid-template-columns: minmax(0, 1fr) auto; }
+  .audio-meter-row > :first-child { grid-column: 1 / -1; }
+  .glossary-detail-custom-row { display: grid; grid-template-columns: minmax(0, 1fr); }
+  .glossary-detail-custom-row input { flex-basis: auto; }
+}
+
+.language-search-field { display: grid; gap: 8px; margin-bottom: 12px; }
+.lang-select-panel .lang-pill[hidden] { display: none; }

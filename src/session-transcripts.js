@@ -1,5 +1,6 @@
 import fs from "node:fs/promises";
 import path from "node:path";
+import { normalizeSpeakerProfile } from "../packages/caption-core/speaker-profile.js";
 
 // Per-session transcript recorder for local caption sessions. Unlike the
 // rolling 200-line subtitle history (translation-only), this store keeps the
@@ -39,6 +40,7 @@ export function createSessionTranscripts({
       id: session.id,
       kind: session.kind === "live-call" ? "live-call" : "local",
       liveSessionId: session.liveSessionId ?? "",
+      ownerHostId: session.ownerHostId ?? "",
       title: session.title,
       startedAt: session.startedAt,
       endedAt: session.endedAt,
@@ -125,6 +127,9 @@ export function createSessionTranscripts({
       at: at.toISOString(),
       elapsedMs: Math.max(0, at.getTime() - active.startedMs),
       speaker: normalizeLineText(message.speaker).slice(0, 80),
+      ...(message.speakerProfile ? { speakerProfile: normalizeSpeakerProfile(message.speakerProfile) } : {}),
+      ...(message.speakerAttribution === "unresolved" ? { speakerAttribution: "unresolved" } : {}),
+      ...(typeof message.liveSessionId === "string" && /^[0-9a-f-]{36}$/iu.test(message.liveSessionId) ? { liveSessionId: message.liveSessionId } : {}),
       sourceText,
       translatedText,
       sourceLanguage: normalizeLineText(message.sourceLanguage).slice(0, 16),
@@ -202,19 +207,28 @@ export function createSessionTranscripts({
 
   /** Archive a transcript recorded elsewhere (e.g. a Live Call meeting record
    *  fetched from the workspace) so it appears alongside local sessions.
-   *  @param {{ id?: string, title?: string, startedAt?: string, endedAt?: string, lines?: any[], summary?: any }} [payload] */
-  async function importSession({ id, title = "", startedAt = "", endedAt = "", lines = [], summary = null } = {}) {
+   *  @param {{ id?: string, ownerHostId?: string, title?: string, startedAt?: string, endedAt?: string, lines?: any[], summary?: any }} [payload] */
+  async function importSession({ id, ownerHostId, title = "", startedAt = "", endedAt = "", lines = [], summary = null } = {}) {
     if (typeof id !== "string" || !id) return null;
+    if (active?.id === id) return null;
+    if (ownerHostId !== undefined && (typeof ownerHostId !== "string" || !/^[a-zA-Z0-9-]{1,200}$/u.test(ownerHostId))) return null;
+    if (!Array.isArray(lines) || lines.length > MAX_LINES_PER_SESSION) return null;
+    if (lines.some((line) => typeof line?.sourceText === "string"
+      && (Array.from(line.sourceText).length > 8000 || Buffer.byteLength(line.sourceText, "utf8") > 24000))) return null;
+    const existing = await readSessionFile(sessionPath(id));
     const startedMs = Date.parse(startedAt) || 0;
+    const isLiveCall = existing?.kind === "live-call" || id.startsWith("live-");
     const session = {
       id,
+      kind: isLiveCall ? "live-call" : "local",
+      liveSessionId: existing?.liveSessionId || (isLiveCall ? id.slice(5) : ""),
+      ownerHostId: ownerHostId ?? existing?.ownerHostId ?? "",
       title: normalizeLineText(title).slice(0, MAX_TITLE_CHARS),
       startedAt: typeof startedAt === "string" ? startedAt : "",
       startedMs,
       endedAt: typeof endedAt === "string" ? endedAt : "",
-      lines: (Array.isArray(lines) ? lines : []).slice(0, MAX_LINES_PER_SESSION)
-        .map((line) => {
-          const sourceText = normalizeLineText(line?.sourceText);
+      lines: lines.map((line) => {
+          const sourceText = typeof line?.sourceText === "string" ? line.sourceText : "";
           const translatedText = normalizeLineText(line?.translatedText);
           if (!sourceText && !translatedText) return null;
           const atMs = Date.parse(line?.at) || startedMs;
@@ -222,16 +236,22 @@ export function createSessionTranscripts({
             at: typeof line?.at === "string" ? line.at : "",
             elapsedMs: Math.max(0, atMs - startedMs),
             speaker: normalizeLineText(line?.speaker).slice(0, 80),
+            ...(line?.speakerProfile ? { speakerProfile: normalizeSpeakerProfile(line.speakerProfile) } : {}),
+            ...(line?.speakerAttribution === "unresolved" ? { speakerAttribution: "unresolved" } : {}),
             sourceText,
             translatedText,
             sourceLanguage: normalizeLineText(line?.sourceLanguage).slice(0, 16),
             targetLanguage: normalizeLineText(line?.targetLanguage).slice(0, 16),
             source: "live",
+            ...(Number.isSafeInteger(line?.sourceSeq) && line.sourceSeq > 0 ? { sourceSeq: line.sourceSeq } : {}),
+            ...(typeof line?.id === "string" && line.id.length <= 200 ? { id: line.id } : {}),
+            ...(typeof line?.utteranceKey === "string" && line.utteranceKey.length <= 200 ? { utteranceKey: line.utteranceKey } : {}),
           };
         })
         .filter(Boolean),
-      summary: summary && typeof summary === "object" ? summary : null,
-      audioSources: new Set(),
+      // Remote pending is not a deletion request for a previously saved recap.
+      summary: summary && typeof summary === "object" ? summary : existing?.summary ?? null,
+      audioSources: new Set(existing?.audioSources ?? []),
     };
     await writeSessionFile(session);
     return metaOf(session, { minBlockMs });
@@ -363,6 +383,7 @@ function metaOf(session, { minBlockMs = MIN_BLOCK_MILLISECONDS } = {}) {
     // local caption sessions, so that is the safe default.
     kind: session.kind === "live-call" ? "live-call" : "local",
     liveSessionId: typeof session.liveSessionId === "string" ? session.liveSessionId : "",
+    ownerHostId: typeof session.ownerHostId === "string" ? session.ownerHostId : "",
     title: session.title ?? "",
     startedAt,
     endedAt,
@@ -398,6 +419,7 @@ async function readSessionFile(filePath) {
       // local caption sessions.
       kind: parsed.kind === "live-call" ? "live-call" : "local",
       liveSessionId: typeof parsed.liveSessionId === "string" ? parsed.liveSessionId : "",
+      ownerHostId: typeof parsed.ownerHostId === "string" ? parsed.ownerHostId : "",
       title: typeof parsed.title === "string" ? parsed.title : "",
       startedAt: typeof parsed.startedAt === "string" ? parsed.startedAt : "",
       startedMs: Date.parse(parsed.startedAt) || 0,

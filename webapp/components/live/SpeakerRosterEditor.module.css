@@ -1,0 +1,24 @@
+.panel { margin-block: 24px; padding: 16px; border: 1px solid var(--nova-surface-hairline); border-radius: 12px; min-width: 0; font: var(--nova-ui-font); }
+.panel header, .panel footer, .dialog header, .dialog footer { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; }
+.panel h2, .dialog h2 { font-size: var(--nova-font-size-t3, 22px); line-height: 1.4; font-weight: 600; margin: 0; }
+.panel p, .dialog p { margin: 8px 0; overflow-wrap: anywhere; }
+.panel ul { list-style: none; padding: 0; margin: 16px 0; }
+.panel li { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 16px; padding-block: 12px; border-top: 1px solid var(--nova-surface-hairline); }
+.identity { display: flex; align-items: center; min-width: 0; gap: 12px; overflow-wrap: anywhere; }
+.identity img { width: 44px; height: 44px; object-fit: cover; flex: 0 0 auto; border-radius: 8px; }
+.actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.panel button, .dialog button, .dialog input, .dialog select { box-sizing: border-box; min-height: 44px; min-width: 0; max-width: 100%; border: 1px solid var(--nova-surface-hairline); border-radius: 8px; padding: 8px 12px; color: var(--nova-fg-primary); background: var(--nova-surface-base); font: var(--nova-ui-font); }
+.panel button, .dialog button { cursor: pointer; white-space: normal; }
+.panel button:disabled, .dialog button:disabled { opacity: .5; cursor: default; }
+.panel .primary, .dialog .primary, .panel button[aria-pressed="true"] { background: var(--nova-web-action); color: var(--nova-web-text); }
+.panel :focus-visible, .dialog :focus-visible { outline: 2px solid var(--nova-web-action); outline-offset: 2px; }
+.dialog { box-sizing: border-box; width: min(600px, calc(100% - 32px)); min-width: 0; max-width: calc(100% - 32px); max-height: calc(100dvh - 32px); padding: 0; border: 1px solid var(--nova-surface-hairline); border-radius: 12px; background: var(--nova-surface-base); color: var(--nova-fg-primary); overflow: hidden; }
+.dialog::backdrop { background: var(--nova-scrim); }
+.dialog form { display: grid; grid-template-rows: auto minmax(0, 1fr) auto; max-height: calc(100dvh - 34px); }
+.dialog header, .dialog footer { padding: 16px; }
+.dialog footer { justify-content: flex-end; border-top: 1px solid var(--nova-surface-hairline); }
+.body { min-height: 0; overflow: auto; padding: 0 16px 16px; display: grid; gap: 16px; }
+.body label { display: grid; min-width: 0; gap: 8px; }
+.body input, .body select { width: 100%; }
+@media (max-width: 599px) { .panel { padding: 12px; } .panel header > button { width: 100%; } .panel li { display: grid; } .actions { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+.organization { display: block; color: var(--nova-fg-secondary); font: var(--nova-ui-font); white-space: normal; overflow-wrap: anywhere; }

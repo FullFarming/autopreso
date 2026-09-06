@@ -1,0 +1,111 @@
+.system-language {
+  position: relative;
+  flex: 0 0 auto;
+  -webkit-app-region: no-drag;
+}
+
+.system-language-trigger,
+.system-language-choice {
+  display: flex;
+  align-items: center;
+  gap: var(--nova-gap-8);
+  min-width: 44px;
+  min-height: 44px;
+  border: 0;
+  border-radius: var(--nova-r-sm);
+  color: var(--nova-fg-primary);
+  font-family: inherit;
+  font-size: var(--nova-t6);
+  font-weight: 600;
+  line-height: var(--nova-t6-lh);
+  letter-spacing: -0.02em;
+  white-space: nowrap;
+  word-break: keep-all;
+  cursor: pointer;
+}
+
+.system-language-trigger {
+  padding: 0 var(--nova-gap-12);
+  border: 1px solid var(--nova-surface-hairline);
+  background: var(--nova-surface-layered);
+}
+
+.system-language-trigger:hover,
+.system-language-trigger[aria-expanded="true"] {
+  background: var(--nova-surface-float);
+}
+
+.system-language-trigger:focus-visible,
+.system-language-choice:focus-visible {
+  outline: 2px solid var(--nova-system-default);
+  outline-offset: 2px;
+}
+
+.system-language-icon {
+  display: inline-block;
+  flex: 0 0 18px;
+  width: 18px;
+  height: 18px;
+  background: currentColor;
+  mask: var(--system-language-icon) center / contain no-repeat;
+}
+.system-language-icon-globe { --system-language-icon: url("./icons/globe.svg"); }
+.system-language-icon-chevron {
+  --system-language-icon: url("./icons/chevron-down.svg");
+  flex-basis: 16px;
+  width: 16px;
+  height: 16px;
+  color: var(--nova-fg-secondary);
+}
+.system-language-icon-check { --system-language-icon: url("./icons/check.svg"); }
+
+.system-language-menu,
+.system-language-status {
+  position: absolute;
+  z-index: 100;
+  top: calc(100% + var(--nova-gap-8));
+  right: 0;
+  width: 180px;
+  padding: var(--nova-gap-8);
+  border: 1px solid var(--nova-surface-hairline);
+  border-radius: var(--nova-r-sm);
+  background: var(--nova-surface-float);
+}
+.system-language-menu[hidden],
+.system-language-status[hidden] { display: none; }
+.system-language-status {
+  margin: 0;
+  padding: var(--nova-gap-12);
+  color: var(--nova-fg-primary);
+  font-size: var(--nova-t7);
+  font-weight: 400;
+  line-height: var(--nova-t7-lh);
+  letter-spacing: -0.02em;
+  white-space: normal;
+  word-break: keep-all;
+}
+.system-language-choice {
+  justify-content: space-between;
+  width: 100%;
+  padding: 0 var(--nova-gap-12);
+  background: transparent;
+  text-align: left;
+}
+.system-language-choice:hover,
+.system-language-choice:focus-visible { background: var(--nova-overlay-100); }
+.system-language-choice[aria-checked="true"] { background: var(--nova-system-subtle); }
+.system-language-choice[aria-checked="false"] .system-language-icon-check { visibility: hidden; }
+
+.subtitle-controller-body .system-language-trigger {
+  gap: var(--nova-gap-4);
+  padding-inline: var(--nova-gap-8);
+  font-size: var(--nova-t7);
+  line-height: var(--nova-t7-lh);
+}
+
+/* 2026-08-31 fix: Electron clips overflow outside its physical window. Reserve
+   the menu height while open so the existing ResizeObserver also grows it. */
+.subtitle-controller-body .caption-controller-window.is-language-menu-open,
+.subtitle-controller-body .caption-controller-window:has(.system-language-status:not([hidden])) {
+  padding-bottom: 170px;
+}

@@ -1,0 +1,26 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "webapp-dev",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["run", "dev"],
+      "cwd": "webapp",
+      "port": 3000,
+      "autoPort": true
+    },
+    {
+      "name": "public-static",
+      "runtimeExecutable": "python3",
+      "runtimeArgs": ["-m", "http.server", "4173", "-d", "public"],
+      "port": 4173
+    },
+    {
+      "name": "desktop-workspace",
+      "runtimeExecutable": "node",
+      "runtimeArgs": ["./src/cli.js", "--no-open"],
+      "port": 3213,
+      "env": { "PORT": "3213" }
+    }
+  ]
+}

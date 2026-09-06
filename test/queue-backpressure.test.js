@@ -1,3 +1,4 @@
+import { GEMINI_ENGINE_SELECTION } from "../packages/caption-core/caption-engine-catalog.js";
 // Queue-accumulation stall guards ("큐가 쌓이면 멈추는 현상"):
 //  1. subtitle audio must never pile up in a slow translation socket's send
 //     buffer — realtime audio is dropped (stay live) instead of queued forever,
@@ -16,7 +17,6 @@ import { test } from "node:test";
 import { WebSocket } from "ws";
 
 import { createSubtitleRealtimeManager } from "../src/subtitle-realtime.js";
-import { createTranscriptTurnQueue } from "../src/transcript-turn-queue.js";
 import { createSubtitleHistory } from "../src/subtitle-history.js";
 import { createSettingsStore } from "../src/settings-store.js";
 
@@ -51,8 +51,8 @@ async function startManagerWithSockets() {
     broadcast: () => {},
     settingsStore: {
       load: async () => ({
-        apiKeys: { openai: "sk-test" },
-        subtitle: { translationProvider: "openai", inputMode: "mic", languagePair: { a: "en", b: "ko" } },
+        apiKeys: { gemini: "AIza-test" },
+        subtitle: { engine: GEMINI_ENGINE_SELECTION, translationProvider: "gemini", inputMode: "mic", languagePair: { a: "en", b: "ko" } },
       }),
     },
     createWebSocket: (url, protocols, init) => {
@@ -64,6 +64,7 @@ async function startManagerWithSockets() {
   });
   await manager.start({ sessionId: "active" });
   await new Promise((resolve) => setImmediate(resolve));
+  for (const socket of sockets) socket.emit("message", JSON.stringify({ setupComplete: {} }));
   return { manager, sockets };
 }
 
@@ -72,7 +73,7 @@ test("subtitle audio is dropped instead of queued when the translation socket ba
   const socket = sockets[0];
   const before = socket.sent.length;
 
-  manager.sendAudio({ sessionId: "active", source: "mic", audio: "AAAA" });
+  manager.sendAudio({ sessionId: "active", source: "mic", audio: Buffer.alloc(4800).toString("base64") });
   assert.equal(socket.sent.length, before + 1, "audio flows while the socket buffer is empty");
 
   // The socket send buffer has backed up past the live threshold: new frames
@@ -85,53 +86,10 @@ test("subtitle audio is dropped instead of queued when the translation socket ba
 
   // Buffer drained → audio resumes.
   socket.bufferedAmount = 0;
-  manager.sendAudio({ sessionId: "active", source: "mic", audio: "DDDD" });
+  manager.sendAudio({ sessionId: "active", source: "mic", audio: Buffer.alloc(4800).toString("base64") });
   assert.equal(socket.sent.length, before + 2, "audio resumes once the buffer drains");
 
   await manager.stop();
-});
-
-test("a hung turn cannot jam the transcript turn queue forever", async () => {
-  const ran = [];
-  const queue = createTranscriptTurnQueue({
-    debounceMs: 0,
-    turnTimeoutMs: 30,
-    runTurn: async (text) => {
-      ran.push(text);
-      if (text === "hang") await new Promise(() => {});
-    },
-  });
-
-  queue.enqueue("hang");
-  queue.enqueue("after");
-  // Without a turn timeout the queue stays `running` forever and "after" never
-  // fires. With the timeout the queue must move on.
-  await new Promise((resolve) => setTimeout(resolve, 120));
-  assert.deepEqual(ran, ["hang", "after"]);
-});
-
-test("turn queue overflow buffer stays bounded while a turn is running", async () => {
-  let release = (..._args) => {};
-  const gate = new Promise((resolve) => { release = resolve; });
-  const ran = [];
-  const queue = createTranscriptTurnQueue({
-    debounceMs: 0,
-    maxBufferedChunks: 5,
-    runTurn: async (text) => {
-      ran.push(text);
-      if (text === "first") await gate;
-    },
-  });
-
-  queue.enqueue("first");
-  for (let i = 0; i < 50; i += 1) queue.enqueue(`chunk-${i}`);
-  release();
-  await queue.idle();
-
-  assert.equal(ran.length, 2, "buffered chunks coalesce into one follow-up turn");
-  const followUp = ran[1].split("\n");
-  assert.equal(followUp.length, 5, "only the most recent chunks are kept");
-  assert.equal(followUp[followUp.length - 1], "chunk-49");
 });
 
 test("subtitle history batches disk writes instead of persisting every committed line", async () => {
@@ -156,7 +114,7 @@ test("subtitle history batches disk writes instead of persisting every committed
 test("concurrent settings saves are serialized and the file stays valid JSON", async () => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "settings-store-"));
   const filePath = path.join(dir, "settings.json");
-  const store = createSettingsStore({ filePath, env: {}, readCodexAuth: () => null });
+  const store = createSettingsStore({ filePath, env: {} });
   await store.load();
 
   await Promise.all(Array.from({ length: 25 }, (_, i) =>

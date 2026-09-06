@@ -1,0 +1,7 @@
+.group { display: grid; grid-template-columns: minmax(0, auto) var(--nova-control-height, 44px); align-items: start; gap: 8px; min-width: 0; max-width: 100%; }
+.action { min-width: 0; }
+.action > :is(button, a) { display: inline-flex; align-items: center; justify-content: center; min-height: var(--nova-control-height, 44px); max-width: 100%; box-sizing: border-box; white-space: nowrap; }
+.group .helpButton { display: inline-flex; align-items: center; justify-content: center; box-sizing: border-box; width: var(--nova-control-height, 44px); height: var(--nova-control-height, 44px); min-width: var(--nova-control-height, 44px); min-height: var(--nova-control-height, 44px); padding: 0; border: 1px solid var(--nova-surface-hairline); border-radius: 8px; background: transparent; color: var(--nova-fg-secondary); font: var(--nova-ui-font); cursor: pointer; }
+.helpButton:focus-visible { outline: 2px solid var(--nova-web-action); outline-offset: 2px; }
+.group .description { grid-column: 1 / -1; min-width: 0; max-height: min(160px, 25dvh); overflow: auto; overscroll-behavior: contain; margin: 0; padding: 12px; border: 1px solid var(--nova-surface-hairline); border-radius: 8px; color: var(--nova-fg-secondary); background: var(--nova-surface-base); font: var(--nova-ui-font); white-space: normal; overflow-wrap: anywhere; }
+.description[hidden] { display: none; }

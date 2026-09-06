@@ -1,10 +1,47 @@
+import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 
-import { readCodexCliAuthSync } from "./codex-auth.js";
+import { DEFAULT_GLOSSARY_PRESET_ID, GLOSSARY_PRESETS } from "./glossary-presets.js";
 import { MAX_TRANSLATION_LANGUAGES, isSupportedSubtitleLanguage } from "./subtitle-languages.js";
+import {
+  DEFAULT_ENGINE_SELECTION,
+  ENGINE_ROLES,
+  engineSelectionKey,
+  migrateLegacyEngineSelection,
+  normalizeEngineSelection,
+  validateEngineForLanguages,
+} from "../packages/caption-core/caption-engine-catalog.js";
 
-export const MAX_AGENT_INSTRUCTIONS_CHARS = 100_000;
+
+const DEFAULT_GLOSSARY_PRESET = GLOSSARY_PRESETS.find((preset) => preset.id === DEFAULT_GLOSSARY_PRESET_ID);
+if (!DEFAULT_GLOSSARY_PRESET) throw new Error("Default glossary preset is missing.");
+const BUILT_IN_GLOSSARY_IDS = new Set([
+  "common_business", "ai_ax", "commercial_real_estate", "hospitality", "fnb_retail", "proper_nouns", "ko_ja_idioms",
+]);
+const GLOSSARY_PRESET_UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
+
+// Exact released defaults advance to the current full corpus. Matching both
+// fields protects user-owned Custom text, while upgrading the previously
+// focused presets ensures existing installs receive the restored terminology.
+const LEGACY_DEFAULT_PRESET_FINGERPRINTS = Object.freeze([
+  Object.freeze({
+    glossary: "c60af3a907b01188a3ab6345d84d3ee2f27ce332af51ec0e6e230b270213561a",
+    domain: "923ae9ab0dee73f2668e10ede1dd44d84f532c51bac39bf260568ad6437a277b",
+  }),
+  Object.freeze({
+    glossary: "41ea50d2b39c30385192d59075ad69ffb921e45abb4dc02b722f2ded47649888",
+    domain: "0554c8ec443eb21453209834e691e01d7f7c58c788827299929aeb0cc520dad4",
+  }),
+  Object.freeze({
+    glossary: "563ab9e0966cf71073ab87ff43f4da9834f487d5c51a5747b5f953d0e295bf25",
+    domain: "56a55879bb88fc3825e5a9b0bde0e13a54e04b795c0635a597ba84ab8c161897",
+  }),
+  Object.freeze({
+    glossary: "fc870dbf9a375af759d4063eb446b81dd51836445719a37e6089506d4b767fd9",
+    domain: "56a55879bb88fc3825e5a9b0bde0e13a54e04b795c0635a597ba84ab8c161897",
+  }),
+]);
 
 export async function migrateSettingsFile({ fromPath, toPath }) {
   if (!fromPath || !toPath || fromPath === toPath) return;
@@ -28,17 +65,19 @@ export async function migrateSettingsFile({ fromPath, toPath }) {
 }
 
 export const DEFAULT_SUBTITLE_SETTINGS = Object.freeze({
-  inputMode: "system_mic",
+  // 2026-08-22 비용 감사: system+mic 이중 캡처가 모든 유료 세션 비용을 2배로
+  // 만들던 기본값. 행사 계약(마이크 또는 믹서 하나)과 정렬해 mic 단일이 기본.
+  inputMode: "mic",
   micDeviceId: "",
   languagePair: { a: "en", b: "ko" },
   translationLanguages: ["en", "ko"],
+  // Live Call publishes its own language set; [] means "inherit the subtitle
+  // languages above" so existing settings files keep today's behavior.
+  liveCallTranslationLanguages: [],
   outputMode: "captions",
-  audioLanguage: "en",
-  audioVolume: 0.8,
   displayMode: "translation_only",
   showSourceText: false,
   translateAllLanguages: false,
-  model: "gpt-realtime-translate",
   fontFamily: "Arial, Helvetica, sans-serif",
   translationFontSize: 38,
   sourceFontSize: 36,
@@ -51,46 +90,40 @@ export const DEFAULT_SUBTITLE_SETTINGS = Object.freeze({
   opacity: 0.92,
   maxSubtitleLines: 2,
   overlayEnabled: true,
+  overlayDisplayId: "",
+  overlayAllDisplays: true,
+  overlayDisplayIds: null,
   recordProvider: "ollama",
   ollamaBaseURL: "http://127.0.0.1:11434",
   ollamaModel: "gemma3n:e2b",
   tone: "natural",
   tonePolishModel: "gpt-5.5",
   translationProvider: "gemini",
-  voiceProvider: "gemini",
-  geminiModel: "gemini-3.5-live-translate-preview",
-  geminiPolishModel: "gemini-3.5-flash",
-  glossary: "",
-  translationDomain: "",
+  engine: DEFAULT_ENGINE_SELECTION,
+  glossaryPresetId: DEFAULT_GLOSSARY_PRESET_ID,
+  glossaryPresetName: "",
+  glossaries: Object.freeze([Object.freeze({ sourceKind: "builtin", sourceId: "common_business" })]),
+  glossary: DEFAULT_GLOSSARY_PRESET.glossary,
+  translationDomain: DEFAULT_GLOSSARY_PRESET.domain,
   verticalOffset: 48,
 });
 
-// Has to clear the LARGEST shipped preset, not a round number: at 16,000 the
-// store rejected the hotel-investment preset (27.5k) outright and the webapp and
-// gateway silently sliced it, dropping whichever sections sat at the end.
-// test/glossary-presets.test.js pins all three ceilings against the presets.
-export const MAX_SUBTITLE_GLOSSARY_CHARS = 40000;
-export const MAX_SUBTITLE_DOMAIN_CHARS = 2000;
+// 2026-07-27 fix: local settings written before the synchronized-preset feature
+// legitimately exceed the remote preset's 16k storage cap. The gateway already
+// accepts 40k and filters the polish prompt to relevant entries, so rejecting a
+// 19k local glossary only bricked Live Call startup without reducing API work.
+export const MAX_SUBTITLE_GLOSSARY_CHARS = 40_000;
+// Local legacy domains may be more descriptive than synchronized preset
+// metadata. Keep this aligned with the gateway's bounded 2k start contract.
+export const MAX_SUBTITLE_DOMAIN_CHARS = 2_000;
 export const MAX_SUBTITLE_VERTICAL_OFFSET = 600;
 export const MAX_SUBTITLE_FONT_FAMILY_CHARS = 400;
 export const MAX_API_KEY_CHARS = 500;
-export const API_KEY_NAMES = Object.freeze(["openai", "openaiSecondary", "gemini", "geminiSecondary"]);
+export const API_KEY_NAMES = Object.freeze(["openai", "gemini", "geminiSecondary", "soniox"]);
 
 export const DEFAULT_SETTINGS = Object.freeze({
-  agent: {
-    provider: "openai",
-    openai: { model: "gpt-5.5", reasoningEffort: "low", baseURL: "https://api.openai.com/v1" },
-    codex: { model: "gpt-5.5-fast", baseURL: "https://chatgpt.com/backend-api/codex" },
-    ollama: { model: "", baseURL: "http://localhost:11434/v1" },
-  },
-  transcription: {
-    provider: "moonshine",
-    moonshine: { model: "medium" },
-    openai: { model: "gpt-realtime-whisper" },
-  },
   apiKeys: {
     openai: "",
-    openaiSecondary: "",
     gemini: "",
     geminiSecondary: "",
   },
@@ -98,16 +131,46 @@ export const DEFAULT_SETTINGS = Object.freeze({
   subtitleHistory: {
     records: [],
   },
-  agentInstructions: "",
 });
 
-export function createSettingsStore({ filePath, env = process.env, readCodexAuth = readCodexCliAuthSync }) {
+export function createSettingsStore({ filePath, env = process.env }) {
   let cached = null;
+  let loadPromise = null;
 
   async function readFromDisk() {
     try {
       const raw = await fs.readFile(filePath, "utf8");
-      return migrateSettings(deepMerge(cloneDefaults(), JSON.parse(raw)));
+      const parsed = JSON.parse(raw);
+      const merged = deepMerge(cloneDefaults(), parsed);
+      // deepMerge fills in the default `engine` even when the on-disk file never
+      // had one, which would make migrateLegacyEngineSelection's "an explicit
+      // engine always wins" rule silently mask legacy per-role model fields on
+      // every disk load. Only carry `engine` into migration when the file itself
+      // set it; otherwise let the legacy fields (or the true default) decide.
+      if (isPlainObject(merged.subtitle) && !Object.hasOwn(parsed?.subtitle ?? {}, "engine")) {
+        delete merged.subtitle.engine;
+      }
+      if (isPlainObject(merged.subtitle) && !Object.hasOwn(parsed?.subtitle ?? {}, "overlayAllDisplays") && parsed?.subtitle?.overlayDisplayId) {
+        merged.subtitle.overlayAllDisplays = false;
+      }
+      const migrated = migrateSettings(merged);
+      const legacyPresent = ["geminiTranscribeModel", "geminiSummaryModel", "geminiPolishModel", "geminiModel"].some((key) => Object.hasOwn(parsed?.subtitle ?? {}, key));
+      let storedEngineKey;
+      try {
+        storedEngineKey = engineSelectionKey(parsed?.subtitle?.engine ?? DEFAULT_ENGINE_SELECTION);
+      } catch {
+        storedEngineKey = null;
+      }
+      if (legacyPresent || storedEngineKey !== engineSelectionKey(migrated.subtitle.engine)) {
+        // The rewrite is an optimization: it stops the same migration running on
+        // every boot. A read-only (or full) config directory must not turn
+        // load() into a rejected promise — on the desktop that is no window, no
+        // dialog, just a dock icon — so keep the migrated settings in memory.
+        try {
+          await writeToDisk(migrated);
+        } catch {}
+      }
+      return migrated;
     } catch (error) {
       if (error.code === "ENOENT") return null;
       throw error;
@@ -137,20 +200,28 @@ export function createSettingsStore({ filePath, env = process.env, readCodexAuth
 
   async function load() {
     if (cached) return cached;
-    const fromDisk = await readFromDisk();
-    if (fromDisk) {
-      cached = fromDisk;
+    // 2026-09-01 fix: Concurrent first saves must merge against one initialized settings snapshot.
+    if (!loadPromise) loadPromise = (async () => {
+      const fromDisk = await readFromDisk();
+      if (fromDisk) {
+        cached = fromDisk;
+        return cached;
+      }
+      const seeded = seedFromEnv(cloneDefaults(), env);
+      await writeToDisk(seeded);
+      cached = seeded;
       return cached;
-    }
-    const seeded = seedFromEnv(cloneDefaults(), env, readCodexAuth);
-    await writeToDisk(seeded);
-    cached = seeded;
-    return cached;
+    })();
+    const pending = loadPromise;
+    try { return await pending; }
+    finally { if (loadPromise === pending) loadPromise = null; }
   }
 
   async function save(partial) {
     if (!cached) await load();
-    validateAgentInstructions(partial?.agentInstructions);
+    if (!isPlainObject(partial) || Object.keys(partial).some((key) => !["apiKeys", "subtitle", "subtitleHistory"].includes(key))) {
+      throw new Error("NOVA 설정 항목만 저장할 수 있습니다.");
+    }
     // Shape-check the patch BEFORE merging. `"subtitle": []` used to slip
     // through here (an array is truthy, every field reads undefined so the
     // field validators all passed) and deepMerge preserved the array shape —
@@ -159,6 +230,24 @@ export function createSettingsStore({ filePath, env = process.env, readCodexAuth
     if (partial?.subtitle !== undefined && !isPlainObject(partial.subtitle)) {
       throw new Error("Subtitle settings must be a plain object.");
     }
+    // A partial `engine` patch may only name the role the caller actually
+    // changed (e.g. `{ translation: {...} }`). Validating that patch in
+    // isolation would normalize the OMITTED roles to the Gemini defaults, and
+    // a combo check (Soniox translation's requiresSttProvider) can then fail
+    // against a phantom default stt role the caller never touched. Merge the
+    // patch role-by-role over the CURRENTLY SAVED engine before any
+    // validation or persistence sees it, so "change translation only" reads
+    // as exactly that, not as "reset every other role to its default too."
+    if (isPlainObject(partial?.subtitle) && isPlainObject(partial.subtitle.engine)) {
+      partial = {
+        ...partial,
+        subtitle: {
+          ...partial.subtitle,
+          engine: mergeEnginePatch(cached.subtitle.engine, partial.subtitle.engine),
+        },
+      };
+    }
+    if (partial?.subtitle) validateSubtitleSettings(partial.subtitle);
     validateApiKeys(partial?.apiKeys);
     // fontFamily is checked against the RAW patch: migrateSettings self-heals a
     // non-string value on the way in (so an already-poisoned file still boots),
@@ -166,11 +255,30 @@ export function createSettingsStore({ filePath, env = process.env, readCodexAuth
     if (partial?.subtitle?.fontFamily !== undefined) {
       validateSubtitleSettings({ fontFamily: partial.subtitle.fontFamily });
     }
+    if (partial?.subtitle?.glossaryPresetId !== undefined) {
+      validateSubtitleSettings({ glossaryPresetId: partial.subtitle.glossaryPresetId });
+    }
+    if (partial?.subtitle?.glossaryPresetName !== undefined) {
+      validateSubtitleSettings({ glossaryPresetName: partial.subtitle.glossaryPresetName });
+    }
     if (partial?.subtitle?.translationProvider !== undefined && partial.subtitle.translationProvider !== "gemini") {
       throw new Error("Subtitle translationProvider must remain gemini.");
     }
-    const candidate = migrateSettings(deepMerge(cached, partial));
+    const retiredSubtitleKeys = ["audioLanguage", "audioVolume", "voiceProvider", "model"];
+    const retiredSubtitleKey = retiredSubtitleKeys.find((key) => partial?.subtitle?.[key] !== undefined);
+    if (retiredSubtitleKey) {
+      throw new Error(`Subtitle ${retiredSubtitleKey} is retired in caption-only mode.`);
+    }
+    // strictEngine: the load path repairs an unusable stored engine by falling
+    // back to the catalog defaults (a corrupt file must still boot). On the save
+    // path that same fallback silently threw away the user's whole engine choice
+    // and still answered 200, so here an unusable merged engine is an error.
+    const candidate = migrateSettings(deepMerge(cached, partial), { strictEngine: true });
     if (partial?.subtitle) validateSubtitleSettings(candidate.subtitle);
+    // Capability constraints span two fields (Soniox two-way translation needs
+    // exactly two caption languages), so they are checked against the MERGED
+    // settings — either field may be the one the patch moved.
+    validateEngineForLanguages(candidate.subtitle.engine, candidate.subtitle.translationLanguages);
     cached = candidate;
     await writeToDisk(cached);
     return cached;
@@ -182,9 +290,9 @@ export function createSettingsStore({ filePath, env = process.env, readCodexAuth
     return {
       ...rest,
       hasOpenAIKey: Boolean(apiKeys?.openai),
-      hasOpenAISecondaryKey: Boolean(apiKeys?.openaiSecondary),
       hasGeminiKey: Boolean(apiKeys?.gemini),
       hasGeminiSecondaryKey: Boolean(apiKeys?.geminiSecondary),
+      hasSonioxKey: Boolean(apiKeys?.soniox),
     };
   }
 
@@ -217,7 +325,49 @@ function deepMerge(target, source) {
   return result;
 }
 
-function migrateSettings(settings) {
+/**
+ * Merges a partial `subtitle.engine` patch over the CURRENTLY SAVED engine and
+ * validates the result strictly.
+ *
+ * Two rules the plain deep merge got wrong:
+ *  - roles are replaced whole, never field-merged. A patched `stt` used to
+ *    inherit the saved `languageMode` ("ko") from a Soniox engine onto a Gemini
+ *    engine that only allows "auto" — an invalid combo the save path then
+ *    "repaired" by resetting every role to its default.
+ *  - a patched `stt` that names the SAME provider/model without a languageMode
+ *    is not a request to reset the input language, so the saved mode is kept.
+ *
+ * Unknown keys and non-object roles are passed through untouched so
+ * normalizeEngineSelection rejects them instead of this function guessing.
+ *
+ * @param {Record<string, any>} savedEngine
+ * @param {Record<string, any>} patchEngine
+ */
+function mergeEnginePatch(savedEngine, patchEngine) {
+  const merged = { ...savedEngine, ...patchEngine };
+  const patchedStt = patchEngine.stt;
+  const savedStt = savedEngine?.stt;
+  if (isPlainObject(patchedStt) && patchedStt.languageMode === undefined && isPlainObject(savedStt)
+    && patchedStt.provider === savedStt.provider && patchedStt.model === savedStt.model
+    && typeof savedStt.languageMode === "string") {
+    merged.stt = { ...patchedStt, languageMode: savedStt.languageMode };
+  }
+  for (const role of ENGINE_ROLES) {
+    if (isPlainObject(merged[role])) merged[role] = { ...merged[role] };
+  }
+  // Throws EngineSelectionError on an unusable combination; the fully
+  // normalized result then replaces the saved engine role for role, so a stale
+  // field (a languageMode from the previous provider) cannot survive the merge.
+  return normalizeEngineSelection(merged);
+}
+
+function migrateSettings(settings, { strictEngine = false } = {}) {
+  // 2026-09-05 fix: Imported settings must not carry the separate canvas agent's context.
+  settings = {
+    apiKeys: settings.apiKeys,
+    subtitle: settings.subtitle,
+    subtitleHistory: settings.subtitleHistory,
+  };
   // A hand-edited, truncated, or half-written settings.json can hold
   // `"subtitle": null`, `"subtitle": []`, `"subtitle": "boom"`, or a number.
   // Every migration below assumed a plain object, so the very first assignment
@@ -227,97 +377,162 @@ function migrateSettings(settings) {
   if (!isPlainObject(settings.subtitle)) {
     settings.subtitle = JSON.parse(JSON.stringify(DEFAULT_SUBTITLE_SETTINGS));
   }
+  if (isPlainObject(settings.apiKeys)) {
+    settings.apiKeys = Object.fromEntries(
+      Object.entries(settings.apiKeys).filter(([name]) => name !== "openaiSecondary"),
+    );
+  }
   // Self-heal a fontFamily that an earlier unvalidated save turned into an
   // object/array: deepMerge spread the default string into per-index keys
   // ({"0":"A","1":"r",...}) that later reached setProperty("--subtitle-font-family").
   if (typeof settings.subtitle.fontFamily !== "string") {
     settings.subtitle.fontFamily = DEFAULT_SUBTITLE_SETTINGS.fontFamily;
   }
+  migrateGlossaryPresetSelection(settings.subtitle);
+  if (!isValidGlossarySelections(settings.subtitle.glossaries)) {
+    settings.subtitle.glossaries = DEFAULT_SUBTITLE_SETTINGS.glossaries.map((glossary) => ({ ...glossary }));
+  }
   settings.subtitle.translationProvider = "gemini";
-  // Mixed caption+audio output is retired. Any settings.json written before that
-  // still holds it, and validateSubtitleSettings now rejects it — so migrate on
-  // the way in rather than letting the file become unloadable. Captions is the
-  // safe half: it degrades what the user hears, never what they read.
-  if (settings.subtitle?.outputMode === "captions_audio") {
-    settings.subtitle.outputMode = "captions";
+  settings.subtitle.outputMode = "captions";
+  // 2026-09-02: per-role Gemini model fields are replaced by the engine catalog selection.
+  let engine;
+  const legacyEngineInput = {
+    engine: settings.subtitle.engine,
+    geminiTranscribeModel: settings.subtitle.geminiTranscribeModel,
+    geminiSummaryModel: settings.subtitle.geminiSummaryModel,
+    geminiPolishModel: settings.subtitle.geminiPolishModel,
+  };
+  if (strictEngine) engine = migrateLegacyEngineSelection(legacyEngineInput);
+  else {
+    try {
+      engine = migrateLegacyEngineSelection(legacyEngineInput);
+    } catch {
+      engine = DEFAULT_ENGINE_SELECTION;
+    }
+  }
+  settings.subtitle.engine = engine;
+  // `engineDefaultsSeen` (852c486) is retired by spec §9: the Live Call engine
+  // is the admin's global value and the desktop never remembers it.
+  for (const retiredKey of ["geminiTranscribeModel", "geminiSummaryModel", "geminiPolishModel", "audioLanguage", "audioVolume", "voiceProvider", "model", "geminiModel", "engineDefaultsSeen"]) {
+    delete settings.subtitle[retiredKey];
   }
   if (settings.subtitle?.tonePolishModel === "gpt-4o-mini") {
     settings.subtitle.tonePolishModel = DEFAULT_SUBTITLE_SETTINGS.tonePolishModel;
   }
-  if (settings.subtitle?.displayMode === "translation_source") {
-    settings.subtitle.displayMode = DEFAULT_SUBTITLE_SETTINGS.displayMode;
-  }
-  if (
-    settings.subtitle?.translateAllLanguages === true
-    && Array.isArray(settings.subtitle.translationLanguages)
-    && settings.subtitle.translationLanguages.length === 2
-    && settings.subtitle.translationLanguages[0] === "en"
-    && settings.subtitle.translationLanguages[1] === "ko"
-  ) {
-    settings.subtitle.translationLanguages = ["en", "ko", "ja"];
-  }
+  // 2026-09-06: displayMode is an operator choice again (captions default to translation
+  // only; "translation_source" shows the spoken original beside every selected language).
+  // A saved language list is the user's choice: loading never adds a language.
+  // (An earlier migration expanded ["en","ko"] to ["en","ko","ja"] when
+  // translateAllLanguages was on - a silent third Soniox connection.)
   if (settings.subtitle?.maxWidth === 1100) {
     settings.subtitle.maxWidth = DEFAULT_SUBTITLE_SETTINGS.maxWidth;
   }
-  if (
-    settings.subtitle?.outputMode === "captions"
-    && Array.isArray(settings.subtitle?.translationLanguages)
-    && !settings.subtitle.translationLanguages.includes(settings.subtitle.audioLanguage)
-  ) {
-    settings.subtitle.audioLanguage = settings.subtitle.translationLanguages[0]
-      ?? DEFAULT_SUBTITLE_SETTINGS.audioLanguage;
+  if (typeof settings.subtitle.overlayDisplayId !== "string"
+    || settings.subtitle.overlayDisplayId.length > 64
+    || /[\u0000-\u001f\u007f]/u.test(settings.subtitle.overlayDisplayId)) {
+    settings.subtitle.overlayDisplayId = "";
+  }
+  if (typeof settings.subtitle.overlayAllDisplays !== "boolean") {
+    settings.subtitle.overlayAllDisplays = !settings.subtitle.overlayDisplayId;
+  }
+  // A stored combination can be individually valid yet unusable together: a
+  // file written before the caption-language rule existed can hold Soniox's
+  // two-way translation next to three languages. The load path repairs that by
+  // dropping the one role it cannot honour - leaving it in place would make
+  // every later save (which validates strictly) fail, locking the user out of
+  // the settings screen. strictEngine callers check this themselves.
+  if (!strictEngine) {
+    try {
+      validateEngineForLanguages(settings.subtitle.engine, settings.subtitle.translationLanguages);
+    } catch {
+      // Nothing on this path may throw: it runs while the desktop app boots.
+      let repaired = DEFAULT_ENGINE_SELECTION;
+      try {
+        repaired = validateEngineForLanguages(
+          { ...settings.subtitle.engine, translation: DEFAULT_ENGINE_SELECTION.translation },
+          settings.subtitle.translationLanguages,
+        );
+      } catch {}
+      settings.subtitle.engine = repaired;
+    }
   }
   return settings;
 }
 
-function seedFromEnv(settings, env, readCodexAuth) {
+function migrateGlossaryPresetSelection(subtitle) {
+  const glossary = typeof subtitle.glossary === "string" ? subtitle.glossary : "";
+  const domain = typeof subtitle.translationDomain === "string" ? subtitle.translationDomain : "";
+  if (!glossary.trim() && !domain.trim()) {
+    subtitle.glossaryPresetId = DEFAULT_GLOSSARY_PRESET_ID;
+    subtitle.glossaryPresetName = "";
+    subtitle.glossary = DEFAULT_GLOSSARY_PRESET.glossary;
+    subtitle.translationDomain = DEFAULT_GLOSSARY_PRESET.domain;
+    return;
+  }
+
+  if (isReleasedDefaultGlossary(subtitle, glossary, domain)) {
+    subtitle.glossaryPresetId = DEFAULT_GLOSSARY_PRESET_ID;
+    subtitle.glossaryPresetName = "";
+    subtitle.glossary = DEFAULT_GLOSSARY_PRESET.glossary;
+    subtitle.translationDomain = DEFAULT_GLOSSARY_PRESET.domain;
+    return;
+  }
+
+  const exactBuiltIn = GLOSSARY_PRESETS.find((preset) => preset.glossary === glossary
+    && preset.domain === domain
+    && hasSameLanguagePair(preset.languagePair, subtitle.languagePair));
+  if (exactBuiltIn) {
+    subtitle.glossaryPresetId = exactBuiltIn.id;
+    subtitle.glossaryPresetName = "";
+    return;
+  }
+
+  const currentId = typeof subtitle.glossaryPresetId === "string"
+    ? subtitle.glossaryPresetId.trim().slice(0, 128)
+    : "";
+  const isKnownBuiltIn = GLOSSARY_PRESETS.some((preset) => preset.id === currentId);
+  subtitle.glossaryPresetId = isKnownBuiltIn ? "" : currentId;
+  subtitle.glossaryPresetName = subtitle.glossaryPresetId && typeof subtitle.glossaryPresetName === "string"
+    ? subtitle.glossaryPresetName.trim().slice(0, 80)
+    : "";
+}
+
+function isReleasedDefaultGlossary(subtitle, glossary, domain) {
+  const presetId = typeof subtitle.glossaryPresetId === "string" ? subtitle.glossaryPresetId.trim() : "";
+  const presetName = typeof subtitle.glossaryPresetName === "string" ? subtitle.glossaryPresetName.trim() : "";
+  if (presetName || (presetId && presetId !== DEFAULT_GLOSSARY_PRESET_ID)) return false;
+  if (!hasSameLanguagePair(DEFAULT_GLOSSARY_PRESET.languagePair, subtitle.languagePair)) return false;
+  const glossaryFingerprint = fingerprintPresetText(glossary);
+  const domainFingerprint = fingerprintPresetText(domain);
+  return LEGACY_DEFAULT_PRESET_FINGERPRINTS.some((fingerprints) => (
+    fingerprints.glossary === glossaryFingerprint && fingerprints.domain === domainFingerprint
+  ));
+}
+
+function fingerprintPresetText(value) {
+  const normalized = value.replace(/\r\n?/gu, "\n").replace(/\n$/u, "");
+  return createHash("sha256").update(normalized, "utf8").digest("hex");
+}
+
+function hasSameLanguagePair(left, right) {
+  if (!left || !right) return false;
+  return new Set([left.a, left.b]).size === 2
+    && new Set([left.a, left.b]).size === new Set([right.a, right.b]).size
+    && [left.a, left.b].every((language) => new Set([right.a, right.b]).has(language));
+}
+
+function seedFromEnv(settings, env) {
   const next = settings;
   const openaiKey = trimOrEmpty(env.OPENAI_API_KEY);
   if (openaiKey) next.apiKeys.openai = openaiKey;
-  const openaiSecondaryKey = trimOrEmpty(env.OPENAI_SECONDARY_API_KEY);
-  if (openaiSecondaryKey) next.apiKeys.openaiSecondary = openaiSecondaryKey;
   const geminiKey = trimOrEmpty(env.GEMINI_API_KEY);
   if (geminiKey) next.apiKeys.gemini = geminiKey;
   const geminiSecondaryKey = trimOrEmpty(env.GEMINI_SECONDARY_API_KEY);
   if (geminiSecondaryKey) next.apiKeys.geminiSecondary = geminiSecondaryKey;
-
-  const openaiModel = trimOrEmpty(env.OPENAI_MODEL);
-  if (openaiModel) next.agent.openai.model = openaiModel;
-
-  const openaiBaseURL = trimOrEmpty(env.OPENAI_BASE_URL);
-  if (openaiBaseURL) next.agent.openai.baseURL = openaiBaseURL;
-
-  const reasoningEffort = trimOrEmpty(env.OPENAI_REASONING_EFFORT);
-  if (reasoningEffort) next.agent.openai.reasoningEffort = reasoningEffort;
-
-  const codexModel = trimOrEmpty(env.CODEX_MODEL);
-  if (codexModel) next.agent.codex.model = codexModel;
-
-  const codexBaseURL = trimOrEmpty(env.CODEX_BASE_URL);
-  if (codexBaseURL) next.agent.codex.baseURL = codexBaseURL;
-
-  const ollamaModel = trimOrEmpty(env.OLLAMA_MODEL);
-  if (ollamaModel) next.agent.ollama.model = ollamaModel;
-
-  const ollamaBaseURL = trimOrEmpty(env.OLLAMA_BASE_URL);
-  if (ollamaBaseURL) next.agent.ollama.baseURL = ollamaBaseURL;
-
-  const codexAuth = safeReadCodexAuth(readCodexAuth, env);
-  if (codexAuth) next.agent.provider = "codex";
-  else if (ollamaModel) next.agent.provider = "ollama";
-  else next.agent.provider = "openai";
-
-  if (openaiKey) next.transcription.provider = "openai";
+  const sonioxKey = trimOrEmpty(env.SONIOX_API_KEY);
+  if (sonioxKey) next.apiKeys.soniox = sonioxKey;
 
   return next;
-}
-
-function safeReadCodexAuth(readCodexAuth, env) {
-  try {
-    return readCodexAuth(env);
-  } catch {
-    return null;
-  }
 }
 
 function trimOrEmpty(value) {
@@ -325,16 +540,10 @@ function trimOrEmpty(value) {
   return value.trim();
 }
 
-export function validateAgentInstructions(value) {
-  if (typeof value === "string" && value.length > MAX_AGENT_INSTRUCTIONS_CHARS) {
-    throw new Error(`Agent instructions must be ${MAX_AGENT_INSTRUCTIONS_CHARS} characters or fewer.`);
-  }
-}
-
 // API keys were persisted with no validation at all: `{ openai: { evil: 1 } }`
 // was written straight to disk and then made getSanitized() report
 // hasOpenAIKey: true for a "key" no provider call can ever use. Keys must be
-// strings under one of the four known slots.
+// strings under one of the three known slots.
 export function validateApiKeys(value) {
   if (value === undefined) return;
   if (!isPlainObject(value)) throw new Error("apiKeys must be a plain object.");
@@ -362,6 +571,11 @@ export function validateSubtitleSettings(value) {
   if (value.micDeviceId !== undefined && typeof value.micDeviceId !== "string") {
     throw new Error("Subtitle micDeviceId must be a string.");
   }
+  // Live Call 중 로컬 Gemini 엔진 병행(hybrid) opt-in. 기본 false = 게이트웨이
+  // 단일 정본 생산자(이중 번역 비용 방지).
+  if (value.liveCallLocalEngine !== undefined && typeof value.liveCallLocalEngine !== "boolean") {
+    throw new Error("Subtitle liveCallLocalEngine must be a boolean.");
+  }
   if (value.displayMode !== undefined && !["translation_only", "translation_source"].includes(value.displayMode)) {
     throw new Error("Subtitle display mode must be translation_only or translation_source.");
   }
@@ -373,43 +587,18 @@ export function validateSubtitleSettings(value) {
   }
   if (value.languagePair !== undefined) validateLanguagePair(value.languagePair);
   if (value.translationLanguages !== undefined) validateTranslationLanguages(value.translationLanguages);
+  if (value.liveCallTranslationLanguages !== undefined) {
+    validateLiveCallTranslationLanguages(value.liveCallTranslationLanguages);
+  }
   // Mixed caption+audio output is retired: a session produces captions OR
   // interpreted audio, not both. A settings file written before this still holds
   // the old value, so the READ path migrates it (see migrateSettingsFile) rather
   // than throwing here, which would make the file unloadable.
-  if (value.outputMode !== undefined && !["captions", "audio"].includes(value.outputMode)) {
-    throw new Error("Subtitle outputMode must be captions or audio.");
+  if (value.outputMode !== undefined && value.outputMode !== "captions") {
+    throw new Error("Subtitle outputMode must be captions.");
   }
-  const hasAudioOutput = value.outputMode === "audio";
-  if (hasAudioOutput) {
-    if (value.translationProvider !== "gemini") throw new Error("Subtitle translationProvider must remain gemini.");
-    const voiceProvider = value.voiceProvider ?? "gemini";
-    if (!["gemini", "openai"].includes(voiceProvider)) throw new Error("Subtitle voiceProvider must be gemini or openai.");
-    if (!Array.isArray(value.translationLanguages)) {
-      throw new Error("Subtitle audioLanguage requires translationLanguages.");
-    }
-    if (typeof value.audioLanguage !== "string" || !value.translationLanguages.includes(value.audioLanguage)) {
-      throw new Error("Subtitle audioLanguage must be one of translationLanguages.");
-    }
-    if (voiceProvider === "openai" && !OPENAI_REALTIME_TRANSLATION_LANGUAGES.has(value.audioLanguage)) {
-      throw new Error("Subtitle audioLanguage is not supported by OpenAI Realtime Translation.");
-    }
-    if (!Number.isFinite(value.audioVolume) || value.audioVolume < 0 || value.audioVolume > 1) {
-      throw new Error("Subtitle audioVolume must be between 0 and 1.");
-    }
-  } else {
-    if (value.audioLanguage !== undefined && !isSupportedSubtitleLanguage(value.audioLanguage)) {
-      throw new Error("Subtitle audioLanguage must be a supported language code.");
-    }
-    if (value.audioLanguage !== undefined
-      && Array.isArray(value.translationLanguages)
-      && !value.translationLanguages.includes(value.audioLanguage)) {
-      throw new Error("Subtitle audioLanguage must be one of translationLanguages.");
-    }
-    if (value.audioVolume !== undefined
-      && (!Number.isFinite(value.audioVolume) || value.audioVolume < 0 || value.audioVolume > 1)) {
-      throw new Error("Subtitle audioVolume must be between 0 and 1.");
-    }
+  for (const retiredKey of ["audioLanguage", "audioVolume", "voiceProvider", "model", "geminiModel"]) {
+    if (value[retiredKey] !== undefined) throw new Error(`Subtitle ${retiredKey} is retired in caption-only mode.`);
   }
   if (value.position !== undefined && !["bottom-center", "top-center", "middle-center"].includes(value.position)) {
     throw new Error("Subtitle position must be bottom-center, top-center, or middle-center.");
@@ -444,12 +633,22 @@ export function validateSubtitleSettings(value) {
   if (value.translationProvider !== undefined && value.translationProvider !== "gemini") {
     throw new Error("Subtitle translationProvider must remain gemini.");
   }
-  if (value.voiceProvider !== undefined && !["gemini", "openai"].includes(value.voiceProvider)) {
-    throw new Error("Subtitle voiceProvider must be gemini or openai.");
-  }
   if (value.glossary !== undefined) {
     if (typeof value.glossary !== "string" || value.glossary.length > MAX_SUBTITLE_GLOSSARY_CHARS) {
       throw new Error(`Subtitle glossary must be a string of ${MAX_SUBTITLE_GLOSSARY_CHARS} characters or fewer.`);
+    }
+  }
+  if (value.glossaries !== undefined && !isValidGlossarySelections(value.glossaries)) {
+    throw new Error("Subtitle glossaries must contain between 1 and 5 valid glossary selections.");
+  }
+  if (value.glossaryPresetId !== undefined) {
+    if (typeof value.glossaryPresetId !== "string" || value.glossaryPresetId.length > 128) {
+      throw new Error("Subtitle glossaryPresetId must be a string of 128 characters or fewer.");
+    }
+  }
+  if (value.glossaryPresetName !== undefined) {
+    if (typeof value.glossaryPresetName !== "string" || value.glossaryPresetName.length > 80) {
+      throw new Error("Subtitle glossaryPresetName must be a string of 80 characters or fewer.");
     }
   }
   if (value.translationDomain !== undefined) {
@@ -468,17 +667,30 @@ export function validateSubtitleSettings(value) {
       throw new Error(`Subtitle fontFamily must be a string of ${MAX_SUBTITLE_FONT_FAMILY_CHARS} characters or fewer.`);
     }
   }
-  if (value.geminiModel !== undefined && typeof value.geminiModel !== "string") {
-    throw new Error("Subtitle geminiModel must be a string.");
+  for (const legacy of ["geminiTranscribeModel", "geminiSummaryModel", "geminiPolishModel", "geminiModel"]) {
+    if (value[legacy] !== undefined) throw new Error("Subtitle model fields moved to subtitle.engine.");
   }
-  if (value.geminiPolishModel !== undefined && typeof value.geminiPolishModel !== "string") {
-    throw new Error("Subtitle geminiPolishModel must be a string.");
-  }
+  if (value.engine !== undefined) normalizeEngineSelection(value.engine);
   if (value.tonePolishModel !== undefined && typeof value.tonePolishModel !== "string") {
     throw new Error("Subtitle tonePolishModel must be a string.");
   }
   if (value.overlayEnabled !== undefined && typeof value.overlayEnabled !== "boolean") {
     throw new Error("Subtitle overlayEnabled must be a boolean.");
+  }
+  if (value.overlayDisplayIds !== undefined && value.overlayDisplayIds !== null
+    && (!Array.isArray(value.overlayDisplayIds) || value.overlayDisplayIds.length > 16
+      || new Set(value.overlayDisplayIds).size !== value.overlayDisplayIds.length
+      || value.overlayDisplayIds.some((id) => typeof id !== "string" || !id || id.length > 64 || /[\u0000-\u001f\u007f]/u.test(id)))) {
+    throw new Error("Subtitle overlayDisplayIds must contain unique display IDs.");
+  }
+  if (value.overlayAllDisplays !== undefined && typeof value.overlayAllDisplays !== "boolean") {
+    throw new Error("Subtitle overlayAllDisplays must be a boolean.");
+  }
+  if (value.overlayDisplayId !== undefined
+    && (typeof value.overlayDisplayId !== "string"
+      || value.overlayDisplayId.length > 64
+      || /[\u0000-\u001f\u007f]/u.test(value.overlayDisplayId))) {
+    throw new Error("Subtitle overlayDisplayId must be a valid display ID.");
   }
   if (value.ollamaBaseURL !== undefined) validateLocalOllamaBaseURL(value.ollamaBaseURL);
   if (value.ollamaModel !== undefined) {
@@ -493,13 +705,32 @@ export function validateSubtitleSettings(value) {
   }
   if (value.opacity !== undefined) {
     const opacity = Number(value.opacity);
-    if (!Number.isFinite(opacity) || opacity < 0.2 || opacity > 1) {
-      throw new Error("Subtitle opacity must be between 0.2 and 1.");
+    if (!Number.isFinite(opacity) || opacity < 0 || opacity > 1) {
+      throw new Error("Subtitle opacity must be between 0 and 1.");
     }
   }
 }
 
-const OPENAI_REALTIME_TRANSLATION_LANGUAGES = new Set(["en", "es", "pt", "fr", "ja", "ru", "zh", "de", "ko", "hi", "id", "vi", "it"]);
+function isValidGlossarySelections(value) {
+  if (!Array.isArray(value) || value.length < 1 || value.length > 5) return false;
+  const keys = new Set();
+  for (const selection of value) {
+    if (!isPlainObject(selection)) return false;
+    const selectionKeys = Object.keys(selection);
+    if (selection.sourceKind === "builtin") {
+      if (selectionKeys.length !== 2 || !BUILT_IN_GLOSSARY_IDS.has(selection.sourceId)) return false;
+    } else if (selection.sourceKind === "host") {
+      if (selectionKeys.length !== 3 || typeof selection.sourceId !== "string"
+        || !GLOSSARY_PRESET_UUID_PATTERN.test(selection.sourceId)
+        || !Number.isSafeInteger(selection.documentVersion) || selection.documentVersion < 1) return false;
+    } else return false;
+    const key = `${selection.sourceKind}:${selection.sourceId}`;
+    if (keys.has(key)) return false;
+    keys.add(key);
+  }
+  return true;
+}
+
 
 function validateFontSize(value, label) {
   const fontSize = Number(value);
@@ -518,9 +749,21 @@ function validateLanguagePair(value) {
 function validateTranslationLanguages(value) {
   if (!Array.isArray(value)) throw new Error("Subtitle translationLanguages must be an array.");
   const unique = new Set(value);
-  if (value.length < 2 || value.length > MAX_TRANSLATION_LANGUAGES || unique.size !== value.length
+  if (value.length < 1 || value.length > MAX_TRANSLATION_LANGUAGES || unique.size !== value.length
     || value.some((language) => !isSupportedSubtitleLanguage(language))) {
-    throw new Error(`Subtitle translationLanguages must include 2-${MAX_TRANSLATION_LANGUAGES} different supported language codes.`);
+    throw new Error(`Subtitle translationLanguages must include 1-${MAX_TRANSLATION_LANGUAGES} different supported language codes.`);
+  }
+}
+
+function validateLiveCallTranslationLanguages(value) {
+  if (!Array.isArray(value)) throw new Error("Subtitle liveCallTranslationLanguages must be an array.");
+  if (value.length === 0) return; // empty = inherit translationLanguages
+  const unique = new Set(value);
+  // Live Call sessions accept 1-3 languages (webapp schema min is 1), unlike
+  // the local overlay which needs at least 2.
+  if (value.length > MAX_TRANSLATION_LANGUAGES || unique.size !== value.length
+    || value.some((language) => !isSupportedSubtitleLanguage(language))) {
+    throw new Error(`Subtitle liveCallTranslationLanguages must include up to ${MAX_TRANSLATION_LANGUAGES} different supported language codes.`);
   }
 }
 

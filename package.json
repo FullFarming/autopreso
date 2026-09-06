@@ -1,7 +1,7 @@
 {
-  "name": "realtime-noel",
-  "version": "0.2.1",
-  "description": "Realtime bilingual subtitles and visual note taking.",
+  "name": "nova",
+  "version": "0.2.3",
+  "description": "NOVA live translation captions.",
   "license": "MIT",
   "author": "Kun Chen <kun@kunchenguid.com>",
   "homepage": "https://github.com/kyeongmankim/realtime-noel#readme",
@@ -18,25 +18,28 @@
   "type": "module",
   "main": "electron/main.js",
   "bin": {
-    "realtime-noel": "src/cli.js"
+    "nova": "src/nova-cli.js"
   },
   "files": [
     "assets/",
     "electron/",
     "LICENSE",
+    "packages/caption-core/",
+    "packages/gemini-server/",
     "public/",
     "src/"
   ],
   "scripts": {
-    "build:moonshine-sidecars": "node ./scripts/build-moonshine-sidecars.js",
     "desktop": "node ./scripts/start-desktop.js",
-    "dev": "node ./src/cli.js",
+    "dev": "node ./src/nova-cli.js",
     "dist:mac": "electron-builder --mac dmg --arm64 --publish never",
     "dist:mac:x64": "electron-builder --mac dmg --x64 --publish never",
     "dist:win": "electron-builder --win portable --x64 --publish never",
-    "prepare:release-packages": "node ./scripts/prepare-release-packages.js",
-    "start": "node ./src/cli.js",
-    "test": "node --test \"test/**/*.test.js\"",
+    "spike:engine": "node ./scripts/engine-spike.mjs",
+    "start": "node ./src/nova-cli.js",
+    "cloud-run:configure-scale-zero": "bash ./scripts/configure-cloud-run-scale-zero.sh",
+    "cloud-run:verify-scale-zero": "node ./scripts/verify-cloud-run-scale-zero.mjs",
+    "test": "node --test \"test/**/*.test.js\" \"packages/gemini-server/*.test.js\"",
     "test:all": "npm test && npm --prefix media-gateway test && npm --prefix webapp test",
     "typecheck": "tsc --noEmit"
   },
@@ -44,15 +47,25 @@
     "appId": "com.realtime-noel.app",
     "productName": "NOVA",
     "icon": "assets/icon.png",
+    "protocols": [
+      {
+        "name": "NOVA",
+        "schemes": [
+          "nova"
+        ]
+      }
+    ],
     "files": [
       "assets/**",
       "electron/**",
+      "packages/caption-core/**",
       "public/**",
       "src/**",
       "package.json"
     ],
     "mac": {
       "category": "public.app-category.productivity",
+      "identity": "-",
       "hardenedRuntime": true,
       "entitlements": "build/entitlements.mac.plist",
       "entitlementsInherit": "build/entitlements.mac.plist",
@@ -94,10 +107,6 @@
     "open": "^11.0.0",
     "ws": "^8.20.0",
     "zod": "^4.4.3"
-  },
-  "optionalDependencies": {
-    "@realtime-noel/moonshine-darwin-arm64": "0.1.1",
-    "@realtime-noel/moonshine-darwin-x64": "0.1.1"
   },
   "devDependencies": {
     "@types/express": "^5.0.6",

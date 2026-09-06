@@ -1,5 +1,46 @@
 # NOVA — Design System
 
+## 2026-09-05 unified controls and concise labels
+
+This user-approved refinement takes precedence over earlier wrapping rules for
+ordinary action buttons. Standard action buttons, text inputs and select triggers
+use 44px height, border-box sizing and 8px radius. Icon-only actions have a 44px
+hit area. Keep range tracks, checkbox/radio graphics, textareas and content-rich
+selection rows appropriate to their content; do not stretch their internal graphics.
+
+Use short action labels on one line. Let action groups move to the next row when
+space is insufficient. Put optional explanations behind a separate right-side `?`
+button with an accessible name. Help opens by click/keyboard/touch, closes with
+Escape or outside interaction, and stays within the viewport. A help action must
+never submit a form or trigger its neighboring action. Do not hide required errors
+or destructive-action consequences exclusively in optional help.
+
+Caption startup emphasizes language, output displays and transport actions.
+Glossary and appearance details remain available in a collapsed details panel;
+opening or closing details does not reset settings or stop transcription.
+
+## 2026-09-05 approved control and dialog policy
+
+This update takes precedence over older control metrics below. Keep the existing
+caption-first layout and typography; use Apple HIG button and alert hierarchy for
+the controls revised in this release.
+
+- Primary action and keyboard focus: `#0071e3`. Standard action radius: 8px;
+  floating controller and speaking action: pill. Ordinary dialog actions have a
+  minimum 44px target. Keep stop/end visibly distinct from appearance settings.
+- Dialogs have a bounded viewport width and height, an independently scrolling
+  body, and a non-shrinking action footer. Long titles, terms and action labels
+  wrap. Count the browser scrollbar when calculating side margins.
+- The desktop controller stays on the internal display when available. Caption
+  appearance controls update the selected overlay displays without restarting
+  transcription. Closing a settings popover never ends a session.
+- Participant interface language and caption language remain separate. Keep one
+  globe next to the overflow menu, autonym language labels, 16/24px transcript
+  paragraphs, and a visible label on the microphone action.
+
+Verification and remaining scope are recorded in
+`docs/superpowers/status/2026-09-05-ui-polish-verification.md`.
+
 Source of truth for the NOVA desktop app. **Toss (TDS) is the structural
 authority** — principles, type scale, component metrics, motion. Naver's speech
 products (Clova Note, Papago, CLOVA X) supply the transcript- and live-specific
@@ -171,6 +212,28 @@ white initials.
 Toss's `greyOpacity` ramp exists precisely so one component composites correctly
 over any background in either mode. This is the mechanism, not a shortcut.
 
+### 5.7 Web interface — three-color palette
+
+The web app uses three primitives, including admin, participant entry, login,
+records, and dialogs. These web decisions override the older desktop surface
+and brand ramps above for product chrome.
+
+| Role | Token | Value |
+|---|---|---|
+| Background | `--nova-web-background` | `#15151A` |
+| Text | `--nova-web-text` | `#FFFFFF` |
+| Action / selection / focus | `--nova-web-action` | `#0071E3` |
+
+The page, rail, workspace, cards, input surfaces, dialog, and sticky footer
+share the background token. Separate areas with spacing and alpha-white
+borders rather than unrelated dark fills. Muted text, disabled controls, hover
+and selected-state tints derive only from these three primitives. Primary
+actions use white text on blue; secondary actions remain outlined.
+
+Error, warning, live/microphone status, and stable speaker identities retain
+their semantic colors. Captions and presentation surfaces keep their dark
+reading treatment; QR images retain the contrast required for scanning.
+
 ---
 
 ## 6. Typography
@@ -244,6 +307,27 @@ compact    → 22px / 1.4
 ```
 
 Sub-pixel steps `10.5 / 11.5 / 12.5 / 13.5px` in the current CSS all go.
+
+### 6.4 Web interface typography and aligned controls
+
+The web admin, participant entry, login, and dialogs use one ordinary-text row:
+
+| Token | Family | px | line-height | weight | letter-spacing |
+|---|---|---|---|---|---|
+| `--nova-ui-font` | self-hosted Pretendard with locale system fallback | 16 | 24 | 400 | -0.02em |
+
+Labels, values, help text, inputs, buttons, badges, and navigation all use this
+row. Page and section headings retain the heading scale and weight 600, using
+the same family. Status is communicated with color and placement rather than
+another font size or weight. The line-height token is unitless `1.5` (24px at
+16px), so inherited display text scales its line box with its size.
+User-adjustable captions, presentation access codes, countdowns, and icon
+geometry retain their own display rules.
+
+Peer fields and choices use equal-width `minmax(0, 1fr)` tracks. Session titles
+and multiline agendas can span a complete row. Long controls keep a single
+line and scroll within their available width; they do not enlarge one column.
+Workspace zoom and dialog-contained scrolling remain available on narrow views.
 
 ---
 

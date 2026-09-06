@@ -1,0 +1,26 @@
+.shell { min-height: 100dvh; --system-language-bar-height: 64px; }
+.shell[data-presentation="true"] { --system-language-bar-height: 0px; }
+.bar { position: relative; z-index: 30; box-sizing: border-box; display: flex; align-items: center; justify-content: flex-end; min-height: var(--system-language-bar-height); padding: 10px 24px; background: var(--nova-web-background); color: var(--nova-web-text); }
+.content { min-width: 0; min-height: calc(100dvh - var(--system-language-bar-height)); }
+.control { position: relative; max-width: 100%; font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
+.trigger, .option { display: flex; align-items: center; gap: 8px; min-height: 44px; border: 1px solid var(--nova-hairline); border-radius: 8px; background: var(--nova-web-background); color: var(--nova-web-text); padding: 8px 12px; font: inherit; letter-spacing: inherit; cursor: pointer; }
+.trigger { white-space: nowrap; }
+.trigger:focus-visible, .option:focus-visible { outline: 2px solid var(--nova-web-action); outline-offset: 2px; }
+.trigger:hover, .option:hover { background: color-mix(in srgb, var(--nova-web-text) 4%, var(--nova-web-background)); }
+.menu { position: absolute; inset-inline-end: 0; top: calc(100% + 8px); display: grid; gap: 4px; min-width: 176px; max-width: calc(100vw - 48px); padding: 8px; border: 1px solid var(--nova-hairline); border-radius: 8px; background: var(--nova-web-background); }
+.option { justify-content: space-between; width: 100%; border-color: transparent; }
+.option[aria-checked="true"] { background: color-mix(in srgb, var(--nova-web-action) 16%, var(--nova-web-background)); }
+.notice { position: absolute; inset-inline-end: 0; top: 100%; box-sizing: border-box; width: min(360px, calc(100vw - 48px)); margin: 8px 0 0; padding: 12px; border: 1px solid var(--nova-hairline); border-radius: 8px; background: var(--nova-web-background); color: var(--nova-web-text); font: inherit; }
+/* 2026-08-31 fix: The normal-flow language bar reserves space above bounded live workspaces. */
+.content :global(.live-viewer-shell[data-reading-state="live"]),
+.content :global(.live-host-shell:has(.live-workspace-viewport)) { height: calc(100dvh - var(--system-language-bar-height)); }
+.content :global(.live-viewer-shell[data-reading-state="ended"]),
+.content :global(.live-viewer-shell[data-reading-state="ended"] .viewer-notebook),
+.content :global(.live-viewer-shell.is-join),
+.content :global(.live-records-route) { min-height: calc(100dvh - var(--system-language-bar-height)); }
+
+/* 2026-09-05 feat: Live participants keep one language control in their toolbar. */
+.shell:has([data-inline-system-language="true"]) { --system-language-bar-height: 0px; }
+.shell:has([data-inline-system-language="true"]) > .bar { display: none; }
+.trigger[data-compact="true"] { width: 44px; justify-content: center; padding: 8px; }
+.menu { z-index: 40; max-height: min(320px, calc(100dvh - 80px)); overflow-y: auto; overscroll-behavior: contain; }

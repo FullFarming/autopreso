@@ -1,13 +1,30 @@
+import { createSentenceLanguageRouting } from "./sentence-language-routing.js";
+import { createHash, randomUUID } from "node:crypto";
+
 import { AUDIO_CONFIG, normalizeLiveLanguage, textPlausiblyInLanguage, validateLiveSettings } from "./config.js";
 import { OrderedTaskQueue } from "./ordered-task-queue.js";
-import { applyGlossaryCorrections } from "./glossary-corrections.js";
-import { isOutputInTargetLanguage, sourceLaneMatches } from "./language-gate.js";
+import { RollingSpeechSession } from "./rolling-speech-session.js";
+import { safeProviderErrorIdentifier } from "./caption-polish.js";
+import { detectSourceLanguage, isOutputInTargetLanguage, sourceLaneMatches } from "./language-gate.js";
+import { SpeakerCaptureLedger } from "./speaker-capture-ledger.js";
 import { SpeakerRegistry } from "./speaker-registry.js";
+import {
+  createCrossChannelEchoDeduper,
+  createCommittedCaptionFinalizer,
+  createSourceLanguageConsensus,
+  crossChannelEchoContract,
+  isCombinedEngine,
+} from "../../packages/caption-core/index.js";
+export { evaluateCaptionPolish } from "../../packages/caption-core/index.js";
+import {
+  hasKoreanGrammarEvidence,
+  hasUnsupportedEnglishKoreanText,
+  resolveSourceLanguageObservation,
+  canPassThroughSourceObservation,
+  isFixedTargetOutputSupported,
+} from "../../packages/caption-core/language-gate.js";
 
 const INPUT_FRAME_BYTES = AUDIO_CONFIG.inputSampleRate * 2 * AUDIO_CONFIG.chunkMilliseconds / 1_000;
-const OUTPUT_CHUNK_BYTES = AUDIO_CONFIG.outputSampleRate * 2 * 250 / 1_000;
-const TTS_INACTIVITY_MILLISECONDS = 10_000;
-const TTS_MAX_SYNTHESIS_MILLISECONDS = 120_000;
 const LANGUAGE_FAILURE_LIMIT = 3;
 const LANGUAGE_COOLDOWN_MILLISECONDS = 30_000;
 /** Must exceed the real provider commit lag or the fallback fence expires
@@ -19,23 +36,129 @@ const FLOOR_ATTRIBUTION_GRACE_MILLISECONDS = 6_000;
 const REEMISSION_WINDOW_MILLISECONDS = 1_000;
 /** A persistently broken lane logs once per interval, not once per caption. */
 const EMISSION_FAILURE_LOG_INTERVAL_MS = 30_000;
+// Fixed internal constants (never provider or user data), so they are safe to
+// print. They distinguish a durable-persistence stall — which latches the lane
+// closed until reconciliation — from an ordinary provider callback fault.
+const INTERNAL_EMISSION_FAILURE_CODES = Object.freeze([
+  "DURABLE_CAPTION_PERSIST_FAILED",
+  "DURABLE_CAPTION_LANE_FAILED",
+  "AUTHORITATIVE_SOURCE_PERSIST_FAILED",
+  "AUTHORITATIVE_SOURCE_LANE_FAILED",
+  "SESSION_STOPPED",
+]);
+// Keep Live Call's visible revision cadence aligned with captions-only. Gemini
+// often revises the same tail several times in a few hundred milliseconds;
+// forwarding every snapshot makes the caption look as if it is being rewritten.
+const PARTIAL_STABILITY_MILLISECONDS = 140;
+const PARTIAL_MAX_HOLD_MILLISECONDS = 500;
+const PARTIAL_MIN_SIGNAL_CHARACTERS = 12;
+/** Gemini's captions-only-compatible reconnect backs off for as much as 5s.
+ * Frame freshness still uses the 750ms capture guard, but an already accepted
+ * ordered write gets a separate, bounded recovery window. Conflating those two
+ * deadlines permanently removed every caption lane during an ordinary goAway. */
+const CAPTION_POLISH_POLICIES = new Set(["off", "selective", "full"]);
+const AUDIO_SOURCES = new Set(["system", "mic", "participant"]);
+const MAX_SUPPRESSED_SOURCE_TEXTS = 256;
+const ENGLISH_LETTER = /[A-Za-z]/u;
+const KOREAN_LETTER = /[가-힣ㄱ-ㅎㅏ-ㅣ]/u;
+const LANGUAGE_DRIFT_RECONNECT_THRESHOLD = 2;
+/** `sttProvider` spelling for the authoritative source ledger, keyed by the
+ *  engine catalog's stt provider. `supabase-adapters.js` accepts exactly these. */
+const STT_PROVIDER_LABELS = Object.freeze({ gemini: "gemini-transcribe-live", soniox: "soniox" });
+
+function isEnglishKoreanPair(languages) {
+  return languages.length === 2 && languages.includes("en") && languages.includes("ko");
+}
+
+function hasClearKoreanEvidence(value) {
+  const text = String(value ?? "").normalize("NFC");
+  const hangulCount = (text.match(/[가-힣]/gu) ?? []).length;
+  return hasKoreanGrammarEvidence(text)
+    || (hangulCount >= 4 && !ENGLISH_LETTER.test(text));
+}
+
+function resolveSessionInputLanguage(languageCode, text, languages, { strictEnglishKorean = false } = {}) {
+  const providerLanguage = normalizeLiveLanguage(languageCode);
+  if (!isEnglishKoreanPair(languages)) return providerLanguage;
+  // 2026-07-27 fix: EN/KO-only calls are a closed binary contract. Provider
+  // metadata and the prior-turn consensus may lag a clear script transition.
+  // In-pair single-script evidence wins; outside Latin metadata cannot be
+  // relabelled as English, while strong Hangul can recover a stale provider
+  // hint. Mixed text keeps the configured sentence lock.
+  if (strictEnglishKorean && hasUnsupportedEnglishKoreanText(text)) return providerLanguage;
+  const normalizedText = String(text ?? "").normalize("NFC");
+  const hasEnglish = ENGLISH_LETTER.test(normalizedText);
+  const hasKorean = KOREAN_LETTER.test(normalizedText);
+  if (strictEnglishKorean && providerLanguage && !languages.includes(providerLanguage)) {
+    return hasClearKoreanEvidence(normalizedText) ? "ko" : providerLanguage;
+  }
+  if (hasEnglish && !hasKorean) return "en";
+  if (hasKorean && !hasEnglish) return "ko";
+  if (providerLanguage && languages.includes(providerLanguage)) return providerLanguage;
+  if (!providerLanguage && hasKoreanGrammarEvidence(normalizedText)) return "ko";
+  const detected = detectSourceLanguage(text, { minimumSignalChars: 1 });
+  if (detected === "en" || detected === "ko") return detected;
+  if (!providerLanguage) return providerLanguage;
+  if (hasKorean) return "ko";
+  if (hasEnglish) return "en";
+  return providerLanguage;
+}
+
+function isMalformedExplicitLanguageCode(languageCode) {
+  if (languageCode === undefined || languageCode === null || String(languageCode).trim() === "") return false;
+  if (String(languageCode).trim().toLowerCase() === "und") return false;
+  return !normalizeLiveLanguage(languageCode);
+}
+
+function isEnglishKoreanInputRejected(languageCode, text, resolvedLanguage, languages, { strictEnglishKorean = false } = {}) {
+  if (!strictEnglishKorean || !isEnglishKoreanPair(languages)) return false;
+  if (hasUnsupportedEnglishKoreanText(text)) return true;
+  const canonicalLanguage = normalizeLiveLanguage(languageCode);
+  const hasClearKoreanOverride = resolvedLanguage === "ko"
+    && hasClearKoreanEvidence(text);
+  return Boolean((canonicalLanguage && !languages.includes(canonicalLanguage) && !hasClearKoreanOverride)
+    || (resolvedLanguage && !languages.includes(resolvedLanguage)));
+}
+
+function isSessionOutputInTargetLanguage(text, targetLanguage, languages) {
+  if (!isEnglishKoreanPair(languages)) return isOutputInTargetLanguage(text, targetLanguage);
+  const normalizedText = String(text ?? "").normalize("NFC");
+  if (hasUnsupportedEnglishKoreanText(normalizedText)) return false;
+  return isOutputInTargetLanguage(normalizedText, targetLanguage);
+}
 
 export class LiveMediaPipeline {
-  #liveSessions = new Map();
-  #voiceSessions = new Map();
+  #suppressedSourceTexts = new Map();
   #translationQueues = new Map();
-  #ttsQueues = new Map();
-  #lastAudioAt = null;
-  #didEndTurn = false;
+
+  /** Last two committed source finals, oldest first. Passed to the translator
+   *  as previous_utterances so pronoun-dropping sources (Korean, Japanese)
+   *  keep their antecedents; the current utterance is never its own context. */
+  #recentSourceFinals = [];
+  #stt = null;
+  #sourceRecordingFailed = false;
+  #sourceGapTasks = new Set();
+  #sourceGapIds = new Set();
+  #hostAudioSource = null;
   /** Finalized caption sequence per language: (sessionId, language) monotonic, starts at 1. */
   #captionSeq = new Map();
-  /** Transient media events (audio chunks/controls) never consume caption seq. */
-  #mediaSeq = 0;
   #isStopped = false;
+  #isDraining = false;
   #isPaused = false;
-  #ttsAbortControllers = new Set();
   #languageRecovery = new Map();
   #recentUtteranceKeys = new Map();
+  #finalUtteranceTasks = new Map();
+  #lifecycleAbort = new AbortController();
+  #translationAbort = new AbortController();
+  #sourceDraftGeneration = randomUUID();
+  #sourceStreamGeneration = randomUUID();
+  #sourceDraftRevision = 0;
+  #sourceDraftPending = null;
+  #sourceDraftWork = null;
+  #pauseTask = Promise.resolve();
+  #resumeTask = null;
+  #speechRevision = 0;
+  #startTask = null;
   #presentationCaptionState = new Map();
   /** Final side effects stay ordered per language while provider partials are
    *  allowed to keep flowing during the slower polish/persist path. */
@@ -47,9 +170,25 @@ export class LiveMediaPipeline {
   /** Per-lane throttle for caption-emission failure logs. */
   #emissionFailureLoggedAt = new Map();
   #floorSpeaker = null;
+  #sentenceLanguage = createSentenceLanguageRouting();
+  #speakerCapture = new SpeakerCaptureLedger();
+  #audioAcceptanceTail = Promise.resolve();
+  #speakerRoster = null;
+  #speakerRosterKnown = false;
+  #lastCapturedSpeakerKey = null;
+  #pendingSpeakerRoster = null;
+  #speakerRosterPoll = null;
+  #speakerRosterLastPoll = -Infinity;
+  #speakerRosterAcknowledged = -1;
   #recentFloor = null;
   /** Meeting-mode interim caption lanes: per-language latest-wins throttle. */
   #partialLanes = new Map();
+  /** Gemini caption lanes: per-language debounce with a bounded first paint. */
+  #presentationPartialLanes = new Map();
+  #didReportFatalError = false;
+  #authoritativeSourceLaneFailed = false;
+  #authoritativeSourceTail = Promise.resolve();
+  #languageDriftCounts = new Map();
 
   constructor({
     sessionId,
@@ -58,11 +197,17 @@ export class LiveMediaPipeline {
     maxViewers,
     glossaryPack,
     glossaryText,
+    glossaryPresetId,
+    glossaryPresetName,
+    compiledGlossary = undefined,
+    captionConfig,
+    captionConfigFingerprint,
     translationTone,
     domainText,
+    geminiModel,
+    geminiPolishModel,
     mode,
     voiceOutputMode,
-    voiceProvider,
     languages,
     dependencies,
     now = Date.now,
@@ -70,10 +215,12 @@ export class LiveMediaPipeline {
     initialSequence = 0,
     initialSequences = null,
     onHostEvent = null,
+    onFatalError = null,
     getSubscriberCount = null,
     observeLatency = null,
     setTimeoutFn = setTimeout,
     clearTimeoutFn = clearTimeout,
+    captionPolishPolicy = "selective",
   }) {
     const settings = validateLiveSettings({
       sessionType,
@@ -85,20 +232,47 @@ export class LiveMediaPipeline {
       domainText,
       mode,
       voiceOutputMode,
-      voiceProvider,
       languages,
+      captionConfig,
+      captionConfigFingerprint,
+      geminiModel,
+      geminiPolishModel,
+      captionPolishPolicy,
     });
     this.sessionId = sessionId;
     this.sessionType = settings.sessionType;
     this.outputMode = settings.outputMode;
-    this.voiceProvider = settings.voiceProvider;
+    this.captionConfig = settings.captionConfig;
+    this.captionConfigFingerprint = settings.captionConfigFingerprint;
     this.maxViewers = settings.maxViewers;
-    this.glossaryPack = settings.glossaryPack;
-    this.glossaryText = settings.glossaryText;
-    this.translationTone = settings.translationTone;
-    this.domainText = settings.domainText;
-    this.languages = settings.languages;
+    this.glossaryText = this.captionConfig.glossary;
+    this.translationTone = this.captionConfig.tone;
+    this.domainText = this.captionConfig.domain;
+    // The engine selection is the only source of provider/model identity: it
+    // decides whether translation is a separate text call or arrives attached
+    // to each STT final, and it is what the source ledger records as provenance.
+    this.engine = this.captionConfig.engine;
+    this.isCombined = isCombinedEngine(this.engine);
+    this.transcriptionModel = this.engine.stt.model;
+    this.sttProvider = STT_PROVIDER_LABELS[this.engine.stt.provider];
+    if (!this.sttProvider) throw new Error("ENGINE_SELECTION_INVALID");
+    this.translationModel = this.engine.translation.model;
+    this.languages = this.captionConfig.languages;
     this.dependencies = dependencies;
+    if (!this.isCombined && typeof dependencies?.textTranslate?.translate !== "function") {
+      throw new Error("TEXT_TRANSLATE_REQUIRED");
+    }
+    this.captionFinalizer = createCommittedCaptionFinalizer({
+      sessionId: this.sessionId,
+      compiledGlossary,
+      config: this.captionConfig,
+      polish: dependencies.captionPolish?.polish
+        ? (request) => dependencies.captionPolish.polish(request)
+        : null,
+    });
+    // Partials and source-side pre-translation repair reuse the exact index
+    // owned by the shared committed finalizer.
+    this.termRetriever = this.captionFinalizer.termRetriever;
     this.now = now;
     if (!Number.isSafeInteger(initialSequence) || initialSequence < 0) throw new Error("INVALID_INITIAL_SEQUENCE");
     for (const language of this.languages) {
@@ -107,10 +281,15 @@ export class LiveMediaPipeline {
       this.#captionSeq.set(language, Math.max(seed, initialSequence));
     }
     this.onHostEvent = onHostEvent;
+    this.onFatalError = onFatalError;
     this.getSubscriberCount = getSubscriberCount;
     this.observeLatency = observeLatency;
     this.setTimeoutFn = setTimeoutFn;
     this.clearTimeoutFn = clearTimeoutFn;
+    if (!CAPTION_POLISH_POLICIES.has(this.captionConfig.polishPolicy.mode)) throw new Error("INVALID_CAPTION_POLISH_POLICY");
+    this.captionPolishPolicy = this.captionConfig.polishPolicy.mode;
+    this.sourceLanguageConsensus = createSourceLanguageConsensus({ now });
+    this.crossChannelEchoDedupers = new Map(this.languages.map((language) => [language, createCrossChannelEchoDeduper({ now })]));
     this.speakers = speakerRegistry ?? new SpeakerRegistry({
       sessionType: settings.sessionType,
       outputMode: settings.outputMode,
@@ -123,22 +302,12 @@ export class LiveMediaPipeline {
         taskTimeoutMs: 15_000,
         admissionTimeoutMs: 2_000,
       }));
-      if (hasAudioOutput(settings.outputMode)) {
-        this.#ttsQueues.set(language, new OrderedTaskQueue({
-          maxPending: 32,
-          taskTimeoutMs: TTS_MAX_SYNTHESIS_MILLISECONDS + 5_000,
-          admissionTimeoutMs: 2_000,
-          onBackpressureChange: (isBackpressured) => {
-            void this.#setLanguageBackpressure(language, isBackpressured);
-          },
-        }));
-      }
       this.#languageRecovery.set(language, { consecutiveFailures: 0, cooldownUntil: 0, status: "ready" });
     }
   }
 
   get lastSequence() {
-    return Math.max(0, ...this.#captionSeq.values());
+    return Math.max(0, ...Object.values(this.lastSequences));
   }
 
   /** Per-language last finalized caption seq, e.g. { ko: 12, en: 11 }. */
@@ -150,16 +319,78 @@ export class LiveMediaPipeline {
     return this.#isPaused;
   }
 
-  /** Pause: discard inbound audio and stop emitting captions/TTS while keeping
-   *  the pipeline, floor attribution, and per-language seq counters intact. */
+  // There is deliberately NO text-caption ingress. The host's audio arrives as
+  // PCM like any participant's and this pipeline translates it itself for the
+  // web record; accepting the desktop's already-translated text as well wrote
+  // the same utterance twice.
+
+  #hasEnglishKoreanFirewall() {
+    return this.sessionType === "meeting" && isEnglishKoreanPair(this.languages);
+  }
+
+  #recordLanguageDrift(channel) {
+    if (!this.#hasEnglishKoreanFirewall() || this.#didReportFatalError) return;
+    const count = (this.#languageDriftCounts.get(channel) ?? 0) + 1;
+    this.#languageDriftCounts.set(channel, count);
+    if (count < LANGUAGE_DRIFT_RECONNECT_THRESHOLD) return;
+    this.#didReportFatalError = true;
+    try {
+      this.onFatalError?.(new Error("TRANSLATION_LANGUAGE_DRIFT"));
+    } catch {
+      // The current callback remains fail-closed even if the out-of-band
+      // recovery notifier itself fails.
+    }
+  }
+
+  #clearLanguageDrift(channel) {
+    this.#languageDriftCounts.delete(channel);
+  }
+
+  /** Pause keeps record identity but releases the paid speech connection. */
   pause() {
     this.#assertRunning();
     this.#isPaused = true;
+    this.#speechRevision += 1;
+    this.#translationAbort.abort();
+    this.#sourceDraftPending = null;
+    const speech = this.#stt;
+    this.#stt = null;
+    if (speech) {
+      this.#pauseTask = speech.close();
+      this.#pauseTask.catch(() => undefined);
+    }
+    this.#cancelAllPresentationPartials();
+    this.#runTopicSideEffect("pauseTopicSession", this.sessionId);
+    return this.#pauseTask;
   }
 
   resume() {
     this.#assertRunning();
-    this.#isPaused = false;
+    if (!this.#isPaused) return Promise.resolve();
+    if (this.#resumeTask) return this.#resumeTask;
+    const revision = this.#speechRevision;
+    this.#resumeTask = (async () => {
+      await this.#pauseTask;
+      this.#assertRunning();
+      if (revision !== this.#speechRevision) throw new Error("MEDIA_RESUME_CANCELLED");
+      try {
+        await this.#openSpeechSession();
+        this.#assertRunning();
+        if (revision !== this.#speechRevision) throw new Error("MEDIA_RESUME_CANCELLED");
+        this.#translationAbort = new AbortController();
+        this.#isPaused = false;
+        await Promise.all(this.languages.map((language) => this.#publishLanguageStatus(language, "ready")));
+        this.#runTopicSideEffect("resumeTopicSession", this.sessionId);
+      } catch (error) {
+        this.#isPaused = true;
+        this.#translationAbort.abort();
+        const speech = this.#stt;
+        this.#stt = null;
+        await speech?.close();
+        throw error;
+      }
+    })().finally(() => { this.#resumeTask = null; });
+    return this.#resumeTask;
   }
 
   /** Advances the FINALIZED caption counter. Contract C1: only committed
@@ -183,141 +414,205 @@ export class LiveMediaPipeline {
     return (this.#captionSeq.get(language) ?? 0) + 1;
   }
 
-  async start() {
-    if (usesLiveTranslateCaptions(this.sessionType)) {
-      // Captions are locked to the SAME model as the desktop subtitle
-      // pipeline: gemini-3.5-live-translate (audio in → translated captions).
-      // Meeting mode differences from presentation: the first session also
-      // surfaces the input transcript (source-language lane, like the desktop
-      // channel hub), captions carry floor attribution, and voice — when the
-      // session has audio output — is OpenAI, never Gemini.
-      const isMeeting = this.sessionType === "meeting";
-      const opened = await Promise.all(this.languages.map(async (language, languageIndex) => {
-        try {
-          const session = await this.dependencies.liveTranslate.open({
-            language,
-            inputSampleRate: AUDIO_CONFIG.inputSampleRate,
-            outputSampleRate: AUDIO_CONFIG.outputSampleRate,
-            contextCompression: true,
-            sessionResumption: true,
-            correlateInputCaption: isMeeting,
-            onCaption: (caption) => this.#publishPresentationCaption(language, caption),
-            ...(isMeeting && languageIndex === 0
-              ? { onInputCaption: (caption) => this.#publishMeetingInputCaption(caption) }
-              : {}),
-            onAudio: !isMeeting && this.voiceProvider === "gemini"
-              ? (audio) => this.#publishPresentationAudio(language, audio)
-              : async () => {},
-            onInterruption: () => this.#publishAudioControl(language, "clear", "interrupted"),
-            onCallbackError: (error) => this.#recordCaptionEmissionFailure(language, error),
-          });
-          await this.#publishLanguageStatus(language, "ready");
-          return [language, session];
-        } catch {
-          await this.#publishLanguageStatus(language, "unavailable", "LANGUAGE_UNAVAILABLE");
-          return null;
-        }
-      }));
-      this.#liveSessions = new Map(opened.filter(Boolean));
-      if (this.#liveSessions.size === 0) throw new Error("LANGUAGE_UNAVAILABLE");
-      if (hasAudioOutput(this.outputMode) && (this.voiceProvider === "openai" || isMeeting)) {
-        const voiceSessions = await Promise.all(this.languages.map(async (language) => {
-          try {
-            const session = await this.dependencies.openaiLiveTranslate.open({
-              language: language.toLowerCase().split("-")[0],
-              inputSampleRate: AUDIO_CONFIG.inputSampleRate,
-              outputSampleRate: AUDIO_CONFIG.outputSampleRate,
-              onAudio: (audio) => this.#publishPresentationAudio(language, audio),
-              onInterruption: () => this.#publishAudioControl(language, "clear", "interrupted"),
-            });
-            return [language, session];
-          } catch {
-            await this.#publishAudioControl(language, "clear", "voice_unavailable");
-            await this.#publishLanguageStatus(language, "ready", "VOICE_UNAVAILABLE");
-            return null;
-          }
-        }));
-        this.#voiceSessions = new Map(voiceSessions.filter(Boolean));
-      }
-      if (typeof this.dependencies.publisher.markLive === "function") await this.dependencies.publisher.markLive(this.sessionId);
-      return;
+  start() {
+    if (this.#startTask) return this.#startTask;
+    this.#startTask = this.#start();
+    return this.#startTask;
+  }
+
+  async #start() {
+    this.#assertRunning();
+    await this.#refreshSpeakerRoster();
+    await this.#openSpeechSession();
+    this.#assertRunning();
+    if (typeof this.dependencies.publisher.markLive === "function") await this.dependencies.publisher.markLive(this.sessionId);
+    await Promise.all(this.languages.map((language) => this.#publishLanguageStatus(language, "ready")));
+    if (this.speakers.list().length > 0) await this.#publishLegend();
+    this.#runTopicSideEffect("startTopicSession", this.sessionId, this.languages);
+  }
+
+  async #openSpeechSession() {
+    this.#sourceStreamGeneration = randomUUID();
+    this.#sentenceLanguage.reset();
+    this.#speakerCapture = new SpeakerCaptureLedger();
+    this.#lastCapturedSpeakerKey = null;
+    // One microphone feeds the engine and one authoritative source ledger.
+    // Gemini translates finalized text; Soniox native target streams attach
+    // aligned translations to the primary source final.
+    this.#stt = new RollingSpeechSession({
+      provider: {
+        open: (options) => this.dependencies.speechToText.open({
+          ...options,
+          // Live Call has exactly one host input device. Speaker diarization is
+          // unnecessary and makes rollover attribution harder to keep stable.
+          diarization: false,
+          // A provider that had to drop committed source text (terminal stream
+          // failure mid-segment) leaves a hole in the original record; say so
+          // once instead of letting the ledger look complete.
+          onContinuityDiscard: (event) => this.#reportSourceRecordingFailure(event ?? {}),
+        }),
+      },
+      onConnectionState: (state) => this.onHostEvent?.({
+        type: "engine-status", sessionId: this.sessionId,
+        role: state.language ? "translation" : "stt",
+        provider: this.engine.stt.provider, model: this.engine.stt.model,
+        ...state,
+      }),
+      onFinalUtterance: (utterance) => this.acceptFinalUtterance(utterance),
+      onPartialTranscript: (partial) => this.acceptPartialTranscript(partial),
+      onPartialTranslation: (partial) => this.acceptPartialTranslation(partial),
+      onRemap: (mapping) => {
+        for (const [nextLabel, previousLabel] of mapping) this.speakers.alias(nextLabel, previousLabel);
+      },
+      capturePcmWindows: false,
+      now: this.now,
+    });
+    await this.#stt.start({ signal: this.#lifecycleAbort.signal });
+  }
+
+  #reportSourceRecordingFailure(failure = {}) {
+    this.#recordKnownSourceGap(failure);
+    if (this.#sourceRecordingFailed || this.#isStopped) return;
+    this.#sourceRecordingFailed = true;
+    this.observeLatency?.("source_recording_failures_total", 1);
+    const event = { type: "source-status", sessionId: this.sessionId,
+      status: "unavailable", code: "SOURCE_RECORDING_UNAVAILABLE" };
+    this.onHostEvent?.(event);
+    void Promise.resolve(this.dependencies.publisher.publishSourceStatus?.(event)).catch(() => {});
+  }
+
+  #recordKnownSourceGap(failure) {
+    if (!failure || typeof failure.segmentId !== "string" || !Number.isFinite(Date.parse(failure.sourceStartedAt))
+      || !Number.isFinite(Date.parse(failure.sourceEndedAt))) return;
+    if (this.#sourceGapIds.has(failure.segmentId)) return;
+    if (this.#sourceGapIds.size >= 2048 || this.#sourceGapTasks.size >= 8
+      || typeof this.dependencies.publisher.persistSourceRecordingGap !== "function") {
+      this.#reportSourceGapWriteFailure(); return;
     }
-    // No session type reaches here anymore: presentation AND meeting both
-    // caption through Gemini Live Translate (desktop-identical model). The
-    // Cloud STT rolling-session path was removed with the 2026-07-24 provider
-    // split; acceptFinalUtterance stays as the direct-injection entry point.
-    throw new Error("UNSUPPORTED_SESSION_TYPE");
+    this.#sourceGapIds.add(failure.segmentId);
+    const task = Promise.resolve().then(() => this.dependencies.publisher.persistSourceRecordingGap({
+      sessionId: this.sessionId, segmentId: failure.segmentId,
+      sourceStartedAt: failure.sourceStartedAt, sourceEndedAt: failure.sourceEndedAt,
+    })).catch(() => this.#reportSourceGapWriteFailure())
+      .finally(() => this.#sourceGapTasks.delete(task));
+    this.#sourceGapTasks.add(task);
+  }
+
+  #reportSourceGapWriteFailure() {
+    this.observeLatency?.("source_gap_persist_failures_total", 1);
+    console.warn("SOURCE_GAP_PERSIST_FAILED");
   }
 
   #reservePresentationFinal(language) {
     const previous = this.#presentationFinalTails.get(language) ?? Promise.resolve();
-    let release;
-    const current = new Promise((resolve) => { release = resolve; });
+    let release = () => {};
+    const current = new Promise((resolve) => { release = () => resolve(); });
     this.#presentationFinalTails.set(language, previous.then(() => current));
     return { previous, release };
   }
 
-  async acceptAudio(frame, capturedAt = this.now(), capturedFloorSpeaker = undefined) {
+  acceptAudio(frame, capturedAt = this.now(), capturedFloorSpeaker = undefined, inputSource = null) {
+    const floor = structuredClone(capturedFloorSpeaker === undefined ? this.#floorSpeaker : capturedFloorSpeaker);
+    // Host and participant WebSocket queues are independent. Their accepted
+    // PCM must share one order with profile epochs and provider rotations.
+    const work = this.#audioAcceptanceTail.then(() => this.#acceptCapturedAudio(frame, capturedAt, floor, inputSource));
+    this.#audioAcceptanceTail = work.catch(() => undefined);
+    return work;
+  }
+
+  async #acceptCapturedAudio(frame, capturedAt, capturedFloorSpeaker, inputSource) {
     this.#assertRunning();
     if (!(frame instanceof Uint8Array) || frame.byteLength !== INPUT_FRAME_BYTES) throw new Error("INVALID_AUDIO_FRAME");
-    if (this.#isPaused) return false;
+    if (this.#isPaused || this.#isDraining) return false;
     if (this.now() - capturedAt > AUDIO_CONFIG.staleFrameMilliseconds) return false;
-    this.#lastAudioAt = this.now();
-    this.#didEndTurn = false;
-    if (usesLiveTranslateCaptions(this.sessionType)) {
-      // The gateway snapshots the producer identity when it accepts the frame.
-      // Its ordered audio tail may reach this method after speak-end or a host
-      // reclaim, so resolving from the current floor here can steal the late
-      // final for the host. `undefined` keeps the direct-call compatibility;
-      // explicit null is a host frame captured while the floor was free.
-      const floorSpeaker = this.sessionType === "meeting"
-        ? (capturedFloorSpeaker === undefined
-          ? this.#floorAttribution(capturedAt)
-          : capturedFloorSpeaker)
-        : null;
-      const results = await Promise.all([...this.#liveSessions].map(async ([language, session]) => {
-        try {
-          await session.sendAudio(frame, { capturedAt, floorSpeaker });
-          return null;
-        } catch {
-          this.#liveSessions.delete(language);
-          await session.close().catch(() => undefined);
-          await this.#publishLanguageStatus(language, "unavailable", "LANGUAGE_UNAVAILABLE");
-          return language;
-        }
-      }));
-      if (results.some(Boolean) && this.#liveSessions.size === 0) throw new Error("LANGUAGE_UNAVAILABLE");
-      await Promise.all([...this.#voiceSessions].map(async ([language, session]) => {
-        try {
-          await session.sendAudio(frame);
-        } catch {
-          this.#voiceSessions.delete(language);
-          await session.close().catch(() => undefined);
-          await this.#publishAudioControl(language, "clear", "voice_unavailable");
-          await this.#publishLanguageStatus(language, "ready", "VOICE_UNAVAILABLE");
-        }
-      }));
+    const source = AUDIO_SOURCES.has(inputSource) ? inputSource : "host";
+    // The pin guards against a host mixing two CAPTURE devices into one STT
+    // stream. Participant floor audio is a different speaker by design — the
+    // gateway floor gate already serializes it against host audio — so it
+    // must neither trip the pin nor claim it for itself.
+    if (source !== "participant") {
+      if (this.#hostAudioSource === null) this.#hostAudioSource = source;
+      else if (this.#hostAudioSource !== source) throw new Error("MULTIPLE_HOST_AUDIO_SOURCES_FORBIDDEN");
+    }
+    if (!this.#stt) throw new Error("STT_SESSION_NOT_STARTED");
+    if (this.#pendingSpeakerRoster) {
+      this.#speakerRoster = this.#pendingSpeakerRoster;
+      this.#pendingSpeakerRoster = null;
+    }
+    const floor = capturedFloorSpeaker === undefined ? this.#floorSpeaker : capturedFloorSpeaker;
+    const linked = floor && this.#speakerRoster?.speakers.find((speaker) => speaker.participantId === floor.participantId);
+    const onsite = this.#speakerRoster?.speakers.find((speaker) => speaker.id === this.#speakerRoster.activeOnsiteSpeakerId);
+    const selected = floor ? linked : onsite;
+    const speakerProfile = selected ? Object.fromEntries(Object.entries(selected).filter(([key]) => key !== "participantId")) : null;
+    const captureKey = JSON.stringify({ floor, speakerProfile });
+    // Gemini does not expose reliable acoustic onset for every callback. A new
+    // stream makes the old tail immutable before a different person owns PCM.
+    if (this.#speakerRoster && this.engine.stt.provider === "gemini" && this.#lastCapturedSpeakerKey !== null
+      && captureKey !== this.#lastCapturedSpeakerKey) await this.#stt.rotateAtSpeakerBoundary();
+    if (this.#lastCapturedSpeakerKey !== null && captureKey !== this.#lastCapturedSpeakerKey) this.#sentenceLanguage.reset();
+    this.#lastCapturedSpeakerKey = captureKey;
+    this.#speakerCapture.capture(AUDIO_CONFIG.chunkMilliseconds, { floor, speakerProfile,
+      unresolved: typeof this.dependencies.publisher.fetchSpeakerRoster === "function" && !this.#speakerRosterKnown });
+    await this.#stt.sendAudio(frame);
+    if (!this.#isStopped && !this.#isDraining && this.#speakerRoster && this.#speakerRosterAcknowledged < this.#speakerRoster.revision) {
+      const revision = this.#speakerRoster.revision;
+      this.#speakerRosterAcknowledged = revision;
+      void this.dependencies.publisher.ackSpeakerRoster?.(this.sessionId, revision).catch(() => {
+        this.#speakerRosterAcknowledged = Math.min(this.#speakerRosterAcknowledged, revision - 1);
+        this.onHostEvent?.({ type: "speaker-roster-status", sessionId: this.sessionId, status: "unavailable", revision });
+      });
     }
     return true;
   }
 
   async tick() {
-    if (!usesLiveTranslateCaptions(this.sessionType) || this.#lastAudioAt === null || this.#didEndTurn) return;
-    if (this.now() - this.#lastAudioAt <= AUDIO_CONFIG.streamEndAfterMilliseconds) return;
-    await Promise.all([...this.#liveSessions.values()].map((session) => session.audioStreamEnd()));
-    await Promise.all([...this.#voiceSessions.values()].map((session) => session.audioStreamEnd()));
-    this.#didEndTurn = true;
+    if (this.#isStopped || this.#isDraining || this.now() - this.#speakerRosterLastPoll < 1000) return;
+    await this.#refreshSpeakerRoster();
+  }
+
+  async #refreshSpeakerRoster() {
+    if (typeof this.dependencies.publisher.fetchSpeakerRoster !== "function") return;
+    if (this.#speakerRosterPoll) return this.#speakerRosterPoll;
+    this.#speakerRosterLastPoll = this.now();
+    this.#speakerRosterPoll = Promise.resolve().then(async () => {
+      const roster = await this.dependencies.publisher.fetchSpeakerRoster(this.sessionId);
+      if (this.#isStopped) return;
+      this.#speakerRosterKnown = true;
+      if (!roster || roster.revision === 0) return;
+      const previous = this.#pendingSpeakerRoster ?? this.#speakerRoster;
+      if (!previous || roster.revision > previous.revision) this.#pendingSpeakerRoster = structuredClone(roster);
+    }).catch(() => {
+      this.onHostEvent?.({ type: "speaker-roster-status", sessionId: this.sessionId, status: "unavailable" });
+    }).finally(() => { this.#speakerRosterPoll = null; });
+    return this.#speakerRosterPoll;
   }
 
   async endAudioStream() {
-    if (!usesLiveTranslateCaptions(this.sessionType) || this.#didEndTurn) return;
-    await Promise.all([...this.#liveSessions.values()].map((session) => session.audioStreamEnd()));
-    await Promise.all([...this.#voiceSessions.values()].map((session) => session.audioStreamEnd()));
-    this.#didEndTurn = true;
+    // Production STT keeps one rolling host stream open. Short browser
+    // silence boundaries do not close it; the stream closes only on Stop.
   }
 
   acceptFinalUtterance(utterance) {
-    return this.#processFinalUtterance(utterance);
+    try {
+      this.#assertRunning();
+      if (this.#authoritativeSourceLaneFailed) throw new Error("AUTHORITATIVE_SOURCE_LANE_FAILED");
+      const sourceGeneration = utterance.sourceGeneration ?? this.#sourceStreamGeneration;
+      const key = createUtteranceKey({ ...utterance, sourceGeneration, text: String(utterance.text ?? "").normalize("NFC").trim() });
+      const existing = this.#finalUtteranceTasks.get(key);
+      if (existing) return existing.finally(() => utterance.pcmWindow?.fill(0));
+      if (this.#recentUtteranceKeys.has(key)) { utterance.pcmWindow?.fill(0); return Promise.resolve(); }
+      if (this.#finalUtteranceTasks.size >= 64) throw new Error("SOURCE_BACKPRESSURE_EXCEEDED");
+      const draftRevision = this.#sourceDraftRevision;
+      this.#sentenceLanguage.complete(this.#sourceSentenceKey(utterance));
+      const captureAttribution = this.#resolveCapturedSpeaker(utterance);
+      utterance = { ...utterance, captureAttribution };
+      const task = Promise.resolve().then(() => this.#processFinalUtterance(utterance, draftRevision, sourceGeneration)).then(() => {
+        this.#recentUtteranceKeys.set(key, true);
+        if (this.#recentUtteranceKeys.size > 256) this.#recentUtteranceKeys.delete(this.#recentUtteranceKeys.keys().next().value);
+      }).finally(() => { this.#finalUtteranceTasks.delete(key); utterance.pcmWindow?.fill(0); });
+      this.#finalUtteranceTasks.set(key, task);
+      return task;
+    } catch (error) { utterance.pcmWindow?.fill(0); return Promise.reject(error); }
   }
 
   /** Streams interim STT transcripts as isFinal:false captions so viewers see
@@ -325,18 +620,89 @@ export class LiveMediaPipeline {
    *  previously showed nothing until Google finalized an utterance, which can
    *  take 10s+ during continuous speech). Latest-wins per language: while a
    *  translation is in flight, newer interim text replaces the queued one. */
-  acceptPartialTranscript({ text, sourceLanguage } = {}) {
+  /** @param {{text?: unknown, sourceLanguage?: unknown, sourceGeneration?: string, segmentId?: string, sourceGenerationStartOffsetMs?: number, sourceGenerationEndOffsetMs?: number, sourceSessionStartOffsetMs?: number, sourceSessionEndOffsetMs?: number}} [value] */
+  acceptPartialTranscript({ text, sourceLanguage, ...sourceBounds } = {}) {
     if (this.#isStopped || this.#isPaused || !hasCaptionOutput(this.outputMode)) return;
     const normalizedText = String(text ?? "").normalize("NFC").trim();
     if (!normalizedText) return;
-    const normalizedSourceLanguage = normalizeLiveLanguage(sourceLanguage);
-    const floor = this.#floorAttribution(Number.NaN);
-    // Partials share one synthetic "live" lane (or the floor holder's lane) so
-    // the viewer can replace them in place; finals clear the "live" lane.
-    // Must be a COMPLETE SpeakerAssignment: the viewer contract validates
-    // every field (colorToken/voiceName/voiceStatus/lastSeenAt) and silently
-    // drops captions whose speaker shape is partial.
-    const speaker = floor
+    const decision = this.#sentenceLanguage.observe(normalizedText, sourceLanguage, this.#sourceSentenceKey(sourceBounds));
+    if (decision.suppressSource) return;
+    const languageObservation = decision.observation;
+    const normalizedSourceLanguage = languageObservation.languageCode;
+    const attribution = this.#resolveCapturedSpeaker(sourceBounds);
+    const floor = attribution ? attribution.floor : this.#floorAttribution(Number.NaN);
+    const metadata = this.#profileMetadata(attribution);
+    this.#queueSourceDraft({ type: "source-draft", sessionId: this.sessionId,
+      generation: this.#sourceDraftGeneration, revision: ++this.#sourceDraftRevision,
+      text: normalizedText, sourceLanguage: normalizedSourceLanguage, languageObservation,
+      ...metadata,
+      speaker: { role: attribution?.unresolved ? "unknown" : floor ? "participant" : "host",
+        label: attribution?.unresolved ? "발언자 확인 필요" : attribution?.speakerProfile?.displayName ?? (floor ? "참여자" : "발표자") },
+      emittedAt: new Date(this.now()).toISOString() });
+    const speaker = { ...this.#interimSpeaker(floor), ...(metadata.speakerName ? { name: metadata.speakerName, label: metadata.speakerName } : {}) };
+    for (const language of this.languages) {
+      // Cost guard: interim speech is published only on its verbatim source
+      // lane. Target-language Gemini calls wait for the committed STT result,
+      // avoiding repeated latest-wins translations while the speaker talks.
+      if (!canPassThroughSourceObservation(languageObservation, language)) continue;
+      const lane = this.#partialLane(language);
+      lane.pending = {
+        normalizedText,
+        normalizedSourceLanguage,
+        languageObservation,
+        speaker,
+        speakerMetadata: { ...this.#liveCaptionSpeakerMetadata(floor), ...metadata },
+        epoch: lane.epoch,
+      };
+      if (!lane.inFlight) {
+        lane.inFlight = true;
+        void this.#drainPartialLane(language, lane).finally(() => { lane.inFlight = false; });
+      }
+    }
+  }
+
+  /** Streams a combined engine's interim translation (Soniox emits target-
+   *  language tokens while the speaker is still talking) as an isFinal:false
+   *  caption on that target lane. Contract C1: the interim carries the seq the
+   *  coming final will take and never consumes one. The lane's epoch gate makes
+   *  the committed final supersede any interim still queued behind it. */
+  /** @param {{language?: unknown, text?: unknown, sourceLanguage?: unknown, sourceGeneration?: string, segmentId?: string, sourceGenerationStartOffsetMs?: number, sourceGenerationEndOffsetMs?: number, sourceSessionStartOffsetMs?: number, sourceSessionEndOffsetMs?: number}} [value] */
+  acceptPartialTranslation({ language, text, sourceLanguage, ...sourceBounds } = {}) {
+    if (this.#isStopped || this.#isPaused || !hasCaptionOutput(this.outputMode)) return;
+    const targetLanguage = normalizeLiveLanguage(language);
+    if (!targetLanguage || !this.languages.includes(targetLanguage)) return;
+    const normalizedText = String(text ?? "").normalize("NFC").trim();
+    if (!normalizedText) return;
+    const normalizedSourceLanguage = normalizeLiveLanguage(sourceLanguage) || null;
+    // Same-language "translation" is the source lane's verbatim interim, which
+    // acceptPartialTranscript already publishes; a second copy would flicker.
+    if (this.#sentenceLanguage.resolveHint(sourceLanguage) === targetLanguage) return;
+    const attribution = this.#resolveCapturedSpeaker(sourceBounds);
+    const floor = attribution ? attribution.floor : this.#floorAttribution(Number.NaN);
+    const metadata = this.#profileMetadata(attribution);
+    const lane = this.#partialLane(targetLanguage);
+    lane.pending = {
+      kind: "translation",
+      normalizedText,
+      normalizedSourceLanguage,
+      languageObservation: null,
+      speaker: this.#interimSpeaker(floor),
+      speakerMetadata: { ...this.#liveCaptionSpeakerMetadata(floor), ...metadata },
+      epoch: lane.epoch,
+    };
+    if (!lane.inFlight) {
+      lane.inFlight = true;
+      void this.#drainPartialLane(targetLanguage, lane).finally(() => { lane.inFlight = false; });
+    }
+  }
+
+  /** Partials share one synthetic "live" lane (or the floor holder's lane) so
+   *  the viewer can replace them in place; finals clear the "live" lane. Must
+   *  be a COMPLETE SpeakerAssignment: the viewer contract validates every field
+   *  (colorToken/voiceName/voiceStatus/lastSeenAt) and silently drops captions
+   *  whose speaker shape is partial. */
+  #interimSpeaker(floor) {
+    return floor
       ? this.#floorSpeakerAssignment(floor)
       : {
         speakerId: "live",
@@ -347,14 +713,6 @@ export class LiveMediaPipeline {
         voiceStatus: "disabled",
         lastSeenAt: new Date(this.now()).toISOString(),
       };
-    for (const language of this.languages) {
-      const lane = this.#partialLane(language);
-      lane.pending = { normalizedText, normalizedSourceLanguage, sourceLanguage, speaker, epoch: lane.epoch };
-      if (!lane.inFlight) {
-        lane.inFlight = true;
-        void this.#drainPartialLane(language, lane).finally(() => { lane.inFlight = false; });
-      }
-    }
   }
 
   #partialLane(language) {
@@ -366,38 +724,92 @@ export class LiveMediaPipeline {
     return lane;
   }
 
+  #supportsFixedTargetOutput(text, language) {
+    return isFixedTargetOutputSupported(text, language, {
+      protectedTerms: language === "ko"
+        ? this.termRetriever.getProtectedTerms({ translatedText: text, targetLanguage: language })
+        : [],
+    });
+  }
+
+  /** Output-language gate for translated interims. It is the same test the
+   *  source-partial path applies (fixed-target check on ko, session-language
+   *  check elsewhere); finals run the stricter `#supportsFixedTargetOutput`
+   *  on every target lane, so an interim can pass here and its final still be
+   *  refused. */
+  #isTranslatedOutputAcceptable(text, language) {
+    return language === "ko"
+      ? this.#supportsFixedTargetOutput(text, language)
+      : isSessionOutputInTargetLanguage(text, language, this.languages);
+  }
+
+  /** One text translation through the engine's translator. `translateWithProvenance`
+   *  reports the model that actually produced the text (the fallback chain may
+   *  have moved off the primary); a plain `translate` seam is credited to the
+   *  engine's configured model. */
+  async #translateText(input) {
+    const translator = this.dependencies.textTranslate;
+    if (typeof translator.translateWithProvenance === "function") {
+      const produced = await translator.translateWithProvenance(input);
+      const model = typeof produced?.model === "string" && produced.model.trim() ? produced.model : this.translationModel;
+      return { text: String(produced?.text ?? ""), model };
+    }
+    return { text: await translator.translate(input), model: this.translationModel };
+  }
+
   async #drainPartialLane(language, lane) {
     while (lane.pending && !this.#isStopped && !this.#isPaused) {
       const partial = lane.pending;
       lane.pending = null;
       try {
+        if (partial.kind === "translation") {
+          // Deterministic terminology only: an interim never earns a text-model
+          // call. The gate below is the source-partial output gate, not the
+          // finals gate (finals additionally require fixed-target output).
+          const textOut = this.termRetriever.repair(partial.normalizedText, { language, isFinal: false });
+          if (partial.epoch !== lane.epoch) continue;
+          if (lane.lastText === textOut) continue;
+          if (!this.#isTranslatedOutputAcceptable(textOut, language)) continue;
+          lane.lastText = textOut;
+          await this.#publishCaption(language, {
+            type: "caption",
+            seq: this.#peekCaptionSeq(language),
+            sessionId: this.sessionId,
+            language,
+            speaker: partial.speaker,
+            ...partial.speakerMetadata,
+            text: textOut,
+            isFinal: false,
+            sourceText: null,
+            sourceLanguage: partial.normalizedSourceLanguage,
+            translationStatus: "translated",
+            translationModel: this.translationModel,
+            sourceEndedAt: new Date(this.now()).toISOString(),
+            emittedAt: new Date(this.now()).toISOString(),
+          }, { mirrorToHost: true });
+          continue;
+        }
         // Same detection-backed decision as the final path: an interim must not
         // flash raw English on the KO lane just because the STT labelled
         // contaminated English as Korean.
-        const isSourceLane = sourceLaneMatches(partial.normalizedText, partial.normalizedSourceLanguage, language);
-        let textOut = partial.normalizedText;
-        // Partials never carry "failed": a throw below skips publication
-        // entirely rather than fail-open, so an interim caption is only ever
-        // the verbatim source or a real translation.
-        const translationStatus = isSourceLane ? "verbatim" : "translated";
-        if (!isSourceLane) {
-          const recovery = this.#languageRecovery.get(language);
-          if (recovery && recovery.cooldownUntil > this.now()) continue;
-          textOut = await this.dependencies.textTranslate.translate({
-            text: partial.normalizedText,
-            language,
-            sourceLanguage: textPlausiblyInLanguage(partial.normalizedText, partial.normalizedSourceLanguage ?? "") ? partial.sourceLanguage : undefined,
-            glossaryPack: this.glossaryPack,
-            glossaryText: this.glossaryText,
-            intent: "partial",
-          });
-        }
+        const repairLanguage = partial.normalizedSourceLanguage
+          || detectSourceLanguage(partial.normalizedText, { minimumSignalChars: 1 });
+        const repairedSourceText = this.termRetriever.repair(partial.normalizedText, {
+          language: repairLanguage,
+          isFinal: false,
+        });
+        const isSourceLane = canPassThroughSourceObservation(partial.languageObservation, language)
+          && (language !== "ko" || this.#supportsFixedTargetOutput(repairedSourceText, language));
+        // 2026-08-31 fix: 오염된 한국어 초안은 확정 발언의 최초 번역을 기다린다. 초안마다 추가 모델 호출을 만들지 않는다.
+        if (!isSourceLane) continue;
+        const textOut = repairedSourceText;
+        const translationStatus = "verbatim";
         // A final published while this partial was translating supersedes it.
         if (partial.epoch !== lane.epoch) continue;
         if (lane.lastText === textOut) continue;
         // Output-language gate, same as finals: never show an interim that is
         // not in this lane's language.
-        if (!isOutputInTargetLanguage(textOut, language)) continue;
+        if (language !== "ko" && !isSessionOutputInTargetLanguage(textOut, language, this.languages)) continue;
         lane.lastText = textOut;
         const caption = {
           type: "caption",
@@ -405,17 +817,20 @@ export class LiveMediaPipeline {
           sessionId: this.sessionId,
           language,
           speaker: partial.speaker,
+          ...partial.speakerMetadata,
           text: textOut,
           isFinal: false,
-          sourceText: isSourceLane ? null : partial.normalizedText,
+          sourceText: isSourceLane ? null : repairedSourceText,
           sourceLanguage: partial.normalizedSourceLanguage || null,
+          languageObservation: partial.languageObservation,
           translationStatus,
+          ...(isSourceLane ? { origin: "source" } : {}),
           sourceEndedAt: new Date(this.now()).toISOString(),
           emittedAt: new Date(this.now()).toISOString(),
         };
         await this.#publishCaption(language, caption, { mirrorToHost: true });
       } catch {
-        // Partial captions are best-effort; the finalized utterance retries.
+        // A failed preview is discarded; only the committed utterance can authorize target translation.
       }
     }
   }
@@ -439,7 +854,9 @@ export class LiveMediaPipeline {
         this.#meetingInputCaption = null;
         this.#requiresFreshMeetingSourceContext = true;
         this.#presentationCaptionState.clear();
-        for (const session of this.#liveSessions.values()) session.setFloorSpeaker?.(next);
+        this.#cancelAllPresentationPartials();
+        this.sourceLanguageConsensus.resetForSpeakerBoundary();
+        this.#sentenceLanguage.reset();
       }
       // Speaker→speaker preemption keeps a grace record for the previous
       // holder: their lagging STT finals must not attribute to the new one.
@@ -460,7 +877,9 @@ export class LiveMediaPipeline {
       this.#meetingInputCaption = null;
       this.#requiresFreshMeetingSourceContext = true;
       this.#presentationCaptionState.clear();
-      for (const session of this.#liveSessions.values()) session.setFloorSpeaker?.(null);
+      this.#cancelAllPresentationPartials();
+      this.sourceLanguageConsensus.resetForSpeakerBoundary();
+      this.#sentenceLanguage.reset();
     }
     this.#floorSpeaker = null;
   }
@@ -478,7 +897,13 @@ export class LiveMediaPipeline {
     const lastLoggedAt = this.#emissionFailureLoggedAt.get(language) ?? 0;
     if (this.now() - lastLoggedAt < EMISSION_FAILURE_LOG_INTERVAL_MS) return;
     this.#emissionFailureLoggedAt.set(language, this.now());
-    const reason = error instanceof Error ? error.message : String(error);
+    // Our OWN failure constants are safe to name (they are fixed strings in
+    // this repo, never provider or user data) and they are the only way to
+    // tell a durable-persist stall from a provider callback fault in
+    // production. Without this every cause collapsed to the generic fallback,
+    // which made a recurring lane blackout undiagnosable from the logs.
+    const internalCode = INTERNAL_EMISSION_FAILURE_CODES.find((code) => hasErrorCode(error, new Set([code])));
+    const reason = internalCode ?? safeProviderErrorIdentifier(error, "CAPTION_EMISSION_FAILED");
     console.error(`[live] caption emission failed on lane ${language} (${reason}). `
       + "Captions for this lane are being dropped, not retried.");
   }
@@ -486,7 +911,7 @@ export class LiveMediaPipeline {
   /** Resolves which floor holder a caption belongs to, given when its speech
    *  STARTED (epoch ms). Exposed so the attribution fence is directly testable
    *  and so a provider that can stamp speech onset has a seam to feed it —
-   *  today the live-translate path has no onset and passes NaN, which makes the
+   *  today the Gemini Transcribe path has no onset and passes NaN, which makes the
    *  fence inert in production (tracked separately). */
   resolveFloorForCapture(sourceStartedAtMs = Number.NaN) {
     return this.#floorAttribution(sourceStartedAtMs);
@@ -545,30 +970,123 @@ export class LiveMediaPipeline {
     return assignment;
   }
 
-  async #processFinalUtterance({ speakerLabel, text, sourceLanguage, sourceStartOffsetMs, sourceEndOffsetMs, sourceEndedAt, pcmWindow = null }) {
+  #sourceSentenceKey(value) {
+    return `${value.sourceGeneration ?? this.#sourceStreamGeneration}:${value.segmentId ?? "current"}`;
+  }
+
+  #resolveCapturedSpeaker(utterance) {
+    if (!this.#speakerRoster && (this.#speakerRosterKnown || typeof this.dependencies.publisher.fetchSpeakerRoster !== "function")) return null;
+    return this.#speakerCapture.resolve(utterance);
+  }
+
+  #profileMetadata(attribution) {
+    if (attribution?.unresolved) return { speakerAttribution: "unresolved", speakerRole: "unknown", speakerName: "발언자 확인 필요" };
+    if (!attribution?.speakerProfile) return {};
+    return { speakerProfile: attribution.speakerProfile, speakerName: attribution.speakerProfile.displayName,
+      speakerDepartment: attribution.speakerProfile.department };
+  }
+
+  #liveCaptionSpeakerMetadata(floor) {
+    if (this.sessionType !== "meeting") return {};
+    return floor
+      ? {
+        speakerRole: "participant",
+        speakerName: floor.displayName,
+        speakerDepartment: floor.department ?? "",
+        speakerJobTitle: floor.jobTitle ?? "",
+      }
+      : {
+        speakerRole: "host",
+        speakerName: "Host",
+        speakerDepartment: "",
+        speakerJobTitle: "",
+      };
+  }
+
+  async #processFinalUtterance({ speakerLabel, text, rawText = null, sourceLanguage, sourceStartOffsetMs, sourceEndOffsetMs, sourceEndedAt, pcmWindow = null, translations = null, captureAttribution = null }, draftRevision, sourceGeneration) {
     this.#assertRunning();
-    if (this.#isPaused) {
-      pcmWindow?.fill(0);
-      return;
-    }
+    if (this.#authoritativeSourceLaneFailed) throw new Error("AUTHORITATIVE_SOURCE_LANE_FAILED");
     const finalizedAt = this.now();
-    const normalizedText = String(text).normalize("NFC").trim();
+    // Preserve the provider's committed value byte-for-byte in the admin-only
+    // source ledger. The canonical form below is a separate field used by
+    // terminology normalization, translation, search, and summaries.
+    const rawProviderText = String(rawText ?? text);
+    const normalizedText = rawProviderText.normalize("NFC").trim();
     if (!normalizedText) return;
-    const utteranceKey = createUtteranceKey({ speakerLabel, text: normalizedText, sourceStartOffsetMs, sourceEndOffsetMs, sourceEndedAt });
-    if (this.#recentUtteranceKeys.has(utteranceKey)) {
-      pcmWindow?.fill(0);
-      return;
-    }
-    this.#recentUtteranceKeys.set(utteranceKey, true);
-    if (this.#recentUtteranceKeys.size > 256) this.#recentUtteranceKeys.delete(this.#recentUtteranceKeys.keys().next().value);
+    const utteranceKey = createUtteranceKey({ speakerLabel, text: normalizedText, sourceGeneration, sourceStartOffsetMs, sourceEndOffsetMs, sourceEndedAt });
+    // 2026-08-31 fix: pause may flush accepted speech into a final source row.
+    // Persist it, then the aborted translation signal prevents new inference.
+    const processingSignal = AbortSignal.any([this.#lifecycleAbort.signal, this.#translationAbort.signal]);
     const sourceStartedAt = resolveSourceStartedAt({ sourceStartOffsetMs, sourceEndOffsetMs, sourceEndedAt });
     const speakerCount = this.speakers.list().length;
-    const floor = this.#floorAttribution(sourceStartedAt === null ? Number.NaN : Date.parse(sourceStartedAt));
-    const speaker = floor
+    const floor = captureAttribution ? captureAttribution.floor : this.#floorAttribution(sourceStartedAt === null ? Number.NaN : Date.parse(sourceStartedAt));
+    const speakerProfile = captureAttribution?.speakerProfile;
+    const speakerAttribution = captureAttribution?.unresolved ? "unresolved" : null;
+    const assignedSpeaker = floor
       ? this.#floorSpeakerAssignment(floor)
       : this.speakers.getOrCreate(String(speakerLabel));
-    const normalizedSourceLanguage = normalizeLiveLanguage(sourceLanguage);
+    const speaker = { ...assignedSpeaker };
+    if (speakerProfile) {
+      speaker.label = speakerProfile.displayName;
+      speaker.name = speakerProfile.displayName;
+      speaker.department = speakerProfile.department;
+    } else if (speakerAttribution) {
+      speaker.label = "발언자 확인 필요";
+      speaker.name = "발언자 확인 필요";
+    }
+    const profileMetadata = {
+      ...(speakerProfile ? { speakerProfile } : {}),
+      ...(speakerAttribution ? { speakerAttribution } : {}),
+    };
+    const languageObservation = resolveSourceLanguageObservation(normalizedText, sourceLanguage);
+    const normalizedSourceLanguage = languageObservation.languageCode;
+    // Provider text decides the source language before any canonicalization.
+    // Repairing first would let a glossary term bias the lane decision.
+    const repairLanguage = normalizedSourceLanguage;
+    const repairedSourceText = this.termRetriever.repair(normalizedText, {
+      language: repairLanguage,
+      isFinal: true,
+    });
+    const authoritativeSource = await this.#persistAuthoritativeSource({
+      utteranceKey,
+      rawText: rawProviderText,
+      normalizedText: repairedSourceText,
+      sourceLanguage: repairLanguage || "und",
+      languageObservation,
+      speakerLabel: String(speakerLabel),
+      ...profileMetadata,
+      speaker,
+      floor,
+      sourceStartedAt,
+      sourceEndedAt,
+      providerCommittedAt: new Date(finalizedAt).toISOString(),
+    });
+    if (draftRevision > 0 && draftRevision === this.#sourceDraftRevision) {
+      this.#queueSourceDraft({ type: "source-draft-clear", sessionId: this.sessionId,
+        generation: this.#sourceDraftGeneration, revision: draftRevision });
+    }
     pcmWindow?.fill(0);
+    this.#assertRunning();
+    if (processingSignal.aborted) return;
+    if (authoritativeSource.idempotent === true) {
+      let restoredLanguages = [];
+      try {
+        const replay = await this.dependencies.publisher.replayAuthoritativeSourceCaptions?.(
+          this.sessionId, authoritativeSource.sourceUtteranceId, this.languages, { signal: processingSignal },
+        );
+        if (Array.isArray(replay?.restoredLanguages)) restoredLanguages = replay.restoredLanguages;
+      } catch { /* A lost replay response cannot authorize another paid inference. */ }
+      this.#assertRunning();
+      if (processingSignal.aborted) return;
+      await Promise.all(this.languages.map((language) => this.#publishLanguageStatus(language,
+        restoredLanguages.includes(language) ? "ready" : "unavailable",
+        restoredLanguages.includes(language) ? undefined : "SOURCE_REPLAY_INCOMPLETE")));
+      return;
+    }
+    // Snapshot BEFORE appending: the context for utterance N is N-2 and N-1.
+    const recentSourceContext = this.#recentSourceFinals.join("\n");
+    this.#recentSourceFinals.push(repairedSourceText);
+    if (this.#recentSourceFinals.length > 2) this.#recentSourceFinals.shift();
     const legendPromise = this.speakers.list().length !== speakerCount
       ? this.#publishLegend()
       : Promise.resolve();
@@ -576,94 +1094,119 @@ export class LiveMediaPipeline {
       const recovery = this.#languageRecovery.get(language);
       const cooldownActive = Boolean(recovery && recovery.cooldownUntil > this.now());
       let translationFailureCode = null;
+      // Set when a combined engine's final simply lacked this lane. The
+      // original is published as `failed` (fail-open, contract ruling 2) and
+      // the lane is reported unavailable, but the miss must not count toward
+      // the three-strike cooldown: the provider cannot be re-asked, and after
+      // three misses `cooldownActive` would short-circuit BEFORE the fail-open
+      // publish, leaving the lane silent for 30 s with no seq consumed.
+      let isFailOpenMiss = false;
       try {
           const { ttsCompletion } = await queue.enqueue(async (signal) => {
+            const requestSignal = AbortSignal.any([signal, processingSignal]);
             await legendPromise;
-            if (signal.aborted) throw new Error("QUEUE_TASK_TIMEOUT");
+            if (requestSignal.aborted) return { ttsCompletion: null };
             this.#assertRunning();
-          // Dual-language lanes (contract C6): when the caption language equals
-          // the utterance's source language (as detected by the STT provider),
-          // the STT text is emitted verbatim; only the other lanes translate.
-          // The STT detection is per-result and can be wrong, so passthrough
-          // additionally requires the text's script to match the lane language
-          // — otherwise misdetected Korean would surface raw on the en lane.
-          // sourceLaneMatches applies the desktop engine's count+ratio detection
-          // instead of a bare script-presence test: English carrying a single
-          // Korean place name used to count as Korean and was published
-          // untranslated on the KO lane.
-          const isSourceLane = sourceLaneMatches(normalizedText, normalizedSourceLanguage, language);
-          // laneReady: the published text is genuinely in the lane language
-          // (verbatim source or successful translation) — the TTS gate.
-          let laneReady = isSourceLane;
-          let translatedText = normalizedText;
-          // Provenance for the viewer's original/translation disclosure:
-          // "verbatim" = text IS the original, "translated" = text is a real
-          // translation of sourceText, "failed" = fail-open published the
-          // original on this lane and it is NOT in the lane language.
+          // 2026-08-31 fix: mixed or conflicting source evidence never authorizes
+          // verbatim text on a target lane; numeric neutral text needs no model.
+          const isSourceLane = canPassThroughSourceObservation(languageObservation, language)
+            && (language !== "ko" || this.#supportsFixedTargetOutput(repairedSourceText, language));
+          let translatedText = repairedSourceText;
           let translationStatus = isSourceLane ? "verbatim" : "translated";
+          let translationModel = this.translationModel;
           if (!isSourceLane && !cooldownActive) {
             try {
-              translatedText = await this.dependencies.textTranslate.translate({
-                text: normalizedText,
-                language,
-                // A misdetected source poisons translation; let the provider
-                // auto-detect when the text does not match the detected script.
-                sourceLanguage: textPlausiblyInLanguage(normalizedText, normalizedSourceLanguage ?? "") ? sourceLanguage : undefined,
-                glossaryPack: this.glossaryPack,
-                glossaryText: this.glossaryText,
-                intent: "final",
+              const translationGlossary = this.termRetriever.retrieve({
+                sourceText: repairedSourceText,
+                targetLanguage: language,
+                isFinal: true,
               });
-              laneReady = true;
+              if (this.isCombined) {
+                // The STT provider translated this segment itself; the lane text
+                // arrived on the same final. No text-model call is made here.
+                const laneText = String(translations?.[language]?.text ?? "").normalize("NFC").trim();
+                if (!laneText) throw new Error("COMBINED_TRANSLATION_MISSING");
+                translatedText = laneText;
+              } else {
+                const produced = await this.#translateText({
+                  text: repairedSourceText,
+                  language,
+                  // A misdetected source poisons translation; let the provider
+                  // auto-detect when the text does not match the detected script.
+                  sourceLanguage: languageObservation.state === "single" ? normalizedSourceLanguage : undefined,
+                  signal: requestSignal,
+                  glossaryText: translationGlossary,
+                  sessionContext: this.domainText,
+                  recentSourceText: recentSourceContext,
+                  intent: "final",
+                });
+                translatedText = produced.text;
+                translationModel = produced.model;
+              }
+              const finalized = await this.captionFinalizer.finalize({
+                translatedText,
+                sourceText: repairedSourceText,
+                sourceLanguage: repairLanguage,
+                targetLanguage: language,
+                // This route has already paid for a text translation.
+                // Never issue a second text-model request for the same final;
+                // deterministic terminology enforcement still runs below.
+                hasPriorTextModelCall: true,
+              });
+              if (!finalized) throw new Error("TRANSLATION_EMPTY");
+              translatedText = finalized.text;
             } catch (error) {
-              // Fail-open: a verbatim caption beats a dropped one.
-              translationFailureCode = error instanceof Error ? error.message : "LANGUAGE_UNAVAILABLE";
-              console.warn(`[translate] final translate failed for lane ${language} (${translationFailureCode}); publishing verbatim`);
-              translatedText = normalizedText;
+              if (requestSignal.aborted) return { ttsCompletion: null };
+              translationFailureCode = safeProviderErrorIdentifier(error,
+                this.isCombined ? "COMBINED_TRANSLATION_FAILED" : "GEMINI_TRANSLATE_FAILED");
+              await this.#publishLanguageStatus(language, "unavailable", "LANGUAGE_UNAVAILABLE");
+              // A combined engine cannot be asked again: there is no separate
+              // translator to retry. Keep the record whole by publishing the
+              // original on this lane, labelled so no display path renders it
+              // as a translation.
+              if (!(this.isCombined && hasErrorCode(error, new Set(["COMBINED_TRANSLATION_MISSING"])))) {
+                return { ttsCompletion: null };
+              }
+              isFailOpenMiss = true;
+              translatedText = repairedSourceText;
               translationStatus = "failed";
             }
           }
-          if (!isSourceLane && cooldownActive) translationStatus = "failed";
-          if (signal.aborted) throw new Error("QUEUE_TASK_TIMEOUT");
+          if (!isSourceLane && cooldownActive) return { ttsCompletion: null };
+          if (requestSignal.aborted) return { ttsCompletion: null };
           this.#assertRunning();
-          // Output-language gate — desktop parity (shouldDisplay). A lane must
-          // never publish text that is not in its own language. This is exactly
-          // where fail-open used to leak the untranslated English source onto
-          // the Korean lane, making captions alternate 한글 / 영어. Suppress
-          // instead, and suppress BEFORE #nextCaptionSeq so a dropped lane never
-          // burns a caption seq (contract C1: only committed captions consume).
-          // A "translated" result that is not actually in the lane language is
-          // no translation at all (a provider echoing the source, a mislabelled
-          // lane). Downgrade it to "failed" rather than presenting it to the
-          // viewer as a real translation.
-          //
-          // Note what this does NOT do: it does not drop the caption. The record
-          // has to stay hole-free so a viewer browsing this language's
-          // transcript later still sees the utterance, and live_utterances.text
-          // is NOT NULL so the original travels as the lane text (with the same
-          // string in sourceText, which is what the records view labels as 원문).
-          // Keeping raw English OFF a Korean screen is the VIEWER's job.
-          // Publishing here and filtering at the desktop boundary lets both
-          // lanes record while the screen stays single-lane.
-          if (!isSourceLane && translationStatus === "translated"
-            && !isOutputInTargetLanguage(translatedText, language)) {
-            translationStatus = "failed";
-            laneReady = false;
+          if (!isSourceLane && translationStatus !== "failed" && !this.#supportsFixedTargetOutput(translatedText, language)) {
+            translationFailureCode = "TRANSLATION_LANGUAGE_MISMATCH";
+            await this.#publishLanguageStatus(language, "unavailable", "LANGUAGE_UNAVAILABLE");
+            return { ttsCompletion: null };
           }
-          // Never synthesize speech from text that is not in the lane language.
-          if (translationStatus === "failed") laneReady = false;
           const caption = {
             type: "caption",
             seq: this.#nextCaptionSeq(language),
             sessionId: this.sessionId,
             language,
             speaker,
+            ...this.#liveCaptionSpeakerMetadata(floor),
+            ...profileMetadata,
+            ...(speakerProfile ? { speakerName: speakerProfile.displayName, speakerDepartment: speakerProfile.department } : {}),
+            ...(speakerAttribution ? { speakerRole: "unknown", speakerName: "발언자 확인 필요" } : {}),
             text: translatedText,
             isFinal: true,
             // null on the source lane: text already IS the original, so
             // duplicating it would double every payload for no disclosure.
-            sourceText: isSourceLane ? null : normalizedText,
+            sourceText: isSourceLane ? null : repairedSourceText,
             sourceLanguage: normalizedSourceLanguage || null,
+            languageObservation,
             translationStatus,
+            // Only a translated caption names a model: nothing produced the
+            // text of a fail-open caption, and the source lane IS the original.
+            ...(translationStatus === "translated" ? { translationModel } : {}),
+            ...(authoritativeSource.sourceUtteranceId ? {
+              authoritativeSourceId: authoritativeSource.sourceUtteranceId,
+              sourceSequence: authoritativeSource.sourceSeq,
+            } : {}),
+            utteranceKey,
+            ...(isSourceLane ? { origin: "source" } : {}),
             sourceStartedAt,
             sourceEndedAt,
             emittedAt: new Date(this.now()).toISOString(),
@@ -682,22 +1225,12 @@ export class LiveMediaPipeline {
             await this.#publishCaption(language, caption, { mirrorToHost: true });
             this.observeLatency?.("caption_publish_latency_ms", Math.max(0, this.now() - finalizedAt));
           }
-          if (!hasAudioOutput(this.outputMode)) return { ttsCompletion: null };
-          // A fallback verbatim caption is not in the lane language — never
-          // synthesize it with this lane's voice.
-          if (!laneReady) return { ttsCompletion: null };
-          // TTS is skipped for languages nobody is listening to right now;
-          // the translated caption above still ran (contract C6).
-          if (typeof this.getSubscriberCount === "function" && this.getSubscriberCount(language) === 0) {
-            return { ttsCompletion: null };
-          }
-          const ttsQueue = this.#ttsQueues.get(language);
-          if (!ttsQueue) throw new Error("TTS_QUEUE_UNAVAILABLE");
-          const submission = await ttsQueue.submit(() => this.#synthesize(language, speaker, translatedText));
-          return { ttsCompletion: submission.completion };
+          return { ttsCompletion: null };
         });
         if (ttsCompletion) await ttsCompletion;
-        if (translationFailureCode) {
+        if (isFailOpenMiss) {
+          this.#noteFailOpenMiss(language);
+        } else if (translationFailureCode) {
           await this.#recordLanguageFailure(language, translationFailureCode);
         } else if (!cooldownActive) {
           await this.#markLanguageRecovered(language);
@@ -714,6 +1247,75 @@ export class LiveMediaPipeline {
       }
     });
     await Promise.all(tasks);
+  }
+
+  async #persistAuthoritativeSource(input) {
+    const operation = this.dependencies.publisher?.persistAuthoritativeSource;
+    if (typeof operation !== "function") {
+      const error = new Error("AUTHORITATIVE_SOURCE_PUBLISHER_REQUIRED");
+      this.#authoritativeSourceLaneFailed = true;
+      this.#reportFatalPublisherError(error);
+      throw error;
+    }
+    const persist = this.#authoritativeSourceTail.then(() => {
+      if (this.#authoritativeSourceLaneFailed) throw new Error("AUTHORITATIVE_SOURCE_LANE_FAILED");
+      return operation.call(this.dependencies.publisher, {
+        sessionId: this.sessionId,
+        utteranceKey: input.utteranceKey,
+        rawText: input.rawText,
+        normalizedText: input.normalizedText,
+        sourceLanguage: input.sourceLanguage,
+        languageObservation: input.languageObservation,
+        speakerRole: input.speakerAttribution ? "unknown" : input.floor ? "participant" : "host",
+        ...(input.speakerProfile ? { speakerProfile: input.speakerProfile } : {}),
+        ...(input.speakerAttribution ? { speakerAttribution: input.speakerAttribution } : {}),
+        speakerLabel: input.speakerLabel || null,
+        speakerName: input.speaker?.name || input.speaker?.label || (input.floor ? null : "Host"),
+        speakerDepartment: input.speakerProfile?.department ?? input.floor?.department ?? null,
+        speakerJobTitle: input.floor?.jobTitle ?? null,
+        participantId: input.floor?.participantId ?? null,
+        sourceStartedAt: input.sourceStartedAt,
+        sourceEndedAt: input.sourceEndedAt,
+        providerCommittedAt: input.providerCommittedAt,
+        sttProvider: this.sttProvider,
+        sttModel: this.transcriptionModel,
+        translationModel: this.translationModel,
+        pipelineConfigFingerprint: /^sha256:[a-f0-9]{64}$/u.test(this.captionConfigFingerprint ?? "")
+          ? this.captionConfigFingerprint
+          : null,
+      });
+    });
+    this.#authoritativeSourceTail = persist.catch(() => undefined);
+    try {
+      return await persist;
+    } catch (error) {
+      this.#authoritativeSourceLaneFailed = true;
+      const failure = hasErrorCode(error, new Set([
+        "AUTHORITATIVE_SOURCE_PERSIST_FAILED",
+        "AUTHORITATIVE_SOURCE_LANE_FAILED",
+      ]))
+        ? error
+        : new Error("AUTHORITATIVE_SOURCE_PERSIST_FAILED", { cause: error });
+      this.#reportFatalPublisherError(failure);
+      throw failure;
+    }
+  }
+
+  #queueSourceDraft(event) {
+    if (this.#isStopped || this.#isPaused || typeof this.dependencies.publisher.publishSourceDraft !== "function") return;
+    this.#sourceDraftPending = event;
+    if (this.#sourceDraftWork) return;
+    this.#sourceDraftWork = (async () => {
+      while (this.#sourceDraftPending && !this.#isStopped && !this.#isPaused) {
+        const next = this.#sourceDraftPending;
+        this.#sourceDraftPending = null;
+        try { await this.dependencies.publisher.publishSourceDraft(next); }
+        catch { this.observeLatency?.("source_draft_publish_failures_total", 1); }
+      }
+    })().finally(() => {
+      this.#sourceDraftWork = null;
+      if (this.#sourceDraftPending) this.#queueSourceDraft(this.#sourceDraftPending);
+    });
   }
 
   async #setLanguageBackpressure(language, isBackpressured) {
@@ -733,14 +1335,65 @@ export class LiveMediaPipeline {
 
   async #publishCaption(language, caption, { mirrorToHost }) {
     let didMirror = false;
-    await this.dependencies.publisher.publish(this.sessionId, language, caption, {
-      onLiveEvent: () => {
-        didMirror = true;
-        if (mirrorToHost) this.onHostEvent?.(caption);
-      },
-    });
+    if (caption.origin === "source" && !caption.isFinal) {
+      this.#runTopicSideEffect("noteTopicPartial", this.sessionId);
+    }
+    // The desktop screen is owned by the host's LOCAL caption engine, which
+    // hears the host microphone directly. This pipeline translates the same
+    // host audio a second time for the web app's captions and records, so
+    // mirroring the host half back would put a competing second translation of
+    // the same sentence on the overlay. Only PARTICIPANT speech — which the
+    // local engine cannot hear — is mirrored to the desktop.
+    const isParticipantCaption = typeof caption.speaker?.speakerId === "string"
+      && caption.speaker.speakerId.startsWith("participant:");
+    const shouldMirrorToHost = mirrorToHost
+      && isParticipantCaption
+      && caption.translationStatus === "translated";
+    try {
+      await this.dependencies.publisher.publish(this.sessionId, language, caption, {
+        onLiveEvent: (liveEvent) => {
+          didMirror = true;
+          if (shouldMirrorToHost) this.onHostEvent?.(liveEvent);
+        },
+      });
+    } catch (error) {
+      this.#reportFatalPublisherError(error);
+      throw error;
+    }
     // Test/in-memory publishers may implement the older three-argument seam.
-    if (mirrorToHost && !didMirror) this.onHostEvent?.(caption);
+    if (shouldMirrorToHost && !didMirror) this.onHostEvent?.(caption);
+  }
+
+  #runTopicSideEffect(method, ...args) {
+    if (this.isCombined) return;
+    const operation = this.dependencies.publisher?.[method];
+    if (typeof operation !== "function") return;
+    Promise.resolve()
+      .then(() => operation.apply(this.dependencies.publisher, args))
+      .catch(() => this.observeLatency?.("topic_side_effect_failures_total", 1));
+  }
+
+  async completeTopicsOnSessionEnd() {
+    const operation = this.dependencies.publisher?.endTopicSession;
+    if (typeof operation !== "function") return;
+    await operation.call(this.dependencies.publisher, this.sessionId, this.languages);
+  }
+
+  #reportFatalPublisherError(error) {
+    if (this.#didReportFatalError || !hasErrorCode(error, new Set([
+      "DURABLE_CAPTION_PERSIST_FAILED",
+      "DURABLE_CAPTION_LANE_FAILED",
+      "AUTHORITATIVE_SOURCE_PUBLISHER_REQUIRED",
+      "AUTHORITATIVE_SOURCE_PERSIST_FAILED",
+      "AUTHORITATIVE_SOURCE_LANE_FAILED",
+    ]))) return;
+    this.#didReportFatalError = true;
+    try {
+      this.onFatalError?.(error);
+    } catch {
+      // Recovery notification is out-of-band; it must never replace the
+      // original persistence error observed by the provider callback.
+    }
   }
 
   async #publishLegend() {
@@ -754,7 +1407,6 @@ export class LiveMediaPipeline {
     if (!recovery) return;
     recovery.consecutiveFailures += 1;
     const statusCode = normalizeLanguageErrorCode(code);
-    await this.#publishAudioControl(language, "restart", "queue_restart");
     if (recovery.consecutiveFailures >= LANGUAGE_FAILURE_LIMIT) {
       recovery.consecutiveFailures = 0;
       recovery.cooldownUntil = this.now() + LANGUAGE_COOLDOWN_MILLISECONDS;
@@ -764,6 +1416,14 @@ export class LiveMediaPipeline {
     }
     recovery.status = "preparing";
     await this.#publishLanguageStatus(language, "preparing", statusCode);
+  }
+
+  /** A combined-engine final that lacked this lane: neither a strike nor a
+   *  recovery. Viewers were told `unavailable`, so remember that here and let
+   *  the next translated final re-announce `ready`. */
+  #noteFailOpenMiss(language) {
+    const recovery = this.#languageRecovery.get(language);
+    if (recovery) recovery.status = "unavailable";
   }
 
   async #markLanguageRecovered(language) {
@@ -776,88 +1436,105 @@ export class LiveMediaPipeline {
     if (shouldPublish) await this.#publishLanguageStatus(language, "ready");
   }
 
-  async #publishAudioControl(language, action, reason) {
-    const event = {
-      type: "audio-control",
-      seq: ++this.#mediaSeq,
-      sessionId: this.sessionId,
-      language,
-      action,
-      reason,
-    };
-    this.onHostEvent?.(event);
-    await this.dependencies.publisher.publish(this.sessionId, language, event);
-  }
-
-  async #synthesize(language, speaker, text) {
-    const abortController = new AbortController();
-    this.#ttsAbortControllers.add(abortController);
-    let inactivityTimer = null;
-    let synthesisTimer = null;
-    const armInactivityTimer = () => {
-      if (inactivityTimer !== null) this.clearTimeoutFn(inactivityTimer);
-      inactivityTimer = this.setTimeoutFn(() => {
-        abortController.abort(new Error("TTS_STREAM_STALLED"));
-      }, TTS_INACTIVITY_MILLISECONDS);
-    };
-    try {
-      const stream = this.dependencies.textToSpeech.synthesizeStream({
-        language,
-        voiceName: speaker.voiceName,
-        text,
-        sampleRate: AUDIO_CONFIG.outputSampleRate,
-        signal: abortController.signal,
-      });
-      if (!stream || typeof stream[Symbol.asyncIterator] !== "function") throw new Error("TTS_STREAMING_UNAVAILABLE");
-      synthesisTimer = this.setTimeoutFn(() => {
-        abortController.abort(new Error("TTS_SYNTHESIS_LIMIT_EXCEEDED"));
-      }, TTS_MAX_SYNTHESIS_MILLISECONDS);
-      const iterator = stream[Symbol.asyncIterator]();
-      let pending = new Uint8Array();
-      while (true) {
-        armInactivityTimer();
-        const result = await iterator.next();
-        if (inactivityTimer !== null) {
-          this.clearTimeoutFn(inactivityTimer);
-          inactivityTimer = null;
-        }
-        if (result.done) break;
-        const providerChunk = result.value;
-        if (abortController.signal.aborted) throw abortController.signal.reason;
-        const bytes = providerChunk instanceof Uint8Array ? providerChunk : new Uint8Array(providerChunk);
-        if (bytes.byteLength === 0) continue;
-        const combined = new Uint8Array(pending.byteLength + bytes.byteLength);
-        combined.set(pending);
-        combined.set(bytes, pending.byteLength);
-        let offset = 0;
-        while (combined.byteLength - offset >= OUTPUT_CHUNK_BYTES) {
-          this.#assertRunning();
-          await this.#publishAudioChunk(language, speaker, combined.slice(offset, offset + OUTPUT_CHUNK_BYTES));
-          offset += OUTPUT_CHUNK_BYTES;
-        }
-        pending = combined.slice(offset);
-      }
-      if (pending.byteLength % 2 !== 0) throw new Error("INVALID_PCM16_STREAM");
-      if (pending.byteLength > 0) {
-        this.#assertRunning();
-        await this.#publishAudioChunk(language, speaker, pending);
-      }
-    } finally {
-      if (inactivityTimer !== null) this.clearTimeoutFn(inactivityTimer);
-      if (synthesisTimer !== null) this.clearTimeoutFn(synthesisTimer);
-      this.#ttsAbortControllers.delete(abortController);
+  #presentationPartialLane(language) {
+    let lane = this.#presentationPartialLanes.get(language);
+    if (!lane) {
+      lane = {
+        epoch: 0,
+        firstPendingAt: null,
+        pending: null,
+        timer: null,
+        isPublishing: false,
+        inFlight: Promise.resolve(),
+      };
+      this.#presentationPartialLanes.set(language, lane);
     }
+    return lane;
   }
 
-  async #publishAudioChunk(language, speaker, chunk) {
-    await this.dependencies.publisher.publishAudio(this.sessionId, language, {
-        type: "audio-chunk",
-        seq: ++this.#mediaSeq,
-        sessionId: this.sessionId,
-        language,
-        speaker,
-        sampleRate: AUDIO_CONFIG.outputSampleRate,
-    }, chunk);
+  #schedulePresentationPartial(language, value, sourceContext) {
+    const lane = this.#presentationPartialLane(language);
+    const now = this.now();
+    if (lane.firstPendingAt === null) lane.firstPendingAt = now;
+    lane.pending = { value, sourceContext, epoch: lane.epoch };
+    if (lane.timer) this.clearTimeoutFn(lane.timer);
+
+    const elapsed = Math.max(0, now - lane.firstPendingAt);
+    const hasSentenceBoundary = /[.!?。！？…]$/.test(String(value.text ?? "").trim());
+    const hasMinimumSignal = countSignalCharacters(value.text) >= PARTIAL_MIN_SIGNAL_CHARACTERS;
+    if (hasSentenceBoundary || (hasMinimumSignal && elapsed >= PARTIAL_MAX_HOLD_MILLISECONDS)) {
+      this.#flushPresentationPartial(language, lane);
+      return;
+    }
+    const delay = Math.max(0, Math.min(
+      PARTIAL_STABILITY_MILLISECONDS,
+      PARTIAL_MAX_HOLD_MILLISECONDS - elapsed,
+    ));
+    lane.timer = this.setTimeoutFn(() => {
+      lane.timer = null;
+      const current = lane.pending;
+      if (!current || current.epoch !== lane.epoch || this.#isStopped || this.#isPaused) return;
+      const heldFor = Math.max(0, this.now() - lane.firstPendingAt);
+      if (countSignalCharacters(current.value.text) >= PARTIAL_MIN_SIGNAL_CHARACTERS
+        && heldFor >= PARTIAL_MAX_HOLD_MILLISECONDS) {
+        this.#flushPresentationPartial(language, lane);
+        return;
+      }
+      if (heldFor >= PARTIAL_MAX_HOLD_MILLISECONDS) {
+        // Captions-only also drops an under-sized hold at the deadline. Re-
+        // arming here with a zero delay creates a hot timer loop until the next
+        // provider delta arrives.
+        lane.pending = null;
+        lane.firstPendingAt = null;
+        return;
+      }
+      this.#schedulePresentationPartial(language, current.value, current.sourceContext);
+    }, delay);
+  }
+
+  #flushPresentationPartial(language, lane) {
+    if (lane.timer) {
+      this.clearTimeoutFn(lane.timer);
+      lane.timer = null;
+    }
+    if (lane.isPublishing) return;
+    const pending = lane.pending;
+    lane.pending = null;
+    lane.firstPendingAt = null;
+    if (!pending || pending.epoch !== lane.epoch || this.#isStopped || this.#isPaused) return;
+    lane.isPublishing = true;
+    lane.inFlight = this.#publishPresentationCaption(
+      language,
+      pending.value,
+      { stabilized: true, sourceContext: pending.sourceContext, partialEpoch: pending.epoch },
+    ).catch((error) => this.#recordCaptionEmissionFailure(language, error)).finally(() => {
+      lane.isPublishing = false;
+      const latest = lane.pending;
+      if (latest && latest.epoch === lane.epoch && !this.#isStopped && !this.#isPaused) {
+        this.#schedulePresentationPartial(language, latest.value, latest.sourceContext);
+      }
+    });
+  }
+
+  #cancelPresentationPartial(language) {
+    const lane = this.#presentationPartialLanes.get(language);
+    if (!lane) return Promise.resolve();
+    lane.epoch += 1;
+    lane.pending = null;
+    lane.firstPendingAt = null;
+    if (lane.timer) {
+      this.clearTimeoutFn(lane.timer);
+      lane.timer = null;
+    }
+    return lane.inFlight;
+  }
+
+  #cancelAllPresentationPartials() {
+    const inFlight = [];
+    for (const language of this.#presentationPartialLanes.keys()) {
+      inFlight.push(this.#cancelPresentationPartial(language));
+    }
+    return inFlight;
   }
 
   /** The desktop channel-hub pattern: the source-language lane is fed by the
@@ -869,29 +1546,72 @@ export class LiveMediaPipeline {
     const { text, isFinal, languageCode } = value;
     const normalized = String(text ?? "").normalize("NFC").trim();
     if (!normalized) return;
+    const inputSource = AUDIO_SOURCES.has(value.inputSource) ? value.inputSource : "system";
+    if (this.#isSuppressedSource(inputSource, normalized)) return;
     const rawLanguageCode = typeof languageCode === "string" ? languageCode.trim() : "";
     const hasExplicitLanguageCode = languageCode !== undefined
       && languageCode !== null
       && String(languageCode).trim() !== "";
     const isExplicitlyUnknown = rawLanguageCode.toLowerCase() === "und";
-    const hinted = normalizeLiveLanguage(languageCode);
-    const utteranceKey = typeof value.utteranceKey === "string" && value.utteranceKey
+    const canonicalProviderHint = normalizeLiveLanguage(languageCode);
+    const strictEnglishKorean = this.#hasEnglishKoreanFirewall();
+    const providerHint = resolveSessionInputLanguage(languageCode, normalized, this.languages, { strictEnglishKorean });
+    const explicitUtteranceKey = typeof value.utteranceKey === "string" && value.utteranceKey
       ? value.utteranceKey
+      : null;
+    const isContinuingInputCaption = Boolean(this.#meetingInputCaption)
+      && this.#meetingInputCaption.isFinal !== true
+      && (!explicitUtteranceKey || explicitUtteranceKey === this.#meetingInputCaption?.utteranceKey);
+    const consensusHint = this.sourceLanguageConsensus.resolveSource(providerHint || "unknown", {
+      isStrong: String(value.text ?? "").trim().length >= 4,
+      channelKey: value.targetLanguage,
+    });
+    let hinted = resolveSessionInputLanguage(
+      consensusHint === "unknown" ? providerHint : consensusHint,
+      normalized,
+      this.languages,
+      { strictEnglishKorean },
+    );
+    if (isEnglishKoreanPair(this.languages)) {
+      const hasEnglish = ENGLISH_LETTER.test(normalized);
+      const hasKorean = KOREAN_LETTER.test(normalized);
+      const hasSingleScriptEvidence = hasEnglish !== hasKorean;
+      if (isContinuingInputCaption
+        && !hasSingleScriptEvidence
+        && ["en", "ko"].includes(this.#meetingInputCaption?.language)) {
+        hinted = this.#meetingInputCaption.language;
+      } else if (this.languages.includes(providerHint)) {
+        // A previous sentence's two-channel consensus may still be inside its
+        // hold window. At a new utterance boundary, current provider/script
+        // evidence starts the new lock; ambiguous mixed-script revisions retain
+        // it while clear single-script corrections still match Caption-only.
+        hinted = providerHint;
+      }
+    }
+    const utteranceKey = explicitUtteranceKey
+      ? explicitUtteranceKey
       : this.#meetingInputCaption && this.#meetingInputCaption.isFinal !== true
         ? this.#meetingInputCaption.utteranceKey
         : `${this.sessionId}:input:${++this.#meetingInputCaptionCounter}`;
     // 2026-07-26 fix: Provider result metadata is the primary language signal.
     // Script is only a fallback because names, numbers, and code-switched
     // sentences can legitimately look unlike their provider-classified lane.
-    // A recognized provider language outside this session is not uncertainty:
-    // falling back to script would relabel Vietnamese/Japanese as EN/KO and
-    // persist a false source record. Only missing or explicit BCP-47 `und`
-    // metadata may use the legacy script fallback. Malformed explicit values
-    // fail closed at the same boundary.
+    // In an exact EN/KO call, outside Latin metadata is never relabelled as
+    // English; only strong Hangul can recover a stale outside hint into KO.
+    // Other scripts, Vietnamese leakage, and malformed explicit values fail
+    // closed before consensus can relabel them.
     const isCanonicalEnglishKoreanBridge = hinted === "en" || hinted === "ko";
-    const isRejectedLanguage = (hinted && !this.languages.includes(hinted) && !isCanonicalEnglishKoreanBridge)
-      || (hasExplicitLanguageCode && !hinted && !isExplicitlyUnknown);
+    const isRejectedLanguage = isEnglishKoreanInputRejected(
+      languageCode,
+      normalized,
+      providerHint,
+      this.languages,
+      { strictEnglishKorean },
+    )
+      || (hinted && !this.languages.includes(hinted) && !isCanonicalEnglishKoreanBridge)
+      || (hasExplicitLanguageCode && !canonicalProviderHint && !isExplicitlyUnknown);
     if (isRejectedLanguage || (hinted && !this.languages.includes(hinted))) {
+      this.#recordLanguageDrift(`input:${inputSource}`);
       // Keep a non-publishable correlation fence. Without it, an output partial
       // can inherit the previous input context after this source row is omitted
       // (unsupported language, or the absent source lane of a one-lane pair).
@@ -917,11 +1637,17 @@ export class LiveMediaPipeline {
       }
       return;
     }
+    this.#clearLanguageDrift(`input:${inputSource}`);
     const lane = hinted || this.languages.find((language) => textPlausiblyInLanguage(normalized, language));
     if (!lane) return;
+    if (this.crossChannelEchoDedupers.get(lane)?.outputEchoesAnotherSource(inputSource, normalized)) return;
+    const repairedSourceText = this.termRetriever.repair(normalized, {
+      language: lane,
+      isFinal: Boolean(isFinal),
+    });
     this.#requiresFreshMeetingSourceContext = false;
     this.#meetingInputCaption = {
-      text: normalized,
+      text: repairedSourceText,
       language: lane,
       isFinal: Boolean(isFinal),
       utteranceKey,
@@ -938,32 +1664,115 @@ export class LiveMediaPipeline {
       }
     }
     // origin:"source" = the untranslated input transcript on its own-language
-    // lane. The webapp keeps both lanes; the desktop picks exactly its selected
-    // language, so same-language speech uses this source lane as the one line.
+    // lane. The webapp keeps both lanes for the bilingual record; the desktop
+    // mirror excludes this row and renders only a successful opposite-language
+    // translation.
     await this.#publishPresentationCaption(lane, {
-      text: normalized, isFinal, origin: "source", utteranceKey,
+      text: repairedSourceText, isFinal, origin: "source", utteranceKey,
       capturedAt: value.capturedAt, floorSpeaker: value.floorSpeaker ?? null,
     });
   }
 
-  async #publishPresentationCaption(language, value) {
+  async #observeMeetingInputCaption(channelId, value = {}) {
+    const strictEnglishKorean = this.#hasEnglishKoreanFirewall();
+    const language = resolveSessionInputLanguage(
+      value.languageCode,
+      value.text,
+      this.languages,
+      { strictEnglishKorean },
+    );
+    if (!language
+      || isMalformedExplicitLanguageCode(value.languageCode)
+      || isEnglishKoreanInputRejected(
+        value.languageCode,
+        value.text,
+        language,
+        this.languages,
+        { strictEnglishKorean },
+      )) return;
+    this.sourceLanguageConsensus.reportSource(channelId, language, value.text, {
+      isStrong: String(value.text ?? "").trim().length >= 4,
+    });
+    const source = String(channelId).split(":", 1)[0];
+    let normalizedText = "";
+    let isDuplicate = false;
+    for (const deduper of this.crossChannelEchoDedupers.values()) {
+      const observation = deduper.observeSource(source, value.text);
+      normalizedText ||= observation.normalizedText;
+      isDuplicate ||= observation.isDuplicate;
+    }
+    if (isDuplicate && normalizedText) {
+      const currentTime = this.now();
+      for (const [key, expiresAt] of this.#suppressedSourceTexts) {
+        if (expiresAt <= currentTime) this.#suppressedSourceTexts.delete(key);
+      }
+      while (this.#suppressedSourceTexts.size >= MAX_SUPPRESSED_SOURCE_TEXTS) {
+        this.#suppressedSourceTexts.delete(this.#suppressedSourceTexts.keys().next().value);
+      }
+      this.#suppressedSourceTexts.set(
+        `${source}\u0000${normalizedText}`,
+        currentTime + crossChannelEchoContract.windowMilliseconds,
+      );
+    }
+  }
+
+  #isSuppressedSource(source, text) {
+    const normalized = this.crossChannelEchoDedupers.values().next().value?.normalize(text) ?? "";
+    const key = `${source}\u0000${normalized}`;
+    const expiresAt = this.#suppressedSourceTexts.get(key) ?? 0;
+    if (expiresAt <= this.now()) {
+      this.#suppressedSourceTexts.delete(key);
+      return false;
+    }
+    return true;
+  }
+
+  async #publishPresentationCaption(language, value, options = {}) {
     if (!hasCaptionOutput(this.outputMode) || this.#isPaused) return;
     let text = String(value.text ?? "").normalize("NFC").trim();
     if (!text) return;
+    const inputSource = AUDIO_SOURCES.has(options.inputSource ?? value.inputSource)
+      ? (options.inputSource ?? value.inputSource)
+      : "system";
+    const echoDeduper = this.crossChannelEchoDedupers.get(language);
+    if (value.origin !== "source" && echoDeduper?.outputEchoesAnotherSource(inputSource, text)) return;
     const isFinal = Boolean(value.isFinal);
-    let sourceContext = null;
-    if (value.origin !== "source") {
+    const strictEnglishKorean = this.#hasEnglishKoreanFirewall();
+    let sourceContext = Object.hasOwn(options, "sourceContext") ? options.sourceContext : null;
+    if (value.origin !== "source" && !Object.hasOwn(options, "sourceContext")) {
       const queue = this.#meetingInputFinalQueues.get(language) ?? [];
       if (typeof value.sourceText === "string" && value.sourceText.trim()) {
+        const providerSourceLanguage = resolveSessionInputLanguage(
+          value.sourceLanguage,
+          value.sourceText,
+          this.languages,
+          { strictEnglishKorean },
+        );
         const providerSourceContext = {
           text: value.sourceText,
-          language: normalizeLiveLanguage(value.sourceLanguage),
+          language: providerSourceLanguage,
           utteranceKey: value.utteranceKey,
           capturedAt: value.capturedAt,
           floorSpeaker: value.floorSpeaker ?? null,
+          isUnsupportedLanguage: isMalformedExplicitLanguageCode(value.sourceLanguage)
+            || isEnglishKoreanInputRejected(
+              value.sourceLanguage,
+              value.sourceText,
+              providerSourceLanguage,
+              this.languages,
+              { strictEnglishKorean },
+            ),
         };
         const matchingIndex = findCanonicalInputContext(queue, providerSourceContext);
-        sourceContext = matchingIndex >= 0 ? queue[matchingIndex] : providerSourceContext;
+        sourceContext = matchingIndex >= 0
+          ? queue[matchingIndex]
+          : {
+            ...providerSourceContext,
+            text: this.termRetriever.repair(providerSourceContext.text, {
+              language: providerSourceLanguage,
+              isFinal,
+            }),
+          };
         // A matched later identity/source proves every earlier queued source
         // missed this target lane. Finals consume that stale prefix atomically;
         // partials only observe it so their eventual final can still correlate.
@@ -972,15 +1781,22 @@ export class LiveMediaPipeline {
         sourceContext = isFinal ? (queue.shift() ?? this.#meetingInputCaption) : this.#meetingInputCaption;
       }
     }
+    if (value.origin !== "source" && this.#isSuppressedSource(inputSource, sourceContext?.text ?? value.sourceText)) return;
     const sourceLanguage = normalizeLiveLanguage(sourceContext?.language);
     const providerOutputLanguage = normalizeLiveLanguage(value.languageCode);
+    const hasRejectedOutputMetadata = strictEnglishKorean
+      && (isMalformedExplicitLanguageCode(value.languageCode)
+        || Boolean(providerOutputLanguage && !this.languages.includes(providerOutputLanguage)));
+    const hasRejectedOutputText = strictEnglishKorean && hasUnsupportedEnglishKoreanText(text);
     // 2026-07-26 fix: Gemini can echo the input on the output callback even
     // with echoTargetLanguage=false. Drop that callback before polish, seq, and
     // publisher persistence. Provider output metadata also provides a strict
     // target-lane boundary when available; script inspection remains a legacy
     // fallback only when Gemini omits the language code.
     if (value.origin !== "source"
-      && ((sourceContext?.isUnsupportedLanguage === true)
+      && (hasRejectedOutputMetadata
+        || hasRejectedOutputText
+        || (sourceContext?.isUnsupportedLanguage === true)
         || (sourceLanguage
           && !this.languages.includes(sourceLanguage)
           && sourceLanguage !== "en"
@@ -988,60 +1804,68 @@ export class LiveMediaPipeline {
         || (sourceLanguage && sourceLanguage === language)
         || (providerOutputLanguage
           && providerOutputLanguage !== language
-          && !isOutputInTargetLanguage(text, language)))) {
+          && !isSessionOutputInTargetLanguage(text, language, this.languages)))) {
+      if (hasRejectedOutputMetadata || hasRejectedOutputText || sourceContext?.isUnsupportedLanguage === true) {
+        this.#recordLanguageDrift(`output:${inputSource}:${language}`);
+      }
       return;
     }
+    if (value.origin !== "source") this.#clearLanguageDrift(`output:${inputSource}:${language}`);
+    if (value.origin !== "source") echoDeduper?.recordSource(inputSource, text);
     if (this.sessionType === "meeting"
       && !isFinal
       && value.origin !== "source"
       && this.#requiresFreshMeetingSourceContext
       && !sourceContext) return;
+    if (!isFinal && !options.stabilized) {
+      this.#schedulePresentationPartial(language, { ...value, text }, sourceContext);
+      return;
+    }
+    if (isFinal) await this.#cancelPresentationPartial(language);
     const finalOrder = isFinal ? this.#reservePresentationFinal(language) : null;
     try {
-    // Latency was previously observed ONLY on #processFinalUtterance, which no
-    // session type reaches — so the live path emitted no metric at all and the
-    // p95 2.5s committed-caption target could not be measured. Split polish out
-    // separately: without it there is no way to tell a slow provider from a
-    // slow second-pass.
     const startedAt = this.now();
-    // Committed lines run the SAME two-layer finish as the desktop subtitle
-    // pipeline: the LLM second-pass polish (business register, terminology,
-    // proper-noun repair; fail-open) followed by the deterministic glossary
-    // pass as the guaranteed safety net.
-    if (isFinal && this.dependencies.captionPolish) {
+    const isPolishCandidate = isFinal && value.origin !== "source";
+    if (value.origin !== "source" && !isFinal) {
+      text = this.termRetriever.repair(text, { language, isFinal });
+    }
+    if (isPolishCandidate) {
       const polishStartedAt = this.now();
-      const polished = await this.dependencies.captionPolish.polish({
+      const sourceForFinal = sourceContext?.text ?? value.sourceText ?? "";
+      const sourceLanguage = sourceContext?.sourceLanguage
+        ?? value.sourceLanguage
+        ?? detectSourceLanguage(sourceForFinal, { minimumSignalChars: 1 });
+      const finalized = await this.captionFinalizer.finalize({
         translatedText: text,
-        sourceText: sourceContext?.text ?? "",
+        sourceText: sourceForFinal,
+        sourceLanguage,
         targetLanguage: language,
-        tone: this.translationTone,
-        glossary: this.glossaryText,
-        domain: this.domainText,
       });
-      text = String(polished ?? "").trim() || text;
+      if (!finalized) return;
+      text = finalized.text;
+      this.observeLatency?.(`caption_polish_policy_${this.captionPolishPolicy}_total`, 1);
+      this.observeLatency?.(`caption_polish_reason_${finalized.polishDecision.reason}_total`, 1);
+      this.observeLatency?.(finalized.polishDecision.shouldPolish
+        ? "caption_polish_attempts_total"
+        : "caption_polish_skipped_total", 1);
       this.observeLatency?.("caption_polish_latency_ms", Math.max(0, this.now() - polishStartedAt));
     }
-    // Runs on EVERY caption, interims included, and is NOT gated on a glossary
-    // being configured. Two reasons:
-    //   - number notation (만/억/조 ↔ million/billion/trillion) lives inside this
-    //     pass and is arithmetic, not terminology, so it has to apply to every
-    //     session — gating it on glossaryText skipped it entirely whenever no
-    //     preset was picked.
-    //   - the caption IS the final artifact. Correcting only finals meant the
-    //     screen showed "3,000억" and then visibly rewrote itself to
-    //     "KRW 300 billion" when the final landed, and the record disagreed with
-    //     what the reader had just seen.
-    // Measured at ~0.13ms per line against the 19KB CRE glossary, so the interim
-    // path can afford it.
-    text = applyGlossaryCorrections(text, {
-      glossary: this.glossaryText,
-      targetLanguage: language,
-      sourceText: sourceContext?.text ?? "",
-    });
+    if (value.origin !== "source" && strictEnglishKorean && hasUnsupportedEnglishKoreanText(text)) {
+      this.#recordLanguageDrift(`output:${inputSource}:${language}`);
+      return;
+    }
+    if (value.origin !== "source" && language === "ko" && !this.#supportsFixedTargetOutput(text, language)) {
+      this.#recordLanguageDrift(`output:${inputSource}:${language}`);
+      return;
+    }
     // Polish can run concurrently across finalized cues, but seq allocation,
     // fanout, and persistence remain in provider arrival order. Partials never
     // wait on this gate and therefore keep the live line moving.
     if (finalOrder) await finalOrder.previous;
+    if (!isFinal) {
+      const partialLane = this.#presentationPartialLanes.get(language);
+      if (partialLane && options.partialEpoch !== partialLane.epoch) return;
+    }
     // Dedupe identity is (text, isFinal, TIME) — never text alone. A provider
     // re-emitting the same committed line lands within milliseconds; a speaker
     // genuinely repeating themselves ("네, 맞습니다.", "OK.") does not. Keying
@@ -1068,6 +1892,11 @@ export class LiveMediaPipeline {
       ? (value.floorSpeaker ?? sourceContext?.floorSpeaker
         ?? this.#floorAttribution(capturedAt))
       : null;
+    const translationStatus = value.origin === "source"
+      ? "verbatim"
+      : isSessionOutputInTargetLanguage(text, language, this.languages)
+        ? "translated"
+        : "failed";
     const caption = {
       type: "caption",
       // Only the committed line consumes durable seq space (contract C1).
@@ -1075,6 +1904,7 @@ export class LiveMediaPipeline {
       sessionId: this.sessionId,
       language,
       speaker: floor ? this.#floorSpeakerAssignment(floor) : null,
+      ...this.#liveCaptionSpeakerMetadata(floor),
       text,
       isFinal,
       ...(sourceContext ? {
@@ -1089,12 +1919,10 @@ export class LiveMediaPipeline {
       // A translated lane that came back NOT in its own language is a broken
       // translation (provider echoing the source, a mislabelled lane). It is
       // still published — the transcript must not have a hole — but it is
-      // labelled so the viewer never renders it as a real translation. This is
-      // the same record-vs-display split as origin:"source": recording is
-      // unconditional, DISPLAY is filtered client-side.
-      ...(value.origin !== "source" && !isOutputInTargetLanguage(text, language)
-        ? { translationStatus: "failed" }
-        : {}),
+      // labelled so display paths never render it as a real translation. This
+      // is the same record-vs-display split as origin:"source": recording is
+      // unconditional, while the host mirror is filtered at this boundary.
+      translationStatus,
       ...(Number.isFinite(capturedAt)
         ? { sourceStartedAt: new Date(capturedAt).toISOString() }
         : {}),
@@ -1112,37 +1940,60 @@ export class LiveMediaPipeline {
     }
   }
 
-  async #publishPresentationAudio(language, value) {
-    if (!hasAudioOutput(this.outputMode) || this.#isPaused) return;
-    const pcm = value?.pcm;
-    if (!(pcm instanceof Uint8Array)
-      || pcm.byteLength === 0
-      || pcm.byteLength % 2 !== 0
-      || value.sampleRate !== AUDIO_CONFIG.outputSampleRate) {
-      throw new Error("INVALID_GEMINI_AUDIO");
-    }
-    await this.dependencies.publisher.publishAudio(this.sessionId, language, {
-      type: "audio-chunk",
-      seq: ++this.#mediaSeq,
-      sessionId: this.sessionId,
-      language,
-      speaker: null,
-      sampleRate: AUDIO_CONFIG.outputSampleRate,
-    }, pcm);
+  async gracefulDrain({ timeoutMilliseconds = 10_000 } = {}) {
+    this.#isDraining = true;
+    let timer;
+    try {
+      await Promise.race([
+        (async () => {
+          await this.#stt?.gracefulDrain();
+          await this.#pauseTask;
+          this.#stt = null;
+          await this.#authoritativeSourceTail;
+          await Promise.allSettled(this.#finalUtteranceTasks.values());
+          await Promise.all([...this.#translationQueues.values()].map((queue) => queue.drain()));
+          await Promise.all(this.#presentationFinalTails.values());
+          await this.dependencies.publisher.suspendTopicSession?.(this.sessionId);
+        })(),
+        new Promise((_, reject) => { timer = setTimeout(() => reject(new Error("MEDIA_DRAIN_TIMEOUT")), timeoutMilliseconds); }),
+      ]);
+    } catch (error) {
+      this.abortMedia();
+      throw error;
+    } finally { clearTimeout(timer); }
+  }
+
+  abortMedia() {
+    this.#isDraining = true;
+    this.#isStopped = true;
+    this.#lifecycleAbort.abort();
+    this.#sourceDraftPending = null;
+    this.#stt?.abort();
+    Promise.resolve(this.dependencies.publisher.suspendTopicSession?.(this.sessionId))
+      .catch(() => this.observeLatency?.("topic_suspend_failures_total", 1));
   }
 
   async close() {
     this.#isStopped = true;
-    for (const abortController of this.#ttsAbortControllers) {
-      abortController.abort(new Error("LIVE_PIPELINE_STOPPED"));
+    this.#lifecycleAbort.abort();
+    this.#sourceDraftPending = null;
+    const partialPublications = this.#cancelAllPresentationPartials();
+    try {
+      await Promise.all([
+        ...(this.#stt ? [this.#stt.close()] : []),
+        this.#pauseTask,
+        ...this.#finalUtteranceTasks.values(),
+        ...[...this.#translationQueues.values()].map((queue) => queue.drain()),
+        ...this.#presentationFinalTails.values(),
+        ...partialPublications,
+        ...this.#sourceGapTasks,
+      ]);
+    } finally {
+      // Keep the source write fence until bounded gap IO settles, even if a
+      // translation transport fails to close cleanly.
+      await Promise.allSettled([...this.#sourceGapTasks]);
+      this.captionFinalizer.release();
     }
-    await Promise.all([
-      ...[...this.#liveSessions.values()].map((session) => session.close()),
-      ...[...this.#voiceSessions.values()].map((session) => session.close()),
-      ...[...this.#translationQueues.values()].map((queue) => queue.drain()),
-      ...[...this.#ttsQueues.values()].map((queue) => queue.drain()),
-      ...this.#presentationFinalTails.values(),
-    ]);
   }
 
   #assertRunning() {
@@ -1159,13 +2010,22 @@ function findCanonicalInputContext(queue, providerContext) {
 
   const sourceText = String(providerContext.text ?? "").normalize("NFC").trim();
   const sourceLanguage = normalizeLiveLanguage(providerContext.language);
-  const textMatches = [];
+  const exactTextMatches = [];
   for (let index = 0; index < queue.length; index += 1) {
     const entry = queue[index];
     if (String(entry.text ?? "").normalize("NFC").trim() !== sourceText) continue;
-    if (sourceLanguage && entry.language !== sourceLanguage) continue;
-    textMatches.push(index);
+    exactTextMatches.push(index);
   }
+  // 2026-07-26 fix: The canonical input callback is the shared source of truth
+  // across target sessions. A sibling session can report a contradictory
+  // languageCode for the exact same transcript; requiring that hint to agree
+  // rejected the canonical context and made the target lane drop its final as
+  // a same-language echo. A unique exact transcript proves identity more
+  // strongly than the unstable per-session language hint.
+  if (exactTextMatches.length === 1) return exactTextMatches[0];
+  const textMatches = sourceLanguage
+    ? exactTextMatches.filter((index) => queue[index].language === sourceLanguage)
+    : exactTextMatches;
   // A single exact source match is a safe FIFO resynchronization when provider
   // sessions reconnect with different generations. When a speaker repeats the
   // same sentence, use the lane-local coordinate only inside the text/language
@@ -1187,6 +2047,17 @@ function parseGeminiUtteranceCoordinate(value) {
   return match ? `${match[1]}:${match[2]}` : null;
 }
 
+function hasErrorCode(error, codes) {
+  let current = error;
+  const visited = new Set();
+  while (current && typeof current === "object" && !visited.has(current)) {
+    visited.add(current);
+    if (current instanceof Error && codes.has(current.message)) return true;
+    current = current.cause;
+  }
+  return false;
+}
+
 function resolveSourceStartedAt({ sourceStartOffsetMs, sourceEndOffsetMs, sourceEndedAt }) {
   if (!Number.isFinite(sourceStartOffsetMs) || !Number.isFinite(sourceEndOffsetMs)) return null;
   const endedAt = Date.parse(sourceEndedAt);
@@ -1196,27 +2067,27 @@ function resolveSourceStartedAt({ sourceStartOffsetMs, sourceEndOffsetMs, source
 }
 
 function hasCaptionOutput(outputMode) {
-  return outputMode === "captions" || outputMode === "captions_audio";
-}
-
-function hasAudioOutput(outputMode) {
-  return outputMode === "captions_audio" || outputMode === "audio";
-}
-
-function usesLiveTranslateCaptions(sessionType) {
-  return sessionType === "presentation" || sessionType === "meeting";
+  return outputMode === "captions";
 }
 
 function normalizeLanguageErrorCode(code) {
-  if (["QUEUE_BACKPRESSURE", "QUEUE_BACKPRESSURE_EXCEEDED", "TTS_RESPONSE_BUFFER_EXCEEDED", "TTS_STREAM_STALLED", "TTS_SYNTHESIS_LIMIT_EXCEEDED"].includes(code)) return code;
+  if (["QUEUE_BACKPRESSURE", "QUEUE_BACKPRESSURE_EXCEEDED"].includes(code)) return code;
   return "LANGUAGE_UNAVAILABLE";
 }
 
-function createUtteranceKey({ speakerLabel, text, sourceStartOffsetMs, sourceEndOffsetMs, sourceEndedAt }) {
+function createUtteranceKey({ speakerLabel, text, sourceGeneration, sourceStartOffsetMs, sourceEndOffsetMs, sourceEndedAt }) {
   const sourceIdentity = Number.isFinite(sourceStartOffsetMs) && Number.isFinite(sourceEndOffsetMs)
     ? `${sourceStartOffsetMs}:${sourceEndOffsetMs}`
     : String(sourceEndedAt ?? "");
-  return `${String(speakerLabel)}\u0000${sourceIdentity}\u0000${text}`;
+  const digest = createHash("sha256")
+    // 2026-08-31 fix: provider offsets restart at zero on pause/resume and rollover.
+    .update(JSON.stringify([sourceGeneration, String(speakerLabel), sourceIdentity, text]), "utf8")
+    .digest("hex");
+  return `stt-v1:${digest}`;
+}
+
+function countSignalCharacters(value) {
+  return (String(value ?? "").match(/[\p{L}\p{N}]/gu) ?? []).length;
 }
 
 export { textPlausiblyInLanguage } from "./config.js";

@@ -8,82 +8,13 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
-import { DEFAULT_AGENT_TIMEOUT_MS, runWhiteboardAgent, selectSubtitlePolishOptions, startServer, whiteboardSystemPrompt } from "../src/server.js";
+import { selectSubtitlePolishOptions, startServer } from "../src/server.js";
 import { createSettingsStore, MAX_SUBTITLE_GLOSSARY_CHARS } from "../src/settings-store.js";
+import { DEFAULT_ENGINE_SELECTION, GEMINI_ENGINE_SELECTION } from "../packages/caption-core/caption-engine-catalog.js";
 
-test("default whiteboard agent timeout is 90 seconds", () => {
-  assert.equal(DEFAULT_AGENT_TIMEOUT_MS, 90_000);
-});
-
-test("startServer waits for Moonshine readiness before listening", async () => {
-  let resolveReady;
-  let closed = false;
-  const progressMessages = [];
-  const readyPromise = new Promise((resolve) => {
-    resolveReady = resolve;
-  });
-
-  const serverPromise = startServer({
-    host: "127.0.0.1",
-    port: 0,
-    moonshineModel: "medium",
-    openaiApiKey: "test",
-    onStatus: (message) => progressMessages.push(message),
-    createTranscription: () => ({
-      ready: () => readyPromise,
-      sendAudio: () => {},
-      stop: () => {},
-      close: () => {
-        closed = true;
-      },
-    }),
-  });
-
-  let started = false;
-  serverPromise.then(() => {
-    started = true;
-  });
-  await Promise.resolve();
-  assert.equal(started, false);
-  assert.deepEqual(progressMessages, ["Preparing Moonshine medium transcription model..."]);
-
-  resolveReady();
-  const { httpServer } = await serverPromise;
-  assert.equal(started, true);
-  assert.deepEqual(progressMessages, [
-    "Preparing Moonshine medium transcription model...",
-    "Moonshine medium transcription model ready.",
-  ]);
-
-  await new Promise((resolve) => httpServer.close(resolve));
-  assert.equal(closed, true);
-});
-
-test("server still starts when the transcription model fails to load (missing sidecar)", async () => {
-  // A missing local Moonshine sidecar must not crash boot — the subtitle feature
-  // (Gemini/OpenAI Realtime) is independent of it. startServer must resolve and
-  // listen even though ready() rejects.
-  const { httpServer, url } = await startServer({
-    host: "127.0.0.1",
-    port: 0,
-    moonshineModel: "medium",
-    openaiApiKey: "test",
-    createTranscription: () => ({
-      ready: async () => { throw new Error("Cannot find Moonshine sidecar package for darwin/arm64."); },
-      sendAudio: () => {},
-      stop: () => {},
-      close: () => {},
-    }),
-  });
-
-  try {
-    assert.ok(url, "server should still come up and listen");
-    const messages = await collectWebSocketMessages(url.replace("http:", "ws:") + "/ws", 1);
-    assert.equal(messages[0].type, "config", "server serves clients despite the transcription model being unavailable");
-  } finally {
-    await new Promise((resolve) => httpServer.close(resolve));
-  }
-});
+function sameOriginHeaders(url, headers = {}) {
+  return { origin: new URL(url).origin, ...headers };
+}
 
 test("desktop subtitle static assets are always revalidated instead of surviving an app update cache", async () => {
   const { httpServer, url } = await startServer({
@@ -102,7 +33,6 @@ test("desktop subtitle static assets are always revalidated instead of surviving
     for (const asset of [
       "subtitle.html",
       "subtitle-dashboard.js",
-      "subtitle-audio-player.js",
       "subtitle.css",
       "subtitle-overlay.html",
       "subtitle-overlay.js",
@@ -117,39 +47,7 @@ test("desktop subtitle static assets are always revalidated instead of surviving
       assert.equal(response.headers.get("surrogate-control"), "no-store", asset);
     }
     const unrelated = await fetch(`${url}/app.js`);
-    assert.equal(unrelated.status, 200);
-    assert.equal(unrelated.headers.get("cache-control")?.includes("no-store"), false, "the emergency policy must stay scoped to subtitle assets");
-  } finally {
-    await new Promise((resolve) => httpServer.close(resolve));
-  }
-});
-
-test("websocket clients receive the current agent status on connect", async () => {
-  const { httpServer, url } = await startServer({
-    host: "127.0.0.1",
-    port: 0,
-    moonshineModel: "medium",
-    openaiApiKey: "test",
-    createTranscription: () => ({
-      ready: async () => {},
-      sendAudio: () => {},
-      stop: () => {},
-      close: () => {},
-    }),
-  });
-
-  try {
-    const messages = await collectWebSocketMessages(url.replace("http:", "ws:") + "/ws", 7);
-    assert.deepEqual(
-      messages.map((message) => message.type),
-      ["config", "agent:status", "mode", "warmup", "cost", "subtitle:history", "subtitle:snapshot"],
-    );
-    assert.equal(messages[1].status, "idle");
-    assert.equal(messages[2].mode, "staging");
-    assert.equal(messages[3].state, "idle");
-    assert.equal(messages[4].agent.cost, 0);
-    assert.equal(messages[4].transcription.cost, 0);
-    assert.deepEqual(messages[5].records, []);
+    assert.equal(unrelated.status, 404, "the canvas application is served only by its independent project");
   } finally {
     await new Promise((resolve) => httpServer.close(resolve));
   }
@@ -222,7 +120,7 @@ test("settings export downloads subtitle settings as a portable JSON file", asyn
     openaiApiKey: "test",
     settingsStore: await (async () => {
       const dir = await fs.mkdtemp(path.join(os.tmpdir(), "rn-export-"));
-      const store = createSettingsStore({ filePath: path.join(dir, "settings.json"), env: {}, readCodexAuth: () => null });
+      const store = createSettingsStore({ filePath: path.join(dir, "settings.json"), env: {} });
       await store.load();
       await store.save({
         apiKeys: { openai: "sk-test" },
@@ -270,19 +168,60 @@ test("settings export downloads subtitle settings as a portable JSON file", asyn
   }
 });
 
-test("subtitle second-pass polish uses separated provider keys", () => {
-  assert.deepEqual(
-    selectSubtitlePolishOptions({
-      args: { tone: "natural", glossary: "operator = 운영사", domain: "Commercial real estate" },
-      saved: {
-        apiKeys: { openai: "sk-primary", openaiSecondary: "sk-secondary" },
-        subtitle: { tonePolishModel: "gpt-5.5" },
-      },
-      env: {},
-    }),
-    { provider: "openai", apiKey: "sk-secondary", modelId: "gpt-5.5" },
-  );
+test("text adapter accepts one-character speech without optional polish settings", () => {
+  const saved = { apiKeys: { gemini: "test-caption-key" }, subtitle: { engine: GEMINI_ENGINE_SELECTION } };
+  assert.deepEqual(selectSubtitlePolishOptions({
+    args: { translatedText: "…", sourceText: "네", tone: "natural" }, saved, env: {},
+  }), { provider: "gemini", apiKey: saved.apiKeys.gemini, modelId: "gemini-3.6-flash", fallbackModels: ["gemini-3.5-flash-lite"] });
+  assert.equal(selectSubtitlePolishOptions({
+    args: { translatedText: "…", sourceText: "  ", tone: "natural" }, saved, env: {},
+  }), null);
+});
 
+// Availability routing only: one attempt per model in the selected engine's
+// catalog chain, in order, and no model is retried.
+test("text adapter outages walk the engine fallback chain once per model", async () => {
+  let polish;
+  const calls = [];
+  const { httpServer } = await startServer({
+    host: "127.0.0.1", port: 0, env: { GEMINI_API_KEY: "test-caption-key" },
+    settingsStore: { load: async () => ({ transcription: { provider: "moonshine", moonshine: { model: "medium" }, openai: { model: "gpt-4o-transcribe" } }, subtitle: { engine: GEMINI_ENGINE_SELECTION } }), getSanitized: async () => ({ subtitle: { engine: GEMINI_ENGINE_SELECTION } }) },
+    createTranscription: () => ({ ready: async () => {}, sendAudio() {}, stop() {}, close() {} }),
+    createSubtitleRealtimeManager: (options) => { polish = options.polish; return { close() {} }; },
+    fetchImpl: async (url) => { calls.push(url); return new Response("", { status: 503 }); },
+  });
+  try {
+    await polish({ translatedText: "…", sourceText: "오늘 회의를 시작합니다.", targetLanguage: "en", tone: "natural" });
+    assert.deepEqual(
+      calls.map((url) => String(url).split("/").at(-1)),
+      ["gemini-3.6-flash:generateContent", "gemini-3.5-flash-lite:generateContent"],
+    );
+  } finally {
+    await new Promise((resolve) => httpServer.close(resolve));
+  }
+});
+
+// The "polish" call is the caption text-translation call, so its model is the
+// engine selection's translation model — not a separate hard-coded pin.
+test("caption text translation follows the saved engine translation model", () => {
+  const saved = {
+    apiKeys: { gemini: "AIza-live" },
+    subtitle: {
+      engine: {
+        stt: { provider: "gemini", model: "gemini-3.5-transcribe-live", languageMode: "auto" },
+        translation: { provider: "gemini", model: "gemini-3.7-flash" },
+        summary: { provider: "gemini", model: "gemini-3.6-flash" },
+      },
+    },
+  };
+  assert.deepEqual(
+    selectSubtitlePolishOptions({ args: { tone: "business", glossary: "" }, saved, env: {} }),
+    { provider: "gemini", apiKey: "AIza-live", modelId: "gemini-3.7-flash", fallbackModels: ["gemini-3.6-flash", "gemini-3.5-flash-lite"] },
+  );
+});
+
+test("subtitle second-pass polish uses separated provider keys", () => {
+  const secondaryFixture = "AIza-finalizer";
   assert.equal(
     selectSubtitlePolishOptions({
       args: { tone: "natural", glossary: "operator = 운영사" },
@@ -292,34 +231,16 @@ test("subtitle second-pass polish uses separated provider keys", () => {
     null,
   );
 
-  assert.equal(
-    selectSubtitlePolishOptions({
-      args: { tone: "business", glossary: "" },
-      saved: { apiKeys: { openai: "sk-primary" }, subtitle: {} },
-      env: {},
-    }),
-    null,
-  );
-
-  assert.deepEqual(
-    selectSubtitlePolishOptions({
-      args: { tone: "business", glossary: "" },
-      saved: { apiKeys: { openai: "sk-primary", openaiSecondary: "sk-secondary" }, subtitle: {} },
-      env: {},
-    }),
-    { provider: "openai", apiKey: "sk-secondary", modelId: "gpt-5.5" },
-  );
-
   assert.deepEqual(
     selectSubtitlePolishOptions({
       args: { tone: "business", glossary: "", polishProvider: "gemini" },
       saved: {
         apiKeys: { gemini: "AIza-live", geminiSecondary: "AIza-finalizer" },
-        subtitle: { geminiPolishModel: "gemini-3.5-flash" },
+        subtitle: { engine: GEMINI_ENGINE_SELECTION, geminiPolishModel: "gemini-3.5-flash" },
       },
       env: {},
     }),
-    { provider: "gemini", apiKey: "AIza-finalizer", modelId: "gemini-3.5-flash" },
+    { provider: "gemini", apiKey: secondaryFixture, modelId: "gemini-3.6-flash", fallbackModels: ["gemini-3.5-flash-lite"] },
   );
 
   assert.deepEqual(
@@ -333,11 +254,11 @@ test("subtitle second-pass polish uses separated provider keys", () => {
       },
       saved: {
         apiKeys: { gemini: "AIza-live", geminiSecondary: "AIza-finalizer" },
-        subtitle: { geminiPolishModel: "gemini-3.5-flash" },
+        subtitle: { engine: GEMINI_ENGINE_SELECTION, geminiPolishModel: "gemini-3.5-flash" },
       },
       env: {},
     }),
-    { provider: "gemini", apiKey: "AIza-finalizer", modelId: "gemini-3.5-flash" },
+    { provider: "gemini", apiKey: secondaryFixture, modelId: "gemini-3.6-flash", fallbackModels: ["gemini-3.5-flash-lite"] },
   );
 
   assert.deepEqual(
@@ -345,11 +266,11 @@ test("subtitle second-pass polish uses separated provider keys", () => {
       args: { tone: "business", glossary: "", polishProvider: "gemini" },
       saved: {
         apiKeys: { gemini: "AIza-live" },
-        subtitle: { geminiPolishModel: "gemini-3.5-flash" },
+        subtitle: { engine: GEMINI_ENGINE_SELECTION, geminiPolishModel: "gemini-3.5-flash" },
       },
       env: {},
     }),
-    { provider: "gemini", apiKey: "AIza-live", modelId: "gemini-3.5-flash" },
+    { provider: "gemini", apiKey: "AIza-live", modelId: "gemini-3.6-flash", fallbackModels: ["gemini-3.5-flash-lite"] },
   );
 
   assert.equal(
@@ -360,10 +281,20 @@ test("subtitle second-pass polish uses separated provider keys", () => {
     }),
     null,
   );
+
+  assert.deepEqual(
+    selectSubtitlePolishOptions({
+      args: { tone: "business", glossary: "", polishProvider: "gemini" },
+      saved: { apiKeys: { gemini: "AIza-live" }, subtitle: { engine: GEMINI_ENGINE_SELECTION } },
+      env: {},
+    }),
+    { provider: "gemini", apiKey: "AIza-live", modelId: "gemini-3.6-flash", fallbackModels: ["gemini-3.5-flash-lite"] },
+  );
 });
 
 test("subtitle:start validates runtime subtitle settings before opening providers", async () => {
   const { httpServer, url } = await startServer({
+    resolveCaptionEngine: async () => GEMINI_ENGINE_SELECTION,
     host: "127.0.0.1",
     port: 0,
     moonshineModel: "medium",
@@ -378,7 +309,7 @@ test("subtitle:start validates runtime subtitle settings before opening provider
 
   let ws;
   try {
-    ws = new WebSocket(url.replace("http:", "ws:") + "/ws");
+    ws = new WebSocket(url.replace("http:", "ws:") + "/ws", { headers: { Origin: url } });
     await new Promise((resolve, reject) => {
       ws.once("open", resolve);
       ws.once("error", reject);
@@ -412,6 +343,7 @@ test("subtitle:start validates runtime subtitle settings before opening provider
 test("subtitle:stop without a sessionId cannot stop the active subtitle session", async () => {
   const sockets = [];
   const { httpServer, url } = await startServer({
+    resolveCaptionEngine: async () => GEMINI_ENGINE_SELECTION,
     host: "127.0.0.1",
     port: 0,
     moonshineModel: "medium",
@@ -432,7 +364,7 @@ test("subtitle:stop without a sessionId cannot stop the active subtitle session"
 
   let ws;
   try {
-    ws = new WebSocket(url.replace("http:", "ws:") + "/ws");
+    ws = new WebSocket(url.replace("http:", "ws:") + "/ws", { headers: { Origin: url } });
     await new Promise((resolve, reject) => {
       ws.once("open", resolve);
       ws.once("error", reject);
@@ -449,7 +381,7 @@ test("subtitle:stop without a sessionId cannot stop the active subtitle session"
       type: "subtitle:audio",
       sessionId: "active",
       source: "mic",
-      audio: "AAAA",
+      audio: Buffer.alloc(4_800, 1).toString("base64"),
     }));
     await new Promise((resolve) => setTimeout(resolve, 25));
 
@@ -459,6 +391,61 @@ test("subtitle:stop without a sessionId cannot stop the active subtitle session"
     );
   } finally {
     ws?.close();
+    await new Promise((resolve) => httpServer.close(resolve));
+  }
+});
+
+test("subtitle:input-status preserves the microphone source for the stall watchdog", { timeout: 2_000 }, async () => {
+  let resolveSignal;
+  const signalPromise = new Promise((resolve) => {
+    resolveSignal = resolve;
+  });
+  const { httpServer, url } = await startServer({
+    resolveCaptionEngine: async () => GEMINI_ENGINE_SELECTION,
+    host: "127.0.0.1",
+    port: 0,
+    moonshineModel: "medium",
+    openaiApiKey: "test",
+    createTranscription: () => ({
+      ready: async () => {},
+      sendAudio: () => {},
+      stop: () => {},
+      close: () => {},
+    }),
+    createSubtitleRealtimeManager: () => ({
+      start: async () => {},
+      stop: async () => {},
+      sendAudio: () => {},
+      restartChannels: async () => {},
+      noteInputSignal: (signal) => resolveSignal(signal),
+      close: () => {},
+    }),
+  });
+
+  const ws = new WebSocket(url.replace("http:", "ws:") + "/ws", { headers: { Origin: url } });
+  try {
+    await new Promise((resolve, reject) => {
+      ws.once("open", resolve);
+      ws.once("error", reject);
+    });
+    const started = new Promise((resolve) => {
+      ws.on("message", (raw) => {
+        const message = JSON.parse(raw.toString("utf8"));
+        if (message.type === "subtitle:started") resolve();
+      });
+    });
+    ws.send(JSON.stringify({ type: "subtitle:start", sessionId: "mic-session", settings: {} }));
+    await started;
+    ws.send(JSON.stringify({
+      type: "subtitle:input-status",
+      sessionId: "mic-session",
+      source: "mic",
+      status: "signal",
+    }));
+
+    assert.deepEqual(await signalPromise, { sessionId: "mic-session", source: "mic" });
+  } finally {
+    ws.close();
     await new Promise((resolve) => httpServer.close(resolve));
   }
 });
@@ -492,7 +479,7 @@ test("history exports as Excel-compatible CSV with a UTF-8 BOM", async () => {
   }
 });
 
-test("server rejects cross-origin mutating HTTP and websocket requests", async () => {
+test("server requires exact local origin for mutating HTTP and websocket requests", async () => {
   const { httpServer, url } = await startServer({
     host: "127.0.0.1",
     port: 0,
@@ -507,7 +494,23 @@ test("server rejects cross-origin mutating HTTP and websocket requests", async (
   });
 
   try {
-    const response = await fetch(`${url}/api/session/reset`, {
+    const sameOriginResponse = await fetch(`${url}/api/subtitles/history/clear`, {
+      method: "POST",
+      headers: sameOriginHeaders(url),
+    });
+    assert.equal(sameOriginResponse.status, 200);
+
+    const missingOriginResponse = await fetch(`${url}/api/subtitles/history/clear`, {
+      method: "POST",
+    });
+    assert.equal(missingOriginResponse.status, 403);
+    assert.deepEqual(await missingOriginResponse.json(), {
+      ok: false,
+      error: "허용되지 않은 요청 출처입니다.",
+      code: "INVALID_ORIGIN",
+    });
+
+    const response = await fetch(`${url}/api/subtitles/history/clear`, {
       method: "POST",
       headers: { origin: "https://example.test" },
     });
@@ -517,6 +520,19 @@ test("server rejects cross-origin mutating HTTP and websocket requests", async (
       error: "허용되지 않은 요청 출처입니다.",
       code: "INVALID_ORIGIN",
     });
+
+    const localOrigin = new URL(url).origin;
+    for (const origin of [
+      `${localOrigin}.evil.test`,
+      `${localOrigin}/forged-path`,
+      localOrigin.replace(/:\d+$/u, ":444"),
+    ]) {
+      const confused = await fetch(`${url}/api/subtitles/history/clear`, {
+        method: "POST",
+        headers: { origin },
+      });
+      assert.equal(confused.status, 403, origin);
+    }
 
     await assert.rejects(
       new Promise((resolve, reject) => {
@@ -535,7 +551,7 @@ test("server rejects cross-origin mutating HTTP and websocket requests", async (
   }
 });
 
-test("server validates OpenAI Realtime translation keys before saving", async () => {
+test("server validates OpenAI Realtime transcription keys before saving", async () => {
   const sockets = [];
   const { httpServer, url } = await startServer({
     host: "127.0.0.1",
@@ -550,6 +566,7 @@ test("server validates OpenAI Realtime translation keys before saving", async ()
     }),
     createSubtitleWebSocket: (socketUrl, protocols, init) => {
       const socket = new FakeRealtimeSocket(socketUrl, init);
+      socket.responseType = "transcription_session.updated";
       sockets.push(socket);
       return socket;
     },
@@ -558,14 +575,25 @@ test("server validates OpenAI Realtime translation keys before saving", async ()
   try {
     const response = await fetch(`${url}/api/subtitles/openai/validate`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: sameOriginHeaders(url, { "content-type": "application/json" }),
       body: JSON.stringify({ apiKey: "sk-test" }),
     });
     assert.equal(response.status, 200);
     assert.deepEqual(await response.json(), { ok: true, data: { status: "valid" } });
-    assert.equal(sockets[0].url, "wss://api.openai.com/v1/realtime/translations?model=gpt-realtime-translate");
+    assert.equal(sockets[0].url, "wss://api.openai.com/v1/realtime?intent=transcription");
     assert.equal(sockets[0].init.headers.Authorization, "Bearer sk-test");
-    assert.equal(JSON.parse(sockets[0].sent[0]).type, "session.update");
+    assert.deepEqual(JSON.parse(sockets[0].sent[0]), {
+      type: "session.update",
+      session: {
+        type: "transcription",
+        audio: {
+          input: {
+            format: { type: "audio/pcm", rate: 24_000 },
+            transcription: { model: "gpt-realtime-whisper" },
+          },
+        },
+      },
+    });
     assert.equal(sockets[0].closed, true);
   } finally {
     await new Promise((resolve) => httpServer.close(resolve));
@@ -594,7 +622,7 @@ test("server returns a sanitized OpenAI validation error", async () => {
   try {
     const response = await fetch(`${url}/api/subtitles/openai/validate`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: sameOriginHeaders(url, { "content-type": "application/json" }),
       body: JSON.stringify({ apiKey: "sk-secret-value" }),
     });
     assert.equal(response.status, 400);
@@ -608,7 +636,7 @@ test("server returns a sanitized OpenAI validation error", async () => {
   }
 });
 
-test("server validates Gemini keys through text generation before saving", async () => {
+test("server validates Gemini model access without paid inference and rate limits repeated checks", async () => {
   const fetchCalls = [];
   const { httpServer, url } = await startServer({
     host: "127.0.0.1",
@@ -625,7 +653,7 @@ test("server validates Gemini keys through text generation before saving", async
       fetchCalls.push({ url: requestUrl, init });
       return {
         ok: true,
-        json: async () => ({ candidates: [{ content: { parts: [{ text: "ok" }] } }] }),
+        json: async () => ({ candidates: [{ finishReason: "STOP", content: { parts: [{ text: "ok" }] } }] }),
       };
     },
   });
@@ -633,14 +661,23 @@ test("server validates Gemini keys through text generation before saving", async
   try {
     const response = await fetch(`${url}/api/subtitles/gemini/validate`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: sameOriginHeaders(url, { "content-type": "application/json" }),
       body: JSON.stringify({ apiKey: "AIza-test" }),
     });
     assert.equal(response.status, 200);
     assert.deepEqual(await response.json(), { ok: true, data: { status: "valid" } });
     assert.match(fetchCalls[0].url, /generativelanguage\.googleapis\.com/);
+    assert.match(fetchCalls[0].url, /gemini-3\.6-flash/u);
     assert.equal(fetchCalls[0].init.headers["x-goog-api-key"], "AIza-test");
-    assert.match(JSON.parse(fetchCalls[0].init.body).contents[0].parts[0].text, /ok/);
+    assert.equal(fetchCalls[0].init.method, "GET");
+    assert.equal(fetchCalls[0].init.body, undefined);
+    assert.equal(fetchCalls[0].init.redirect, "error");
+    const repeated = await fetch(`${url}/api/subtitles/gemini/validate`, {
+      method: "POST", headers: sameOriginHeaders(url, { "content-type": "application/json" }),
+      body: JSON.stringify({ apiKey: "AIza-test" }),
+    });
+    assert.equal(repeated.status, 429);
+    assert.equal(fetchCalls.length, 1);
   } finally {
     await new Promise((resolve) => httpServer.close(resolve));
   }
@@ -664,7 +701,7 @@ test("server returns a sanitized Gemini validation error", async () => {
   try {
     const response = await fetch(`${url}/api/subtitles/gemini/validate`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: sameOriginHeaders(url, { "content-type": "application/json" }),
       body: JSON.stringify({ apiKey: "AIza-secret" }),
     });
     assert.equal(response.status, 400);
@@ -673,54 +710,6 @@ test("server returns a sanitized Gemini validation error", async () => {
       error: "Gemini 연결 확인에 실패했습니다. API key, 프로젝트 권한, 사용량 한도를 확인하세요.",
       code: "GEMINI_VALIDATE_FAILED",
     });
-  } finally {
-    await new Promise((resolve) => httpServer.close(resolve));
-  }
-});
-
-test("websocket screenshot messages update agent visual context", async () => {
-  let resolveGenerateText;
-  const generateTextStarted = new Promise((resolve) => {
-    resolveGenerateText = resolve;
-  });
-  const { httpServer, url, state } = await startServer({
-    host: "127.0.0.1",
-    port: 0,
-    moonshineModel: "medium",
-    openaiApiKey: "test",
-    createTranscription: ({ queueTranscript }) => ({
-      ready: async () => {},
-      sendAudio: () => queueTranscript("Update the visual layout"),
-      stop: () => {},
-      close: () => {},
-    }),
-    generateTextFn: async ({ messages }) => {
-      const currentCanvasMessage = messages.at(-1);
-      assert.deepEqual(currentCanvasMessage.content.at(-1), { type: "image", image: "data:image/png;base64,latest" });
-      resolveGenerateText();
-      return { text: "DONE", finishReason: "stop" };
-    },
-  });
-
-  try {
-    state.mode = "live";
-    const ws = new WebSocket(url.replace("http:", "ws:") + "/ws");
-    const initialMessages = new Promise((resolve) => {
-      let count = 0;
-      ws.on("message", () => {
-        count += 1;
-        if (count === 7) resolve();
-      });
-    });
-    await new Promise((resolve, reject) => {
-      ws.once("open", resolve);
-      ws.once("error", reject);
-    });
-    await initialMessages;
-    ws.send(JSON.stringify({ type: "whiteboard:screenshot", image: "data:image/png;base64,latest" }));
-    ws.send(JSON.stringify({ type: "audio", audio: "" }));
-    await generateTextStarted;
-    ws.close();
   } finally {
     await new Promise((resolve) => httpServer.close(resolve));
   }
@@ -745,405 +734,15 @@ class FakeRealtimeSocket extends EventEmitter {
       return;
     }
     const value = JSON.parse(message);
-    queueMicrotask(() => this.emit("message", JSON.stringify(value.setup ? { setupComplete: {} } : { type: "session.updated" })));
+    queueMicrotask(() => this.emit("message", JSON.stringify(
+      value.setup ? { setupComplete: {} } : { type: this.responseType ?? "session.updated" },
+    )));
   }
 
   close() {
     this.closed = true;
   }
 }
-
-test("websocket stop makes synchronous transcript flush stale", async () => {
-  let generateCalled = false;
-  let ws;
-  let resolveStopCalled;
-  const stopCalled = new Promise((resolve) => {
-    resolveStopCalled = resolve;
-  });
-  const { httpServer, url, state } = await startServer({
-    host: "127.0.0.1",
-    port: 0,
-    moonshineModel: "medium",
-    openaiApiKey: "test",
-    createTranscription: ({ queueTranscript }) => ({
-      ready: async () => {},
-      sendAudio: () => {},
-      stop: () => {
-        queueTranscript("Final flushed words");
-        resolveStopCalled();
-      },
-      close: () => {},
-    }),
-    generateTextFn: async () => {
-      generateCalled = true;
-      return { text: "DONE", finishReason: "stop" };
-    },
-  });
-
-  try {
-    state.mode = "live";
-    ws = new WebSocket(url.replace("http:", "ws:") + "/ws");
-    const initialMessages = new Promise((resolve) => {
-      let count = 0;
-      ws.on("message", () => {
-        count += 1;
-        if (count === 5) resolve();
-      });
-    });
-    await new Promise((resolve, reject) => {
-      ws.once("open", resolve);
-      ws.once("error", reject);
-    });
-    await initialMessages;
-    ws.send(JSON.stringify({ type: "stop" }));
-    await Promise.race([
-      stopCalled,
-      new Promise((_, reject) => setTimeout(() => reject(new Error("Timed out waiting for transcription stop.")), 2000)),
-    ]);
-    await state.idle();
-    assert.equal(generateCalled, false);
-    ws.close();
-  } finally {
-    ws?.close();
-    await new Promise((resolve) => httpServer.close(resolve));
-  }
-});
-
-test("runWhiteboardAgent rejects with a timeout instead of hanging forever", async () => {
-  await assert.rejects(
-    () =>
-      runWhiteboardAgent({
-        transcript: "hello",
-        state: { elements: [], agentHistory: [] },
-        wss: { clients: new Set() },
-        options: { agentTimeoutMs: 1 },
-        generateTextFn: () => new Promise(() => {}),
-      }),
-    /Whiteboard agent timed out/,
-  );
-});
-
-test("runWhiteboardAgent exposes whiteboard_apply that combines edits and viewport in one call", async () => {
-  const broadcasts = [];
-  const state = {
-    elements: [{ type: "text", id: "title", x: 72, y: 68, text: "Realtime Noel" }],
-    agentHistory: [],
-  };
-
-  await runWhiteboardAgent({
-    transcript: "Add a voice box and focus on it",
-    state,
-    wss: {
-      clients: new Set([
-        {
-          readyState: WebSocket.OPEN,
-          send: (message) => broadcasts.push(JSON.parse(message)),
-        },
-      ]),
-    },
-    options: {},
-    generateTextFn: async ({ tools }) => {
-      assert.equal(tools.updateWhiteboard, undefined);
-      assert.equal(tools.whiteboard_edit, undefined, "whiteboard_edit removed");
-      assert.equal(tools.whiteboard_viewport, undefined, "whiteboard_viewport removed");
-      assert.ok(tools.whiteboard_overwrite);
-      assert.ok(tools.whiteboard_apply);
-
-      const result = await tools.whiteboard_apply.execute({
-        operations: [
-          {
-            type: "insert_after",
-            line: 1,
-            element: { type: "rectangle", id: "voice", x: 80, y: 140, width: 220, height: 80 },
-          },
-        ],
-        viewport: { action: "scroll_to_content", focus_ids: ["voice"] },
-      });
-
-      assert.match(result, /001: \{"type":"text","id":"title"/);
-      assert.match(result, /002: \{"type":"rectangle","id":"voice"/);
-      assert.match(result, /Viewport scrolled to 1 element: \["voice"\]/);
-    },
-  });
-
-  assert.deepEqual(state.elements, [
-    { type: "text", id: "title", x: 72, y: 68, text: "Realtime Noel" },
-    { type: "rectangle", id: "voice", x: 80, y: 140, width: 220, height: 80 },
-  ]);
-  assert.deepEqual(
-    broadcasts,
-    [
-      { type: "whiteboard:update", elements: state.elements },
-      { type: "whiteboard:viewport", action: "scroll_to_content", focus_ids: ["voice"] },
-    ],
-  );
-});
-
-test("whiteboard_apply with operations only edits the canvas without touching viewport", async () => {
-  const broadcasts = [];
-  const state = {
-    elements: [{ type: "text", id: "title", x: 0, y: 0, text: "Hi" }],
-    agentHistory: [],
-  };
-
-  await runWhiteboardAgent({
-    transcript: "Add a box",
-    state,
-    wss: {
-      clients: new Set([
-        { readyState: WebSocket.OPEN, send: (msg) => broadcasts.push(JSON.parse(msg)) },
-      ]),
-    },
-    options: {},
-    generateTextFn: async ({ tools }) => {
-      const result = await tools.whiteboard_apply.execute({
-        operations: [
-          { type: "insert_after", line: 1, element: { type: "rectangle", id: "box", x: 10, y: 50, width: 100, height: 50 } },
-        ],
-      });
-      assert.match(result, /002: \{"type":"rectangle","id":"box"/);
-      assert.doesNotMatch(result, /Viewport/);
-    },
-  });
-
-  assert.equal(broadcasts.filter((m) => m.type === "whiteboard:viewport").length, 0);
-});
-
-test("whiteboard_apply with viewport only moves the camera without editing", async () => {
-  const broadcasts = [];
-  const state = {
-    elements: [{ type: "rectangle", id: "oauth-box", x: 0, y: 0, width: 200, height: 100 }],
-    agentHistory: [],
-  };
-
-  await runWhiteboardAgent({
-    transcript: "Zoom to the OAuth box",
-    state,
-    wss: {
-      clients: new Set([
-        { readyState: WebSocket.OPEN, send: (msg) => broadcasts.push(JSON.parse(msg)) },
-      ]),
-    },
-    options: {},
-    generateTextFn: async ({ tools }) => {
-      const result = await tools.whiteboard_apply.execute({
-        viewport: { action: "scroll_to_content", focus_ids: ["oauth-box"] },
-      });
-      assert.match(result, /Viewport scrolled to 1 element/);
-    },
-  });
-
-  assert.deepEqual(
-    broadcasts.filter((m) => m.type === "whiteboard:viewport"),
-    [{ type: "whiteboard:viewport", action: "scroll_to_content", focus_ids: ["oauth-box"] }],
-  );
-  assert.equal(broadcasts.filter((m) => m.type === "whiteboard:update").length, 0);
-});
-
-test("whiteboard_apply rejects calls with neither operations nor viewport", async () => {
-  let returned;
-  await runWhiteboardAgent({
-    transcript: "do nothing",
-    state: { elements: [], agentHistory: [] },
-    wss: { clients: new Set() },
-    options: {},
-    generateTextFn: async ({ tools }) => {
-      returned = await tools.whiteboard_apply.execute({});
-    },
-  });
-  assert.match(returned, /Provide at least one of operations or viewport/);
-});
-
-test("whiteboard_apply scroll_to_content without focus_ids returns a nudge to use them", async () => {
-  let returned;
-  await runWhiteboardAgent({
-    transcript: "scroll please",
-    state: { elements: [], agentHistory: [] },
-    wss: { clients: new Set() },
-    options: {},
-    generateTextFn: async ({ tools }) => {
-      returned = await tools.whiteboard_apply.execute({
-        viewport: { action: "scroll_to_content" },
-      });
-    },
-  });
-  assert.match(returned, /focus_ids/);
-});
-
-test("runWhiteboardAgent passes OpenAI reasoning effort provider option", async () => {
-  await runWhiteboardAgent({
-    transcript: "hello",
-    state: { elements: [], agentHistory: [] },
-    wss: { clients: new Set() },
-    options: {
-      agentProvider: {
-        provider: "openai",
-        model: "gpt-5.5",
-        apiKey: "test",
-        reasoningEffort: "low",
-      },
-    },
-    generateTextFn: async ({ providerOptions }) => {
-      assert.deepEqual(providerOptions, {
-        openai: { reasoningEffort: "low" },
-      });
-    },
-  });
-});
-
-test("runWhiteboardAgent always uses the production system prompt", async () => {
-  await runWhiteboardAgent({
-    transcript: "hello",
-    state: { elements: [], agentHistory: [] },
-    wss: { clients: new Set() },
-    options: { systemPrompt: "Custom whiteboard instructions" },
-    generateTextFn: async ({ system }) => {
-      assert.equal(system, whiteboardSystemPrompt());
-    },
-  });
-});
-
-test("runWhiteboardAgent records a model result summary in agent events", async () => {
-  const events = [];
-
-  await runWhiteboardAgent({
-    transcript: "hello",
-    state: { elements: [], agentHistory: [] },
-    wss: { clients: new Set() },
-    options: { onAgentEvent: (event) => events.push(event) },
-    generateTextFn: async () => ({ text: "DONE", finishReason: "stop", usage: { totalTokens: 12 } }),
-  });
-
-  const endEvent = events.find((event) => event.type === "model:end");
-  assert.deepEqual(endEvent.result, {
-    text: "DONE",
-    finishReason: "stop",
-    usage: { totalTokens: 12 },
-  });
-});
-
-test("runWhiteboardAgent passes Codex reasoning effort provider option", async () => {
-  await runWhiteboardAgent({
-    transcript: "hello",
-    state: { elements: [], agentHistory: [] },
-    wss: { clients: new Set() },
-    options: {
-      agentProvider: {
-        provider: "codex",
-        model: "gpt-5.5",
-        baseURL: "https://chatgpt.com/backend-api/codex",
-        apiKey: "test",
-        reasoningEffort: "low",
-      },
-    },
-    streamTextFn: ({ providerOptions }) => ({
-      consumeStream: async () => {
-        assert.deepEqual(providerOptions, {
-          openai: { reasoningEffort: "low", store: false, instructions: whiteboardSystemPrompt() },
-        });
-      },
-    }),
-  });
-});
-
-test("runWhiteboardAgent passes Codex fast mode provider option", async () => {
-  await runWhiteboardAgent({
-    transcript: "hello",
-    state: { elements: [], agentHistory: [] },
-    wss: { clients: new Set() },
-    options: {
-      agentProvider: {
-        provider: "codex",
-        model: "gpt-5.5",
-        requestedModel: "gpt-5.5-fast",
-        baseURL: "https://chatgpt.com/backend-api/codex",
-        apiKey: "test",
-        reasoningEffort: "low",
-        serviceTier: "priority",
-      },
-    },
-    streamTextFn: ({ providerOptions }) => ({
-      consumeStream: async () => {
-        assert.deepEqual(providerOptions, {
-          openai: { reasoningEffort: "low", serviceTier: "priority", store: false, instructions: whiteboardSystemPrompt() },
-        });
-      },
-    }),
-  });
-});
-
-test("runWhiteboardAgent passes Codex instructions provider option", async () => {
-  await runWhiteboardAgent({
-    transcript: "hello",
-    state: { elements: [], agentHistory: [] },
-    wss: { clients: new Set() },
-    options: {
-      agentProvider: {
-        provider: "codex",
-        model: "gpt-5.5",
-        baseURL: "https://chatgpt.com/backend-api/codex",
-        apiKey: "test",
-        reasoningEffort: "low",
-      },
-    },
-    streamTextFn: ({ providerOptions, system }) => ({
-      consumeStream: async () => {
-        assert.equal(providerOptions.openai.instructions, system);
-      },
-    }),
-  });
-});
-
-test("runWhiteboardAgent disables Codex response storage", async () => {
-  await runWhiteboardAgent({
-    transcript: "hello",
-    state: { elements: [], agentHistory: [] },
-    wss: { clients: new Set() },
-    options: {
-      agentProvider: {
-        provider: "codex",
-        model: "gpt-5.5",
-        baseURL: "https://chatgpt.com/backend-api/codex",
-        apiKey: "test",
-        reasoningEffort: "low",
-      },
-    },
-    streamTextFn: ({ providerOptions }) => ({
-      consumeStream: async () => {
-        assert.equal(providerOptions.openai.store, false);
-      },
-    }),
-  });
-});
-
-test("runWhiteboardAgent uses streaming for Codex responses", async () => {
-  let consumed = false;
-
-  await runWhiteboardAgent({
-    transcript: "hello",
-    state: { elements: [], agentHistory: [] },
-    wss: { clients: new Set() },
-    options: {
-      agentProvider: {
-        provider: "codex",
-        model: "gpt-5.5",
-        baseURL: "https://chatgpt.com/backend-api/codex",
-        apiKey: "test",
-        reasoningEffort: "low",
-      },
-    },
-    generateTextFn: async () => {
-      throw new Error("Codex should use streamText");
-    },
-    streamTextFn: () => ({
-      consumeStream: async () => {
-        consumed = true;
-      },
-    }),
-  });
-
-  assert.equal(consumed, true);
-});
 
 function collectWebSocketMessages(url, count) {
   return new Promise((resolve, reject) => {
@@ -1185,3 +784,135 @@ function waitForWebSocketMessage(ws, predicate) {
     ws.on("message", onMessage);
   });
 }
+
+test("caption engine settings come from the server catalog and reject unknown selections", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "nova-model-settings-"));
+  const store = createSettingsStore({ filePath: path.join(dir, "settings.json"), env: {} });
+  await store.load();
+  const activeState = { active: true };
+  let providerStarts = 0;
+  const { httpServer, url } = await startServer({
+    host: "127.0.0.1", port: 0, moonshineModel: "medium", settingsStore: store,
+    createTranscription: () => ({ ready: async () => {}, sendAudio() {}, stop() {}, close() {} }),
+    createSubtitleRealtimeManager: () => ({
+      _state: activeState, start() { providerStarts += 1; }, stop() {}, close() {}, sendAudio() {},
+      restartChannels: async () => true,
+    }),
+  });
+  try {
+    const config = await fetch(`${url}/api/config`).then((response) => response.json());
+    assert.equal(config.captionModels, undefined, "the retired per-role model catalog is gone");
+    assert.deepEqual(
+      config.captionEngines.stt.map((entry) => `${entry.provider}:${entry.model}`),
+      ["gemini:gemini-3.5-transcribe-live", "soniox:stt-rt-v5"],
+    );
+    assert.deepEqual(config.captionEngines.defaults, DEFAULT_ENGINE_SELECTION);
+    // Availability is reported, never the key itself.
+    assert.equal(JSON.stringify(config.captionEngines).includes("apiKey"), false);
+    assert.equal(config.captionEngines.stt.every((entry) => entry.available === false), true);
+
+    const put = (subtitle) => fetch(`${url}/api/settings`, {
+      method: "PUT",
+      headers: sameOriginHeaders(url, { "content-type": "application/json" }),
+      body: JSON.stringify({ subtitle }),
+    });
+
+    // Retired per-role model fields and unknown provider/model pairs are refused.
+    assert.equal((await put({ geminiTranscribeModel: "gemini-3.7-flash" })).status, 400);
+    assert.equal((await put({ engine: { stt: { provider: "gemini", model: "gemini-9.9-imaginary", languageMode: "auto" } } })).status, 400);
+    assert.equal((await put({ engine: { translation: { provider: "gemini", model: "gemini-3.6-flash" } } })).status, 400,
+      "Gemini translation cannot be paired with Soniox STT");
+    assert.deepEqual((await store.load()).subtitle.engine.stt, DEFAULT_ENGINE_SELECTION.stt);
+
+    // A valid engine change is accepted even while a session is running: the
+    // selection is picked up by the next channel restart.
+    assert.equal((await put({ engine: { ...GEMINI_ENGINE_SELECTION, translation: { provider: "gemini", model: "gemini-3.7-flash" } } })).status, 200);
+    const saved = await store.load();
+    assert.equal(saved.subtitle.engine.translation.model, "gemini-3.7-flash");
+    assert.equal(saved.subtitle.engine.stt.model, "gemini-3.5-transcribe-live");
+    assert.equal(providerStarts, 0, "reading or saving settings never starts a paid session");
+  } finally {
+    await new Promise((resolve) => httpServer.close(resolve));
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
+// Active sessions retain their assigned engine and credentials until the host ends them.
+test("saving an engine or key while captions run applies only to the next session", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "nova-engine-hotswap-"));
+  const store = createSettingsStore({ filePath: path.join(dir, "settings.json"), env: {} });
+  await store.load();
+  await store.save({ apiKeys: { soniox: "fixture-key" } });
+  const calls = [];
+  const fakeManager = {
+    start: async () => {}, stop: async () => true, close() {}, sendAudio() {}, noteInputSignal() {},
+    restartChannels: async (args) => { calls.push(args); return true; },
+    _state: { active: true },
+  };
+  const { httpServer, url } = await startServer({
+    host: "127.0.0.1", port: 0, moonshineModel: "medium", settingsStore: store,
+    createTranscription: () => ({ ready: async () => {}, sendAudio() {}, stop() {}, close() {} }),
+    createSubtitleRealtimeManager: () => fakeManager,
+  });
+  try {
+    const response = await fetch(`${url}/api/settings`, {
+      method: "PUT",
+      headers: sameOriginHeaders(url, { "content-type": "application/json" }),
+      body: JSON.stringify({
+        subtitle: {
+          engine: {
+            stt: { provider: "soniox", model: "stt-rt-v5", languageMode: "ko" },
+            translation: { provider: "soniox", model: "stt-rt-v5" },
+            summary: { provider: "gemini", model: "gemini-3.6-flash" },
+          },
+        },
+      }),
+    });
+    assert.equal(response.status, 200);
+    assert.deepEqual(calls, []);
+
+    const again = await fetch(`${url}/api/settings`, {
+      method: "PUT",
+      headers: sameOriginHeaders(url, { "content-type": "application/json" }),
+      body: JSON.stringify({ subtitle: { fontSize: 40 } }),
+    });
+    assert.equal(again.status, 200);
+    assert.equal(calls.length, 0, "unrelated settings do not restart the engine");
+
+    // Credential rotation also applies at the next product session boundary.
+    const rotated = await fetch(`${url}/api/settings`, {
+      method: "PUT",
+      headers: sameOriginHeaders(url, { "content-type": "application/json" }),
+      body: JSON.stringify({ apiKeys: { soniox: "fixture-key-rotated" } }),
+    });
+    assert.equal(rotated.status, 200);
+    assert.deepEqual(calls, []);
+
+    // A key the selected engine does not use is still not a reason to restart.
+    const unrelatedKey = await fetch(`${url}/api/settings`, {
+      method: "PUT",
+      headers: sameOriginHeaders(url, { "content-type": "application/json" }),
+      body: JSON.stringify({ apiKeys: { openai: "sk-unrelated" } }),
+    });
+    assert.equal(unrelatedKey.status, 200);
+    assert.equal(calls.length, 0, "a key no selected engine requires never restarts the channels");
+
+    // Re-saving the SAME key value is not a change either.
+    const sameKey = await fetch(`${url}/api/settings`, {
+      method: "PUT",
+      headers: sameOriginHeaders(url, { "content-type": "application/json" }),
+      body: JSON.stringify({ apiKeys: { soniox: "fixture-key-rotated" } }),
+    });
+    assert.equal(sameKey.status, 200);
+    assert.equal(calls.length, 0, "an unchanged key value never restarts the channels");
+  } finally {
+    await new Promise((resolve) => httpServer.close(resolve));
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("Soniox captions never request Gemini polish even when Gemini credentials exist", () => {
+  const args = { tone: "business", glossary: "NOVA = NOVA", sourceText: "안녕", translatedText: "…", required: true };
+  const saved = { apiKeys: { gemini: "fixture-key", geminiSecondary: "fixture-secondary" }, subtitle: { engine: DEFAULT_ENGINE_SELECTION } };
+  assert.equal(selectSubtitlePolishOptions({ args, saved, env: {} }), null);
+});

@@ -1,0 +1,41 @@
+.root {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  color: var(--nova-fg-primary);
+}
+
+.root legend { margin-block-end: 8px; font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
+
+.choice {
+  min-width: 0;
+  min-height: 44px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  padding: 8px;
+  border-radius: var(--nova-radius-sm);
+  background: var(--nova-surface-layered);
+  word-break: keep-all;
+  font: var(--nova-ui-font);
+  letter-spacing: var(--nova-ui-letter-spacing);
+}
+
+.choice label { min-width: 0; min-height: 44px; display: grid; grid-template-columns: 24px minmax(0, 1fr); align-items: center; gap: 8px; }
+.choice input { width: 20px; height: 20px; accent-color: var(--nova-brand-default); }
+.choice input:focus-visible,
+.choice summary:focus-visible { outline: 2px solid var(--nova-system-default); outline-offset: 2px; }
+.choice strong { color: var(--nova-brand-fg); font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
+.choice details { min-width: 0; color: var(--nova-fg-secondary); }
+.choice summary { min-height: 44px; display: flex; align-items: center; color: var(--nova-brand-fg); cursor: pointer; }
+.choice p { grid-column: 1 / -1; margin: 0 0 8px; word-break: keep-all; font: var(--nova-ui-font); letter-spacing: var(--nova-ui-letter-spacing); }
+
+@media (max-width: 360px) {
+  .choice { grid-template-columns: minmax(0, 1fr); }
+  .choice details { margin-inline-start: 32px; }
+}

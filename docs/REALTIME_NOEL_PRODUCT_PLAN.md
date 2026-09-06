@@ -59,10 +59,8 @@ System audio + Microphone
 - 시스템 오디오, 마이크, 시스템+마이크 입력 모드
 - 영어, 한국어, 일본어 번역 언어 선택
 - 체크된 번역 언어 기반 다국어 동시 번역
-- OpenAI Realtime Translation
-- OpenAI API key 2개 등록과 역할 분리
-- Gemini Live Translation 선택 지원
-- Gemini key가 있을 때 일본어 target 자동 우회 route
+- Gemini 3.5 Live Translate 기반 단일 실시간 번역 경로
+- 동시 번역 부하 분산을 위한 Gemini API key 2개 역할 분리
 - 항상 위에 표시되는 자막 오버레이
 - 오버레이 켜기/끄기
 - 자막 위치, 크기, 투명도, 최대 줄 수, 원문 표시 설정
@@ -151,27 +149,27 @@ System audio + Microphone
 - 같은 언어로의 번역은 source language가 판정된 뒤 suppress한다.
 - source가 영어이면 한국어/일본어로, source가 한국어이면 영어/일본어로, source가 일본어이면 영어/한국어로 fan-out한다.
 
-### 7.3 Dual OpenAI API key
+### 7.3 Dual Gemini API key
 
-3개국어 동시 번역에서는 channel 수가 늘어나고 API 부하가 커진다. 이를 위해 OpenAI key를 2개까지 저장할 수 있다.
+3개국어 동시 번역에서는 channel 수가 늘어나고 API 부하가 커진다. 이를 위해 Gemini key를 2개까지 저장할 수 있다.
 
 정책:
 
-- 2개 언어 번역은 primary OpenAI key만 사용한다.
+- 2개 언어 번역은 primary Gemini key만 사용한다.
 - 모든 언어 동시 번역 또는 3개 target 운용에서는 역할별로 primary/secondary key를 나눈다.
 - 예시: 영어 입력과 한국어 입력 출력 role은 API 1, 일본어 관련 출력 role은 API 2처럼 분산한다.
 - secondary key가 없어도 기능은 동작하지만, channel 부하와 rate limit 안정성은 낮아질 수 있다.
-- key는 settings 응답에서 제거하고 `hasOpenAIKey`, `hasOpenAISecondaryKey`만 반환한다.
+- key는 settings 응답에서 제거하고 `hasGeminiKey`, `hasGeminiSecondaryKey`만 반환한다.
 
-### 7.4 Gemini와 일본어
+### 7.4 Gemini Live Translate
 
-OpenAI realtime translation에서 일본어 output latency가 길거나 출력이 늦는 문제가 관찰되었다. 그래서 일본어 target은 Gemini key가 있을 때 Gemini Live로 route할 수 있다.
+영어·한국어·일본어 실시간 번역은 모두 Gemini 3.5 Live Translate 경로를 사용한다. OpenAI primary key는 로컬 음성 인식과 화이트보드 기능에만 사용하며 실시간 번역에는 사용하지 않는다.
 
 정책:
 
-- 사용자가 provider를 Gemini로 선택하면 Gemini를 기본 transport로 사용한다.
-- OpenAI provider 상태에서도 일본어 target이고 Gemini key가 있으면 Gemini로 자동 route할 수 있다.
-- 3개국어 OpenAI all-language mode에서는 OpenAI project key만 사용하도록 구성한다.
+- `translationProvider`는 `gemini`으로 고정한다.
+- 모든 target 언어는 Gemini Live transport로 route한다.
+- 3개국어 모드에서는 primary/secondary Gemini project key로 channel 부하를 분산한다.
 - Gemini Live 입력은 PCM16 mono 16kHz를 요구하므로 앱 내부 24kHz audio를 transport에서 16kHz로 resample한다.
 
 ### 7.5 언어 판정
@@ -337,22 +335,24 @@ Dashboard preview + overlay + history
 | `inputMode` | `system_mic` | 시스템 오디오 + 마이크 |
 | `languagePair` | `{ a: "en", b: "ko" }` | 기본 언어쌍 |
 | `translationLanguages` | `["en", "ko"]` | 실제 번역 target 언어 |
-| `translationProvider` | `openai` | 기본 번역 provider |
-| `model` | `gpt-realtime-translate` | OpenAI realtime 번역 모델 |
+| `translationProvider` | `gemini` | 고정 번역 provider |
+| `model` | `gemini-3.5-live-translate-preview` | realtime 번역 모델 |
 | `geminiModel` | `gemini-3.5-live-translate-preview` | Gemini Live 번역 모델 |
 | `overlayEnabled` | `true` | overlay 기본 활성화 |
 | `showSourceText` | `false` | 원문 같이 표시 여부 |
 | `recordProvider` | `ollama` | 로컬 topic 분류 |
 | `ollamaModel` | `gemma3n:e2b` | topic model |
 | `tone` | `natural` | 번역 어투 |
-| `tonePolishModel` | `gpt-4o-mini` | commit polish 모델 |
+| `tonePolishModel` | `gpt-5.5` | 로컬 Caption-only 후처리 모델 |
 | `verticalOffset` | `48` | 화면 가장자리 offset |
 
 API key:
 
 - `openai`
-- `openaiSecondary`
 - `gemini`
+- `geminiSecondary`
+
+`openai`은 로컬 OpenAI 음성 인식·화이트보드용이며 실시간 번역에는 사용하지 않는다.
 
 보안 원칙:
 
@@ -411,9 +411,9 @@ API key:
 - capture timeout과 fallback
 - AudioContext resume과 track 진단
 - audio source live meter
-- OpenAI key validation
-- secondary OpenAI key 저장과 상태 표시
-- Gemini provider 설정과 transport
+- OpenAI 음성 인식 key validation
+- secondary Gemini key 저장과 상태 표시
+- Gemini 단일 번역 provider 설정과 transport
 - EN/KO/JA 선택 언어 기반 translation channel
 - 3개 언어 동시 번역 설정
 - source language lock
@@ -508,8 +508,8 @@ npm run dist:mac
 
 1. `/Applications/Realtime Noel.app` 실행
 2. dashboard 열림 확인
-3. OpenAI primary/secondary key 등록 상태 확인
-4. Gemini key 등록 상태 확인
+3. OpenAI primary 음성 인식 key 등록 상태 확인
+4. Gemini primary/secondary 번역 key 등록 상태 확인
 5. mic only 번역 확인
 6. system only 번역 확인
 7. system + mic 동시 입력 확인

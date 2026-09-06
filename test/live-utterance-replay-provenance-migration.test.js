@@ -6,6 +6,7 @@ const migrationName = "202607260003_live_utterance_replay_provenance.sql";
 const migrationUrl = new URL(`../supabase/migrations/${migrationName}`, import.meta.url);
 const bootstrapUrl = new URL("../supabase/bootstrap-new-project.sql", import.meta.url);
 const transcriptRouteUrl = new URL("../webapp/app/api/live-sessions/[id]/transcript/route.ts", import.meta.url);
+const transcriptReadUrl = new URL("../webapp/lib/live/transcript-read.ts", import.meta.url);
 
 test("replay provenance migration is additive and follows caption identity", async () => {
   const migrations = (await readdir(new URL("../supabase/migrations/", import.meta.url))).sort();
@@ -22,11 +23,13 @@ test("replay provenance migration is additive and follows caption identity", asy
 
 test("transcript response keeps its legacy fields and adds optional provenance", async () => {
   const route = await readFile(transcriptRouteUrl, "utf8");
+  const transcriptRead = await readFile(transcriptReadUrl, "utf8");
+  assert.match(route, /readCachedLiveTranscript\(sessionId, parsedLanguage\.data\)/u);
   for (const field of ["seq", "speaker", "text", "emittedAt"]) {
-    assert.match(route, new RegExp(`${field}: utterance\\.`, "u"));
+    assert.match(transcriptRead, new RegExp(`${field}: utterance\\.`, "u"));
   }
   for (const field of ["participantId", "sourceText", "sourceLanguage", "origin", "utteranceKey", "translationStatus"]) {
-    assert.match(route, new RegExp(`utterance\\.${field} \\? \\{ ${field}: utterance\\.${field} \\}`, "u"));
+    assert.match(transcriptRead, new RegExp(`utterance\\.${field} \\? \\{ ${field}: utterance\\.${field} \\}`, "u"));
   }
 });
 

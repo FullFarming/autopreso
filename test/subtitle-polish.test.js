@@ -1,13 +1,12 @@
 // @ts-nocheck - injects a fake generateText to exercise the polish contract.
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
 import { test } from "node:test";
 
+import { captionPolishContract } from "../packages/caption-core/index.js";
 import { createSubtitlePolisher } from "../src/subtitle-polish.js";
 
-test("desktop polish keeps a six-second budget for full glossary prompts", async () => {
-  const source = await readFile(new URL("../src/subtitle-polish.js", import.meta.url), "utf8");
-  assert.match(source, /DEFAULT_TIMEOUT_MS\s*=\s*6000/u);
+test("desktop polish keeps a six-second budget for full glossary prompts", () => {
+  assert.equal(captionPolishContract.timeoutMilliseconds, 6_000);
 });
 
 function recordingGenerateText(text) {
@@ -57,12 +56,14 @@ test("business prompt encodes the register rules per target language", async () 
   await polisher.polish({ translatedText: "회의 시작", targetLanguage: "ko", tone: "business" });
   const koPrompt = `${calls[0].system ?? ""}\n${calls[0].prompt ?? ""}`;
   assert.match(koPrompt, /격식체|존댓말/);
-  assert.match(koPrompt, /proper noun/i);
+  assert.match(koPrompt, /explicit glossary preservation instruction/);
   assert.match(koPrompt, /meaning/i);
 
   await polisher.polish({ translatedText: "Start the meeting", targetLanguage: "en", tone: "business" });
   const enPrompt = `${calls[1].system ?? ""}\n${calls[1].prompt ?? ""}`;
   assert.match(enPrompt, /professional business English/i);
+  assert.match(enPrompt, /KRW 300 billion/u);
+  assert.doesNotMatch(enPrompt, /KRW 300bn/u, "compact CRE notation is a Live Call finalizer concern");
 });
 
 test("polish never drops a subtitle: generateText throwing falls back to raw text", async () => {
@@ -121,15 +122,11 @@ test("polish injects the configured glossary into the prompt", async () => {
   assert.match(prompt, /TRANSLATION MEMORY/);
   assert.match(prompt, /full-sentence|clause-level/);
   assert.match(prompt, /close variant/);
-  // Figurative source expressions (현주소, 발목을 잡다, 옥석 가리기 …) must be
-  // rendered by meaning, never word-for-word.
-  assert.match(prompt, /sense-for-sense/);
-  assert.match(prompt, /never word-for-word/);
-  // And when the TARGET language has an equivalent idiom, prefer it
-  // (idiom-for-idiom) over a flat paraphrase — in both directions
-  // (옥석 가리기 ↔ separating the wheat from the chaff, 연착륙 ↔ soft landing).
-  assert.match(prompt, /idiom-for-idiom/);
-  assert.match(prompt, /equivalent idiom/);
+  // The global prompt carries one restraint, not a broad idiom dictionary that
+  // biases ordinary speech or makes every committed line expensive.
+  assert.match(prompt, /intended meaning rather than its literal words/);
+  assert.match(prompt, /Do not introduce an idiom/);
+  assert.doesNotMatch(prompt, /soft landing|separating the wheat|현주소/u);
 });
 
 test("a relevant late glossary entry survives bounded selection with its section and global rules", async () => {
@@ -157,7 +154,9 @@ test("a relevant late glossary entry survives bounded selection with its section
   });
 
   const system = String(calls[0].system);
-  const selectedGlossary = system.split("GLOSSARY:\n")[1] ?? "";
+  const dataBlock = system.match(/^BEGIN_UNTRUSTED_DATA\n([^\n]+)\nEND_UNTRUSTED_DATA$/mu);
+  assert.ok(dataBlock, "bounded glossary JSON must be carried inside the untrusted-data block");
+  const selectedGlossary = JSON.parse(dataBlock[1]).glossary;
   assert.match(selectedGlossary, /\[규칙\]/u);
   assert.match(selectedGlossary, /양방향으로 적용/u);
   assert.match(selectedGlossary, /\[고유명사 — 회사\]/u);
@@ -333,4 +332,43 @@ test("polish skips trivial or empty text without calling the model", async () =>
   assert.equal(await polisher.polish({ translatedText: "", targetLanguage: "ko", tone: "business" }), "");
   assert.equal(await polisher.polish({ translatedText: "  ", targetLanguage: "ko", tone: "business" }), "  ");
   assert.equal(calls.length, 0);
+});
+
+test("required initial translation bypasses optional polish skipping and accepts one-character sources", async () => {
+  const { fn, calls } = recordingGenerateText("Yes.");
+  const polisher = createSubtitlePolisher({ generateText: fn, model: "fixture" });
+  assert.equal(await polisher.polish({ translatedText: "…", sourceText: "네", targetLanguage: "en", tone: "natural", required: true }), "Yes.");
+  assert.equal(calls.length, 1);
+});
+
+test("required translation distinguishes safe provider failures and empty responses without copying provider text", async () => {
+  for (const [failure, expected] of [
+    [Object.assign(new Error("sensitive provider detail"), { code: "GEMINI_TEXT_HTTP_ERROR", status: 401 }), "TRANSLATION_AUTH_FAILED"],
+    [Object.assign(new Error("sensitive provider detail"), { code: "GEMINI_TEXT_HTTP_ERROR", status: 429 }), "TRANSLATION_RATE_LIMITED"],
+    [Object.assign(new Error("sensitive provider detail"), { code: "GEMINI_TEXT_HTTP_ERROR", status: 503 }), "TRANSLATION_PROVIDER_UNAVAILABLE"],
+    [Object.assign(new Error("sensitive provider detail"), { code: "GEMINI_TEXT_BLOCKED" }), "TRANSLATION_BLOCKED"],
+    [null, "TRANSLATION_EMPTY"],
+  ]) {
+    let calls = 0;
+    const polisher = createSubtitlePolisher({ model: "fixture", generateText: async () => { calls++; if (failure) throw failure; return { text: "" }; } });
+    await assert.rejects(polisher.polish({ translatedText: "…", sourceText: "테스트 문장", targetLanguage: "en", required: true }), error => error.code === expected && !error.message.includes("sensitive"));
+    assert.equal(calls, 1);
+  }
+});
+
+test("required translation deadline aborts provider work even when it never settles", async () => {
+  let providerSignal;
+  const polisher = createSubtitlePolisher({ model: "fixture", timeoutMs: 10,
+    generateText: async ({ abortSignal }) => { providerSignal = abortSignal; return new Promise(() => {}); } });
+  await assert.rejects(polisher.polish({ translatedText: "…", sourceText: "테스트 문장", targetLanguage: "en", required: true }), { code: "TRANSLATION_TIMEOUT" });
+  assert.equal(providerSignal.aborted, true);
+  assert.equal(providerSignal.reason.name, "TimeoutError");
+});
+
+test("required translation rejects an already cancelled request before paid work", async () => {
+  const controller = new AbortController(); controller.abort();
+  let calls = 0;
+  const polisher = createSubtitlePolisher({ model: "fixture", generateText: async () => { calls++; return { text: "Never" }; } });
+  await assert.rejects(polisher.polish({ translatedText: "…", sourceText: "테스트", targetLanguage: "en", required: true, signal: controller.signal }), { code: "TRANSLATION_CANCELLED" });
+  assert.equal(calls, 0);
 });

@@ -48,6 +48,14 @@ venv/
 .playwright-cli/
 .claude/agent-memory/
 .claude/worktrees/
+.codex-artifacts/
+.realtime-noel-dev/
+
+# Real-API spike script output and synthetic fixtures (scripts/engine-spike.mjs)
+scratch/
+
+# Vercel CLI project link (machine-local)
+.vercel/
 
 # Design-QA and audit screenshots: regenerable artifacts, not sources.
 output/
@@ -57,3 +65,4 @@ output/
 .idea/
 .vscode/
 *.swp
+.gstack/

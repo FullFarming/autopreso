@@ -41,7 +41,11 @@ export function isAllowedWebSocketUpgrade(request, policy, { gatewaySecret, view
   const rawOrigin = singleHeader(request.headers.origin);
   if (rawOrigin) {
     try {
-      return policy.allowedOrigins.has(canonicalOrigin(rawOrigin));
+      // 2026-08-15 fix: Origin allowlisting is byte-for-byte exact. Parsing
+      // still rejects malformed values, while strict membership prevents a
+      // trailing slash or other normalized variant from widening the policy.
+      canonicalOrigin(rawOrigin);
+      return policy.allowedOrigins.has(rawOrigin);
     } catch {
       return false;
     }

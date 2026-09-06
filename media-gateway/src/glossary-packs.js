@@ -1,5 +1,9 @@
-// Gemini Live Translation does not accept instructions; these packs are used
-// only by the Meeting text-translation stage, where prompt constraints exist.
+import { getBuiltInGlossary } from "../../packages/caption-core/index.js";
+
+// Session terminology flows through pinned compiled glossaries (translation
+// prompts + the bounded STT vocabulary path). What remains here is only the
+// polisher's standing default-domain instruction; the legacy per-pack
+// selection (hotel/fnb) is gone — glossaryPack never reached a prompt.
 const BASE_IDIOMS = Object.freeze([
   "현주소: current landscape or current state, never a physical address",
   "숙제: remaining challenge in business contexts, never homework",
@@ -15,8 +19,7 @@ const BASE_IDIOMS = Object.freeze([
   "headwinds and tailwinds: 역풍 and 훈풍",
 ]);
 
-const INDUSTRY_TERMS = Object.freeze({
-  general_cre: [
+const DEFAULT_DOMAIN_TERMS = Object.freeze([
     "NOI: net operating income",
     "cap rate: capitalization rate",
     "market rent: rent achievable in the current open market",
@@ -40,31 +43,9 @@ const INDUSTRY_TERMS = Object.freeze({
     "share of voice: share of press coverage in the market",
     "pax: the number of people a space accommodates",
     "GFA: gross floor area, as opposed to net leasable area",
-  ],
-  hotel: [
-    "ADR: average daily rate",
-    "occupancy: percentage of available rooms sold",
-    "RevPAR: revenue per available room",
-    "TRevPAR: total revenue per available room",
-    "GOPPAR: gross operating profit per available room",
-    "flow-through: share of incremental revenue converted to profit",
-    "flex: reduction of expenses as revenue declines",
-    "competitive set: hotels used for performance benchmarking",
-  ],
-  fnb: [
-    "covers: number of guests served",
-    "table turn: reuse of a table for a new party",
-    "food cost: ingredient cost as a share of food sales",
-    "prime cost: combined cost of ingredients and direct labor",
-    "percentage rent: rent calculated as a percentage of restaurant sales",
-    "tenant improvement allowance: landlord contribution to restaurant fit-out",
-    "common area maintenance: tenant share of operating common areas",
-  ],
-});
+]);
 
-export function buildGlossaryInstruction(glossaryPack) {
-  const industryTerms = INDUSTRY_TERMS[glossaryPack];
-  if (!industryTerms) throw new Error("INVALID_GLOSSARY_PACK");
+export function buildDefaultDomainInstruction() {
   return [
     "Translate naturally while preserving names, numbers, and business meaning.",
     // Korean counts in myriads, English business speech in million/billion —
@@ -75,12 +56,21 @@ export function buildGlossaryInstruction(glossaryPack) {
     "- Percentages, years, quarters, floor areas, and headcounts are copied as spoken.",
     "Interpret these base idioms by meaning:",
     ...BASE_IDIOMS.map((entry) => `- ${entry}`),
-    `Apply this ${glossaryPack} glossary:`,
-    ...industryTerms.map((entry) => `- ${entry}`),
+    "Apply this commercial real estate glossary:",
+    ...DEFAULT_DOMAIN_TERMS.map((entry) => `- ${entry}`),
   ].join("\n");
+}
+
+export function resolveBuiltInGlossaryDocument(sourceId, documentVersion) {
+  if (documentVersion !== 1) throw new Error("INVALID_BUILT_IN_GLOSSARY_VERSION");
+  const glossary = getBuiltInGlossary(sourceId);
+  if (!glossary || glossary.document.version !== documentVersion) {
+    throw new Error("UNKNOWN_BUILT_IN_GLOSSARY");
+  }
+  return glossary.document;
 }
 
 export const glossaryContract = Object.freeze({
   baseIdioms: BASE_IDIOMS,
-  industryTerms: INDUSTRY_TERMS,
+  defaultDomainTerms: DEFAULT_DOMAIN_TERMS,
 });

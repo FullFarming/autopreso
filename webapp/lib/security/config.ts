@@ -51,14 +51,19 @@ export function isProductionRuntime(): boolean {
 readRequiredProductionSecret("SESSION_SECRET");
 readRequiredProductionSecret("PAIR_SECRET");
 
-// ADMIN_PASSWORD is an operator-chosen login password, not an HMAC secret:
-// brute force is bounded by the login rate limiter, so it follows the 5+
-// character policy from host-login-config.ts instead of the 32-char secret
-// minimum above.
+// 2026-08-31 fix: 해시만 설정한 운영 환경도 로그인 설정과 같은 우선순위로 검증한다.
+// This module runs in Edge middleware, so it must not import the Node scrypt helper.
 if (process.env.NODE_ENV === "production") {
-  const adminPassword = process.env.ADMIN_PASSWORD?.trim() ?? "";
-  if (adminPassword.length < 5 || isKnownInsecureSecret(adminPassword)) {
-    throw new Error("ADMIN_PASSWORD must be configured with a non-placeholder password of at least 5 characters");
+  const adminPasswordHash = process.env.ADMIN_PASSWORD_HASH;
+  if (adminPasswordHash !== undefined) {
+    if (adminPasswordHash.length !== 171 || !/^scrypt-v1\$[a-f0-9]{32}\$[a-f0-9]{128}$/u.test(adminPasswordHash)) {
+      throw new Error("ADMIN_PASSWORD_HASH must contain a valid scrypt-v1 password hash");
+    }
+  } else {
+    const adminPassword = process.env.ADMIN_PASSWORD?.trim() ?? "";
+    if (adminPassword.length < 10 || adminPassword.length > 256 || isKnownInsecureSecret(adminPassword)) {
+      throw new Error("ADMIN_PASSWORD must be configured with a non-placeholder password of 10 to 256 characters");
+    }
   }
 }
 
